@@ -1,3 +1,4 @@
+#include "api/ops/residual_add.h"
 #include "api/ops/rmsnorm.h"
 #include "ops/norm_test_common.h"
 
@@ -70,6 +71,51 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
     return failures;
 }
 
+// `rmsnorm_add` exists to replace `rmsnorm` into a scratch plane followed by
+// `residual_add`, so what it owes is not "close to the oracle" but "the same
+// bits as the pair". This runs both and compares the raw BF16 storage: if the
+// fused epilogue ever stopped rounding the normalised term before adding, or
+// routed to a kernel that reduces in a different order than its base epilogue,
+// the two would drift in the last bit and this fails while a tolerance-based
+// oracle check would not.
+int run_composition_case(const char* label, const Shape& shape, bool unit_offset,
+                         std::uint32_t seed) {
+    const std::size_t count = shape.elements();
+    std::vector<float> input(count), weight(shape.d), prior(count);
+    fill_uniform(input, seed, -4.0F, 4.0F);
+    fill_uniform(weight, seed + 1U, unit_offset ? -0.5F : 0.25F, unit_offset ? 0.5F : 1.75F);
+    fill_uniform(prior, seed + 2U, -8.0F, 8.0F);
+    round_to_bf16(input);
+    round_to_bf16(weight);
+    round_to_bf16(prior);
+
+    DeviceInput device_input  = make_input(input, false);
+    DeviceInput device_weight = make_input(weight, false);
+    Tensor input_tensor = tensor_for(device_input.data, shape);
+    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
+
+    // Fused: the prior is the destination, read and written in place.
+    DeviceInput fused_storage = make_input(prior, false);
+    Tensor fused = tensor_for(fused_storage.data, shape);
+    ops::rmsnorm_add(input_tensor, weight_tensor, kEps, unit_offset, fused, nullptr);
+
+    // The pair it replaces: normalise into a plane, then add that plane on.
+    GuardedDeviceBuffer plane(count * sizeof(std::uint16_t));
+    plane.fill(0xff);
+    Tensor plane_tensor = tensor_for(plane.data(), shape);
+    ops::rmsnorm(input_tensor, weight_tensor, kEps, unit_offset, plane_tensor, nullptr);
+    DeviceInput staged_storage = make_input(prior, false);
+    Tensor staged = tensor_for(staged_storage.data, shape);
+    ops::residual_add(plane_tensor, staged, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_exact(label, from_device<std::uint16_t>(fused_storage.data, count),
+                                from_device<std::uint16_t>(staged_storage.data, count));
+    failures += verify_preserved(std::string(label) + " preserves input", device_input);
+    failures += verify_preserved(std::string(label) + " preserves weight", device_weight);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -92,6 +138,18 @@ int main() {
     failures += run_case("rmsnorm offset unaligned [128,32]", {128, 32}, true, 1301U, 4.0F, true);
     failures += run_case("rmsnorm plain unaligned [128,8]", {128, 8}, false, 1302U, 4.0F, true);
     failures += run_case("rmsnorm plain near-zero [128,32]", {128, 32}, false, 1303U, 1.0e-5F);
+
+    // The accumulating form, against the two-kernel sequence it replaces. 640 is
+    // Gemma 3's hidden extent and the shape the engine actually runs; the others
+    // cover the warp, d128, cta and d2048 routes so a route that diverged from
+    // its base epilogue is caught rather than assumed away.
+    failures += run_composition_case("rmsnorm_add offset [640,1]", {640, 1}, true, 1401U);
+    failures += run_composition_case("rmsnorm_add offset [640,37]", {640, 37}, true, 1402U);
+    failures += run_composition_case("rmsnorm_add offset [256,4,9]", {256, 4, 9}, true, 1403U);
+    failures += run_composition_case("rmsnorm_add offset [2048,5]", {2048, 5}, true, 1404U);
+    failures += run_composition_case("rmsnorm_add plain [128,32]", {128, 32}, false, 1405U);
+    failures += run_composition_case("rmsnorm_add plain [2048,9]", {2048, 9}, false, 1406U);
+    failures += run_composition_case("rmsnorm_add plain [5120,3]", {5120, 3}, false, 1407U);
     std::cout << (failures ? "FAIL" : "OK") << " rmsnorm\n";
     return failures ? 1 : 0;
 }

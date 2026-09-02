@@ -1,4 +1,5 @@
 #include "core/decode_graph.h"
+#include <cstdlib>
 
 #include "core/device.h"
 
@@ -122,6 +123,15 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
                                  cudaGetErrorString(err));
     }
     exec_ = exec;
+    // The node count is the direct measure of what a captured round costs to
+    // dispatch, and nothing else reports it. Off unless asked for.
+    if (std::getenv("SUROGATE_SERVE_GRAPH_NODES") != nullptr) {
+        std::size_t nodes = 0;
+        if (cudaGraphGetNodes(definition.graph_, nullptr, &nodes) == cudaSuccess) {
+            std::fprintf(stderr, "graph-nodes: %zu\n", nodes);
+            std::fflush(stderr);
+        }
+    }
 }
 
 bool DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {

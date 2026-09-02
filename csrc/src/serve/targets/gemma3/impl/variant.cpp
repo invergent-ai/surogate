@@ -3,8 +3,6 @@
 #include "api/ops/gelu.h"
 #include "api/ops/gelu_mul.h"
 #include "api/ops/linear.h"
-#include "api/ops/linear_add.h"
-#include "api/ops/residual_add.h"
 #include "api/ops/rmsnorm.h"
 
 #include "core/device.h"
@@ -128,33 +126,24 @@ std::size_t attention_projection_workspace_bytes(QType qtype, std::int32_t first
 }
 
 std::size_t attention_output_workspace_bytes(QType qtype, std::int32_t first, std::int32_t last) {
-    // Sized for the norm-applying tail, which is the model Gemma actually is:
-    // o_proj into a plane, `post_attention_norm` over it, then the residual add.
-    // The fused `linear_add` the leaf runs today needs strictly less, so the
-    // figure does not change when the shared runtime starts routing the
-    // projection payload here.
+    // o_proj into one plane, then `post_attention_norm` accumulating from it onto
+    // the residual. One plane, not two: the norm writes where the residual add
+    // used to, so nothing holds the normalised copy.
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
     account_linear(layout, qtype, TextConfig::hidden, TextConfig::query_size, first, last);
-    {
-        auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-            qtype, TextConfig::hidden, TextConfig::query_size, kTextPolicy, first, last));
-    }
     return layout.peak_bytes(1);
 }
 
 std::size_t post_mixer_workspace_bytes(QType qtype, std::int32_t first, std::int32_t last) {
-    // gate, up, the gated activation, the down projection, and its normalised
-    // copy. Five planes where Llama's SwiGLU MLP needs one, and every one of them
-    // is a separate allocation on purpose: `gelu_mul` and `rmsnorm` both require
-    // their output not to overlap their inputs.
+    // gate, up, the gated activation and the down projection. Four planes where
+    // Llama's SwiGLU MLP needs one: `gelu_mul` requires its output not to overlap
+    // its inputs, so those three stand apart. The normalised copy is gone --
+    // the norm accumulates onto the residual instead of through a fifth plane.
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
     (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
     account_linear(layout, qtype, TextConfig::intermediate, TextConfig::hidden, first, last);
     account_linear(layout, qtype, TextConfig::intermediate, TextConfig::hidden, first, last);
@@ -209,16 +198,19 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                 = workspace.scope();
     const std::int32_t columns = attention.ne[1];
-    Tensor projected  = workspace.alloc(DType::BF16, {TextConfig::hidden, columns});
-    Tensor normalized = workspace.alloc(DType::BF16, {TextConfig::hidden, columns});
+    Tensor projected = workspace.alloc(DType::BF16, {TextConfig::hidden, columns});
     ops::linear(attention, weight, projected, kTextPolicy, workspace, stream);
     apply_lora(weight, kOutputPort, attention, projected, stream);
     // Zero-centred, like every Gemma norm: the artifact holds `w` and the kernel
     // applies `1 + w`. Same convention as `norm_unit_offset<Variant>()`, which is
     // the family default this target does not override.
-    ops::rmsnorm(projected, weights.post_attention_norm, TextConfig::rms_epsilon,
-                 /*unit_offset*/ true, normalized, stream);
-    ops::residual_add(normalized, residual, stream);
+    //
+    // The norm accumulates straight onto the residual. The plane it used to
+    // write and the residual add that read it back existed only because
+    // `ops::rmsnorm` forbids aliasing its output with its inputs; the fused form
+    // is bit-identical to that pair, which sinfer_rmsnorm_test pins.
+    ops::rmsnorm_add(projected, weights.post_attention_norm, TextConfig::rms_epsilon,
+                     /*unit_offset*/ true, residual, stream);
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
@@ -245,8 +237,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     Tensor up         = workspace.alloc(DType::BF16, {TextConfig::intermediate, columns});
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, columns});
     Tensor projected  = workspace.alloc(DType::BF16, {TextConfig::hidden, columns});
-    Tensor normalized = workspace.alloc(DType::BF16, {TextConfig::hidden, columns});
-
+    
     // Gate and up are separate matrices here, where Llama and the Qwen families
     // fuse them and feed one `linear_swiglu`. That costs a launch and buys two
     // adaptable modules: `gate_proj` and `up_proj` have their own weights, so the
@@ -262,9 +253,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     apply_lora(weights.down, kDownPort, activation, projected, stream);
     // The second half of the FFN sandwich: `post_feedforward_layernorm` over the
     // MLP's output, before it reaches the residual.
-    ops::rmsnorm(projected, weights.post_feedforward_norm, TextConfig::rms_epsilon,
-                 /*unit_offset*/ true, normalized, stream);
-    ops::residual_add(normalized, residual, stream);
+    ops::rmsnorm_add(projected, weights.post_feedforward_norm, TextConfig::rms_epsilon,
+                     /*unit_offset*/ true, residual, stream);
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,

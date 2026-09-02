@@ -16,19 +16,35 @@ enum class RmsEpilogue {
     Plain,
     Gated,
     GatedSigmoid,
+    /// `out += normalised`, with and without the unit offset on the gain. The
+    /// second operand is the destination itself, which is what lets a norm land
+    /// straight on a residual instead of through a plane and a second kernel.
+    OffsetAdd,
+    PlainAdd,
 };
 
-/// Epilogues that multiply by an activation of the gate operand `z`.
+/// Epilogues that read the second per-element operand `z`: the gated ones
+/// multiply by an activation of it, the accumulating ones add it.
 template <RmsEpilogue Epilogue>
-inline constexpr bool kRmsEpilogueReadsGate =
-    Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::GatedSigmoid;
+inline constexpr bool kRmsEpilogueReadsOperand =
+    Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::GatedSigmoid ||
+    Epilogue == RmsEpilogue::OffsetAdd || Epilogue == RmsEpilogue::PlainAdd;
 
 template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
-    if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
+    if constexpr (Epilogue == RmsEpilogue::Offset || Epilogue == RmsEpilogue::OffsetAdd) {
+        weight += 1.0f;
+    }
     float value = x * inv * weight;
     if constexpr (Epilogue == RmsEpilogue::Gated) { value *= silu(z); }
     if constexpr (Epilogue == RmsEpilogue::GatedSigmoid) { value *= sigmoid(z); }
+    if constexpr (Epilogue == RmsEpilogue::OffsetAdd || Epilogue == RmsEpilogue::PlainAdd) {
+        // Round the normalised term to BF16 before adding, because that is what
+        // the two kernels this replaces did: the norm wrote a BF16 plane and the
+        // residual add read it back. Keeping the rounding keeps the fused form
+        // bit-identical to them, and it is also what the reference does.
+        value = __bfloat162float(__float2bfloat16(value)) + z;
+    }
     return value;
 }
 
@@ -74,7 +90,7 @@ __launch_bounds__(Block) __global__
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
+            if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             out[row_base + pair] =
@@ -116,7 +132,7 @@ __launch_bounds__(Block) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
+    if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -169,7 +185,7 @@ __launch_bounds__(Block) __global__
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
+            if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             out[row_base + pair] =
@@ -212,7 +228,7 @@ __launch_bounds__(512) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
+    if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -255,7 +271,7 @@ __launch_bounds__(256) __global__
         const float xv           = __bfloat162float(x[index]);
         const float wv           = __bfloat162float(weight[i]);
         float zv                 = 0.0f;
-        if constexpr (kRmsEpilogueReadsGate<Epilogue>) { zv = __bfloat162float(z[index]); }
+        if constexpr (kRmsEpilogueReadsOperand<Epilogue>) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
     }
 }

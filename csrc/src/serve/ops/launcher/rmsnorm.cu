@@ -22,7 +22,8 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
     auto* out_bf16     = static_cast<__nv_bfloat16*>(out.data);
 
-    if (aligned2 && d == 128 && Epilogue == RmsEpilogue::Plain) {
+    if (aligned2 && d == 128 &&
+        (Epilogue == RmsEpilogue::Plain || Epilogue == RmsEpilogue::PlainAdd)) {
         // Plain per-head D128 is latency-bound for Q32/KV8 rows. Four rows per CTA follows the
         // measured lower envelope from T=1 through the 1024-token prefill point.
         constexpr int kBlock         = 128;
@@ -42,7 +43,8 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
             reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
-    } else if (aligned2 && d == 2048 && Epilogue == RmsEpilogue::Plain) {
+    } else if (aligned2 && d == 2048 &&
+               (Epilogue == RmsEpilogue::Plain || Epilogue == RmsEpilogue::PlainAdd)) {
         // The 512-thread CTA is faster than 128/256-thread alternatives at every measured DFlash
         // extent and reaches the same-topology payload floor at the prefill endpoint.
         rmsnorm_d2048_bf16x2_kernel<Epilogue><<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
@@ -71,6 +73,30 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
 }
 
 } // namespace
+
+void rmsnorm_add_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
+                        Tensor& out, cudaStream_t stream) {
+    const std::int32_t d = x.ne[0];
+    if (d <= 0) { throw std::invalid_argument("rmsnorm_add: ne[0] must be positive"); }
+    const std::int64_t rows = out.numel() / d;
+    if (rows > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("rmsnorm_add: row count exceeds CUDA grid limit");
+    }
+    const auto x_addr = reinterpret_cast<std::uintptr_t>(x.data);
+    const auto w_addr = reinterpret_cast<std::uintptr_t>(weight.data);
+    const auto o_addr = reinterpret_cast<std::uintptr_t>(out.data);
+    const bool aligned2 =
+        ((x_addr | w_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
+    // The destination is also the operand read: every kernel reads z[i] and
+    // writes out[i] from the one thread, so aliasing them is well defined.
+    if (unit_offset) {
+        launch_rmsnorm<RmsEpilogue::OffsetAdd>(x, weight, &out, out, d, rows, eps, aligned2,
+                                               stream);
+    } else {
+        launch_rmsnorm<RmsEpilogue::PlainAdd>(x, weight, &out, out, d, rows, eps, aligned2, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                     const Tensor* z, Tensor& out, cudaStream_t stream) {

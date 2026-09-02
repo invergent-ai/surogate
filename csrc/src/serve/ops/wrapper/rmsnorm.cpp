@@ -49,7 +49,7 @@ namespace {
 
 void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                   const Tensor* z, Tensor& out, cudaStream_t stream,
-                  GatedRmsGate gate = GatedRmsGate::Silu) {
+                  GatedRmsGate gate = GatedRmsGate::Silu, bool accumulate = false) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || out.dtype != DType::BF16 ||
         (z != nullptr && z->dtype != DType::BF16)) {
         throw std::invalid_argument("rmsnorm: x/weight/z/out must be BF16");
@@ -84,6 +84,13 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
         throw std::invalid_argument("rmsnorm: x/weight/z/out data must be non-null");
     }
 
+    if (accumulate) {
+        if (x.data == out.data) {
+            throw std::invalid_argument("rmsnorm_add: x must not alias out");
+        }
+        detail::rmsnorm_add_launch(x, weight, eps, unit_offset, out, stream);
+        return;
+    }
     detail::rmsnorm_launch(x, weight, eps, unit_offset, z, gate, out, stream);
 }
 
@@ -92,6 +99,12 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream) {
     rmsnorm_impl(x, weight, eps, unit_offset, nullptr, out, stream);
+}
+
+void rmsnorm_add(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
+                 cudaStream_t stream) {
+    rmsnorm_impl(x, weight, eps, unit_offset, nullptr, out, stream, GatedRmsGate::Silu,
+                 /*accumulate=*/true);
 }
 
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
