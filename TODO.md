@@ -36,7 +36,7 @@ built, tested, verified on GPU 1 and committed before the next.
 
 ## Group 5 — CUDA-graph budget accounting
 
-- [ ] **TODO** `graph_bytes_` is a `cudaMemGetInfo` free-before minus free-after, so two engines starting on one GPU attribute each other's weight loads to graph preparation and abort. Make the measurement or the decision process-robust; keep refusing to serve without headroom.
+- [x] **DONE** (Group 5 commit) Graph preparation is measured per process via NVML (`core/device_footprint.*`, dlopened so the CUDA stub library is never linked); the two derived-plane registries accumulate the sizes they allocate instead of a device-wide delta, so both sides of the subtraction are this process's own. The refusal fires only on an attributed figure; unattributed it is reported. Two engines now start together on one GPU and both answer.
 
 ## Group 6 — windowed attention performance
 

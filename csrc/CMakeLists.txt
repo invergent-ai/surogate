@@ -829,6 +829,7 @@ add_library(sinfer_core STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/core/sleep.cu
   ${SERVE_ROOT}/core/engine_context.cpp
   ${SERVE_ROOT}/core/device.cu
+  ${SERVE_ROOT}/core/device_footprint.cpp
   ${SERVE_ROOT}/core/dtype.cpp
   ${SERVE_ROOT}/core/host_worker_pool.cpp
   ${SERVE_ROOT}/core/numa.cpp
@@ -846,7 +847,7 @@ add_library(sinfer_core STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/runtime/engine/request_memory.cpp)
 sinfer_internal_includes(sinfer_core)
 sinfer_cuda_archive(sinfer_core)
-target_link_libraries(sinfer_core PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::nvtx3 Threads::Threads)
+target_link_libraries(sinfer_core PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::nvtx3 Threads::Threads ${CMAKE_DL_LIBS})
 # libnuma places the host buffers of an offloaded model (core/numa.*). Optional: without it the
 # engine warns and the operator must run under `numactl --interleave=all` on a multi-socket host.
 find_library(NUMA_LIBRARY NAMES numa)

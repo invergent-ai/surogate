@@ -181,9 +181,6 @@ W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         return {nullptr, nullptr};
     }
 
-    std::size_t free_pre_alloc = 0;
-    (void)cudaMemGetInfo(&free_pre_alloc, &total_bytes);
-
     PlaneEntry entry;
     if (cudaMalloc(&entry.codes, code_bytes) != cudaSuccess) {
         g_planes.emplace(weight.qdata, PlaneEntry{});
@@ -216,10 +213,11 @@ W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         return {nullptr, nullptr};
     }
 
-    std::size_t free_post_alloc = 0;
-    (void)cudaMemGetInfo(&free_post_alloc, &total_bytes);
-    g_allocated_bytes +=
-        free_pre_alloc > free_post_alloc ? free_pre_alloc - free_post_alloc : 0;
+    // What this plane cost, from the sizes just allocated. A free-memory delta
+    // across the two cudaMalloc calls would be device-wide: another process
+    // allocating in the window overstates it, freeing understates it, and the
+    // graph budget subtracts this figure from a measurement of its own.
+    g_allocated_bytes += code_bytes + scale_bytes;
     g_planes.emplace(weight.qdata, entry);
     return {entry.codes, entry.row_scales};
 }

@@ -1,3 +1,4 @@
+#include "core/device_footprint.h"
 #include "core/sleep.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
@@ -1268,9 +1269,7 @@ void ProgramImplCore::prepare_graphs() {
     }
     device.synchronize();
 
-    std::size_t free_before = 0;
-    std::size_t total_bytes = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_before, &total_bytes));
+    const DeviceFootprint footprint_before = sample_device_footprint();
 
     const auto clear_stable_controls = [&] {
         std::vector<Tensor> controls{
@@ -1611,20 +1610,39 @@ void ProgramImplCore::prepare_graphs() {
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     device.synchronize();
 
-    std::size_t free_after = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_after, &total_bytes));
-    std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
-    // surogate vendor patch (PATCHES.md #22): derived quant planes (fp8/fp4
-    // registries) allocate lazily during the pre-capture warmup decode; they
-    // carry their own VRAM guard and are not graph memory, so exclude them.
+    const DeviceFootprint footprint_after = sample_device_footprint();
+    const DeviceFootprintDelta prepared    = device_footprint_delta(footprint_before,
+                                                                    footprint_after);
+    // Derived quant planes (fp8/fp4 registries) allocate lazily during the
+    // pre-capture warmup decode; they carry their own VRAM guard and are not
+    // graph memory, so exclude them. Both sides of this subtraction are the
+    // bytes this process allocated -- the registries accumulate the sizes they
+    // ask for, and the measurement above is per-process wherever the driver
+    // will attribute it -- so a neighbouring process cannot move either one.
     const std::size_t plane_bytes =
         ops::detail::w8_derived_plane_bytes() + ops::detail::marlin_plane_bytes();
-    consumed                      = consumed > plane_bytes ? consumed - plane_bytes : 0;
-    graph_observed_bytes          = consumed;
+    const std::size_t consumed =
+        prepared.bytes > plane_bytes ? prepared.bytes - plane_bytes : 0;
+    graph_observed_bytes = consumed;
     if (consumed > graph_allowance_bytes) {
-        throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
-                                 " bytes, exceeding the planned allowance of " +
-                                 std::to_string(graph_allowance_bytes) + " bytes");
+        // Refuse only on a figure that is this engine's own. Unattributed, the
+        // number counts every process on the card: a second engine loading its
+        // weights inside this window once aborted a startup with an allowance
+        // error naming bytes this one had never allocated. Say so and continue
+        // -- the headroom the pool reserves is what actually protects serving,
+        // and it is checked against the device, not against this delta.
+        if (!prepared.attributed) {
+            std::fprintf(stderr,
+                         "CUDA Graph preparation: device free fell by %zu bytes against a planned "
+                         "allowance of %zu, but this figure counts every process on the device "
+                         "(%s), so it is reported rather than enforced.\n",
+                         consumed, graph_allowance_bytes, device_footprint_attribution_note());
+            std::fflush(stderr);
+        } else {
+            throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
+                                     " bytes, exceeding the planned allowance of " +
+                                     std::to_string(graph_allowance_bytes) + " bytes");
+        }
     }
     // surogate vendor patch (PATCHES.md #27): prefill CUDA graphs.
     static const bool prefill_graph_vetoed = [] {

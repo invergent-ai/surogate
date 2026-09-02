@@ -24,6 +24,7 @@
 #include "core/decode_graph.h"
 #include "api/types.h"
 #include "core/device.h"
+#include "core/device_footprint.h"
 #include "core/tensor.h"
 
 #include "api/ops/position.h"
@@ -173,9 +174,7 @@ public:
                          prefill_chunk_);
         }
         try {
-            std::size_t free_before = 0;
-            std::size_t total       = 0;
-            CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+            const DeviceFootprint footprint_before = sample_device_footprint();
 
             DecodeGraphDefinition definition;
             definition.capture(device_.stream, body);
@@ -184,9 +183,10 @@ public:
             executable.upload(device_.stream);
             device_.synchronize();
 
-            std::size_t free_after = 0;
-            CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
-            graph_bytes_ += free_before > free_after ? free_before - free_after : 0;
+            // Per-process where the driver will attribute it, so a neighbouring
+            // engine's allocations are not counted as this family's graphs.
+            graph_bytes_ +=
+                device_footprint_delta(footprint_before, sample_device_footprint()).bytes;
 
             auto emplaced = buckets_.emplace(bucket, std::move(executable));
             return &emplaced.first->second;

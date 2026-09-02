@@ -361,9 +361,7 @@ W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
         return fail(PlaneEntry{});
     }
 
-    std::size_t free_pre_alloc = 0;
-    (void)cudaMemGetInfo(&free_pre_alloc, &total_bytes);
-
+    
     PlaneEntry entry;
     if (cudaMalloc(&entry.codes, code_bytes) != cudaSuccess) { return fail(entry); }
     if (cudaMalloc(&entry.sf, sf_bytes) != cudaSuccess) { return fail(entry); }
@@ -385,10 +383,10 @@ W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
         return fail(entry);
     }
 
-    std::size_t free_post_alloc = 0;
-    (void)cudaMemGetInfo(&free_post_alloc, &total_bytes);
-    g_allocated_bytes +=
-        free_pre_alloc > free_post_alloc ? free_pre_alloc - free_post_alloc : 0;
+    // The sizes just allocated, not a device-wide free-memory delta:
+    // the delta counts every process on the card, and the graph budget
+    // subtracts this from a measurement of its own.
+    g_allocated_bytes += code_bytes + sf_bytes + sf_atom_bytes + scale_bytes;
     g_planes.emplace(weight.qdata, entry);
     return {entry.codes, entry.sf, entry.row_scales, entry.sf_atom};
 }
