@@ -4,7 +4,8 @@ Status legend: **DONE** (commit) · **IN PROGRESS** · **TODO** · **DEFERRED** 
 
 Each group is built, tested, verified against the HF reference and committed
 before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
---test-dir csrc/build-serve -j8` (53 s, 104 tests) rather than a serial loop.
+--test-dir csrc/build-serve -j16` (~40 s, 105 tests) rather than a serial loop —
+and capture it to a file once rather than re-running it to grep twice.
 
 ## Group 1 — W8 `linear_add` plan and launchers — **DONE** (`8beb4e69`)
 
@@ -12,8 +13,9 @@ before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
 - [x] **DONE** (this pass) One registered-shape list (`w8_linear_add_registered_shapes`) feeds the plan, the wrapper's W8 gate and the conformance test; the wrapper no longer restates it (gemma3 `{640, *}` was admitted by one and refused by the other).
 - [x] **DONE** (this pass) TinyLlama `{2048, 5632}` exact-T bake over T=2..32, measured 2.8–4.2x over the runtime tile (PATCHES.md #90); exact-T tables keyed on (rows, k) in one table; bench `--k` accepts any registered k.
 - [x] **DONE** (`28406e6e`) `w8_linear_swiglu_gemm_mma.cu` refuses a misaligned k like its two siblings. Every swiglu k admitted today is a multiple of 256, so nothing served changes.
-- [ ] **TODO** The swiglu wrapper still restates the plan's shape list (six hand-written shape predicates); same two-list drift `linear_add` had. `wrapper/attn_input_proj.cpp` may too.
-- [ ] **TODO** bench `--rows` so gemma3's 640-row shapes can be measured for a bake of their own.
+- [x] **DONE** (`45c2727e`) The W8 SwiGLU shape list existed three times — plan, wrapper gate, test harness. The harness now asks the plan, and the plan exports the list. The wrapper's gate stays separate **on purpose**: it is wider because it spans codecs this plan does not serve, so merging them would change admission for NVFP4/FP8/Q4. What was missing was a check that it still accepts everything the plan admits — the three previously unexercised geometries (4b, 0.6b, tinyllama) now run through the public op and are that check.
+- [ ] **TODO** `wrapper/attn_input_proj.cpp` has the same shape of hand-written gate; not yet checked against its plan.
+- [ ] **TODO** bench `--rows` (it hardcodes `kRows = 2048` in nine places) so gemma3's 640-row shapes can be measured for an exact-T bake of their own. An enabler for a measurement, not a fix.
 
 ## Group 2 — frontend — **DONE** (`52abbe9a`)
 
@@ -47,7 +49,7 @@ before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
 - [x] **DONE** `{"gemma3_270m", 4, 1}` added to `kGeometries` — the first numerical conformance the multi-query shape has had, and what makes the trim a tested path.
 - [x] **DONE** (`4e1fccb8`) Decode splits the window's key range, not all of history. **Measured** at 8k context, interleaved: **375.8 → 414.8 tok/s (+10.3%)**. Against 434 tok/s at 8 tokens of context, the old path gave up 13.4% by 8k and the new one gives up 4.5% — the rest is the 3 global layers. HF-exact, deterministic, ladder matches 10/10.
 - [x] **DONE** The gqa test now poisons the workspace. A split past the active count returns without writing, so zeros in the partial buffers hid a reducer/kernel split-count disagreement; with the poison, reverting the reducer fails exactly the decode window cases (without it, it passed).
-- [ ] **TODO** `Gqa256_4q1` `DecodeSplitScale`: apply the tile floor only to the default tiers, never to the measured INT8 special cases (`24/scale`, `32/scale` bands are deliberately sub-tile).
+- [x] **DONE, measured and rejected** (`c4e81336`) The tile floor for `Gqa256_4q1`'s `DecodeSplitScale` of 4 is a **loss**, not a win: 413.4 → 410.3 tok/s at 8k, both arms interleaved twice. With one KV head the grid is `(KVHeads, splits, batch)`, so the split count *is* the parallelism — halving it halves the CTAs on a 170-SM part to save staging that was not the binding cost. The scale is buying grid width. Recorded at the geometry so the idea is not re-derived.
 
 ## Group 7 — Gemma sandwich norms — **DONE** (`913dc6e3`)
 
@@ -60,11 +62,17 @@ before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
 
 - [x] **DONE** (`9ce7c3b6`) SentencePiece encoding was O(n²) — it rescanned every adjacent pair per merge and built a key string per pair. 4,000 tokens took 7.5 s, **425× slower than the reference tokenizer**, and an 8k prompt ~29 s against 0.26 s of prefill, so a long request was almost entirely tokenization and back-to-back ones expired in the queue. Now a merge heap over a linked list of input spans: **54× at 4,000 tokens**, linear growth, token-for-token identical output.
 - [x] **DONE** (`5b578d6f`) Test oracles spawned a thread set per call — over a million threads in the widest sparse-MoE cases, with the profile almost entirely `clone3`/`allocate_stack`. One shared pool (`ops/parallel_rows.h`): **sparse-MoE 62 s → 10 s**. Also, `ctest` reported a skip (exit 77) as a failure because only op-tests set `SKIP_RETURN_CODE`.
-- [x] **DONE** Suite: **352 s serial → 40–60 s at `ctest -j16`**, 104 tests, 100% passing.
+- [x] **DONE** Suite: **352 s serial → ~40 s at `ctest -j16`**, 105 tests, 100% passing.
 - [x] **DONE** (`59df8f5a`) `projection_oracle` re-decoded a whole 5,120-wide weight row once **per token**, through a per-element accessor that revalidates metadata and switches on quantization type every element. Decoding each sampled row once is the same arithmetic in the same order: **NVFP4 21.2 → 2.2 s, FP8 10.0 → 1.9 s**; attention input projection 39 → 11 s, GDN (shares the oracle) 18 → 8 s.
-- [x] **DONE** Oracle pools capped at 8 threads (`SUROGATE_TEST_ORACLE_THREADS` overrides). One machine-sized pool per process oversubscribed under `ctest -j` — 8 processes × 64 threads on 64 cores took the suite 53 → 132 s and failed a CPU-bound test. **Suite is now 40–60 s at `-j16`, 104 tests, 100% passing**, against 352 s serially.
+- [x] **DONE** Oracle pools capped at 8 threads (`SUROGATE_TEST_ORACLE_THREADS` overrides). One machine-sized pool per process oversubscribed under `ctest -j` — 8 processes × 64 threads on 64 cores took the suite 53 → 132 s and failed a CPU-bound test. **Suite is now ~40 s at `-j16`, 105 tests, 100% passing**, against 352 s serially.
 - [ ] **TODO** `sinfer_gqa_attention_test` is the floor at ~32 s, and it is GPU work rather than oracle arithmetic.
-- [ ] **TODO** `linear_test_common.cpp` and `linear_swiglu_test_common.cpp` still spawn per call; they run once per case rather than per token so the churn is bounded, but the shared helper (including a range form for per-thread scratch) now exists.
+- [x] **DONE** (`c4e81336`) `linear_test_common.cpp` and `linear_swiglu_test_common.cpp` moved to the shared pool. Nothing in the test tree spawns per call now; the W8 linear test went 11.9 → 8.8 s.
+- [x] **DONE** (`2acc5801`) `sinfer_elastic_kv_region_test` was not flaky — its two assertions read `cudaMemGetInfo`, which answers for the whole device, so a neighbour allocating between samples masked the VRAM the region gave back. Reproduced 1-in-6 beside the three heaviest GPU tests (12 concurrent copies of itself never failed, which is why it read as random). Both now use the per-process footprint. **Third instance of this same error** — after the graph budget and the two derived-plane registries.
+
+## Open, and worth knowing
+
+- **`cudaMemGetInfo` deltas are not process-isolated.** Three separate places used one to attribute this process's own allocation: the graph budget, the two derived-plane registries, and the elastic-KV test. `core/device_footprint.*` is the per-process probe; prefer it, or accumulate known byte counts, over a free-memory delta.
+- **A device-global measurement under `ctest -j` reads as a flake.** It is not — it is a measurement that cannot answer the question it asks.
 
 ## Found while measuring
 
