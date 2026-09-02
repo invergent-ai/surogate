@@ -1,6 +1,7 @@
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 
 #include "core/device.h"
+#include "core/engine_context.h"
 
 #include <cublasLt.h>
 
@@ -71,13 +72,32 @@ struct DeviceState {
     std::mutex mutex;
 };
 
+// Homed per engine (core/engine_context.h), not per process: two models in one process must
+// not share a workspace. The mutex below only serializes the enqueue; the matmuls then run
+// concurrently on the engines' own streams, and a stream-K algorithm keeps its cross-CTA
+// barrier flags in the workspace, so one buffer for both wedged the device under multi-model
+// load -- one engine's kernel spinning on a flag the other's had overwritten. Still keyed by
+// device inside: pipeline stages on several devices each run this route.
+struct PlaneState {
+    std::mutex mutex;
+    std::unordered_map<int, std::unique_ptr<DeviceState>> by_device;
+    ~PlaneState() {
+        // The device buffers go back. The cuBLASLt objects are left to the library: destroying
+        // a handle during static teardown of the process-default context races the driver's
+        // own shutdown, and an engine's handful of descriptors is not worth that.
+        for (auto& [device, state] : by_device) {
+            (void)device;
+            if (state->workspace != nullptr) { (void)cudaFree(state->workspace); }
+        }
+    }
+};
+
 DeviceState& state_for_current_device() {
-    static std::mutex registry_mutex;
-    static std::unordered_map<int, std::unique_ptr<DeviceState>> registry;
-    int device = 0;
+    PlaneState& plane = engine_slot<PlaneState>();
+    int device        = 0;
     CUDA_CHECK(cudaGetDevice(&device));
-    const std::lock_guard<std::mutex> lock(registry_mutex);
-    auto& slot = registry[device];
+    const std::lock_guard<std::mutex> lock(plane.mutex);
+    auto& slot = plane.by_device[device];
     if (!slot) {
         auto state = std::make_unique<DeviceState>();
         check(cublasLtCreate(&state->handle), "create");

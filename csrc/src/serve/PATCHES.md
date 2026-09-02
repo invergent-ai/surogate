@@ -2783,7 +2783,9 @@ quantizer write the same tiled layout, and the W4A4 workspace pads the scale
 interval to 128 rows.
 
 **Route.** `ops/linear/nvfp4/nvfp4_cublaslt.{h,cpp}`: one handle, a 32 MB
-workspace and a descriptor/algorithm cache per device, keyed by (rows, K,
+workspace and a descriptor/algorithm cache per engine and device (the
+workspace holds a stream-K algorithm's barrier flags, so two engines sharing
+one wedged the device under multi-model load), keyed by (rows, K,
 tokens, ld, accumulate); scale pointers are rebound per call because they
 follow the weight, not the shape. `nvfp4_cublaslt_route(tokens)` is true
 from `kNvfp4CublasLtDefaultMinTokens` (64) up; `SUROGATE_SERVE_NVFP4_CUBLASLT=0`
