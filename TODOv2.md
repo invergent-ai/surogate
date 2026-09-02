@@ -195,6 +195,50 @@ quantized-layout decoder that also exists under `csrc/src/utilities/` or
 - [ ] `TODO.md`'s parked converter-driver hoist: close as superseded.
 - [ ] `PATCHES.md` entries that describe per-export workarounds: retire.
 
+## 4a. M1 findings (running)
+
+- **Meta-device skeleton is the mechanism for scheme resolution.**
+  `AutoModelForImageTextToText.from_config` under `torch.device('meta')`
+  builds `Qwen3_5MoeForConditionalGeneration` in 1.1 s: 1,119 modules,
+  35.1B params, zero bytes. `match_named_modules(model, targets, ignore)`
+  then runs the library's own `targets`/`ignore` semantics (class name,
+  exact name, `re:` regex) with no re-implementation.
+- **Resolution is exact where the skeleton and the checkpoint agree on
+  structure.** 160 modules resolved (10 full-attention layers × q/k/v/o +
+  40 × shared-expert gate/up/down); all 160 are packed in the file; zero
+  false positives.
+- **The one seam: fused experts.** transformers 5.16.1 represents the 256
+  routed experts per layer as one fused module; the checkpoint stores them
+  per-expert (`experts.N.{gate,up,down}_proj.weight_packed`, 40 × 256 × 3 =
+  30,720). The matcher therefore never sees a per-expert `Linear`.
+  Principle that follows: **the checkpoint's tensor names are the authority
+  for structure; the config is the authority for format.** Resolution has
+  to run over checkpoint-derived module names, with class taken from the
+  skeleton where the name exists and from the fused module's constituents
+  where it does not.
+- **Done that way, resolution is exact on the whole file.** Module names
+  derived from the three shard headers (31,233 candidates: 503 with a class
+  from the skeleton, 30,720 expert leaves, 10 outside the skeleton);
+  `match_targets` applied per name with the library's own semantics:
+  **resolved 30,880 = packed 30,880, zero either way.** No heuristic on
+  tensor names decides format; the config does.
+- Design rules that fall out:
+  1. Apply `ignore` first and by name — it needs no class. The 10 modules
+     outside the skeleton are all `mtp.*`, caught by `re:^mtp.*`; a
+     resolver that demanded a class for them would fail on a file it can in
+     fact serve.
+  2. `targets` needs a class only for class-name targets like `Linear`;
+     take it from the skeleton, and for leaves of a fused module from the
+     module it fuses. `match_named_modules(fused=…)` ("mapping from
+     suffixes of fused modules to the suffixes of their corresponding
+     shards", see `compressed_tensors.utils.match.is_match`) is the
+     library's own form of this and is preferred over a hand-written
+     expert regex once its exact shape is confirmed.
+  3. transformers is pinned `>=5.5.0` (`pyproject.toml:29`) with a
+     `transformers_v5_compat` patch hook, so the fused-expert
+     representation is the one to design for, not the legacy per-expert
+     one.
+
 ## 5. Surveys feeding this document
 
 - [~] Trainer loader capabilities (`SafeTensorsReader` API, pre-quantized loading, `recipes/nvfp4/` inputs, HF-name mapping, GGUF)
