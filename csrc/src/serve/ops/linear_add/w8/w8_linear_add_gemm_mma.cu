@@ -2,9 +2,12 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/linear/w8/w8_launch.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace sinfer::ops::detail {
 namespace {
@@ -27,6 +30,14 @@ void launch_tt(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStrea
 template <class Schedule>
 void launch_variant(bool full, const Tensor& x, const Weight& w, Tensor& residual_out,
                     cudaStream_t stream) {
+    // The plan refuses such a shape before it is admitted; this is the guard for
+    // a direct caller (the bench's candidate rows, or a future route), and the
+    // one modulo per launch is what keeps a misaligned k from launching at all.
+    if ((w.k % kW8MmaScaleRowAlignmentK) != 0) {
+        throw std::invalid_argument(
+            "w8 linear_add MMA route requires k % 256 == 0 for 16-byte-aligned scale rows; k=" +
+            std::to_string(w.k) + " must use a SIMT route");
+    }
     if (full) {
         launch_tt<Schedule, true>(x, w, residual_out, stream);
     } else {

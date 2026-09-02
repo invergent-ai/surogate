@@ -91,8 +91,10 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--production-only") {
             options.production_only = true;
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--k 4096|6144] [--t-sweep 1,2,...] [--warmup N] [--repeat N] "
-                        "[--csv-out PATH] [--profile] [--production-only]\n",
+            std::printf("Usage: %s [--k K] [--t-sweep 1,2,...] [--warmup N] [--repeat N] "
+                        "[--csv-out PATH] [--profile] [--production-only]\n"
+                        "  --k: any W8 linear_add k registered at 2048 rows "
+                        "(4096, 6144, 2048, 5632)\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -102,8 +104,9 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
-    if (options.hidden != 4096 && options.hidden != 6144) {
-        throw std::invalid_argument("--k must be 4096 or 6144");
+    if (!ops::detail::w8_linear_add_admits({kRows, options.hidden, options.hidden, 1})) {
+        throw std::invalid_argument("--k must be a W8 linear_add shape registered at " +
+                                    std::to_string(kRows) + " rows");
     }
     if (options.profile && options.t_sweep.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
@@ -211,7 +214,9 @@ int main(int argc, char** argv) {
                 ops::detail::w8_linear_add_simt_r8_c8_launch(full_for(t, 8), x, packed.weight, out,
                                                              candidate_stream);
             });
-            if (t >= 2 && t <= 48) {
+            // The exact-T launcher refuses a (rows, k) it has no table for, so
+            // the candidate row exists only where a bake does.
+            if (ops::detail::w8_linear_add_exact_t_covers(kRows, options.hidden, t)) {
                 run("splitk_mma_exact_t", [&](cudaStream_t candidate_stream) {
                     ops::detail::w8_linear_add_splitk_mma_launch(x, packed.weight, out,
                                                                  candidate_stream);

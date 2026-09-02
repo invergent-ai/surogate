@@ -3191,3 +3191,91 @@ and both launchers refuse rather than borrow, naming rows and k.
 Verification discipline changed with it: one request against a cold engine
 is not evidence. Repeat it, cross the threshold the change is about, and
 diff against HF over the same artifact.
+
+## 90
+
+**tinyllama's mlp down {2048, 5632} gets its exact-T bake, and the W8 linear_add stack closes two latent gaps (2026-09-01).**
+
+#89 moved the shape off the 4096 bake and onto the extent-agnostic table,
+which sends every T from 2 up to the runtime-tiled `MmaR32C128`. Every other
+registered geometry has an exact-T table over the C=32 batch band (#28/#29),
+and the exact-T launcher is `Hidden`/`Rows`-parameterised, so the shape
+lacked a bake for no reason but history. `make_launchers<5632, 2048, 32>`
+adds it: 11 groups of 512 at `KWarps=8`, the same schedule the 2048x2048 and
+1024x3584 tables use, and no new shared-memory shape (storage is
+`Hidden`-independent).
+
+Measured on an idle RTX 5090 with `sinfer_w8_linear_add_bench --k 5632`
+(cold cache, 5 warmup, 30 repeats, medians; the timer quantises at 2.048 us):
+
+| T  | splitk_mma_exact_t | mma_r32_c128 | ratio | simt_r8_c4 |
+|----|-------------------:|-------------:|------:|-----------:|
+| 2  | 20.5 us (600 GB/s) | 86.0 us (143 GB/s) | 4.2x | 36.9 us |
+| 3  | 20.5 | 86.0 | 4.2x | 43.0 |
+| 4  | 20.5 | 86.0 | 4.2x | 32.8 |
+| 6  | 20.5 | 86.0 | 4.2x | 47.1 |
+| 8  | 22.5 (551 GB/s) | 86.0 | 3.8x | 34.8 |
+| 12 | 24.6 | 86.0 | 3.5x | 45.1 |
+| 16 | 24.6 (511 GB/s) | 86.0 | 3.5x | 53.2 |
+| 17 | 24.6 | 86.0 | 3.5x | 86.0 |
+| 24 | 26.6 | 86.0 | 3.2x | 67.6 |
+| 32 | 30.7 (419 GB/s) | 86.0 (150 GB/s) | 2.8x | 77.8 |
+| 33 | -- | 86.0 | | 127.0 |
+| 48 | -- | 88.1 | | 108.5 |
+
+Decision rule: keep the bake where it beats the runtime tile at every T of
+the band, trim the band to the crossover otherwise. It wins everywhere, so
+the route is `{1 SimtR8C4} {2..32 SplitKMmaExactT} {33..1024 MmaR32C128}
+{1025.. MmaR48C128}` (`kR2048K5632Routes`). Which alternative each half of
+the band is judged against differs, and the bench cannot see the difference
+because it links with Marlin disabled: T=2..16 is batch decode, where the
+plan route is what the engine runs and r32c128 is the incumbent; T=17..32
+belongs to the Marlin band in the engine whenever a plane exists (5632 % 64
+== 0, so one does; warm-cache `sinfer_marlin_w8_bench` on the same shape:
+T=16 10.3 us, T=24/32 12.3 us, T=48 16.4 us), and the bake there is only the
+fallback for the plane-budget and capture refusals -- where it beats the
+r32c128 it replaces by 2.8-3.5x. Same shape of band as the q08/q2b/q4b
+tables, for the same reason.
+
+Two latent defects surfaced while wiring it, both closed the same day:
+
+- `ops/linear`'s MMA route refused `k % 256 != 0` (the 16-byte cp.async of
+  each `k/16`-byte scale row is aligned only then), but `linear_add`'s MMA
+  launcher launched the identical kernel with no check, and the plan comment
+  claimed the ops/linear rule covered it. The constant now lives in
+  `w8_launch.h` (`kW8MmaScaleRowAlignmentK`), both launchers test it per
+  launch, and the plan is keyed on the table the shape takes: a registered
+  shape whose table has an MMA band fails to compile with a misaligned k,
+  and an unregistered one is refused by name from `resolve_plan`. The rule
+  is per-table, not per-k, so a SIMT-only table for an odd-k shape (ops/linear
+  serves EmbeddingGemma's 1152 that way) stays possible. The test drives
+  `mma_r32_c128` and `mma_r48_c128` directly with a k=1152 fixture: without
+  the guard both launched silently (no fault at T=8 -- the failure mode is
+  wrong scales, not a trap).
+- The wrapper's W8 shape gate restated the plan's list and had drifted:
+  gemma-3-270m's {640, 1024|2048} were admitted by the plan (and validated
+  at load through `linear_add_workspace_capacity_bytes`) and refused by the
+  wrapper at every T. Nothing noticed because gemma3's leaf runs
+  `linear` + `rmsnorm` + `residual_add`, so the fused op it validates is a
+  path it never runs. The plan exports the one list
+  (`w8_linear_add_registered_shapes`), the wrapper consults
+  `w8_linear_add_admits`, and the conformance test iterates the list; the
+  {640, *} cases are the first numeric exercise of the fused op at 640 rows,
+  and with the {1024, *} cases past T=1024 the first of `MmaR48C128` with
+  `rows % 48 == 16` (the q08/q2b starts also move from {5, 129} to the live
+  band edges, so T=32/33 of the #28/#29 bakes is finally sampled).
+
+The exact-T launcher's `(rows, k) -> table` selection is a table too now
+(`kExactTables`, one entry per baked geometry, asserted unique), exported as
+`w8_linear_add_exact_t_last_cols/covers`. `sinfer_linear_add_w8_a16_test`
+checks both directions for every registered shape and every T to 1100: a
+`SplitKMmaExactT` band is covered by a table (the #89 fall-through), and
+every baked T is routed to its bake (no dead bakes); the medium split-K and
+decode bakes stay the 35B's. The bench's `--k` accepts anything registered at
+2048 rows and its exact-T candidate row exists only where a table does.
+
+Queued, out of this pass: `w8_linear_swiglu_gemm_mma.cu` launches the same
+MMA kernel with no alignment guard and its plan has no per-table rule; the
+two-list drift is likely repeated in `wrapper/linear_swiglu.cpp` and
+`wrapper/attn_input_proj.cpp`; the bench wants `--rows` before gemma3's
+640-row shapes can be measured for a bake of their own.

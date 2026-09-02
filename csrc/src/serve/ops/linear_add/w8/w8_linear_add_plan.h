@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <span>
 
 namespace sinfer::ops::detail {
 
@@ -39,8 +40,17 @@ struct W8LinearAddProblem {
     std::int32_t cols;
 };
 
+// A (rows, k) weight geometry the W8 residual projection serves. The one list
+// of them lives in the plan; the wrapper's shape gate and the conformance test
+// both read it from here instead of restating it.
+struct W8LinearAddShape {
+    std::int32_t rows;
+    std::int32_t k;
+};
+
 const char* w8_linear_add_schedule_name(W8LinearAddScheduleId schedule) noexcept;
 bool w8_linear_add_schedule_uses_mma(W8LinearAddScheduleId schedule) noexcept;
+std::span<const W8LinearAddShape> w8_linear_add_registered_shapes() noexcept;
 bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept;
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem);
 

@@ -212,17 +212,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("W8 linear_add admits A16 or A8");
         }
         require_w8(w);
-        // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b
-        // {1024,2048|3584} and qwen3.5-2b output projections {2048,2048}.
-        const bool base = w.n == 2048 && (w.k == 4096 || w.k == 6144 || w.k == 2048);
-        const bool q08  = w.n == 1024 && (w.k == 2048 || w.k == 3584);
-        const bool q4b  = w.n == 2560 && (w.k == 4096 || w.k == 9216);
-        // qwen3-0.6b: its attention output {1024, 2048} is already the 0.8b shape
-        // above; only the mlp down {1024, 3072} is new.
-        const bool q3_06b = w.n == 1024 && w.k == 3072;
-        // tinyllama-1.1b mlp down; its attention output is the 2b shape already.
-        const bool tinyllama = w.n == 2048 && w.k == 5632;
-        if (!base && !q08 && !q4b && !q3_06b && !tinyllama) {
+        // The plan owns the shape list; the same call validated this geometry
+        // at load through linear_add_workspace_capacity_bytes.
+        if (!detail::w8_linear_add_admits({w.n, w.k, w.padded_shape[1], t})) {
             throw std::invalid_argument("linear_add: unsupported W8 shape (n " +
                                         std::to_string(w.n) + ", k " + std::to_string(w.k) + ")");
         }

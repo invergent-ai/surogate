@@ -27,21 +27,9 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
     CUDA_CHECK(cudaGetLastError());
 }
 
-//: A scale row is `k / 32` binary16 values, so `k / 16` bytes, and the kernel
-//: stages them with a 16-byte `cp_async`. That is only aligned when `k % 256 ==
-//: 0`; at `k = 1152` every odd row starts eight bytes short, which reads a
-//: neighbour's scales and eventually faults outright.
-//:
-//: Every shape registered before EmbeddingGemma happened to satisfy this -- the
-//: Qwen k values are all multiples of 256 -- so the requirement was never stated
-//: and nothing checked it. It is checked here rather than documented, because
-//: the failure is silent: wrong numbers at small T, a misaligned-address fault
-//: only once a row crosses a page.
-constexpr std::int32_t kScaleRowAlignmentK = 256;
-
 template <class Schedule>
 void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    if ((w.k % kScaleRowAlignmentK) != 0) {
+    if ((w.k % kW8MmaScaleRowAlignmentK) != 0) {
         throw std::invalid_argument(
             "w8 MMA route requires k % 256 == 0 for 16-byte-aligned scale rows; k=" +
             std::to_string(w.k) + " must use a SIMT route");

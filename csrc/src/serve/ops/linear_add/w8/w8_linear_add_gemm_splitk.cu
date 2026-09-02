@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -49,44 +50,84 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
             static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaResidualEpilogue{});
 }
 
-template <int Hidden, std::size_t... Offsets>
-constexpr auto make_projection_launchers(std::index_sequence<Offsets...>) {
-    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
-        &launch_active_cols<Hidden, kFirstExactCols + static_cast<int>(Offsets)>...};
-}
-
-constexpr auto kK4096ProjectionLaunchers = make_projection_launchers<4096>(
-    std::make_index_sequence<kLastExactCols - kFirstExactCols + 1>{});
-constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
-    std::make_index_sequence<kLastExactCols - kFirstExactCols + 1>{});
-
-// surogate vendor patch (PATCHES.md #29): qwen3.5-4b o_proj (2560x4096) and
-// mlp down (2560x9216) exact-T tables, T=2..16 (the batch-decode band; the
-// runtime-shaped SIMT read weights ceil(T/4) times there).
-constexpr int kQ4bLastExactCols = 32; // PATCHES.md #29: C=32 batch band
-template <int Hidden, std::size_t... Offsets>
-constexpr auto make_q4b_launchers(std::index_sequence<Offsets...>) {
-    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
-        &launch_active_cols<Hidden, kFirstExactCols + static_cast<int>(Offsets), 2560>...};
-}
-constexpr auto kQ4bK4096Launchers = make_q4b_launchers<4096>(
-    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
-constexpr auto kQ4bK9216Launchers = make_q4b_launchers<9216>(
-    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
-
-// surogate vendor patch (PATCHES.md #29): qwen3.5-2b o_proj (2048x2048) and
-// qwen3.5-0.8b o_proj (1024x2048) / down (1024x3584), same batch-decode band.
 template <int Hidden, int Rows, std::size_t... Offsets>
-constexpr auto make_small_launchers(std::index_sequence<Offsets...>) {
+constexpr auto make_launchers(std::index_sequence<Offsets...>) {
     return std::array<ProjectionLauncher, sizeof...(Offsets)>{
         &launch_active_cols<Hidden, kFirstExactCols + static_cast<int>(Offsets), Rows>...};
 }
-constexpr auto kQ2bK2048Launchers = make_small_launchers<2048, 2048>(
-    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
-constexpr auto kQ08K2048Launchers = make_small_launchers<2048, 1024>(
-    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
-constexpr auto kQ08K3584Launchers = make_small_launchers<3584, 1024>(
-    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
+
+// One table per baked (rows, k) geometry, T = kFirstExactCols..LastCols.
+template <int Hidden, int Rows, int LastCols>
+constexpr auto make_launchers() {
+    static_assert(LastCols >= kFirstExactCols && LastCols <= kLastExactCols);
+    return make_launchers<Hidden, Rows>(std::make_index_sequence<LastCols - kFirstExactCols + 1>{});
+}
+
+// The 35B residual projections bake the whole T=2..48 band.
+constexpr auto kR2048K4096Launchers = make_launchers<4096, 2048, kLastExactCols>();
+constexpr auto kR2048K6144Launchers = make_launchers<6144, 2048, kLastExactCols>();
+
+// Every other geometry bakes the C=32 batch band (PATCHES.md #29): T=2..16 is
+// batch decode, where the runtime-shaped SIMT read weights ceil(T/4) times;
+// 17..32 is reachable only when the Marlin band declines the call.
+constexpr int kSmallLastExactCols = 32;
+// surogate vendor patch (PATCHES.md #29): qwen3.5-4b o_proj (2560x4096) and
+// mlp down (2560x9216).
+constexpr auto kR2560K4096Launchers = make_launchers<4096, 2560, kSmallLastExactCols>();
+constexpr auto kR2560K9216Launchers = make_launchers<9216, 2560, kSmallLastExactCols>();
+// surogate vendor patch (PATCHES.md #29): qwen3.5-2b o_proj (2048x2048) and
+// qwen3.5-0.8b o_proj (1024x2048) / down (1024x3584).
+constexpr auto kR2048K2048Launchers = make_launchers<2048, 2048, kSmallLastExactCols>();
+constexpr auto kR1024K2048Launchers = make_launchers<2048, 1024, kSmallLastExactCols>();
+constexpr auto kR1024K3584Launchers = make_launchers<3584, 1024, kSmallLastExactCols>();
+// tinyllama-1.1b mlp down (2048x5632): 11 groups of 512 at KWarps=8.
+constexpr auto kR2048K5632Launchers = make_launchers<5632, 2048, kSmallLastExactCols>();
+
+// (rows, k) is the key by construction: every table bakes both extents, so a
+// shape not listed here is refused rather than run through a neighbour's bake
+// (qwen3-0.6b's {1024, 3072} would otherwise have taken the 2048 table, and
+// tinyllama's {2048, 5632} once took the 4096 one).
+struct ExactTable {
+    std::int32_t rows;
+    std::int32_t k;
+    std::span<const ProjectionLauncher> launchers;
+
+    constexpr std::int32_t last_cols() const noexcept {
+        return kFirstExactCols + static_cast<std::int32_t>(launchers.size()) - 1;
+    }
+};
+
+constexpr std::array<ExactTable, 8> kExactTables{{
+    {2048, 4096, kR2048K4096Launchers},
+    {2048, 6144, kR2048K6144Launchers},
+    {2560, 4096, kR2560K4096Launchers},
+    {2560, 9216, kR2560K9216Launchers},
+    {2048, 2048, kR2048K2048Launchers},
+    {1024, 2048, kR1024K2048Launchers},
+    {1024, 3584, kR1024K3584Launchers},
+    {2048, 5632, kR2048K5632Launchers},
+}};
+
+constexpr bool exact_tables_are_keyed_once() {
+    for (std::size_t i = 0; i < kExactTables.size(); ++i) {
+        if (kExactTables[i].launchers.empty()) { return false; }
+        for (std::size_t j = i + 1; j < kExactTables.size(); ++j) {
+            if (kExactTables[i].rows == kExactTables[j].rows &&
+                kExactTables[i].k == kExactTables[j].k) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+static_assert(exact_tables_are_keyed_once(), "one exact-T table per (rows, k)");
+
+const ExactTable* find_table(std::int32_t rows, std::int32_t k) noexcept {
+    for (const ExactTable& table : kExactTables) {
+        if (table.rows == rows && table.k == k) { return &table; }
+    }
+    return nullptr;
+}
 
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
@@ -114,43 +155,34 @@ void dispatch_medium_shape(const Tensor& x, const Weight& weight, Tensor& residu
 
 } // namespace
 
+std::int32_t w8_linear_add_exact_t_last_cols(std::int32_t rows, std::int32_t k) noexcept {
+    const ExactTable* table = find_table(rows, k);
+    return table == nullptr ? 0 : table->last_cols();
+}
+
+bool w8_linear_add_exact_t_covers(std::int32_t rows, std::int32_t k, std::int32_t t) noexcept {
+    return t >= kFirstExactCols && t <= w8_linear_add_exact_t_last_cols(rows, k);
+}
+
 void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
                                      cudaStream_t stream) {
     if (x.ne[1] < kFirstExactCols || x.ne[1] > kLastExactCols) {
         throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..48");
     }
-    if (weight.n == 2560 || weight.n == 1024 || (weight.n == 2048 && weight.k == 2048)) {
-        if (x.ne[1] > kQ4bLastExactCols) {
-            throw std::invalid_argument(
-                "W8 linear_add: small-target exact tables cover T=2..32");
-        }
-        // Every table bakes its hidden extent, so an unlisted k must be refused
-        // rather than silently run through a neighbour's: qwen3-0.6b's mlp down
-        // is {1024, 3072} and would otherwise have taken the 2048 table.
-        if ((weight.n == 2560 && weight.k != 9216 && weight.k != 4096) ||
-            (weight.n == 1024 && weight.k != 3584 && weight.k != 2048)) {
-            throw std::invalid_argument("W8 linear_add exact split-K: no table for rows " +
-                                        std::to_string(weight.n) + " over k " +
-                                        std::to_string(weight.k));
-        }
-        const auto& launchers = weight.n == 2560
-                                    ? (weight.k == 9216 ? kQ4bK9216Launchers : kQ4bK4096Launchers)
-                                : weight.n == 1024
-                                    ? (weight.k == 3584 ? kQ08K3584Launchers : kQ08K2048Launchers)
-                                    : kQ2bK2048Launchers;
-        launchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
-    } else if (weight.n == kRows && weight.k == 6144) {
-        kK6144ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
-    } else if (weight.n == kRows && weight.k == 4096) {
-        kK4096ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
-    } else {
-        // Same rule the small-target tables above enforce. These tables bake both
-        // extents -- kRows rows over k 4096 or 6144 -- so anything else must be
-        // refused rather than run through a neighbour's bake.
+    const ExactTable* table = find_table(weight.n, weight.k);
+    if (table == nullptr) {
         throw std::invalid_argument("W8 linear_add exact split-K: no table for rows " +
                                     std::to_string(weight.n) + " over k " +
                                     std::to_string(weight.k));
     }
+    if (x.ne[1] > table->last_cols()) {
+        throw std::invalid_argument("W8 linear_add exact split-K: the table for rows " +
+                                    std::to_string(weight.n) + " over k " +
+                                    std::to_string(weight.k) + " covers T=2.." +
+                                    std::to_string(table->last_cols()));
+    }
+    table->launchers[static_cast<std::size_t>(x.ne[1] - kFirstExactCols)](x, weight, residual_out,
+                                                                          stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

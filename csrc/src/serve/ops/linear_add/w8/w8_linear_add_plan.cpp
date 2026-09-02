@@ -2,10 +2,12 @@
 
 #include "ops/linear_add/w8/w8_linear_add_kernels.h"
 #include "ops/common/token_slices.h"
+#include "ops/linear/w8/w8_launch.h"
 
 #include <string>
 #include <array>
 #include <limits>
+#include <span>
 #include <stdexcept>
 
 namespace sinfer::ops::detail {
@@ -104,14 +106,26 @@ constexpr std::array<RouteSpec, 5> kQ4B29Routes{{
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
 }};
 
+// {2048, 5632}: exact-T bakes over the C=32 batch band; the runtime-tiled
+// r32c128 / r48c128 split follows the extent-agnostic table. Measured on an
+// idle RTX 5090 (bench/ops/w8_linear_add_bench --k 5632, cold cache, medians):
+// see PATCHES.md #90 for the T table the band is cut from.
+constexpr std::array<RouteSpec, 4> kR2048K5632Routes{{
+    {1, 1, W8LinearAddScheduleId::SimtR8C4},
+    {2, 32, W8LinearAddScheduleId::SplitKMmaExactT},
+    {33, 1024, W8LinearAddScheduleId::MmaR32C128},
+    {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
+}};
+
 // Every admitted shape with no bake of its own. The exact-T split-K tables and
 // the medium split-K family bake both extents (rows and k), so a shape that is
 // not one of theirs takes only the kernels that read both from the weight: the
 // SIMT decode and the runtime-tiled MMA. Today that is qwen3-0.6b's mlp down
-// {1024, 3072}, tinyllama's {2048, 5632}, and gemma-3-270m's {640, 1024|2048}.
-// The MMA tiles still need k % 256 == 0 for their 16-byte scale-row staging;
-// every k here satisfies it, and an admitted k that did not would be refused by
-// the same rule the ops/linear route already enforces.
+// {1024, 3072} and gemma-3-270m's {640, 1024|2048}.
+// The MMA tiles need k % kW8MmaScaleRowAlignmentK == 0 for their 16-byte
+// scale-row staging (w8_launch.h); `mma_alignment_holds` below refuses a shape
+// that would reach them otherwise, at compile time for a registered shape and
+// by name from `w8_linear_add_resolve_plan` for anything else.
 constexpr std::array<RouteSpec, 3> kExtentAgnosticRoutes{{
     {1, 1, W8LinearAddScheduleId::SimtR8C4},
     {2, 1024, W8LinearAddScheduleId::MmaR32C128},
@@ -130,8 +144,140 @@ constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
 
 static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes) &&
                   routes_are_closed(kQ08Routes) && routes_are_closed(kExtentAgnosticRoutes) &&
-                  routes_are_closed(kQ2BRoutes) && routes_are_closed(kQ4B29Routes),
+                  routes_are_closed(kQ2BRoutes) && routes_are_closed(kQ4B29Routes) &&
+                  routes_are_closed(kR2048K5632Routes),
               "W8 LinearAdd routes must be exact, contiguous, and closed");
+
+enum class RouteTable {
+    K4096,
+    K6144,
+    Q08,
+    Q2B,
+    Q4B29,
+    R2048K5632,
+    ExtentAgnostic,
+};
+
+constexpr std::span<const RouteSpec> routes_of(RouteTable table) {
+    switch (table) {
+    case RouteTable::K4096:
+        return kK4096Routes;
+    case RouteTable::K6144:
+        return kK6144Routes;
+    case RouteTable::Q08:
+        return kQ08Routes;
+    case RouteTable::Q2B:
+        return kQ2BRoutes;
+    case RouteTable::Q4B29:
+        return kQ4B29Routes;
+    case RouteTable::R2048K5632:
+        return kR2048K5632Routes;
+    case RouteTable::ExtentAgnostic:
+        return kExtentAgnosticRoutes;
+    }
+    return kExtentAgnosticRoutes;
+}
+
+// Which table a (rows, k) geometry takes. A shape is keyed on both extents:
+// the exact-T and medium split-K bakes instantiate rows and k, and every
+// launcher refuses a geometry it did not bake, so the geometry must never be
+// read from k alone (tinyllama's {2048, 5632} once fell through to the 4096
+// table that way).
+constexpr RouteTable table_for(std::int32_t rows, std::int32_t k) {
+    // gemma-3-270m's two shapes take the runtime-tiled routes; its 640 rows have
+    // no exact-T bake of their own, and the k=2048 branch below is the 2b's.
+    if (rows == 640) { return RouteTable::ExtentAgnostic; }
+    if (rows == 1024) {
+        // The row count alone does not name the geometry here: the 0.8b's exact-T
+        // bakes are k=2048/3584, and the 0.6b's mlp down is k=3072.
+        return k == 3072 ? RouteTable::ExtentAgnostic : RouteTable::Q08;
+    }
+    // qwen3.5-2b output projections (measured on an idle RTX 5090,
+    // bench/ops/q08_route_sweep_bench: 472 -> r32c96 63.5us, 888 -> r48c128
+    // 102.8us (+26% over r32c128), 1024 -> r32c128, 1912 -> r48c128).
+    if (k == 2048) { return RouteTable::Q2B; }
+    // surogate vendor patch (PATCHES.md #29): qwen3.5-4b (2560 rows) has its
+    // exact-T bakes now (T=2..16, k=4096/9216).
+    if (rows == 2560) { return RouteTable::Q4B29; }
+    // tinyllama's mlp down: its own exact-T bake since PATCHES.md #90; before
+    // that it was the shape that fell through here to the 4096 table.
+    if (rows == 2048 && k == 5632) { return RouteTable::R2048K5632; }
+    // The exact-T and medium split-K bakes that remain are 2048 rows over k 4096
+    // or 6144. Anything else unbaked takes the table whose kernels read both
+    // extents from the weight.
+    if (rows != 2048 || (k != 4096 && k != 6144)) { return RouteTable::ExtentAgnostic; }
+    return k == 6144 ? RouteTable::K6144 : RouteTable::K4096;
+}
+
+constexpr bool schedule_uses_mma(W8LinearAddScheduleId schedule) {
+    return schedule != W8LinearAddScheduleId::DecodeR16 &&
+           schedule != W8LinearAddScheduleId::SimtR8C4;
+}
+
+constexpr bool table_uses_mma(std::span<const RouteSpec> routes) {
+    for (const RouteSpec& route : routes) {
+        if (schedule_uses_mma(route.schedule)) { return true; }
+    }
+    return false;
+}
+
+// The MMA tiles stage each scale row (k / 16 bytes) with a 16-byte cp.async,
+// so a table with any MMA band needs k % kW8MmaScaleRowAlignmentK == 0. A
+// SIMT-only table would not, which is why the rule is keyed on the table the
+// shape takes and not on k alone.
+constexpr bool mma_alignment_holds(std::int32_t rows, std::int32_t k) {
+    return k % kW8MmaScaleRowAlignmentK == 0 || !table_uses_mma(routes_of(table_for(rows, k)));
+}
+
+// The one list of (rows, k) geometries this op serves. Registering a shape
+// here is what admits it in the plan, the wrapper, and the conformance test.
+constexpr auto kRegisteredShapes = std::to_array<W8LinearAddShape>({
+    // 35B residual projections: the exact-T, medium split-K and per-band MMA
+    // tables above are measured on these two.
+    {2048, 4096},
+    {2048, 6144},
+    // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b
+    // ({1024,2048|3584}) and qwen3.5-2b attn/gdn output ({2048,2048}; its
+    // mlp down {2048,6144} rides the registered base shape).
+    {1024, 2048},
+    {1024, 3584},
+    {2048, 2048},
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b output/down.
+    {2560, 4096},
+    {2560, 9216},
+    // qwen3-0.6b: its attention output {1024, 2048} already rides the 0.8b
+    // shape above; only the mlp down {1024, 3072} is new, and it has no bake, so
+    // it resolves through the extent-agnostic table.
+    {1024, 3072},
+    // tinyllama-1.1b: its attention output {2048, 2048} is already the 2b shape
+    // above; only the mlp down {2048, 5632} is new.
+    {2048, 5632},
+    // gemma-3-270m: attention output {640, 1024} and mlp down {640, 2048}. Its
+    // hidden is narrower than anything else registered here, so both are new.
+    {640, 1024},
+    {640, 2048},
+});
+
+constexpr bool registered_shapes_are_sound() {
+    for (const W8LinearAddShape& shape : kRegisteredShapes) {
+        // Positive extents, whole 32-lane scale groups, and the scale-row
+        // alignment the shape's own table needs.
+        if (shape.rows <= 0 || shape.k <= 0 || shape.k % 32 != 0) { return false; }
+        if (!mma_alignment_holds(shape.rows, shape.k)) { return false; }
+    }
+    return true;
+}
+
+static_assert(registered_shapes_are_sound(),
+              "every registered W8 linear_add shape must have k % 32 == 0, and k % 256 == 0 "
+              "whenever its route table has an MMA band (16-byte scale-row staging)");
+
+bool registered(std::int32_t rows, std::int32_t k) {
+    for (const W8LinearAddShape& shape : kRegisteredShapes) {
+        if (shape.rows == rows && shape.k == k) { return true; }
+    }
+    return false;
+}
 
 std::int32_t schedule_rows(W8LinearAddScheduleId schedule) {
     switch (schedule) {
@@ -244,35 +390,30 @@ const char* w8_linear_add_schedule_name(W8LinearAddScheduleId schedule) noexcept
 }
 
 bool w8_linear_add_schedule_uses_mma(W8LinearAddScheduleId schedule) noexcept {
-    return schedule != W8LinearAddScheduleId::DecodeR16 &&
-           schedule != W8LinearAddScheduleId::SimtR8C4;
+    return schedule_uses_mma(schedule);
+}
+
+std::span<const W8LinearAddShape> w8_linear_add_registered_shapes() noexcept {
+    return kRegisteredShapes;
 }
 
 bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
-    // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b
-    // ({1024,2048|3584}) and qwen3.5-2b attn/gdn output ({2048,2048}; its
-    // mlp down {2048,6144} rides the registered base shape).
-    const bool base = problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144);
-    const bool q08  = problem.rows == 1024 && (problem.k == 2048 || problem.k == 3584);
-    const bool q2b  = problem.rows == 2048 && problem.k == 2048;
-    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b output/down.
-    const bool q4b  = problem.rows == 2560 && (problem.k == 4096 || problem.k == 9216);
-    // qwen3-0.6b: its attention output {1024, 2048} already rides the 0.8b
-    // shape above; only the mlp down {1024, 3072} is new, and it has no bake, so
-    // it resolves through the extent-agnostic table below.
-    const bool q3_06b = problem.rows == 1024 && problem.k == 3072;
-    // tinyllama-1.1b: its attention output {2048, 2048} is already the 2b shape
-    // above; only the mlp down {2048, 5632} is new.
-    const bool tinyllama = problem.rows == 2048 && problem.k == 5632;
-    // gemma-3-270m: attention output {640, 1024} and mlp down {640, 2048}. Its
-    // hidden is narrower than anything else registered here, so both are new.
-    const bool gemma3 = problem.rows == 640 && (problem.k == 1024 || problem.k == 2048);
-    return (base || q08 || q2b || q4b || q3_06b || tinyllama || gemma3) &&
-           problem.padded_k == problem.k &&
+    return registered(problem.rows, problem.k) && problem.padded_k == problem.k &&
            problem.cols >= 1;
 }
 
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
+    // Named first: for a shape whose table has an MMA band, a misaligned k is
+    // the constraint that matters, not the generic "not admitted".
+    if (!mma_alignment_holds(problem.rows, problem.k)) {
+        throw std::invalid_argument(
+            "w8 linear_add: k " + std::to_string(problem.k) + " violates k % " +
+            std::to_string(kW8MmaScaleRowAlignmentK) +
+            " == 0 -- the MMA tiles stage each scale row (k/16 bytes) with a 16-byte "
+            "cp.async, and the route table for this shape sends some T band to them (rows " +
+            std::to_string(problem.rows) + ", k " + std::to_string(problem.k) + ", padded_k " +
+            std::to_string(problem.padded_k) + ", cols " + std::to_string(problem.cols) + ")");
+    }
     if (!w8_linear_add_admits(problem)) {
         throw std::invalid_argument("w8 linear_add: exact problem or column count is not admitted "
                                     "(rows " + std::to_string(problem.rows) + ", k " +
@@ -280,39 +421,12 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
                                     std::to_string(problem.padded_k) + ", cols " +
                                     std::to_string(problem.cols) + ")");
     }
-    const auto resolve_from = [&](const auto& routes) -> W8LinearAddPlan {
-        for (const RouteSpec& route : routes) {
-            if (problem.cols >= route.first && problem.cols <= route.last) {
-                return {route.schedule};
-            }
+    for (const RouteSpec& route : routes_of(table_for(problem.rows, problem.k))) {
+        if (problem.cols >= route.first && problem.cols <= route.last) {
+            return {route.schedule};
         }
-        throw std::logic_error("w8 linear_add: admitted problem has no covering route");
-    };
-    // gemma-3-270m's two shapes take the runtime-tiled routes; its 640 rows have
-    // no exact-T bake of their own, and the k=2048 branch below is the 2b's.
-    if (problem.rows == 640) { return resolve_from(kExtentAgnosticRoutes); }
-    if (problem.rows == 1024) {
-        // The row count alone does not name the geometry here: the 0.8b's exact-T
-        // bakes are k=2048/3584, and the 0.6b's mlp down is k=3072.
-        return problem.k == 3072 ? resolve_from(kExtentAgnosticRoutes) : resolve_from(kQ08Routes);
     }
-    // qwen3.5-2b output projections (measured on an idle RTX 5090,
-    // bench/ops/q08_route_sweep_bench: 472 -> r32c96 63.5us, 888 -> r48c128
-    // 102.8us (+26% over r32c128), 1024 -> r32c128, 1912 -> r48c128).
-    if (problem.k == 2048) { return resolve_from(kQ2BRoutes); }
-    // surogate vendor patch (PATCHES.md #29): qwen3.5-4b (2560 rows) has its
-    // exact-T bakes now (T=2..16, k=4096/9216).
-    if (problem.rows == 2560) { return resolve_from(kQ4B29Routes); }
-    // The exact-T and medium split-K bakes that remain are 2048 rows over k 4096
-    // or 6144, and both launchers refuse any other geometry. This branch keeps an
-    // admitted shape from ever reaching them: anything unbaked takes the table
-    // whose kernels read both extents from the weight, the rule the
-    // extent-agnostic table above states. tinyllama's mlp down {2048, 5632} is
-    // the shape that used to fall through here to the 4096 bake.
-    if (problem.rows != 2048 || (problem.k != 4096 && problem.k != 6144)) {
-        return resolve_from(kExtentAgnosticRoutes);
-    }
-    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
+    throw std::logic_error("w8 linear_add: admitted problem has no covering route");
 }
 
 void w8_linear_add_execute_plan(const W8LinearAddPlan& plan, const Tensor& x, const Weight& w,
