@@ -51,6 +51,15 @@ struct GemmaEmbeddingConfig {
     /// query_pre_attn_scalar ** -0.5, which is *not* always 1/sqrt(head_dim).
     float attention_scale = 0.0625F;
     /// Gemma scales the embedding table by sqrt(hidden) on the way in.
+    ///
+    /// The reference casts this scalar to the weight dtype before multiplying
+    /// (`embed_scale.to(self.weight.dtype)`), so the value to match depends on
+    /// the dtype of the run being matched: a BF16 run rounds sqrt(768) to 27.75,
+    /// an FP32 one keeps 27.712812921102035, and the two differ by 0.134% on the
+    /// residual stream. The generation path rounds, because its target runs
+    /// BF16; this encoder is checked against an FP32 reference (cosine 0.999855)
+    /// and keeps the unrounded value. Settle it by measuring both against that
+    /// reference before changing it -- the arithmetic alone does not say which.
     float embedding_scale = 27.712812921102035F; // sqrt(768)
 
     [[nodiscard]] bool is_global(std::int32_t layer) const noexcept {

@@ -2,6 +2,9 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/linear/w8/w8_launch.h"
+#include <string>
+#include <stdexcept>
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
 
@@ -11,6 +14,16 @@ namespace {
 
 template <class Schedule, bool Full>
 void launch_variant(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    // This is the same row-split MMA kernel ops/linear and ops/linear_add run,
+    // and it stages each scale row (k/16 bytes) with a 16-byte cp.async, which
+    // is aligned only when k % 256 == 0. Both of those refuse a k that is not;
+    // this one launched regardless, and the failure is silent -- wrong scales at
+    // small T, a misaligned-address fault only once a row crosses a page.
+    if ((w.k % kW8MmaScaleRowAlignmentK) != 0) {
+        throw std::invalid_argument(
+            "w8 linear_swiglu MMA route requires k % 256 == 0 for 16-byte-aligned scale rows; k=" +
+            std::to_string(w.k) + " must use a SIMT route");
+    }
     // surogate vendor patch (PATCHES.md #13): geometry from the admitted weight
     // (35B 12288x2048 or qwen3.5-0.8b 7168x1024); the kernel is runtime-shaped
     // and both intermediate extents divide every registered BM/2.

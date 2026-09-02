@@ -24,7 +24,7 @@ inline constexpr std::size_t kFullAttentionLayers = 18;
 // runtime's GDN arrays and state pool are sized from it.
 //
 // "Full attention" here is the *mixer* axis, and it is easy to confuse with the
-// other one: Gemma 3 alternates windowed against global attention on a period
+// other one: Gemma 3 alternates windowed against global attention on a schedule
 // (`TextConfig::is_windowed_attention`). Both kinds are ordinary GQA layers
 // storing identical objects, so the schedule never reaches this constant.
 inline constexpr std::size_t kGdnLayers = 0;

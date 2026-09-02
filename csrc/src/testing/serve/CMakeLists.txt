@@ -15,7 +15,12 @@ function(sinfer_add_test name)
     ${SINFER_JSON_INCLUDE}
     ${SUROGATE_VENDOR_DIR}
     ${SUROGATE_VENDOR_DIR}/cpp-httplib
-    ${SUROGATE_VENDOR_DIR}/utf8proc)
+    ${SUROGATE_VENDOR_DIR}/utf8proc
+    # Serve headers reach cuda_runtime.h on their own now -- a package header
+    # pulls in the KV pool, which pulls in the demand-mapped region. A test that
+    # links sinfer_engine rather than sinfer_core does not inherit the toolkit's
+    # include path, so give every test target its own.
+    ${CUDAToolkit_INCLUDE_DIRS})
   if(arg_LIBRARIES)
     target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
   else()
