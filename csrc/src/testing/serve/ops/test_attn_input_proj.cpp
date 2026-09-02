@@ -580,6 +580,64 @@ int run_w8_companion() {
     return failures;
 }
 
+// The two ungated parents the plan registers that nothing here exercised. Both
+// are models this engine serves -- qwen3-0.6b and tinyllama-1.1b -- and the
+// wrapper derives neither split from a dimension: it looks them up in a table
+// that restates what the plan already says. Driving the public op is what
+// checks the two still agree, which is the same gap the fused SwiGLU had.
+int run_w8_ungated_case(DevicePackedWeight& parent, std::int32_t hidden, std::int32_t q_rows,
+                        std::int32_t kv_rows, const char* name, std::uint32_t seed,
+                        std::int32_t tokens) {
+    const std::vector<float> activation = make_bf16_activation(hidden, tokens, seed + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(q_rows, tokens);
+    GuardedBf16Tensor key(kv_rows, tokens);
+    GuardedBf16Tensor value(kv_rows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
+    Tensor q = query.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    ops::attn_input_proj(x, parent.view(), q, k, v, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix =
+        std::string(" W8 ") + name + " A16 T=" + std::to_string(tokens);
+    int failures = 0;
+    failures += verify_output("attn q" + suffix, query, parent.host, 0, q_rows, activation, hidden,
+                              tokens);
+    failures += verify_output("attn k" + suffix, key, parent.host, q_rows, kv_rows, activation,
+                              hidden, tokens);
+    failures += verify_output("attn value" + suffix, value, parent.host, q_rows + kv_rows, kv_rows,
+                              activation, hidden, tokens);
+    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent weight" + suffix);
+    return failures;
+}
+
+int run_w8_ungated() {
+    int failures = 0;
+    // qwen3-0.6b: 16 query heads and 8 KV heads at head dim 128 over hidden 1024.
+    {
+        DevicePackedWeight parent(
+            quantized_weight::make_patterned_weight(QType::W8G32_F16S, 4096, 1024, 601U));
+        for (const std::int32_t tokens : {1, 2, 17, 48, 65, 129}) {
+            failures += run_w8_ungated_case(parent, 1024, 2048, 1024, "qwen3-0.6b", 611U, tokens);
+        }
+    }
+    // tinyllama-1.1b: 32 query heads and 4 KV heads at head dim 64 over hidden
+    // 2048, the narrowest KV split registered.
+    {
+        DevicePackedWeight parent(
+            quantized_weight::make_patterned_weight(QType::W8G32_F16S, 2560, 2048, 607U));
+        for (const std::int32_t tokens : {1, 2, 17, 48, 65, 129}) {
+            failures += run_w8_ungated_case(parent, 2048, 2048, 256, "tinyllama", 617U, tokens);
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -597,6 +655,7 @@ int main() {
     failures += run_w8_q08();
     failures += run_w8_q2b();
     failures += run_w8_companion();
+    failures += run_w8_ungated();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }
