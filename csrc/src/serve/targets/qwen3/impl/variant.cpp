@@ -19,6 +19,8 @@
 #define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3::detail::Variant
 #define SINFER_FAMILY_RUNTIME_NS qwen3_runtime
 #include "family/impl/runtime/instantiate.h"
+#include "family/impl/runtime/target_support.h"
+#include "family/impl/runtime/unrunnable_leaves.h"
 
 namespace sinfer::targets::qwen3::detail {
 namespace {
@@ -26,27 +28,7 @@ namespace {
 using family::apply_lora;
 using family::apply_lora_qkv;
 
-std::vector<GraphExecutionProfile>
-graph_profiles_through(std::uint32_t max_frontier,
-                       const std::vector<std::uint32_t>& preferred_ends) {
-    std::vector<GraphExecutionProfile> out;
-    std::uint32_t begin = 0;
-    for (const std::uint32_t preferred_end : preferred_ends) {
-        if (begin > max_frontier) { break; }
-        const std::uint32_t end = std::min(preferred_end, max_frontier);
-        out.push_back({begin, end});
-        if (end == max_frontier) { return out; }
-        begin = end + 1;
-    }
-    if (begin <= max_frontier) { out.push_back({begin, max_frontier}); }
-    return out;
-}
 
-void validate_token_interval(std::int32_t first, std::int32_t last) {
-    if (first <= 0 || last < first) {
-        throw std::invalid_argument("invalid target leaf token interval");
-    }
-}
 
 /// This target has one export profile and it is W8. The ungated
 /// `attn_input_proj` overload it uses admits A16 only, and keeping the linear
@@ -102,7 +84,7 @@ QType profile_qtype(WeightsProfile weights_profile) {
 std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
     // E+1 is the one-token visible window; the ranges follow the family's measured
     // split-policy transitions until the producer grid reaches its fixed cap.
-    return graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
+    return family::graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
 }
 
 std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t, std::uint32_t) {
@@ -139,7 +121,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     (void)profile_qtype(weights_profile);
     // The ungated three-output `attn_input_proj` overload writes q, k and v
     // directly from the row-split parent; it materializes no packed parent and
@@ -149,7 +131,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     return ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile),
                                                     TextConfig::hidden, TextConfig::query_size,
                                                     kTextPolicy, first, last);
@@ -171,7 +153,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     const QType qtype = profile_qtype(weights_profile);
     return post_mixer_workspace_bytes(qtype, qtype, kTextPolicy, first, last);
 }
@@ -184,167 +166,16 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
 // contributed nothing to the residual, which reads as a model that merely
 // answers badly.
 
-void Variant::gdn_input_projection(const Tensor&, const GdnProjectionWeights&, Tensor&, Tensor&,
-                                   family::TextPhase, WorkspaceArena&, cudaStream_t) {
-    no_linear_layers("gdn_input_projection");
-}
-
-void Variant::gdn_input_projection_snapshot(const Tensor&, const GdnProjectionWeights&,
-                                            const Tensor&, Tensor&, const Tensor&, const Tensor&,
-                                            const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                                            family::TextPhase, WorkspaceArena&, cudaStream_t) {
-    no_linear_layers("gdn_input_projection_snapshot");
-}
-
-void Variant::gdn_input_projection_record(const Tensor&, const GdnProjectionWeights&, const Tensor&,
-                                          const Tensor&, const Tensor&, const Tensor&, Tensor&,
-                                          Tensor&, Tensor&, Tensor&, Tensor&, family::TextPhase,
-                                          WorkspaceArena&, cudaStream_t) {
-    no_linear_layers("gdn_input_projection_record");
-}
-
-void Variant::gdn_output_projection(const Tensor&, const Weight&, Tensor&, family::TextPhase,
-                                    WorkspaceArena&, cudaStream_t) {
-    no_linear_layers("gdn_output_projection");
-}
-
-void Variant::gdn_norm_control_projection(const Tensor&, const Tensor&, float,
-                                          const GdnProjectionWeights&, Tensor&, Tensor&, Tensor&,
-                                          WorkspaceArena&, cudaStream_t) {
-    no_linear_layers("gdn_norm_control_projection");
-}
-
-std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                   family::TextPhase,
-                                                                   std::int32_t, std::int32_t) {
-    return 0;
-}
-
-std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile,
-                                                                            family::TextPhase,
-                                                                            std::int32_t,
-                                                                            std::int32_t,
-                                                                            std::int32_t) {
-    return 0;
-}
-
-std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile,
-                                                                          family::TextPhase,
-                                                                          std::int32_t,
-                                                                          std::int32_t,
-                                                                          std::int32_t) {
-    return 0;
-}
-
-std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                    family::TextPhase,
-                                                                    std::int32_t, std::int32_t) {
-    return 0;
-}
-
-std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t,
-                                                                          std::int32_t) {
-    return 0;
-}
-
-void Variant::mtp_attention_projection(const Tensor&, const MtpAttentionProjectionWeights&, Tensor&,
-                                       Tensor&, Tensor&, Tensor&, WorkspaceArena&, cudaStream_t) {
-    no_speculation("mtp_attention_projection");
-}
-
-void Variant::mtp_kv_projection(const Tensor&, const MtpAttentionProjectionWeights&, Tensor&,
-                                Tensor&, WorkspaceArena&, cudaStream_t) {
-    no_speculation("mtp_kv_projection");
-}
-
-void Variant::mtp_q_gate_projection(const Tensor&, const MtpAttentionProjectionWeights&, Tensor&,
-                                    Tensor&, WorkspaceArena&, cudaStream_t) {
-    no_speculation("mtp_q_gate_projection");
-}
-
-void Variant::mtp_post_mixer(const Tensor&, const MtpPostMixerWeights&, Tensor&, WorkspaceArena&,
-                             cudaStream_t) {
-    no_speculation("mtp_post_mixer");
-}
-
-std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t, std::int32_t) {
-    return 0;
-}
-
-std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t, std::int32_t) {
-    return 0;
-}
-
-std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t, std::int32_t) {
-    return 0;
-}
-
-std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t, std::int32_t) {
-    return 0;
-}
-
-
-// Parity probe. SUROGATE_SERVE_DUMP_RESIDUAL=<dir> writes each tagged attention
-// intermediate of the first forward as raw BF16 behind a 16-byte header
-// {magic, rows, columns, occurrence}. Layers run in order, so the occurrence
-// count of a tag is its layer index -- which keeps the family's probe signature
-// (tag, tensor, stream) unchanged. Synchronises the stream, so it is only ever
-// on for parity work.
-namespace {
-
-const char* probe_directory() {
-    static const char* dir = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_DUMP_RESIDUAL");
-        return (raw != nullptr && *raw != '\0') ? raw : nullptr;
-    }();
-    return dir;
-}
-
-std::int32_t probe_columns() {
-    static const std::int32_t columns = [] {
-        const char* raw = std::getenv("SUROGATE_SERVE_DUMP_COLUMNS");
-        return (raw != nullptr && *raw != '\0') ? std::atoi(raw) : 0;
-    }();
-    return columns;
-}
-
-std::map<std::string, int>& probe_counts() {
-    static std::map<std::string, int> counts;
-    return counts;
-}
-
-} // namespace
+// Every leaf this target cannot run, defined once in the family: see
+// family/impl/runtime/unrunnable_leaves.h. The two arguments are this
+// target's own refusal messages.
+SINFER_FAMILY_UNRUNNABLE_LEAVES(no_linear_layers, no_speculation)
 
 void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
-    const char* dir = probe_directory();
-    if (dir == nullptr || tensor.data == nullptr) { return; }
-    // Prompt-sized rounds only: a long generation would otherwise write a file per
-    // decode step per layer.
-    if (tensor.ne[1] > 64) { return; }
-    // Warmup runs forwards of its own before any request, so a plain "first N
-    // occurrences" rule would spend the budget before the prompt under study
-    // arrives. Select the round by its width instead: SUROGATE_SERVE_DUMP_COLUMNS
-    // names the column count to capture, and the occurrence counter is kept per
-    // (tag, width) so the captured round's layers number 0..N-1 whatever ran
-    // before it.
-    if (probe_columns() > 0 && tensor.ne[1] != probe_columns()) { return; }
-    const std::string key = std::string(tag) + "@" + std::to_string(tensor.ne[1]);
-    const int occurrence  = probe_counts()[key]++;
-    if (occurrence >= TextConfig::layers) { return; }
-
-    const std::size_t bytes = tensor.bytes();
-    std::vector<std::byte> host(bytes);
-    CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, bytes, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    const std::string path =
-        std::string(dir) + "/" + tag + "_" + std::to_string(occurrence) + ".bin";
-    FILE* file = std::fopen(path.c_str(), "wb");
-    if (file == nullptr) { return; }
-    const std::int32_t header[4] = {0x51335042, tensor.ne[0], tensor.ne[1], occurrence};
-    std::fwrite(header, sizeof(header), 1, file);
-    std::fwrite(host.data(), 1, bytes, file);
-    std::fclose(file);
+    // Only the magic is this target's: 'Q3PB'. Everything else -- which rounds
+    // are captured, how the occurrence is counted, the header layout -- is the
+    // family's, and lived in nine byte-identical copies before it moved there.
+    family::debug_probe_dump(0x51335042, tag, tensor, TextConfig::layers, stream);
 }
 
 } // namespace sinfer::targets::qwen3::detail

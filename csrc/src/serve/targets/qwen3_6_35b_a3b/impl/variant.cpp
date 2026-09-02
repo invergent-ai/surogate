@@ -13,25 +13,11 @@
 #define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_6_35b_a3b::detail::Variant
 #define SINFER_FAMILY_RUNTIME_NS qwen3_6_35b_a3b_runtime
 #include "family/impl/runtime/instantiate.h"
+#include "family/impl/runtime/target_support.h"
 
 namespace sinfer::targets::qwen3_6_35b_a3b::detail {
 namespace {
 
-std::vector<GraphExecutionProfile>
-graph_profiles_through(std::uint32_t max_frontier,
-                       const std::vector<std::uint32_t>& preferred_ends) {
-    std::vector<GraphExecutionProfile> out;
-    std::uint32_t begin = 0;
-    for (const std::uint32_t preferred_end : preferred_ends) {
-        if (begin > max_frontier) { break; }
-        const std::uint32_t end = std::min(preferred_end, max_frontier);
-        out.push_back({begin, end});
-        if (end == max_frontier) { return out; }
-        begin = end + 1;
-    }
-    if (begin <= max_frontier) { out.push_back({begin, max_frontier}); }
-    return out;
-}
 
 std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
                                                         std::uint32_t draft_window) {
@@ -52,7 +38,7 @@ std::vector<GraphExecutionProfile> dflash_base_profiles(std::uint32_t capacity,
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(max_frontier, ends);
+    return family::graph_profiles_through(max_frontier, ends);
 }
 
 bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_t batch_size,
@@ -75,11 +61,6 @@ void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, 
                     stream);
 }
 
-void validate_token_interval(std::int32_t first, std::int32_t last) {
-    if (first <= 0 || last < first) {
-        throw std::invalid_argument("invalid target leaf token interval");
-    }
-}
 
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
@@ -93,7 +74,7 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden) {
 } // namespace
 
 std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
-    return graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
+    return family::graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
 }
 
 std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
@@ -108,7 +89,7 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(capacity - 1, ends);
+    return family::graph_profiles_through(capacity - 1, ends);
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
@@ -228,13 +209,13 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
 
 std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
                                                                        std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     return 0;
 }
 
 std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
                                                                 std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::query_size, last});
     (void)layout.alloc(DType::BF16, {TextConfig::query_size, last});
@@ -243,7 +224,7 @@ std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t fir
 
 std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
                                                                     std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
     (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});

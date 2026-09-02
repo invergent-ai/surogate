@@ -24,31 +24,12 @@
 #define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_6_27b::detail::Variant
 #define SINFER_FAMILY_RUNTIME_NS qwen3_6_27b_runtime
 #include "family/impl/runtime/instantiate.h"
+#include "family/impl/runtime/target_support.h"
 
 namespace sinfer::targets::qwen3_6_27b::detail {
 namespace {
 
-std::vector<GraphExecutionProfile>
-graph_profiles_through(std::uint32_t max_frontier,
-                       const std::vector<std::uint32_t>& preferred_ends) {
-    std::vector<GraphExecutionProfile> out;
-    std::uint32_t begin = 0;
-    for (const std::uint32_t preferred_end : preferred_ends) {
-        if (begin > max_frontier) { break; }
-        const std::uint32_t end = std::min(preferred_end, max_frontier);
-        out.push_back({begin, end});
-        if (end == max_frontier) { return out; }
-        begin = end + 1;
-    }
-    if (begin <= max_frontier) { out.push_back({begin, max_frontier}); }
-    return out;
-}
 
-void validate_token_interval(std::int32_t first, std::int32_t last) {
-    if (first <= 0 || last < first) {
-        throw std::invalid_argument("invalid target leaf token interval");
-    }
-}
 
 constexpr ops::LinearPolicy kNvfp4TextPolicy = ops::LinearPolicy::AllowA4;
 constexpr ops::LinearPolicy kFp8TextPolicy   = ops::LinearPolicy::AllowA8;
@@ -141,7 +122,7 @@ std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
 std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
     // E+1 is the one-token visible window. Early ranges limit empty producer CTAs; later ranges
     // follow measured split-policy transitions until the producer grid reaches its fixed cap.
-    return graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
+    return family::graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
 }
 
 std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
@@ -170,7 +151,7 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
-    return graph_profiles_through(capacity - 1, ends);
+    return family::graph_profiles_through(capacity - 1, ends);
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
@@ -368,7 +349,7 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
 
 std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
                                                                        std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
     return layout.peak_bytes(1);
@@ -376,13 +357,13 @@ std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int3
 
 std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
                                                                 std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     return 0;
 }
 
 std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
                                                                     std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     return 0;
 }
 
@@ -390,7 +371,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -408,7 +389,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -432,7 +413,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -453,7 +434,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
 std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     WeightsProfile weights_profile, family::TextPhase, std::int32_t batch_size, std::int32_t first,
     std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -483,7 +464,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
 std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     WeightsProfile weights_profile, family::TextPhase, std::int32_t batch_size, std::int32_t first,
     std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -514,7 +495,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
                                                                     family::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -542,7 +523,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -565,7 +546,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
-    validate_token_interval(first, last);
+    family::validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, last});
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
