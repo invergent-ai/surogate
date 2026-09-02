@@ -83,13 +83,35 @@ them.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 100 | **46,225** | **11,166** | **57,391** | **20 ms** | GGUF Q4_K_M repack, 128 lanes, `--max-model-len 2048`, 8 client shards; 2026-08-30 07:08, uncapped GPU 0 |
+| **surogate** | 1 | 100 | **46,225** | **11,166** | **57,391** | **20 ms** | GGUF Q4_K_M **repack** — an artifact path retired on 2026-09-02, see the native rows below; 128 lanes, `--max-model-len 2048`, 8 client shards; 2026-08-30 07:08, uncapped GPU 0 |
 | vLLM | 1 | 100 | 29,122 | 7,009 | 36,131 | 0.69 s | NVFP4 (`surogate/Qwen3.5-0.8B-NVFP4`), `--max-model-len 2048`; same batch, uncapped GPU 1. surogate **+59 % decode, 34× TTFT** |
 | **surogate** | 1 | 100 | **117,563** | 910.5 | **118,473** | **1.48 s** | prefill-heavy 2048/16, `--max-model-len 2304`, 128 lanes, chunk 4,096, 4 client shards; 2026-08-30 19:17, GPU 0. Replaces a 2026-08-27 pass that read 81,376 — **+44 % on the current binary** |
 | vLLM | 1 | 100 | 46,990 | 363.6 | 47,354 | 3.70 s | prefill-heavy, GPU 1, launched and probed concurrently with the row above. surogate **+150 % prefill** |
 | **surogate** | 1 | 1 | **95,000 †** | **673** | — | **20 ms** | 2026-08-30 10:16, uncapped GPU 0, fp8 KV, ~1,900-token prompt |
 | vLLM | 1 | 1 | 38,000 † | 498 | — | 50 ms | same batch, uncapped GPU 1. surogate **+35 % decode, 2.5× TTFT** |
 | llama.cpp | 1 | 1 | **19,000 †** | **411** | — | **100 ms** | 2026-08-30 12:01, uncapped GPU 5, `llama-server -ngl 999 -c 4096 -np 1` on the same Q4_K_M GGUF. Its own prompt-eval timing is 34,500 tok/s; the † above is the board's prompt÷TTFT and carries the queueing. **Use `study/llama.cpp-master/build/bin` — the `llama-server` on `PATH` is Homebrew's Vulkan build** (no CUDA, ignores `CUDA_VISIBLE_DEVICES`) and reads 252 tg / 6,880 pp512 on `llama-bench`, roughly 40 % of the CUDA build |
+
+
+**GGUF served natively (2026-09-02).** The three engines on one idle 5090, the same
+closed-loop client, 512/128, salted prompts, staggered workers, a 60 s window after 15 s of
+warm-up, each engine at its own natural weight format: surogate and llama.cpp both read
+`models/Qwen3.5-0.8B-Q4_K_M.gguf`, vLLM reads `surogate/Qwen3.5-0.8B-NVFP4`. surogate's
+artifact is now the file's own K-quants — Q4_K, Q5_K and Q6_K blocks byte-for-byte, no
+dequantise-and-requantise — at 713 MB.
+
+| engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | latency p50 | comments |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **surogate** | 1 | 1 | **4,372** | **802** | **5,174** | **0.16 s** | native K-quant GGUF, `--kv-capacity auto` |
+| vLLM 0.27.1 | 1 | 1 | 2,053 | 346 | 2,399 | 0.25 s | NVFP4. surogate **2.3× decode, 2.1× prefill** |
+| llama.cpp | 1 | 1 | 2,477 | 454 | 2,932 | 0.28 s | same GGUF, `-ngl 999 -fa 1 -np 16`. surogate **1.8× decode and prefill** |
+| **surogate** | 1 | 8 | **15,071** | **2,765** | **17,836** | **0.37 s** | |
+| vLLM 0.27.1 | 1 | 8 | 10,496 | 1,768 | 12,264 | 0.56 s | surogate **1.6× decode, 1.4× prefill** |
+| llama.cpp | 1 | 8 | 3,721 | 683 | 4,404 | 1.53 s | surogate **4.1× decode and prefill, 4.1× latency** |
+
+Isolated kernel rates on the same file, `llama-bench -p 512,2048 -n 128 -fa 1` against the
+engine's own accounting: prefill **97,062** vs 39,511 (pp512) and **107,604** vs 42,863
+(pp2048); decode **864** vs 809 (tg128). The concurrency gap is wider than the single-stream
+gap because llama.cpp's server does not batch these as well as its kernels run.
 
 ### Qwen3.5-4B
 
