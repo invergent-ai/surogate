@@ -22,7 +22,7 @@ import torch
 from surogate.serve.tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common import conversion as family_conversion
+from surogate.serve.tools.convert.common import conversion as family_conversion
 from surogate.serve.tools.convert.qwen3_6_27b import convert as qwen3_6_convert
 from surogate.serve.tools.convert.qwen3_6_27b import draft_head, recipe
 

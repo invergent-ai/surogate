@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common.recipe import (
+from surogate.serve.tools.convert.common.recipe import (
     Cast,
     Concat,
     DraftHeadTokenIds,

@@ -27,7 +27,7 @@ from surogate.serve.tools.artifact.layouts import (
 )
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common import conversion as family_conversion
+from surogate.serve.tools.convert.common import conversion as family_conversion
 
 from . import convert as base_convert
 from . import draft_head

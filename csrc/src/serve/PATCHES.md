@@ -67,7 +67,7 @@ training `surogate-common` build.
    in NOTICE — process names and logs carry the product's name.
     The console-prefix expectation in `tests/test_request_log.cpp` is
     updated to the renamed `surogate-engine: ` prefix.
-12. `tools/convert/qwen3_6/common/official_resources.py` — GGUF-sourced
+12. `tools/convert/common/official_resources.py` — GGUF-sourced
    conversions reconstruct tokenizer.json/tokenizer_config.json/
    chat_template.jinja from the GGUF's own KV metadata (semantically
    equivalent — encode-identical, tests/serve/test_gguf_frontend.py — but not

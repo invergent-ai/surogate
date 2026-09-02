@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.convert.qwen3_6.common.official_resources import (
+from tools.convert.common.official_resources import (
     OFFICIAL_RESOURCE_SHA256,
     validate_official_resource_hashes,
 )

@@ -72,8 +72,8 @@ from surogate.serve.tools.artifact.container import (
 )
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common import conversion as family_conversion
-from surogate.serve.tools.convert.qwen3_6.common.recipe import (
+from surogate.serve.tools.convert.common import conversion as family_conversion
+from surogate.serve.tools.convert.common.recipe import (
     SourcePreflight,
     TensorRecipe,
     expression_sources,
@@ -81,7 +81,7 @@ from surogate.serve.tools.convert.qwen3_6.common.recipe import (
     preflight_source_reader,
     source,
 )
-from surogate.serve.tools.convert.qwen3_6.common.recipe import (
+from surogate.serve.tools.convert.common.recipe import (
     validate_recipe_coverage as _validate_recipe_coverage,
 )
 

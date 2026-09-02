@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from surogate.serve.tools.convert.qwen3_6.common.draft_head import (
+from surogate.serve.tools.convert.common.draft_head import (
     DraftHeadContext,
     compute_shortlist as _compute_shortlist,
     load_total_counts as _load_total_counts,

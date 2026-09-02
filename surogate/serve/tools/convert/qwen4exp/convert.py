@@ -38,7 +38,7 @@ from surogate.serve.tools.artifact.layouts import encode_direct, encode_row_spli
 from surogate.serve.tools.artifact.numeric import get_format
 from surogate.serve.tools.convert.common.gguf_repack import REPACKABLE_TYPES
 from surogate.serve.tools.convert.common.quantize import pick_device, quantize_matrix
-from surogate.serve.tools.convert.qwen3_6.common import conversion as family_conversion
+from surogate.serve.tools.convert.common import conversion as family_conversion
 
 from . import inventory as inv
 

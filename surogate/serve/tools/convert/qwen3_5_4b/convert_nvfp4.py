@@ -20,7 +20,7 @@ from surogate.serve.tools.artifact.container import ArtifactIdentity, ArtifactWr
 from surogate.serve.tools.artifact.layouts import encode_direct, encode_nvfp4, swizzle_nvfp4_scales
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common import conversion as family_conversion
+from surogate.serve.tools.convert.common import conversion as family_conversion
 
 from . import draft_head
 from . import inventory_nvfp4 as inventory

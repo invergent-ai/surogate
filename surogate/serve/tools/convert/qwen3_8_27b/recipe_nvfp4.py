@@ -10,7 +10,7 @@ import torch
 
 from surogate.serve.tools.artifact.numeric import valid_positive_fp32_word
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common import recipe as family_recipe
+from surogate.serve.tools.convert.common import recipe as family_recipe
 from surogate.serve.tools.convert.qwen3_6_27b import recipe as official_recipe
 
 from . import inventory_nvfp4 as inventory

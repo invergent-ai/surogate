@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from surogate.serve.tools.convert.qwen3_6.common.draft_head import (
+from surogate.serve.tools.convert.common.draft_head import (
     DraftHeadContext,
     compute_shortlist as _compute_shortlist,
     materialize_draft_head,

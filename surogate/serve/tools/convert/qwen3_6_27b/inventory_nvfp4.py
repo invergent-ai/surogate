@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from surogate.serve.tools.convert.qwen3_6.common.inventory import TensorSpec
+from surogate.serve.tools.convert.common.inventory import TensorSpec
 
 from . import inventory as base
 

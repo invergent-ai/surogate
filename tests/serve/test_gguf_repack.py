@@ -21,7 +21,7 @@ from gguf.quants import dequantize, quantize
 
 from surogate.serve.tools.artifact.layouts import dequantize_row_split
 from surogate.serve.tools.convert.common.gguf_repack import GgufRepackSource
-from surogate.serve.tools.convert.qwen3_6.common.recipe import (
+from surogate.serve.tools.convert.common.recipe import (
     Concat,
     GatherRows,
     Reshape,
@@ -29,7 +29,7 @@ from surogate.serve.tools.convert.qwen3_6.common.recipe import (
     SourceTensor,
     TensorRecipe,
 )
-from surogate.serve.tools.convert.qwen3_6.common.inventory import TensorSpec  # noqa: E402
+from surogate.serve.tools.convert.common.inventory import TensorSpec  # noqa: E402
 
 K = 128  # four 32-value groups per row (k128 layout needs k % 128 == 0)
 

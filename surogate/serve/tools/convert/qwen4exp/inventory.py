@@ -24,7 +24,7 @@ ggml's broadcast, and `recipe.py` inverts that.
 
 from __future__ import annotations
 
-from surogate.serve.tools.convert.qwen3_6.common.inventory import (
+from surogate.serve.tools.convert.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
     FP32,

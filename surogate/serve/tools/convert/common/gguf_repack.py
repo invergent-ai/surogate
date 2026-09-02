@@ -48,7 +48,7 @@ import torch
 
 from surogate.serve.tools.artifact.layouts import encode_row_split, row_split_geometry
 from surogate.serve.tools.artifact.numeric import QuantFormat, get_format
-from surogate.serve.tools.convert.qwen3_6.common.recipe import (
+from surogate.serve.tools.convert.common.recipe import (
     Concat,
     Expression,
     GatherRows,

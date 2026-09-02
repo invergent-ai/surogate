@@ -22,6 +22,18 @@ class DraftHeadContext:
     force_include: tuple[int, ...]
 
 
+
+def _tools_root() -> Path:
+    """The `tools` directory this module lives under."""
+
+    for parent in Path(__file__).resolve().parents:
+        if parent.name == "tools":
+            return parent
+    raise RuntimeError(
+        f"draft_head is outside the tools package ({__file__}); "
+        "package-relative fixture paths cannot be resolved"
+    )
+
 def load_total_counts(path: str | Path, vocab: int) -> np.ndarray:
     """Load only the total-frequency row from a ``[rows,vocab]`` I64 ranking."""
 
@@ -115,8 +127,12 @@ def compute_shortlist(
         )
     ranking = Path(ranking_path)
     if not ranking.is_absolute() and not ranking.exists():
-        # Package-relative fixtures (surogate/serve/tools/...).
-        ranking = Path(__file__).resolve().parents[3] / ranking_path
+        # Fixtures are named relative to surogate/serve/tools. Anchoring on the
+        # directory by name rather than by how many levels up it happens to be
+        # keeps this working when the module moves: it moved once already, and a
+        # hardcoded depth resolved silently to the wrong directory rather than
+        # failing, which a fixture path is well placed to hide.
+        ranking = _tools_root() / ranking_path
     tokenizer = Path(tokenizer_dir)
     forced = read_special_ids(tokenizer)
     total = load_total_counts(ranking, vocab)

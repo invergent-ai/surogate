@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common import recipe as family_recipe
+from surogate.serve.tools.convert.common import recipe as family_recipe
 from surogate.serve.tools.convert.qwen3_6_27b import recipe as official_recipe
 
 from . import inventory_nvfp4_all as inventory

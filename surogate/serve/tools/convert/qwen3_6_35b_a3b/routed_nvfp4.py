@@ -59,7 +59,7 @@ import torch
 
 from surogate.serve.tools.artifact.layouts import encode_nvfp4
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common.inventory import TensorSpec, tensor_spec
+from surogate.serve.tools.convert.common.inventory import TensorSpec, tensor_spec
 
 from . import inventory
 

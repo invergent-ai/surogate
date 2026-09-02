@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from surogate.serve.tools.convert.qwen3_6.common.recipe import (
+from surogate.serve.tools.convert.common.recipe import (
     SOURCE_DTYPE,
     Cast,
     Concat,

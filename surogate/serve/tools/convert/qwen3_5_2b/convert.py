@@ -26,8 +26,8 @@ from surogate.serve.tools.artifact.container import (
 from surogate.serve.tools.convert.common.gguf_repack import GgufRepackSource, RepackError
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
-from surogate.serve.tools.convert.qwen3_6.common import conversion as family_conversion
-from surogate.serve.tools.convert.qwen3_6.common import official_resources
+from surogate.serve.tools.convert.common import conversion as family_conversion
+from surogate.serve.tools.convert.common import official_resources
 
 from . import draft_head, inventory, recipe
 
