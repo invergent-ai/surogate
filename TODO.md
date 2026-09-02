@@ -11,7 +11,8 @@ before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
 - [x] **DONE** (this pass) k % 256 scale-row alignment refused in the plan by name, and per launch in both MMA launchers; a registered shape whose table has an MMA band fails to compile if misaligned.
 - [x] **DONE** (this pass) One registered-shape list (`w8_linear_add_registered_shapes`) feeds the plan, the wrapper's W8 gate and the conformance test; the wrapper no longer restates it (gemma3 `{640, *}` was admitted by one and refused by the other).
 - [x] **DONE** (this pass) TinyLlama `{2048, 5632}` exact-T bake over T=2..32, measured 2.8–4.2x over the runtime tile (PATCHES.md #90); exact-T tables keyed on (rows, k) in one table; bench `--k` accepts any registered k.
-- [ ] **TODO** `w8_linear_swiglu_gemm_mma.cu` launches the same MMA kernel with no alignment guard; its plan has no per-table rule; the wrapper/plan two-list drift is likely repeated in `wrapper/linear_swiglu.cpp` and `wrapper/attn_input_proj.cpp`.
+- [x] **DONE** (`28406e6e`) `w8_linear_swiglu_gemm_mma.cu` refuses a misaligned k like its two siblings. Every swiglu k admitted today is a multiple of 256, so nothing served changes.
+- [ ] **TODO** The swiglu wrapper still restates the plan's shape list (six hand-written shape predicates); same two-list drift `linear_add` had. `wrapper/attn_input_proj.cpp` may too.
 - [ ] **TODO** bench `--rows` so gemma3's 640-row shapes can be measured for a bake of their own.
 
 ## Group 2 — frontend — **DONE** (`52abbe9a`)
@@ -44,7 +45,8 @@ before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
 
 - [x] **DONE** Prefill starts at the window's first key block in both kernels instead of scanning from key 0. **Measured** at 8k, prefix reuse off, medians of 3: prefill **28,412 → 30,657 tok/s (+7.9%)**, HF-exact preserved. (The first attempt measured wall time, which is dominated by tokenization — see below.)
 - [x] **DONE** `{"gemma3_270m", 4, 1}` added to `kGeometries` — the first numerical conformance the multi-query shape has had, and what makes the trim a tested path.
-- [ ] **TODO** Decode key-range re-basing. Higher risk per review: feed the policy the tile-aligned extent or half the splits go neutral; a 1-KV-head layer collapses to ~9–18 CTAs on a 170-SM part so latency may not follow bytes; reduction order changes, and HF-exactness is the gate.
+- [x] **DONE** (`4e1fccb8`) Decode splits the window's key range, not all of history. **Measured** at 8k context, interleaved: **375.8 → 414.8 tok/s (+10.3%)**. Against 434 tok/s at 8 tokens of context, the old path gave up 13.4% by 8k and the new one gives up 4.5% — the rest is the 3 global layers. HF-exact, deterministic, ladder matches 10/10.
+- [x] **DONE** The gqa test now poisons the workspace. A split past the active count returns without writing, so zeros in the partial buffers hid a reducer/kernel split-count disagreement; with the poison, reverting the reducer fails exactly the decode window cases (without it, it passed).
 - [ ] **TODO** `Gqa256_4q1` `DecodeSplitScale`: apply the tile floor only to the default tiers, never to the measured INT8 special cases (`24/scale`, `32/scale` bands are deliberately sub-tile).
 
 ## Group 7 — Gemma sandwich norms — **DONE** (`913dc6e3`)
@@ -66,8 +68,9 @@ before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
 
 ## Found while measuring
 
-- [ ] **TODO** `csrc/src/serve/encoder/gemma_embedding.h` hardcodes `embedding_scale = 27.712812921102035F` (fp32 `sqrt(768)`) with no bf16 rounding; HF would use 27.75, so the EmbeddingGemma encoder path is 0.14% off the reference.
-- [ ] **TODO** `targets/gemma3/impl/load/bindings.h` still says Gemma "alternates windowed against global attention on a period"; the header states a per-layer array now.
+- [ ] **TODO** (investigated, not changed) EmbeddingGemma's `embedding_scale`. The reference casts the scalar to the **weight** dtype, so the right value depends on the dtype of the run being matched: bf16 → 27.75, fp32 → 27.712812921102035, differing 0.134% on the residual stream. The generation path rounds because its target is bf16; this encoder is checked against an **fp32** reference (cosine 0.999855), which points the other way. The reasoning is recorded beside the constant; settling it needs that reference re-run, which needs sentence-transformers (absent here).
+- [x] **DONE** (`28406e6e`) `bindings.h` no longer describes the schedule as a period.
+- [x] **DONE** (`28406e6e`) Test targets get the CUDA include path. The elastic-KV work made a target package header reach `cuda_runtime.h` via the KV pool, breaking any test linking `sinfer_engine`.
 
 ## Recorded, deferred
 
