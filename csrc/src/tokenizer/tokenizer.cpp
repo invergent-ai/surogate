@@ -13,11 +13,13 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -311,63 +313,122 @@ struct Tokenizer::Impl {
     // instead. Seed with whole characters, then merge by the same lowest-rank
     // rule.
     void spm_encode(const std::string& text, std::vector<int32_t>& out) const {
-        std::vector<std::string> symbols;
+        // Symbols are spans of `text`, not copies. Every merge joins neighbours,
+        // so a merged symbol is always a contiguous substring of the input and a
+        // {begin, length} pair describes it for free.
+        struct Symbol {
+            std::int32_t prev;
+            std::int32_t next;
+            std::uint32_t begin;
+            std::uint32_t length; // zero once merged away
+        };
+        std::vector<Symbol> symbols;
         for (size_t i = 0; i < text.size();) {
-            const size_t len = std::min(unicode_len_utf8(text[i]), text.size() - i);
-            symbols.emplace_back(text, i, len);
+            const size_t len   = std::min(unicode_len_utf8(text[i]), text.size() - i);
+            const auto index   = static_cast<std::int32_t>(symbols.size());
+            symbols.push_back({index - 1, -1, static_cast<std::uint32_t>(i),
+                               static_cast<std::uint32_t>(len)});
+            if (index > 0) { symbols[static_cast<size_t>(index) - 1].next = index; }
             i += len;
         }
         if (symbols.empty()) return;
 
-        const auto rank_of = [&](const std::string& piece) -> std::optional<Rank> {
-            const std::vector<uint8_t> key(piece.begin(), piece.end());
+        const auto rank_of = [&](std::uint32_t begin, std::uint32_t length) -> std::optional<Rank> {
+            const auto* first = reinterpret_cast<const uint8_t*>(text.data()) + begin;
+            const std::vector<uint8_t> key(first, first + length);
             const auto found = encoder.find(key);
             if (found == encoder.end()) return std::nullopt;
             return found->second;
         };
-        const auto merge_rank = [&](const std::string& left,
-                                    const std::string& right) -> std::optional<int> {
-            const auto found = spm_merge_rank.find(left + '\x00' + right);
+
+        // The merge table is keyed on "left\0right". Building that key into one
+        // reused buffer keeps the hot path free of allocation.
+        std::string key;
+        const auto merge_rank = [&](std::int32_t left, std::int32_t right) -> std::optional<int> {
+            const Symbol& l = symbols[static_cast<size_t>(left)];
+            const Symbol& r = symbols[static_cast<size_t>(right)];
+            key.assign(text, l.begin, l.length);
+            key.push_back('\x00');
+            key.append(text, r.begin, r.length);
+            const auto found = spm_merge_rank.find(key);
             if (found == spm_merge_rank.end()) return std::nullopt;
             return found->second;
         };
 
-        // Repeatedly merge the adjacent pair the training learned earliest. Ties
-        // go to the leftmost pair, which is the order a left-to-right scan finds
-        // them in.
-        for (;;) {
-            std::optional<int> best_rank;
-            size_t best_index = 0;
-            for (size_t i = 0; i + 1 < symbols.size(); ++i) {
-                const auto rank = merge_rank(symbols[i], symbols[i + 1]);
-                if (!rank.has_value()) continue;
-                if (!best_rank.has_value() || *rank < *best_rank) {
-                    best_rank  = rank;
-                    best_index = i;
-                }
-            }
-            if (!best_rank.has_value()) break;
-            symbols[best_index] += symbols[best_index + 1];
-            symbols.erase(symbols.begin() + static_cast<long>(best_index) + 1);
+        // Merge the pair the training learned earliest, then only reconsider the
+        // two pairs that merge created. Rescanning every pair after every merge
+        // is what made this quadratic: an 8k-token prompt took ~29 s, against
+        // ~30 ms for the same text through the reference tokenizer.
+        //
+        // Ties go to the leftmost pair, which is what a left-to-right scan for a
+        // strictly smaller rank picked before; here the heap orders by rank and
+        // then by position, which is the same choice.
+        struct Candidate {
+            int rank;
+            std::uint32_t begin;
+            std::int32_t left;
+            std::int32_t right;
+            std::uint32_t left_length;
+            std::uint32_t right_length;
+        };
+        const auto later = [](const Candidate& a, const Candidate& b) {
+            if (a.rank != b.rank) { return a.rank > b.rank; }
+            return a.begin > b.begin;
+        };
+        std::priority_queue<Candidate, std::vector<Candidate>, decltype(later)> pending(later);
+
+        const auto offer = [&](std::int32_t left, std::int32_t right) {
+            if (left < 0 || right < 0) { return; }
+            const auto rank = merge_rank(left, right);
+            if (!rank.has_value()) { return; }
+            const Symbol& l = symbols[static_cast<size_t>(left)];
+            pending.push({*rank, l.begin, left, right, l.length,
+                          symbols[static_cast<size_t>(right)].length});
+        };
+        for (std::int32_t i = 0; symbols[static_cast<size_t>(i)].next >= 0;
+             i = symbols[static_cast<size_t>(i)].next) {
+            offer(i, symbols[static_cast<size_t>(i)].next);
         }
 
-        for (const std::string& symbol : symbols) {
-            const auto rank = rank_of(symbol);
+        while (!pending.empty()) {
+            const Candidate best = pending.top();
+            pending.pop();
+            Symbol& left = symbols[static_cast<size_t>(best.left)];
+            Symbol& right = symbols[static_cast<size_t>(best.right)];
+            // A candidate goes stale when either side has since been merged.
+            // Checking the lengths it was queued with is enough to tell.
+            if (left.next != best.right || left.length != best.left_length ||
+                right.length != best.right_length || left.length == 0 || right.length == 0) {
+                continue;
+            }
+            left.length += right.length;
+            left.next = right.next;
+            if (right.next >= 0) { symbols[static_cast<size_t>(right.next)].prev = best.left; }
+            right.length = 0;
+            offer(left.prev, best.left);
+            offer(best.left, left.next);
+        }
+
+        for (std::int32_t i = 0; i >= 0; i = symbols[static_cast<size_t>(i)].next) {
+            const Symbol& symbol = symbols[static_cast<size_t>(i)];
+            const auto rank      = rank_of(symbol.begin, symbol.length);
             if (rank.has_value()) {
                 out.push_back(static_cast<int32_t>(*rank));
                 continue;
             }
             // What the merges could not place is spelled one raw byte at a time.
-            for (const unsigned char byte : symbol) {
+            for (std::uint32_t b = 0; b < symbol.length; ++b) {
+                const auto byte = static_cast<unsigned char>(text[symbol.begin + b]);
                 char named[7];
                 std::snprintf(named, sizeof(named), "<0x%02X>", byte);
-                const auto fallback = rank_of(named);
-                if (!fallback.has_value()) {
+                const std::vector<uint8_t> key_bytes(named, named + std::strlen(named));
+                const auto found = encoder.find(key_bytes);
+                if (found == encoder.end()) {
                     throw std::runtime_error(
                         std::string("Tokenizer::encode: vocabulary defines no <0xNN> token for byte ") +
                         named);
                 }
-                out.push_back(static_cast<int32_t>(*fallback));
+                out.push_back(static_cast<int32_t>(found->second));
             }
         }
     }
