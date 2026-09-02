@@ -59,6 +59,12 @@ constexpr Geometry kGeometries[] = {
     // 24 query heads over 2 KV heads: a group of twelve, which the small-T
     // lane step (64 rows) serves 5 tokens at a time rather than 6.
     {"qwen3_8_flash_next", 24, 2},
+    // gemma-3-270m: one KV head, the only multi-query shape registered. It is
+    // the shape the sliding window was written for and the first with a group
+    // of four, so the small-T lane step serves 16 tokens rather than 6 -- and
+    // dividing the split target by its DecodeSplitScale of 4 asks for fewer
+    // keys per split than any other geometry.
+    {"gemma3_270m", 4, 1},
 };
 
 struct AttentionCase {

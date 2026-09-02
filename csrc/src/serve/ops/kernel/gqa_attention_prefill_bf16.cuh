@@ -250,19 +250,32 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
-    const int n_block_max   = (max_query_abs / Bc) + 1; // n_block_min == 0
+    const int n_block_max   = (max_query_abs / Bc) + 1;
+    // A window makes the oldest keys invisible to every query in this tile, so
+    // the loop need not start at zero. The tile's earliest query sits at
+    // `base_pos + q0`, and it admits keys from `base_pos + q0 - window + 1`;
+    // anything below that is masked for all Br rows. Starting at that key's
+    // block turns the scan from O(context) into O(window) per tile -- the mask
+    // was correct without this, just paid for on every key ever written.
+    // A sparse chunk carries no window (the block mask is its selection), so it
+    // keeps starting at zero.
+    const int first_visible_key =
+        metadata.window > 0 ? (base_pos + q0) - metadata.window + 1 : 0;
+    const int n_block_min = first_visible_key > 0 ? (first_visible_key / Bc) : 0;
 
     // Fold softmax_scale into the exp2 (FA-style): scores stay raw, so the
     // per-element "* scale" multiply drops out of the QK epilogue entirely.
     const float scale_l2 = scale * Log2E;
-    int physical_page    = block_table[0];
+    int physical_page    = block_table[n_block_min];
 
-    // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
+    // Prologue: commit Q, then kick off the first key block the loop will read.
+    // The loop's wait<0> below drains both.
     sinfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
+    gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, n_block_min * Bc, max_query_abs,
+                                           physical_page, tid);
     sinfer::ops::cp_commit();
 
-    for (int kb = 0; kb < n_block_max; ++kb) {
+    for (int kb = n_block_min; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
         const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
 

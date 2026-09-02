@@ -296,6 +296,17 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int key_blocks    = max_query_abs / Bc + 1;
+    // A window makes the oldest keys invisible to every query in this tile, so
+    // the loop need not start at zero. The tile's earliest query sits at
+    // `base_pos + q0`, and it admits keys from `base_pos + q0 - window + 1`;
+    // anything below that is masked for all Br rows. Starting at that key's
+    // block turns the scan from O(context) into O(window) per tile -- the mask
+    // was correct without this, just paid for on every key ever written.
+    // A sparse chunk carries no window (the block mask is its selection), so it
+    // keeps starting at zero.
+    const int first_visible_key =
+        metadata.window > 0 ? (base_pos + q0) - metadata.window + 1 : 0;
+    const int first_key_block = first_visible_key > 0 ? (first_visible_key / Bc) : 0;
 
     // Quantize Q cooperatively. One warp owns one (row, 64-d group) at a time.
     for (int unit = warp; unit < Br * Groups; unit += kGqaPrefillI8Warps) {
@@ -366,7 +377,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         sinfer::ops::cp_commit();
     };
 
-    issue_kv_tile(0);
+    issue_kv_tile(first_key_block * Bc);
     sinfer::ops::cp_wait<0>();
     __syncthreads();
 
@@ -408,7 +419,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     float running_l0     = 0.0f;
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
-    for (int kb = 0; kb < key_blocks; ++kb) {
+    for (int kb = first_key_block; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
