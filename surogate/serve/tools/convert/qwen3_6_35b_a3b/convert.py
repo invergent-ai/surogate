@@ -24,12 +24,14 @@ from typing import Mapping, Sequence
 import torch
 
 from surogate.serve.tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
+from surogate.core.model import quant_schemes
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
 from surogate.serve.tools.convert.common import conversion as family_conversion
 from surogate.serve.tools.convert.common import official_resources
+from surogate.serve.tools.convert.common import recipe as family_recipe
 
-from . import draft_head, inventory, recipe, routed_nvfp4
+from . import compressed_tensors_source, draft_head, inventory, recipe, routed_nvfp4
 
 
 RECIPE_ID = "qwen3_6_35b_a3b-v2"
@@ -165,6 +167,10 @@ class ConversionPreflight:
     object_plan: ObjectPlan
     routed_nvfp4_dir: Path | None = None
     routed_nvfp4_summary: dict[str, object] | None = None
+    #: Set when the source is a compressed-tensors export: the config decided every
+    #: text-core object's format, and these read the stored words for them.
+    compressed_source: compressed_tensors_source.CompressedTensorsSource | None = None
+    compressed_plan: compressed_tensors_source.SourcePlan | None = None
 
 
 def _repo_root() -> Path:
@@ -269,7 +275,7 @@ def preflight_inventory() -> None:
     )
     if counts != (6, 533, 2, 15, 333, 51, 934, 940):
         raise ValueError(f"target inventory is incomplete: {counts}")
-    if inventory.FORMAT_COUNTS != {
+    if {k: v for k, v in inventory.FORMAT_COUNTS.items() if v} != {
         inventory.BF16: 487,
         inventory.FP32: 60,
         inventory.I32: 1,
@@ -279,7 +285,7 @@ def preflight_inventory() -> None:
         inventory.W8: 195,
     }:
         raise ValueError(f"target format counts drifted: {inventory.FORMAT_COUNTS}")
-    if inventory.LAYOUT_COUNTS != {
+    if {k: v for k, v in inventory.LAYOUT_COUNTS.items() if v} != {
         inventory.CONTIGUOUS_LAYOUT: 548,
         inventory.ROW_SPLIT_LAYOUT: 386,
     }:
@@ -319,9 +325,11 @@ def preflight_inventory() -> None:
     recipe.validate_recipe_coverage()
 
 
-def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
+def load_resources(
+    model_dir: str | Path, *, accept_source: bool = False
+) -> tuple[ResourcePayload, ...]:
     return official_resources.load_official_resources(
-        model_dir, inventory.RESOURCE_SPECS
+        model_dir, inventory.RESOURCE_SPECS, accept_source=accept_source
     )
 
 
@@ -365,6 +373,17 @@ def preflight_conversion(
 
     model = Path(model_dir)
     dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
+    # A compressed-tensors export supplies every role itself: its config says which
+    # modules are quantized, its packed routed experts come from the same shards, and
+    # the modules it left alone are read as the BF16 they are stored in.
+    compressed_source = (
+        compressed_tensors_source.CompressedTensorsSource(model)
+        if quant_schemes.quantization_config_of(family_conversion.load_json(model / "config.json"))
+        is not None
+        else None
+    )
+    if compressed_source is not None and routed_nvfp4_dir is None:
+        routed_nvfp4_dir = model
     routed_nvfp4_model = Path(routed_nvfp4_dir) if routed_nvfp4_dir is not None else None
     routed_nvfp4_summary = (
         routed_nvfp4.validate_config(
@@ -384,20 +403,42 @@ def preflight_conversion(
         else None
     )
     preflight_inventory()
-    base_source = recipe.preflight_base_sources(model)
+    compressed_plan = (
+        compressed_source.plan(routed_nvfp4.tensor_specs(), recipe.BASE_RECIPES_BY_NAME)
+        if compressed_source is not None
+        else None
+    )
+    if compressed_plan is None:
+        base_source = recipe.preflight_base_sources(model)
+    else:
+        # The exact-inventory preflight cannot apply here: the export stores packed
+        # tensors the recipes never name and lacks the plain ones they do. The recipes
+        # the plan did not take over are checked leniently, as the GGUF path does.
+        remaining = tuple(
+            item
+            for name, item in recipe.BASE_RECIPES_BY_NAME.items()
+            if name not in compressed_plan.covered and not routed_nvfp4.is_routed_object(name)
+        )
+        base_source = family_recipe.preflight_sources(model, remaining)
     dflash_source = (
         recipe.preflight_dflash_sources(dflash_model)
         if dflash_model is not None
         else None
     )
 
-    resources = load_resources(model)
+    resources = load_resources(model, accept_source=compressed_source is not None)
     resource_map = {resource.name: resource.data for resource in resources}
-    object_plan = build_object_plan(
-        resource_map,
-        include_dflash=dflash_model is not None,
-        routed_nvfp4_source=routed_nvfp4_model is not None,
-    )
+    if compressed_plan is None:
+        object_plan = build_object_plan(
+            resource_map,
+            include_dflash=dflash_model is not None,
+            routed_nvfp4_source=routed_nvfp4_model is not None,
+        )
+    else:
+        specs = inventory.RESOURCE_SPECS + compressed_plan.specs
+        if dflash_model is None:
+            specs = tuple(spec for spec in specs if spec not in inventory.DFLASH_TENSOR_SPECS)
+        object_plan = family_conversion.build_object_plan(specs, resource_map)
 
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
@@ -413,6 +454,8 @@ def preflight_conversion(
         object_plan=object_plan,
         routed_nvfp4_dir=routed_nvfp4_model,
         routed_nvfp4_summary=routed_nvfp4_summary,
+        compressed_source=compressed_source,
+        compressed_plan=compressed_plan,
     )
 
 
@@ -583,7 +626,9 @@ def convert(
         output,
         ArtifactIdentity(
             inventory.MODEL_ID,
-            routed_nvfp4.WEIGHTS_ID
+            compressed_tensors_source.WEIGHTS_ID
+            if preflight.compressed_plan is not None
+            else routed_nvfp4.WEIGHTS_ID
             if preflight.routed_nvfp4_dir is not None
             else inventory.WEIGHTS_ID,
         ),
@@ -603,7 +648,11 @@ def convert(
         for spec in inventory.RESOURCE_SPECS:
             write_payload(spec, resources[spec.name])
 
-        all_specs = tensor_specs(preflight.routed_nvfp4_dir is not None)
+        all_specs = (
+            preflight.compressed_plan.specs
+            if preflight.compressed_plan is not None
+            else tensor_specs(preflight.routed_nvfp4_dir is not None)
+        )
         base_specs = all_specs[: -len(inventory.DFLASH_TENSOR_SPECS)]
         routed_reader = (
             ShardReader.from_index(
@@ -618,6 +667,19 @@ def convert(
                 model / "model.safetensors.index.json"
             ) as reader:
                 for spec in base_specs:
+                    if preflight.compressed_plan is not None and (
+                        spec.name in preflight.compressed_plan.objects
+                        or spec.name.endswith(compressed_tensors_source.INPUT_DIVISOR_SUFFIX)
+                    ):
+                        # Stored words copied as they are: NVFP4 codes, scales and global
+                        # scale where the export packed the module, BF16 rows where it did
+                        # not. No dequantise-requantise round trip in either case.
+                        payload = preflight.compressed_source.payload_for(
+                            spec.name, preflight.compressed_plan.objects, reader
+                        )
+                        write_payload(spec, payload)
+                        del payload
+                        continue
                     if routed_cache is not None and routed_nvfp4.is_routed_object(spec.name):
                         # The routed experts come from the NVFP4 checkpoint as stored words:
                         # no dequantise-requantise round trip, so the artifact holds exactly

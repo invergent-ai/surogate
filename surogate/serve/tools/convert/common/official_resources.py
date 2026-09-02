@@ -56,8 +56,17 @@ _DERIVABLE_RESOURCES = frozenset(
 
 def validate_official_resource_hashes(
     actual_hashes: Mapping[str, str],
+    *,
+    accept_source: bool = False,
 ) -> None:
-    """Require the complete official six-resource profile."""
+    """Require the complete official six-resource profile.
+
+    ``accept_source`` is for a checkpoint that is its own authority -- a
+    quantized export ships the frontend it was calibrated and served with, and
+    a re-serialised ``tokenizer.json`` is not a defect. Every resource is still
+    present and hashed; a hash that differs from the pinned official one is
+    reported, not refused.
+    """
 
     expected_names = tuple(OFFICIAL_RESOURCE_SHA256)
     actual_names = tuple(actual_hashes)
@@ -71,6 +80,15 @@ def validate_official_resource_hashes(
         actual = actual_hashes[name]
         if actual != expected:
             filename = name.removeprefix("frontend/")
+            if accept_source:
+                import sys
+
+                print(
+                    f"note: {filename} is the checkpoint's own: sha256 {actual} "
+                    f"(pinned official {expected})",
+                    file=sys.stderr,
+                )
+                continue
             if derived_ok and name in _DERIVABLE_RESOURCES:
                 import sys
 
@@ -87,7 +105,9 @@ def validate_official_resource_hashes(
             )
 
 
-def validate_official_resources(resources: Sequence[ResourcePayload]) -> None:
+def validate_official_resources(
+    resources: Sequence[ResourcePayload], *, accept_source: bool = False
+) -> None:
     """Hash and validate already loaded resource payloads."""
 
     hashes = {
@@ -96,12 +116,14 @@ def validate_official_resources(resources: Sequence[ResourcePayload]) -> None:
     }
     if len(hashes) != len(resources):
         raise ValueError("Qwen3.6 frontend resource set contains duplicate names")
-    validate_official_resource_hashes(hashes)
+    validate_official_resource_hashes(hashes, accept_source=accept_source)
 
 
 def load_official_resources(
     model_dir: str | Path,
     resource_specs: Sequence[ResourceSpec],
+    *,
+    accept_source: bool = False,
 ) -> tuple[ResourcePayload, ...]:
     """Load exactly the pinned official resource set from a source checkpoint."""
 
@@ -113,7 +135,7 @@ def load_official_resources(
             f"expected {expected_names!r}, got {spec_names!r}"
         )
     resources = load_resources(model_dir, resource_specs)
-    validate_official_resources(resources)
+    validate_official_resources(resources, accept_source=accept_source)
     return resources
 
 

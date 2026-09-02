@@ -42,7 +42,7 @@ def test_complete_full_only_inventory_and_canonical_order() -> None:
 
 
 def test_format_layout_counts_and_key_signatures() -> None:
-    assert inventory.FORMAT_COUNTS == {
+    assert {k: v for k, v in inventory.FORMAT_COUNTS.items() if v} == {
         "BF16": 582,
         "FP32": 96,
         "I32": 1,
@@ -51,7 +51,7 @@ def test_format_layout_counts_and_key_signatures() -> None:
         "Q6G64_F16S": 3,
         "W8G32_F16S": 7,
     }
-    assert inventory.LAYOUT_COUNTS == {
+    assert {k: v for k, v in inventory.LAYOUT_COUNTS.items() if v} == {
         "contiguous-le-v1": 679,
         "row-split-k128-v1": 439,
     }

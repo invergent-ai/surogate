@@ -12,6 +12,8 @@ from dataclasses import dataclass
 
 CONTIGUOUS_LAYOUT = "contiguous-le-v1"
 ROW_SPLIT_LAYOUT = "row-split-k128-v1"
+BLOCK_SCALE_LAYOUT = "blockscale-k16-m128x4-v1"
+ROW_SCALE_LAYOUT = "row-scale-v1"
 RESOURCE_ENCODING = "raw-bytes-v1"
 
 BF16 = "BF16"
@@ -21,10 +23,15 @@ Q4 = "Q4G64_F16S"
 Q5 = "Q5G64_F16S"
 Q6 = "Q6G64_F16S"
 W8 = "W8G32_F16S"
+NVFP4 = "NVFP4"
+FP8 = "FP8_E4M3FN_ROW_BF16S"
 
 DIRECT_FORMATS = frozenset((BF16, FP32, I32))
-FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8)
-LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT)
+# The engine's nine formats and four layouts (csrc/src/serve/artifact/reader.h). Every
+# target used to re-declare the NVFP4 pair beside its own inventory; they are named
+# once here so a converter that reads formats off a checkpoint has one vocabulary.
+FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8, NVFP4, FP8)
+LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT, BLOCK_SCALE_LAYOUT, ROW_SCALE_LAYOUT)
 
 VISION_LAYERS = tuple(range(27))
 
