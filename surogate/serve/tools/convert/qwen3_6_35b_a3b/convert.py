@@ -364,6 +364,8 @@ def preflight_conversion(
     model_dir: str | Path,
     dflash_model_dir: str | Path | None,
     routed_nvfp4_dir: str | Path | None = None,
+    *,
+    shared_expert: str = "as-stored",
 ) -> ConversionPreflight:
     """Complete config, source, shortlist, and offset work before writing.
 
@@ -404,7 +406,9 @@ def preflight_conversion(
     )
     preflight_inventory()
     compressed_plan = (
-        compressed_source.plan(routed_nvfp4.tensor_specs(), recipe.BASE_RECIPES_BY_NAME)
+        compressed_source.plan(
+            routed_nvfp4.tensor_specs(), recipe.BASE_RECIPES_BY_NAME, shared_expert=shared_expert
+        )
         if compressed_source is not None
         else None
     )
@@ -602,6 +606,7 @@ def convert(
     *,
     device: str | torch.device = "cuda",
     routed_nvfp4_dir: str | Path | None = None,
+    shared_expert: str = "as-stored",
 ) -> Path:
     """Run the complete target conversion and return its report path."""
 
@@ -611,7 +616,7 @@ def convert(
     requested_device = str(device)
     resolved_device = pick_device(device)
     dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
-    preflight = preflight_conversion(model, dflash_model, routed_nvfp4_dir)
+    preflight = preflight_conversion(model, dflash_model, routed_nvfp4_dir, shared_expert=shared_expert)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -675,7 +680,7 @@ def convert(
                         # scale where the export packed the module, BF16 rows where it did
                         # not. No dequantise-requantise round trip in either case.
                         payload = preflight.compressed_source.payload_for(
-                            spec.name, preflight.compressed_plan.objects, reader
+                            spec.name, preflight.compressed_plan.objects, reader, resolved_device
                         )
                         write_payload(spec, payload)
                         del payload
@@ -776,6 +781,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--shared-expert",
+        choices=compressed_tensors_source.SHARED_EXPERT_CHOICES,
+        default="as-stored",
+        help=(
+            "compressed-tensors sources only: keep the shared expert in the format the export "
+            "stored (default), or requantise it to W8 for the MoE kernels, which admit W8 only "
+            "until they take NVFP4 -- the one place the export's format is not kept"
+        ),
+    )
     args = parser.parse_args(argv)
     convert(
         args.model,
@@ -783,6 +798,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.out,
         device=args.device,
         routed_nvfp4_dir=args.routed_nvfp4,
+        shared_expert=args.shared_expert,
     )
 
 

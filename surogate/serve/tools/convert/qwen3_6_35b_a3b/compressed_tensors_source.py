@@ -37,12 +37,15 @@ from surogate.core.model.quant_schemes import (
     resolve_checkpoint,
 )
 from surogate.serve.tools.artifact.layouts import encode_direct, encode_nvfp4
+from surogate.serve.tools.convert.common.conversion import encode_tensor_payload
 from surogate.serve.tools.convert.common.inventory import (
     BF16,
     FP32,
     BLOCK_SCALE_LAYOUT,
     CONTIGUOUS_LAYOUT,
     NVFP4,
+    ROW_SPLIT_LAYOUT,
+    W8,
     TensorSpec,
 )
 from surogate.serve.tools.convert.common.recipe import TensorRecipe
@@ -69,20 +72,36 @@ SEGMENT_NAMES: Mapping[str, tuple[str, ...]] = {
 
 INPUT_DIVISOR_SUFFIX = "/input_scale_divisor"
 
+#: The shared expert's objects. The MoE kernels compute the shared expert inside their
+#: bodies and admit W8 only, so until they take NVFP4 the converter can, on request,
+#: requantise these to the W8 the base converter would have produced -- the one place the
+#: export's format is not kept, opted into explicitly, and recorded in the report.
+SHARED_EXPERT_SUFFIXES = ("moe/shared_gate_up", "moe/shared_down")
+SHARED_EXPERT_CHOICES = ("as-stored", "w8")
+
 
 @dataclass(frozen=True)
 class ObjectSource:
-    """One artifact object as a run of rows from one logical source."""
+    """One artifact object as a run of rows from one logical source.
+
+    ``extra`` carries further (source, rows) segments for an object that keeps a
+    fused parent while being requantised from separately stored halves.
+    """
 
     name: str
     source: str  # logical HF tensor, e.g. "...self_attn.q_proj.weight"
     rows: np.ndarray  # row ids into the source, in object row order
     k: int
     quantized: bool  # NVFP4 (weight_packed) if True, BF16 (weight) if not
+    requantize_to: str | None = None  # a stored format to re-encode into, e.g. W8
+    extra: tuple[tuple[str, np.ndarray], ...] = ()
 
     @property
     def n(self) -> int:
-        return int(self.rows.size)
+        return int(self.rows.size) + sum(int(rows.size) for _, rows in self.extra)
+
+    def segments(self) -> tuple[tuple[str, np.ndarray], ...]:
+        return ((self.source, self.rows),) + self.extra
 
 
 @dataclass(frozen=True)
@@ -128,6 +147,8 @@ class CompressedTensorsSource:
         self,
         specs: Sequence[TensorSpec],
         recipes_by_name: Mapping[str, TensorRecipe],
+        *,
+        shared_expert: str = "as-stored",
     ) -> SourcePlan:
         """Rewrite the text-core specs: formats from the export, parents split.
 
@@ -135,8 +156,13 @@ class CompressedTensorsSource:
         this module's business; a fused parent listed in SEGMENT_NAMES becomes
         one object per segment, any other Linear-derived object keeps its name
         and takes the file's format. Everything else passes through untouched.
+        ``shared_expert="w8"`` keeps the shared expert's inventory objects as
+        they are and requantises them from the stored halves (see
+        SHARED_EXPERT_SUFFIXES).
         """
 
+        if shared_expert not in SHARED_EXPERT_CHOICES:
+            raise ValueError(f"shared_expert must be one of {SHARED_EXPERT_CHOICES}")
         out: list[TensorSpec] = []
         objects: dict[str, ObjectSource] = {}
         covered: set[str] = set()
@@ -151,6 +177,17 @@ class CompressedTensorsSource:
                 out.append(spec)
                 continue
             segments = program.segments()
+            if shared_expert == "w8" and suffix in SHARED_EXPERT_SUFFIXES:
+                if spec.format != W8:
+                    raise ValueError(f"{spec.name}: expected a W8 inventory object, got {spec.format}")
+                (source, rows), *rest = segments
+                objects[spec.name] = ObjectSource(
+                    spec.name, source, rows, program.k, self.is_quantized(source),
+                    requantize_to=W8, extra=tuple((s, r) for s, r in rest),
+                )
+                covered.add(spec.name)
+                out.append(spec)
+                continue
             if suffix in SEGMENT_NAMES:
                 names = SEGMENT_NAMES[suffix]
                 if len(segments) != len(names):
@@ -190,12 +227,32 @@ class CompressedTensorsSource:
 
     # -- payloads ----------------------------------------------------------------
 
-    def payload_for(self, name: str, objects: Mapping[str, ObjectSource], reader: ShardReader) -> bytes:
+    def payload_for(
+        self,
+        name: str,
+        objects: Mapping[str, ObjectSource],
+        reader: ShardReader,
+        device: str | torch.device = "cpu",
+    ) -> bytes:
         if name.endswith(INPUT_DIVISOR_SUFFIX):
             item = objects[name[: -len(INPUT_DIVISOR_SUFFIX)]]
             word = reader.get(_module_of(item.source) + ".input_global_scale")
             return _fp32_word(word, item.source + " input_global_scale")
         item = objects[name]
+        if item.requantize_to is not None:
+            # Every segment brought to BF16 -- the NVFP4 ones dequantised through the same
+            # words the engine would read -- then encoded as the base converter encodes.
+            parts = []
+            for source, rows in item.segments():
+                index = torch.from_numpy(np.ascontiguousarray(rows))
+                if self.is_quantized(source):
+                    parts.append(_dequantize_nvfp4(reader, _module_of(source), index))
+                else:
+                    parts.append(reader.get(source).index_select(0, index).to(torch.bfloat16))
+            fused = torch.cat(parts, dim=0).contiguous()
+            layout = ROW_SPLIT_LAYOUT if item.requantize_to == W8 else CONTIGUOUS_LAYOUT
+            spec = TensorSpec(name, (item.n, item.k), item.requantize_to, layout)
+            return encode_tensor_payload(fused, spec, device)
         module = _module_of(item.source)
         rows = torch.from_numpy(np.ascontiguousarray(item.rows))
         if not item.quantized:
@@ -219,6 +276,33 @@ class CompressedTensorsSource:
             divisor,
             (item.n, item.k),
         )
+
+
+#: E2M1 nibble -> value: sign in bit 3, exponent bits 2-1, mantissa bit 0.
+_E2M1 = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+
+
+def _dequantize_nvfp4(reader: ShardReader, module: str, rows: torch.Tensor) -> torch.Tensor:
+    """The values an NVFP4 module represents, as BF16 rows.
+
+    compressed-tensors: value = code * fp8_block_scale / weight_global_scale (the global
+    scale divides). Low nibble is the even column, as the packed layout stores it.
+    """
+
+    codes = reader.get(module + ".weight_packed").index_select(0, rows)
+    scales = reader.get(module + ".weight_scale").index_select(0, rows)
+    global_scale = float(reader.get(module + ".weight_global_scale").reshape(()).to(torch.float32))
+    if codes.dtype != torch.uint8 or scales.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"{module}: unexpected packed dtypes {codes.dtype}, {scales.dtype}")
+    n, half = codes.shape
+    values = torch.empty((n, half * 2), dtype=torch.float32)
+    values[:, 0::2] = _E2M1[(codes & 0x0F).long()]
+    values[:, 1::2] = _E2M1[(codes >> 4).long()]
+    block_scale = scales.to(torch.float32).repeat_interleave(16, dim=1)
+    return (values * block_scale / global_scale).to(torch.bfloat16)
 
 
 def _fp32_word(tensor: torch.Tensor, what: str) -> bytes:
