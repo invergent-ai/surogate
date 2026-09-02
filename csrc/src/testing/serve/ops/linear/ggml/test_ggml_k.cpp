@@ -1,8 +1,15 @@
-// K-quant GEMV against an independent reference. Fixtures (gen_fixture.py) hold each type's
-// weight in native GGML blocks plus gguf-py's exact dequantisation. The reference quantises the
-// activation exactly as the kernel does (per 32: d = amax/127 in fp32, q = round(x/d), d kept
-// as fp16) and takes the fp64 dot of the dequantised weight with that quantised activation, so
-// the only divergence left is fp32 accumulation order -- a tight bound, not a statistical one.
+// K-quant routes against an independent reference. Fixtures (gen_fixture.py) hold each
+// type's weight in native GGML blocks plus gguf-py's exact dequantisation. The reference
+// quantises the activation exactly as the kernel does (per 32: d = amax/127 in fp32,
+// q = round(x/d), d kept as fp16) and takes the fp64 dot of the dequantised weight with that
+// quantised activation, so the only divergence left is fp32 accumulation order -- a tight
+// bound, not a statistical one. Beyond the launchers, the public wrappers are driven too:
+// ops::linear without a workspace (the engine-slot scratch the lm_head takes) and
+// ops::embedding (the row gather).
+#include "api/ops/embedding.h"
+#include "api/ops/linear.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/ggml/ggml_embedding.h"
 #include "ops/linear/ggml/ggml_linear.h"
 
 #include <cuda_bf16.h>
@@ -22,6 +29,11 @@
 namespace {
 
 namespace gg = sinfer::ops::detail::ggml;
+using sinfer::DType;
+using sinfer::QType;
+using sinfer::QuantLayout;
+using sinfer::Tensor;
+using sinfer::Weight;
 
 #define CHECK_CUDA(call)                                                                        \
     do {                                                                                        \
@@ -70,6 +82,38 @@ bool load_fixture(const std::string& dir, gg::GgmlType type, const std::string& 
     return true;
 }
 
+QType qtype_of(gg::GgmlType type) {
+    switch (type) {
+    case gg::GgmlType::Q2_K: return QType::Q2_K;
+    case gg::GgmlType::Q3_K: return QType::Q3_K;
+    case gg::GgmlType::Q4_K: return QType::Q4_K;
+    case gg::GgmlType::Q5_K: return QType::Q5_K;
+    case gg::GgmlType::Q6_K: return QType::Q6_K;
+    }
+    return QType::Q4_K;
+}
+
+// The Weight the artifact loader builds for a GgmlBlocks object (typed_binding.cpp).
+Weight make_weight(const Fixture& f, void* d_blocks) {
+    Weight w{};
+    w.payload         = d_blocks;
+    w.payload_bytes   = f.blocks.size();
+    w.qtype           = qtype_of(f.type);
+    w.group_size      = 256;
+    w.ndim            = 2;
+    w.qdata           = d_blocks;
+    w.n               = f.n;
+    w.k               = f.k;
+    w.group           = 256;
+    w.layout          = QuantLayout::GgmlBlocks;
+    w.scale_dtype     = DType::FP16;
+    w.shape[0]        = f.n;
+    w.shape[1]        = f.k;
+    w.padded_shape[0] = f.n;
+    w.padded_shape[1] = f.k;
+    return w;
+}
+
 // The kernel's own activation quantisation, on the host, in the same arithmetic.
 std::vector<double> quantised_activation(const std::vector<__nv_bfloat16>& x, int k, int tokens) {
     std::vector<double> y(static_cast<std::size_t>(k) * tokens);
@@ -82,7 +126,7 @@ std::vector<double> quantised_activation(const std::vector<__nv_bfloat16>& x, in
                 amax    = std::fmax(amax, std::fabs(vals[i]));
             }
             const float d      = amax / 127.0F;
-            const float d_half = __half2float(__float2half(d)); // stored as half, read back
+            const float d_half = __half2float(__float2half(d));
             for (int i = 0; i < 32; ++i) {
                 const int q = amax == 0.0F ? 0 : static_cast<int>(std::round(vals[i] / d));
                 y[static_cast<std::size_t>(t) * k + b * 32 + i] = static_cast<double>(d_half) * q;
@@ -92,26 +136,64 @@ std::vector<double> quantised_activation(const std::vector<__nv_bfloat16>& x, in
     return y;
 }
 
-int run_case(const Fixture& f, int tokens, bool bf16_out, void* d_blocks, void* d_scratch,
-             std::size_t scratch_bytes) {
-    const int n = f.n, k = f.k;
-    std::mt19937 rng(static_cast<unsigned>(1234 + tokens + 7 * static_cast<int>(f.type)));
+std::vector<__nv_bfloat16> random_activation(int k, int tokens, unsigned seed) {
+    std::mt19937 rng(seed);
     std::normal_distribution<float> normal(0.0F, 1.0F);
     std::vector<__nv_bfloat16> x(static_cast<std::size_t>(k) * tokens);
     for (auto& v : x) { v = __float2bfloat16(normal(rng)); }
+    return x;
+}
 
-    const std::vector<double> y = quantised_activation(x, k, tokens);
+// ref[t][row] = base[t][row] + sum_k W[row][k] * yq[t][k]
+std::vector<double> reference(const Fixture& f, const std::vector<double>& y, int tokens,
+                              const std::vector<double>* base) {
+    const int n = f.n, k = f.k;
     std::vector<double> ref(static_cast<std::size_t>(n) * tokens, 0.0);
     for (int t = 0; t < tokens; ++t) {
+        const double* yt = &y[static_cast<std::size_t>(t) * k];
         for (int row = 0; row < n; ++row) {
-            double acc = 0.0;
+            double acc = base != nullptr ? (*base)[static_cast<std::size_t>(t) * n + row] : 0.0;
             const float* w = &f.dequant[static_cast<std::size_t>(row) * k];
-            const double* yt = &y[static_cast<std::size_t>(t) * k];
             for (int i = 0; i < k; ++i) { acc += static_cast<double>(w[i]) * yt[i]; }
             ref[static_cast<std::size_t>(t) * n + row] = acc;
         }
     }
+    return ref;
+}
 
+struct Score {
+    double rel_l2 = 0.0, max_abs = 0.0, max_ref = 0.0;
+};
+
+Score score(const std::vector<float>& got, const std::vector<double>& ref) {
+    Score s;
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const double diff = static_cast<double>(got[i]) - ref[i];
+        num += diff * diff;
+        den += ref[i] * ref[i];
+        s.max_abs = std::fmax(s.max_abs, std::fabs(diff));
+        s.max_ref = std::fmax(s.max_ref, std::fabs(ref[i]));
+    }
+    s.rel_l2 = std::sqrt(num / std::fmax(den, 1e-300));
+    return s;
+}
+
+int report(const Fixture& f, const char* what, int tokens, const Score& s, double bound_l2,
+           double bound_abs_of_max) {
+    const bool ok = s.rel_l2 <= bound_l2 && s.max_abs <= bound_abs_of_max * s.max_ref;
+    std::printf("  %-5s %-10s [%6d,%5d] %-22s T=%-2d rel_l2=%.2e max_abs=%.1e of max  %s\n",
+                gg::type_name(f.type), f.label.c_str(), f.n, f.k, what, tokens, s.rel_l2,
+                s.max_abs / std::fmax(s.max_ref, 1e-300), ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// linear_launch_f32 / linear_launch (bf16) against the reference.
+int run_case(const Fixture& f, int tokens, bool bf16_out, void* d_blocks, void* d_scratch,
+             std::size_t scratch_bytes) {
+    const int n = f.n, k = f.k;
+    const auto x = random_activation(k, tokens, static_cast<unsigned>(1234 + tokens + 7 * static_cast<int>(f.type)));
+    const std::vector<double> ref = reference(f, quantised_activation(x, k, tokens), tokens, nullptr);
     __nv_bfloat16* d_x = nullptr;
     void* d_out        = nullptr;
     CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
@@ -133,41 +215,110 @@ int run_case(const Fixture& f, int tokens, bool bf16_out, void* d_blocks, void* 
     }
     CHECK_CUDA(cudaFree(d_x));
     CHECK_CUDA(cudaFree(d_out));
+    return report(f, bf16_out ? "launch bf16" : "launch f32", tokens, score(got, ref),
+                  bf16_out ? 4e-3 : 2e-5, bf16_out ? 8e-3 : 2e-4);
+}
 
-    if (std::getenv("SINFER_GGML_DEBUG") != nullptr && tokens <= 3 && !bf16_out) {
-        for (int t = 0; t < tokens; ++t) {
-            for (int row = 0; row < 4; ++row) {
-                const std::size_t at = static_cast<std::size_t>(t) * n + row;
-                std::printf("      col %d row %d: got %12.5f ref %12.5f  ratio %.4f\n", t, row, got[at],
-                            ref[at], got[at] / ref[at]);
-            }
+// linear_add_launch: residual += W x, BF16 residual.
+int run_accumulate(const Fixture& f, int tokens, void* d_blocks, void* d_scratch, std::size_t scratch_bytes) {
+    const int n = f.n, k = f.k;
+    const auto x = random_activation(k, tokens, static_cast<unsigned>(777 + tokens));
+    std::mt19937 rng(static_cast<unsigned>(99 + tokens));
+    std::normal_distribution<float> normal(0.0F, 4.0F);
+    std::vector<__nv_bfloat16> residual(static_cast<std::size_t>(n) * tokens);
+    std::vector<double> base(residual.size());
+    for (std::size_t i = 0; i < residual.size(); ++i) {
+        residual[i] = __float2bfloat16(normal(rng));
+        base[i]     = __bfloat162float(residual[i]);
+    }
+    const std::vector<double> ref = reference(f, quantised_activation(x, k, tokens), tokens, &base);
+    __nv_bfloat16* d_x   = nullptr;
+    __nv_bfloat16* d_res = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&d_res, residual.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_res, residual.data(), residual.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    gg::linear_add_launch(f.type, d_blocks, n, k, d_x, tokens, d_res, d_scratch, scratch_bytes, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::vector<__nv_bfloat16> raw(residual.size());
+    CHECK_CUDA(cudaMemcpy(raw.data(), d_res, raw.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaFree(d_x));
+    CHECK_CUDA(cudaFree(d_res));
+    std::vector<float> got(raw.size());
+    for (std::size_t i = 0; i < got.size(); ++i) { got[i] = __bfloat162float(raw[i]); }
+    return report(f, "linear_add_launch", tokens, score(got, ref), 4e-3, 8e-3);
+}
+
+// ops::linear with no workspace: the wrapper, the QType dispatch and the engine-slot scratch.
+int run_wrapper_linear(const Fixture& f, int tokens, void* d_blocks) {
+    const int n = f.n, k = f.k;
+    const auto x = random_activation(k, tokens, static_cast<unsigned>(4242 + tokens));
+    const std::vector<double> ref = reference(f, quantised_activation(x, k, tokens), tokens, nullptr);
+    __nv_bfloat16* d_x   = nullptr;
+    __nv_bfloat16* d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&d_out, static_cast<std::size_t>(n) * tokens * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    const Weight w = make_weight(f, d_blocks);
+    const Tensor xt(d_x, DType::BF16, {k, tokens});
+    Tensor out(d_out, DType::BF16, {n, tokens});
+    sinfer::ops::linear(xt, w, out, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::vector<__nv_bfloat16> raw(static_cast<std::size_t>(n) * tokens);
+    CHECK_CUDA(cudaMemcpy(raw.data(), d_out, raw.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaFree(d_x));
+    CHECK_CUDA(cudaFree(d_out));
+    std::vector<float> got(raw.size());
+    for (std::size_t i = 0; i < got.size(); ++i) { got[i] = __bfloat162float(raw[i]); }
+    return report(f, "ops::linear (no ws)", tokens, score(got, ref), 4e-3, 8e-3);
+}
+
+// The row gather, through the launcher and through ops::embedding, against the oracle rows.
+int run_gather(const Fixture& f, bool through_wrapper, void* d_blocks) {
+    const int n = f.n, k = f.k, tokens = 64;
+    std::mt19937 rng(through_wrapper ? 98 : 99);
+    std::vector<std::int32_t> ids(tokens);
+    for (auto& id : ids) { id = static_cast<std::int32_t>(rng() % static_cast<unsigned>(n)); }
+    std::int32_t* d_ids  = nullptr;
+    __nv_bfloat16* d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_ids, ids.size() * sizeof(std::int32_t)));
+    CHECK_CUDA(cudaMalloc(&d_out, static_cast<std::size_t>(k) * tokens * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMemcpy(d_ids, ids.data(), ids.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    if (through_wrapper) {
+        const Weight w = make_weight(f, d_blocks);
+        const Tensor idt(d_ids, DType::I32, {tokens});
+        Tensor out(d_out, DType::BF16, {k, tokens});
+        sinfer::ops::embedding(idt, w, out, nullptr);
+    } else {
+        gg::embedding_gather_launch(f.type, d_blocks, n, k, d_ids, tokens, d_out, nullptr);
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::vector<__nv_bfloat16> got(static_cast<std::size_t>(k) * tokens);
+    CHECK_CUDA(cudaMemcpy(got.data(), d_out, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaFree(d_ids));
+    CHECK_CUDA(cudaFree(d_out));
+    double max_rel = 0.0;
+    for (int t = 0; t < tokens; ++t) {
+        for (int i = 0; i < k; ++i) {
+            const float ref    = f.dequant[static_cast<std::size_t>(ids[t]) * k + i];
+            const float expect = __bfloat162float(__float2bfloat16(ref)); // exact up to the BF16 store
+            const float val    = __bfloat162float(got[static_cast<std::size_t>(t) * k + i]);
+            max_rel = std::fmax(max_rel, std::fabs(static_cast<double>(val) - expect) / std::fmax(std::fabs(expect), 1e-6));
         }
     }
-    double num = 0.0, den = 0.0, max_abs = 0.0, max_ref = 0.0;
-    for (std::size_t i = 0; i < got.size(); ++i) {
-        const double diff = static_cast<double>(got[i]) - ref[i];
-        num += diff * diff;
-        den += ref[i] * ref[i];
-        max_abs = std::fmax(max_abs, std::fabs(diff));
-        max_ref = std::fmax(max_ref, std::fabs(ref[i]));
-    }
-    const double rel_l2 = std::sqrt(num / std::fmax(den, 1e-300));
-    // fp32 accumulation over k <= 2048 terms: ~1e-6; BF16 output adds its 2^-9 per element.
-    const double bound_l2  = bf16_out ? 4e-3 : 2e-5;
-    const double bound_abs = bf16_out ? 8e-3 * max_ref : 2e-4 * max_ref;
-    const bool ok = rel_l2 <= bound_l2 && max_abs <= bound_abs;
-    std::printf("  %-5s %-10s [%5d,%5d] T=%-2d %-4s rel_l2=%.2e max_abs=%.2e (%.1e of max)  %s\n",
-                gg::type_name(f.type), f.label.c_str(), n, k, tokens, bf16_out ? "bf16" : "f32",
-                rel_l2, max_abs, max_abs / std::fmax(max_ref, 1e-300), ok ? "ok" : "FAIL");
+    const bool ok = max_rel <= 1e-6;
+    std::printf("  %-5s %-10s [%6d,%5d] %-22s 64 rows: max rel %.1e  %s\n", gg::type_name(f.type),
+                f.label.c_str(), n, k, through_wrapper ? "ops::embedding" : "gather launch", max_rel,
+                ok ? "ok" : "FAIL");
     return ok ? 0 : 1;
 }
 
 } // namespace
 
 int main() {
-    const char* env = std::getenv("SINFER_GGML_FIXTURE_DIR");
+    const char* env       = std::getenv("SINFER_GGML_FIXTURE_DIR");
     const std::string dir = env != nullptr ? env : "/tmp/surogate_ggml_test";
-    int device_count = 0;
+    int device_count      = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
         std::fprintf(stderr, "SKIP: no CUDA device\n");
         return 77;
@@ -176,9 +327,10 @@ int main() {
     const gg::GgmlType types[] = {gg::GgmlType::Q2_K, gg::GgmlType::Q3_K, gg::GgmlType::Q4_K,
                                   gg::GgmlType::Q5_K, gg::GgmlType::Q6_K};
     for (const gg::GgmlType type : types) {
-        for (const char* label : {"synthetic", "odd", "real"}) {
+        for (const char* label : {"synthetic", "odd", "real", "big"}) {
             Fixture f;
             if (!load_fixture(dir, type, label, f)) { continue; }
+            const bool big = f.label == "big";
             void* d_blocks = nullptr;
             CHECK_CUDA(cudaMalloc(&d_blocks, f.blocks.size()));
             CHECK_CUDA(cudaMemcpy(d_blocks, f.blocks.data(), f.blocks.size(), cudaMemcpyHostToDevice));
@@ -186,11 +338,22 @@ int main() {
             void* d_scratch = nullptr;
             CHECK_CUDA(cudaMalloc(&d_scratch, scratch_bytes));
             for (const int tokens : {1, 2, 3, 5, 8, 17}) {
+                if (big && tokens > 2) { continue; }
                 failures += run_case(f, tokens, false, d_blocks, d_scratch, scratch_bytes);
                 ++cases;
             }
             failures += run_case(f, 1, true, d_blocks, d_scratch, scratch_bytes);
             ++cases;
+            for (const int tokens : {1, 3}) {
+                if (big && tokens > 1) { continue; }
+                failures += run_accumulate(f, tokens, d_blocks, d_scratch, scratch_bytes);
+                ++cases;
+                failures += run_wrapper_linear(f, tokens, d_blocks);
+                ++cases;
+            }
+            failures += run_gather(f, false, d_blocks);
+            failures += run_gather(f, true, d_blocks);
+            cases += 2;
             CHECK_CUDA(cudaFree(d_scratch));
             CHECK_CUDA(cudaFree(d_blocks));
         }

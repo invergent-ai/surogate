@@ -12,6 +12,7 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 #include "ops/linear/w8a8/w8a8_dispatch.h"
 
@@ -89,6 +90,9 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear_add workspace: invalid token interval");
+    }
+    if (detail::ggml::is_ggml_qtype(qtype)) {
+        return detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, max_tokens);
     }
     if (qtype == QType::BF16_CTRL) {
         if (policy != LinearPolicy::A16Only) {
@@ -173,6 +177,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
     }
 
+    if (detail::ggml::is_ggml_qtype(w.qtype)) {
+        detail::ggml::ggml_linear_add(x, w, residual_out, &ws, stream);
+        return;
+    }
     if (w.qtype == QType::BF16_CTRL) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("BF16 linear_add admits only A16");

@@ -82,6 +82,16 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::Q2_K:
+        return "Q2_K";
+    case NumericFormat::Q3_K:
+        return "Q3_K";
+    case NumericFormat::Q4_K:
+        return "Q4_K";
+    case NumericFormat::Q5_K:
+        return "Q5_K";
+    case NumericFormat::Q6_K:
+        return "Q6_K";
     }
     return {};
 }
@@ -112,6 +122,18 @@ std::uint64_t tensor_alignment(StorageLayout) noexcept { return kTensorAlignment
 
 std::uint64_t resource_alignment(ResourceEncoding) noexcept { return 1; }
 
+std::uint64_t ggml_block_bytes(NumericFormat format) {
+    switch (format) {
+    case NumericFormat::Q2_K: return 84;
+    case NumericFormat::Q3_K: return 110;
+    case NumericFormat::Q4_K: return 144;
+    case NumericFormat::Q5_K: return 176;
+    case NumericFormat::Q6_K: return 210;
+    default: break;
+    }
+    throw ArtifactError("format is not a GGML superblock format");
+}
+
 std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
                                   std::span<const std::uint64_t> shape) {
     if (layout == StorageLayout::ContiguousLeV1) {
@@ -137,6 +159,13 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::RowScaleV1) {
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::GgmlBlocksV1) {
+        if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || (shape[1] % 256) != 0) {
+            throw ArtifactError("ggml-blocks-v1 requires a rank-two shape with k a multiple of 256");
+        }
+        const auto blocks = checked_mul(shape[0], shape[1] / 256, "ggml block count");
+        return checked_mul(blocks, ggml_block_bytes(format), "ggml encoded size");
     }
     throw ArtifactError("unknown tensor layout");
 }

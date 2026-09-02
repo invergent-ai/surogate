@@ -257,6 +257,7 @@ def _repack_planner(root: Path, target_key: str):
         if str(root) not in _sys.path:
             _sys.path.insert(0, str(root))
         from surogate.serve.tools.convert.common.gguf_repack import (
+            NATIVE_TYPES,
             REPACKABLE_TYPES,
             GgufRepackSource,
         )
@@ -267,11 +268,13 @@ def _repack_planner(root: Path, target_key: str):
             hf: entry
             for hf, entry in candidates.items()
             if entry["type"] in REPACKABLE_TYPES
+            or (entry["type"] in NATIVE_TYPES and os.environ.get("SUROGATE_GGUF_NATIVE", "1") != "0")
         }
         source = GgufRepackSource.from_sources(gguf_path, candidates)
         planned = source.plan(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
+        native = source.plan_native(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
         keep: set[str] = set()
-        for name in planned:
+        for name in (*planned, *native):
             for src in recipe.expression_sources(recipe.RECIPES_BY_NAME[name].expression):
                 keep.add(src.name)
         return {hf: candidates[hf] for hf in sorted(keep & set(candidates))}

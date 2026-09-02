@@ -9,6 +9,7 @@
 #include "../config.h"
 
 #include "artifact/binder.h"
+#include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
 
@@ -114,7 +115,7 @@ struct BindingPlan {
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
     WeightPlan output_head;
-    artifact::ObjectHandle draft_head;
+    artifact::LinearBinding draft_head; // format read from the artifact
     artifact::ObjectHandle draft_head_token_ids;
     // surogate vendor patch (PATCHES.md #15): artifacts from MTP-less GGUF
     // exports omit the mtp/* objects; speculation requires has_mtp.

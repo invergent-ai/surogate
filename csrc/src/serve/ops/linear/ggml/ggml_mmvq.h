@@ -35,10 +35,10 @@ constexpr const char* type_name(GgmlType type) noexcept {
 /// The widest column count one mmvq launch handles; wider problems are chunked by the caller.
 inline constexpr std::int32_t kMmvqMaxColumns = 8;
 
-/// out[n, tokens] = W[n, k] · x for tokens <= 8 columns, W in native GGML superblocks
+/// out[n, tokens] = W[n, k] · x (or += with Accumulate) for tokens <= 8 columns, W in native GGML superblocks
 /// (`blocks` = n rows × k/256 blocks, verbatim file bytes) and x already quantised to
 /// block_q8_1 [tokens][k/32]. `DstT` is float (tests, fp32 consumers) or __nv_bfloat16.
-template <typename DstT>
+template <typename DstT, bool Accumulate = false>
 void mmvq_launch(GgmlType type, const void* blocks, std::int32_t n, std::int32_t k,
                  const block_q8_1* y, std::int32_t tokens, DstT* out, cudaStream_t stream);
 

@@ -21,6 +21,11 @@ void linear_launch(GgmlType type, const void* blocks, std::int32_t n, std::int32
                    const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out,
                    void* scratch, std::size_t scratch_bytes, cudaStream_t stream);
 
+/// residual[n, tokens] += W · x: the same route accumulating into the residual.
+void linear_add_launch(GgmlType type, const void* blocks, std::int32_t n, std::int32_t k,
+                       const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* residual,
+                       void* scratch, std::size_t scratch_bytes, cudaStream_t stream);
+
 /// Same, fp32 output (tests and fp32 consumers).
 void linear_launch_f32(GgmlType type, const void* blocks, std::int32_t n, std::int32_t k,
                        const __nv_bfloat16* x, std::int32_t tokens, float* out, void* scratch,

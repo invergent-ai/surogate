@@ -19,6 +19,7 @@ from typing import Sequence, TypeAlias
 import torch
 
 from .numeric import (
+    GgmlBlockFormat,
     DirectFormat,
     Fp8RowFormat,
     Nvfp4Format,
@@ -116,6 +117,11 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("FP8_E4M3FN_ROW_BF16S",)),
 )
+GGML_BLOCKS_V1 = Layout(
+    "ggml-blocks-v1",
+    256,
+    frozenset(("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K")),
+)
 
 LAYOUTS = MappingProxyType(
     {
@@ -125,6 +131,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCKSCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            GGML_BLOCKS_V1,
         )
     }
 )
@@ -299,6 +306,13 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is GGML_BLOCKS_V1:
+        if not isinstance(numeric_spec, GgmlBlockFormat):
+            raise ValueError("ggml-blocks-v1 requires a GGML superblock format")
+        n, k = _shape(shape, rank=2)
+        if k % 256:
+            raise ValueError("ggml-blocks-v1 requires k to be a multiple of 256")
+        return n * (k // 256) * numeric_spec.block_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
 
 

@@ -358,9 +358,12 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
-        return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
-                                                        TextConfig::query_size,
-                                                        ops::LinearPolicy::AllowA8, first, last);
+        return std::max(ops::linear_add_workspace_capacity_bytes(
+                            QType::W8G32_F16S, TextConfig::hidden, TextConfig::query_size,
+                            ops::LinearPolicy::AllowA8, first, last),
+                        ops::linear_add_workspace_capacity_bytes(
+                            QType::Q4_K, TextConfig::hidden, TextConfig::query_size,
+                            ops::LinearPolicy::A16Only, first, last));
     case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
@@ -383,8 +386,12 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
-        return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::W8G32_F16S, 12288, TextConfig::hidden, ops::LinearPolicy::AllowA8, first, last);
+        return std::max(ops::gdn_input_proj_workspace_capacity_bytes(
+                            QType::W8G32_F16S, 12288, TextConfig::hidden, ops::LinearPolicy::AllowA8,
+                            first, last),
+                        ops::gdn_input_proj_workspace_capacity_bytes(
+                            QType::Q4_K, 12288, TextConfig::hidden, ops::LinearPolicy::A16Only,
+                            first, last));
     case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 12288, TextConfig::hidden,
@@ -484,8 +491,8 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return post_mixer_workspace_bytes(QType::W8G32_F16S, QType::W8G32_F16S,
-                                          ops::LinearPolicy::A16Only, first, last);
+        return std::max(post_mixer_workspace_bytes(QType::W8G32_F16S, QType::W8G32_F16S, ops::LinearPolicy::A16Only, first, last),
+                        post_mixer_workspace_bytes(QType::Q4_K, QType::Q4_K, ops::LinearPolicy::A16Only, first, last));
     case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,

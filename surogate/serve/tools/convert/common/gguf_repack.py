@@ -39,6 +39,8 @@ bridged checkpoint as before.
 from __future__ import annotations
 
 import json
+import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -112,6 +114,12 @@ def _planes_iq4_nl(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # returns (codes int8 [n, groups, 32], scales fp16 [n, groups]) with values
 # in logical order; each is pinned bit-exact against gguf-py dequantize in
 # tests/serve/test_gguf_repack.py.
+# GGML K-quants are served in their own superblocks (artifact layout ggml-blocks-v1): the
+# bytes go into the artifact verbatim, row by row, and the kernels read them as the file holds
+# them. Type -> bytes per 256-value superblock.
+NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210}
+_NATIVE_LAYOUT = "ggml-blocks-v1"
+
 REPACKABLE_TYPES = {
     "Q8_0": (34, _planes_q8_0),
     "Q4_0": (18, _planes_q4_0),
@@ -151,9 +159,10 @@ class GgufRepackSource:
         for hf_name, entry in sources.items():
             if not {"name", "rows", "k", "offset", "type"} <= set(entry):
                 raise RepackError(f"{hf_name}: repack map entry is missing fields")
-            if entry["type"] not in REPACKABLE_TYPES:
+            if entry["type"] not in REPACKABLE_TYPES and entry["type"] not in NATIVE_TYPES:
                 raise RepackError(
-                    f"{hf_name}: GGUF type {entry['type']!r} is not exactly repackable"
+                    f"{hf_name}: GGUF type {entry['type']!r} is neither exactly repackable "
+                    "nor a native K-quant"
                 )
         self._file = None
         self._planes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -179,6 +188,8 @@ class GgufRepackSource:
         n, k = self.source_shape(hf_name)
         if k % _GROUP != 0:
             raise RepackError(f"{hf_name}: k={k} is not a multiple of {_GROUP}")
+        if entry["type"] in NATIVE_TYPES:
+            raise RepackError(f"{hf_name}: {entry['type']} is served natively, not as planes")
         block_bytes, decoder = REPACKABLE_TYPES[entry["type"]]
         offset = int(entry["offset"])
         nbytes = n * (k // _GROUP) * block_bytes
@@ -241,11 +252,119 @@ class GgufRepackSource:
                 program = self._evaluate_rows(recipe.expression, probe)
             if program is None:
                 continue
+            if any(self.native_type_of(name) is not None for name in program.sources):
+                # A source held as a K-quant never deinterleaves into W8 planes: the object
+                # is either served natively (plan_native) or dequantised by the bridge.
+                continue
             geometry = row_split_geometry(get_format(_REPACK_FORMAT), spec.shape)
             if geometry.k_pad != geometry.k or geometry.k != program.k:
                 continue  # padding groups would need re-encoding
             planned.append(spec.name)
         return tuple(planned)
+
+    # -- native K-quants: bytes verbatim, row by row ------------------------
+    def native_type_of(self, hf_name: str) -> str | None:
+        """The K-quant type of a mapped source, or None if it is not one."""
+        entry = self.sources.get(hf_name)
+        if entry is None or entry["type"] not in NATIVE_TYPES:
+            return None
+        return str(entry["type"])
+
+    def plan_native(
+        self,
+        recipes_by_name: Mapping[str, TensorRecipe],
+        tensor_specs: Sequence,
+        *,
+        with_token_ids: bool = True,
+    ) -> dict[str, str]:
+        """Objects served as native K-quants: quantized-linear specs whose row program draws
+        every row from mapped sources of one K-quant type at the spec's own k. Returns
+        {object name: GGML type}. A parent that mixes types is not planned here."""
+        probe = np.zeros(1, dtype=np.int64) if with_token_ids else None
+        planned: dict[str, str] = {}
+        for spec in tensor_specs:
+            if getattr(spec, "kind", None) != "tensor" or spec.format != _REPACK_FORMAT:
+                continue
+            recipe = recipes_by_name.get(spec.name)
+            if recipe is None:
+                continue
+            if isinstance(recipe.expression, GatherRows):
+                program = self._evaluate_rows(recipe.expression.source, None)
+            else:
+                program = self._evaluate_rows(recipe.expression, probe)
+            if program is None or program.k != int(spec.shape[1]) or program.k % 256:
+                continue
+            types = {self.native_type_of(name) for name in program.sources}
+            if len(types) != 1 or None in types:
+                continue
+            only = os.environ.get("SUROGATE_GGUF_NATIVE_ONLY")  # bisection aid: name substrings
+            if only and not any(part and part in spec.name for part in only.split(",")):
+                continue
+            planned[spec.name] = next(iter(types))
+        return planned
+
+    @staticmethod
+    def native_specs(tensor_specs: Sequence, plan: Mapping[str, str]) -> tuple:
+        """The specs with each natively planned object's format and layout rewritten."""
+        out = []
+        for spec in tensor_specs:
+            gguf_type = plan.get(getattr(spec, "name", None))
+            if gguf_type is None:
+                out.append(spec)
+            else:
+                out.append(replace(spec, format=gguf_type, layout=_NATIVE_LAYOUT))
+        return tuple(out)
+
+    def _native_rows(self, hf_name: str) -> np.ndarray:
+        """The source's superblock bytes as [rows, bytes per row], zero-copy over the memmap."""
+        entry = self.sources[hf_name]
+        n, k = self.source_shape(hf_name)
+        block_bytes = NATIVE_TYPES[entry["type"]]
+        if k % 256:
+            raise RepackError(f"{hf_name}: k={k} is not a multiple of 256")
+        row_bytes = (k // 256) * block_bytes
+        offset = int(entry["offset"])
+        nbytes = n * row_bytes
+        data = self._memmap()
+        if offset < 0 or offset + nbytes > data.shape[0]:
+            raise RepackError(f"{hf_name}: quantized payload is outside the GGUF file")
+        return np.asarray(data[offset : offset + nbytes]).reshape(n, row_bytes)
+
+    def payload_for_native(
+        self,
+        spec,
+        recipe: TensorRecipe,
+        token_ids: torch.Tensor | np.ndarray | None,
+    ) -> bytes:
+        """The object's superblock bytes: the recipe's rows gathered from the file verbatim."""
+        ids = None
+        if token_ids is not None:
+            ids = (
+                token_ids.detach().cpu().numpy()
+                if isinstance(token_ids, torch.Tensor)
+                else np.asarray(token_ids)
+            )
+        program = self._evaluate_rows(recipe.expression, ids)
+        if program is None:
+            raise RepackError(f"{spec.name}: expression is not row-repackable")
+        n = int(program.rows.shape[0])
+        if (n, program.k) != tuple(spec.shape):
+            raise RepackError(
+                f"{spec.name}: native shape {(n, program.k)} != spec {tuple(spec.shape)}"
+            )
+        types = {self.native_type_of(name) for name in program.sources}
+        if types != {spec.format}:
+            raise RepackError(f"{spec.name}: sources are {types}, spec is {spec.format}")
+        row_bytes = (program.k // 256) * NATIVE_TYPES[spec.format]
+        out = np.empty((n, row_bytes), dtype=np.uint8)
+        source_of = program.rows // _SOURCE_STRIDE
+        row_of = program.rows % _SOURCE_STRIDE
+        for index, source_name in enumerate(program.sources):
+            mask = source_of == index
+            if not mask.any():
+                continue
+            out[mask] = self._native_rows(source_name)[row_of[mask]]
+        return out.tobytes()
 
     def covered_sources(
         self, recipes_by_name: Mapping[str, TensorRecipe], planned: Sequence[str]

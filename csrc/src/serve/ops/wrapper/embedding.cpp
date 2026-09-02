@@ -1,5 +1,6 @@
 // sinfer::ops - embedding wrapper: public api validation and qtype dispatch.
 #include "api/ops/embedding.h"
+#include "ops/linear/ggml/ggml_embedding.h"
 
 #include "ops/common/math.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -231,6 +232,15 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_fp8_launch(ids, table, out, stream);
+        break;
+    case QType::Q2_K:
+    case QType::Q3_K:
+    case QType::Q4_K:
+    case QType::Q5_K:
+    case QType::Q6_K:
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::ggml::ggml_embedding(ids, table, out, stream);
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");

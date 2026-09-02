@@ -188,11 +188,15 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     return family_conversion.load_resources(model_dir, inventory.RESOURCE_SPECS)
 
 
-def build_object_plan(resources: Mapping[str, bytes], *, mtp: bool = True) -> ObjectPlan:
-    """Compute every payload-relative object offset for the selected variant."""
-
+def build_object_plan(
+    resources: Mapping[str, bytes], *, mtp: bool = True, native: Mapping[str, str] | None = None
+) -> ObjectPlan:
+    """Compute every payload-relative object offset for the selected variant. `native` names
+    the objects served as K-quants verbatim from a GGUF, with their format rewritten."""
     preflight_inventory()
     _, object_specs = inventory.active_specs(mtp=mtp)
+    if native:
+        object_specs = GgufRepackSource.native_specs(object_specs, native)
     return family_conversion.build_object_plan(object_specs, resources)
 
 
@@ -211,6 +215,7 @@ def plan_repack(
     repack: GgufRepackSource | None,
     recipes_by_name: dict[str, recipe.TensorRecipe],
     tensor_specs,
+    native: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Objects the repack source covers; verifies the map is not over-broad.
 
@@ -222,10 +227,11 @@ def plan_repack(
     if repack is None:
         return ()
     planned = repack.plan(recipes_by_name, tensor_specs)
+    covered = set(planned) | set(native or ())
     stray = {
         source.name
         for name, tensor_recipe in recipes_by_name.items()
-        if name not in planned
+        if name not in covered
         for source in recipe.expression_sources(tensor_recipe.expression)
         if source.name in repack.sources
     }
@@ -243,6 +249,7 @@ def preflight_conversion(
     planned: tuple[str, ...] = (),
     *,
     mtp: bool = True,
+    native: Mapping[str, str] | None = None,
 ) -> ConversionPreflight:
     """Finish all checkpoint, inventory, shortlist, and offset work before writing."""
 
@@ -264,7 +271,7 @@ def preflight_conversion(
         source = recipe.preflight_sources(model)
     resources = load_resources(model)
     resource_map = {resource.name: resource.data for resource in resources}
-    object_plan = build_object_plan(resource_map, mtp=mtp)
+    object_plan = build_object_plan(resource_map, mtp=mtp, native=native)
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
@@ -374,9 +381,16 @@ def convert(
     repack = GgufRepackSource(gguf_repack) if gguf_repack else None
     recipes = active_recipes(mtp=mtp)
     active_tensor_specs, active_object_specs = inventory.active_specs(mtp=mtp)
-    planned = plan_repack(repack, recipes, active_tensor_specs)
+    native = repack.plan_native(recipes, active_tensor_specs) if repack is not None else {}
+    planned = plan_repack(repack, recipes, active_tensor_specs, native)
     repacked_names = frozenset(planned)
-    preflight = preflight_conversion(model, repack, planned, mtp=mtp)
+    if native:
+        active_tensor_specs = GgufRepackSource.native_specs(active_tensor_specs, native)
+        active_object_specs = GgufRepackSource.native_specs(active_object_specs, native)
+        print(f"native K-quants: {len(native)} objects served as the GGUF stores them", flush=True)
+    preflight = preflight_conversion(
+        model, repack, planned + tuple(native), mtp=mtp, native=native
+    )
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -397,6 +411,15 @@ def convert(
                 repacked = False
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
+                elif repack is not None and spec.name in native:
+                    # A K-quant served as the GGUF stores it: rows gathered verbatim.
+                    token_ids = None
+                    if spec.name == draft_head.DRAFT_HEAD_OBJECT:
+                        token_ids = draft_head.materialize_draft_head_token_ids(
+                            preflight.draft
+                        )
+                    payload = repack.payload_for_native(spec, recipes[spec.name], token_ids)
+                    repacked = True
                 elif repack is not None and spec.name in repacked_names:
                     # surogate vendor patch (PATCHES.md #14): bit-exact Q8_0
                     # plane repack; no dequantization or requantization.

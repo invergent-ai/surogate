@@ -47,5 +47,8 @@ if REAL.exists():
             data = np.asarray(tensor.data).reshape(n, -1)[:rows]
             write(t, np.ascontiguousarray(data), rows, k, "real")
             seen.add(t)
+            if tensor.name == "token_embd.weight":
+                # the whole table: the lm_head's row count, which the small cases never reach
+                write(t, np.ascontiguousarray(np.asarray(tensor.data).reshape(n, -1)), n, k, "big")
 else:
     print(f"  (no real GGUF at {REAL}; synthetic only)")

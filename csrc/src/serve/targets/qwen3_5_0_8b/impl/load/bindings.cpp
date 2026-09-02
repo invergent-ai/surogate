@@ -75,6 +75,19 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
                       .format = format};
 }
 
+// A linear or table object bound by shape alone: the stored format is read from the
+// artifact (W8 from a BF16 conversion, a GGML K-quant from a GGUF served natively) and
+// materialized_weight builds the Weight the ops dispatch on.
+WeightPlan bind_linear_weight(artifact::Binder& binder, std::string_view name,
+                              std::initializer_list<std::uint64_t> shape) {
+    if (shape.size() != 2) { throw std::logic_error("bind_linear_weight: rank-two shape"); }
+    const auto dims = std::vector<std::uint64_t>(shape);
+    const artifact::LinearBinding binding =
+        artifact::bind_linear(binder, name, static_cast<std::int32_t>(dims[0]),
+                              static_cast<std::int32_t>(dims[1]));
+    return WeightPlan{.object = binding.object, .format = binding.format};
+}
+
 WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, std::int32_t rows,
                              std::int32_t columns, std::string_view input_divisor_name) {
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
@@ -226,15 +239,13 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
         if (target.is_full_attention) {
             target.attention.projection = FusedAttentionProjectionPlan{
                 .query_key_gate_value =
-                    bind_weight(binder, prefix + "attention/query_key_gate_value",
-                                NumericFormat::W8G32_F16S, {TextConfig::mtp_attention_input_rows, TextConfig::hidden}),
+                    bind_linear_weight(binder, prefix + "attention/query_key_gate_value", {TextConfig::mtp_attention_input_rows, TextConfig::hidden}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {TextConfig::head_dim});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {TextConfig::head_dim});
-            target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                  NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::query_size});
+            target.attention.output = bind_linear_weight(binder, prefix + "attention/output", {TextConfig::hidden, TextConfig::query_size});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {TextConfig::gdn_value_heads});
@@ -250,20 +261,19 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
-                    bind_weight(binder, prefix + "gdn/query_key_value_z",
-                                NumericFormat::W8G32_F16S, {TextConfig::convolution_dim + TextConfig::value_dim, TextConfig::hidden}),
+                    bind_linear_weight(binder, prefix + "gdn/query_key_value_z", {TextConfig::convolution_dim + TextConfig::value_dim, TextConfig::hidden}),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
             target.gdn.output =
-                bind_weight(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::value_dim});
+                bind_linear_weight(binder, prefix + "gdn/output", {TextConfig::hidden, TextConfig::value_dim});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
         target.mlp.gate_up =
-            bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::W8G32_F16S, {2 * TextConfig::intermediate, TextConfig::hidden});
+            bind_linear_weight(binder, prefix + "mlp/gate_up", {2 * TextConfig::intermediate, TextConfig::hidden});
         target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::intermediate});
+            bind_linear_weight(binder, prefix + "mlp/down", {TextConfig::hidden, TextConfig::intermediate});
     }
 }
 
@@ -420,7 +430,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
     out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {TextConfig::output_rows, TextConfig::hidden});
+        bind_linear_weight(binder, "text/token_embedding", {TextConfig::output_rows, TextConfig::hidden});
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -437,12 +447,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {TextConfig::hidden});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {TextConfig::output_rows, TextConfig::hidden});
+    out.output_head = bind_linear_weight(binder, "text/output_head", {TextConfig::output_rows, TextConfig::hidden});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::W8G32_F16S,
-                                           {131072, 1024}, proposal_placement);
+    out.draft_head = artifact::bind_linear(binder, "text/draft_head", 131072, 1024,
+                                           proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
@@ -557,8 +567,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     output_head = materialized_weight(backing, plan.output_head, TextConfig::output_rows, TextConfig::hidden);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
-        proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
-                                                           NumericFormat::W8G32_F16S, 131072, TextConfig::hidden);
+        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, 131072, 1024);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
                                                            NumericFormat::I32, {131072});
     }

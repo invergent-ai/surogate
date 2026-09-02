@@ -37,6 +37,13 @@ enum class QType : std::uint16_t {
     I32_CTRL             = 6,
     NVFP4                = 7,
     FP8_E4M3FN_ROW_BF16S = 8,
+    // GGML K-quants in their own superblock layout (QuantLayout::GgmlBlocks), bytes as the
+    // GGUF stores them: 256 values per block, affine sub-scales, k a multiple of 256.
+    Q2_K                 = 9,
+    Q3_K                 = 10,
+    Q4_K                 = 11,
+    Q5_K                 = 12,
+    Q6_K                 = 13,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -54,6 +61,8 @@ enum class QuantLayout : std::uint16_t {
     // rather than in a target, so any architecture inherits it by declaring
     // a compute profile.
     MarlinTiles         = 4,
+    // qdata is an [n][k/256] array of GGML superblocks; qhigh and scales are null.
+    GgmlBlocks          = 5,
 };
 
 struct Weight {

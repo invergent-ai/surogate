@@ -1,4 +1,6 @@
 #include "api/ops/attn_input_proj.h"
+
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
@@ -95,6 +97,19 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
     validate_policy(policy);
+    if (detail::ggml::is_ggml_qtype(weight.qtype)) {
+        // A K-quant parent is split by row range straight into the four outputs: physical row
+        // order query, key, output gate, value. Any width; k a multiple of 256.
+        const std::int32_t rows_q = q.ne[0], rows_k = k.ne[0], rows_gate = gate.ne[0], rows_v = v.ne[0];
+        if (rows_q + rows_k + rows_gate + rows_v != weight.n) {
+            throw std::invalid_argument("attn_input_proj: K-quant parent rows must equal q+k+gate+v");
+        }
+        detail::ggml::ggml_project_rows(x, weight, 0, q, workspace, stream);
+        detail::ggml::ggml_project_rows(x, weight, rows_q, k, workspace, stream);
+        detail::ggml::ggml_project_rows(x, weight, rows_q + rows_k, gate, workspace, stream);
+        detail::ggml::ggml_project_rows(x, weight, rows_q + rows_k + rows_gate, v, workspace, stream);
+        return;
+    }
     if (weight.qtype == QType::BF16_CTRL) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
@@ -212,6 +227,12 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     }
 
     switch (parent_qtype) {
+    case QType::Q2_K:
+    case QType::Q3_K:
+    case QType::Q4_K:
+    case QType::Q5_K:
+    case QType::Q6_K:
+        return detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, max_tokens);
     case QType::BF16_CTRL:
         if (parent_rows != 14336 || input_rows != 5120 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");

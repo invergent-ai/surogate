@@ -57,6 +57,20 @@ W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("NVFP4", 16)
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
 
+@dataclass(frozen=True, slots=True)
+class GgmlBlockFormat:
+    """A GGML K-quant kept in its own 256-value superblocks, bytes as the GGUF stores them."""
+
+    name: str
+    bits: float
+    block_bytes: int
+
+Q2_K = GgmlBlockFormat("Q2_K", 2.625, 84)
+Q3_K = GgmlBlockFormat("Q3_K", 3.4375, 110)
+Q4_K = GgmlBlockFormat("Q4_K", 4.5, 144)
+Q5_K = GgmlBlockFormat("Q5_K", 5.5, 176)
+Q6_K = GgmlBlockFormat("Q6_K", 6.5625, 210)
+
 
 DIRECT_FORMATS = MappingProxyType(
     {item.name: item for item in (BF16, FP32, I32)}
@@ -71,8 +85,11 @@ NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType(
     {FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S}
 )
+GGML_BLOCK_FORMATS = MappingProxyType(
+    {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)}
+)
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **GGML_BLOCK_FORMATS}
 )
 
 
@@ -150,6 +167,13 @@ def get_format(name: str) -> NumericFormat:
 
 
 __all__ = [
+    "GGML_BLOCK_FORMATS",
+    "GgmlBlockFormat",
+    "Q2_K",
+    "Q3_K",
+    "Q4_K",
+    "Q5_K",
+    "Q6_K",
     "BF16",
     "DIRECT_FORMATS",
     "DirectFormat",

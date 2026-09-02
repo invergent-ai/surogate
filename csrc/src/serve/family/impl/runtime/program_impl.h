@@ -16,6 +16,7 @@
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 #include "api/ops/scatter.h"
 #include "api/ops/speculative_round.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 
 #include <cuda_runtime.h>
 
@@ -1668,8 +1669,9 @@ void ProgramImplCore::prepare_graphs() {
     // bytes this process allocated -- the registries accumulate the sizes they
     // ask for, and the measurement above is per-process wherever the driver
     // will attribute it -- so a neighbouring process cannot move either one.
-    const std::size_t plane_bytes =
-        ops::detail::w8_derived_plane_bytes() + ops::detail::marlin_plane_bytes();
+    const std::size_t plane_bytes = ops::detail::w8_derived_plane_bytes() +
+                                    ops::detail::marlin_plane_bytes() +
+                                    ops::detail::ggml::scratch_bytes();
     const std::size_t consumed =
         prepared.bytes > plane_bytes ? prepared.bytes - plane_bytes : 0;
     graph_observed_bytes = consumed;

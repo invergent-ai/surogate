@@ -8,6 +8,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
@@ -301,6 +302,17 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
 
+    if (detail::ggml::is_ggml_qtype(weight.qtype)) {
+        // A K-quant parent splits by row range straight into the two outputs: qkv rows first,
+        // z rows after, the split read off the output views.
+        if (qkv.ne[0] + z.ne[0] != weight.n) {
+            throw std::invalid_argument("gdn_input_proj: K-quant parent rows must equal qkv + z rows");
+        }
+        detail::ggml::ggml_project_rows(x, weight, 0, qkv, workspace, stream);
+        detail::ggml::ggml_project_rows(x, weight, qkv.ne[0], z, workspace, stream);
+        return;
+    }
+
     if (weight.qtype == QType::NVFP4) {
         // The registered geometry is the 27B's; other shapes take the split from the output
         // views and run on the cuBLASLt route (#84).
@@ -467,6 +479,49 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      Tensor& value, Tensor& z, LinearPolicy policy,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
+
+    if (detail::ggml::is_ggml_qtype(weight.qtype)) {
+        // K-quant parent: the row split comes from the output views, the projection is the
+        // plain single-parent form, and the conv is the shared projected-conv tail.
+        const std::int32_t kQueryRows = query.ne[0];
+        const std::int32_t kKeyRows   = key.ne[0];
+        const std::int32_t kValueRows = value.ne[0];
+        const std::int32_t kZRows     = z.ne[0];
+        const std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+        const ConvGeometry geometry   = require_snapshot_input(x, weight.k);
+        if (weight.n != kChannels + kZRows) {
+            throw std::invalid_argument(
+                "gdn_input_proj_conv_snapshot: K-quant parent rows must equal q+k+v+z");
+        }
+        require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                  snapshot_base_slots, kChannels, geometry);
+        require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "query");
+        require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "key");
+        require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "value");
+        require_conv_tensor(z, kZRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_snapshot", "z");
+        if (geometry.batch > 1) {
+            compose_batched_snapshot(
+                x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                snapshot_base_slots, query, key, value, z, kQueryRows, kKeyRows, kValueRows,
+                geometry, workspace, stream,
+                [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
+                    gdn_input_proj(x_flat, weight, projected, z_flat, policy, workspace, stream);
+                });
+            return;
+        }
+        auto scope = workspace.scope();
+        ProjectedWorkspace scratch =
+            allocate_projected_workspace(workspace, kChannels, geometry.width);
+        gdn_input_proj(x, weight, scratch.projected, z, policy, workspace, stream);
+        detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states,
+                                                   valid_columns, initial_state_slots,
+                                                   snapshot_base_slots, query, key, value, stream);
+        return;
+    }
 
     if (weight.qtype == QType::NVFP4) {
         // Only the 27B geometry has fused NVFP4 conv schedules; other shapes derive their row
@@ -654,6 +709,47 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    cudaStream_t stream) {
     validate_policy(policy);
 
+    if (detail::ggml::is_ggml_qtype(weight.qtype)) {
+        const std::int32_t kQueryRows = query.ne[0];
+        const std::int32_t kKeyRows   = key.ne[0];
+        const std::int32_t kValueRows = value.ne[0];
+        const std::int32_t kZRows     = z.ne[0];
+        const std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+        const ConvGeometry geometry   = require_record_input(x, weight.k);
+        if (weight.n != kChannels + kZRows) {
+            throw std::invalid_argument(
+                "gdn_input_proj_conv_record: K-quant parent rows must equal q+k+v+z");
+        }
+        require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                                kChannels, geometry);
+        require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "conv record");
+        require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "query");
+        require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "key");
+        require_conv_tensor(value, kValueRows, geometry.width, geometry.batch,
+                            "gdn_input_proj_conv_record", "value");
+        require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_conv_record",
+                            "z");
+        require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                                  conv_record, query, key, value, z, workspace);
+        if (geometry.batch > 1) {
+            compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots,
+                           conv_record, query, key, value, z, geometry, workspace, stream,
+                           [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
+                               gdn_input_proj(x_flat, weight, record_flat, z_flat, policy,
+                                              workspace, stream);
+                           });
+            return;
+        }
+        auto scope = workspace.scope();
+        gdn_input_proj(x, weight, conv_record, z, policy, workspace, stream);
+        detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states,
+                                                 valid_columns, initial_state_slots, query, key,
+                                                 value, stream);
+        return;
+    }
     if (weight.qtype == QType::NVFP4) {
         // See the snapshot path: outside the 27B geometry the split comes from the weight and
         // the projection runs on cuBLASLt (#84).
@@ -834,6 +930,9 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
+    }
+    if (detail::ggml::is_ggml_qtype(parent_qtype)) {
+        return detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, max_tokens);
     }
     if (parent_qtype == QType::NVFP4) {
         const bool registered = parent_rows == detail::Nvfp4GdnInputGeometry::kOutputRows &&
@@ -1105,6 +1204,15 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
+    if (detail::ggml::is_ggml_qtype(parent_qtype)) {
+        // The split is read off the output views at run time; here only the parent is known,
+        // so the projected plane is sized for every parent row (z included) -- sufficient,
+        // and a few MiB over at most -- plus the int8 activation scratch.
+        const std::int32_t widest = batch_size * max_width;
+        return composed_snapshot_capacity(
+            parent_rows, widest,
+            detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, widest));
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
         input_rows == detail::Fp8GdnInputGeometry::kInputRows &&
@@ -1189,6 +1297,10 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
+    if (detail::ggml::is_ggml_qtype(parent_qtype)) {
+        return detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows,
+                                                                    batch_size * max_width);
+    }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
         input_rows == detail::Fp8GdnInputGeometry::kInputRows &&
