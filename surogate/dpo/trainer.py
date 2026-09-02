@@ -150,16 +150,9 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
     checkpoint_dir = config.checkpoint_dir or str(Path(config.output_dir))
 
     # --- tokenize preference pairs, before anything is sized to T -----------
-    # The trainer's arena and buffers are allocated for `seq_len` at
-    # construction, so T has to be known first. Reading the data here rather
-    # than after the build is what lets it be the length the data actually
-    # needs instead of the configured ceiling; `sequence_len` stays the cap,
-    # and rows that do not fit it are still dropped during tokenization.
-    #
-    # Nothing between here and the old position reads the data: the IR build
-    # and JIT compile depend only on `config.model_dir`. Doing it first also
-    # means a dataset that cannot be tokenized fails before the JIT compile
-    # rather than after it.
+    # The trainer's buffers are allocated for `seq_len` at construction, so T
+    # has to come from the tokenized batch: `sequence_len` is the cap, the batch
+    # reports the width the data actually needed.
     rows = _load_pref_datasets(config.datasets or [], num_workers=config.dataloader_num_workers or 1)
     batch = tokenize_preference_pairs(
         rows,
@@ -167,8 +160,13 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
         max_len=int(config.sequence_len),
         span_mask=config.loss.span_mask,
     )
-    T = int(batch.max_len)
-    logger.info(f"Tokenized {batch.n_pairs} preference pairs (from {len(rows)} rows)")
+    T = batch.width
+    n_rows = len(rows)
+    # The raw rows are only needed for the count from here on, and would
+    # otherwise stay resident through the JIT compile and weight import.
+    del rows
+    logger.info(f"Tokenized {batch.n_pairs} preference pairs (from {n_rows} rows)")
+    Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 
     # --- compile the DSL IR + JIT kernels (mirrors SurogateTrainerWrapper) ---
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
@@ -228,7 +226,6 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
         else:
             logger.info("No DPO checkpoint found; starting from step 0")
 
-    Path(config.output_dir).mkdir(parents=True, exist_ok=True)
     # Reference log-probs are computed INLINE per micro-step (see module docstring):
     # the frozen-ref forward must share the policy step's exact batch so fp8's
     # current-batch activation scaling produces a matching scale (margin == 0 at init).

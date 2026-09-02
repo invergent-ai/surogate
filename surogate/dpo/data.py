@@ -2,7 +2,8 @@
 
 Each preference row is {prompt, chosen, rejected}. We render prompt+chosen and
 prompt+rejected, mask the prompt (loss only on the response continuation), and
-lay each sequence out as its own right-padded row of width `max_len`. A
+lay each sequence out as its own right-padded row. Rows are laid out at the
+width the data needs, capped by `max_len`, not at `max_len` itself. A
 micro-batch of B rows is therefore B/2 atomic pairs (pair k = rows 2k, 2k+1);
 the trainer (surogate/dpo/data.py packing → step_dpo_native) keeps both rows of a
 pair in the same optimizer step.
@@ -12,8 +13,13 @@ Engine conventions (must match step_dpo_native / the dpo_dloss kernel):
 - loss_mask[j] = 1 iff position j holds a scored response token. The logprob of
   token j is read from losses[j-1] (shifted layout), so the FIRST response token
   (position = prompt_len) and the LAST response token are both scored.
-- position_ids restart at 0 per row; padding uses position 0 and loss_mask 0.
-  Right padding + causal attention means padding never affects real-token logits.
+- position_ids advance by one across the WHOLE row, padding included. The
+  engine reads a document boundary wherever they fail to advance
+  (`compute_doc_masking`), and the flash-varlen backward sizes `dq_accum` per
+  document, so a zero-filled pad tail makes every pad token its own length-1
+  document and the allocation scales with padding instead of data. Right
+  padding plus causal attention already keeps padding out of real-token
+  logits; the ramp is about the document count, not the logits.
 """
 
 from __future__ import annotations
@@ -36,14 +42,16 @@ logger = get_logger()
 class PrefBatch:
     """Tokenized preference pairs, one sequence per row (chosen=2k, rejected=2k+1)."""
 
-    max_len: int
+    # The realised row width, which is the longest row the batch kept. Not the
+    # `max_len` cap the caller passed: that is a ceiling, this is what was used.
+    width: int
     n_pairs: int
-    input_ids: np.ndarray  # int32 [2*n_pairs, max_len]
-    targets: np.ndarray  # int32 [2*n_pairs, max_len]
-    loss_mask: np.ndarray  # uint8 [2*n_pairs, max_len]
-    position_ids: np.ndarray  # int32 [2*n_pairs, max_len]
+    input_ids: np.ndarray  # int32 [2*n_pairs, width]
+    targets: np.ndarray  # int32 [2*n_pairs, width]
+    loss_mask: np.ndarray  # uint8 [2*n_pairs, width]
+    position_ids: np.ndarray  # int32 [2*n_pairs, width]
     seq_len: np.ndarray  # int32 [2*n_pairs] real (unpadded) length per row
-    ref: np.ndarray | None = None  # float32 [2*n_pairs, max_len] reference logprobs (filled by precompute)
+    ref: np.ndarray | None = None  # float32 [2*n_pairs, width] reference logprobs (filled by precompute)
 
     @property
     def n_seq(self) -> int:
@@ -181,16 +189,19 @@ def tokenize_preference_pairs(
         )
 
     n_seq = 2 * n_pairs
-    # Width is the longest row that survived, not the configured cap. `max_len`
-    # is the most a row *may* be, and allocating at it made a 50-token pair cost
-    # a 2048-token forward, paid three times per step: the policy pass, the
-    # frozen reference pass, and the backward. Rows too long for the cap have
-    # already been dropped above, so this can only shrink the buffer.
-    width = min(int(max_len), max(len(ids) for ids, _ in seqs))
+    # The width the data needs, not the configured ceiling: allocating at
+    # `max_len` made a short pair cost a full-length forward. `_layout_sequence`
+    # has already left-truncated every row to `max_len`, so this cannot exceed it.
+    width = max(len(ids) for ids, _ in seqs)
     input_ids = np.full((n_seq, width), pad_id, dtype=np.int32)
     targets = np.zeros((n_seq, width), dtype=np.int32)
     loss_mask = np.zeros((n_seq, width), dtype=np.uint8)
-    position_ids = np.zeros((n_seq, width), dtype=np.int32)
+    # Identical for every row: one document running the full width. See the
+    # position_ids bullet in the module docstring for why the ramp continues
+    # through padding.
+    position_ids = np.broadcast_to(
+        np.arange(width, dtype=np.int32), (n_seq, width)
+    ).copy()
     seq_len = np.zeros((n_seq,), dtype=np.int32)
 
     for k, (ids, prompt_len) in enumerate(seqs):
@@ -205,20 +216,10 @@ def tokenize_preference_pairs(
         else:
             for start, end in diff_segments:
                 loss_mask[k, prompt_len + start : prompt_len + end] = 1
-        # Across the whole width, not just the used prefix. The engine reads
-        # a document boundary wherever the position id fails to advance by one
-        # (compute_doc_masking), so a zero-filled tail declared every pad token
-        # its own length-1 document, and the flash-varlen backward sizes
-        # dq_accum per document. Padding then drove the allocation instead of
-        # data: 4027 MB against a 1298 MB arena for 101 real tokens. Padding is
-        # absorbed into the row's single document this way, and loss_mask and
-        # targets are already zero there, so nothing about the loss moves. The
-        # SFT tokenizer does the same, for the same reason (train/tokenize.py).
-        position_ids[k] = np.arange(width, dtype=np.int32)
         seq_len[k] = L
 
     return PrefBatch(
-        max_len=width,
+        width=width,
         n_pairs=n_pairs,
         input_ids=input_ids,
         targets=targets,
