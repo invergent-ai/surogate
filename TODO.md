@@ -58,8 +58,10 @@ before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
 
 - [x] **DONE** (`9ce7c3b6`) SentencePiece encoding was O(n²) — it rescanned every adjacent pair per merge and built a key string per pair. 4,000 tokens took 7.5 s, **425× slower than the reference tokenizer**, and an 8k prompt ~29 s against 0.26 s of prefill, so a long request was almost entirely tokenization and back-to-back ones expired in the queue. Now a merge heap over a linked list of input spans: **54× at 4,000 tokens**, linear growth, token-for-token identical output.
 - [x] **DONE** (`5b578d6f`) Test oracles spawned a thread set per call — over a million threads in the widest sparse-MoE cases, with the profile almost entirely `clone3`/`allocate_stack`. One shared pool (`ops/parallel_rows.h`): **sparse-MoE 62 s → 10 s**. Also, `ctest` reported a skip (exit 77) as a failure because only op-tests set `SKIP_RETURN_CODE`.
-- [x] **DONE** Suite: **352 s serial → 53 s at `ctest -j8`**, 104 tests, 100% passing.
-- [ ] **TODO** `sinfer_attn_input_proj_test` is now the critical path at 39 s. Unlike sparse-MoE this is genuine FP64 oracle arithmetic, so it needs a cheaper oracle or a trimmed case matrix, not a threading fix.
+- [x] **DONE** Suite: **352 s serial → 40–60 s at `ctest -j16`**, 104 tests, 100% passing.
+- [x] **DONE** (`59df8f5a`) `projection_oracle` re-decoded a whole 5,120-wide weight row once **per token**, through a per-element accessor that revalidates metadata and switches on quantization type every element. Decoding each sampled row once is the same arithmetic in the same order: **NVFP4 21.2 → 2.2 s, FP8 10.0 → 1.9 s**; attention input projection 39 → 11 s, GDN (shares the oracle) 18 → 8 s.
+- [x] **DONE** Oracle pools capped at 8 threads (`SUROGATE_TEST_ORACLE_THREADS` overrides). One machine-sized pool per process oversubscribed under `ctest -j` — 8 processes × 64 threads on 64 cores took the suite 53 → 132 s and failed a CPU-bound test. **Suite is now 40–60 s at `-j16`, 104 tests, 100% passing**, against 352 s serially.
+- [ ] **TODO** `sinfer_gqa_attention_test` is the floor at ~32 s, and it is GPU work rather than oracle arithmetic.
 - [ ] **TODO** `linear_test_common.cpp` and `linear_swiglu_test_common.cpp` still spawn per call; they run once per case rather than per token so the churn is bounded, but the shared helper (including a range form for per-thread scratch) now exists.
 
 ## Found while measuring
