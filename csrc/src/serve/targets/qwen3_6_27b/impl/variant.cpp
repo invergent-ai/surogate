@@ -1,5 +1,6 @@
 #include "targets/qwen3_6_27b/impl/variant.h"
 
+#include "core/device.h"
 #include "family/impl/lora_hook.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/gdn_gating_proj.h"
@@ -13,7 +14,12 @@
 #include "api/ops/silu_mul.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_6_27b::detail::Variant
 #define SINFER_FAMILY_RUNTIME_NS qwen3_6_27b_runtime
@@ -565,6 +571,60 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
     return layout.peak_bytes(1);
+}
+
+// Parity probe (same contract as the qwen3 target): SUROGATE_SERVE_DUMP_RESIDUAL=<dir> writes
+// each tagged intermediate as raw BF16 behind a 16-byte header {magic, rows, columns,
+// occurrence}; SUROGATE_SERVE_DUMP_COLUMNS selects the round by its column count, and the
+// occurrence counter is kept per (tag, width) so the captured round's layers number 0..N-1
+// whatever ran before it. Synchronises the stream: parity work only.
+namespace {
+
+const char* probe_directory() {
+    static const char* dir = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DUMP_RESIDUAL");
+        return (raw != nullptr && *raw != '\0') ? raw : nullptr;
+    }();
+    return dir;
+}
+
+std::int32_t probe_columns() {
+    static const std::int32_t columns = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DUMP_COLUMNS");
+        return (raw != nullptr && *raw != '\0') ? std::atoi(raw) : 0;
+    }();
+    return columns;
+}
+
+std::map<std::string, int>& probe_counts() {
+    static std::map<std::string, int> counts;
+    return counts;
+}
+
+} // namespace
+
+void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+    const char* dir = probe_directory();
+    if (dir == nullptr || tensor.data == nullptr) { return; }
+    if (tensor.ne[1] > 1024) { return; }
+    if (probe_columns() > 0 && tensor.ne[1] != probe_columns()) { return; }
+    const std::string key = std::string(tag) + "@" + std::to_string(tensor.ne[1]);
+    const int occurrence  = probe_counts()[key]++;
+    if (occurrence >= 4 * TextConfig::layers) { return; }
+
+    const std::size_t bytes = tensor.bytes();
+    std::vector<std::byte> host(bytes);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const std::string path = std::string(dir) + "/" + tag + "_w" + std::to_string(tensor.ne[1]) +
+                             "_" + std::to_string(occurrence) + ".bin";
+    FILE* file = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) { return; }
+    const std::int32_t header[4] = {0x51335042, tensor.ne[0], tensor.ne[1], occurrence};
+    std::fwrite(header, sizeof(header), 1, file);
+    std::fwrite(host.data(), 1, bytes, file);
+    std::fclose(file);
 }
 
 } // namespace sinfer::targets::qwen3_6_27b::detail

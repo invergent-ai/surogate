@@ -1,5 +1,7 @@
 #include <api/family/decoder_state.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -194,11 +196,15 @@ DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
 }
 
 void DecoderState::copy_state_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream) {
+    static const bool trace = std::getenv("SUROGATE_SERVE_ROUND_TRACE") != nullptr;
+    if (trace) { std::fprintf(stderr, "round-trace: copy_state_slot %d -> %d\n", src, dst); }
     linear_attention.copy_slot(src, dst, stream);
     if (!ple.empty()) { ple.copy_slot(src, dst, stream); }
 }
 
 void DecoderState::reset_state_slot(std::int32_t slot, cudaStream_t stream) {
+    static const bool trace = std::getenv("SUROGATE_SERVE_ROUND_TRACE") != nullptr;
+    if (trace) { std::fprintf(stderr, "round-trace: reset_state_slot %d\n", slot); }
     linear_attention.zero_slot(slot, stream);
     if (!ple.empty()) { ple.reset_slot(slot, stream); }
 }

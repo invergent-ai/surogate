@@ -270,7 +270,8 @@ PagedKVOccupancy PagedKVPool::occupancy(std::size_t granule_bytes) const noexcep
     return out;
 }
 
-void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream) {
+void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream,
+                             int byte) {
     if (page_ids.empty()) { return; }
 
     std::vector<std::int32_t> sorted(page_ids.begin(), page_ids.end());
@@ -286,11 +287,11 @@ void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_
         for (const Tensor& plane : planes_) {
             auto* base = static_cast<unsigned char*>(plane.data);
             if (spec_.plane_order == PagedKVPlaneOrder::PageMajor) {
-                CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(first) * plane.nb[3], 0,
+                CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(first) * plane.nb[3], byte,
                                            static_cast<std::size_t>(count) * plane.nb[3], stream));
             } else {
                 CUDA_CHECK(cudaMemset2DAsync(base + static_cast<std::int64_t>(first) * plane.nb[2],
-                                             plane.nb[3], 0,
+                                             plane.nb[3], byte,
                                              static_cast<std::size_t>(count) * plane.nb[2],
                                              static_cast<std::size_t>(plane.ne[3]), stream));
             }
@@ -485,6 +486,11 @@ void PagedKVAllocation::materialize_pages(std::uint32_t pages, cudaStream_t stre
     const std::int32_t preferred =
         page_ids_.empty() ? -1 : static_cast<std::int32_t>(page_ids_.back() + 1);
     std::vector<std::int32_t> acquired = pool_->take_pages(count, preferred);
+    static const int kZeroTake = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_KV_ZERO_TAKE");
+        return raw == nullptr ? -1 : std::atoi(raw);
+    }();
+    if (kZeroTake >= 0) { pool_->zero_pages(acquired, stream, kZeroTake); }
     page_ids_.insert(page_ids_.end(), acquired.begin(), acquired.end());
     if (bound_row_ >= 0) { publish_range(old_count, count, stream); }
 }

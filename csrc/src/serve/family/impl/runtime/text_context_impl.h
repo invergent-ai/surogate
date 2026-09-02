@@ -1556,6 +1556,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
 
     Tensor x = roots.residual;
     if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
+    debug_probe<Variant>("mixed_embed_out", x, s);
 
     PrefillFamilyTimer& timer = prefill_family_timer();
     cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
@@ -1711,6 +1712,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 Tensor vc = projection.value;
                 const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, total);
                 Tensor qkv      = conv.projected;
+                debug_probe<Variant>("mixed_gdn_in", x, s);
                 Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
                 Tensor qkv_c = conv.convolved;
                 if (timing) { lap(timer.begin, timer.g_proj, acc_g_proj); cudaEventRecord(timer.begin, s); }
@@ -1738,6 +1740,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                      decode.linear_state_slots, qkv_cb, s);
                 }
                 if (timing) { lap(timer.begin, timer.g_conv, acc_g_conv); cudaEventRecord(timer.begin, s); }
+                debug_probe<Variant>("mixed_gdn_conv", qkv_c, s);
                 ops::extract_bf16_columns(qkv_c, 0, qc, s);
                 ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
                 ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);

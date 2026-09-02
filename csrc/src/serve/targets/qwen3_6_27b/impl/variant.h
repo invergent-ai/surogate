@@ -73,6 +73,10 @@ struct Variant {
     static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                       family::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream);
+    /// Parity probe: under SUROGATE_SERVE_DUMP_RESIDUAL the family loop's tagged
+    /// intermediates are written out, numbered by the order the layers run in. A no-op
+    /// unless the variable is set.
+    static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,

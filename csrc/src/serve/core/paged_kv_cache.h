@@ -177,7 +177,8 @@ public:
     occupancy(std::size_t granule_bytes = 2ULL * 1024ULL * 1024ULL) const noexcept;
 
     // Zeros only the named physical page groups across every storage plane.
-    void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
+    void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr,
+                    int byte = 0);
 
     /// The demand-mapped plane region, or null for a pool inside the arena.
     [[nodiscard]] ElasticKvRegion* elastic_region() noexcept { return elastic_.get(); }

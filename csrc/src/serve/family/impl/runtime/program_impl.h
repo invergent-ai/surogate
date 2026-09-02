@@ -26,6 +26,32 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
+inline bool round_trace_enabled() {
+    static const bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TRACE") != nullptr;
+    return enabled;
+}
+// FNV-1a over every slot's layer-0 recurrent state, so a lane's state can be followed across
+// rounds and its writers identified.
+template <typename Pool>
+void round_trace_state(const Pool& pool, cudaStream_t stream, const char* when) {
+    if (!round_trace_enabled() || pool.layer_count() == 0) { return; }
+    std::string line = std::string("round-trace: state ") + when;
+    for (std::int32_t slot = 0; slot < pool.slot_count(); ++slot) {
+        const Tensor t = pool.recurrent_slot(0, slot);
+        std::vector<unsigned char> host(t.bytes());
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), t.data, t.bytes(), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::uint64_t h = 1469598103934665603ULL;
+        for (unsigned char byte : host) { h = (h ^ byte) * 1099511628211ULL; }
+        char buf[48];
+        std::snprintf(buf, sizeof(buf), " s%d=%016llx", slot, static_cast<unsigned long long>(h));
+        line += buf;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+} // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS
 #include <utility>
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
@@ -1227,6 +1253,7 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
 }
 
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
+    if (round_trace_enabled()) { std::fprintf(stderr, "round-trace: ordered_reset lane=%u\n", sequence.lane); }
     decoder->reset_state_slot(
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
     work.reset();
@@ -1900,6 +1927,15 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr,
             requests[sequence.lane].lora_slot};
 
+        // The single-sequence table-row scalars are staged when a lane binds its KV, but an
+        // admission between that bind and this launch binds another lane and restages them —
+        // every lone prefill of the first lane then wrote its KV through the second lane's
+        // block table, and read its own page's previous occupant back for the rest of the
+        // request. Stage this lane's rows here, at launch, as the mixed round does per segment.
+        set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
+        set_device_i32(io.backend_kv_table_row,
+                       sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
                 staged.cursor >= staged.prompt_tokens) {
@@ -1975,9 +2011,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             {
                 static const bool state_trace =
                     std::getenv("SUROGATE_SERVE_STATE_TRACE") != nullptr;
-                if (state_trace) {
+                if (state_trace || round_trace_enabled()) {
                     std::fprintf(stderr,
-                                 "state-trace: run lane=%u cursor=%u nominal=%u graph=%d\n",
+                                 "round-trace: prefill lane=%u cursor=%u nominal=%u graph=%d\n",
                                  sequence.lane, staged.cursor, nominal, int(staged.use_graph));
                 }
             }
@@ -2022,6 +2058,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             mark_workspace_usage(workspace_plan.ordinary_round);
             if (!sequence.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
+            }
+            if (round_trace_enabled()) {
+                std::fprintf(stderr, "round-trace: zero-suffix lane=%u prompt_tokens=%u\n",
+                             sequence.lane, staged.prompt_tokens);
             }
             schedule::sample_from_hidden(schedule_state, sequence.tail_hidden,
                                          checked_i32(staged.prompt_tokens, "sample position"),
@@ -2070,6 +2110,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
         sequence.ledger.push_back(host_tokens[0]);
+        if (round_trace_enabled()) {
+            std::fprintf(stderr, "round-trace: sampled prefill lane=%u pos=%zu token=%d\n",
+                         sequence.lane, sequence.ledger.size() - 1, host_tokens[0]);
+        }
+        round_trace_state(decoder->linear_attention, device.stream, "post-prefill");
         sequence.prefix_identity.append_generated(1, sequence.rope_delta);
         sequence.text_kv_valid = prompt_tokens;
         if (staged.prepare_mtp) {
@@ -2163,6 +2208,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
     }
 
     const auto start = Clock::now();
+    round_trace_state(decoder->linear_attention, device.stream, "pre-ordinary");
     try {
         // Round chaining (PATCHES.md #32): launch up to round_burst_limit
         // consecutive rounds; the chained flavor consumes the previous
@@ -2201,6 +2247,11 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
             const RequestControl& request      = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
+            if (round_trace_enabled()) {
+                std::fprintf(stderr, "round-trace: ordinary row=%zu lane=%u frontier=%u token=%d table_row=%d\n",
+                             row, sequence.lane, sequence.execution_frontier, sequence.ledger.back(),
+                             sequence.kv->text.bound_row());
+            }
             ordinary_host_ingress->cache_positions[row] =
                 checked_i32(frontier, "ordinary batch position");
             ordinary_host_ingress->rope_positions[row] =
@@ -2294,6 +2345,7 @@ ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        round_trace_state(decoder->linear_attention, device.stream, "post-round");
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence    = sequences[lanes[row]];
             RequestControl& request    = requests[lanes[row]];
@@ -2308,6 +2360,10 @@ ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
             sequence.tail_hidden_valid = true;
             for (std::uint32_t round = 0; round < burst; ++round) {
                 sequence.ledger.push_back(row_tokens[round]);
+                if (round_trace_enabled()) {
+                    std::fprintf(stderr, "round-trace: sampled ordinary lane=%u pos=%zu token=%d\n",
+                                 sequence.lane, sequence.ledger.size() - 1, row_tokens[round]);
+                }
             }
             sequence.prefix_identity.append_generated(burst, sequence.rope_delta);
             burst_counts[row] = static_cast<std::int32_t>(burst);
@@ -2432,6 +2488,11 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             const RequestControl& request      = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
+            if (round_trace_enabled()) {
+                std::fprintf(stderr, "round-trace: ordinary row=%zu lane=%u frontier=%u token=%d table_row=%d\n",
+                             row, sequence.lane, sequence.execution_frontier, sequence.ledger.back(),
+                             sequence.kv->text.bound_row());
+            }
             ordinary_host_ingress->cache_positions[row] =
                 checked_i32(frontier, "mixed round position");
             ordinary_host_ingress->rope_positions[row] =
@@ -2540,6 +2601,21 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             card.set_prefill_graph_family(&*prefill_graphs);
         }
         set_device_i32(io.text_kv_table_row, prefill_sequence.kv->text.bound_row());
+        if (round_trace_enabled()) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& sequence = sequences[lanes[row]];
+                std::fprintf(stderr, "round-trace: mixed row=%zu lane=%u frontier=%u token=%d table_row=%d\n",
+                             row, sequence.lane, sequence.execution_frontier, sequence.ledger.back(),
+                             sequence.kv->text.bound_row());
+            }
+            for (std::size_t i = 0; i < staged_count; ++i) {
+                const SequenceState& sequence = sequences[prefill_lanes[i]];
+                std::fprintf(stderr, "round-trace: mixed staged lane=%u cursor=%u nominal=%u prompt_tokens=%u table_row=%d\n",
+                             sequence.lane, requests[prefill_lanes[i]].prefill->cursor, nominals[i],
+                             requests[prefill_lanes[i]].prefill->prompt_tokens, sequence.kv->text.bound_row());
+            }
+            round_trace_state(decoder->linear_attention, device.stream, "pre-mixed");
+        }
 
         schedule::TextContext::MixedDecodeSlice slice;
         slice.ids                = ordinary.tokens.slice(0, 0, rows);
@@ -2649,6 +2725,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 slice, schedule::TextContext::MixedPrefillFinalize{});
         }
 
+        if (round_trace_enabled()) { std::fprintf(stderr, "round-trace: mixed graph_hit=%d\n", int(graph_hit)); }
         if (rows > 0) {
             Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows);
             Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows);
@@ -2705,6 +2782,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        round_trace_state(decoder->linear_attention, device.stream, "post-round");
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence    = sequences[lanes[row]];
             RequestControl& request    = requests[lanes[row]];
@@ -2715,6 +2793,10 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             sequence.text_kv_valid     = base_E + 1;
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
+            if (round_trace_enabled()) {
+                std::fprintf(stderr, "round-trace: sampled mixed lane=%u pos=%zu token=%d\n",
+                             sequence.lane, sequence.ledger.size() - 1, token);
+            }
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);
             request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
                                                  .base_E        = base_E,

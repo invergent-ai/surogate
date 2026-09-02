@@ -3281,3 +3281,51 @@ MMA kernel with no alignment guard and its plan has no per-table rule; the
 two-list drift is likely repeated in `wrapper/linear_swiglu.cpp` and
 `wrapper/attn_input_proj.cpp`; the bench wants `--rows` before gemma3's
 640-row shapes can be measured for a bake of their own.
+
+## 91
+
+**The lone prefill wrote its KV through the last-bound lane's block table
+(2026-09-02).**
+
+**Symptom.** Two short prompts submitted together; the one prefilled alone
+answered the other's question in 7 of 8 rounds, its own reasoning preamble
+first, the other prompt's content from about the tenth token. The late prompt
+was always right. Independent of KV dtype, graphs, PDL, burst length, prefix
+reuse, cuBLASLt and the pool kind. This is the "concurrent identical requests
+diverge" item the elastic-KV pass recorded as open.
+
+**Cause.** `bind_sequence_kv` staged the single-sequence scalars
+`io.text_kv_table_row` / `io.backend_kv_table_row` at admission; the lone
+prefill consumed them at launch. An admission in between — the second prompt
+binding its lane — restaged them, and the first prompt's prefill wrote its
+whole prompt's KV through the second lane's table. The first lane's page kept
+its previous occupant's KV, and the request decoded against that. With the
+same prompt in the page before (every solo run, soak and sleep/wake cycle)
+that KV is identical, so nothing showed; with another prompt there, its
+question. The GDN state is computed from the real tokens and carries the
+real context through 48 of 64 layers, hence the in-character preamble. The
+hazard class is #27's scratch-slot seeding — state staged once at begin,
+consumed per unit while other lanes' units interleave — on the KV side.
+
+**Fix.** `advance_prefill` stages the lane's text and backend table rows at
+launch, before the MTP bridge and the chunk, as the mixed round does per
+segment.
+
+**Method, kept as knobs.** `SUROGATE_SERVE_ROUND_TRACE` prints every round's
+rows, sampled tokens per lane, staged prompts, state-slot copies and resets,
+and a hash of each lane's layer-0 recurrent state per launch and resolve; it
+put the divergence at the first burst starting inside the request's second
+page — the page the other prompt's mixed-graph window had just used.
+`SUROGATE_SERVE_KV_ZERO_TAKE=<byte>` fills every page as it is taken; at 126
+(0x7E) any read of an unwritten cell turns the output into garbage instead of
+a plausible answer, which is what a page-reuse leak needs to be visible at
+all. A differential probe of the batched attention (row 0 alone against its
+batched output: identical, both exactly the fill value) cleared the kernel;
+a scan of the visible cells showed the lone-prefilled request's own page
+entirely unwritten. `surogate/serve/tools/probe/pairleak.py` is the
+reproducer and counts garbage as a leak.
+
+**Validation.** Arena pool, graphs on: 12/12 canonical. Under the fill: 8/8,
+the paired request's tokens equal to the solo run's. Elastic pool: 12/12.
+`sinfer_kv_cache_test`, `sinfer_elastic_kv_region_test`,
+`sinfer_gqa_attention_test` pass.
