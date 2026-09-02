@@ -1,3 +1,4 @@
+#include "ops/parallel_rows.h"
 #include "api/ops/attn_input_proj.h"
 
 #include "ops/direct_bf16_weight.h"
@@ -109,22 +110,9 @@ int run_q4_q5() {
 std::vector<double> bf16_attention_oracle(const HostWeight& weight,
                                           std::span<const float> activation) {
     std::vector<double> result(static_cast<std::size_t>(weight.n));
-    const unsigned available   = std::max(1U, std::thread::hardware_concurrency());
-    const std::int32_t threads = std::min(weight.n, static_cast<std::int32_t>(available));
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(threads));
-    for (std::int32_t thread = 0; thread < threads; ++thread) {
-        const std::int32_t begin =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(weight.n) * thread) / threads);
-        const std::int32_t end = static_cast<std::int32_t>(
-            (static_cast<std::int64_t>(weight.n) * (thread + 1)) / threads);
-        workers.emplace_back([&, begin, end] {
-            for (std::int32_t row = begin; row < end; ++row) {
-                result[static_cast<std::size_t>(row)] = dot_fp64(weight, row, activation);
-            }
-        });
-    }
-    for (std::thread& worker : workers) { worker.join(); }
+    sinfer::test::parallel_rows(weight.n, [&](std::int32_t row) {
+        result[static_cast<std::size_t>(row)] = dot_fp64(weight, row, activation);
+    });
     return result;
 }
 

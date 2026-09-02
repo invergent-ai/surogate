@@ -27,6 +27,13 @@ function(sinfer_add_test name)
       SINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
   add_test(NAME ${name} COMMAND ${name})
+  # 77 is this suite's skip convention: a test whose fixture is absent (real
+  # weights, tokenizer resources) says so and exits 77. Without this property
+  # ctest reads that as a failure, which is how the frontend test came to be
+  # reported failing while a serial loop that treated 77 as a skip called it
+  # green -- and the test only actually runs under ctest, which supplies the
+  # source directory it needs.
+  set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
 endfunction()
 
 function(sinfer_add_op_test name)

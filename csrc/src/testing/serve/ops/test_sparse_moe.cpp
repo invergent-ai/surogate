@@ -1,3 +1,5 @@
+#include "ops/parallel_rows.h"
+
 #include "api/ops/sparse_moe.h"
 
 #include "ops/op_tester.h"
@@ -19,6 +21,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <future>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -481,23 +484,6 @@ const HostExpert& find_expert(const std::vector<HostExpert>& experts, int id) {
     return *found;
 }
 
-template <class Function>
-void parallel_rows(std::int32_t rows, Function&& function) {
-    const unsigned available   = std::max(1U, std::thread::hardware_concurrency());
-    const std::int32_t threads = std::min(rows, static_cast<std::int32_t>(available));
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(threads));
-    for (std::int32_t thread = 0; thread < threads; ++thread) {
-        const std::int32_t begin =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(rows) * thread) / threads);
-        const std::int32_t end =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(rows) * (thread + 1)) / threads);
-        workers.emplace_back([&, begin, end] {
-            for (std::int32_t row = begin; row < end; ++row) { function(row); }
-        });
-    }
-    for (std::thread& worker : workers) { worker.join(); }
-}
 
 double dot_fp64(const std::vector<float>& matrix, std::int32_t row, std::int32_t columns,
                 const std::vector<double>& input) {
@@ -570,7 +556,7 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
                                       const Nvfp4ActivationModel& activation = {}) {
     const std::vector<double> x(input.begin(), input.end());
     std::vector<double> scores(kExperts + 1);
-    parallel_rows(kExperts + 1,
+    sinfer::test::parallel_rows(kExperts + 1,
                   [&](std::int32_t row) { scores[row] = dot_fp64(router, row, kHidden, x); });
 
     std::vector<int> ranked(kExperts);
@@ -602,7 +588,7 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
             round_activation_to_nvfp4(
                 expert_x, (*activation.gate_up_scale)[static_cast<std::size_t>(expert.id)]);
         }
-        parallel_rows(kIntermediate, [&](std::int32_t row) {
+        sinfer::test::parallel_rows(kIntermediate, [&](std::int32_t row) {
             double gate = dot_fp64(expert.gate_up.dequant, row, kHidden, expert_x);
             double up   = dot_fp64(expert.gate_up.dequant, kIntermediate + row, kHidden, expert_x);
             if (activation.enabled()) {
@@ -621,14 +607,14 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
     }
 
     std::vector<double> shared_activation(kIntermediate);
-    parallel_rows(kIntermediate, [&](std::int32_t row) {
+    sinfer::test::parallel_rows(kIntermediate, [&](std::int32_t row) {
         const double gate      = dot_fp64(shared_gate_up.dequant, row, kHidden, x);
         const double up        = dot_fp64(shared_gate_up.dequant, kIntermediate + row, kHidden, x);
         shared_activation[row] = (gate / (1.0 + std::exp(-gate))) * up;
     });
 
     std::vector<double> output(kHidden);
-    parallel_rows(kHidden, [&](std::int32_t row) {
+    sinfer::test::parallel_rows(kHidden, [&](std::int32_t row) {
         double value = static_cast<double>(residual[row]);
         for (int route = 0; route < kTopK; ++route) {
             // A path served elsewhere (the round hook's host split) keeps its routing weight
@@ -969,7 +955,7 @@ public:
             const std::vector<double> x(input.begin(), input.end());
             for (const HostExpert& expert : experts_) {
                 std::vector<double> row_max(kIntermediate, 0.0);
-                parallel_rows(kIntermediate, [&](std::int32_t row) {
+                sinfer::test::parallel_rows(kIntermediate, [&](std::int32_t row) {
                     const double gate = dot_fp64(expert.gate_up.dequant, row, kHidden, x);
                     const double up = dot_fp64(expert.gate_up.dequant, kIntermediate + row,
                                                kHidden, x);
