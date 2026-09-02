@@ -199,7 +199,16 @@ def tokenize_preference_pairs(
         else:
             for start, end in diff_segments:
                 loss_mask[k, prompt_len + start : prompt_len + end] = 1
-        position_ids[k, :L] = np.arange(L, dtype=np.int32)
+        # Across the whole width, not just the used prefix. The engine reads
+        # a document boundary wherever the position id fails to advance by one
+        # (compute_doc_masking), so a zero-filled tail declared every pad token
+        # its own length-1 document, and the flash-varlen backward sizes
+        # dq_accum per document. Padding then drove the allocation instead of
+        # data: 4027 MB against a 1298 MB arena for 101 real tokens. Padding is
+        # absorbed into the row's single document this way, and loss_mask and
+        # targets are already zero there, so nothing about the loss moves. The
+        # SFT tokenizer does the same, for the same reason (train/tokenize.py).
+        position_ids[k] = np.arange(max_len, dtype=np.int32)
         seq_len[k] = L
 
     return PrefBatch(

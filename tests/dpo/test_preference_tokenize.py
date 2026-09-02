@@ -157,3 +157,60 @@ def test_span_mask_drops_pair_when_only_one_side_has_surviving_edit_tokens():
 
     with pytest.raises(ValueError, match="no preference pair"):
         tokenize_preference_pairs(rows, tok, max_len=8, span_mask=True)
+
+
+# ── padding must not look like document boundaries ─────────────────
+
+
+def _doc_count(position_ids_row) -> int:
+    """Documents the engine would see in one row.
+
+    Mirrors `compute_doc_masking` (csrc/.../causal_lm_execution_profile.cpp):
+    a new document starts wherever the position id does not advance by one.
+    """
+    row = np.asarray(position_ids_row)
+    return 1 + int(np.sum(np.diff(row) != 1))
+
+
+def test_position_ids_advance_across_padding():
+    """Zero-filled padding made every pad token its own document.
+
+    `dq_accum` in the flash-varlen backward is sized per document, so a short
+    row at a large `max_len` asked for gigabytes: 4027 MB against a 1298 MB
+    arena on a 0.6B model, for 101 real tokens in 4096 slots.
+    """
+    tok = FakeTok()
+    rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
+    b = tokenize_preference_pairs(rows, tok, max_len=512)
+
+    for k in range(b.n_seq):
+        assert np.all(np.diff(b.position_ids[k]) == 1), (
+            "position ids must advance by one across the whole row, padding included"
+        )
+
+
+def test_a_row_is_one_document_however_much_padding_it_has():
+    tok = FakeTok()
+    rows = [
+        {"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"},
+        {"prompt": "alt prompt", "chosen": "da", "rejected": "nu"},
+    ]
+    b = tokenize_preference_pairs(rows, tok, max_len=512)
+
+    total_docs = sum(_doc_count(b.position_ids[k]) for k in range(b.n_seq))
+    assert total_docs == 2 * b.n_pairs, (
+        f"expected one document per sequence, got {total_docs} for {b.n_seq} sequences"
+    )
+
+
+def test_padding_change_does_not_touch_the_loss():
+    """The fix must be invisible to the loss: `loss_mask` and `targets` are
+    already zero across padding, so only `position_ids` may differ."""
+    tok = FakeTok()
+    rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
+    b = tokenize_preference_pairs(rows, tok, max_len=512)
+
+    for k in range(b.n_seq):
+        L = int(b.seq_len[k])
+        assert b.loss_mask[k, L:].sum() == 0
+        assert np.all(b.targets[k, L:] == 0)
