@@ -58,6 +58,8 @@ converter:
 
 from __future__ import annotations
 
+import struct
+
 from .. import nn
 from ..block_schema import ServeObject
 from ..blocks.gemma3 import GEMMA3_BLOCK_NAME_REMAP, Gemma3FullBlock, Gemma3SlidingBlock
@@ -145,6 +147,23 @@ EMBEDDING_GEMMA_POOLING = {
 }
 
 
+def _round_bf16_scalar(value: float) -> float:
+    """Round a Python float to the nearest representable bf16 value.
+
+    HF applies Gemma's embedding scale as ``embed_scale.to(self.weight.dtype)``
+    (``transformers/models/gemma3/modeling_gemma3.py``,
+    ``Gemma3TextScaledWordEmbedding.forward``), so on a bf16 checkpoint the
+    scalar is rounded *before* it multiplies anything. For hidden 640 that is
+    25.25 rather than 25.298221, a 0.19% difference on every token of every
+    prompt. ``gemma4.py`` carries the same function for the same reason; the two
+    want hoisting the first time a third model needs one.
+    """
+
+    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
+    bits += 0x7FFF + ((bits >> 16) & 1)
+    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFF0000))[0]
+
+
 def _parse_gemma3_layer_types(
     layer_types: list[str] | None,
     n_layers: int,
@@ -155,9 +174,21 @@ def _parse_gemma3_layer_types(
     Gemma 3 states it as a period rather than a list: layer ``i`` is global when
     ``(i + 1) % pattern == 0``. For 24 layers at period 6 that is 5/11/17/23 --
     the schedule embeddinggemma-300m ships. An explicit ``layer_types`` list from
-    the config wins when present.
+    the config wins when present; newer Gemma 3 exports ship only that list and
+    drop ``_sliding_window_pattern`` entirely.
+
+    With neither, the schedule is unknown, and every way of inventing one is
+    silent: all-local masks the global layers and rotates them at the local base,
+    all-global unmasks the local ones. So it raises.
     """
     if not layer_types:
+        if not sliding_window_pattern:
+            raise ValueError(
+                "Gemma3 layer schedule is undetermined: the config states neither "
+                "`layer_types` nor `_sliding_window_pattern`, and a local/global "
+                "schedule cannot be guessed -- either choice serves the wrong mask "
+                "and the wrong rope base on some layer without raising"
+            )
         layer_types = [
             "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
             for i in range(n_layers)
@@ -260,7 +291,7 @@ def _build_gemma3_model(
     cls.rotary_dim = head_size
     # Surfaced for the serve contract: the same factor ScaledEmbedding applies
     # below, so the engine scales identically rather than rediscovering it.
-    cls.embedding_scale = float(d_model) ** 0.5
+    cls.embedding_scale = _round_bf16_scalar(float(d_model) ** 0.5)
 
     cls.block_types = _parse_gemma3_layer_types(layer_types, n_layers, sliding_window_pattern)
     cls.n_sliding_blocks = sum(1 for t in cls.block_types if t == "sliding")
@@ -291,9 +322,14 @@ def _build_gemma3_model(
     if cls.n_full_blocks > 0:
         block_configs.append(("full_blocks", Gemma3FullBlock, cls.n_full_blocks, dict(shared)))
 
-    # Gemma scales the embedding by sqrt(hidden_size). HF computes this in fp32
-    # before casting, so a bf16 rounding of the scalar would not match.
-    cls.embedding = ScaledEmbedding(vocab_size, d_model, embed_scale=float(d_model) ** 0.5)
+    # Gemma scales the embedding by sqrt(hidden_size), and HF rounds that scalar
+    # to the weight dtype before multiplying -- `embed_scale.to(self.weight.dtype)`
+    # in Gemma3TextScaledWordEmbedding.forward -- so on a bf16 checkpoint the
+    # factor is 25.25, not 25.298221. Matching the rounding removes a systematic
+    # 0.19% drift at layer 0; the serving engine rounds the same way.
+    cls.embedding = ScaledEmbedding(
+        vocab_size, d_model, embed_scale=cls.embedding_scale
+    )
     cls.hybrid_blocks = nn.HybridBlockStack(
         block_configs=block_configs,
         block_types=cls.block_types,
@@ -356,6 +392,11 @@ class _Gemma3Base(nn.Model):
     #: stack. The output head is added only by the variant that has one.
     _serve_objects_ = GEMMA3_MODEL_SERVE_OBJECTS
     _serve_blocks_ = {"sliding": Gemma3SlidingBlock, "full": Gemma3FullBlock}
+    #: Which of the block types above attend through the sliding window. The
+    #: serve generator reads this beside ``_serve_block_schedule_`` to emit the
+    #: per-layer window schedule; naming it here is what keeps the shared
+    #: emitter from having to know that "sliding" is Gemma's word for it.
+    _serve_windowed_blocks_ = ("sliding",)
 
     @staticmethod
     def _serve_block_schedule_(config: dict) -> list[str]:
@@ -369,7 +410,7 @@ class _Gemma3Base(nn.Model):
         return _parse_gemma3_layer_types(
             config.get("layer_types"),
             config["n_layers"],
-            config["sliding_window_pattern"],
+            config.get("sliding_window_pattern"),
         )
 
     def _init(

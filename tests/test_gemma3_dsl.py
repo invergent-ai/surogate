@@ -16,7 +16,12 @@ Three of them have already been wrong somewhere in this repo:
   kernel's 1/sqrt(head_dim) default looks perfect on this checkpoint and breaks
   on Gemma3-27B, whose scalar is 168 against head_dim 128.
 
-* **Schedule.** Gemma 3 states local-vs-global as a period, not a list.
+* **Schedule.** Gemma 3 states local-vs-global as a period *or* as a list, and
+  which one depends on the export: embeddinggemma-300m publishes
+  ``_sliding_window_pattern`` alone, gemma-3-270m-it publishes both, and newer
+  exports publish ``layer_types`` alone. Reading a missing period as zero is how
+  every layer became windowed -- global ones included, which then also rotated at
+  the local base.
 """
 
 from __future__ import annotations
@@ -505,3 +510,145 @@ def test_only_the_norms_and_the_head_leave_the_quantised_path():
     assert len(repackable) == 1 + 24 * 7 == 169
     assert "text/embedding_head" not in repackable
     assert not any(name.endswith("_norm") for name in repackable)
+
+
+# ---------------------------------------------------------------------------
+# What the serve target reads off the declaration
+# ---------------------------------------------------------------------------
+
+#: google/gemma-3-270m-it, the checkpoint `targets/gemma3` is built for. Inlined
+#: for the same reason the one above is: it is the contract under test.
+GEMMA3_270M_CONFIG = {
+    "architectures": ["Gemma3ForCausalLM"],
+    "model_type": "gemma3_text",
+    "_sliding_window_pattern": 6,
+    "head_dim": 256,
+    "hidden_size": 640,
+    "intermediate_size": 2048,
+    "layer_types": ["sliding_attention"] * 5 + ["full_attention"]
+    + ["sliding_attention"] * 5 + ["full_attention"]
+    + ["sliding_attention"] * 5 + ["full_attention"],
+    "max_position_embeddings": 32768,
+    "num_attention_heads": 4,
+    "num_hidden_layers": 18,
+    "num_key_value_heads": 1,
+    "query_pre_attn_scalar": 256,
+    "rms_norm_eps": 1e-06,
+    "rope_local_base_freq": 10000.0,
+    "rope_theta": 1000000.0,
+    "sliding_window": 512,
+    "vocab_size": 262144,
+}
+
+
+GEMMA3_270M_CHECKPOINT = Path(
+    "~/.cache/huggingface/hub/models--google--gemma-3-270m-it/snapshots"
+).expanduser()
+
+
+@pytest.mark.skipif(
+    not sorted(GEMMA3_270M_CHECKPOINT.glob("*/config.json")),
+    reason="google/gemma-3-270m-it not cached",
+)
+def test_the_inlined_270m_config_still_matches_the_published_one():
+    """Guards the constant above, the way the EmbeddingGemma one is guarded: the
+    serve target is generated from the published file, so an upstream edit must
+    fail here rather than quietly redefine what the tests assert."""
+
+    published = json.loads(
+        sorted(GEMMA3_270M_CHECKPOINT.glob("*/config.json"))[0].read_text()
+    )
+    for key, value in GEMMA3_270M_CONFIG.items():
+        assert published[key] == value, key
+
+
+def serve_spec(cfg: dict, *, arch: str = "Gemma3ForCausalLM", name: str = "probe"):
+    """The serve contract the generator reads out of the declaration."""
+
+    import sys
+
+    sys.path.insert(0, str(Path("surogate/serve/tools/generate").resolve()))
+    from_dsl = pytest.importorskip("from_dsl")
+    return from_dsl.from_dsl(arch, cfg, name=name)
+
+
+def test_the_schedule_survives_a_config_that_publishes_only_layer_types():
+    """`_sliding_window_pattern` is not guaranteed, and its absence used to read
+    as period 0 -- which the header then took as "every layer windowed", global
+    layers included, on the local rope base.
+
+    The list here is deliberately not periodic: no period can express it, which
+    is the point of carrying the resolved schedule rather than a rule.
+    """
+
+    cfg = dict(GEMMA3_270M_CONFIG)
+    cfg.pop("_sliding_window_pattern")
+    cfg["layer_types"] = ["full_attention", "full_attention"] + ["sliding_attention"] * 16
+
+    spec = serve_spec(cfg)
+    assert spec.sliding_window == 512
+    assert spec.sliding_window_schedule == (False, False) + (True,) * 16
+    assert len(spec.sliding_window_schedule) == spec.layers
+
+
+def test_the_published_270m_schedule_is_every_sixth_layer_global():
+    spec = serve_spec(GEMMA3_270M_CONFIG)
+    assert [i for i, w in enumerate(spec.sliding_window_schedule) if not w] == [5, 11, 17]
+
+
+def test_a_window_with_no_schedule_at_all_is_refused():
+    """Neither a list nor a period. Every way of inventing one is silent, so the
+    declaration raises instead of picking."""
+
+    cfg = dict(GEMMA3_270M_CONFIG)
+    cfg.pop("_sliding_window_pattern")
+    cfg.pop("layer_types")
+    with pytest.raises(ValueError, match="layer schedule is undetermined"):
+        serve_spec(cfg)
+
+
+def test_the_generator_refuses_a_window_whose_block_types_are_unnamed(monkeypatch):
+    """The generator asks the declaration which of its block types are windowed;
+    a model that declares a window and does not answer must be refused rather
+    than defaulted, because the default that used to apply was "all of them"."""
+
+    monkeypatch.setattr(Gemma3CausalModel, "_serve_windowed_blocks_", None)
+    with pytest.raises(ValueError, match="no per-layer window schedule"):
+        serve_spec(GEMMA3_270M_CONFIG)
+
+
+def test_the_serve_attention_scale_is_the_declared_scalar():
+    """The 270M hides this -- scalar 256 is its head dim, so both give 0.0625 --
+    and the 27B is where the two part company."""
+
+    assert serve_spec(GEMMA3_270M_CONFIG).attention_scale == pytest.approx(0.0625)
+
+    wide = dict(GEMMA3_270M_CONFIG, head_dim=128, query_pre_attn_scalar=168)
+    spec = serve_spec(wide)
+    assert spec.query_pre_attn_scalar == 168
+    assert spec.attention_scale == pytest.approx(0.07715167498104596)
+    assert spec.attention_scale != pytest.approx(128.0**-0.5)
+
+
+def test_the_embedding_scale_is_rounded_to_bf16_as_hf_rounds_it():
+    """`Gemma3TextScaledWordEmbedding.forward` multiplies by
+    `self.embed_scale.to(self.weight.dtype)`, so on a bf16 checkpoint the factor
+    is the bf16 rounding of sqrt(hidden): 25.25, not 25.298221. The declaration,
+    the training module and the serve contract must all carry the same number --
+    the serving engine rounds again, so a mismatch here is invisible there and
+    visible in training."""
+
+    model = Gemma3CausalModel(
+        vocab_size=GEMMA3_270M_CONFIG["vocab_size"],
+        d_model=640,
+        n_layers=18,
+        num_query_heads=4,
+        num_kv_heads=1,
+        d_ff=2048,
+        max_seq=32768,
+        head_size=256,
+    )
+    assert model.embedding_scale == 25.25
+    assert model.embedding.embed_scale == model.embedding_scale
+    assert model.embedding_scale != pytest.approx(640.0**0.5)
+    assert serve_spec(GEMMA3_270M_CONFIG).embedding_scale == 25.25

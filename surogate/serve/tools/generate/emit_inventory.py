@@ -22,7 +22,12 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from from_dsl import _compile, _config, _module  # noqa: PLC2701 - same package, one contract
+from from_dsl import (  # noqa: PLC2701 - same package, one contract
+    _compile,
+    _config,
+    _module,
+    model_class as _model_class,
+)
 
 
 def geometry(config: dict[str, Any]) -> dict[str, int]:
@@ -135,20 +140,10 @@ def inventory_for(
     declaration itself wants.
     """
 
-    from surogate.dsl.decorators import _block_registry, _model_registry  # noqa: PLC2701
-
     ir = _compile(architecture, hf_config)
     config = _config(ir)
     symbols = geometry(config)
-
-    spec = next(
-        (s for s in _model_registry.values()
-         if s.hf_config and architecture in (s.hf_config.architecture, s.hf_config.model_type)),
-        None,
-    )
-    if spec is None or not getattr(spec, "_nn_model_class", None):
-        raise ValueError(f"no DSL model registered for {architecture}")
-    model_class = spec._nn_model_class  # noqa: SLF001
+    model_class = _model_class(architecture)
 
     model_objects = getattr(model_class, "_serve_objects_", ())
     layer_objects = getattr(model_class, "_serve_layer_objects_", {})

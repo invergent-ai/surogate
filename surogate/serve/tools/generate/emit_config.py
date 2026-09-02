@@ -21,6 +21,86 @@ def _float_literal(value: float) -> str:
     return f"{mantissa}e{int(exponent)}F"
 
 
+def _bool_rows(flags: tuple[bool, ...], per_row: int = 6) -> str:
+    """`true`/`false` in fixed-width columns, `per_row` to a line."""
+
+    cells = [("true," if flag else "false,").ljust(6) for flag in flags]
+    rows = [cells[start:start + per_row] for start in range(0, len(cells), per_row)]
+    return "\n".join("        " + "".join(row).rstrip() for row in rows)
+
+
+def _window_block(spec: TargetSpec) -> str:
+    """The window fields, the resolved schedule, and the per-layer rope base.
+
+    Emitted for both templates from one place: a windowed model whose target
+    happens to be hybrid must not lose its window because the other emitter was
+    the one that grew it. Nothing at all is emitted for a model with no window --
+    `family/impl/runtime/residual_policy.h` probes for these members with
+    `requires` and treats their absence as "unwindowed, one rope base", so
+    absence is the declaration, not an omission.
+
+    The schedule is data rather than a rule. Every earlier form of this was a
+    per-model convention hiding in the shared emitter -- Gemma 3 counts its
+    period from the end, which nothing but Gemma 3 does -- and a model whose
+    checkpoint states `layer_types` need not be periodic at all.
+    """
+
+    if not spec.sliding_window_schedule:
+        return ""
+    windowed = sum(spec.sliding_window_schedule)
+    return f"""
+    // Causal sliding-window attention: a query at position i admits keys j with
+    // `i - j < sliding_window`, i.e. exactly `sliding_window` keys including its
+    // own. Windowed layers rotate at their own base, {windowed} of {spec.layers} here.
+    static constexpr int sliding_window          = {spec.sliding_window};
+    static constexpr float sliding_rope_theta    = {_float_literal(spec.sliding_rope_theta)};
+
+    /// Which layers attend through the window, resolved from the declaration's
+    /// own layer schedule. Stated per layer rather than as a period because a
+    /// checkpoint states it per layer (`layer_types`), and a period that had to
+    /// be guessed would be guessed wrong in silence.
+    static constexpr std::array<bool, layers> kWindowedAttention{{
+{_bool_rows(spec.sliding_window_schedule)}
+    }};
+
+    /// True when this layer attends through the sliding window, false for a
+    /// global layer that sees the whole context.
+    [[nodiscard]] static constexpr bool is_windowed_attention(int layer) {{
+        return kWindowedAttention[static_cast<std::size_t>(layer)];
+    }}
+
+    /// The rope base this layer rotates at.
+    [[nodiscard]] static constexpr float layer_rope_theta(int layer) {{
+        return is_windowed_attention(layer) ? sliding_rope_theta : rope_theta;
+    }}
+"""
+
+
+def _embedding_scale_block(spec: TargetSpec) -> str:
+    """The factor applied to the embedding lookup, when there is one.
+
+    Absent rather than zero for a model that does not scale, for the same reason
+    the window block is: `residual_policy.h` probes for the member and skips the
+    multiply entirely when it is not there.
+    """
+
+    if not spec.embedding_scale:
+        return ""
+    return f"""
+    // Applied to the embedding lookup before the first block. The runtime rounds
+    // it to bf16, as the reference implementation does before multiplying.
+    static constexpr float embedding_scale       = {_float_literal(spec.embedding_scale)};
+"""
+
+
+def _standard_includes(spec: TargetSpec) -> str:
+    """`<array>` and `<cstddef>` only where the window schedule needs them."""
+
+    if not spec.sliding_window_schedule:
+        return "#include <cstdint>"
+    return "#include <array>\n#include <cstddef>\n#include <cstdint>"
+
+
 def emit_config_h(spec: TargetSpec) -> str:
     spec.validate()
     a = spec.attention
@@ -33,7 +113,7 @@ def emit_config_h(spec: TargetSpec) -> str:
 #include <api/family/hybrid_topology.h>
 #include <api/family/vision.h>
 
-#include <cstdint>
+{_standard_includes(spec)}
 
 namespace sinfer::targets::{spec.name}::detail {{
 
@@ -62,7 +142,7 @@ struct TextConfig {{
     static constexpr int full_attention_interval = family::kHybridAttentionInterval;
     static constexpr float rms_epsilon           = {_float_literal(spec.rms_epsilon)};
     static constexpr float rope_theta            = {_float_literal(spec.rope_theta)};
-
+{_window_block(spec)}{_embedding_scale_block(spec)}
     static constexpr int key_dim               = gdn_key_heads * gdn_key_head_dim;
     static constexpr int value_dim             = gdn_value_heads * gdn_value_head_dim;
     static constexpr int convolution_dim       = 2 * key_dim + value_dim;
@@ -150,7 +230,7 @@ def _emit_dense_config_h(spec: TargetSpec) -> str:
 #include <api/family/hybrid_topology.h>
 #include <api/family/vision.h>
 
-#include <cstdint>
+{_standard_includes(spec)}
 
 namespace sinfer::targets::{spec.name}::detail {{
 
@@ -181,35 +261,7 @@ struct TextConfig {{
     static constexpr int full_attention_interval = 1;
     static constexpr float rms_epsilon           = {_float_literal(spec.rms_epsilon)};
     static constexpr float rope_theta            = {_float_literal(spec.rope_theta)};
-
-    // Causal sliding-window attention. Zero is a model whose every layer sees the
-    // whole context; otherwise a query at position i admits keys j with
-    // `i - j < sliding_window`, i.e. exactly `sliding_window` keys including its
-    // own. `sliding_window_period` is how often a layer escapes the window: with
-    // 6, every 6th layer is global. Windowed layers rotate at their own base.
-    static constexpr int sliding_window          = {spec.sliding_window};
-    static constexpr int sliding_window_period   = {spec.sliding_window_period};
-    static constexpr float sliding_rope_theta    = {_float_literal(spec.sliding_rope_theta or spec.rope_theta)};
-
-    // Applied to the embedding lookup before the first block. Zero means none.
-    static constexpr float embedding_scale       = {_float_literal(spec.embedding_scale)};
-
-    /// True when this layer attends through the sliding window, false for a global
-    /// layer that sees the whole context. A model with no window has
-    /// every layer global; otherwise the period says which escape it. Gemma 3
-    /// counts from the end -- its last layer is global -- which is what
-    /// `(layer + 1) % period == 0` expresses.
-    [[nodiscard]] static constexpr bool is_windowed_attention(int layer) {{
-        if (sliding_window <= 0) {{ return false; }}
-        if (sliding_window_period <= 0) {{ return true; }}
-        return ((layer + 1) % sliding_window_period) != 0;
-    }}
-
-    /// The rope base this layer rotates at.
-    [[nodiscard]] static constexpr float layer_rope_theta(int layer) {{
-        return is_windowed_attention(layer) ? sliding_rope_theta : rope_theta;
-    }}
-
+{_window_block(spec)}{_embedding_scale_block(spec)}
     static constexpr int key_dim               = 0;
     static constexpr int value_dim             = 0;
     static constexpr int convolution_dim       = 0;

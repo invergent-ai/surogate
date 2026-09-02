@@ -112,6 +112,55 @@ def _hf_name(hf_mapping: dict[str, Any], dsl_name: str) -> str | None:
     return None
 
 
+def model_class(architecture: str) -> Any:
+    """The declared model class behind an architecture string.
+
+    The IR is a projection of the declaration and does not carry its hooks, so
+    every consumer that needs one (the artifact inventory, the window schedule)
+    has to come back to the class. One lookup, here, rather than one per
+    consumer.
+    """
+
+    from surogate.dsl.decorators import _model_registry  # noqa: PLC2701 - one contract
+
+    spec = next(
+        (s for s in _model_registry.values()
+         if s.hf_config and architecture in (s.hf_config.architecture, s.hf_config.model_type)),
+        None,
+    )
+    if spec is None or not getattr(spec, "_nn_model_class", None):
+        raise ValueError(f"no DSL model registered for {architecture}")
+    return spec._nn_model_class  # noqa: SLF001
+
+
+def window_schedule(architecture: str, config: dict[str, Any]) -> tuple[bool, ...]:
+    """Which layers attend through the sliding window, one entry per layer.
+
+    Resolved by the declaration, not here. A model states its layer schedule
+    through `_serve_block_schedule_` -- the same hook the artifact inventory
+    reads, so the header and the artifact cannot disagree about which layer is
+    which -- and names which of its block types are windowed in
+    `_serve_windowed_blocks_`. That second half is what keeps this generic: the
+    block vocabulary is per-model ("sliding"/"full" for Gemma 3,
+    "attention"/"mamba" for the hybrid families), and a generator that knew which
+    names meant windowed would have baked one model's convention into every
+    target.
+
+    An empty result means the declaration does not describe a window schedule.
+    The caller decides whether that is fatal; it is, for a model with a window.
+    """
+
+    try:
+        declaration = model_class(architecture)
+    except ValueError:
+        return ()
+    schedule = getattr(declaration, "_serve_block_schedule_", None)
+    windowed = getattr(declaration, "_serve_windowed_blocks_", None)
+    if schedule is None or windowed is None:
+        return ()
+    return tuple(str(block) in set(windowed) for block in schedule(config))
+
+
 def _params(ir: dict[str, Any]) -> tuple[ParamSpec, ...]:
     module = _module(ir)
     hf_mapping = module.get("hf_mapping") or ir.get("hf_mapping") or {}
@@ -196,6 +245,24 @@ def from_dsl(
             )
 
     token_domain = overrides.pop("token_domain", 0)
+
+    # The window is three facts: how wide it is, which layers are inside it, and
+    # what base those layers rotate at. The schedule is carried as data because a
+    # period cannot state what a checkpoint may state -- HF's `layer_types` is an
+    # arbitrary list -- and because the failure of guessing is silent: an absent
+    # period read as 0 windowed every layer, global ones included, and put them on
+    # the local rope base as well.
+    sliding_window = int(config.get("sliding_window", 0) or 0)
+    schedule = window_schedule(architecture, config) if sliding_window > 0 else ()
+    if sliding_window > 0 and not schedule:
+        raise ValueError(
+            f"the {architecture} declaration states sliding_window={sliding_window} but no "
+            f"per-layer window schedule; it must expose `_serve_block_schedule_` and name its "
+            f"windowed block types in `_serve_windowed_blocks_`. Refusing to assume every layer "
+            f"is windowed: that is how a global layer ends up masked to the window and rotating "
+            f"at the local base, which serves fluent nonsense rather than raising"
+        )
+
     spec = TargetSpec(
         name=name,
         token_domain=int(token_domain),
@@ -210,13 +277,16 @@ def from_dsl(
         native_context=int(config.get("max_seq") or TargetSpec.native_context),
         attention_interval=int(config.get("full_attention_interval", 4)),
         # A windowed model states all three or none of them: the window itself,
-        # how often a layer escapes it, and the base its windowed layers rotate
+        # which layers are inside it, and the base its windowed layers rotate
         # at. Read from the declaration, which is where the checkpoint's own
-        # config was mapped.
-        sliding_window=int(config.get("sliding_window", 0) or 0),
-        sliding_window_period=int(config.get("sliding_window_pattern", 0) or 0),
+        # config was mapped; `TargetSpec.validate` refuses a half-stated window.
+        sliding_window=sliding_window,
+        sliding_window_schedule=schedule,
         sliding_rope_theta=float(config.get("sliding_rope_theta", 0.0) or 0.0),
         embedding_scale=float(config.get("embedding_scale", 0.0) or 0.0),
+        # Gemma 3 decouples the attention scale from the head dim; every other
+        # declaration leaves this absent and inherits `head_dim ** -0.5`.
+        query_pre_attn_scalar=int(config.get("query_pre_attn_scalar", 0) or 0),
         params=_params(ir),
         **overrides,
     )

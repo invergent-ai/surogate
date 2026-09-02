@@ -4,6 +4,8 @@
 #include <api/family/hybrid_topology.h>
 #include <api/family/vision.h>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace sinfer::targets::gemma3_270m::detail {
@@ -36,33 +38,36 @@ struct TextConfig {
     static constexpr float rms_epsilon           = 1.0e-6F;
     static constexpr float rope_theta            = 1.0e6F;
 
-    // Causal sliding-window attention. Zero is a model whose every layer sees the
-    // whole context; otherwise a query at position i admits keys j with
+    // Causal sliding-window attention: a query at position i admits keys j with
     // `i - j < sliding_window`, i.e. exactly `sliding_window` keys including its
-    // own. `sliding_window_period` is how often a layer escapes the window: with
-    // 6, every 6th layer is global. Windowed layers rotate at their own base.
+    // own. Windowed layers rotate at their own base, 15 of 18 here.
     static constexpr int sliding_window          = 512;
-    static constexpr int sliding_window_period   = 6;
     static constexpr float sliding_rope_theta    = 1.0e4F;
 
-    // Applied to the embedding lookup before the first block. Zero means none.
-    static constexpr float embedding_scale       = 2.529822e1F;
+    /// Which layers attend through the window, resolved from the declaration's
+    /// own layer schedule. Stated per layer rather than as a period because a
+    /// checkpoint states it per layer (`layer_types`), and a period that had to
+    /// be guessed would be guessed wrong in silence.
+    static constexpr std::array<bool, layers> kWindowedAttention{
+        true, true, true, true, true, false,
+        true, true, true, true, true, false,
+        true, true, true, true, true, false,
+    };
 
-    /// True when this layer attends through the sliding window, false for a global
-    /// layer that sees the whole context. A model with no window has
-    /// every layer global; otherwise the period says which escape it. Gemma 3
-    /// counts from the end -- its last layer is global -- which is what
-    /// `(layer + 1) % period == 0` expresses.
+    /// True when this layer attends through the sliding window, false for a
+    /// global layer that sees the whole context.
     [[nodiscard]] static constexpr bool is_windowed_attention(int layer) {
-        if (sliding_window <= 0) { return false; }
-        if (sliding_window_period <= 0) { return true; }
-        return ((layer + 1) % sliding_window_period) != 0;
+        return kWindowedAttention[static_cast<std::size_t>(layer)];
     }
 
     /// The rope base this layer rotates at.
     [[nodiscard]] static constexpr float layer_rope_theta(int layer) {
         return is_windowed_attention(layer) ? sliding_rope_theta : rope_theta;
     }
+
+    // Applied to the embedding lookup before the first block. The runtime rounds
+    // it to bf16, as the reference implementation does before multiplying.
+    static constexpr float embedding_scale       = 2.525e1F;
 
     static constexpr int key_dim               = 0;
     static constexpr int value_dim             = 0;

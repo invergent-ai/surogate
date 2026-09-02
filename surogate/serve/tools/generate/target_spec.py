@@ -110,11 +110,14 @@ class TargetSpec:
     #: the convention vLLM passes for Gemma 3.
     sliding_window: int = 0
 
-    #: Layers whose attention is windowed, as a repeating period: with
-    #: `sliding_window_period` 6, every 6th layer sees the whole context and the
-    #: other five are windowed. Zero means the window, if any, applies to every
-    #: layer.
-    sliding_window_period: int = 0
+    #: Which layers attend through the window, one entry per layer, `True` for a
+    #: windowed layer. The resolved schedule rather than a period, because a
+    #: period cannot express what a checkpoint is allowed to state: HF's
+    #: `layer_types` is an arbitrary list, and reading a missing period as 0
+    #: silently windowed every layer -- including the global ones, which then
+    #: also took the local rope base. Empty means the model has no window; a
+    #: windowed model states one entry per layer or it is refused.
+    sliding_window_schedule: tuple[bool, ...] = ()
 
     #: Rope base for windowed layers. Gemma 3 rotates its local layers 100x
     #: faster than its global ones, so one theta cannot describe the model.
@@ -126,6 +129,13 @@ class TargetSpec:
     #: doing it in fp32 and rounding after gives a different answer.
     embedding_scale: float = 0.0
 
+    #: The denominator Gemma 3 scales its attention logits by, before the square
+    #: root: `query_pre_attn_scalar ** -0.5`, which is *not* `head_dim ** -0.5`
+    #: in general. The 27B has scalar 168 against head dim 128, so a target that
+    #: inherited the head-dim default would be wrong by 15% and entirely silent.
+    #: Zero means the model does not decouple the two and the head dim is used.
+    query_pre_attn_scalar: int = 0
+
     def validate(self) -> None:
         if not self.name.isidentifier():
             raise ValueError(f"target name {self.name!r} must be a C++ identifier")
@@ -135,6 +145,45 @@ class TargetSpec:
         self.attention.validate()
         if self.linear_attention is not None:
             self.linear_attention.validate()
+        if self.query_pre_attn_scalar < 0:
+            raise ValueError("query_pre_attn_scalar must not be negative")
+        self._validate_window()
+
+    def _validate_window(self) -> None:
+        """A windowed model states all three window fields, or none of them.
+
+        The three are one fact in three parts -- the window itself, which layers
+        are inside it, and the base those layers rotate at -- and any two without
+        the third describe a model nobody meant. A half-stated window is how the
+        emitted header ends up windowing layers that should see their whole
+        context, which is silent: the model still answers, on the wrong keys.
+
+        A model whose windowed layers rotate at the ordinary base states
+        `sliding_rope_theta` equal to `rope_theta` rather than leaving it out, so
+        that "left out" keeps meaning "not windowed".
+        """
+
+        stated = {
+            "sliding_window": self.sliding_window > 0,
+            "sliding_window_schedule": bool(self.sliding_window_schedule),
+            "sliding_rope_theta": self.sliding_rope_theta > 0,
+        }
+        if any(stated.values()) and not all(stated.values()):
+            missing = sorted(name for name, present in stated.items() if not present)
+            present = sorted(name for name, is_set in stated.items() if is_set)
+            raise ValueError(
+                f"a windowed target states all three window fields or none; "
+                f"{self.name} states {present} and leaves {missing} unset"
+            )
+        if not self.sliding_window_schedule:
+            return
+        if len(self.sliding_window_schedule) != self.layers:
+            raise ValueError(
+                f"the window schedule covers {len(self.sliding_window_schedule)} layers, "
+                f"{self.name} has {self.layers}"
+            )
+        if not all(isinstance(flag, bool) for flag in self.sliding_window_schedule):
+            raise ValueError("the window schedule must be one bool per layer")
 
     @property
     def full_attention_layers(self) -> int:
@@ -149,7 +198,10 @@ class TargetSpec:
 
     @property
     def attention_scale(self) -> float:
-        return self.attention.head_dim ** -0.5
+        """`query_pre_attn_scalar ** -0.5` where the declaration decouples the
+        two, `head_dim ** -0.5` otherwise. Gemma3-27B is the case that separates
+        them: scalar 168, head dim 128, and the two differ by 15%."""
+        return (self.query_pre_attn_scalar or self.attention.head_dim) ** -0.5
 
     @property
     def gdn_scale(self) -> float:

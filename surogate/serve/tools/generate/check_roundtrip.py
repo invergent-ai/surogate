@@ -22,31 +22,57 @@ import json
 import os
 import pathlib
 import sys
+from typing import NamedTuple
 
 from emit_config import emit_config_h
 from from_dsl import from_dsl
 
-#: serve target name -> (env var holding a config.json, HF cache glob fallback).
-#: The declaration supplies the architecture; these supply which instance of it.
+
+class Target(NamedTuple):
+    """Where one target's checkpoint config comes from, and where it lands.
+
+    `directory` exists because a target's C++ namespace and its source directory
+    are not always the same word: `targets/gemma3/` holds `gemma3_270m::detail`,
+    since one header describes one size and a 4B Gemma 3 will want its own.
+    """
+
+    env_var: str
+    pattern: str
+    directory: str = ""
+
+
+#: serve target name (the C++ namespace) -> where to find an instance of it.
+#: The declaration supplies the architecture; these supply which instance.
 TARGETS = {
-    "qwen3_5_0_8b": (
+    "qwen3_5_0_8b": Target(
         "QWEN3_5_0_8B_CONFIG",
         "~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/*/config.json",
     ),
-    "qwen3_5_4b": (
+    "qwen3_5_4b": Target(
         "QWEN3_5_4B_CONFIG",
         "~/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/*/config.json",
+    ),
+    "gemma3_270m": Target(
+        "GEMMA3_270M_CONFIG",
+        "~/.cache/huggingface/hub/models--google--gemma-3-270m-it/snapshots/*/config.json",
+        directory="gemma3",
     ),
 }
 
 
 def resolve_config(name: str) -> pathlib.Path | None:
-    env_var, pattern = TARGETS[name]
-    override = os.environ.get(env_var)
+    target = TARGETS[name]
+    override = os.environ.get(target.env_var)
     if override:
         return pathlib.Path(override)
-    matches = sorted(glob.glob(os.path.expanduser(pattern)))
+    matches = sorted(glob.glob(os.path.expanduser(target.pattern)))
     return pathlib.Path(matches[0]) if matches else None
+
+
+def committed_config(root: pathlib.Path, name: str) -> pathlib.Path:
+    """The committed header this target must reproduce."""
+
+    return root / (TARGETS[name].directory or name) / "impl" / "config.h"
 
 
 def main(root: pathlib.Path) -> int:
@@ -68,7 +94,7 @@ def main(root: pathlib.Path) -> int:
             failures += 1
             continue
 
-        committed = (root / name / "impl" / "config.h").read_text()
+        committed = committed_config(root, name).read_text()
         generated = emit_config_h(spec)
         if committed == generated:
             lora = sum(1 for p in spec.params if p.is_lora_target)

@@ -39,7 +39,7 @@ def emitters():
 
 #: Targets whose `config.h` is emitted from the declaration and must match byte
 #: for byte. Anything here has fully migrated.
-GENERATED_TARGETS = ("qwen3_5_0_8b", "qwen3_5_4b")
+GENERATED_TARGETS = ("qwen3_5_0_8b", "qwen3_5_4b", "gemma3_270m")
 
 #: Hand-written targets, checked value-by-value instead: forcing a generator to
 #: reproduce prose that records *why* a constant holds would relocate the
@@ -121,7 +121,7 @@ def test_generated_target_reproduces_from_declaration(emitters, target):
     architecture = (hf_config.get("architectures") or [hf_config.get("model_type")])[0]
     spec = from_dsl.from_dsl(architecture, hf_config, name=target)
 
-    committed = (TARGETS / target / "impl" / "config.h").read_text()
+    committed = check_roundtrip.committed_config(TARGETS, target).read_text()
     assert emit_config.emit_config_h(spec) == committed, (
         f"{target}/impl/config.h no longer matches what the {architecture} declaration "
         f"emits; the declaration and the serve target disagree about the model"
@@ -296,3 +296,167 @@ def test_qwen4exp_inventory_has_a_text_only_variant():
     assert len(with_tower) - len(text_only) == len(inventory.VISION_TENSOR_SPECS)
     assert not [s for s in text_only if s.name.startswith("vision/")]
     assert [s for s in with_tower if s.name.startswith("vision/")]
+
+
+# ---------------------------------------------------------------------------
+# The sliding-window contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def specs():
+    """`target_spec` and `emit_config`, for specs written here rather than read.
+
+    The window rules below are properties of the contract, not of any one
+    checkpoint, so they are stated against hand-built specs: no hub cache, no
+    skip, and a hybrid windowed target can be exercised before one exists.
+    """
+
+    return pytest.importorskip("target_spec"), pytest.importorskip("emit_config")
+
+
+def dense_spec(target_spec, **overrides):
+    fields = dict(
+        name="probe",
+        hidden=640,
+        layers=6,
+        intermediate=2048,
+        vocab=1024,
+        rms_epsilon=1.0e-6,
+        rope_theta=1.0e6,
+        attention=target_spec.AttentionSpec(
+            query_heads=4, kv_heads=1, head_dim=256, rotary_dim=256
+        ),
+    )
+    fields.update(overrides)
+    return target_spec.TargetSpec(**fields)
+
+
+def hybrid_spec(target_spec, **overrides):
+    return dense_spec(
+        target_spec,
+        linear_attention=target_spec.LinearAttentionSpec(
+            key_heads=2, key_head_dim=64, value_heads=4, value_head_dim=64, conv_kernel=4
+        ),
+        **overrides,
+    )
+
+
+#: A window stated in halves. Each of these describes a model nobody meant, and
+#: each used to emit a header that compiles and serves the wrong keys.
+HALF_STATED_WINDOWS = (
+    {"sliding_window": 512},
+    {"sliding_window": 512, "sliding_rope_theta": 1.0e4},
+    {"sliding_window": 512, "sliding_window_schedule": (True,) * 6},
+    {"sliding_window_schedule": (True,) * 6, "sliding_rope_theta": 1.0e4},
+    {"sliding_rope_theta": 1.0e4},
+)
+
+
+@pytest.mark.parametrize("window", HALF_STATED_WINDOWS)
+def test_a_half_stated_window_is_refused(specs, window):
+    """The three window fields are one fact in three parts."""
+
+    target_spec, _ = specs
+    with pytest.raises(ValueError, match="all three window fields or none"):
+        dense_spec(target_spec, **window).validate()
+
+
+def test_the_schedule_must_cover_every_layer(specs):
+    target_spec, _ = specs
+    with pytest.raises(ValueError, match="covers 3 layers"):
+        dense_spec(
+            target_spec,
+            sliding_window=512,
+            sliding_window_schedule=(True, True, False),
+            sliding_rope_theta=1.0e4,
+        ).validate()
+
+
+def test_the_window_schedule_is_emitted_as_data(specs):
+    """Not as a period. A checkpoint states `layer_types`, which need not be
+    periodic at all, and the phase Gemma 3 happens to use ("counted from the
+    end") is a property of one model rather than of the emitter."""
+
+    target_spec, emit_config = specs
+    schedule = (False, False, True, True, False, True)
+    header = emit_config.emit_config_h(
+        dense_spec(
+            target_spec,
+            sliding_window=512,
+            sliding_window_schedule=schedule,
+            sliding_rope_theta=1.0e4,
+        )
+    )
+
+    assert "std::array<bool, layers> kWindowedAttention{" in header
+    body = header.split("kWindowedAttention{", 1)[1].split("};", 1)[0]
+    emitted = [token.strip() for token in body.split(",") if token.strip()]
+    assert [flag == "true" for flag in emitted] == list(schedule)
+    assert "return kWindowedAttention[static_cast<std::size_t>(layer)];" in header
+    assert "#include <array>" in header
+    # The period, and the arithmetic that read one, are gone.
+    assert "sliding_window_period" not in header
+    assert "% sliding" not in header
+
+
+def test_a_hybrid_target_keeps_its_window(specs):
+    """Only the dense emitter grew the window block, so a windowed hybrid model
+    generated a header with no window in it at all: every layer global, every
+    layer on the wrong rope base, and nothing raised. gemma4 and laguna both
+    declare a window, so this is not hypothetical."""
+
+    target_spec, emit_config = specs
+    header = emit_config.emit_config_h(
+        hybrid_spec(
+            target_spec,
+            sliding_window=512,
+            sliding_window_schedule=(True, True, True, True, True, False),
+            sliding_rope_theta=1.0e4,
+            embedding_scale=25.25,
+        )
+    )
+
+    assert "static constexpr int sliding_window          = 512;" in header
+    assert "kWindowedAttention" in header
+    assert "is_windowed_attention(int layer)" in header
+    assert "layer_rope_theta(int layer)" in header
+    assert "static constexpr float embedding_scale       = 2.525e1F;" in header
+    # Still a hybrid header: the window rides on top of the GDN geometry.
+    assert "gdn_conv_kernel      = 4;" in header
+
+
+@pytest.mark.parametrize("build", (dense_spec, hybrid_spec))
+def test_a_model_with_no_window_says_nothing_about_one(specs, build):
+    """`family/impl/runtime/residual_policy.h` probes for these members with
+    `requires`; absence is what makes a target unwindowed with a single rope
+    base, so absence has to stay absence rather than becoming a zero."""
+
+    target_spec, emit_config = specs
+    header = emit_config.emit_config_h(build(target_spec))
+
+    for absent in ("sliding_window", "kWindowedAttention", "is_windowed_attention",
+                   "layer_rope_theta", "embedding_scale", "#include <array>"):
+        assert absent not in header, absent
+
+
+def test_attention_scale_prefers_the_declared_pre_attention_scalar(specs):
+    """Gemma3-27B scales by `query_pre_attn_scalar ** -0.5` with scalar 168
+    against head dim 128. Deriving it from the head dim is wrong by 15% and
+    silent -- and invisible on the 270M, whose scalar is its head dim."""
+
+    target_spec, emit_config = specs
+    wide = dense_spec(
+        target_spec,
+        attention=target_spec.AttentionSpec(
+            query_heads=32, kv_heads=16, head_dim=128, rotary_dim=128
+        ),
+        query_pre_attn_scalar=168,
+    )
+    assert wide.attention_scale == pytest.approx(168.0**-0.5)
+    assert wide.attention_scale != pytest.approx(128.0**-0.5)
+    assert "kAttentionScale                   = 0.07715167498104596F" in emit_config.emit_config_h(wide)
+
+    # Absent, the head dim is what the model uses, and every other target relies
+    # on exactly that.
+    assert dense_spec(target_spec).attention_scale == pytest.approx(256.0**-0.5)
