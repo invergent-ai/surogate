@@ -119,7 +119,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--enforce-eager] [--no-prefix-reuse] "
-           "[--enable-sleep-mode] [--elastic-kv] [--elastic-kv-overcommit] "
+           "[--enable-sleep-mode] [--no-elastic-kv] [--elastic-kv-overcommit] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -150,9 +150,9 @@ std::string serve_usage_text(const char* argv0) {
            "         resumes from its prefix instead of re-prefilling it; one state slot per lane\n"
            "         (72 MiB each on the 27B), off by default\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
-           "       --elastic-kv maps the Main KV pool's pages on demand: the pool keeps its planned\n"
-           "                    size, but only pages in use (plus a small reserve) hold VRAM\n"
-           "       --elastic-kv-overcommit (implies --elastic-kv) guarantees each model only its\n"
+           "       --no-elastic-kv keeps the Main KV pool's planes in the arena; by default they are\n"
+           "                    mapped on demand and only pages in use (plus a small reserve) hold VRAM\n"
+           "       --elastic-kv-overcommit guarantees each model only its\n"
            "                    --kv-capacity (one full-context request when auto) and admits every\n"
            "                    page past that against the device's free memory, shared across models\n"
            "       --enable-sleep-mode adds POST /sleep and /wake_up: sleeping releases VRAM\n"
@@ -354,7 +354,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--elastic-kv") {
-            options.elastic_kv = true;
+            options.elastic_kv = true; // the default; kept so older launch lines still parse
+        } else if (arg == "--no-elastic-kv") {
+            options.elastic_kv = false;
         } else if (arg == "--elastic-kv-overcommit") {
             options.elastic_kv            = true;
             options.elastic_kv_overcommit = true;
@@ -531,6 +533,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
+    if (options.elastic_kv_overcommit && !options.elastic_kv) {
+        throw std::invalid_argument("--elastic-kv-overcommit needs the elastic pool; drop --no-elastic-kv");
+    }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit && options.max_context != 0 &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-model-len");
@@ -565,8 +570,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 // against a shared ledger, so automatic sizing is safe there.
                 throw std::invalid_argument(
                     "--model " + extra.name +
-                    ": kv-tokens=N is required -- extra models size their KV explicitly so the "
-                    "deployment's memory split is stated, not discovered (or use --elastic-kv)");
+                    ": kv-tokens=N is required under --no-elastic-kv -- with arena pools the "
+                    "extras state their KV so the deployment's memory split is explicit");
             }
             for (const auto& seen : names) {
                 if (seen == extra.name) {

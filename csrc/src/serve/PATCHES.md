@@ -3357,3 +3357,17 @@ engine whose whole queue waits paces its retries.
 Measured: 27B+4B both-hot parity (312 + 624 tok/s); contention between two
 4B engines with 4 GB of demand into 2.4 GB of room: 298 + 326 requests, 0
 errors, free memory pinned at the headroom, reserves back afterwards.
+
+## 93
+
+**Elastic KV is the default (2026-09-02).**
+
+`--no-elastic-kv` puts the Main pool's planes back in the arena; `--elastic-kv`
+stays accepted as a no-op so older launch lines parse. With the elastic pool
+the default, an extra model's `kv-tokens=` is optional (its cap commits
+against the ledger) and required only under `--no-elastic-kv`; overcommit
+with `--no-elastic-kv` is refused. Decided on the numbers in #92 and the
+design log: throughput parity with the arena pool at every load tried, the
+cross-request leak closed, 105/105 in the suite, and the default-flag smoke
+(27B + 4B, no elastic flags, 8+8 users): 322 + 612 tok/s, 0 errors,
+0.62 + 0.31 GiB mapped, pair-leak 0/8.

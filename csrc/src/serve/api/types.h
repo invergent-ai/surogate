@@ -181,8 +181,9 @@ struct EngineOptions {
     bool rewrite_checkpoints           = false;
     // The Main KV pool's planes are demand-mapped (core/elastic_kv_region.h): the pool keeps
     // its planned size as a virtual span and only the pages in use, plus a small reserve,
-    // hold physical memory. Off by default while it is being validated.
-    bool elastic_kv                    = false;
+    // hold physical memory. On by default: throughput parity with the arena pool, measured
+    // (design/INFERENCE.md, 2026-09-02); false puts the planes back in the arena.
+    bool elastic_kv                    = true;
     // With elastic_kv: the pool's physical cap is a guaranteed floor (one full-context request
     // under automatic sizing) and every page past it is admitted through a device-wide gate
     // on free memory, so co-resident engines share the device's idle KV.
