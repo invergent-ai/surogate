@@ -31,7 +31,6 @@ constexpr std::size_t kOutputScanWords    = 1U << 20;
 constexpr int kOracleTBlock               = 8;
 constexpr double kBf16UnitRoundoff        = 1.0 / 256.0;
 constexpr double kA8QuantizationAllowance = 0.04;
-constexpr double kA4QuantizationAllowance = 0.16;
 
 // The criterion belongs to the activation compute path, not to a private kernel, schedule, or
 // launcher selected inside that path. The relative-L2 allowance is one BF16 unit roundoff; the
@@ -43,7 +42,9 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     case ActivationCompute::A8:
         return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:
-        return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
+        // The A4 oracle reproduces the kernel's quantiser exactly (materialize_activation), so
+        // the criterion is the A16 one: what is left is accumulation order and BF16 storage.
+        return tolerance_for(ActivationCompute::A16);
     }
     throw std::invalid_argument("linear test: unknown activation compute path");
 }
@@ -130,8 +131,54 @@ std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::
     return result;
 }
 
+namespace {
+
+// E4M3FN: code -> value for positive codes 0x00..0x7e (0x7f is NaN; a saturating encode never
+// produces it).
+float e4m3_value(std::uint8_t code) {
+    const int exponent = (code >> 3) & 0xf;
+    const int mantissa = code & 0x7;
+    if (exponent == 0) { return static_cast<float>(mantissa) * (1.0F / 512.0F); }
+    return std::ldexp(1.0F + static_cast<float>(mantissa) / 8.0F, exponent - 7);
+}
+
+// __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3) for x >= 0: nearest E4M3FN value, ties
+// to the even code, saturating to the largest finite (448).
+std::uint8_t encode_e4m3_satfinite(float value) {
+    if (!(value > 0.0F)) { return 0; }
+    if (value >= e4m3_value(0x7e)) { return 0x7e; }
+    std::uint8_t below = 0;
+    while (below < 0x7e && e4m3_value(static_cast<std::uint8_t>(below + 1)) <= value) { ++below; }
+    const std::uint8_t above = static_cast<std::uint8_t>(below + 1);
+    const float low = e4m3_value(below), high = e4m3_value(above);
+    if (value == low) { return below; }
+    const float to_low = value - low, to_high = high - value;
+    if (to_low < to_high) { return below; }
+    if (to_high < to_low) { return above; }
+    return (below & 1) == 0 ? below : above;
+}
+
+// cvt.rn.satfinite.e2m1x2: nearest of {0, .5, 1, 1.5, 2, 3, 4, 6}, ties to the even code,
+// saturating at 6, sign kept.
+float round_e2m1_satfinite(float value) {
+    constexpr float grid[8] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F};
+    const float magnitude   = std::fabs(value);
+    int code                = 7;
+    if (magnitude < 6.0F) {
+        int below = 0;
+        while (below < 7 && grid[below + 1] <= magnitude) { ++below; }
+        const float to_low = magnitude - grid[below], to_high = grid[below + 1] - magnitude;
+        code = to_low < to_high ? below : to_high < to_low ? below + 1 : ((below & 1) == 0 ? below : below + 1);
+    }
+    return std::copysign(grid[code], value);
+}
+
+} // namespace
+
 std::vector<float> materialize_activation(const std::vector<std::uint16_t>& bits, std::int32_t k,
-                                          std::span<const std::int32_t> columns) {
+                                          std::span<const std::int32_t> columns,
+                                          ActivationCompute activation_compute,
+                                          float input_scale_divisor) {
     std::vector<float> result(
         checked_elements(k, static_cast<std::int32_t>(columns.size()), "oracle activation"));
     for (std::size_t oracle_column = 0; oracle_column < columns.size(); ++oracle_column) {
@@ -140,6 +187,28 @@ std::vector<float> materialize_activation(const std::vector<std::uint16_t>& bits
         float* destination = result.data() + oracle_column * static_cast<std::size_t>(k);
         for (std::int32_t column = 0; column < k; ++column) {
             destination[column] = test::bf16_to_f32(source[column]);
+        }
+        if (activation_compute != ActivationCompute::A4) { continue; }
+        // quantize_nvfp4_k16, step for step, in the kernel's fp32 operation order.
+        for (std::int32_t block = 0; block < k; block += 16) {
+            float* values = destination + block;
+            float max_abs = 0.0F;
+            for (int i = 0; i < 16; ++i) { max_abs = std::fmax(max_abs, std::fabs(values[i])); }
+            const float scaled          = input_scale_divisor * max_abs;
+            const float scale_unencoded = scaled / 6.0F;
+            const std::uint8_t scale    = encode_e4m3_satfinite(scale_unencoded);
+            if (scale == 0) {
+                for (int i = 0; i < 16; ++i) { values[i] = 0.0F; }
+                continue;
+            }
+            const float decoded_scale = e4m3_value(scale);
+            for (int i = 0; i < 16; ++i) {
+                const float lifted = values[i] * input_scale_divisor;
+                const float code   = round_e2m1_satfinite(lifted / decoded_scale);
+                // what the GEMM sees, undone by the divisor the epilogue's alpha applies
+                values[i] = static_cast<float>(static_cast<double>(code) * decoded_scale /
+                                               input_scale_divisor);
+            }
         }
     }
     return result;
@@ -308,7 +377,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     if (shape.comparison == Comparison::Full) {
         const std::vector<std::int32_t> columns = all_indices(maximum->t);
         const std::vector<float> activation =
-            materialize_activation(activation_bits, shape.k, columns);
+            materialize_activation(activation_bits, shape.k, columns, activation_compute,
+                                   host_weight.weight.input_scale_divisor);
         full_reference.resize(checked_elements(shape.n, maximum->t, "full reference"));
         cpu_linear_gemm_fp64(oracle_weight.data(), activation.data(), full_reference.data(),
                              shape.n, shape.k, maximum->t);
@@ -355,7 +425,8 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
                                activation_compute);
         } else {
             const std::vector<float> activation =
-                materialize_activation(activation_bits, shape.k, columns);
+                materialize_activation(activation_bits, shape.k, columns, activation_compute,
+                                   host_weight.weight.input_scale_divisor);
             std::vector<double> reference(
                 checked_elements(static_cast<std::int32_t>(oracle_rows.size()),
                                  static_cast<std::int32_t>(columns.size()), "sampled reference"));

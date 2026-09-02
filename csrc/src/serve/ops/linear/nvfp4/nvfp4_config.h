@@ -168,6 +168,8 @@ inline constexpr bool is_nvfp4_gemv_only_problem(std::int32_t output_rows, std::
 
 // Shapes outside the five registered geometries run on the cuBLASLt route alone (#82): it is
 // shape-generic, so only the activation quantizer needs an instantiation per K.
+using Nvfp4Activation512Geometry   = Nvfp4ActivationGeometry<512>;
+using Nvfp4Activation2048Geometry  = Nvfp4ActivationGeometry<2048>;
 using Nvfp4Activation2560Geometry  = Nvfp4ActivationGeometry<2560>;
 using Nvfp4Activation4096Geometry  = Nvfp4ActivationGeometry<4096>;
 using Nvfp4Activation9216Geometry  = Nvfp4ActivationGeometry<9216>;
@@ -217,7 +219,8 @@ inline constexpr bool is_nvfp4_generic_problem(std::int32_t output_rows, std::in
         return false;
     }
     if (is_nvfp4_registered_problem(output_rows, input_rows)) { return false; }
-    return input_rows == 2560 || input_rows == 4096 || input_rows == 5120 || input_rows == 9216;
+    return input_rows == 512 || input_rows == 2048 || input_rows == 2560 || input_rows == 4096 ||
+           input_rows == 5120 || input_rows == 9216;
 }
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
