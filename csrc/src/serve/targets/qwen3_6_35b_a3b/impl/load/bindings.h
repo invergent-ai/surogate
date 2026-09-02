@@ -40,11 +40,29 @@ struct MoePlan {
     std::optional<artifact::ObjectHandle> routed_down_alpha;
 };
 
+/// The attention input projection as one object per HF Linear. A quantized export stores
+/// q/k/v that way, each with its own global scale, and there is no honest way to fuse two
+/// of those; q and gate are the two halves of HF's q_proj, gathered per head.
+struct SplitAttentionPlan {
+    artifact::LinearBinding query;
+    artifact::LinearBinding key;
+    artifact::LinearBinding gate;
+    artifact::LinearBinding value;
+};
+
 struct FullAttentionPlan {
-    artifact::ObjectHandle query_key_gate_value;
+    /// Exactly one of the two is set: the fused parent the groupwise-int artifacts carry, or
+    /// the split the export stores. Each weight's format is whatever the artifact declares.
+    std::optional<artifact::LinearBinding> query_key_gate_value;
+    std::optional<SplitAttentionPlan> split;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    artifact::LinearBinding output;
+};
+
+struct SplitGdnInputPlan {
+    artifact::LinearBinding query_key_value;
+    artifact::LinearBinding z;
 };
 
 struct GdnPlan {
@@ -52,9 +70,11 @@ struct GdnPlan {
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
     artifact::ObjectHandle a_b_projection;
-    artifact::ObjectHandle query_key_value_z;
+    /// As for attention: the fused qkv|z parent, or in_proj_qkv and in_proj_z as stored.
+    std::optional<artifact::LinearBinding> query_key_value_z;
+    std::optional<SplitGdnInputPlan> split;
     artifact::ObjectHandle norm;
-    artifact::ObjectHandle output;
+    artifact::LinearBinding output;
 };
 
 struct TextLayerPlan {
@@ -101,10 +121,10 @@ struct BindingPlan {
     /// Which weight formats the artifact carries; decided by the identity, read by both the
     /// binder (which object formats to expect) and the loader (which Weights to build).
     WeightsProfile weights = WeightsProfile::GroupwiseInt;
-    artifact::ObjectHandle token_embedding;
+    artifact::LinearBinding token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
-    artifact::ObjectHandle output_head;
+    artifact::LinearBinding output_head;
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
@@ -131,15 +151,31 @@ struct SparseMoePayload {
     ops::SparseMoeWeights op;
 };
 
+struct SplitAttentionWeights {
+    Weight query;
+    Weight key;
+    Weight gate;
+    Weight value;
+};
+
 struct AttentionProjectionPayload {
+    /// The fused parent when `split` is empty; unused otherwise.
     Weight query_key_gate_value;
+    std::optional<SplitAttentionWeights> split;
+};
+
+struct SplitGdnInputWeights {
+    Weight query_key_value;
+    Weight z;
 };
 
 struct GdnProjectionPayload {
     Tensor a_log;
     Tensor dt_bias;
     Weight a_b_projection;
+    /// The fused qkv|z parent when `split` is empty; unused otherwise.
     Weight query_key_value_z;
+    std::optional<SplitGdnInputWeights> split;
 };
 
 using RuntimeModelView =

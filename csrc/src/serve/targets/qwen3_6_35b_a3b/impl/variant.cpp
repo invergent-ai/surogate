@@ -50,6 +50,12 @@ bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_
     return max_visible_keys > prompt_visible_limit;
 }
 
+/// The policy a generic linear accepts for a weight in the format the artifact stored it in:
+/// BF16 takes A16 only; NVFP4 routes W4A4 at every width on these shapes either way.
+ops::LinearPolicy linear_policy_for(const Weight& weight) {
+    return weight.qtype == QType::NVFP4 ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::A16Only;
+}
+
 void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, Tensor& residual,
                     WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope               = workspace.scope();
@@ -110,7 +116,20 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, family::TextPhase,
-                                   WorkspaceArena&, cudaStream_t stream) {
+                                   WorkspaceArena& workspace, cudaStream_t stream) {
+    if (weights.split) {
+        // One projection per stored Linear. The fused op infers its q/k/v split from the
+        // parent's row count and has no NVFP4 route at this geometry; four generic linears
+        // have both, and a quantized export's constituents carry their own global scales, so
+        // this is also the only exact way to run them. LoRA registers against the fused
+        // parent's pointer and is not offered on the split path yet.
+        const SplitAttentionWeights& split = *weights.split;
+        ops::linear(hidden, split.query, query, linear_policy_for(split.query), workspace, stream);
+        ops::linear(hidden, split.gate, gate, linear_policy_for(split.gate), workspace, stream);
+        ops::linear(hidden, split.key, key, linear_policy_for(split.key), workspace, stream);
+        ops::linear(hidden, split.value, value, linear_policy_for(split.value), workspace, stream);
+        return;
+    }
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
     family::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
 }
@@ -151,9 +170,18 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, family::TextPhase,
-                                   WorkspaceArena&, cudaStream_t stream) {
+                                   WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1] * hidden.ne[2])});
+    if (weights.split) {
+        // in_proj_qkv and in_proj_z as the checkpoint stores them, each in its own format.
+        const SplitGdnInputWeights& split = *weights.split;
+        ops::linear(hidden, split.query_key_value, qkv, linear_policy_for(split.query_key_value),
+                    workspace, stream);
+        ops::linear(hidden, split.z, output_gate_flat, linear_policy_for(split.z), workspace,
+                    stream);
+        return;
+    }
     ops::gdn_input_proj(hidden, weights.query_key_value_z, qkv, output_gate_flat, stream);
 }
 
@@ -163,6 +191,14 @@ void Variant::gdn_input_projection_snapshot(
     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
     Tensor& output_gate, family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
+    if (weights.split) {
+        const SplitGdnInputWeights& split = *weights.split;
+        ops::gdn_input_proj_conv_snapshot_split(
+            hidden, split.query_key_value, split.z, conv_weight, conv_states, valid_columns,
+            initial_slot, snapshot_base_slot, query, key, value, output_gate_view,
+            linear_policy_for(split.query_key_value), workspace, stream);
+        return;
+    }
     ops::gdn_input_proj_conv_snapshot(hidden, weights.query_key_value_z, conv_weight, conv_states,
                                       valid_columns, initial_slot, snapshot_base_slot, query, key,
                                       value, output_gate_view, workspace, stream);
@@ -178,6 +214,14 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden));
     WorkspaceArena leaf_workspace(storage);
     Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
+    if (weights.split) {
+        const SplitGdnInputWeights& split = *weights.split;
+        ops::gdn_input_proj_conv_record_split(
+            hidden, split.query_key_value, split.z, conv_weight, conv_states, valid_columns,
+            initial_slots, conv_record, query, key, value, output_gate_view,
+            linear_policy_for(split.query_key_value), leaf_workspace, stream);
+        return;
+    }
     ops::gdn_input_proj_conv_record(hidden, weights.query_key_value_z, conv_weight, conv_states,
                                     valid_columns, initial_slots, conv_record, query, key, value,
                                     output_gate_view, leaf_workspace, stream);
@@ -231,55 +275,95 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
     return layout.peak_bytes(1);
 }
 
-std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights,
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
+    if (weights == WeightsProfile::CompressedTensors) {
+        // Four generic linears over the split. The NVFP4 W4A4 workspace is a function of K and
+        // the token count, not N, so the query's is the widest of the four.
+        return ops::linear_workspace_capacity_bytes(QType::NVFP4, TextConfig::query_size,
+                                                    TextConfig::hidden, ops::LinearPolicy::AllowA4,
+                                                    first, last);
+    }
     return ops::attn_input_proj_workspace_capacity_bytes(
         QType::W8G32_F16S, 9216, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
 }
 
-std::size_t Variant::attention_output_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::attention_output_projection_workspace_capacity_bytes(WeightsProfile weights,
                                                                           family::TextPhase,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
+    if (weights == WeightsProfile::CompressedTensors) {
+        return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
+                                                        TextConfig::query_size,
+                                                        ops::LinearPolicy::AllowA4, first, last);
+    }
     return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
                                                     TextConfig::query_size,
                                                     ops::LinearPolicy::A16Only, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights,
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
+    if (weights == WeightsProfile::CompressedTensors) {
+        // Two generic linears over the split halves; the NVFP4 workspace bounds any format the
+        // export gave them.
+        return std::max(ops::linear_workspace_capacity_bytes(
+                            QType::NVFP4, TextConfig::convolution_dim, TextConfig::hidden,
+                            ops::LinearPolicy::AllowA4, first, last),
+                        ops::linear_workspace_capacity_bytes(QType::NVFP4, TextConfig::value_dim,
+                                                             TextConfig::hidden,
+                                                             ops::LinearPolicy::AllowA4, first, last));
+    }
     return ops::gdn_input_proj_workspace_capacity_bytes(
         QType::W8G32_F16S, 12288, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile weights,
                                                                             family::TextPhase,
                                                                             std::int32_t batch_size,
                                                                             std::int32_t first,
                                                                             std::int32_t last) {
+    if (weights == WeightsProfile::CompressedTensors) {
+        return ops::gdn_input_proj_conv_snapshot_split_workspace_capacity_bytes(
+            QType::NVFP4, TextConfig::convolution_dim, TextConfig::value_dim, TextConfig::hidden,
+            ops::LinearPolicy::AllowA4, batch_size, first, last);
+    }
     return ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile weights,
                                                                           family::TextPhase,
                                                                           std::int32_t batch_size,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
+    if (weights == WeightsProfile::CompressedTensors) {
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_split_workspace_capacity_bytes(
+                            QType::NVFP4, TextConfig::convolution_dim, TextConfig::value_dim,
+                            TextConfig::hidden, ops::LinearPolicy::AllowA4, batch_size, first,
+                            last));
+    }
     return std::max(kMinimumLeafWorkspaceBytes,
                     ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                         TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch_size,
                         first, last));
 }
 
-std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights,
                                                                     family::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
+    if (weights == WeightsProfile::CompressedTensors) {
+        // Whatever format the export gave gdn/output, the NVFP4 workspace bounds it.
+        return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
+                                                        TextConfig::value_dim,
+                                                        ops::LinearPolicy::AllowA4, first, last);
+    }
     return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
                                                     TextConfig::value_dim,
                                                     ops::LinearPolicy::A16Only, first, last);
@@ -294,7 +378,8 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
-    if (weights_profile == WeightsProfile::RoutedNvfp4) {
+    if (weights_profile == WeightsProfile::RoutedNvfp4 ||
+        weights_profile == WeightsProfile::CompressedTensors) {
         return ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry,
                                                         QType::NVFP4, QType::NVFP4, first, last);
     }

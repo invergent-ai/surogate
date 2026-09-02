@@ -40,7 +40,7 @@ NumericFormat routed_down_format(std::size_t layer) {
 }
 
 RoutedFormats routed_formats(WeightsProfile weights, std::size_t layer) {
-    if (weights == WeightsProfile::RoutedNvfp4) {
+    if (weights == WeightsProfile::RoutedNvfp4 || weights == WeightsProfile::CompressedTensors) {
         return {NumericFormat::NVFP4, NumericFormat::NVFP4};
     }
     return {NumericFormat::Q4G64_F16S, routed_down_format(layer)};
@@ -244,8 +244,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     out.frontend        = family::bind_frontend_resources(binder);
     out.features        = features;
     out.weights         = weights;
-    out.token_embedding = artifact::bind_device_tensor(binder, "text/token_embedding",
-                                                       NumericFormat::W8G32_F16S, {248320, 2048});
+    out.token_embedding = artifact::bind_linear(binder, "text/token_embedding", 248320, 2048);
 
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
@@ -254,15 +253,26 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
                                                                 NumericFormat::BF16, {2048});
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
-            target.attention.query_key_gate_value =
-                artifact::bind_device_tensor(binder, prefix + "attention/query_key_gate_value",
-                                             NumericFormat::W8G32_F16S, {9216, 2048});
+            // One object per HF Linear when the artifact stores them so (a quantized export,
+            // each constituent with its own global scale), the fused parent otherwise. The
+            // format of each is read from the artifact, not asserted.
+            if (binder.has(prefix + "attention/query")) {
+                target.attention.split = SplitAttentionPlan{
+                    .query = artifact::bind_linear(binder, prefix + "attention/query", 4096, 2048),
+                    .key   = artifact::bind_linear(binder, prefix + "attention/key", 512, 2048),
+                    .gate  = artifact::bind_linear(binder, prefix + "attention/gate", 4096, 2048),
+                    .value = artifact::bind_linear(binder, prefix + "attention/value", 512, 2048),
+                };
+            } else {
+                target.attention.query_key_gate_value = artifact::bind_linear(
+                    binder, prefix + "attention/query_key_gate_value", 9216, 2048);
+            }
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
-            target.attention.output = artifact::bind_device_tensor(
-                binder, prefix + "attention/output", NumericFormat::W8G32_F16S, {2048, 4096});
+            target.attention.output =
+                artifact::bind_linear(binder, prefix + "attention/output", 2048, 4096);
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {32});
@@ -272,12 +282,19 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
                 binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 8192});
             target.gdn.a_b_projection = artifact::bind_device_tensor(
                 binder, prefix + "gdn/a_b_projection", NumericFormat::BF16, {64, 2048});
-            target.gdn.query_key_value_z = artifact::bind_device_tensor(
-                binder, prefix + "gdn/query_key_value_z", NumericFormat::W8G32_F16S, {12288, 2048});
+            if (binder.has(prefix + "gdn/query_key_value")) {
+                target.gdn.split = SplitGdnInputPlan{
+                    .query_key_value =
+                        artifact::bind_linear(binder, prefix + "gdn/query_key_value", 8192, 2048),
+                    .z = artifact::bind_linear(binder, prefix + "gdn/z", 4096, 2048),
+                };
+            } else {
+                target.gdn.query_key_value_z =
+                    artifact::bind_linear(binder, prefix + "gdn/query_key_value_z", 12288, 2048);
+            }
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {128});
-            target.gdn.output = artifact::bind_device_tensor(
-                binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {2048, 4096});
+            target.gdn.output = artifact::bind_linear(binder, prefix + "gdn/output", 2048, 4096);
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {2048});
@@ -288,8 +305,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
 
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {2048});
-    out.output_head = artifact::bind_device_tensor(binder, "text/output_head",
-                                                   NumericFormat::Q6G64_F16S, {248320, 2048});
+    out.output_head = artifact::bind_linear(binder, "text/output_head", 248320, 2048);
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
@@ -311,14 +327,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     out.mtp.embedding_norm = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {2048});
     out.mtp.hidden_norm    = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {2048});
     out.mtp.input_norm     = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {2048});
-    out.mtp.attention.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
-                                                      NumericFormat::W8G32_F16S, {9216, 2048});
+    out.mtp.attention.query_key_gate_value = artifact::bind_linear(
+        binder, "mtp/layer/attention/query_key_gate_value", 9216, 2048, mtp_placement);
     out.mtp.attention.query_norm =
         bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
     out.mtp.attention.key_norm =
         bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
     out.mtp.attention.output =
-        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {2048, 4096});
+        artifact::bind_linear(binder, "mtp/layer/attention/output", 2048, 4096, mtp_placement);
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {2048});
     out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
@@ -393,8 +409,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     auto& final_norm      = runtime.final_norm;
     auto& output_head     = runtime.output_head;
 
-    token_embedding = artifact::materialized_weight(backing, plan.token_embedding,
-                                                    NumericFormat::W8G32_F16S, 248320, 2048);
+    token_embedding = artifact::materialized_linear(backing, plan.token_embedding, 248320, 2048);
 
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
@@ -404,15 +419,23 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             FullAttentionWeights& target = full_layers.at(full_index++);
             target.input_norm            = artifact::materialized_tensor(backing, source.input_norm,
                                                                          NumericFormat::BF16, {2048});
-            target.projection.query_key_gate_value =
-                artifact::materialized_weight(backing, source.attention.query_key_gate_value,
-                                              NumericFormat::W8G32_F16S, 9216, 2048);
+            if (source.attention.split) {
+                const SplitAttentionPlan& split = *source.attention.split;
+                target.projection.split         = SplitAttentionWeights{
+                            .query = artifact::materialized_linear(backing, split.query, 4096, 2048),
+                            .key   = artifact::materialized_linear(backing, split.key, 512, 2048),
+                            .gate  = artifact::materialized_linear(backing, split.gate, 4096, 2048),
+                            .value = artifact::materialized_linear(backing, split.value, 512, 2048),
+                };
+            } else {
+                target.projection.query_key_gate_value = artifact::materialized_linear(
+                    backing, *source.attention.query_key_gate_value, 9216, 2048);
+            }
             target.query_norm = artifact::materialized_tensor(backing, source.attention.query_norm,
                                                               NumericFormat::BF16, {256});
             target.key_norm   = artifact::materialized_tensor(backing, source.attention.key_norm,
                                                               NumericFormat::BF16, {256});
-            target.output     = artifact::materialized_weight(backing, source.attention.output,
-                                                              NumericFormat::W8G32_F16S, 2048, 4096);
+            target.output     = artifact::materialized_linear(backing, source.attention.output, 2048, 4096);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
             const RoutedFormats routed = routed_formats(plan.weights, layer);
@@ -429,12 +452,20 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                                NumericFormat::BF16, {8192, 4});
             target.projection.a_b_projection = artifact::materialized_weight(
                 backing, source.gdn.a_b_projection, NumericFormat::BF16, 64, 2048);
-            target.projection.query_key_value_z = artifact::materialized_weight(
-                backing, source.gdn.query_key_value_z, NumericFormat::W8G32_F16S, 12288, 2048);
+            if (source.gdn.split) {
+                const SplitGdnInputPlan& split = *source.gdn.split;
+                target.projection.split        = SplitGdnInputWeights{
+                           .query_key_value =
+                               artifact::materialized_linear(backing, split.query_key_value, 8192, 2048),
+                           .z = artifact::materialized_linear(backing, split.z, 4096, 2048),
+                };
+            } else {
+                target.projection.query_key_value_z = artifact::materialized_linear(
+                    backing, *source.gdn.query_key_value_z, 12288, 2048);
+            }
             target.norm =
                 artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16, {128});
-            target.output              = artifact::materialized_weight(backing, source.gdn.output,
-                                                                       NumericFormat::W8G32_F16S, 2048, 4096);
+            target.output              = artifact::materialized_linear(backing, source.gdn.output, 2048, 4096);
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
             const RoutedFormats routed = routed_formats(plan.weights, layer);
@@ -447,8 +478,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {2048});
-    output_head = artifact::materialized_weight(backing, plan.output_head,
-                                                NumericFormat::Q6G64_F16S, 248320, 2048);
+    output_head = artifact::materialized_linear(backing, plan.output_head, 248320, 2048);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
@@ -467,15 +497,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                              NumericFormat::BF16, {2048});
         mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
                                                              NumericFormat::BF16, {2048});
-        mtp.attention.query_key_gate_value =
-            artifact::materialized_weight(backing, plan.mtp.attention.query_key_gate_value,
-                                          NumericFormat::W8G32_F16S, 9216, 2048);
+        mtp.attention.query_key_gate_value = artifact::materialized_linear(
+            backing, *plan.mtp.attention.query_key_gate_value, 9216, 2048);
         mtp.query_norm = artifact::materialized_tensor(backing, plan.mtp.attention.query_norm,
                                                        NumericFormat::BF16, {256});
         mtp.key_norm   = artifact::materialized_tensor(backing, plan.mtp.attention.key_norm,
                                                        NumericFormat::BF16, {256});
-        mtp.output     = artifact::materialized_weight(backing, plan.mtp.attention.output,
-                                                       NumericFormat::W8G32_F16S, 2048, 4096);
+        mtp.output     = artifact::materialized_linear(backing, plan.mtp.attention.output, 2048, 4096);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {2048});
         mtp.post_mixer =

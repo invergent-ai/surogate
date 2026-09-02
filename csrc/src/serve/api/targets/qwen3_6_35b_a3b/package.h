@@ -36,6 +36,12 @@ enum class WeightsProfile : std::uint8_t {
     // only ones the 35B still reads from a GGUF-derived groupwise export, and the format is worth
     // more on this hardware than any scheduling lever the board has measured.
     RoutedNvfp4,
+    // A compressed-tensors export converted from its own directory: every text-core weight in
+    // the format the export's config gave its module (read from the artifact, not asserted),
+    // fused parents split per HF Linear, routed experts NVFP4 as RoutedNvfp4 has them. An
+    // interim value: the profile still sizes workspaces; when formats reach the planner from
+    // the load plan this enumerator goes with the rest.
+    CompressedTensors,
 };
 
 using Frontend       = family::Frontend;

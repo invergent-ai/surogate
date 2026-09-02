@@ -43,6 +43,11 @@ public:
 
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
                                 std::span<const std::uint64_t> shape);
+    /// The tensor named, in whatever format the artifact stores it: only the
+    /// shape is asserted. Structure is the target's to require; format is the
+    /// checkpoint's to declare, and the caller reads it from `descriptor()`.
+    ObjectHandle require_tensor_shaped(std::string_view name,
+                                       std::span<const std::uint64_t> shape);
     // surogate vendor patch (PATCHES.md #15): presence probe for optional
     // object families (e.g. targets whose artifacts may omit the MTP block).
     [[nodiscard]] bool has(std::string_view name) const noexcept;

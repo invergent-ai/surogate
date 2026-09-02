@@ -6,6 +6,12 @@
 #include <cstddef>
 #include <span>
 #include <stdexcept>
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <variant>
 
 namespace sinfer::artifact {
 namespace {
@@ -190,6 +196,109 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         return row_scale_weight(materialized, handle, format, rows, columns);
     }
     return row_split_weight(materialized, handle, format, rows, columns);
+}
+
+namespace {
+
+std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
+                          std::string_view what) {
+    if (offset + 4 > bytes.size()) {
+        throw ArtifactError("payload too short for a divisor word: " + std::string(what));
+    }
+    std::uint32_t word = 0;
+    std::memcpy(&word, bytes.data() + offset, sizeof(word));
+    return word;
+}
+
+void require_positive_finite(std::uint32_t bits, std::string_view what) {
+    const float value = std::bit_cast<float>(bits);
+    if (!std::isfinite(value) || value <= 0.0F) {
+        throw ArtifactError("divisor is not finite and positive: " + std::string(what));
+    }
+}
+
+} // namespace
+
+bool is_linear_format(NumericFormat format) noexcept {
+    switch (format) {
+    case NumericFormat::BF16:
+    case NumericFormat::Q4G64_F16S:
+    case NumericFormat::Q5G64_F16S:
+    case NumericFormat::Q6G64_F16S:
+    case NumericFormat::W8G32_F16S:
+    case NumericFormat::NVFP4:
+    case NumericFormat::FP8_E4M3FN_ROW_BF16S:
+        return true;
+    case NumericFormat::FP32:
+    case NumericFormat::I32:
+        return false;
+    }
+    return false;
+}
+
+LinearBinding bind_linear(Binder& binder, std::string_view name, std::int32_t rows,
+                          std::int32_t columns, TensorPlacement placement) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const ObjectHandle handle = binder.require_tensor_shaped(name, shape);
+    const auto* tensor        = std::get_if<TensorDescriptor>(&binder.descriptor(handle));
+    if (!is_linear_format(tensor->format)) {
+        throw ArtifactError("stored format is not one a linear op can run: " +
+                            std::string(format_name(tensor->format)) + " for " + std::string(name));
+    }
+    if (tensor->layout != storage_layout_for(tensor->format)) {
+        throw ArtifactError("stored layout does not belong to its format: " + std::string(name));
+    }
+    if (placement == TensorPlacement::Device) {
+        binder.materialize_on_device(handle);
+    } else {
+        binder.validate_only(handle);
+    }
+    LinearBinding binding{handle, tensor->format};
+    if (tensor->format == NumericFormat::NVFP4) {
+        const std::string divisor_name = std::string(name) + "/input_scale_divisor";
+        const ObjectHandle divisor =
+            bind_tensor(binder, divisor_name, NumericFormat::FP32, {}, TensorPlacement::ValidateOnly);
+        const BlockScaleGeometry geometry = block_scale_geometry(NumericFormat::NVFP4, shape);
+        binding.weight_scale_divisor_bits =
+            read_u32_le(binder.payload(handle).data, geometry.weight_divisor_offset, name);
+        binding.input_scale_divisor_bits = read_u32_le(binder.payload(divisor).data, 0, divisor_name);
+        require_positive_finite(binding.weight_scale_divisor_bits, name);
+        require_positive_finite(binding.input_scale_divisor_bits, divisor_name);
+    }
+    return binding;
+}
+
+Weight materialized_linear(const MaterializedArtifact& materialized, const LinearBinding& binding,
+                           std::int32_t rows, std::int32_t columns) {
+    if (binding.format != NumericFormat::NVFP4) {
+        return materialized_weight(materialized, binding.object, binding.format, rows, columns);
+    }
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const BlockScaleGeometry geometry = block_scale_geometry(NumericFormat::NVFP4, shape);
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(binding.object));
+
+    Weight out{};
+    out.payload              = bytes;
+    out.payload_bytes        = geometry.encoded_bytes;
+    out.qtype                = QType::NVFP4;
+    out.group_size           = 16;
+    out.ndim                 = 2;
+    out.qdata                = bytes;
+    out.scales               = bytes + geometry.scale_plane_offset;
+    out.n                    = rows;
+    out.k                    = columns;
+    out.group                = 16;
+    out.layout               = QuantLayout::BlockScaleK16M128x4;
+    out.scale_dtype          = DType::FP8_E4M3FN;
+    out.shape[0]             = rows;
+    out.shape[1]             = columns;
+    out.padded_shape[0]      = rows;
+    out.padded_shape[1]      = columns;
+    out.weight_scale_divisor = std::bit_cast<float>(binding.weight_scale_divisor_bits);
+    out.input_scale_divisor  = std::bit_cast<float>(binding.input_scale_divisor_bits);
+    return out;
 }
 
 } // namespace sinfer::artifact

@@ -62,6 +62,20 @@ ObjectHandle Binder::require_tensor(std::string_view name, NumericFormat format,
     return handle;
 }
 
+ObjectHandle Binder::require_tensor_shaped(std::string_view name,
+                                           std::span<const std::uint64_t> shape) {
+    const ObjectHandle handle = find_unconsumed(name);
+    const auto* tensor        = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) {
+        throw ArtifactError("required tensor is a resource: " + std::string(name));
+    }
+    if (!std::equal(tensor->shape.begin(), tensor->shape.end(), shape.begin(), shape.end())) {
+        throw ArtifactError("tensor shape does not match the target geometry: " +
+                            std::string(name));
+    }
+    return handle;
+}
+
 ObjectHandle Binder::require_resource(std::string_view name, ResourceEncoding encoding) {
     const ObjectHandle handle = find_unconsumed(name);
     const auto* resource      = std::get_if<ResourceDescriptor>(&descriptor(handle));
