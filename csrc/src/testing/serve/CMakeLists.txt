@@ -303,6 +303,7 @@ sinfer_add_op_test(sinfer_speculative_round_test
   SOURCES ops/test_speculative_round.cpp
   LIBRARIES sinfer_ops)
 sinfer_add_linear_test(sinfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
+sinfer_add_linear_test(sinfer_linear_ggml_k_test ops/linear/ggml/test_ggml_k.cpp)
 sinfer_add_linear_test(sinfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
 sinfer_add_linear_test(sinfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 sinfer_add_linear_test(sinfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
