@@ -4,6 +4,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
 #include <api/family/frontend.h>
+#include <api/family/target_package.h>
 #include <api/family/runtime.h>
 
 #include <cstdint>
@@ -43,41 +44,7 @@ using Frontend       = family::Frontend;
 using PreparedPrompt = family::PreparedPrompt;
 using OutputSession  = family::OutputSession;
 
-class LoadPlan {
-public:
-    LoadPlan(LoadPlan&&) noexcept;
-    LoadPlan& operator=(LoadPlan&&) noexcept;
-    ~LoadPlan();
-
-    LoadPlan(const LoadPlan&)            = delete;
-    LoadPlan& operator=(const LoadPlan&) = delete;
-
-    [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
-
-private:
-    class Impl;
-    explicit LoadPlan(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
-
-    friend struct qwen3_6_27b::Package;
-};
-
-class LoadedModel {
-public:
-    ~LoadedModel();
-
-    LoadedModel(const LoadedModel&)            = delete;
-    LoadedModel& operator=(const LoadedModel&) = delete;
-    LoadedModel(LoadedModel&&)                 = delete;
-    LoadedModel& operator=(LoadedModel&&)      = delete;
-
-private:
-    class Impl;
-    explicit LoadedModel(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
-
-    friend struct qwen3_6_27b::Package;
-};
+SINFER_TARGET_LOAD_TYPES(qwen3_6_27b::Package);
 
 } // namespace detail
 

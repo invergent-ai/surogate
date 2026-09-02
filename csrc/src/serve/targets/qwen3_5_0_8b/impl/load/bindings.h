@@ -212,14 +212,6 @@ public:
     RuntimeModelView runtime;
 };
 
-class LoadedModel::Impl {
-public:
-    Impl(WeightsProfile weights_profile_in, BindingPlan plan,
-         artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
-
-    WeightsProfile weights_profile;
-    LoadedModelData data;
-};
+SINFER_TARGET_LOADED_MODEL_IMPL();
 
 } // namespace sinfer::targets::qwen3_5_0_8b::detail
