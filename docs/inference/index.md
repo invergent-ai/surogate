@@ -11,6 +11,9 @@ surogate serve Qwen/Qwen3.6-27B --port 8080
 
 - **CUDA-graph-captured decode** over a paged KV cache, with continuous batching across lanes.
 - **Prefix reuse** — a shared prompt prefix is prefilled once and reused (`--no-prefix-reuse` disables).
+- **Elastic KV cache** — the pool is a virtual span and only the pages in use hold VRAM, so an
+  idle model gives its cache back and several models on one GPU can share the room
+  (`--elastic-kv-overcommit`; `--no-elastic-kv` for the static arena).
 - **Streaming SSE**, tool calls, reasoning/thinking separation, request cancellation.
 - **Speculative decoding** with MTP or DFlash draft heads (`--spec`, `--draft-tokens`).
 - **Multi-GPU** as data-parallel replicas or pipeline stages (`--devices 0,1,...`). Tensor

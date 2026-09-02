@@ -94,6 +94,62 @@ surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
 
 Each card materialises only its own layers and holds every expert of those layers locally.
 
+## Several models on one GPU
+
+`--model name=path` serves an additional model beside the primary, each in its own engine
+inside one process, so requests for different models genuinely share the GPU:
+
+```bash
+surogate serve nvidia/Qwen3.6-27B-NVFP4 --served-model-name big \
+  --model small=nvidia/Qwen3.5-4B-NVFP4,max-num-seqs=16,max-model-len=8192 \
+  --kv-capacity auto --max-model-len 8192 --max-num-seqs 16 --port 8080
+```
+
+### The KV pool is elastic
+
+By default a model's KV pool is a **virtual span**: it is laid out at its planned size, but
+only the pages a request actually reaches hold VRAM, mapped in 2 MiB-per-plane granules as
+sequences grow and returned once they finish. A small reserve (four granules) is kept mapped
+ahead of demand so a request never waits on the driver. Throughput is the same as with a static
+pool — measured on this 27B + 4B pair, both busy at 8 + 8 users: 313 + 626 tok/s elastic
+against 318 + 635 static — and what changes is what sits idle:
+
+| | static pool | elastic pool |
+|---|---|---|
+| free VRAM after the 27B starts | 9.75 GiB | 13.56 GiB |
+| KV held with both models busy | 6.0 GiB provisioned | 0.62 + 0.31 GiB mapped |
+| KV held by the 27B asleep | 4 GiB | 192 MiB |
+
+`GET /kv_stats` shows the numbers per model. `--no-elastic-kv` restores the static arena, in
+which case every extra model must state its budget with `kv-tokens=N`.
+
+### Sharing the room: `--elastic-kv-overcommit`
+
+Elastic pools still each fit the GPU on their own: their caps are checked against free memory
+at startup and never sum past it, so one model's idle cache is not available to another's
+requests. `--elastic-kv-overcommit` makes each model's `--kv-capacity` a **guaranteed floor**
+(`auto` = one full-context request) and admits every page past it against the memory the GPU
+actually has free, shared by all models on the device:
+
+```bash
+surogate serve nvidia/Qwen3.6-27B-NVFP4 --served-model-name big \
+  --model small=nvidia/Qwen3.5-4B-NVFP4,max-num-seqs=16,max-model-len=8192 \
+  --elastic-kv-overcommit --kv-capacity auto --max-model-len 8192 --max-num-seqs 16
+```
+
+When the GPU runs short, a request waits in its model's queue (the ordinary
+`--pending-timeout-ms` applies) rather than failing, the models trim their reserves, give back
+their prefix caches, and resume admitting as running requests finish — measured with two
+engines pushing 4 GB of KV demand into 2.4 GB of room for two minutes: every request
+completed, none rejected, both models holding a share, and full throughput back once the
+burst ended. A headroom (`SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB`, default 1024) is never
+given to KV: CUDA graphs are captured lazily and need it. Overcommit changes when a request
+runs, never how it runs — the output is identical.
+
+With `--enable-sleep-mode` as well, models that do not fit together at all are swapped by the
+scheduler; see the [CLI page](cli.md#serving-several-models-from-one-process) for priorities
+and preemption.
+
 ## Embedding model, CPU and GPU
 
 Embedding models take the encoder path — one forward, no KV cache, no sampler, no CUDA graphs —

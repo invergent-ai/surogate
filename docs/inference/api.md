@@ -39,6 +39,7 @@ reports, which is how you keep a client's hard-coded model string working.
 | `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime (`--enable-lora`; `?model=NAME` targets a specific model on multi-model servers) |
 | `POST` | `/v1/unload_lora_adapter` | Unload an adapter by name (`?model=NAME`) |
 | `GET` | `/health` | Readiness probe |
+| `GET` | `/kv_stats` | Per-model KV pool occupancy: provisioned, in use, physically mapped (see below) |
 | `POST` | `/v1/embeddings` | Embeddings — served by `surogate serve --embed`, a separate process |
 
 ## Chat Completions
@@ -127,6 +128,29 @@ While asleep, `/health` answers normally and generation requests get a 503
 naming `/wake_up`. Send an empty body (`-d ''`) with the bare POSTs — a POST
 with neither body nor `Content-Length` waits out a read timeout before the
 server acts.
+
+## KV pool occupancy
+
+`GET /kv_stats` reports, per served model, what its KV pool holds. It is read
+from the engine's per-round statistics snapshot, so polling it costs the
+serving loop nothing.
+
+```json
+{"unix_time": 1788342926, "models": [
+  {"model": "big", "sleeping": false, "running_requests": 8, "waiting_requests": 0,
+   "kv_capacity_tokens": 8192, "weights_bytes": 15032385536,
+   "pages": 2048, "pages_entitled": 168, "pages_in_use": 156,
+   "pages_resident_at_granule": 172, "pages_mapped": 320,
+   "page_bytes": 2097152, "granule_pages": 32,
+   "pool_bytes": 4294967296, "in_use_bytes": 327155712,
+   "resident_at_granule_bytes": 360710144, "mapped_bytes": 671088640}]}
+```
+
+`pool_bytes` is the provisioned span, `in_use_bytes` the pages holding a
+sequence's KV, `mapped_bytes` what physically holds VRAM right now (in use
+plus the reserve, rounded to mapping granules), and `resident_at_granule_bytes`
+the pages that could not be released because a granule they share is still in
+use. With `--no-elastic-kv`, `mapped_bytes` equals `pool_bytes`.
 
 ## LoRA adapters at runtime
 

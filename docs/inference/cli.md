@@ -46,7 +46,9 @@ The most common ones; `--engine-help` has the rest.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--max-model-len N\|auto` | 8192 | Context length, capped by the model's trained maximum |
-| `--kv-capacity N\|auto` | 8192 | KV pool size in tokens; `auto` sizes from free VRAM, leaving 1024 MiB |
+| `--kv-capacity N\|auto` | 8192 | KV pool size in tokens; `auto` sizes from free VRAM, leaving 1024 MiB. Under `--elastic-kv-overcommit` this is the model's guaranteed floor instead (`auto` = one full-context request) |
+| `--no-elastic-kv` | off | Keep the KV pool's planes in the static arena. By default the pool is **elastic**: its planned size is a virtual span, and only pages in use (plus a small reserve) hold VRAM — see [Serving models](serving-models.md#several-models-on-one-gpu) |
+| `--elastic-kv-overcommit` | off | Let co-resident models share the GPU's idle KV: each model is guaranteed only its `--kv-capacity`, and every page past that is admitted against the memory actually free |
 | `--kv-cache-dtype auto\|fp8\|bf16\|int8` | `fp8` | Cache precision; `auto` = fp8 (e4m3) |
 | `--kv-cache-dtype-skip-layers L,...` | none | Hold these full-attention layers at BF16 |
 | `--no-prefix-reuse` | off | Disable compatible-prefix caching |
@@ -106,13 +108,19 @@ what is missing, rather than silently serving unaccelerated.
 | Flag | Meaning |
 |---|---|
 | `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N][,spec=mtp\|dflash][,draft-tokens=N][,lora=name:path][,priority=high\|normal\|low]` | Serve an additional model beside the primary; repeatable. `lora=` (repeatable within one `--model`) gives that model its own adapters. |
-| `--model-priority high\|normal\|low` | The primary model's scheduler weight class. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is required — each extra states its KV budget explicitly. |
+| `--model-priority high\|normal\|low` | The primary model's scheduler weight class. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is optional with the elastic pool (the default) and required under `--no-elastic-kv`, where each extra must state its KV budget. |
 
 Each model runs its own engine — weights, cache, scheduler, CUDA graphs — on
 its own stream inside one process, so concurrent requests for different models
 genuinely share the GPU rather than time-slicing it (measured: two busy models
 in one process reach ~1.3× the aggregate of the same pair in two processes).
-An idle co-resident model costs nothing but its memory.
+An idle co-resident model costs nothing but its memory — and with the elastic
+pool, its KV is only the pages it actually holds: an idle model's cache
+shrinks to its prefix reuse, and a busy one maps what its requests reach.
+`--elastic-kv-overcommit` goes further and lets the models' caches grow into
+each other's idle room, with a floor each is guaranteed; see
+[Serving models](serving-models.md#several-models-on-one-gpu) for the numbers
+and what happens when the GPU runs short.
 
 With `--enable-sleep-mode` as well, the models need not all fit at once: a
 request for a model that is asleep waits while the scheduler frees room —
@@ -246,3 +254,5 @@ threads on one node measured 2.15× faster than 64 threads spanning both sockets
 |---|---|
 | `SUROGATE_SERVE_CACHE` | Converted-weights cache (default `~/.cache/surogate/serve`) |
 | `SUROGATE_CONVERT_DEVICE` | Device used for conversion (e.g. `cuda`, `cpu`) |
+| `SUROGATE_SERVE_ELASTIC_KV_RESERVE` | Granules the elastic KV pool keeps mapped ahead of demand (default 4; 64 MiB each on a 27B). Trimming starts at twice this. |
+| `SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB` | Under `--elastic-kv-overcommit`, VRAM the admission gate never lets KV grow into (default 1024) — room for CUDA graph captures and workspace growth. |
