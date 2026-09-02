@@ -507,6 +507,20 @@ Same on Q5_K and Q6_K (5.8e-3, 5.7e-3). An 8-bit symmetric grid cannot land on a
 
     Greedy text: the native path and the dequantise path agree character for character on both prompts (each shares the same 56- and 139-character prefixes with llama.cpp before the engines' own attention/norm numerics diverge). Decode: +12 % over the dequantise path and past `llama-bench`'s ceiling at T=1, at 75 % of the bytes. **Prefill is 12× slower than before**: the interim route runs the T≤8 GEMV in 8-column chunks, re-reading the weight per chunk — that is what K3 (the MMQ port) is for, and until it lands a native artifact is a decode-side win only.
   - *Known gaps*: the 2B converter needs the vision tower from the HF cache the 0.8B had (`model.visual.patch_embed.proj.weight`), a pre-existing ingest difference; a source shared by a native and a non-native object (tied embeddings with a non-native head) must be both mapped and dequantised, and the planner's single `keep` set cannot say that yet.
+- [x] **K5c — the mixed-format fused parents (2026-09-02): built, measured, and left off.** See the commit; the summary is that a GDN parent stored as its two typed halves is 8 % fewer bytes and 6 % slower, because the fused parent runs one tuned W8 projection-and-convolution kernel per layer and the split runs two K-quant GEMVs and an unfused convolution. `SUROGATE_GGUF_SPLIT_HALVES=1` enables it. The bytes become worth having with a fused K-quant GDN convolution, which is now the top item on this path.
+- [x] **Ingest gaps closed (2026-09-02):** text-only GGUF exports of a vision family convert (`--no-vision`, the loader already probed for a tower), and a tied head is stored once instead of twice (417 MB of a 2B Q4_K_M).
+- [x] **The GGUF head-to-head, board method** (512/128, salted prompts, staggered closed-loop clients, 60 s window after a 15 s warm-up, same file and same 5090; `llama-server -ngl 999 -fa 1 -np 16`):
+
+  | users | | surogate | llama.cpp | |
+  |---|---|---:|---:|---|
+  | 1 | decode tok/s | **802** | 454 | **1.8x** |
+  | 1 | prefill tok/s | **4,372** | 2,477 | **1.8x** |
+  | 1 | latency p50 | **0.16 s** | 0.28 s | **1.8x** |
+  | 8 | decode tok/s | **2,765** | 683 | **4.1x** |
+  | 8 | prefill tok/s | **15,071** | 3,721 | **4.1x** |
+  | 8 | latency p50 | **0.37 s** | 1.53 s | **4.1x** |
+
+  Isolated kernel rates on the same file (`llama-bench -fa 1`) are 97,062 vs 39,511 prefill and 864 vs 809 decode; the concurrency gap is wider than the single-stream gap because llama.cpp's server does not batch these as well.
 - [ ] **K2 — Q8_0 and the legacy types**: W8G32's decode kernel against mmvq's Q8_0 on the same tensor; keep the faster, exactness is equal.
 - [x] **K3 — wide-batch route (prefill), 2026-09-02.** Taken *not* by porting MMQ. MMQ's premise is that the activation is worth quantising to int8 so the weight can stay packed; on a 5090 the BF16 tensor cores make the opposite trade better: expand a bounded row tile of the weight to BF16 **once** and hand it to cuBLASLt, so the weight is read a single time however wide the batch is (the GEMV route re-reads it every eight columns, which was the whole 12x prefill regression). It is also the *more accurate* of the two routes — the activation is never quantised — and it is ~200 lines against MMQ's ~6,000.
   - `ggml_dequant.cuh` holds the five ported dequantisers (lifted out of the embedding gather, which now shares them); `ggml_dequant.cu` expands a row range into a BF16 tile; `bf16_cublaslt_gemm_raw` takes raw operands with an explicit output leading dimension, so a tile writes its row range of the real output and the plan cache is keyed by it. Tile budget 32 MiB — whole weights in one pass at every geometry the tree serves, the widest (a 27B `gate_up` at [34816, 5120]) in eleven.
