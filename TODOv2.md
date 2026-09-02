@@ -458,6 +458,48 @@ histograms read from the headers:
 - [x] Serve quant coverage — folded into §2a, M1, M3.
 - [x] Container rationale and owner directives — folded into §3.
 
+## 7. Product decision (2026-09-02) — GGUF K-quants are the star
+
+Owner directives this day, superseding §2 and M3 where they conflict; the rest of this file stands. "the star of the product are ggufs, especially the common ones (K quants)"; support natively and with the highest performance: GGUF Q*_K, NVFP4 (compressed-tensors and ModelOpt), FP8, BF16; GPTQ/AWQ are off the roadmap. `.sinfer` may be published to HuggingFace as our standard format. "i don't care what we have, i need to figure out what's the ideal product." Permission to borrow code and kernels from `study/llama.cpp-master` (MIT).
+
+**Why this line, measured** (`Qwen3.5-0.8B-Q4_K_M.gguf`, `blk.0.attn_gate`; error relative to the file's own values; bytes per weight):
+
+| path | rel L2 | B/w |
+|---|---|---|
+| the file itself | 0 | 0.56 |
+| keep its codes, scale+min FP16 per 32 | 6.8e-4 | 0.56 |
+| keep its codes, scale+min FP32 per 32 | **0** | 0.81 |
+| dequantise to BF16 and stop | 1.7e-3 | 2.00 |
+| BF16 → W8G32, **what we do today** | **5.7e-3** | **1.06** |
+
+Same on Q5_K and Q6_K (5.8e-3, 5.7e-3). An 8-bit symmetric grid cannot land on an affine 4-bit grid: today we add 0.6 % weight error *and* nearly double VRAM. There is no Q1_K (the 1-bit types are IQ1_S/IQ1_M i-quants, refusable).
+
+**The ideal product, as proposed and not contradicted:**
+1. Adopt GGML's quantised formats as ours; retire Q4G64/Q5G64/Q6G64. W8G32 holds Q8_0's numbers exactly (a deinterleave) and stays Q8_0's device layout while the W8 kernels are the better-tuned ones.
+2. Format is per-tensor data; every op takes every codec. A Q4_K_M file is Q4_K + Q5_K + Q6_K + Q8_0 + F32 in one file (measured 98/36/17/36/133 tensors).
+3. Fastest kernel per format. K-quants: activation quantised to int8 per 32 with its block sum (`Q8_1`), integer dp4a/mma dot, the affine min folded into the activation's sum — llama.cpp's method. NVFP4: W4A4. FP8: FP8 tensor cores. BF16: cuBLASLt. The bar is llama.cpp on the same GGUF and GPU.
+4. `.sinfer` is for what GGUF cannot hold — NVFP4, mixed recipes (NVFP4 experts + Q6_K attention), bundled vision/draft heads — and that is what gets published. A GGUF loads at disk speed; caching it saves nothing.
+5. Device layout for K-quants: **native GGML superblocks, bytes verbatim** (Q2_K 84 B, Q3_K 110, Q4_K 144, Q5_K 176, Q6_K 210 per 256 values). GGML guarantees k % 256 == 0 for every K-quant tensor (checked on six files; non-multiples fall back to Q*_0/Q8_0, which is why the files mix types), so no padding. `Weight.qdata` is the block array; `QuantLayout::GgmlBlocks`.
+
+**The bar.** Server-to-server is `surogate/serve/BENCHMARKS.md` (0.8B: llama.cpp 411 decode / 34,500 prompt-eval through `llama-server`; ours 753 decode / ~106k prefill on a 640-token prompt this day, i.e. +83 % and ~3×, from a heavier and less exact artifact). The kernel-level ceiling at T=1 is `llama-bench` on the same file, same card class (GPU 2, `-fa 1`, 2026-09-02): **0.8B Q4_K_M 802.7 tg128 / 37,945 pp512; 2B Q4_K_M 577.6 / 28,081.** A native K-quant GEMV that does not beat 803 on the 0.8B is not done.
+
+**What llama.cpp's structure buys.** `mmvq.cu`'s `mul_mat_vec_q<type, ncols_dst∈1..8, fusion, small_k>` is one body for every type — T=1, small-T and, via `ids`, routed-expert decode; the per-type part is one `vec_dot_*_q8_1` of ~40-60 lines. `mmq.cuh`'s `mul_mat_q<type, J>` is one prefill body (int8 `mma.sync m16n8k16/k32`; sm_120 takes the Ampere path) with per-type tile loaders. 10,379 lines in all, of which the K-quant share is a fraction. So the port is two bodies plus per-type atoms — not five copies of a 2,000-line family, which is what the tree's own Q4/Q5/Q6 directories are (Q4's and Q5's GEMV share almost no lines).
+
+### K-milestones
+
+- [x] **K0 — the bar**: above.
+- [ ] **K1 — mmvq port.** `ops/linear/ggml/`: `quantize_q8_1` (activation → int8 per 32 + (d, sum)), ported `vec_dot_{q2..q6}_K_q8_1` (+ Q8_0/Q4_0/Q5_0/IQ4_NL, which llama.cpp also has), the `mul_mat_vec_q` body for T ≤ 8, dispatch from `ops::linear` on the new `QType`s. Artifact: `NumericFormat::Q2_K..Q6_K`, `QuantLayout::GgmlBlocks`, `tensor_encoded_size`, converter passthrough (verbatim bytes; the `_planes_*` deinterleave stays only for Q8_0 → W8G32), binder. Tests: each type against a CPU reference that applies the *same* Q8_1 activation quantisation then fp64, on real blocks from the GGUFs on disk and on synthetic ones. **Acceptance:** the 0.8B Q4_K_M's K-quant tensors served natively; greedy tokens identical to llama.cpp's on the same file (llama.cpp is the oracle for "the file's numbers are the served numbers"); tg128 ≥ 803 on a 5090.
+- [ ] **K2 — Q8_0 and the legacy types**: W8G32's decode kernel against mmvq's Q8_0 on the same tensor; keep the faster, exactness is equal.
+- [ ] **K3 — MMQ port (prefill, T > 8)**: `mul_mat_q` body, `load_tiles_{q2..q6}_K`, the int8 mma vec-dots, `quantize_q8_1_mmq`; stream-K fixup second. **Acceptance:** pp512 ≥ 37,945 (0.8B), ≥ 28,081 (2B).
+- [ ] **K4 — MoE**: mmvq's `ids` indirection is routed-expert decode for T ≤ 8 (port it with K1); MMQ per expert for prefill (`mul_mat_id`); host expert bank in K-quants (ggml-cpu `ggml_vec_dot_q4_K_q8_K`, or ik_llama's AVX-512). **Acceptance:** a Q4_K_M MoE GGUF (Qwen3.6-35B-A3B, ~20 GB — download) serves natively on one 5090 with the existing CPU offload.
+- [ ] **K5 — the ops that embed a weight decode**: only three sites switch on `QType` (`linear.cpp`, `sparse_moe.cpp`, `attn_input_proj.cpp`); `linear_add` and the fused GDN/attention projections route K-quant weights through mmvq/MMQ plus their epilogue.
+- [ ] **K6 — retire the home-grown formats.** Converters stop emitting Q4G64/Q5G64/Q6G64; `surogate quantize` produces K-quants by writing a BF16 GGUF (gguf-py) and running `llama-quantize` (their quantiser, imatrix included) — no port of `ggml-quants.c`; regenerate the local artifacts.
+- [ ] **N — NVFP4 ModelOpt ingest**: `weight_scale_2` is a multiplier where compressed-tensors' global is a divisor; parents split per component so each keeps its own global (the trainer instead rescales block scales to a shared one, which is lossy).
+- [ ] **F — FP8**: compressed-tensors per-channel/per-tensor is per-row with an FP32 scale (add `_F32S`, or accept the BF16 cast); HF fine-grained block-128 (what the trainer loads as `prequant_fp8`) needs block-indexed scales in the fp8 family and a prefill route.
+- [x] **B — BF16**: correctness done (cuBLASLt off the table, `8d1b9cc4`); the registered shapes keep the hand kernels.
+
+M2 (geometry templating), M4 (unified loading) and M5 (cleanup) stand; the K-line is the main line and goes first.
+
 ## 6. Progress log
 
 - 2026-09-02 — Redesign scoped. Prior boilerplate hoists (`f1a869eb`,
