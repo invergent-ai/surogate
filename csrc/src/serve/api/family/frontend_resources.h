@@ -30,6 +30,14 @@ struct FrontendResources {
     std::string video_preprocessor_config_json;
 };
 
+/// Binds the four resources every target has. A vision-capable target uses the
+/// six-resource pair below instead; a text-only one that bound all six would be
+/// asking the artifact for a preprocessor config it does not carry.
+[[nodiscard]] FrontendResourcePlan bind_text_only_frontend_resources(artifact::Binder& binder);
+[[nodiscard]] FrontendResources
+take_text_only_frontend_resources(artifact::MaterializedArtifact& artifact,
+                                  const FrontendResourcePlan& plan);
+
 [[nodiscard]] FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder);
 [[nodiscard]] FrontendResources take_frontend_resources(artifact::MaterializedArtifact& artifact,
                                                         const FrontendResourcePlan& plan);

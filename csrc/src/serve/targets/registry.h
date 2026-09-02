@@ -32,273 +32,70 @@ using Qwen3_6_27B    = qwen3_6_27b::Package;
 using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
 using Qwen38FlashNext = qwen4exp::Package;
 
-struct LoadedGemma3 {
-    std::unique_ptr<Gemma3::LoadedModel> model;
-    Gemma3::Frontend frontend;
+// One loaded model and one live instance, per target.
+//
+// These were nine hand-written pairs, identical to the character apart from the
+// package they name -- and their constructors in registry.cpp were identical
+// too. Two templates say it once; the aliases below keep every existing name,
+// because the engine's executor arms and the target variant refer to them.
+template <class PackageT>
+struct LoadedTarget {
+    using Package = PackageT;
 
-    LoadedGemma3(std::unique_ptr<Gemma3::LoadedModel> stable_model, const EngineOptions& options);
-    ~LoadedGemma3();
+    std::unique_ptr<typename Package::LoadedModel> model;
+    typename Package::Frontend frontend;
 
-    LoadedGemma3(const LoadedGemma3&)            = delete;
-    LoadedGemma3& operator=(const LoadedGemma3&) = delete;
+    LoadedTarget(std::unique_ptr<typename Package::LoadedModel> stable_model,
+                 const EngineOptions& options)
+        : model(std::move(stable_model)), frontend(Package::make_frontend(*model, options)) {}
+    ~LoadedTarget() = default;
+
+    LoadedTarget(const LoadedTarget&)            = delete;
+    LoadedTarget& operator=(const LoadedTarget&) = delete;
 };
 
-struct Gemma3Instance {
-    using Package = Gemma3;
+template <class PackageT>
+struct TargetInstance {
+    using Package = PackageT;
 
-    std::unique_ptr<LoadedGemma3> loaded;
+    std::unique_ptr<LoadedTarget<Package>> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
     runtime::RequestMemory request_memory;
     const std::uint32_t capacity;
-    std::unique_ptr<Gemma3::Program> program;
+    std::unique_ptr<typename Package::Program> program;
 
-    Gemma3Instance(std::unique_ptr<LoadedGemma3> stable_loaded,
-                   runtime::KvCapacityResolution resolution, Gemma3::SequencePlan sequence_plan,
-                   DeviceContext& device);
-    ~Gemma3Instance();
+    TargetInstance(std::unique_ptr<LoadedTarget<Package>> stable_loaded,
+                   runtime::KvCapacityResolution resolution,
+                   typename Package::SequencePlan sequence_plan, DeviceContext& device)
+        : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+          request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+          capacity(sequence_plan.capacity()),
+          program(Package::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+    ~TargetInstance() = default;
 
-    Gemma3Instance(const Gemma3Instance&)            = delete;
-    Gemma3Instance& operator=(const Gemma3Instance&) = delete;
+    TargetInstance(const TargetInstance&)            = delete;
+    TargetInstance& operator=(const TargetInstance&) = delete;
 };
 
-struct LoadedLlama {
-    std::unique_ptr<Llama::LoadedModel> model;
-    Llama::Frontend frontend;
+using LoadedGemma3 = LoadedTarget<Gemma3>;
+using Gemma3Instance = TargetInstance<Gemma3>;
+using LoadedLlama = LoadedTarget<Llama>;
+using LlamaInstance = TargetInstance<Llama>;
+using LoadedQwen3Dense = LoadedTarget<Qwen3Dense>;
+using Qwen3DenseInstance = TargetInstance<Qwen3Dense>;
+using LoadedQwen3_5_0_8B = LoadedTarget<Qwen3_5_0_8B>;
+using Qwen3_5_0_8BInstance = TargetInstance<Qwen3_5_0_8B>;
+using LoadedQwen3_5_2B = LoadedTarget<Qwen3_5_2B>;
+using Qwen3_5_2BInstance = TargetInstance<Qwen3_5_2B>;
+using LoadedQwen3_5_4B = LoadedTarget<Qwen3_5_4B>;
+using Qwen3_5_4BInstance = TargetInstance<Qwen3_5_4B>;
+using LoadedQwen3_6_27B = LoadedTarget<Qwen3_6_27B>;
+using Qwen3_6_27BInstance = TargetInstance<Qwen3_6_27B>;
+using LoadedQwen3_6_35BA3B = LoadedTarget<Qwen3_6_35BA3B>;
+using Qwen3_6_35BA3BInstance = TargetInstance<Qwen3_6_35BA3B>;
+using LoadedQwen38FlashNext = LoadedTarget<Qwen38FlashNext>;
+using Qwen38FlashNextInstance = TargetInstance<Qwen38FlashNext>;
 
-    LoadedLlama(std::unique_ptr<Llama::LoadedModel> stable_model, const EngineOptions& options);
-    ~LoadedLlama();
-
-    LoadedLlama(const LoadedLlama&)            = delete;
-    LoadedLlama& operator=(const LoadedLlama&) = delete;
-};
-
-struct LlamaInstance {
-    using Package = Llama;
-
-    std::unique_ptr<LoadedLlama> loaded;
-    runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
-    const std::uint32_t capacity;
-    std::unique_ptr<Llama::Program> program;
-
-    LlamaInstance(std::unique_ptr<LoadedLlama> stable_loaded,
-                  runtime::KvCapacityResolution resolution, Llama::SequencePlan sequence_plan,
-                  DeviceContext& device);
-    ~LlamaInstance();
-
-    LlamaInstance(const LlamaInstance&)            = delete;
-    LlamaInstance& operator=(const LlamaInstance&) = delete;
-};
-
-struct LoadedQwen3Dense {
-    std::unique_ptr<Qwen3Dense::LoadedModel> model;
-    Qwen3Dense::Frontend frontend;
-
-    LoadedQwen3Dense(std::unique_ptr<Qwen3Dense::LoadedModel> stable_model,
-                     const EngineOptions& options);
-    ~LoadedQwen3Dense();
-
-    LoadedQwen3Dense(const LoadedQwen3Dense&)            = delete;
-    LoadedQwen3Dense& operator=(const LoadedQwen3Dense&) = delete;
-};
-
-struct Qwen3DenseInstance {
-    using Package = Qwen3Dense;
-
-    std::unique_ptr<LoadedQwen3Dense> loaded;
-    runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
-    const std::uint32_t capacity;
-    std::unique_ptr<Qwen3Dense::Program> program;
-
-    Qwen3DenseInstance(std::unique_ptr<LoadedQwen3Dense> stable_loaded,
-                       runtime::KvCapacityResolution resolution,
-                       Qwen3Dense::SequencePlan sequence_plan, DeviceContext& device);
-    ~Qwen3DenseInstance();
-
-    Qwen3DenseInstance(const Qwen3DenseInstance&)            = delete;
-    Qwen3DenseInstance& operator=(const Qwen3DenseInstance&) = delete;
-};
-
-struct LoadedQwen3_5_0_8B {
-    std::unique_ptr<Qwen3_5_0_8B::LoadedModel> model;
-    Qwen3_5_0_8B::Frontend frontend;
-
-    LoadedQwen3_5_0_8B(std::unique_ptr<Qwen3_5_0_8B::LoadedModel> stable_model,
-                      const EngineOptions& options);
-    ~LoadedQwen3_5_0_8B();
-
-    LoadedQwen3_5_0_8B(const LoadedQwen3_5_0_8B&)            = delete;
-    LoadedQwen3_5_0_8B& operator=(const LoadedQwen3_5_0_8B&) = delete;
-};
-
-struct LoadedQwen3_5_2B {
-    std::unique_ptr<Qwen3_5_2B::LoadedModel> model;
-    Qwen3_5_2B::Frontend frontend;
-
-    LoadedQwen3_5_2B(std::unique_ptr<Qwen3_5_2B::LoadedModel> stable_model,
-                      const EngineOptions& options);
-    ~LoadedQwen3_5_2B();
-
-    LoadedQwen3_5_2B(const LoadedQwen3_5_2B&)            = delete;
-    LoadedQwen3_5_2B& operator=(const LoadedQwen3_5_2B&) = delete;
-};
-
-struct LoadedQwen3_5_4B {
-    std::unique_ptr<Qwen3_5_4B::LoadedModel> model;
-    Qwen3_5_4B::Frontend frontend;
-
-    LoadedQwen3_5_4B(std::unique_ptr<Qwen3_5_4B::LoadedModel> stable_model,
-                      const EngineOptions& options);
-    ~LoadedQwen3_5_4B();
-
-    LoadedQwen3_5_4B(const LoadedQwen3_5_4B&)            = delete;
-    LoadedQwen3_5_4B& operator=(const LoadedQwen3_5_4B&) = delete;
-};
-
-struct Qwen3_5_0_8BInstance {
-    using Package = Qwen3_5_0_8B;
-
-    std::unique_ptr<LoadedQwen3_5_0_8B> loaded;
-    runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
-    const std::uint32_t capacity;
-    std::unique_ptr<Qwen3_5_0_8B::Program> program;
-
-    Qwen3_5_0_8BInstance(std::unique_ptr<LoadedQwen3_5_0_8B> stable_loaded,
-                        runtime::KvCapacityResolution resolution,
-                        Qwen3_5_0_8B::SequencePlan sequence_plan, DeviceContext& device);
-    ~Qwen3_5_0_8BInstance();
-
-    Qwen3_5_0_8BInstance(const Qwen3_5_0_8BInstance&)            = delete;
-    Qwen3_5_0_8BInstance& operator=(const Qwen3_5_0_8BInstance&) = delete;
-};
-
-struct Qwen3_5_2BInstance {
-    using Package = Qwen3_5_2B;
-
-    std::unique_ptr<LoadedQwen3_5_2B> loaded;
-    runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
-    const std::uint32_t capacity;
-    std::unique_ptr<Qwen3_5_2B::Program> program;
-
-    Qwen3_5_2BInstance(std::unique_ptr<LoadedQwen3_5_2B> stable_loaded,
-                        runtime::KvCapacityResolution resolution,
-                        Qwen3_5_2B::SequencePlan sequence_plan, DeviceContext& device);
-    ~Qwen3_5_2BInstance();
-
-    Qwen3_5_2BInstance(const Qwen3_5_2BInstance&)            = delete;
-    Qwen3_5_2BInstance& operator=(const Qwen3_5_2BInstance&) = delete;
-};
-
-struct Qwen3_5_4BInstance {
-    using Package = Qwen3_5_4B;
-
-    std::unique_ptr<LoadedQwen3_5_4B> loaded;
-    runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
-    const std::uint32_t capacity;
-    std::unique_ptr<Qwen3_5_4B::Program> program;
-
-    Qwen3_5_4BInstance(std::unique_ptr<LoadedQwen3_5_4B> stable_loaded,
-                        runtime::KvCapacityResolution resolution,
-                        Qwen3_5_4B::SequencePlan sequence_plan, DeviceContext& device);
-    ~Qwen3_5_4BInstance();
-
-    Qwen3_5_4BInstance(const Qwen3_5_4BInstance&)            = delete;
-    Qwen3_5_4BInstance& operator=(const Qwen3_5_4BInstance&) = delete;
-};
-
-struct LoadedQwen3_6_27B {
-    std::unique_ptr<Qwen3_6_27B::LoadedModel> model;
-    Qwen3_6_27B::Frontend frontend;
-
-    LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
-                      const EngineOptions& options);
-    ~LoadedQwen3_6_27B();
-
-    LoadedQwen3_6_27B(const LoadedQwen3_6_27B&)            = delete;
-    LoadedQwen3_6_27B& operator=(const LoadedQwen3_6_27B&) = delete;
-};
-
-struct Qwen3_6_27BInstance {
-    using Package = Qwen3_6_27B;
-
-    std::unique_ptr<LoadedQwen3_6_27B> loaded;
-    runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
-    const std::uint32_t capacity;
-    std::unique_ptr<Qwen3_6_27B::Program> program;
-
-    Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
-                        runtime::KvCapacityResolution resolution,
-                        Qwen3_6_27B::SequencePlan sequence_plan, DeviceContext& device);
-    ~Qwen3_6_27BInstance();
-
-    Qwen3_6_27BInstance(const Qwen3_6_27BInstance&)            = delete;
-    Qwen3_6_27BInstance& operator=(const Qwen3_6_27BInstance&) = delete;
-};
-
-struct LoadedQwen3_6_35BA3B {
-    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> model;
-    Qwen3_6_35BA3B::Frontend frontend;
-
-    LoadedQwen3_6_35BA3B(std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model,
-                         const EngineOptions& options);
-    ~LoadedQwen3_6_35BA3B();
-
-    LoadedQwen3_6_35BA3B(const LoadedQwen3_6_35BA3B&)            = delete;
-    LoadedQwen3_6_35BA3B& operator=(const LoadedQwen3_6_35BA3B&) = delete;
-};
-
-struct Qwen3_6_35BA3BInstance {
-    using Package = Qwen3_6_35BA3B;
-
-    std::unique_ptr<LoadedQwen3_6_35BA3B> loaded;
-    runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
-    const std::uint32_t capacity;
-    std::unique_ptr<Qwen3_6_35BA3B::Program> program;
-
-    Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35BA3B> stable_loaded,
-                           runtime::KvCapacityResolution resolution,
-                           Qwen3_6_35BA3B::SequencePlan sequence_plan, DeviceContext& device);
-    ~Qwen3_6_35BA3BInstance();
-
-    Qwen3_6_35BA3BInstance(const Qwen3_6_35BA3BInstance&)            = delete;
-    Qwen3_6_35BA3BInstance& operator=(const Qwen3_6_35BA3BInstance&) = delete;
-};
-
-struct LoadedQwen38FlashNext {
-    std::unique_ptr<Qwen38FlashNext::LoadedModel> model;
-    Qwen38FlashNext::Frontend frontend;
-
-    LoadedQwen38FlashNext(std::unique_ptr<Qwen38FlashNext::LoadedModel> stable_model,
-                          const EngineOptions& options);
-    ~LoadedQwen38FlashNext();
-
-    LoadedQwen38FlashNext(const LoadedQwen38FlashNext&)            = delete;
-    LoadedQwen38FlashNext& operator=(const LoadedQwen38FlashNext&) = delete;
-};
-
-struct Qwen38FlashNextInstance {
-    using Package = Qwen38FlashNext;
-
-    std::unique_ptr<LoadedQwen38FlashNext> loaded;
-    runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
-    const std::uint32_t capacity;
-    std::unique_ptr<Qwen38FlashNext::Program> program;
-
-    Qwen38FlashNextInstance(std::unique_ptr<LoadedQwen38FlashNext> stable_loaded,
-                            runtime::KvCapacityResolution resolution,
-                            Qwen38FlashNext::SequencePlan sequence_plan, DeviceContext& device);
-    ~Qwen38FlashNextInstance();
-
-    Qwen38FlashNextInstance(const Qwen38FlashNextInstance&)            = delete;
-    Qwen38FlashNextInstance& operator=(const Qwen38FlashNextInstance&) = delete;
-};
 
 using Qwen38FlashNextPipeline = runtime::PipelineInstance<Qwen38FlashNextInstance>;
 using Qwen3_6_27BPipeline     = runtime::PipelineInstance<Qwen3_6_27BInstance>;

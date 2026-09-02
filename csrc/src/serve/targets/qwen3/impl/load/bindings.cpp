@@ -31,33 +31,8 @@ static_assert(TextConfig::query_projection_rows == TextConfig::query_size,
 /// which Qwen3-0.6B does not publish. The unfilled halves of the plan stay
 /// default-constructed and `take_text_only_frontend_resources` leaves their
 /// strings empty, which is what the frontend reads as "no pixel pipeline".
-family::FrontendResourcePlan bind_text_only_frontend_resources(artifact::Binder& binder) {
-    family::FrontendResourcePlan plan;
-    plan.tokenizer_json = artifact::bind_raw_resource(binder, "frontend/tokenizer.json");
-    plan.tokenizer_config_json =
-        artifact::bind_raw_resource(binder, "frontend/tokenizer_config.json");
-    plan.chat_template_jinja = artifact::bind_raw_resource(binder, "frontend/chat_template.jinja");
-    plan.generation_config_json =
-        artifact::bind_raw_resource(binder, "frontend/generation_config.json");
-    return plan;
-}
 
-std::string take_resource_string(artifact::MaterializedArtifact& materialized,
-                                 artifact::ObjectHandle handle) {
-    const auto bytes = materialized.take_resource_bytes(handle);
-    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-}
 
-family::FrontendResources
-take_text_only_frontend_resources(artifact::MaterializedArtifact& materialized,
-                                  const family::FrontendResourcePlan& plan) {
-    family::FrontendResources out;
-    out.tokenizer_json         = take_resource_string(materialized, plan.tokenizer_json);
-    out.tokenizer_config_json  = take_resource_string(materialized, plan.tokenizer_config_json);
-    out.chat_template_jinja    = take_resource_string(materialized, plan.chat_template_jinja);
-    out.generation_config_json = take_resource_string(materialized, plan.generation_config_json);
-    return out;
-}
 
 NumericFormat endpoint_format(WeightsProfile weights_profile) {
     switch (weights_profile) {
@@ -121,7 +96,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                family::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
-    out.frontend     = bind_text_only_frontend_resources(binder);
+    out.frontend     = family::bind_text_only_frontend_resources(binder);
     out.features     = features;
 
     if (features.vision) {
@@ -152,7 +127,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {
-    frontend = take_text_only_frontend_resources(backing, plan.frontend);
+    frontend = family::take_text_only_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
