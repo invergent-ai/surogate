@@ -23,6 +23,7 @@
 // serialized by the engine, which parks its worker loop first.
 
 #include <cstddef>
+#include <functional>
 
 namespace sinfer {
 
@@ -48,6 +49,19 @@ bool sleep_free(void* base) noexcept;
 
 /// Change a registered region's tag (startup only, before the first sleep).
 void sleep_tag_region(const void* base, SleepTag tag);
+
+/// A region that maps itself granule by granule (core/elastic_kv_region.h) joins the
+/// registry through hooks instead of a fixed span: sleep and wake are its own, and its
+/// footprint is whatever it has mapped right now. Offload semantics are the region's job.
+struct SparseRegionHooks {
+    const void* owner = nullptr;
+    int device        = 0;
+    std::function<std::size_t()> sleep_fn;     ///< back up, unmap; returns bytes released
+    std::function<std::size_t()> wake_fn;      ///< remap, restore; returns bytes mapped
+    std::function<std::size_t()> mapped_bytes; ///< current physical footprint
+};
+void sleep_register_sparse(const void* key, SparseRegionHooks hooks);
+void sleep_unregister_sparse(const void* key) noexcept;
 
 /// Back up Offload regions to pinned host, then unmap and release the physical
 /// pages of every region on `device`. Returns bytes released. The caller must

@@ -241,6 +241,16 @@ MemorySummary Program<Variant>::memory_summary() const noexcept {
 }
 
 template <>
+PagedKVOccupancy Program<Variant>::kv_occupancy() const noexcept {
+    return impl_->kv_occupancy();
+}
+
+template <>
+void Program<Variant>::kv_settle() noexcept {
+    impl_->kv_settle();
+}
+
+template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
 }

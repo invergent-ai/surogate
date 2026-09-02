@@ -47,6 +47,9 @@ struct PersistentLayout {
     TensorLayout rewrite_checkpoint_hidden;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
+    /// Bytes of the Main pool's planes living outside the arena (elastic pools), counted in the
+    /// device reservation as their worst case; zero otherwise.
+    std::size_t elastic_plane_bytes = 0;
 };
 
 struct WorkspacePlan {
@@ -71,6 +74,7 @@ struct SequencePlanningInputs {
     std::int32_t kv_quant_group            = 0;
     std::vector<std::uint32_t> kv_skip_layers;
     bool rewrite_checkpoints               = false;
+    bool elastic_kv                        = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -91,6 +95,10 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     std::uint32_t capacity                 = 0;
     std::uint32_t kv_capacity              = 0;
     std::uint32_t main_page_groups         = 0;
+    // Elastic Main pool: the page span the layout lays out, every lane free to reach its full
+    // context; main_page_groups above is then the physical cap admission enforces. Equal to
+    // main_page_groups for a pool inside the arena.
+    std::uint32_t main_page_virtual        = 0;
     int pipeline_stage_first               = 0; // pipeline stage layer range (0/0 = whole model)
     int pipeline_stage_last                = 0;
     const void* pipeline_import_pinned     = nullptr;
@@ -103,6 +111,7 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     std::int32_t kv_quant_group            = 0;
     std::vector<std::uint32_t> kv_skip_layers;
     bool rewrite_checkpoints               = false;
+    bool elastic_kv                        = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

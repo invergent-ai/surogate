@@ -30,8 +30,13 @@ struct DecoderStateSpec {
     // hold no KV planes at all, so a quantized cache cannot reach them.
     std::vector<std::uint32_t> kv_skip_layers;
     bool enable_mtp                         = false;
+    // The Main pool's planes follow demand (core/elastic_kv_region.h) instead of sitting in
+    // the arena. The MTP pool stays in the arena: it is small and per-lane.
+    bool elastic_kv                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
+    // Elastic Main pool: pages that may be physical at once (0 = all of the above).
+    std::uint32_t text_physical_page_cap    = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
     LinearAttentionStatePoolSpec linear_attention;
     // Per-slot state of a layer prologue (n-gram memory); absent for targets without one.
@@ -76,7 +81,8 @@ private:
 
 class PagedKVCache {
 public:
-    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
+                 const PagedKVElasticOptions* elastic = nullptr);
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -132,7 +138,10 @@ struct DecoderState {
     LinearAttentionStatePool linear_attention;
     NgramPleStatePool ple; ///< empty unless the layout planned one
 
-    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
+    /// `elastic` supplies the device and fence stream an elastic Main pool maps with; it is
+    /// ignored by layouts that keep their planes in the arena.
+    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
+                 const PagedKVElasticOptions* elastic = nullptr);
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;

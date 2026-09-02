@@ -184,6 +184,23 @@ int main() {
     allocation_b.bind_row(1);
     failures += expect_device_page_ids(allocation_a.block_table(), {0, 1, 2}, "allocation A");
     failures += expect_device_page_ids(allocation_b.block_table(), {3, 4, 5}, "allocation B");
+
+    // Occupancy: pages 0-5 are held by A and B, 6-9 are free. Per page a plane spans
+    // nb[3] bytes -- 8192 for each I8 code plane, 256 for each FP16 scale plane -- so a
+    // 1024-byte mapping quantum needs four pages to cover the scale planes, and the
+    // granule containing pages 4 and 5 stays resident whole.
+    const sinfer::PagedKVOccupancy occupancy = paged_pool.occupancy(1024);
+    failures += expect_size(occupancy.page_group_count, 10, "occupancy page count");
+    failures += expect_size(occupancy.pages_in_use, 6, "occupancy pages in use");
+    failures += expect_size(occupancy.entitled_pages, 6, "occupancy entitled pages");
+    failures += expect_size(occupancy.granule_pages, 4, "occupancy granule pages");
+    failures += expect_size(occupancy.resident_pages_at_granule, 8, "occupancy resident pages");
+    failures += expect_size(occupancy.page_bytes, 2 * 8192 + 2 * 256, "occupancy page bytes");
+    // A head-major plane scatters one page across its heads, so no page-granular mapping
+    // scheme applies and the granule is reported as zero rather than as something usable.
+    failures += expect_size(head_major_pool.occupancy(1024).granule_pages, 0,
+                            "head-major occupancy granule");
+
     allocation_a.release();
 
     auto allocation_c = paged_pool.reserve(6);

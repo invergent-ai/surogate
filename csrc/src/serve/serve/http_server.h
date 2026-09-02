@@ -55,6 +55,8 @@ private:
     void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
+    /// GET /kv_stats: per-model KV pool physical occupancy, for elastic-KV sizing.
+    void handle_kv_stats(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
     // The process-wide console logger serializes lines from request and reporter threads.
@@ -77,6 +79,10 @@ private:
     /// handler's duration; falls back to the primary.
     static thread_local GenerationService* t_routed_service;
     class ModelScheduler* scheduler_ = nullptr;
+    /// Per-service startup geometry (weights, resolved KV capacity) for /kv_stats, so serving it
+    /// never has to reach into a running engine. Written at attach, read-only afterwards.
+    std::map<const GenerationService*, sinfer::MemorySummary> attached_memory_;
+    int device_ = 0;
     [[nodiscard]] GenerationService& svc() const {
         return t_routed_service != nullptr ? *t_routed_service : *service_;
     }

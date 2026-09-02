@@ -142,6 +142,8 @@ public:
     void sleep(bool preempt = false);
     void wake_up();
     [[nodiscard]] bool is_sleeping() const { return engine_->is_sleeping(); }
+    /// Return idle KV (prefix cache) so `resident_bytes` shrinks without sleeping.
+    void shrink_kv() { engine_->shrink_kv(); }
     /// Requests currently inside this service (admission-counted).
     [[nodiscard]] std::size_t active_requests() const;
     void prepare_sleep_backup() { engine_->prepare_sleep_backup(); }

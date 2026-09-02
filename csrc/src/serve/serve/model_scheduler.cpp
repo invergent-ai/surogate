@@ -90,6 +90,18 @@ bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt) {
         }
         return total;
     };
+    // The cheap move first: an idle awake model's KV is mostly prefix cache, and an elastic
+    // pool gives those granules back without the model leaving the device. Shrink every idle
+    // neighbour once and re-check before any model is put to sleep.
+    if (awake_bytes() + needed > budget_bytes_) {
+        for (auto& state : models_) {
+            if (state.entry.service == target.entry.service || state.entry.service->is_sleeping() ||
+                state.entry.service->active_requests() != 0) {
+                continue;
+            }
+            state.entry.service->shrink_kv();
+        }
+    }
     while (awake_bytes() + needed > budget_bytes_) {
         State* victim  = nullptr;
         bool busy_pick = false;

@@ -9,6 +9,8 @@
 #include "serve/request_log.h"
 #include "serve/translate.h"
 
+#include "core/sleep.h"
+
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -290,6 +292,9 @@ void HttpServer::register_routes() {
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
+    server_.Get("/kv_stats", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_kv_stats(req, res);
+    });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
@@ -457,6 +462,53 @@ void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) 
     }
     res.set_content(make_models_list(public_model_id_, unix_time_now(), additional),
                     "application/json");
+}
+
+void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res) const {
+    // Every field here comes from the executor's published stats snapshot, never from
+    // Engine::memory_summary(): that takes the execution lock, which a busy engine holds for a
+    // whole round, so polling it piles handler threads up until the HTTP pool is exhausted and
+    // the server stops answering anything at all. The static geometry is cached at attach time.
+    const auto model_json = [this](const std::string& name, const GenerationService& service) {
+        const sinfer::RuntimeStats stats = service.runtime_stats();
+        const auto found                 = attached_memory_.find(&service);
+        const auto bytes                 = [&](std::uint32_t pages) {
+            return static_cast<std::uint64_t>(pages) * stats.kv_page_bytes;
+        };
+        return nlohmann::json{
+            {"model", name},
+            {"sleeping", service.is_sleeping()},
+            {"running_requests", stats.running_requests},
+            {"waiting_requests", stats.waiting_requests},
+            {"kv_capacity_tokens",
+             found == attached_memory_.end() ? 0U : found->second.kv_capacity},
+            {"weights_bytes",
+             found == attached_memory_.end() ? 0UL : found->second.weights.capacity_bytes},
+            {"page_bytes", stats.kv_page_bytes},
+            {"granule_pages", stats.kv_granule_pages},
+            {"pages", stats.kv_pages},
+            {"pages_entitled", stats.kv_pages_entitled},
+            {"pages_in_use", stats.kv_pages_in_use},
+            {"pages_resident_at_granule", stats.kv_pages_resident_at_granule},
+            {"pages_mapped", stats.kv_pages_mapped},
+            {"pool_bytes", bytes(stats.kv_pages)},
+            {"in_use_bytes", bytes(stats.kv_pages_in_use)},
+            {"resident_at_granule_bytes", bytes(stats.kv_pages_resident_at_granule)},
+            {"mapped_bytes", bytes(stats.kv_pages_mapped)},
+        };
+    };
+
+    nlohmann::json models = nlohmann::json::array();
+    models.push_back(model_json(public_model_id_, *service_));
+    for (const auto& [name, service] : extra_services_) {
+        models.push_back(model_json(name, *service));
+    }
+    const nlohmann::json out{
+        {"unix_time", unix_time_now()},
+        {"device_free_bytes", sinfer::device_free_bytes(device_)},
+        {"models", models},
+    };
+    res.set_content(out.dump(), "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
@@ -935,6 +987,7 @@ void HttpServer::attach_extra(GenerationService& service) {
                                    "' collides with another served name");
         }
     }
+    attached_memory_.emplace(&service, service.memory_summary());
     extra_services_.emplace(id, &service);
 }
 
@@ -981,6 +1034,9 @@ void HttpServer::attach(GenerationService& service) {
     const sinfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     service_                       = &service;
+    const sinfer::MemorySummary memory = service.memory_summary();
+    device_                            = memory.device;
+    attached_memory_.emplace(&service, memory);
     request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());
 }

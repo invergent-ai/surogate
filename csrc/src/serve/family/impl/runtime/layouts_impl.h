@@ -155,7 +155,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
-    const std::uint32_t physical_pages = plan.main_page_groups;
+    // The Main pool's laid-out span; every other consumer of the physical count (MTP, DFlash,
+    // the reservation) uses plan.main_page_groups, the cap.
+    const std::uint32_t physical_pages = plan.main_page_virtual != 0 ? plan.main_page_virtual
+                                                                     : plan.main_page_groups;
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
             ? static_cast<std::uint64_t>(plan.max_concurrency) *
@@ -163,7 +166,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                    static_cast<std::uint32_t>(kPagedKVPageSize))
             : 0ULL;
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
-        checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
+        checked_i32(static_cast<std::uint64_t>(plan.main_page_groups) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
     LayoutBuilder builder;
     PersistentLayout out;
@@ -178,8 +181,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_quant_group            = plan.kv_quant_group,
                      .kv_skip_layers            = plan.kv_skip_layers,
                      .enable_mtp                = plan.features.mtp(),
+                     .elastic_kv                = plan.elastic_kv,
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
+                     .text_physical_page_cap    = plan.elastic_kv ? plan.main_page_groups : 0U,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                      .linear_attention =
                          {
@@ -219,7 +224,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
             PagedKVPoolSpec full_pool{
-                .page_group_count      = physical_pages,
+                .page_group_count      = plan.main_page_groups,
                 .logical_page_capacity = logical_pages,
                 .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
                 .plane_order           = PagedKVPlaneOrder::HeadMajor,
@@ -282,6 +287,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
+    // The reservation charges the planes' exact bytes, which grow linearly with the page
+    // count as the capacity curve requires; the padded span the region reserves (each plane
+    // on a mapping quantum) is virtual and at most one granule wider.
+    if (out.decoder.text_kv.pool.spec.elastic) {
+        const std::size_t per_page = out.decoder.text_kv.payload_bytes() / physical_pages;
+        out.elastic_plane_bytes    = per_page * plan.main_page_groups;
+    }
     return out;
 }
 
@@ -704,6 +716,17 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->weights_profile     = inputs.weights_profile;
     impl->capacity            = inputs.capacity;
     impl->main_page_groups    = main_page_groups;
+    // Elastic: lay out the virtual maximum (every lane at full context); the physical cap
+    // stays main_page_groups, which is what the reservation and admission are sized from.
+    impl->main_page_virtual   = main_page_groups;
+    if (inputs.elastic_kv) {
+        const std::uint64_t virtual_pages =
+            static_cast<std::uint64_t>(inputs.max_concurrency) * page_count(inputs.capacity);
+        impl->main_page_virtual = static_cast<std::uint32_t>(
+            std::max<std::uint64_t>(main_page_groups,
+                                    std::min<std::uint64_t>(virtual_pages,
+                                                            std::numeric_limits<std::uint32_t>::max())));
+    }
     impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
         "resolved Paged KV capacity exceeds int32"));
@@ -723,6 +746,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->kv_skip_layers      = inputs.kv_skip_layers;
     impl->rewrite_checkpoints = inputs.rewrite_checkpoints;
+    impl->elastic_kv          = inputs.elastic_kv;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -776,7 +800,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
     impl->device_reservation_bytes = checked_add(
         checked_add(
-            checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
+            checked_add(checked_add(impl->persistent.bytes, impl->persistent.elastic_plane_bytes,
+                                    "sequence memory plan"),
+                        impl->workspace.capacity, "sequence memory plan"),
             impl->request_transient_capacity_bytes, "request transient reservation"),
         impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
@@ -801,6 +827,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                                                                          : 0,
         .kv_skip_layers = options.kv_cache_skip_layers,
         .rewrite_checkpoints = options.rewrite_checkpoints,
+        .elastic_kv     = options.elastic_kv,
         .proposal_head  = options.speculative.proposal_head,
         .features       = family::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,

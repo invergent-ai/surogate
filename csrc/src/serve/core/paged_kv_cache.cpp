@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <limits>
 #include <new>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -51,10 +52,20 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
         throw std::invalid_argument("Paged KV table row count must be positive");
     }
     if (spec.planes.empty()) { throw std::invalid_argument("Paged KV pool must contain planes"); }
+    if (spec.elastic && spec.plane_order != PagedKVPlaneOrder::PageMajor) {
+        // A head-major plane scatters one page across its heads; there is no page-granular
+        // byte range to map, so only page-major pools can follow demand.
+        throw std::invalid_argument("Elastic Paged KV pools must be page-major");
+    }
 
     PagedKVPoolLayout layout;
     layout.spec = spec;
     layout.planes.reserve(spec.planes.size());
+    // Elastic planes are laid out in their own builder: they get their own reservation, and
+    // every plane starts on a mapping quantum so a granule is a whole number of quanta.
+    LayoutBuilder plane_builder;
+    LayoutBuilder& planes_into = spec.elastic ? plane_builder : builder;
+    std::uint32_t granule_pages = 1;
     for (std::size_t index = 0; index < spec.planes.size(); ++index) {
         const PagedKVPlaneSpec& plane = spec.planes[index];
         if (plane.leading_extent <= 0 || plane.head_extent <= 0) {
@@ -64,17 +75,35 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
         PagedKVPlaneLayout planned;
         planned.spec = plane;
         if (spec.plane_order == PagedKVPlaneOrder::PageMajor) {
-            planned.storage = builder.add_tensor(
+            const std::size_t alignment =
+                spec.elastic ? std::max(plane.alignment, kElasticKvGranuleBytes) : plane.alignment;
+            planned.storage = planes_into.add_tensor(
                 plane.dtype,
                 {plane.leading_extent, kPagedKVPageSize, plane.head_extent, physical_pages},
-                plane.alignment, label);
+                alignment, label);
+            if (spec.elastic) {
+                // Pages per granule: the least count whose span in this plane is a whole
+                // number of quanta, taken across planes (strides differ under mixed dtypes).
+                const auto stride = static_cast<std::size_t>(
+                    Tensor(nullptr, plane.dtype,
+                           {plane.leading_extent, kPagedKVPageSize, plane.head_extent, 1})
+                        .bytes());
+                const std::size_t common = std::gcd(kElasticKvGranuleBytes, stride);
+                granule_pages = std::max(
+                    granule_pages, static_cast<std::uint32_t>(kElasticKvGranuleBytes / common));
+            }
         } else {
-            planned.storage = builder.add_tensor(
+            planned.storage = planes_into.add_tensor(
                 plane.dtype,
                 {plane.leading_extent, kPagedKVPageSize, physical_pages, plane.head_extent},
                 plane.alignment, label);
         }
         layout.planes.push_back(planned);
+    }
+    if (spec.elastic) {
+        layout.elastic_plane_bytes =
+            plane_builder.finish(kElasticKvGranuleBytes, "elastic Paged KV planes");
+        layout.elastic_granule_pages = granule_pages;
     }
     layout.block_tables = builder.add_tensor(DType::I32, {logical_pages, spec.table_rows}, 256,
                                              "Paged KV block tables");
@@ -89,11 +118,36 @@ std::size_t PagedKVPoolLayout::payload_bytes() const noexcept {
 
 std::size_t PagedKVPoolLayout::metadata_bytes() const noexcept { return block_tables.region.bytes; }
 
-PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
+PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
+                         const PagedKVElasticOptions* elastic)
     : spec_(layout.spec), block_tables_(layout.block_tables.bind(backing)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false) {
     if (layout.planes.size() != spec_.planes.size() || layout.planes.empty()) {
         throw std::invalid_argument("Paged KV layout plane inventory is inconsistent");
+    }
+    DeviceSpan plane_backing = backing;
+    if (spec_.elastic) {
+        if (elastic == nullptr) {
+            throw std::invalid_argument("Elastic Paged KV pool needs its engine's device and stream");
+        }
+        ElasticKvRegionSpec region;
+        region.device           = elastic->device;
+        region.fence_stream     = elastic->fence_stream;
+        region.bytes            = layout.elastic_plane_bytes;
+        region.page_count       = spec_.page_group_count;
+        region.granule_pages    = layout.elastic_granule_pages;
+        region.reserve_granules = elastic->reserve_granules;
+        region.cap_pages        = capacity_pages();
+        for (const PagedKVPlaneLayout& plane : layout.planes) {
+            const auto& shape = plane.storage.shape;
+            const Tensor page(nullptr, plane.storage.dtype, {shape[0], shape[1], shape[2], 1});
+            region.planes.push_back(ElasticKvPlane{
+                .offset     = plane.storage.region.offset,
+                .page_bytes = page.bytes(), // one page's bytes: the plane's page stride
+            });
+        }
+        elastic_      = std::make_unique<ElasticKvRegion>(std::move(region));
+        plane_backing = DeviceSpan{elastic_->base(), elastic_->bytes()};
     }
     if (block_tables_.dtype != DType::I32 ||
         block_tables_.ne[0] !=
@@ -110,7 +164,7 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
             plane.spec.head_extent != spec_.planes[index].head_extent) {
             throw std::logic_error("Paged KV plane layout does not match its spec");
         }
-        planes_.push_back(plane.storage.bind(backing));
+        planes_.push_back(plane.storage.bind(plane_backing));
     }
 
     free_page_ids_.reserve(spec_.page_group_count);
@@ -149,15 +203,21 @@ std::uint32_t PagedKVPool::free_pages() const noexcept {
     return static_cast<std::uint32_t>(free_page_ids_.size());
 }
 
+std::uint32_t PagedKVPool::capacity_pages() const noexcept {
+    return spec_.elastic && spec_.physical_page_cap != 0
+               ? std::min(spec_.physical_page_cap, spec_.page_group_count)
+               : spec_.page_group_count;
+}
+
 bool PagedKVPool::can_reserve(std::uint32_t page_entitlement) const noexcept {
     return page_entitlement != 0 && page_entitlement <= logical_page_capacity() &&
-           page_entitlement <= page_group_count() - entitled_pages_;
+           page_entitlement <= capacity_pages() - entitled_pages_;
 }
 
 bool PagedKVPool::can_replace_entitlement(std::uint32_t old_pages,
                                           std::uint32_t new_pages) const noexcept {
     return old_pages <= entitled_pages_ && new_pages <= logical_page_capacity() &&
-           new_pages <= page_group_count() - (entitled_pages_ - old_pages);
+           new_pages <= capacity_pages() - (entitled_pages_ - old_pages);
 }
 
 PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
@@ -165,6 +225,49 @@ PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
     PagedKVAllocation allocation(*this, page_entitlement);
     add_entitlement(page_entitlement);
     return allocation;
+}
+
+PagedKVOccupancy PagedKVPool::occupancy(std::size_t granule_bytes) const noexcept {
+    PagedKVOccupancy out;
+    out.page_group_count = spec_.page_group_count;
+    out.capacity_pages   = capacity_pages();
+    out.entitled_pages   = entitled_pages_;
+    out.pages_in_use     = mapped_pages_;
+    out.mapped_pages     = elastic_ ? std::min(spec_.page_group_count,
+                                               elastic_->mapped_granules() * elastic_->granule_pages())
+                                    : spec_.page_group_count;
+
+    // A page's bytes are contiguous per plane only under PageMajor; a HeadMajor plane scatters
+    // one page across its heads, so no page-granular mapping scheme applies to it.
+    const bool page_mappable = spec_.plane_order == PagedKVPlaneOrder::PageMajor;
+    std::uint32_t granule    = 1;
+    for (const Tensor& plane : planes_) {
+        const std::int64_t stride = page_mappable ? plane.nb[3] : plane.nb[2];
+        if (stride <= 0) { return out; }
+        const auto span = static_cast<std::size_t>(stride) *
+                          (page_mappable ? 1ULL : static_cast<std::size_t>(plane.ne[3]));
+        out.page_bytes += span;
+        const auto pages_per_granule =
+            static_cast<std::uint32_t>((granule_bytes + static_cast<std::size_t>(stride) - 1) /
+                                       static_cast<std::size_t>(stride));
+        granule = std::max(granule, pages_per_granule);
+    }
+    if (!page_mappable || granule == 0) { return out; }
+    out.granule_pages = granule;
+
+    // free_page_ids_ is kept sorted, so one walk covers every granule window.
+    std::size_t cursor = 0;
+    for (std::uint32_t first = 0; first < out.page_group_count; first += granule) {
+        const std::uint32_t last = std::min(first + granule, out.page_group_count);
+        std::uint32_t free_here  = 0;
+        while (cursor < free_page_ids_.size() &&
+               free_page_ids_[cursor] < static_cast<std::int32_t>(last)) {
+            ++free_here;
+            ++cursor;
+        }
+        if (free_here < last - first) { out.resident_pages_at_granule += last - first; }
+    }
+    return out;
 }
 
 void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream) {
@@ -252,6 +355,17 @@ std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
         free_page_ids_.erase(free_page_ids_.begin(), last);
     }
     mapped_pages_ += count;
+    static const bool kTrace = std::getenv("SUROGATE_SERVE_KV_TRACE") != nullptr;
+    if (kTrace) {
+        std::fprintf(stderr, "kv-trace: pool %p take %u pages [%d..%d] preferred %d free_left %zu\n",
+                     static_cast<void*>(this), count, out.front(), out.back(), preferred_first,
+                     free_page_ids_.size());
+    }
+    if (elastic_) {
+        // Physical memory follows the pages just handed out. This is the one place the round
+        // loop may pay a mapping, and only when demand has outrun the reserve.
+        for (const std::int32_t page : out) { elastic_->acquire_page(page); }
+    }
     return out;
 }
 
@@ -260,6 +374,17 @@ void PagedKVPool::return_pages(std::span<const std::int32_t> pages) noexcept {
     free_page_ids_.insert(free_page_ids_.end(), pages.begin(), pages.end());
     std::sort(free_page_ids_.begin(), free_page_ids_.end());
     mapped_pages_ -= static_cast<std::uint32_t>(pages.size());
+    static const bool kTrace = std::getenv("SUROGATE_SERVE_KV_TRACE") != nullptr;
+    if (kTrace) {
+        const bool duplicate =
+            std::adjacent_find(free_page_ids_.begin(), free_page_ids_.end()) != free_page_ids_.end();
+        std::fprintf(stderr, "kv-trace: pool %p return %zu pages [%d..%d]%s\n",
+                     static_cast<void*>(this), pages.size(), pages.front(), pages.back(),
+                     duplicate ? " DUPLICATE IN FREE LIST" : "");
+    }
+    if (elastic_) {
+        for (const std::int32_t page : pages) { elastic_->release_page(page); }
+    }
 }
 
 void PagedKVPool::add_entitlement(std::uint32_t pages) noexcept { entitled_pages_ += pages; }
@@ -368,24 +493,38 @@ void PagedKVAllocation::materialize_tokens(std::uint32_t tokens, cudaStream_t st
     materialize_pages(pages_for_tokens(tokens), stream);
 }
 
-void PagedKVAllocation::trim_pages(std::uint32_t pages) {
+void PagedKVAllocation::trim_pages(std::uint32_t pages, cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot trim an empty Paged KV allocation"); }
     if (pages > mapped_page_count()) {
         throw std::invalid_argument("Paged KV trim extent exceeds mapped pages");
     }
     if (pages == mapped_page_count()) { return; }
+    const std::uint32_t trimmed = mapped_page_count() - pages;
     pool_->return_pages(std::span<const std::int32_t>(
-        page_ids_.data() + pages, static_cast<std::size_t>(mapped_page_count() - pages)));
+        page_ids_.data() + pages, static_cast<std::size_t>(trimmed)));
+    static const bool kPoison = std::getenv("SUROGATE_SERVE_KV_POISON_TRIM") != nullptr;
+    if (kPoison && bound_row_ >= 0 && stream != nullptr) {
+        // Leave a landmine where the pages were: any read through these entries is a bug.
+        for (std::uint32_t i = 0; i < trimmed; ++i) { page_ids_[pages + i] = 0x7ffffff0; }
+        publish_range(pages, trimmed, stream);
+    }
     page_ids_.resize(pages);
 }
 
-void PagedKVAllocation::trim_tokens(std::uint32_t tokens) { trim_pages(pages_for_tokens(tokens)); }
+void PagedKVAllocation::trim_tokens(std::uint32_t tokens, cudaStream_t stream) {
+    trim_pages(pages_for_tokens(tokens), stream);
+}
 
 void PagedKVAllocation::bind_row(std::int32_t row, cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot bind an empty Paged KV allocation"); }
     if (bound_row_ >= 0) { throw std::logic_error("Paged KV allocation is already bound"); }
     pool_->acquire_row(row);
     bound_row_ = row;
+    static const bool kTrace = std::getenv("SUROGATE_SERVE_KV_TRACE") != nullptr;
+    if (kTrace) {
+        std::fprintf(stderr, "kv-trace: pool %p bind row %d (%zu pages mapped)\n",
+                     static_cast<void*>(pool_), row, page_ids_.size());
+    }
     publish_mapping(stream);
 }
 

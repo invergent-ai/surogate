@@ -83,6 +83,19 @@ public:
     [[nodiscard]] std::unique_lock<std::mutex> pause_execution() {
         return std::unique_lock<std::mutex>(execution_mutex_);
     }
+    /// Give back what idling holds: every retained (prefix-cache) lane is evicted, so an
+    /// elastic pool's granules can go back. Runs between rounds; the scheduler calls it on an
+    /// idle model before it would sleep one.
+    void shrink_kv() {
+        auto paused = pause_execution();
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr && instance_.program->has_retained_lane(lane)) {
+                instance_.program->evict_retained_lane(lane);
+                invalidate_lane_plans(lane);
+            }
+        }
+        instance_.program->kv_settle();
+    }
     [[nodiscard]] bool any_active_lane() const {
         std::lock_guard lock(queue_mutex_);
         if (!pending_.empty()) { return true; }
@@ -244,6 +257,14 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = static_cast<std::uint32_t>(prefill_lanes_.size());
+        const auto kv                       = instance_.program->kv_occupancy();
+        snapshot.kv_pages                   = kv.page_group_count;
+        snapshot.kv_pages_entitled          = kv.entitled_pages;
+        snapshot.kv_pages_in_use            = kv.pages_in_use;
+        snapshot.kv_granule_pages           = kv.granule_pages;
+        snapshot.kv_pages_resident_at_granule = kv.resident_pages_at_granule;
+        snapshot.kv_pages_mapped            = kv.mapped_pages;
+        snapshot.kv_page_bytes              = kv.page_bytes;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;

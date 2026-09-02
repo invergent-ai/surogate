@@ -98,7 +98,8 @@ int main(int argc, char** argv) {
             extra_options.artifact_path             = extra.artifact_path;
             extra_options.model_id_override         = extra.name;
             extra_options.kv_capacity =
-                sinfer::KvCapacityPolicy::explicit_capacity(extra.kv_tokens);
+                extra.kv_tokens != 0 ? sinfer::KvCapacityPolicy::explicit_capacity(extra.kv_tokens)
+                                     : options.kv_capacity; // elastic: automatic against the ledger
             if (extra.max_num_seqs != 0) { extra_options.max_concurrency = extra.max_num_seqs; }
             if (extra.max_context != 0) { extra_options.max_context = extra.max_context; }
             extra_options.extra_models.clear();

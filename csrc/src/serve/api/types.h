@@ -179,6 +179,10 @@ struct EngineOptions {
     // and the memory is throughput. A product with edit-and-resend turns
     // opts in with --rewrite-checkpoints.
     bool rewrite_checkpoints           = false;
+    // The Main KV pool's planes are demand-mapped (core/elastic_kv_region.h): the pool keeps
+    // its planned size as a virtual span and only the pages in use, plus a small reserve,
+    // hold physical memory. Off by default while it is being validated.
+    bool elastic_kv                    = false;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -549,6 +553,18 @@ struct RuntimeStats {
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;
     std::uint32_t waiting_requests      = 0;
+    std::uint32_t kv_pages_mapped       = 0; ///< pages physically resident (see PagedKVOccupancy)
+    // Main KV pool physical occupancy, read on the executor thread at the boundary that published
+    // this snapshot -- never by asking the engine, which would queue behind a whole round.
+    // `kv_pages_in_use` is live demand; `kv_pages_resident_at_granule` is what a demand-mapped
+    // (CUDA VMM) pool could not have released, a mapping granule staying resident while any one
+    // of its pages is live.
+    std::uint32_t kv_pages                     = 0;
+    std::uint32_t kv_pages_entitled            = 0;
+    std::uint32_t kv_pages_in_use              = 0;
+    std::uint32_t kv_granule_pages             = 0;
+    std::uint32_t kv_pages_resident_at_granule = 0;
+    std::size_t kv_page_bytes                  = 0;
 };
 
 struct LoadSummary {

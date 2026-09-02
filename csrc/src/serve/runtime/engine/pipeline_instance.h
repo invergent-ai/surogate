@@ -12,6 +12,7 @@
 
 #include "api/types.h"
 #include "core/device.h"
+#include "core/paged_kv_cache.h"
 #include "runtime/contract/round_lifecycle.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
@@ -267,6 +268,14 @@ public:
     }
     [[nodiscard]] MemorySummary memory_summary() const noexcept {
         return stages_.front()->program->memory_summary();
+    }
+    /// Every stage carries the full-attention layers of its own span, and the pool geometry is
+    /// planned per stage; the first stage's is the one memory_summary() already reports.
+    [[nodiscard]] PagedKVOccupancy kv_occupancy() const noexcept {
+        return stages_.front()->program->kv_occupancy();
+    }
+    void kv_settle() noexcept {
+        for (Stage* stage : stages_) { stage->program->kv_settle(); }
     }
     void reset_memory_peaks() noexcept {
         for (Stage* stage : stages_) { stage->program->reset_memory_peaks(); }

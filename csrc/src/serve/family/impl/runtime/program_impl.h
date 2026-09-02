@@ -294,7 +294,17 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     configure_stage(plan);
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    decoder = std::make_unique<family::DecoderState>(backing, plan.persistent.decoder);
+    // SUROGATE_SERVE_ELASTIC_KV_RESERVE=N: granules kept mapped ahead of demand (0 maps on
+    // demand only, every emptied granule going straight back) -- a bisection knob.
+    const PagedKVElasticOptions elastic_kv{
+        .device           = device.device,
+        .fence_stream     = device.stream,
+        .reserve_granules = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_ELASTIC_KV_RESERVE");
+            return raw != nullptr && *raw != '\0' ? static_cast<std::uint32_t>(std::atoi(raw)) : 4U;
+        }(),
+    };
+    decoder = std::make_unique<family::DecoderState>(backing, plan.persistent.decoder, &elastic_kv);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
     }
@@ -412,7 +422,7 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
     const auto can_replace        = [](const PagedKVPool& pool, std::uint32_t old_pages,
                                 std::uint32_t new_pages) {
         return old_pages <= pool.entitled_pages() && new_pages <= pool.logical_page_capacity() &&
-               new_pages <= pool.page_group_count() - (pool.entitled_pages() - old_pages);
+               new_pages <= pool.capacity_pages() - (pool.entitled_pages() - old_pages);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
@@ -452,7 +462,7 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
             return false;
         }
         const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
-        return new_pages <= pool.page_group_count() - committed;
+        return new_pages <= pool.capacity_pages() - committed;
     };
 
     const SequenceState& sequence = sequences[lane];
@@ -474,8 +484,8 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
     const family::PagedKVCache* backend = backend_kv_cache();
     return runtime::AdmissionResources{
         .active_lanes     = max_concurrency,
-        .main_kv_pages    = decoder->text_kv.pool().page_group_count(),
-        .backend_kv_pages = backend != nullptr ? backend->pool().page_group_count() : 0U,
+        .main_kv_pages    = decoder->text_kv.pool().capacity_pages(),
+        .backend_kv_pages = backend != nullptr ? backend->pool().capacity_pages() : 0U,
     };
 }
 
@@ -1188,8 +1198,8 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
-    sequence.kv->text.trim_tokens(main_tokens);
-    if (sequence.kv->backend) { sequence.kv->backend->trim_tokens(backend_tokens); }
+    sequence.kv->text.trim_tokens(main_tokens, device.stream);
+    if (sequence.kv->backend) { sequence.kv->backend->trim_tokens(backend_tokens, device.stream); }
 }
 
 void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequence) noexcept {
@@ -1240,7 +1250,7 @@ void ProgramImplCore::prepare_graphs() {
                                           std::vector<PagedKVAllocation>& allocations,
                                           const char* label) {
         PagedKVPool& pool = cache.pool();
-        if (pool.page_group_count() < max_concurrency) {
+        if (pool.capacity_pages() < max_concurrency) {
             throw std::invalid_argument(std::string(label) +
                                         " cannot provide one Paged KV page per concurrent request");
         }
@@ -3185,6 +3195,18 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
     return out;
+}
+
+PagedKVOccupancy ProgramImplCore::kv_occupancy() const noexcept {
+    return decoder->text_kv.pool().occupancy();
+}
+
+void ProgramImplCore::kv_settle() noexcept {
+    if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
+        try {
+            region->wait_idle();
+        } catch (...) {}
+    }
 }
 
 void ProgramImplCore::reset_memory_peaks() noexcept {

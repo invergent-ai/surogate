@@ -254,6 +254,11 @@ public:
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    /// Main KV pool occupancy. Cheap and allocation-free: the executor samples it every
+    /// time it publishes runtime stats.
+    [[nodiscard]] PagedKVOccupancy kv_occupancy() const noexcept;
+    /// Blocks until an elastic Main pool has no map or unmap work pending (no-op otherwise).
+    void kv_settle() noexcept;
 
     void reset_memory_peaks() noexcept;
 

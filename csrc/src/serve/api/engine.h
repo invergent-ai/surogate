@@ -116,6 +116,9 @@ public:
     /// process meanwhile; the engine stays asleep and the call can be retried.
     void wake();
     [[nodiscard]] bool is_sleeping() const;
+    /// Drop the prefix cache and let an elastic KV pool return its idle granules; the
+    /// footprint `sleepable_bytes` reports shrinks accordingly. A no-op for arena pools.
+    void shrink_kv();
 
     /// VRAM this engine's sleepable regions occupy while awake -- its cost in
     /// a resident set. Zero when built without sleep_enable.

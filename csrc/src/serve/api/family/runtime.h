@@ -1,6 +1,7 @@
 #pragma once
 
 #include "api/types.h"
+#include "core/paged_kv_cache.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/round_lifecycle.h"
@@ -187,6 +188,9 @@ public:
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] PagedKVOccupancy kv_occupancy() const noexcept;
+    /// Blocks until an elastic Main pool has no map or unmap work pending (no-op otherwise).
+    void kv_settle() noexcept;
     void reset_memory_peaks() noexcept;
     /// Pipeline stage before the last: the pinned buffer holding the residual it exports
     /// (the next stage's `pipeline_import_pinned`); null for a whole-model program.

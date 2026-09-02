@@ -41,9 +41,15 @@ struct Region {
     bool asleep                         = false;
 };
 
+struct SparseEntry {
+    SparseRegionHooks hooks;
+    bool asleep = false;
+};
+
 struct Registry {
     std::mutex mutex;
     std::map<void*, Region> regions;
+    std::map<const void*, SparseEntry> sparse;
 };
 
 Registry& registry() {
@@ -144,11 +150,27 @@ void sleep_tag_region(const void* base, SleepTag tag) {
     found->second.tag = tag;
 }
 
+void sleep_register_sparse(const void* key, SparseRegionHooks hooks) {
+    const std::lock_guard<std::mutex> lock(registry().mutex);
+    registry().sparse[key] = SparseEntry{std::move(hooks), false};
+}
+
+void sleep_unregister_sparse(const void* key) noexcept {
+    const std::lock_guard<std::mutex> lock(registry().mutex);
+    registry().sparse.erase(key);
+}
+
 std::size_t sleep_device(int device, const void* owner) {
     using Clock = std::chrono::steady_clock;
     const std::lock_guard<std::mutex> lock(registry().mutex);
     CUDA_CHECK(cudaSetDevice(device));
     std::size_t released = 0;
+    for (auto& [key, entry] : registry().sparse) {
+        if (entry.hooks.device != device || entry.asleep) { continue; }
+        if (owner != nullptr && entry.hooks.owner != owner) { continue; }
+        released += entry.hooks.sleep_fn();
+        entry.asleep = true;
+    }
     double pin_ms = 0, copy_ms = 0, unmap_ms = 0;
     for (auto& [base, region] : registry().regions) {
         if (region.device != device || region.asleep) { continue; }
@@ -182,6 +204,12 @@ std::size_t wake_device(int device, const void* owner) {
     CUDA_CHECK(cudaSetDevice(device));
     std::size_t mapped = 0;
     double map_ms = 0, copy_ms = 0;
+    for (auto& [key, entry] : registry().sparse) {
+        if (entry.hooks.device != device || !entry.asleep) { continue; }
+        if (owner != nullptr && entry.hooks.owner != owner) { continue; }
+        mapped += entry.hooks.wake_fn();
+        entry.asleep = false;
+    }
     for (auto& [base, region] : registry().regions) {
         if (region.device != device || !region.asleep) { continue; }
         if (owner != nullptr && region.owner != owner) { continue; }
@@ -208,6 +236,9 @@ std::size_t sleep_owned_bytes(const void* owner) noexcept {
     for (const auto& [base, region] : registry().regions) {
         if (owner == nullptr || region.owner == owner) { bytes += region.bytes; }
     }
+    for (const auto& [key, entry] : registry().sparse) {
+        if (owner == nullptr || entry.hooks.owner == owner) { bytes += entry.hooks.mapped_bytes(); }
+    }
     return bytes;
 }
 
@@ -233,6 +264,10 @@ bool device_asleep(int device, const void* owner) noexcept {
     for (const auto& [base, region] : registry().regions) {
         if (region.device == device && region.asleep &&
             (owner == nullptr || region.owner == owner)) { return true; }
+    }
+    for (const auto& [key, entry] : registry().sparse) {
+        if (entry.hooks.device == device && entry.asleep &&
+            (owner == nullptr || entry.hooks.owner == owner)) { return true; }
     }
     return false;
 }

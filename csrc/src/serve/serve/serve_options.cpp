@@ -119,7 +119,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--enforce-eager] [--no-prefix-reuse] "
-           "[--enable-sleep-mode] "
+           "[--enable-sleep-mode] [--elastic-kv] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -150,6 +150,8 @@ std::string serve_usage_text(const char* argv0) {
            "         resumes from its prefix instead of re-prefilling it; one state slot per lane\n"
            "         (72 MiB each on the 27B), off by default\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --elastic-kv maps the Main KV pool's pages on demand: the pool keeps its planned\n"
+           "                    size, but only pages in use (plus a small reserve) hold VRAM\n"
            "       --enable-sleep-mode adds POST /sleep and /wake_up: sleeping releases VRAM\n"
            "                           (weights and cache parked in host RAM), waking restores in ~a second\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -348,6 +350,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             default_max_tokens_explicit = true;
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--elastic-kv") {
+            options.elastic_kv = true;
         } else if (arg == "--enforce-eager") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
@@ -549,11 +553,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!options.extra_models.empty()) {
         std::vector<std::string> names;
         for (const auto& extra : options.extra_models) {
-            if (extra.kv_tokens == 0) {
+            if (extra.kv_tokens == 0 && !options.elastic_kv) {
+                // With arena pools the split must be stated: an extra sized from whatever is
+                // free would take the primary's headroom. Elastic pools commit only a cap
+                // against a shared ledger, so automatic sizing is safe there.
                 throw std::invalid_argument(
                     "--model " + extra.name +
                     ": kv-tokens=N is required -- extra models size their KV explicitly so the "
-                    "deployment's memory split is stated, not discovered");
+                    "deployment's memory split is stated, not discovered (or use --elastic-kv)");
             }
             for (const auto& seen : names) {
                 if (seen == extra.name) {

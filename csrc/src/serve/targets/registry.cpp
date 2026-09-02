@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/elastic_kv_region.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/kv_capacity.h"
@@ -216,7 +217,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     }
     auto sequence_planner = Target::make_sequence_planner(device, effective, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
-    (void)runtime::resolve_kv_capacity(effective.kv_capacity, curve, preflight_runtime_bytes);
+    (void)runtime::resolve_kv_capacity(
+        effective.kv_capacity, curve,
+        subtract_saturating(preflight_runtime_bytes, elastic_kv_unmapped_commitment(device.device)));
 
     auto progress     = artifact_progress(options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
@@ -225,9 +228,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
+    // Elastic pools on this device have mapped only what they use so far; what they may still
+    // map is not free for this engine's cap, or two engines would fill against each other.
     runtime::KvCapacityResolution capacity_resolution = runtime::resolve_kv_capacity(
         effective.kv_capacity, curve,
-        subtract_saturating(current_free_device_bytes(), derived_residency_bytes));
+        subtract_saturating(
+            subtract_saturating(current_free_device_bytes(), derived_residency_bytes),
+            elastic_kv_unmapped_commitment(device.device)));
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {

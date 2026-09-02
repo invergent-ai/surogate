@@ -483,6 +483,15 @@ std::size_t Engine::sleepable_bytes() const { return sleep_owned_bytes(&impl_->o
 
 ops::LoraStore& Engine::lora_store() { return impl_->ops_context.slot<ops::LoraStore>(); }
 
+void Engine::shrink_kv() {
+    std::visit(
+        [](auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (!std::is_same_v<Executor, std::monostate>) { executor->shrink_kv(); }
+        },
+        impl_->executor);
+}
+
 bool Engine::is_sleeping() const {
     return std::visit(
         [](auto& executor) -> bool {

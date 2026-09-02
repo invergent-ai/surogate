@@ -84,6 +84,7 @@ struct ServeOptions {
     KvCacheStorage kv_cache                = KvCacheStorage::Fp8E4M3;
     std::vector<std::uint32_t> kv_cache_skip_layers;
     bool rewrite_checkpoints = false;
+    bool elastic_kv          = false; // --elastic-kv: demand-mapped Main KV planes
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

@@ -16,7 +16,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::int32_t quant_group, std::int32_t table_rows,
                               std::uint32_t physical_page_groups,
                               const std::vector<std::uint32_t>& skip_layers,
-                              std::int32_t indexer_head_dim) {
+                              std::int32_t indexer_head_dim, bool elastic = false,
+                              std::uint32_t physical_page_cap = 0) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -55,6 +56,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.page_group_count      = physical_page_groups;
     pool_spec.logical_page_capacity = logical_pages;
     pool_spec.table_rows            = table_rows;
+    pool_spec.elastic               = elastic;
+    pool_spec.physical_page_cap     = elastic ? physical_page_cap : 0;
     const std::size_t planes_per_layer =
         (grouped ? 4ULL : 2ULL) + (indexer_head_dim > 0 ? 1ULL : 0ULL);
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
@@ -94,7 +97,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 spec.kv_table_rows, spec.text_physical_page_groups,
-                                spec.kv_skip_layers, spec.indexer_head_dim);
+                                spec.kv_skip_layers, spec.indexer_head_dim, spec.elastic_kv,
+                                spec.text_physical_page_cap);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
@@ -106,8 +110,9 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     return layout;
 }
 
-PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
-    : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
+PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
+                           const PagedKVElasticOptions* elastic)
+    : pool_(backing, layout.pool, elastic), layers_(layout.layers), max_context_(layout.max_context),
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
       quant_group_(layout.quant_group), indexer_head_dim_(layout.indexer_head_dim),
       layer_dtypes_(layout.layer_dtypes) {}
@@ -181,8 +186,9 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
 }
 
-DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
-    : text_kv(backing, layout.text_kv), linear_attention(backing, layout.linear_attention) {
+DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
+                           const PagedKVElasticOptions* elastic)
+    : text_kv(backing, layout.text_kv, elastic), linear_attention(backing, layout.linear_attention) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
     if (layout.ple) { ple = NgramPleStatePool(backing, *layout.ple); }
 }

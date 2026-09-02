@@ -827,6 +827,7 @@ endfunction()
 add_library(sinfer_core STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/core/arena.cu
   ${SERVE_ROOT}/core/sleep.cu
+  ${SERVE_ROOT}/core/elastic_kv_region.cu
   ${SERVE_ROOT}/core/engine_context.cpp
   ${SERVE_ROOT}/core/device.cu
   ${SERVE_ROOT}/core/device_footprint.cpp
