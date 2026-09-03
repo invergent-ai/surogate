@@ -554,7 +554,24 @@ Same on Q5_K and Q6_K (5.8e-3, 5.7e-3). An 8-bit symmetric grid cannot land on a
     Prefill was 8,909 before this change. The K-quant test grew to 241 cases: each route is now checked against the arithmetic it actually performs (int8-quantised activation below the threshold, exact BF16 above), including the boundary at T=64/65 and the accumulate route at T=128.
 - [ ] **K3b — MMQ, if ever.** Worth revisiting only where the dequantisation tile is the constraint: very large weights on a small card, or a batch wide enough that reading the BF16 tile back dominates. Not on the path to the numbers above.
 - [ ] **K3 — MMQ port (prefill, T > 8)**: `mul_mat_q` body, `load_tiles_{q2..q6}_K`, the int8 mma vec-dots, `quantize_q8_1_mmq`; stream-K fixup second. **Acceptance:** pp512 ≥ 37,945 (0.8B), ≥ 28,081 (2B).
-- [ ] **K4 — MoE**: mmvq's `ids` indirection is routed-expert decode for T ≤ 8 (port it with K1); MMQ per expert for prefill (`mul_mat_id`); host expert bank in K-quants (ggml-cpu `ggml_vec_dot_q4_K_q8_K`, or ik_llama's AVX-512). **Acceptance:** a Q4_K_M MoE GGUF (Qwen3.6-35B-A3B, ~20 GB — download) serves natively on one 5090 with the existing CPU offload.
+- [x] **K4 — MoE, done 2026-09-03.** `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (256 experts, 8 routed) serves
+  with its routed experts read as the file's own Q4_K/Q5_K/Q6_K superblocks, decode *and* prefill.
+  One 5090, 654-token prompt, warm, greedy: **prefill 9,400 tok/s, decode 328**, against llama.cpp's
+  **8,408 / 278** — ahead on both. Our own dequantise-to-Q4G64 path still leads prefill at
+  **13,730 / 346**; that, not llama.cpp, is the remaining gap.
+  - The decode-side codec existed but nothing could reach it: the decode and small-T *plans*
+    rejected the profile, D4 small-T had no K-quant case, the payload check demanded an aligned
+    scale pointer from a format that has no scale plane, and the D4 geometry guard hard-coded the
+    64-wide codecs' warp step of four.
+  - **The bug that hid all of it**: `bind_moe` discovered each routed tensor's stored format and
+    kept only the handle, so `load_moe` passed the *profile's* expectation to
+    `materialized_weight`. Q4_K superblocks went to the groupwise-int row-split codec — same byte
+    count, different meaning, no exception, and every expert decoded to noise. Print the qtype the
+    kernel actually received before auditing weights.
+  - Prefill kernel: `ggml_prefill_codec.cuh` + `sparse_moe_prefill_ggml_{gate_up,down}_kernel`.
+    K-quants must dequantise *inside* `decode_weight` rather than scaling the accumulator, because
+    a 64-wide tile spans two sub-block scales and Q4_K/Q5_K are affine. Q6_K's 210-byte block
+    leaves consecutive blocks 2-byte aligned, so it stages in scalar pairs, not `cp_async<16>`.
 - [ ] **K5 — the ops that embed a weight decode**: only three sites switch on `QType` (`linear.cpp`, `sparse_moe.cpp`, `attn_input_proj.cpp`); `linear_add` and the fused GDN/attention projections route K-quant weights through mmvq/MMQ plus their epilogue.
 - [ ] **K6 — retire the home-grown formats.** Converters stop emitting Q4G64/Q5G64/Q6G64; `surogate quantize` produces K-quants by writing a BF16 GGUF (gguf-py) and running `llama-quantize` (their quantiser, imatrix included) — no port of `ggml-quants.c`; regenerate the local artifacts.
 - [ ] **N — NVFP4 ModelOpt ingest**: `weight_scale_2` is a multiplier where compressed-tensors' global is a divisor; parents split per component so each keeps its own global (the trainer instead rescales block scales to a shared one, which is lossy).
@@ -568,8 +585,12 @@ Done and measured: K0 the bar, K1 the native K-quant read path, K2 Q8_0 by decis
 Open, in the order they matter:
 
 1. **Fused K-quant GDN projection-and-convolution.** Unlocks K5c's 8 % of bytes, which today costs more in launches than it saves in bandwidth.
-2. **K4 — MoE.** mmvq's `ids` indirection is routed-expert decode; `mul_mat_id` is the prefill; the host expert bank wants `ggml_vec_dot_q4_K_q8_K`. No MoE GGUF small enough to iterate on is on this disk, so it needs a download first.
-3. **K6 — retire Q4G64/Q5G64/Q6G64** once nothing emits them, and `surogate quantize` by writing a BF16 GGUF and calling `llama-quantize` (their quantiser, imatrix included) rather than porting `ggml-quants.c`.
+2. **K6 — retire Q4G64/Q5G64/Q6G64** and add `surogate quantize`. With K4 done, the home-grown
+   formats' only remaining advantage is the prefill gap above.
+3. **Close the native prefill gap** (9,400 -> 13,730): Q6_K's scalar staging and the per-tile
+   header re-read are the two named suspects.
+4. **Direct GGUF loading.** The artifact is now a byte-for-byte copy of the file plus an index;
+   a sidecar index over the mmapped `.gguf` removes the copy. Nothing else blocks it.
 4. **N (NVFP4 ModelOpt ingest)** and **F (FP8 strategies)** — neither blocks GGUF.
 
 M2 (geometry templating), M4 (unified loading) and M5 (`--no-cache`, `surogate convert`) stand behind these.
