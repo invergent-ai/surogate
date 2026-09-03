@@ -1,10 +1,10 @@
 # Decode objects of the finished qwen3_8_flash_next.sinfer and compare against the GGUF
 # (gguf-py dequantisation with the converter's own algebra: V-head un-tiling, a_log, row order).
 import sys, time, numpy as np, torch
-from surogate.serve.tools.convert.qwen4exp import inventory as inv, convert as cv
-from surogate.serve.tools.artifact.container import Artifact
-from surogate.serve.tools.artifact.layouts import encoded_size, split_row_planes, dequantize_row_split, decode_direct, row_split_geometry
-from surogate.serve.tools.artifact.numeric import get_format
+from surogate.serve.convert.qwen4exp import inventory as inv, convert as cv
+from surogate.serve.artifact.container import Artifact
+from surogate.serve.artifact.layouts import encoded_size, split_row_planes, dequantize_row_split, decode_direct, row_split_geometry
+from surogate.serve.artifact.numeric import get_format
 
 art = Artifact.open("/home/densemax2/work/models/sinfer/qwen3_8_flash_next.sinfer")
 src = cv.GgufSource("models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")

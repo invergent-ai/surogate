@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tools.convert.qwen3_8_27b import convert_nvfp4
+from surogate.serve.convert.qwen3_8_27b import convert_nvfp4
 
 
 def test_converter_rejects_wrong_basename_before_reading_sources(tmp_path) -> None:

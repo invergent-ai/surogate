@@ -5,7 +5,7 @@ import struct
 import pytest
 import torch
 
-from surogate.serve.tools.artifact.layouts import (
+from surogate.serve.artifact.layouts import (
     RowPlanes,
     assemble_row_planes,
     block_scale_geometry,

@@ -5,9 +5,9 @@ import struct
 import pytest
 import torch
 
-from tools.convert.qwen3_6_27b import convert_nvfp4
-from tools.convert.qwen3_6_27b import inventory_nvfp4 as inventory
-from tools.convert.qwen3_6_27b import recipe_nvfp4 as recipe
+from surogate.serve.convert.qwen3_6_27b import convert_nvfp4
+from surogate.serve.convert.qwen3_6_27b import inventory_nvfp4 as inventory
+from surogate.serve.convert.qwen3_6_27b import recipe_nvfp4 as recipe
 
 
 FULL_ATTENTION = tuple(range(3, 64, 4))

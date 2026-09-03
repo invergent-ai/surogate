@@ -1,0 +1,546 @@
+"""Minimal reader and streaming writer for the SInfer v2 object directory."""
+
+from __future__ import annotations
+
+import json
+import mmap
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Iterable, Iterator, Sequence, TypeAlias
+
+from .layouts import align_up, encoded_size, get_layout
+
+
+MAGIC = b"SINFER\x00\x02"
+_V1_MAGIC = b"NINFER\x00\x01"
+PREFIX = struct.Struct("<8sQ")
+PREFIX_BYTES = PREFIX.size
+PAYLOAD_ALIGNMENT = 4096
+RAW_BYTES_V1 = "raw-bytes-v1"
+
+_ROOT_MEMBERS = frozenset({"identity", "objects"})
+#: Root members an artifact may carry beyond the two it must: the external file table of an
+#: index that reads a GGUF in place, and the model's dimensions as a flat object of numbers
+#: (`geometry`), which lets one engine target serve every size of its family.
+_ROOT_OPTIONAL = frozenset({"external", "geometry"})
+_IDENTITY_MEMBERS = frozenset({"model_id", "weights_id"})
+_TENSOR_MEMBERS = frozenset(
+    {"name", "kind", "shape", "format", "layout", "offset", "bytes"}
+)
+_RESOURCE_MEMBERS = frozenset({"name", "kind", "encoding", "offset", "bytes"})
+
+
+class ArtifactError(ValueError):
+    """The file does not satisfy the SInfer v2 directory contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactIdentity:
+    model_id: str
+    weights_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class TensorSpec:
+    name: str
+    shape: tuple[int, ...]
+    format: str
+    layout: str
+    #: Stretches of an external file this object's bytes are read from, in order, as
+    #: ``(source, offset, bytes)`` with ``source`` a 1-based index into the artifact's external
+    #: table. Empty means the bytes live in the artifact's own payload, which is the default and
+    #: what every object was before external files existed.
+    runs: tuple[tuple[int, int, int], ...] = ()
+    #: How those runs become the stored form. Empty is a copy; ``q8_0-to-w8g32`` rearranges the
+    #: GGUF's Q8_0 blocks into the row-split planes the kernels read, which is a permutation of
+    #: bytes and so costs nothing but the load-time pass.
+    transform: str = ""
+    #: Source group for each destination group, when the transform also carries a column
+    #: permutation. Empty when the columns are in order.
+    group_map: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSpec:
+    name: str
+    encoding: str
+    bytes: int
+
+
+ObjectSpec: TypeAlias = TensorSpec | ResourceSpec
+
+
+@dataclass(frozen=True, slots=True)
+class TensorObject:
+    name: str
+    shape: tuple[int, ...]
+    format: str
+    layout: str
+    offset: int
+    bytes: int
+    runs: tuple[tuple[int, int, int], ...] = ()
+    transform: str = ""
+    group_map: tuple[int, ...] = ()
+
+    @property
+    def kind(self) -> str:
+        return "tensor"
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "shape": list(self.shape),
+            "format": self.format,
+            "layout": self.layout,
+            "offset": self.offset,
+            "bytes": self.bytes,
+        } | ({"runs": [{"source": s, "offset": o, "bytes": b}
+                    for s, o, b in self.runs]} if self.runs else {}) | (
+            {"transform": self.transform} if self.transform else {}) | (
+            {"group_map": list(self.group_map)} if self.group_map else {})
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceObject:
+    name: str
+    encoding: str
+    offset: int
+    bytes: int
+
+    @property
+    def kind(self) -> str:
+        return "resource"
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "encoding": self.encoding,
+            "offset": self.offset,
+            "bytes": self.bytes,
+        }
+
+
+ArtifactObject: TypeAlias = TensorObject | ResourceObject
+PayloadChunk: TypeAlias = bytes | bytearray | memoryview
+Payload: TypeAlias = PayloadChunk | Iterable[PayloadChunk]
+
+
+def _require_string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ArtifactError(f"{field} must be a nonempty string")
+    return value
+
+
+def _require_integer(value: object, field: str, *, positive: bool = False) -> int:
+    if type(value) is not int:
+        raise ArtifactError(f"{field} must be an integer")
+    if value < (1 if positive else 0):
+        qualifier = "positive" if positive else "nonnegative"
+        raise ArtifactError(f"{field} must be {qualifier}")
+    return value
+
+
+def _require_shape(value: object) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        raise ArtifactError("tensor shape must be an array")
+    return tuple(_require_integer(dim, "shape dimension", positive=True) for dim in value)
+
+
+def _resource_alignment(encoding: str) -> int:
+    if encoding != RAW_BYTES_V1:
+        raise ArtifactError(f"unknown resource encoding: {encoding}")
+    return 1
+
+
+def object_alignment(obj: ArtifactObject) -> int:
+    if isinstance(obj, TensorObject):
+        return get_layout(obj.layout).alignment
+    return _resource_alignment(obj.encoding)
+
+
+def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
+    """Assign aligned payload-relative offsets to an ordered complete inventory."""
+
+    if not specs:
+        raise ArtifactError("artifact inventory must not be empty")
+    objects: list[ArtifactObject] = []
+    names: set[str] = set()
+    cursor = 0
+    for spec in specs:
+        name = _require_string(spec.name, "object name")
+        if name in names:
+            raise ArtifactError(f"duplicate object name: {name}")
+        names.add(name)
+        if isinstance(spec, TensorSpec):
+            shape = tuple(_require_integer(dim, "shape dimension", positive=True) for dim in spec.shape)
+            layout = get_layout(_require_string(spec.layout, "tensor layout"))
+            payload_bytes = encoded_size(layout, spec.format, shape)
+            if spec.runs:
+                covered = sum(int(run_bytes) for _, _, run_bytes in spec.runs)
+                # A transformed object's runs carry its source bytes, a different count from
+                # the stored form they become.
+                if not spec.transform and covered != payload_bytes:
+                    raise ArtifactError(
+                        f"{name} declares {payload_bytes} bytes but its runs cover {covered}"
+                    )
+                objects.append(
+                    TensorObject(
+                        name=name,
+                        shape=shape,
+                        format=spec.format,
+                        layout=layout.name,
+                        offset=0,
+                        bytes=payload_bytes,
+                        runs=tuple((int(a), int(b), int(c)) for a, b, c in spec.runs),
+                        transform=spec.transform,
+                        group_map=tuple(int(v) for v in spec.group_map),
+                    )
+                )
+                continue
+            offset = align_up(cursor, layout.alignment)
+            obj: ArtifactObject = TensorObject(
+                name=name,
+                shape=shape,
+                format=_require_string(spec.format, "tensor format"),
+                layout=layout.name,
+                offset=offset,
+                bytes=payload_bytes,
+            )
+        elif isinstance(spec, ResourceSpec):
+            encoding = _require_string(spec.encoding, "resource encoding")
+            alignment = _resource_alignment(encoding)
+            payload_bytes = _require_integer(spec.bytes, "resource bytes", positive=True)
+            offset = align_up(cursor, alignment)
+            obj = ResourceObject(name, encoding, offset, payload_bytes)
+        else:
+            raise TypeError(f"unsupported object spec type: {type(spec).__name__}")
+        objects.append(obj)
+        cursor = obj.offset + obj.bytes
+    return tuple(objects)
+
+
+def _require_identity(identity: ArtifactIdentity) -> ArtifactIdentity:
+    if not isinstance(identity, ArtifactIdentity):
+        raise TypeError("artifact identity must be an ArtifactIdentity")
+    return ArtifactIdentity(
+        model_id=_require_string(identity.model_id, "model_id"),
+        weights_id=_require_string(identity.weights_id, "weights_id"),
+    )
+
+
+def encode_directory(
+    identity: ArtifactIdentity,
+    objects: Sequence[ArtifactObject],
+    external: Sequence[tuple[str, int]] = (),
+    geometry: Mapping[str, float] | None = None,
+) -> bytes:
+    checked_identity = _require_identity(identity)
+    if not objects:
+        raise ArtifactError("objects must not be empty")
+    declared = max(
+        (run[0] for obj in objects for run in getattr(obj, "runs", ())), default=0
+    )
+    if declared > len(external):
+        raise ArtifactError(
+            f"an object reads external source {declared} but only {len(external)} are declared"
+        )
+    value = {
+        "identity": {
+            "model_id": checked_identity.model_id,
+            "weights_id": checked_identity.weights_id,
+        },
+        "objects": [obj.to_json() for obj in objects],
+    }
+    if external:
+        value["external"] = [
+            {"path": str(path), "bytes": int(size)} for path, size in external
+        ]
+    if geometry:
+        value["geometry"] = {str(k): _require_number(v, f"geometry.{k}") for k, v in geometry.items()}
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _require_number(value: object, field: str) -> float | int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ArtifactError(f"{field} must be a number")
+    return value
+
+
+def parse_geometry(directory: bytes) -> dict[str, float]:
+    """The `geometry` member of an encoded directory, or an empty mapping."""
+    value = json.loads(directory.decode("utf-8"))
+    raw = value.get("geometry") if isinstance(value, dict) else None
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ArtifactError("geometry must be an object")
+    return {str(k): _require_number(v, f"geometry.{k}") for k, v in raw.items()}
+
+
+def _parse_object(value: object) -> ArtifactObject:
+    if not isinstance(value, dict):
+        raise ArtifactError("each object entry must be a JSON object")
+    kind = value.get("kind")
+    if kind == "tensor":
+        if frozenset(value) != _TENSOR_MEMBERS:
+            raise ArtifactError("tensor entry has missing or extra members")
+        name = _require_string(value["name"], "tensor name")
+        shape = _require_shape(value["shape"])
+        format_name = _require_string(value["format"], "tensor format")
+        layout_name = _require_string(value["layout"], "tensor layout")
+        offset = _require_integer(value["offset"], "tensor offset")
+        payload_bytes = _require_integer(value["bytes"], "tensor bytes", positive=True)
+        try:
+            expected = encoded_size(layout_name, format_name, shape)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtifactError(str(exc)) from exc
+        if payload_bytes != expected:
+            raise ArtifactError(
+                f"tensor {name} stores {payload_bytes} bytes; layout requires {expected}"
+            )
+        return TensorObject(name, shape, format_name, layout_name, offset, payload_bytes)
+    if kind == "resource":
+        if frozenset(value) != _RESOURCE_MEMBERS:
+            raise ArtifactError("resource entry has missing or extra members")
+        name = _require_string(value["name"], "resource name")
+        encoding = _require_string(value["encoding"], "resource encoding")
+        _resource_alignment(encoding)
+        offset = _require_integer(value["offset"], "resource offset")
+        payload_bytes = _require_integer(value["bytes"], "resource bytes", positive=True)
+        return ResourceObject(name, encoding, offset, payload_bytes)
+    raise ArtifactError("object kind must be 'tensor' or 'resource'")
+
+
+def parse_directory(
+    data: bytes,
+) -> tuple[ArtifactIdentity, tuple[ArtifactObject, ...]]:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(f"invalid JSON directory: {exc}") from exc
+    if (not isinstance(value, dict) or not _ROOT_MEMBERS <= frozenset(value)
+            or not frozenset(value) <= _ROOT_MEMBERS | _ROOT_OPTIONAL):
+        raise ArtifactError(
+            "directory root must contain exactly identity and objects, plus at most external "
+            "and geometry"
+        )
+    raw_identity = value["identity"]
+    if (
+        not isinstance(raw_identity, dict)
+        or frozenset(raw_identity) != _IDENTITY_MEMBERS
+    ):
+        raise ArtifactError(
+            "artifact identity must contain exactly model_id and weights_id"
+        )
+    identity = ArtifactIdentity(
+        model_id=_require_string(raw_identity["model_id"], "model_id"),
+        weights_id=_require_string(raw_identity["weights_id"], "weights_id"),
+    )
+    raw_objects = value["objects"]
+    if not isinstance(raw_objects, list) or not raw_objects:
+        raise ArtifactError("objects must be a nonempty array")
+    objects = tuple(_parse_object(item) for item in raw_objects)
+    names: set[str] = set()
+    for obj in objects:
+        if obj.name in names:
+            raise ArtifactError(f"duplicate object name: {obj.name}")
+        names.add(obj.name)
+    return identity, objects
+
+
+def _validate_ranges(
+    objects: Sequence[ArtifactObject], payload_bytes: int
+) -> dict[str, ArtifactObject]:
+    cursor = 0
+    index: dict[str, ArtifactObject] = {}
+    for obj in objects:
+        alignment = object_alignment(obj)
+        if obj.offset < cursor:
+            raise ArtifactError(f"object {obj.name} overlaps or is out of order")
+        if obj.offset % alignment:
+            raise ArtifactError(f"object {obj.name} is not {alignment}-byte aligned")
+        end = obj.offset + obj.bytes
+        if end > payload_bytes:
+            raise ArtifactError(f"object {obj.name} extends beyond the file")
+        cursor = end
+        index[obj.name] = obj
+    return index
+
+
+class Artifact:
+    """Mmap-backed, structurally validated `.sinfer` artifact."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._file = self.path.open("rb")
+        self._mapping: mmap.mmap | None = None
+        try:
+            self._file.seek(0, 2)
+            self.file_bytes = self._file.tell()
+            self._file.seek(0)
+            if self.file_bytes < PREFIX_BYTES:
+                raise ArtifactError("artifact is shorter than the v2 prefix")
+            prefix = self._file.read(PREFIX_BYTES)
+            magic, json_bytes = PREFIX.unpack(prefix)
+            if magic == _V1_MAGIC:
+                raise ArtifactError(
+                    "SInfer artifact v1 is no longer supported; migrate it with: "
+                    "python -m surogate.serve.artifact.migrate_v1_to_v2 <artifact>"
+                )
+            if magic != MAGIC:
+                raise ArtifactError("artifact magic is not SInfer v2")
+            if json_bytes == 0:
+                raise ArtifactError("json_bytes must be positive")
+            metadata_end = PREFIX_BYTES + json_bytes
+            self.payload_offset = align_up(metadata_end, PAYLOAD_ALIGNMENT)
+            if metadata_end > self.file_bytes or self.payload_offset > self.file_bytes:
+                raise ArtifactError("declared JSON or payload start extends beyond the file")
+            directory = self._file.read(json_bytes)
+            if len(directory) != json_bytes:
+                raise ArtifactError("artifact JSON is truncated")
+            self.identity, self.objects = parse_directory(directory)
+            self.geometry = parse_geometry(directory)
+            payload_bytes = self.file_bytes - self.payload_offset
+            self._index = _validate_ranges(self.objects, payload_bytes)
+            self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+        except BaseException:
+            if self._mapping is not None:
+                self._mapping.close()
+            self._file.close()
+            raise
+
+    @classmethod
+    def open(cls, path: str | Path) -> "Artifact":
+        return cls(path)
+
+    def find(self, name: str) -> ArtifactObject:
+        return self._index[name]
+
+    def payload(self, obj: ArtifactObject | str) -> memoryview:
+        if isinstance(obj, str):
+            obj = self.find(obj)
+        if self._mapping is None:
+            raise RuntimeError("artifact is closed")
+        begin = self.payload_offset + obj.offset
+        return memoryview(self._mapping)[begin : begin + obj.bytes]
+
+    def close(self) -> None:
+        if self._mapping is not None:
+            self._mapping.close()
+            self._mapping = None
+        if not self._file.closed:
+            self._file.close()
+
+    def __enter__(self) -> "Artifact":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+def _payload_chunks(payload: Payload) -> Iterator[memoryview]:
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        yield memoryview(payload).cast("B")
+        return
+    for chunk in payload:
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError("payload chunks must support the buffer protocol")
+        yield memoryview(chunk).cast("B")
+
+
+class ArtifactWriter:
+    """Write one preplanned artifact payload at a time in directory order."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        identity: ArtifactIdentity,
+        specs: Sequence[ObjectSpec],
+        external: Sequence[tuple[str, int]] = (),
+        geometry: Mapping[str, float] | None = None,
+    ):
+        self.path = Path(path)
+        self.identity = _require_identity(identity)
+        self.objects = plan_objects(specs)
+        self.external = tuple((str(p), int(n)) for p, n in external)
+        self.geometry = dict(geometry) if geometry else {}
+        directory = encode_directory(self.identity, self.objects, self.external, geometry=self.geometry)
+        self.payload_offset = align_up(PREFIX_BYTES + len(directory), PAYLOAD_ALIGNMENT)
+        self._file = self.path.open("wb")
+        self._file.write(PREFIX.pack(MAGIC, len(directory)))
+        self._file.write(directory)
+        self._file.write(b"\x00" * (self.payload_offset - PREFIX_BYTES - len(directory)))
+        self._next = 0
+        self._cursor = 0
+        self._finished = False
+
+    def write(self, name: str, payload: Payload) -> None:
+        if self._finished:
+            raise RuntimeError("artifact writer is already finished")
+        # An object served from an external file has no payload here; the writer walks past it
+        # so callers only produce bytes for what the artifact actually stores.
+        while self._next < len(self.objects) and getattr(self.objects[self._next], "runs", ()):
+            self._next += 1
+        if self._next >= len(self.objects):
+            raise ArtifactError("artifact already has every planned payload")
+        obj = self.objects[self._next]
+        if name != obj.name:
+            raise ArtifactError(f"expected payload {obj.name}, got {name}")
+        if obj.offset > self._cursor:
+            self._file.write(b"\x00" * (obj.offset - self._cursor))
+            self._cursor = obj.offset
+        written = 0
+        for chunk in _payload_chunks(payload):
+            if written + len(chunk) > obj.bytes:
+                raise ArtifactError(f"payload {name} exceeds its planned byte length")
+            self._file.write(chunk)
+            written += len(chunk)
+        if written != obj.bytes:
+            raise ArtifactError(f"payload {name} has {written} bytes; expected {obj.bytes}")
+        self._cursor = obj.offset + obj.bytes
+        self._next += 1
+
+    def finish(self) -> None:
+        if self._finished:
+            return
+        while self._next < len(self.objects) and getattr(self.objects[self._next], "runs", ()):
+            self._next += 1
+        if self._next != len(self.objects):
+            missing = self.objects[self._next].name
+            raise ArtifactError(f"artifact is missing payload {missing}")
+        self._file.truncate(self.payload_offset + self._cursor)
+        self._file.flush()
+        self._file.close()
+        self._finished = True
+
+    def close(self) -> None:
+        if not self._file.closed:
+            self._file.close()
+
+    def __enter__(self) -> "ArtifactWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is None:
+            try:
+                self.finish()
+            finally:
+                if not self._finished:
+                    self.close()
+        else:
+            self.close()
+
+
+def write_artifact(
+    path: str | Path,
+    identity: ArtifactIdentity,
+    entries: Sequence[tuple[ObjectSpec, Payload]],
+) -> tuple[ArtifactObject, ...]:
+    specs = [spec for spec, _ in entries]
+    with ArtifactWriter(path, identity, specs) as writer:
+        for spec, payload in entries:
+            writer.write(spec.name, payload)
+    return writer.objects

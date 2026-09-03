@@ -1,6 +1,7 @@
 # SInfer maintainer tools
 
-`tools/` contains the project-owner workflows for artifact conversion and inspection, independent
+`tools/` contains the project-owner workflows that stand beside the engine: benchmarks,
+evaluation, parity checks, probes and smoke runs, independent
 Python references, numerical parity diagnostics, benchmark orchestration, and serving smoke checks.
 These tools are not part of the public download-and-run path; normal users should start with the
 [project README](../README.md).
@@ -12,10 +13,10 @@ for the selected tool.
 
 | Task | Location |
 |---|---|
-| Build the 27B artifact | [`convert/qwen3_6_27b/`](convert/qwen3_6_27b/) |
-| Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
-| Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
-| Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
+| Build the 27B artifact | [`../convert/qwen3_6_27b/`](../convert/qwen3_6_27b/) |
+| Build the Qwen3.8-27B artifact | [`../convert/qwen3_8_27b/`](../convert/qwen3_8_27b/) |
+| Build the 35B-A3B artifact | [`../convert/qwen3_6_35b_a3b/`](../convert/qwen3_6_35b_a3b/) |
+| Inspect artifact metadata and objects | [`../artifact/inspect.py`](../artifact/inspect.py) |
 | Measure perplexity the way llama-perplexity does | [`eval/perplexity.py`](eval/perplexity.py) |
 | Run the 27B Python reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/README.md) |
 | Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
@@ -30,15 +31,15 @@ The converters consume an official local BF16 checkpoint and write one complete 
 artifact. The paths below are placeholders for the maintainer's local checkpoint checkouts:
 
 ```bash
-python3 -m tools.convert.qwen3_6_27b.convert \
+python -m surogate.serve.convert.qwen3_6_27b.convert \
   --model /path/to/Qwen3.6-27B \
   --out out/qwen3_6_27b.sinfer
 
-python3 -m tools.convert.qwen3_8_27b.convert \
+python -m surogate.serve.convert.qwen3_8_27b.convert \
   --model /path/to/Qwen3.8-27B \
   --out out/qwen3_8_27b.sinfer
 
-python3 -m tools.convert.qwen3_6_35b_a3b.convert \
+python -m surogate.serve.convert.qwen3_6_35b_a3b.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \
   --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
   --out out/qwen3_6_35b_a3b.sinfer
@@ -47,7 +48,7 @@ python3 -m tools.convert.qwen3_6_35b_a3b.convert \
 Inspect either result:
 
 ```bash
-python3 -m tools.artifact.inspect out/qwen3_6_27b.sinfer --objects
+python -m surogate.serve.artifact.inspect out/qwen3_6_27b.sinfer --objects
 ```
 
 The exact source revisions, inventories, formats, and conversion recipes are recorded in

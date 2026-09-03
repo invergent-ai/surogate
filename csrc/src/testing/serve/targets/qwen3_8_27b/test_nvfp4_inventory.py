@@ -1,6 +1,6 @@
-from tools.convert.qwen3_8_27b import convert_nvfp4
-from tools.convert.qwen3_8_27b import inventory_nvfp4 as inventory
-from tools.convert.qwen3_8_27b import recipe_nvfp4 as recipe
+from surogate.serve.convert.qwen3_8_27b import convert_nvfp4
+from surogate.serve.convert.qwen3_8_27b import inventory_nvfp4 as inventory
+from surogate.serve.convert.qwen3_8_27b import recipe_nvfp4 as recipe
 
 
 def _tensors() -> dict[str, inventory.TensorSpec]:

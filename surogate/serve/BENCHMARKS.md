@@ -286,7 +286,7 @@ without batch flags understated it 3.9× and are gone.
   rows; the 0.8B one is `models/Qwen3.5-0.8B-Q4_K_M.gguf`.
 - **How to rebuild the 35B's routed-NVFP4 artifact**, if the format is ever
   wanted for a model that arrives on W8:
-  `python -m surogate.serve.tools.convert.qwen3_6_35b_a3b.convert --model <BF16 dir>
+  `python -m surogate.serve.convert.qwen3_6_35b_a3b.convert --model <BF16 dir>
   --routed-nvfp4 <compressed-tensors NVFP4 dir> --out <path>.sinfer` — 77 s, and
   the converter refuses anything that is not `compressed-tensors` /
   `nvfp4-pack-quantized` (a ModelOpt export inverts the global-scale convention).

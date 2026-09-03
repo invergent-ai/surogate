@@ -1,7 +1,7 @@
 import torch
 from safetensors.torch import save_file
 
-from tools.convert.qwen3_6_35b_a3b import recipe
+from surogate.serve.convert.qwen3_6_35b_a3b import recipe
 
 
 class TensorReader:

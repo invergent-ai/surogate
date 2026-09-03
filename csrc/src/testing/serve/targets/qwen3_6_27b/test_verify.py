@@ -4,15 +4,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tools.artifact.container import (
+from surogate.serve.artifact.container import (
     ArtifactIdentity,
     ResourceSpec,
     TensorSpec,
     plan_objects,
 )
-from tools.artifact.layouts import encode_row_split
-from tools.convert.common.quantize import quantize_matrix
-from tools.convert.qwen3_6_27b import inventory, verify
+from surogate.serve.artifact.layouts import encode_row_split
+from surogate.serve.convert.common.quantize import quantize_matrix
+from surogate.serve.convert.qwen3_6_27b import inventory, verify
 
 
 def _structural_artifact():

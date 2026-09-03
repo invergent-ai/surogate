@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tools.convert.qwen3_6_35b_a3b import draft_head
+from surogate.serve.convert.qwen3_6_35b_a3b import draft_head
 
 
 def test_35b_uses_the_measured_27b_ranking() -> None:

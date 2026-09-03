@@ -94,7 +94,7 @@ def test_artifact_inventory_derives_from_the_declaration(emitters, target, sourc
     architecture = (hf_config.get("architectures") or [hf_config.get("model_type")])[0]
     derived = emit_inventory.inventory_for(architecture, hf_config, capabilities=capabilities)
 
-    inventory = importlib.import_module(f"surogate.serve.tools.convert.{target}.inventory")
+    inventory = importlib.import_module(f"surogate.serve.convert.{target}.inventory")
     committed = {s.name: (tuple(s.shape), s.format) for s in inventory.TENSOR_SPECS}
     emitted = {o["name"]: (o["shape"], o["format"]) for o in derived}
 
@@ -257,7 +257,7 @@ def test_conversion_recipe_covers_its_inventory(target):
 
     import importlib
 
-    importlib.import_module(f"surogate.serve.tools.convert.{target}.recipe")
+    importlib.import_module(f"surogate.serve.convert.{target}.recipe")
 
 
 @pytest.mark.parametrize("target", RECIPE_TARGETS)
@@ -270,7 +270,7 @@ def test_converter_preflight_accepts_its_own_inventory(target):
 
     import importlib
 
-    module = importlib.import_module(f"surogate.serve.tools.convert.{target}.convert")
+    module = importlib.import_module(f"surogate.serve.convert.{target}.convert")
     preflight = getattr(module, "preflight_inventory", None)
     if preflight is None:
         pytest.skip(f"{target} has no preflight_inventory")
@@ -288,7 +288,7 @@ def test_qwen4exp_inventory_has_a_text_only_variant():
 
     import importlib
 
-    inventory = importlib.import_module("surogate.serve.tools.convert.qwen4exp.inventory")
+    inventory = importlib.import_module("surogate.serve.convert.qwen4exp.inventory")
     with_tower, _ = inventory.active_specs(vision=True)
     text_only, _ = inventory.active_specs(vision=False)
 

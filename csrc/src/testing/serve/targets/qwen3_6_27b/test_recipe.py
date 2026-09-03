@@ -1,6 +1,6 @@
 import torch
 
-from tools.convert.qwen3_6_27b import inventory, recipe
+from surogate.serve.convert.qwen3_6_27b import inventory, recipe
 
 
 class TensorReader:

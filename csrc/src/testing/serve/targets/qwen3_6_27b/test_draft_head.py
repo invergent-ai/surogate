@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from tools.convert.qwen3_6_27b.draft_head import (
+from surogate.serve.convert.qwen3_6_27b.draft_head import (
     DraftHeadContext,
     materialize_draft_head,
     materialize_draft_head_token_ids,

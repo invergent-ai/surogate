@@ -2,7 +2,7 @@ import os
 # CPU reference for layer-0 GDN block of token 0 (llama.cpp algebra, tiled V pairing v-head h <-> k-head h % 16).
 import sys, numpy as np, subprocess
 SC = os.environ.get("SUROGATE_PARITY_DIR", ".")
-from surogate.serve.tools.convert.qwen4exp import convert as cv
+from surogate.serve.convert.qwen4exp import convert as cv
 gguf = "models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
 src = cv.GgufSource(gguf)
 tok0 = 248045

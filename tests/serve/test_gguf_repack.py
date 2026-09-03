@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Bit-exactness tests for the direct Q8_0 -> W8G32_F16S repack
-# (csrc/src/serve/sinfer/tools/convert/common/gguf_repack.py, PATCHES.md #14):
+# (surogate/serve/convert/common/gguf_repack.py, PATCHES.md #14):
 # a synthetic Q8_0 GGUF is moved through the recipe row-algebra evaluator and
 # the resulting row-split payloads must decode to exactly the values gguf-py's
 # own dequantize produces — no requantization anywhere. CPU-only.
@@ -19,9 +19,9 @@ torch = pytest.importorskip("torch")
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 from gguf.quants import dequantize, quantize
 
-from surogate.serve.tools.artifact.layouts import dequantize_row_split
-from surogate.serve.tools.convert.common.gguf_repack import GgufRepackSource
-from surogate.serve.tools.convert.common.recipe import (
+from surogate.serve.artifact.layouts import dequantize_row_split
+from surogate.serve.convert.common.gguf_repack import GgufRepackSource
+from surogate.serve.convert.common.recipe import (
     Concat,
     GatherRows,
     Reshape,
@@ -29,7 +29,7 @@ from surogate.serve.tools.convert.common.recipe import (
     SourceTensor,
     TensorRecipe,
 )
-from surogate.serve.tools.convert.common.inventory import TensorSpec  # noqa: E402
+from surogate.serve.convert.common.inventory import TensorSpec  # noqa: E402
 
 K = 128  # four 32-value groups per row (k128 layout needs k % 128 == 0)
 

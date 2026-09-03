@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 
-from tools.convert.qwen3_6_35b_a3b import (
+from surogate.serve.convert.qwen3_6_35b_a3b import (
     convert,
     draft_head,
     inventory,

@@ -52,7 +52,7 @@ SINFER_TARGET_LOAD_TYPES(gemma3_270m::Package);
 
 struct Package {
     /// Both strings are the converter's, verbatim:
-    /// `surogate/serve/tools/convert/gemma3/inventory.py` declares `MODEL_ID`
+    /// `surogate/serve/convert/gemma3/inventory.py` declares `MODEL_ID`
     /// and `TARGET_KEY`, and the engine matches an artifact to a package by
     /// comparing them character for character.
     static constexpr std::string_view model_id   = "gemma3-270m";

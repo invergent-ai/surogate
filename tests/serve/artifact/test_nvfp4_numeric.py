@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import struct
 
-from surogate.serve.tools.artifact.numeric import (
+from surogate.serve.artifact.numeric import (
     decode_e2m1_word,
     decode_e4m3fn_word,
     valid_nvfp4_scale_word,

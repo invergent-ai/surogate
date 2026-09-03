@@ -9,7 +9,7 @@ import warnings
 
 import torch
 
-from surogate.serve.tools.artifact import (
+from surogate.serve.artifact import (
     decode_direct,
     dequantize_row_split,
     gather_row_planes,

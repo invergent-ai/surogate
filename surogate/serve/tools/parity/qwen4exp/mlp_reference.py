@@ -1,7 +1,7 @@
 # CPU reference for layer-0 MLP side (hc mix, router, top-10 experts, shared expert, combine) of token 0.
 import sys, numpy as np
 from gguf.quants import dequantize
-from surogate.serve.tools.convert.qwen4exp import convert as cv
+from surogate.serve.convert.qwen4exp import convert as cv
 exec(open(sys.argv[1]).read().split("# ---- engine-comparable")[0].replace('print(', 'None and print('))  # reuse gdn_reference up to `out`
 f = lambda v: np.array2string(np.asarray(v), precision=4, suppress_small=True)
 # GDN output with llama.cpp's tiled pairing (the exec'd loop leaves the interleave variant in `out`)

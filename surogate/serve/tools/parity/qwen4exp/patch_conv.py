@@ -1,9 +1,9 @@
 # The family's conv op reads gdn/convolution channel-major ([c][tap]); the converter had written
 # tap-major bytes. Rewrite the 36 objects in place from the GGUF (value channels un-tiled).
 import numpy as np, sys
-from surogate.serve.tools.convert.qwen4exp import inventory as inv, convert as cv
-from surogate.serve.tools.artifact.container import Artifact
-from surogate.serve.tools.artifact.layouts import decode_direct
+from surogate.serve.convert.qwen4exp import inventory as inv, convert as cv
+from surogate.serve.artifact.container import Artifact
+from surogate.serve.artifact.layouts import decode_direct
 PATH = "/home/densemax2/work/models/sinfer/qwen3_8_flash_next.sinfer"
 src = cv.GgufSource("models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
 art = Artifact.open(PATH)

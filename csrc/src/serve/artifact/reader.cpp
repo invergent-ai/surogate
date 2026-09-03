@@ -336,13 +336,13 @@ struct Reader::Impl {
         }
         if (std::equal(kV1Magic.begin(), kV1Magic.end(), file.data())) {
             throw ArtifactError("SInfer artifact v1 is no longer supported; migrate it with: "
-                                "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>");
+                                "python -m surogate.serve.artifact.migrate_v1_to_v2 <artifact>");
         }
         if (std::equal(kPreRenameMagic.begin(), kPreRenameMagic.end(), file.data())) {
             throw ArtifactError(
                 "this artifact was written before the sinfer rename; its layout is "
                 "identical and migrating it is a one-byte edit, not a reconversion: "
-                "python3 -m surogate.serve.tools.artifact.rename_magic <artifact>");
+                "python3 -m surogate.serve.artifact.rename_magic <artifact>");
         }
         if (!std::equal(kMagic.begin(), kMagic.end(), file.data())) {
             throw ArtifactError("artifact magic is not SInfer v2");

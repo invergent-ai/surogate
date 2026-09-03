@@ -468,7 +468,7 @@ def test_every_object_maps_onto_gguf_tensors_of_the_right_shape():
     """
     from gguf import GGUFReader
 
-    from surogate.serve.tools.convert.gemma_embedding import gguf_names, source_for
+    from surogate.serve.convert.gemma_embedding import gguf_names, source_for
 
     reader = GGUFReader(str(GGUF))
     # gguf-py reports ne as [k, n]; the logical shape is the reverse.
@@ -504,7 +504,7 @@ def test_only_the_norms_and_the_head_leave_the_quantised_path():
     plus the embedding table, all moving across untouched. 169 of 315 objects,
     but very nearly all of the bytes.
     """
-    from surogate.serve.tools.convert.gemma_embedding import source_for
+    from surogate.serve.convert.gemma_embedding import source_for
 
     repackable = [o["name"] for o in generated_inventory() if source_for(o["name"]).repackable]
     assert len(repackable) == 1 + 24 * 7 == 169

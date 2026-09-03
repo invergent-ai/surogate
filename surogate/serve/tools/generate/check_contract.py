@@ -236,7 +236,7 @@ def check_converter(target: str, config: dict[str, Any]) -> int:
 
     try:
         inventory = importlib.import_module(
-            f"surogate.serve.tools.convert.{target}.inventory"
+            f"surogate.serve.convert.{target}.inventory"
         )
     except ModuleNotFoundError:
         print(f"  (no converter inventory for {target}; skipped)")

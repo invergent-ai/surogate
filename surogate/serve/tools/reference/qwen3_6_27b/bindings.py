@@ -14,7 +14,7 @@ from typing import Literal, TypeAlias
 
 import torch
 
-from surogate.serve.tools.artifact import (
+from surogate.serve.artifact import (
     Artifact,
     ArtifactIdentity,
     ResourceObject,

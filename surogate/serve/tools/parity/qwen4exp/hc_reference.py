@@ -1,6 +1,6 @@
 # CPU reference for layer-0 attention-side hyper-connection mix of token 0 (llama.cpp algebra).
 import sys, numpy as np, subprocess
-from surogate.serve.tools.convert.qwen4exp import convert as cv
+from surogate.serve.convert.qwen4exp import convert as cv
 gguf = "models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
 prompt = open(sys.argv[1]).read()
 ids = subprocess.run(["study/llama.cpp-master/build/bin/llama-tokenize", "-m", gguf, "-p", prompt, "--ids", "--log-disable"],

@@ -5,7 +5,7 @@ import struct
 
 import pytest
 
-from surogate.serve.tools.artifact.container import (
+from surogate.serve.artifact.container import (
     Artifact,
     ArtifactError,
     ArtifactIdentity,
@@ -18,8 +18,8 @@ from surogate.serve.tools.artifact.container import (
     parse_geometry,
     write_artifact,
 )
-from surogate.serve.tools.artifact.inspect import artifact_summary
-from surogate.serve.tools.artifact.layouts import align_up, encoded_size
+from surogate.serve.artifact.inspect import artifact_summary
+from surogate.serve.artifact.layouts import align_up, encoded_size
 
 
 def _small_specs():
@@ -180,7 +180,7 @@ def test_reader_rejects_v1_with_the_migration_command(tmp_path):
     )
     with pytest.raises(
         ArtifactError,
-        match=r"python3 -m tools\.artifact\.migrate_v1_to_v2 <artifact>",
+        match=r"python -m surogate\.serve\.artifact\.migrate_v1_to_v2 <artifact>",
     ):
         Artifact.open(path)
 

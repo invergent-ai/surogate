@@ -1,4 +1,4 @@
-from tools.convert.qwen3_6_35b_a3b import inventory
+from surogate.serve.convert.qwen3_6_35b_a3b import inventory
 
 
 def test_identity() -> None:

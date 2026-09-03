@@ -1,4 +1,4 @@
-from tools.convert.qwen3_6_27b import inventory
+from surogate.serve.convert.qwen3_6_27b import inventory
 
 
 def _tensor_by_name() -> dict[str, inventory.TensorSpec]:

@@ -22,7 +22,7 @@ static_assert(TextConfig::query_size == 1024);
 static_assert(TextConfig::kv_size == 256);
 
 /// The four resources a text-only Gemma 3 artifact carries, matching
-/// `RESOURCE_SPECS` in `surogate/serve/tools/convert/gemma3/inventory.py`. The
+/// `RESOURCE_SPECS` in `surogate/serve/convert/gemma3/inventory.py`. The
 /// family's binder demands six; the two it adds are the image and video
 /// preprocessor configs, which gemma-3-270m-it does not publish. The unfilled
 /// halves of the plan stay default-constructed and
@@ -156,7 +156,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // The head is the embedding table. Gemma 3 ties them and ships no
     // `lm_head.weight` at all, so the converter stores one table and names
     // `text/output_head` a logical role on it -- `ALIAS_SPECS` in
-    // `surogate/serve/tools/convert/gemma3/inventory.py`, the same shape as
+    // `surogate/serve/convert/gemma3/inventory.py`, the same shape as
     // `mtp/token_embedding` on the qwen3_5_0_8b target. Binding it a second time
     // would put two ~168 MB tables on a device whose whole model is ~270 MB, and
     // there is no second object to bind: the artifact does not carry one.

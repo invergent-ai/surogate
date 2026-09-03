@@ -36,7 +36,7 @@ def _sinfer_root() -> Path | None:
     # Converters are part of the surogate package now; the "root" is the
     # repository root (kept for subprocess cwd/log context only).
     root = Path(__file__).resolve().parent.parent.parent
-    return root if (root / "surogate" / "serve" / "tools" / "convert").is_dir() else None
+    return root if (root / "surogate" / "serve" / "convert").is_dir() else None
 
 
 def classify_input(spec: str) -> str:
@@ -68,32 +68,32 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     # Registered geometries (vendored targets). Text-config nesting (VL-style
     # configs) is flattened by callers before this point.
     if model_type == "qwen3_5" and hidden == 1024 and layers == 24:
-        return ConverterTarget("qwen3_5_0_8b", "surogate.serve.tools.convert.qwen3_5_0_8b.convert",
+        return ConverterTarget("qwen3_5_0_8b", "surogate.serve.convert.qwen3_5_0_8b.convert",
                                "Qwen3.5-0.8B", gguf_repack=True)
     if model_type == "qwen3_5" and hidden == 2048 and layers == 24:
-        return ConverterTarget("qwen3_5_2b", "surogate.serve.tools.convert.qwen3_5_2b.convert",
+        return ConverterTarget("qwen3_5_2b", "surogate.serve.convert.qwen3_5_2b.convert",
                                "Qwen3.5-2B", gguf_repack=True)
     if model_type == "qwen3_5" and hidden == 2560 and layers == 32:
-        return ConverterTarget("qwen3_5_4b", "surogate.serve.tools.convert.qwen3_5_4b.convert",
+        return ConverterTarget("qwen3_5_4b", "surogate.serve.convert.qwen3_5_4b.convert",
                                "Qwen3.5-4B", gguf_repack=True)
     if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:
         if nvfp4:
-            return ConverterTarget("qwen3_6_27b_nvfp4", "surogate.serve.tools.convert.qwen3_6_27b.convert_nvfp4",
+            return ConverterTarget("qwen3_6_27b_nvfp4", "surogate.serve.convert.qwen3_6_27b.convert_nvfp4",
                                    "Qwen3.6-27B (NVFP4)")
-        return ConverterTarget("qwen3_6_27b", "surogate.serve.tools.convert.qwen3_6_27b.convert", "Qwen3.6-27B")
+        return ConverterTarget("qwen3_6_27b", "surogate.serve.convert.qwen3_6_27b.convert", "Qwen3.6-27B")
     if model_type == "qwen3_8" and hidden == 5120:
         if nvfp4:
-            return ConverterTarget("qwen3_8_27b_nvfp4", "surogate.serve.tools.convert.qwen3_8_27b.convert_nvfp4",
+            return ConverterTarget("qwen3_8_27b_nvfp4", "surogate.serve.convert.qwen3_8_27b.convert_nvfp4",
                                    "Qwen3.8-27B (NVFP4)")
-        return ConverterTarget("qwen3_8_27b", "surogate.serve.tools.convert.qwen3_8_27b.convert", "Qwen3.8-27B")
+        return ConverterTarget("qwen3_8_27b", "surogate.serve.convert.qwen3_8_27b.convert", "Qwen3.8-27B")
     if model_type == "qwen3" and hidden == 1024 and layers == 28:
-        return ConverterTarget("qwen3", "surogate.serve.tools.convert.qwen3.convert", "Qwen3-0.6B")
+        return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3-0.6B")
     if model_type == "llama" and hidden == 2048 and layers == 22:
-        return ConverterTarget("llama", "surogate.serve.tools.convert.llama.convert", "TinyLlama-1.1B")
+        return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "TinyLlama-1.1B")
     if model_type in ("gemma3", "gemma3_text") and hidden == 640 and layers == 18:
-        return ConverterTarget("gemma3", "surogate.serve.tools.convert.gemma3.convert", "Gemma3-270M")
+        return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma3-270M")
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
-        return ConverterTarget("qwen3_6_35b_a3b", "surogate.serve.tools.convert.qwen3_6_35b_a3b.convert",
+        return ConverterTarget("qwen3_6_35b_a3b", "surogate.serve.convert.qwen3_6_35b_a3b.convert",
                                "Qwen3.6-35B-A3B", gguf_repack=True)
     return None
 
@@ -217,7 +217,7 @@ def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *, echo=print) 
     """Qwen3.8-Flash-Next: the GGUF is the weight source and the model's own HF frontend
     (tokenizer, chat template, generation and preprocessor configs) is fetched from the Hub;
     the converter repacks the GGUF tensors directly (no bridged BF16 shards)."""
-    from surogate.serve.tools.convert.qwen4exp import inventory as inv
+    from surogate.serve.convert.qwen4exp import inventory as inv
     frontend_files = [spec.name.removeprefix("frontend/") for spec in inv.RESOURCE_SPECS]
     frontend_dir = cache_dir() / "frontends" / "Qwen3.8-Flash-Next"
     missing = [name for name in frontend_files if not (frontend_dir / name).is_file()]
@@ -241,7 +241,7 @@ def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *, echo=print) 
     tmp.unlink(missing_ok=True)
     echo(f"surogate serve: preparing engine weights for Qwen3.8-Flash-Next "
          f"(one-time conversion of the GGUF shards; cached at {out})")
-    cmd = [sys.executable, "-m", "surogate.serve.tools.convert.qwen4exp.convert",
+    cmd = [sys.executable, "-m", "surogate.serve.convert.qwen4exp.convert",
            "--gguf", str(gguf_path), "--frontend", str(frontend_dir), "--out", str(tmp),
            "--device", os.environ.get("SUROGATE_CONVERT_DEVICE", "cuda")]
     if os.environ.get("SUROGATE_SERVE_DRY"):
@@ -264,13 +264,13 @@ def _repack_planner(root: Path, target_key: str):
         import sys as _sys
         if str(root) not in _sys.path:
             _sys.path.insert(0, str(root))
-        from surogate.serve.tools.convert.common.gguf_repack import (
+        from surogate.serve.convert.common.gguf_repack import (
             NATIVE_TYPES,
             REPACKABLE_TYPES,
             GgufRepackSource,
         )
-        inventory = importlib.import_module(f"surogate.serve.tools.convert.{target_key}.inventory")
-        recipe = importlib.import_module(f"surogate.serve.tools.convert.{target_key}.recipe")
+        inventory = importlib.import_module(f"surogate.serve.convert.{target_key}.inventory")
+        recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.recipe")
 
         candidates = {
             hf: entry
@@ -292,7 +292,7 @@ def _repack_planner(root: Path, target_key: str):
         # Recipes and the bridge may spell one tensor differently; resolve each wanted source to
         # the candidate that actually holds it before intersecting, or nothing matches and the
         # bridge dequantises weights the converter was going to read straight from the file.
-        from surogate.serve.tools.convert.common.safetensors import name_spellings
+        from surogate.serve.convert.common.safetensors import name_spellings
 
         keep: set[str] = set()
         for name in (*planned, *native, *halves):
@@ -392,7 +392,7 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
 ENCODER_TARGETS = {
     # gguf architecture string -> (cache key, converter module, display)
     "gemma-embedding": ("gemma_embedding",
-                        "surogate.serve.tools.convert.gemma_embedding.convert",
+                        "surogate.serve.convert.gemma_embedding.convert",
                         "EmbeddingGemma"),
 }
 

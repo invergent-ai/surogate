@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Config validation and the artifact object list for the Gemma 3 converter
-# (surogate/serve/tools/convert/gemma3/). Every case here is a synthetic
+# (surogate/serve/convert/gemma3/). Every case here is a synthetic
 # `config.json` dict: none of it reads a checkpoint, opens a safetensors shard
 # or touches a GPU, because what is under test is what the converter *refuses*
 # and what it agrees to store, both of which are decided before a tensor is
@@ -16,7 +16,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from surogate.serve.tools.convert.gemma3 import convert, inventory  # noqa: E402
+from surogate.serve.convert.gemma3 import convert, inventory  # noqa: E402
 
 #: `google/gemma-3-270m-it`'s own `config.json`, member for member for everything
 #: this converter reads: the schedule stated both as a `layer_types` list and as

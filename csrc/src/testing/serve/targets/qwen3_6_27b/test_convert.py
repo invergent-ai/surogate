@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from tools.artifact.container import (
+from surogate.serve.artifact.container import (
     Artifact,
     ArtifactIdentity,
     ArtifactWriter,
@@ -13,8 +13,8 @@ from tools.artifact.container import (
     TensorSpec,
     plan_objects,
 )
-from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_size
-from tools.convert.qwen3_6_27b import convert, inventory, recipe
+from surogate.serve.artifact.layouts import decode_direct, dequantize_row_split, encoded_size
+from surogate.serve.convert.qwen3_6_27b import convert, inventory, recipe
 
 
 OFFICIAL_MODEL = Path(

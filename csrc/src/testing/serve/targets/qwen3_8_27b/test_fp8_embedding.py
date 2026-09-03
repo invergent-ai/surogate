@@ -6,9 +6,9 @@ import pytest
 from safetensors.torch import save_file
 import torch
 
-from tools.artifact.layouts import decode_fp8_row_scaled_words
-from tools.convert.common.safetensors import ShardReader
-from tools.convert.qwen3_8_27b import fp8_embedding
+from surogate.serve.artifact.layouts import decode_fp8_row_scaled_words
+from surogate.serve.convert.common.safetensors import ShardReader
+from surogate.serve.convert.qwen3_8_27b import fp8_embedding
 
 
 def test_embedding_profile_zero_rows_ties_and_signed_zero() -> None:
