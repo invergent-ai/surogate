@@ -595,10 +595,22 @@ Open, in the order they matter:
    unchanged. Runs rather than one offset because the fused objects are not slices: a routed
    gate/up is 512 runs (81 objects, 20,521 runs total). Q8_0 joined the GGML op family, which
    took the embedding table, the attention output and the draft head off the copy as well.
-   - Still copied: the fused projections and the shared expert (`NATIVE_EXCLUDE_SUFFIXES` --
-     their kernels read row-split planes and have no Q8_0 path), and `gdn/output`, whose
-     inverse is a column permutation and so is not a row program. Closing those would leave
-     the index holding only the BF16 norms, small enough to build in memory at startup.
+   - Still copied, 1.47 GB: `gdn/query_key_value_z` (802 MB),
+     `attention/query_key_gate_value` (200 MB), the shared expert (134 MB) -- all named in
+     `recipe.NATIVE_EXCLUDE_SUFFIXES` -- plus `gdn/output` (267 MB) and the BF16 norms.
+   - **What each needs.** `gdn/output` needs nothing: llama.cpp's inverse for it is a *column*
+     permutation, so it is not a row program and can never be runs in this format. The other
+     three need a Q8_0 arm in a tuned W8 kernel family:
+     - sparse-MoE shared: the helpers are codec-templated already (`dot_two_rows<Codec>`,
+       `dot_fp32_rows<Codec>`), but the shared path pins `W8Codec` inside kernels templated on
+       the *routed* codec, so it wants a second `SharedCodec` parameter threaded through decode,
+       small-T and prefill -- doubling instantiations of TUs that are already slow to build,
+       for 134 MB.
+     - `attn_input_proj` and `gdn_input_proj`: their W8 kernels take `codes` and `scales` as
+       separate plane pointers, so reading interleaved blocks is a new kernel per family
+       (decode plus two GEMM shapes), not a codec swap. 1.0 GB, and the larger piece of work.
+   - Q8_0 *is* now served by the plain linears, the embedding gather and the routed MoE, so a
+     Q8_0-only GGUF -- three sit in `models/` -- reads its experts and heads in place today.
 4. **N (NVFP4 ModelOpt ingest)** and **F (FP8 strategies)** — neither blocks GGUF.
 
 M2 (geometry templating), M4 (unified loading) and M5 (`--no-cache`, `surogate convert`) stand behind these.
