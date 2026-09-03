@@ -41,6 +41,9 @@ def name_spellings(name: str):
     prefix = "model.language_model."
     if name.startswith(prefix):
         seeds.append("model." + name[len(prefix):])
+    elif name.startswith("model."):
+        # and the other direction: a flat checkpoint answering a nested request
+        seeds.append(prefix + name[len("model."):])
     for seed in list(seeds):
         for left, right in _SEGMENT_ALIASES:
             if left in seed:

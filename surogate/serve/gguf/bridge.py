@@ -227,14 +227,21 @@ def build_hf_dir_from_gguf(
                   else name_map.get(tensor.name))
             if (
                 hf is not None
-                and len(tensor.shape) == 2
+                and len(tensor.shape) >= 2
                 and (not qwen35_family or fam.inverse_is_row_identity(hf, geom))
             ):
-                # GGUF ne order is innermost-first: shape = (k, rows).
+                # GGUF ne order is innermost-first, so the checkpoint shape is its reverse.
+                # Rank is carried whole: a routed MoE stacks its experts, and [experts, out, in]
+                # is [experts*out, in] to the row algebra.
+                shape = tuple(int(extent) for extent in reversed(tensor.shape))
+                rows = 1
+                for extent in shape[:-1]:
+                    rows *= extent
                 candidates[hf] = {
                     "name": tensor.name,
-                    "rows": int(tensor.shape[1]),
-                    "k": int(tensor.shape[0]),
+                    "shape": list(shape),
+                    "rows": rows,
+                    "k": shape[-1],
                     "offset": int(tensor.data_offset),
                     "type": tensor.type_name,
                 }

@@ -193,10 +193,22 @@ class GgufRepackSource:
             self._file = np.memmap(self.gguf_path, dtype=np.uint8, mode="r")
         return self._file
 
-    def source_shape(self, hf_name: str) -> tuple[int, int]:
-        """Logical (rows, k) of a mapped source."""
+    def source_shape(self, hf_name: str) -> tuple[int, ...]:
+        """The source's stored shape, whatever its rank (the last axis is K)."""
         entry = self.sources[hf_name]
+        shape = entry.get("shape")
+        if shape is not None:
+            return tuple(int(extent) for extent in shape)
         return int(entry["rows"]), int(entry["k"])
+
+    def source_rows_k(self, hf_name: str) -> tuple[int, int]:
+        """(rows, K) with every leading axis folded into the row count."""
+        shape = self.source_shape(hf_name)
+        rows = 1
+        for extent in shape[:-1]:
+            rows *= extent
+        return rows, shape[-1]
+
 
     def planes(self, hf_name: str) -> tuple[np.ndarray, np.ndarray]:
         """Deinterleaved (codes int8 [n, groups, 32], scales fp16 [n, groups])."""
@@ -204,7 +216,7 @@ class GgufRepackSource:
         if cached is not None:
             return cached
         entry = self.sources[hf_name]
-        n, k = self.source_shape(hf_name)
+        n, k = self.source_rows_k(hf_name)
         if k % _GROUP != 0:
             raise RepackError(f"{hf_name}: k={k} is not a multiple of {_GROUP}")
         if entry["type"] in NATIVE_TYPES:
@@ -354,7 +366,7 @@ class GgufRepackSource:
     def _native_rows(self, hf_name: str) -> np.ndarray:
         """The source's superblock bytes as [rows, bytes per row], zero-copy over the memmap."""
         entry = self.sources[hf_name]
-        n, k = self.source_shape(hf_name)
+        n, k = self.source_rows_k(hf_name)
         block_bytes = NATIVE_TYPES[entry["type"]]
         if k % 256:
             raise RepackError(f"{hf_name}: k={k} is not a multiple of 256")

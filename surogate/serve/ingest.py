@@ -181,7 +181,7 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
-    repack_targets = {"qwen3_5_0_8b", "qwen3_5_2b", "qwen3_5_4b"}
+    repack_targets = {"qwen3_5_0_8b", "qwen3_5_2b", "qwen3_5_4b", "qwen3_6_35b_a3b"}
     planner = _repack_planner(root, target_key) if target_key in repack_targets else None
     # No-MTP variant (PATCHES.md #15): community exports may strip nextn.
     arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
