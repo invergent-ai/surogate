@@ -12,6 +12,7 @@
 #include "api/ops/sampling.h"
 #include "api/ops/gqa_attention.h"
 #include "api/ops/qsa_indexer.h"
+#include <api/family/text_geometry.h>
 #include <api/family/decoder_state.h>
 #include <api/family/prepared_prompt.h>
 #include <api/family/round_state.h>
@@ -70,15 +71,56 @@ struct ModelConfig {
         return TextConfig::is_full_attention(layer);
     }
 
-    [[nodiscard]] static constexpr int n_full() { return TextConfig::full_attention_layers(); }
+    /// How many layers attend and how many are linear. Which *kind* a layer is stays
+    /// compiled -- that is the family's schedule, not a dimension -- but how many there
+    /// are follows the layer count, which the artifact may declare.
+    [[nodiscard]] constexpr int n_full() const {
+        int count = 0;
+        for (int layer = 0; layer < n_layers; ++layer) { count += is_full(layer) ? 1 : 0; }
+        return count;
+    }
 
-    [[nodiscard]] static constexpr int n_gdn() { return TextConfig::gdn_layers(); }
+    [[nodiscard]] constexpr int n_gdn() const { return n_layers - n_full(); }
 
     [[nodiscard]] static constexpr int full_idx(int layer) {
         return TextConfig::full_attention_index(layer);
     }
 
     [[nodiscard]] static constexpr int gdn_idx(int layer) { return TextConfig::gdn_index(layer); }
+
+    /// The compiled defaults, which is what a target without a declared geometry gets.
+    ModelConfig() = default;
+
+    /// The dimensions the weights were bound against. Everything derived is derived here
+    /// rather than copied, so a geometry that declares `gdn_key_heads` cannot disagree
+    /// with its own `key_dim`.
+    explicit ModelConfig(const family::TextGeometry& geometry)
+        : hidden(geometry.hidden),
+          residual(geometry.hidden == TextConfig::hidden ? residual_width<TextConfig>()
+                                                         : geometry.hidden),
+          n_layers(geometry.layers),
+          intermediate(geometry.intermediate),
+          vocab(geometry.output_rows),
+          token_domain(geometry.token_domain),
+          gdn_k_heads(geometry.gdn_key_heads),
+          gdn_k_dim(geometry.gdn_key_head_dim),
+          gdn_v_heads(geometry.gdn_value_heads),
+          gdn_v_dim(geometry.gdn_value_head_dim),
+          n_q(geometry.query_heads),
+          n_kv(geometry.kv_heads),
+          head_dim(geometry.head_dim),
+          rotary_dim(geometry.rotary_dim),
+          key_dim(geometry.key_dim()),
+          value_dim(geometry.value_dim()),
+          conv_dim(geometry.convolution_dim()),
+          q_size(geometry.query_size()),
+          kv_size(geometry.kv_size()),
+          mtp_fc_in(geometry.mtp_input_rows()),
+          mtp_attn_in(geometry.mtp_attention_input_rows()),
+          mtp_mlp_gateup_rows(geometry.mtp_mlp_gate_up_rows()),
+          rms_eps(geometry.rms_epsilon),
+          rope_theta(geometry.rope_theta),
+          mtp_layers(geometry.mtp_layers) {}
 };
 
 inline const ModelConfig kCfg{};
@@ -462,11 +504,13 @@ private:
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     MtpW mtp_;
-    std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};
-    std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_{};
-    std::array<Weight, TextConfig::gdn_layers()> gdn_in_a_{};
-    std::array<Weight, TextConfig::gdn_layers()> gdn_in_b_{};
-    std::array<Tensor, TextConfig::gdn_layers()> gdn_conv1d_views_{};
+    // Sized from the bound geometry rather than by the type: a checkpoint of this family
+    // may have a different number of layers, and so a different split between them.
+    std::vector<FullLayerW> full_{};
+    std::vector<GdnLayerW> gdn_{};
+    std::vector<Weight> gdn_in_a_{};
+    std::vector<Weight> gdn_in_b_{};
+    std::vector<Tensor> gdn_conv1d_views_{};
 };
 
 } // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule

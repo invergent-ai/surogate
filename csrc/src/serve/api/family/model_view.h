@@ -1,6 +1,7 @@
 #pragma once
 
 #include <api/family/startup_features.h>
+#include <api/family/text_geometry.h>
 #include <api/family/vision.h>
 
 #include "core/tensor.h"
@@ -8,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <optional>
+#include <vector>
 
 namespace sinfer {
 
@@ -80,7 +82,6 @@ struct DFlashWeights {
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,
           class MtpAttentionPayload, class MtpPostMixerPayload, class DFlashPayload,
-          std::size_t FullAttentionLayers, std::size_t GdnLayers,
           // The tower a target ships. Defaulted to the family's so every existing
           // instantiation is unchanged; a target with its own overrides it, and the
           // weights below are sized by it rather than by the family.
@@ -92,9 +93,16 @@ struct ModelView {
     using DFlash    = DFlashPayload;
 
     DeviceArena* weights_arena = nullptr;
+    /// The dimensions these weights were bound against: the target's compiled config with
+    /// whatever the artifact declared laid over it. The runtime reads its sizes from here
+    /// rather than from the compiled constants, which is what lets one target serve every
+    /// size of its family.
+    TextGeometry geometry;
     Weight token_embedding;
-    std::array<FullLayer, FullAttentionLayers> full_layers;
-    std::array<GdnLayer, GdnLayers> gdn_layers;
+    /// Sized when the weights are bound, not by the type: two checkpoints of one family
+    /// differ in how many layers attend and how many are linear.
+    std::vector<FullLayer> full_layers;
+    std::vector<GdnLayer> gdn_layers;
     Tensor final_norm;
     Weight output_head;
     StartupFeatures features;

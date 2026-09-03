@@ -2,12 +2,14 @@
 
 #include <api/targets/qwen3_5_2b/package.h>
 #include <api/family/frontend_resources.h>
+#include <api/family/text_geometry.h>
 #include <api/family/model_view.h>
 #include <api/family/startup_features.h>
 #include <api/family/vision.h>
 
 #include "../config.h"
 
+#include "targets/qwen3_5_2b/impl/config.h"
 #include "artifact/binder.h"
 #include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
@@ -112,6 +114,9 @@ struct MtpPlan {
 };
 
 struct BindingPlan {
+    /// The dimensions bound against: the compiled config with the artifact's
+    /// `geometry` member laid over it.
+    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
@@ -204,7 +209,7 @@ struct MtpAttentionPayload {
 using RuntimeModelView =
     family::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
                        MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<6>,
-                       kFullAttentionLayers, kGdnLayers, VisionConfig>;
+                       VisionConfig>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

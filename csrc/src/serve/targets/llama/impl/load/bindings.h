@@ -2,10 +2,12 @@
 
 #include <api/targets/llama/package.h>
 #include <api/family/frontend_resources.h>
+#include <api/family/text_geometry.h>
 #include <api/family/model_view.h>
 #include <api/family/startup_features.h>
 #include <api/family/vision.h>
 
+#include "targets/llama/impl/config.h"
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
@@ -56,6 +58,9 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
+    /// The dimensions bound against: the compiled config with the artifact's
+    /// `geometry` member laid over it.
+    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
     /// Only four of the family plan's six slots are filled. TinyLlama-1.1B
     /// publishes no image or video preprocessor config, and the loader refuses an
     /// artifact carrying an object no binder consumed -- so this target binds its
@@ -109,8 +114,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     family::ModelView<FusedAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<1>,
-                       kFullAttentionLayers, kGdnLayers>;
+                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<1>>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

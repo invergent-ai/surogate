@@ -2,10 +2,12 @@
 
 #include <api/targets/qwen3_6_35b_a3b/package.h>
 #include <api/family/frontend_resources.h>
+#include <api/family/text_geometry.h>
 #include <api/family/model_view.h>
 #include <api/family/startup_features.h>
 #include <api/family/vision.h>
 
+#include "targets/qwen3_6_35b_a3b/impl/config.h"
 #include "artifact/binder.h"
 #include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
@@ -120,6 +122,9 @@ struct DFlashPlan {
 };
 
 struct BindingPlan {
+    /// The dimensions bound against: the compiled config with the artifact's
+    /// `geometry` member laid over it.
+    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
     /// Which weight formats the artifact carries; decided by the identity, read by both the
@@ -187,7 +192,7 @@ struct GdnProjectionPayload {
 using RuntimeModelView =
     family::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
                        AttentionProjectionPayload, SparseMoePayload,
-                       family::DFlashWeights<kDFlashLayers>, kFullAttentionLayers, kGdnLayers>;
+                       family::DFlashWeights<kDFlashLayers>>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

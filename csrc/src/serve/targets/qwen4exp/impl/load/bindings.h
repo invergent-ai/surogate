@@ -3,6 +3,7 @@
 #include <memory>
 #include <api/targets/qwen4exp/package.h>
 #include <api/family/frontend_resources.h>
+#include <api/family/text_geometry.h>
 #include <api/family/model_view.h>
 #include <api/family/startup_features.h>
 #include <api/family/vision.h>
@@ -94,6 +95,9 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
+    /// The dimensions bound against: the compiled config with the artifact's
+    /// `geometry` member laid over it.
+    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
     bool host_bank_q4 = false; // the routed expert objects are requantised to Q4G32AM
@@ -179,7 +183,7 @@ struct PleWeights {
 using FamilyModelView =
     family::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
                        AttentionProjectionPayload, SparseMoePayload,
-                       family::DFlashWeights<1>, kFullAttentionLayers, kGdnLayers>;
+                       family::DFlashWeights<1>>;
 
 /// The family view plus what the residual hooks need: the output mixer and the PLE layer.
 struct RuntimeModelView : FamilyModelView {

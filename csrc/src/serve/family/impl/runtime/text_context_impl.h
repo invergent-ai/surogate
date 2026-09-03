@@ -236,7 +236,8 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          family::PagedKVCacheView mtp_kv,
                          const family::PagedKVCache* batch_text_kv,
                          const family::PagedKVCache* batch_mtp_kv)
-    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
+    : ctx_(ctx), weights_(weights), cfg_(weights.geometry), work_(work), kv_(kv),
+      mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
       batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
     if (prefill_chunk_ == 0 ||
@@ -308,6 +309,11 @@ void TextContext::bind() {
                     &source.final_norm};
     }
 
+    full_.resize(static_cast<std::size_t>(cfg_.n_full()));
+    gdn_.resize(static_cast<std::size_t>(cfg_.n_gdn()));
+    gdn_in_a_.resize(static_cast<std::size_t>(cfg_.n_gdn()));
+    gdn_in_b_.resize(static_cast<std::size_t>(cfg_.n_gdn()));
+    gdn_conv1d_views_.resize(static_cast<std::size_t>(cfg_.n_gdn()));
     for (int layer = 0; layer < cfg_.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             FullLayerW& out = full_[static_cast<std::size_t>(ModelConfig::full_idx(layer))];

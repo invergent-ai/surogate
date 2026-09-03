@@ -427,6 +427,11 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {
+    // The layer storage is sized here, not by the type: the counts come from the
+    // geometry these weights were bound against.
+    runtime.geometry = plan.geometry;
+    runtime.full_layers.resize(kFullAttentionLayers);
+    runtime.gdn_layers.resize(kGdnLayers);
     frontend = family::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
