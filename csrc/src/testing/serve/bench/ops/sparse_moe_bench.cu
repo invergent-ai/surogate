@@ -45,6 +45,11 @@ enum class CodecProfile : std::uint8_t {
     Q4Q5,
     Q4Q6,
     W8W8,
+    // The native GGML formats, read from a GGUF unrearranged. These are what a downloaded
+    // model actually uses, and until they were here the benchmark could measure only the
+    // formats the converter produces.
+    Q4KQ4K,
+    Q4KQ6K,
 };
 
 enum class ExpertDistribution : std::uint8_t {
@@ -122,11 +127,20 @@ const char* codec_name(CodecProfile profile) {
         return "q4-q6";
     case CodecProfile::W8W8:
         return "w8-w8";
+    case CodecProfile::Q4KQ4K:
+        return "q4_k-q4_k";
+    case CodecProfile::Q4KQ6K:
+        return "q4_k-q6_k";
     }
     return "unknown";
 }
 
+[[nodiscard]] bool is_ggml_profile(CodecProfile profile) {
+    return profile == CodecProfile::Q4KQ4K || profile == CodecProfile::Q4KQ6K;
+}
+
 QType gate_codec(CodecProfile profile) {
+    if (is_ggml_profile(profile)) { return QType::Q4_K; }
     return profile == CodecProfile::W8W8 ? QType::W8G32_F16S : QType::Q4G64_F16S;
 }
 
@@ -138,6 +152,10 @@ QType down_codec(CodecProfile profile) {
         return QType::Q6G64_F16S;
     case CodecProfile::W8W8:
         return QType::W8G32_F16S;
+    case CodecProfile::Q4KQ4K:
+        return QType::Q4_K;
+    case CodecProfile::Q4KQ6K:
+        return QType::Q6_K;
     }
     throw std::logic_error("unknown SparseMoe codec profile");
 }
@@ -169,6 +187,20 @@ const char* execution_name(Execution execution) {
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
 std::uint64_t packed_weight_bytes(QType qtype, std::int32_t rows, std::int32_t columns) {
+    // A GGML block holds its codes, scales and minima in one record, so its size is the
+    // record's, not three planes'.
+    switch (qtype) {
+    case QType::Q4_K:
+    case QType::Q5_K:
+    case QType::Q6_K:
+    case QType::Q8_0: {
+        const std::uint64_t blocks = static_cast<std::uint64_t>(rows) * columns /
+                                     bench::ggml_block_values_for(qtype);
+        return blocks * bench::ggml_block_bytes_for(qtype);
+    }
+    default:
+        break;
+    }
     const std::int32_t group   = qtype == QType::W8G32_F16S ? 32 : 64;
     const std::uint64_t groups = static_cast<std::uint64_t>(rows) * columns / group;
     const std::uint64_t low    = qtype == QType::W8G32_F16S
@@ -285,7 +317,8 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage: %s [options]\n\n"
                  "Public workload:\n"
-                 "  --codec q4-q5|q4-q6|w8-w8|all  Routed weight profile (default q4-q5).\n"
+                 "  --codec q4-q5|q4-q6|w8-w8|q4_k-q4_k|q4_k-q6_k|all\n"
+                 "                                Routed weight profile (default q4-q5).\n"
                  "  --tokens T                       Exact token extent (default 1).\n"
                  "  --sweep START:END[:STEP]         Public token-extent sweep.\n"
                  "  --distribution trace-like|independent|same\n"
@@ -354,9 +387,11 @@ Options parse_options(int argc, char** argv) {
     if (have_tokens && have_sweep) {
         throw std::invalid_argument("--tokens and --sweep are mutually exclusive");
     }
-    if (options.codec != "q4-q5" && options.codec != "q4-q6" && options.codec != "w8-w8" &&
-        options.codec != "all") {
-        throw std::invalid_argument("--codec must be q4-q5, q4-q6, w8-w8, or all");
+    static constexpr std::string_view kCodecs[] = {"q4-q5",     "q4-q6",     "w8-w8",
+                                                   "q4_k-q4_k", "q4_k-q6_k", "all"};
+    if (std::find(std::begin(kCodecs), std::end(kCodecs), options.codec) == std::end(kCodecs)) {
+        throw std::invalid_argument(
+            "--codec must be q4-q5, q4-q6, w8-w8, q4_k-q4_k, q4_k-q6_k, or all");
     }
     if (options.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (options.flush_bytes > std::numeric_limits<std::size_t>::max()) {
@@ -366,7 +401,12 @@ Options parse_options(int argc, char** argv) {
 }
 
 std::vector<CodecProfile> selected_profiles(const std::string& codec) {
-    if (codec == "all") { return {CodecProfile::Q4Q5, CodecProfile::Q4Q6, CodecProfile::W8W8}; }
+    if (codec == "all") {
+        return {CodecProfile::Q4Q5, CodecProfile::Q4Q6, CodecProfile::W8W8, CodecProfile::Q4KQ4K,
+                CodecProfile::Q4KQ6K};
+    }
+    if (codec == "q4_k-q4_k") { return {CodecProfile::Q4KQ4K}; }
+    if (codec == "q4_k-q6_k") { return {CodecProfile::Q4KQ6K}; }
     if (codec == "q4-q5") return {CodecProfile::Q4Q5};
     if (codec == "q4-q6") return {CodecProfile::Q4Q6};
     return {CodecProfile::W8W8};
@@ -504,12 +544,23 @@ class BenchmarkWeights {
 public:
     BenchmarkWeights(CodecProfile profile, std::uint32_t seed, std::size_t flush_bytes)
         : router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
-          routed_gate_(bench::make_row_split_weight(
-              gate_codec(profile), kExperts * 1024, kHidden, kHidden,
-              {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401})),
-          routed_down_(bench::make_row_split_weight(
-              down_codec(profile), kExperts * kHidden, kIntermediate, kIntermediate,
-              {static_cast<std::uint8_t>(0x59U ^ (seed >> 8)), 0x6d, 0x1403})),
+          // The routed pair follows the profile; a GGML profile holds its blocks
+          // unrearranged, which is the whole point of measuring it.
+          routed_gate_(is_ggml_profile(profile)
+                           ? bench::make_ggml_blocks_weight(
+                                 gate_codec(profile), kExperts * 1024, kHidden,
+                                 {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401})
+                           : bench::make_row_split_weight(
+                                 gate_codec(profile), kExperts * 1024, kHidden, kHidden,
+                                 {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401})),
+          routed_down_(is_ggml_profile(profile)
+                           ? bench::make_ggml_blocks_weight(
+                                 down_codec(profile), kExperts * kHidden, kIntermediate,
+                                 {static_cast<std::uint8_t>(0x59U ^ (seed >> 8)), 0x6d, 0x1403})
+                           : bench::make_row_split_weight(
+                                 down_codec(profile), kExperts * kHidden, kIntermediate,
+                                 kIntermediate,
+                                 {static_cast<std::uint8_t>(0x59U ^ (seed >> 8)), 0x6d, 0x1403})),
           shared_gate_(bench::make_row_split_weight(QType::W8G32_F16S, 1024, kHidden, kHidden,
                                                     {0x27, 0x00, 0x1405})),
           shared_down_(bench::make_row_split_weight(QType::W8G32_F16S, kHidden, kIntermediate,

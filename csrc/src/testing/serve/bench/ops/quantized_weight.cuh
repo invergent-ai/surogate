@@ -89,6 +89,79 @@ inline int launch_grid(std::uint64_t elements) {
 
 } // namespace detail
 
+/// Values a block of this format encodes: 32 for the legacy formats, 256 for a K-quant.
+inline std::int32_t ggml_block_values_for(QType qtype) {
+    switch (qtype) {
+    case QType::Q8_0: return 32;
+    case QType::Q2_K:
+    case QType::Q3_K:
+    case QType::Q4_K:
+    case QType::Q5_K:
+    case QType::Q6_K: return 256;
+    default: throw std::invalid_argument("not a GGML block format");
+    }
+}
+
+/// Bytes one block occupies, which is what makes Q6_K's records two-byte aligned.
+inline std::size_t ggml_block_bytes_for(QType qtype) {
+    switch (qtype) {
+    case QType::Q8_0: return 34;
+    case QType::Q2_K: return 84;
+    case QType::Q3_K: return 110;
+    case QType::Q4_K: return 144;
+    case QType::Q5_K: return 176;
+    case QType::Q6_K: return 210;
+    default: throw std::invalid_argument("not a GGML block format");
+    }
+}
+
+/// A weight in the GGML block layout: the bytes a GGUF holds, unrearranged.
+///
+/// The row-split builder above cannot describe these -- a K-quant block interleaves its codes,
+/// its scales and its minima in one 144- or 210-byte record, where row-split keeps three
+/// planes. Without this the benchmark can measure only the formats the converter produces,
+/// which is every codec except the ones a downloaded model actually uses.
+inline PackedQuantizedWeight make_ggml_blocks_weight(QType qtype, std::int32_t n, std::int32_t k,
+                                                    QuantizedWeightFill fill = {}) {
+    const std::int32_t values = ggml_block_values_for(qtype);
+    const std::size_t bytes   = ggml_block_bytes_for(qtype);
+    if (n <= 0 || k <= 0 || (k % values) != 0) {
+        throw std::invalid_argument("invalid benchmark GgmlBlocks weight shape");
+    }
+    const std::uint64_t blocks = detail::checked_mul(
+        static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(k / values),
+        "benchmark ggml block count overflow");
+    const std::uint64_t payload_bytes =
+        detail::checked_mul(blocks, bytes, "benchmark ggml payload size overflow");
+
+    PackedQuantizedWeight result{DeviceBuffer(static_cast<std::size_t>(payload_bytes)), {},
+                                 payload_bytes, 0, 0, 0, 0};
+    // A byte pattern, not real weights: this measures the kernel's traffic and arithmetic,
+    // and the scales inside each block are whatever the pattern makes them. `0x11` keeps the
+    // E8 scale words finite, which is all the kernels require of them.
+    CUDA_CHECK(cudaMemset(result.storage.p, fill.low_byte, result.storage.bytes));
+
+    Weight& weight       = result.weight;
+    weight.payload       = static_cast<const std::byte*>(result.storage.p);
+    weight.payload_bytes = payload_bytes;
+    weight.qtype         = qtype;
+    weight.group_size    = static_cast<std::uint32_t>(values);
+    weight.ndim          = 2;
+    weight.qdata         = result.storage.p;
+    weight.qhigh         = nullptr;
+    weight.scales        = nullptr;
+    weight.n             = n;
+    weight.k             = k;
+    weight.group         = values;
+    weight.layout        = QuantLayout::GgmlBlocks;
+    weight.scale_dtype   = DType::FP16;
+    weight.shape[0]      = n;
+    weight.shape[1]      = k;
+    weight.padded_shape[0] = n;
+    weight.padded_shape[1] = k;
+    return result;
+}
+
 inline PackedQuantizedWeight make_row_split_weight(QType qtype, std::int32_t n, std::int32_t k,
                                                    std::int32_t padded_k,
                                                    QuantizedWeightFill fill = {}) {
