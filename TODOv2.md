@@ -59,18 +59,23 @@ stored once.
 
 **The four things worth doing next**, in order — §7's K-line has the detail:
 
-1. **Build the index in memory and stop writing a file.** At 70 MB there is
-   nothing left worth caching: the router and the norms are cheap to compute,
-   the tokenizer comes from the GGUF's own metadata. `surogate serve
-   model.gguf` would then be literally that, with no artifact and no one-time
-   step. This is the last thing between us and the product claim.
-2. **Close the native prefill gap**, 11,100 against the row-split path's
-   13,700. Q6_K's scalar staging and the K-quant decode's per-tile scale work
-   are the two named suspects.
-3. **Retire the home-grown Q4G64/Q5G64/Q6G64 and add `surogate quantize`**
-   (K6). With K4 done their only remaining advantage is that prefill gap.
-4. **A fused K-quant GDN projection-and-convolution** (K5c), still off: it
+1. **Close the native prefill gap**, 11,100 against the row-split path's
+   13,700 on the same model. Q6_K's scalar staging is the remaining named
+   suspect; the scale-unpack redundancy is *not* (measured, below).
+2. **Retire the home-grown Q4G64/Q5G64/Q6G64 and add `surogate quantize`**
+   (K6). Gated on the above: retiring them sends every converted checkpoint
+   down the K-quant path, so the gap would become a regression.
+3. **A fused K-quant GDN projection-and-convolution** (K5c), still off: it
    costs more in kernel launches than it saves in bandwidth.
+
+**Not worth doing: building the index in memory.** It looked like the last
+step to "no artifact at all", but measured, the one-time step is **18 seconds
+and 70 MB** — the bridge now stages 0.0 GiB of BF16, because everything large
+is read from the file. Removing the file means porting the recipes, the row
+algebra, the name mapping and the permutation tables to C++, which is a large
+change to save eighteen seconds once and a file smaller than the tokenizer's
+own vocabulary. `surogate serve model.gguf` already works with no manual step;
+this would only move where the work happens.
 
 §7 is the governing section where it disagrees with §2 or M3: the owner's
 2026-09-02 decision made GGUF K-quants the product, and this file predates it.
@@ -649,9 +654,12 @@ and heads in place today. Everything else is read in place too, through the load
 
 Open, in the order they matter:
 
-1. **Build the index in memory; stop writing a file.** 70 MB is router, tokenizer, BF16 norms
-   and the draft head's token ids — all cheap to compute or already in the GGUF's metadata. That
-   is the last step to `surogate serve model.gguf` with no artifact at all.
+1. **Close the native prefill gap** (11,100 vs the row-split path's 13,700). One idea measured
+   and rejected: computing each 32-value sub-block's six-bit scale in one lane and broadcasting
+   it, instead of all sixteen lanes repeating the unpack. It is **slower** — 9,700-10,300 — so
+   the two `__shfl_sync` calls cost more in the inner loop than the redundant unpack does. The
+   scale arithmetic is not the bottleneck; look at Q6_K's scalar staging and at the tile's
+   `cp_async` shape instead.
 2. **Close the native prefill gap**, 11,100 against the row-split path's 13,700 on the same
    model. Q6_K's scalar staging (its 210-byte block leaves consecutive blocks 2-byte aligned, so
    it cannot `cp_async<16>`) and the K-quant decode's per-tile scale work are the two suspects.
