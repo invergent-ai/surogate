@@ -210,7 +210,7 @@ public:
                                                            std::int32_t keys,
                                                            PagedKVBatchLayerView cache);
     [[nodiscard]] bool stage_embeds() const noexcept { return stage_first_ == 0; }
-    [[nodiscard]] bool stage_finishes() const noexcept { return stage_last_ == kCfg.n_layers; }
+    [[nodiscard]] bool stage_finishes() const noexcept { return stage_last_ == cfg_.n_layers; }
     void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {
         proposal_head_     = weight;
         proposal_head_ids_ = ids;
@@ -445,7 +445,11 @@ private:
     std::uint32_t mtp_proposal_extent_                    = 0;
 
     int stage_first_                            = 0;
-    int stage_last_                             = kCfg.n_layers;
+    /// The geometry this context runs. It defaults to the target's compiled `TextConfig`, so a
+    /// registered model is unchanged; holding it per context rather than reading a namespace
+    /// constant is what lets two engines of different sizes share one process.
+    ModelConfig cfg_{};
+    int stage_last_                             = cfg_.n_layers;
     StageSpan stage_{};
     void stage_import(Tensor& x, cudaStream_t stream);
     void stage_export(const Tensor& x, cudaStream_t stream);
