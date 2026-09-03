@@ -106,15 +106,44 @@ stored once.
    covers *those* sizes, not those families — Qwen3-8B still has nowhere to go.
    A GGUF published without a chat template is also refused, which is what the
    base `google.gemma-3-270m` files are.
+   **The official unsloth `Qwen3-0.6B-Q4_K_M.gguf` now serves**, after two
+   things that only a published export exposes. It declares `<|vision_pad|>`
+   where the Qwen repository declares `<|endoftext|>`, and the frontend asserted
+   the literal — a *registered-checkpoint identity* check standing on the
+   generic path. A pad token says nothing about how text tokenizes: the frontend
+   resolves it to an id and nothing pads with it. The literal now runs only for
+   a target claiming the registered tokenizer, and the bridge stopped rewriting
+   the pad token to match, which had been putting a token in the artifact that
+   the file does not claim. Both directions were the same mistake.
 4. **[ ] F — FP8.** compressed-tensors per-channel/per-tensor is per-row with an
    FP32 scale — add `_F32S`, or accept the BF16 cast. HF fine-grained FP8 is
    block-scaled and has no runtime format at all.
 5. **[ ] N — NVFP4 ModelOpt ingest.** `weight_scale_2` is a multiplier where
    compressed-tensors' global scale is a divisor; parents split per component.
-6. **[ ] M2 — one directory per architecture, geometry as a template parameter.**
-   `qwen3_5_{0_8b,2b,4b}` are ~1,750 lines each for seven integers; `variant.h`
-   differs by 2 lines across the three. Nothing requires the split: all 52
-   headers in `csrc/src/serve/api/ops/` take runtime shapes.
+6. **[~] M2 — one directory per architecture.** `qwen3_5_{0_8b,2b,4b}` are
+   ~1,750 lines each for seven integers; `variant.h` differs by 2 lines across
+   the three. Nothing requires the split: all 52 headers in
+   `csrc/src/serve/api/ops/` take runtime shapes, and the attention kernel is
+   already dispatched at runtime from a registry of eight `GqaGeometry` shapes.
+   **Geometry as data, not as a template parameter** (owner: "choose the best
+   option"). Shapes alone cannot yield an RMS epsilon, a rope base or a layer
+   schedule, and the converter holds all of them, so the *artifact carries the
+   numbers* and the binder checks tensor shapes against them. Config is the
+   authority; the container is a cache.
+   Shipped so far: `family::TextGeometry`, the compiled config as a value, with
+   primary dimensions as members and derived ones (`key_dim`,
+   `convolution_dim`, the MTP row counts) as functions, so a declaration cannot
+   leave a stale derived value behind; an optional `geometry` root member on the
+   artifact directory, read by both the C++ reader and the Python container;
+   `ModelConfig` turned from static constants into data, and `kCfg` into
+   `TextContext::cfg_` (324 call sites); the qwen3 converter writing the block,
+   with `token_domain` taken from the tokenizer rather than the padded
+   `vocab_size`.
+   Left: the runtime consumes it (the planner takes a geometry, the 49
+   `layouts_impl.h` reads and the ~59 scattered ones become `cfg` reads, five
+   `std::array` members sized by a compiled extent become vectors); the qwen3
+   target proves it on two sizes (0.6B and 1.7B share the registered
+   `Gqa128_16q8` shape); then the three Qwen3.5 directories collapse into one.
 7. **[ ] M4 — unify weight loading with the trainer.** Serve's `recipe.py` +
    `inventory.py` per target restate what the trainer's `hf_mapping` DSL already
    declares (`fuse`, `split`, `stack_experts`); the trainer's
@@ -128,6 +157,11 @@ stored once.
    not exist, and `surogate/serve/tools/README.md` still tells users to download
    artifacts from Hugging Face — a posture the owner rejected — while linking
    three files that do not exist.
+   **The converter is not a tool** (owner, 2026-09-03). `surogate serve` runs it
+   on every first load, so `serve/tools/convert/` is now `serve/convert/` and
+   `serve/tools/artifact/` is `serve/artifact/`; `serve/tools/` keeps the
+   workflows an owner runs by hand (bench, eval, parity, probe, reference,
+   smoke, generate). The README above is what is left of that drift.
 10. **[ ] Q6_K down, the one tensor the int8 route did not fix.** 688 µs against
    the row-split kernel's 337, where Q4_K and Q5_K now beat theirs (498/608 and
    316/335). It is `routed_down` on 3 of 40 layers, so it costs ~1 ms of a
