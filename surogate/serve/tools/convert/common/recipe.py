@@ -373,6 +373,21 @@ def preflight_sources(
         return preflight_source_reader(reader, recipes)
 
 
+
+def _squeeze_units(shape) -> tuple[int, ...]:
+    return tuple(extent for extent in shape if extent != 1)
+
+
+def _same_up_to_unit_axes(stored, required) -> bool:
+    """Whether two shapes describe the same rows, ignoring unit axes.
+
+    A vector is a bare `[n]` in one export and a `[1, n]` Linear weight in another; the values
+    and their order are identical either way. This is a storage convention, so it is tolerated
+    for every checkpoint rather than listed per model, and the reader reshapes on read.
+    """
+    return _squeeze_units(stored) == _squeeze_units(required)
+
+
 def preflight_source_reader(
     reader: ShardReader,
     recipes: Sequence[TensorRecipe],
@@ -390,7 +405,7 @@ def preflight_source_reader(
     shards: set[str] = set()
     for name, requirement in requirements.items():
         actual = metadata[name]
-        if actual.shape != requirement.shape:
+        if not _same_up_to_unit_axes(actual.shape, requirement.shape):
             raise ValueError(f"{name}: source shape {actual.shape} != required {requirement.shape}")
         if actual.dtype != requirement.dtype and not (
             requirement.dtype == "BF16" and actual.dtype == "F32"
@@ -422,6 +437,10 @@ def materialize_expression(
         )
     if isinstance(expression, SourceTensor):
         tensor = reader.get(expression.name)
+        if tuple(tensor.shape) != tuple(expression.shape) and _same_up_to_unit_axes(
+            tuple(tensor.shape), tuple(expression.shape)
+        ):
+            tensor = tensor.reshape(tuple(expression.shape))
         if tuple(tensor.shape) != expression.shape:
             raise ValueError(
                 f"{expression.name}: source shape {tuple(tensor.shape)} != {expression.shape}"

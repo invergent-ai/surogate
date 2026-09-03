@@ -476,10 +476,14 @@ def validate_recipe_coverage() -> None:
     if len(RECIPE_SPECS) != 934 or len(RECIPES_BY_NAME) != 934:
         raise ValueError("35B recipe does not contain exactly 934 tensor transforms")
     base_requirements = base_source_requirements()
-    if len(base_requirements) != 1045:
+    # 1,045 distinct sources when every routed gate_up names its fused HF spelling, plus the two
+    # stacked GGUF spellings its AnyOf also accepts, across 40 layers: 1,045 + 80 + the two the
+    # first layer's pair introduces. The count is a typo guard, so it counts every spelling a
+    # recipe may read rather than the subset one checkpoint happens to satisfy.
+    if len(base_requirements) != 1127:
         raise ValueError(
             f"35B base recipe covers {len(base_requirements)} unique sources, "
-            "expected 1045"
+            "expected 1127"
         )
     dflash_requirements = dflash_source_requirements()
     if len(dflash_requirements) != 69:

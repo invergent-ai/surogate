@@ -25,6 +25,10 @@ import torch
 
 from surogate.serve.tools.artifact.container import ArtifactIdentity, ArtifactObject, ArtifactWriter
 from surogate.core.model import quant_schemes
+from surogate.serve.tools.convert.common.gguf_repack import (
+    GgufRepackSource,
+    RepackError,
+)
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
 from surogate.serve.tools.convert.common import conversion as family_conversion
@@ -366,6 +370,8 @@ def preflight_conversion(
     routed_nvfp4_dir: str | Path | None = None,
     *,
     shared_expert: str = "as-stored",
+    covered: tuple[str, ...] = (),
+    object_specs=None,
 ) -> ConversionPreflight:
     """Complete config, source, shortlist, and offset work before writing.
 
@@ -412,7 +418,14 @@ def preflight_conversion(
         if compressed_source is not None
         else None
     )
-    if compressed_plan is None:
+    if compressed_plan is None and covered:
+        # A GGUF source: the objects it serves from the file need no bridged tensor, so the
+        # rest are checked leniently the way the compressed-tensors path is.
+        remaining = tuple(
+            item for name, item in recipe.BASE_RECIPES_BY_NAME.items() if name not in covered
+        )
+        base_source = family_recipe.preflight_sources(model, remaining)
+    elif compressed_plan is None:
         base_source = recipe.preflight_base_sources(model)
     else:
         # The exact-inventory preflight cannot apply here: the export stores packed
@@ -432,7 +445,12 @@ def preflight_conversion(
 
     resources = load_resources(model, accept_source=compressed_source is not None)
     resource_map = {resource.name: resource.data for resource in resources}
-    if compressed_plan is None:
+    if compressed_plan is None and object_specs is not None:
+        specs = inventory.RESOURCE_SPECS + tuple(object_specs)
+        if dflash_model is None:
+            specs = tuple(spec for spec in specs if spec not in inventory.DFLASH_TENSOR_SPECS)
+        object_plan = family_conversion.build_object_plan(specs, resource_map)
+    elif compressed_plan is None:
         object_plan = build_object_plan(
             resource_map,
             include_dflash=dflash_model is not None,
@@ -607,6 +625,9 @@ def convert(
     device: str | torch.device = "cuda",
     routed_nvfp4_dir: str | Path | None = None,
     shared_expert: str = "as-stored",
+    gguf_repack: str | Path | None = None,
+    mtp: bool = True,
+    vision: bool = True,
 ) -> Path:
     """Run the complete target conversion and return its report path."""
 
@@ -616,7 +637,39 @@ def convert(
     requested_device = str(device)
     resolved_device = pick_device(device)
     dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
-    preflight = preflight_conversion(model, dflash_model, routed_nvfp4_dir, shared_expert=shared_expert)
+    # A GGUF source serves what the file already holds: the routed experts are K-quant
+    # superblocks and the Q8_0 tensors repack into W8 bit-exactly, so only the remainder takes
+    # the dequantise path.
+    repack = GgufRepackSource(gguf_repack) if gguf_repack else None
+    gguf_specs = tensor_specs(routed_nvfp4_dir is not None)
+    native: dict[str, str] = {}
+    repacked: tuple[str, ...] = ()
+    dropped_prefixes = tuple(
+        prefix for prefix, keep in (("mtp/", mtp), ("vision/", vision)) if not keep
+    )
+    if dropped_prefixes:
+        gguf_specs = tuple(
+            spec for spec in gguf_specs
+            if not getattr(spec, "name", "").startswith(dropped_prefixes)
+        )
+        print(f"this export carries no {', '.join(p.rstrip('/') for p in dropped_prefixes)} — "
+              "omitting those objects", flush=True)
+    if repack is not None:
+        native = repack.plan_native(recipe.BASE_RECIPES_BY_NAME, gguf_specs)
+        repacked = repack.plan(recipe.BASE_RECIPES_BY_NAME, gguf_specs)
+        if native:
+            gguf_specs = GgufRepackSource.native_specs(gguf_specs, native)
+            print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
+                  flush=True)
+        if repacked:
+            print(f"bit-exact repack: {len(repacked)} objects", flush=True)
+    preflight = preflight_conversion(
+        model, dflash_model, routed_nvfp4_dir, shared_expert=shared_expert,
+        covered=tuple(native) + tuple(repacked) + tuple(
+            n for n in recipe.BASE_RECIPES_BY_NAME if n.startswith(dropped_prefixes)
+        ) if dropped_prefixes or native or repacked else (),
+        object_specs=gguf_specs if (native or repacked or dropped_prefixes) else None,
+    )
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -654,11 +707,16 @@ def convert(
             write_payload(spec, resources[spec.name])
 
         all_specs = (
-            preflight.compressed_plan.specs
+            gguf_specs
+            if (native or repacked or dropped_prefixes)
+            else preflight.compressed_plan.specs
             if preflight.compressed_plan is not None
             else tensor_specs(preflight.routed_nvfp4_dir is not None)
         )
-        base_specs = all_specs[: -len(inventory.DFLASH_TENSOR_SPECS)]
+        # A GGUF plan rewrites formats and may drop whole families, so the DFlash tail cannot be
+        # sliced off by length any more.
+        dflash_names = {spec.name for spec in inventory.DFLASH_TENSOR_SPECS}
+        base_specs = tuple(spec for spec in all_specs if spec.name not in dflash_names)
         routed_reader = (
             ShardReader.from_index(
                 preflight.routed_nvfp4_dir / "model.safetensors.index.json"
@@ -672,6 +730,22 @@ def convert(
                 model / "model.safetensors.index.json"
             ) as reader:
                 for spec in base_specs:
+                    if repack is not None and (spec.name in native or spec.name in repacked):
+                        # The draft head gathers its rows by shortlist rather than in order.
+                        token_ids = (
+                            draft_head.materialize_draft_head_token_ids(preflight.draft)
+                            if spec.name == draft_head.DRAFT_HEAD_OBJECT
+                            else None
+                        )
+                        source_recipe = recipe.BASE_RECIPES_BY_NAME[spec.name]
+                        payload = (
+                            repack.payload_for_native(spec, source_recipe, token_ids)
+                            if spec.name in native
+                            else repack.payload_for(spec, source_recipe, token_ids)
+                        )
+                        write_payload(spec, payload)
+                        del payload
+                        continue
                     if preflight.compressed_plan is not None and (
                         spec.name in preflight.compressed_plan.objects
                         or spec.name.endswith(compressed_tensors_source.INPUT_DIVISOR_SUFFIX)
@@ -780,6 +854,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "weights profile"
         ),
     )
+    parser.add_argument("--no-vision", action="store_true",
+                        help="convert without the vision tower (a text-only export)")
+    parser.add_argument("--no-mtp", action="store_true",
+                        help="convert without the MTP (nextn) block, which community GGUFs strip")
+    parser.add_argument("--gguf-repack", type=Path, default=None,
+                        help="repack map from a GGUF bridge; serves what the file already holds")
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--shared-expert",
@@ -799,6 +879,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         device=args.device,
         routed_nvfp4_dir=args.routed_nvfp4,
         shared_expert=args.shared_expert,
+        gguf_repack=args.gguf_repack,
+        mtp=not args.no_mtp,
+        vision=not args.no_vision,
     )
 
 

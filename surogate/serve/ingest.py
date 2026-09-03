@@ -88,7 +88,7 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
         return ConverterTarget("qwen3_8_27b", "surogate.serve.tools.convert.qwen3_8_27b.convert", "Qwen3.8-27B")
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
         return ConverterTarget("qwen3_6_35b_a3b", "surogate.serve.tools.convert.qwen3_6_35b_a3b.convert",
-                               "Qwen3.6-35B-A3B")
+                               "Qwen3.6-35B-A3B", gguf_repack=True)
     return None
 
 
@@ -276,11 +276,19 @@ def _repack_planner(root: Path, target_key: str):
         # A fused parent stored as two typed halves keeps its sources too, or the bridge
         # dequantises them and the converter can no longer see the types it split on.
         halves = source.plan_native_halves(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
+        # Recipes and the bridge may spell one tensor differently; resolve each wanted source to
+        # the candidate that actually holds it before intersecting, or nothing matches and the
+        # bridge dequantises weights the converter was going to read straight from the file.
+        from surogate.serve.tools.convert.common.safetensors import name_spellings
+
         keep: set[str] = set()
         for name in (*planned, *native, *halves):
             for src in recipe.expression_sources(recipe.RECIPES_BY_NAME[name].expression):
-                keep.add(src.name)
-        return {hf: candidates[hf] for hf in sorted(keep & set(candidates))}
+                for spelling in name_spellings(src.name):
+                    if spelling in candidates:
+                        keep.add(spelling)
+                        break
+        return {hf: candidates[hf] for hf in sorted(keep)}
     return plan
 
 
