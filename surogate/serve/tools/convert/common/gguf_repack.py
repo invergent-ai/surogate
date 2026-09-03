@@ -222,6 +222,20 @@ class GgufRepackSource:
         return rows, shape[-1]
 
 
+    def row_map(self, hf_name: str) -> np.ndarray | None:
+        """File row for each of the source's rows, when the two differ.
+
+        llama.cpp reorders the V heads of a GDN projection, so the tensor the recipe names is a
+        row permutation of the one the file holds. Expressing that as a map rather than as a
+        materialised transform is what lets those weights be read in place: a permuted head is
+        128 contiguous rows, so it is one run, not 128.
+        """
+        entry = self.sources.get(hf_name)
+        if entry is None:
+            return None
+        raw = entry.get("row_perm")
+        return None if raw is None else np.asarray(raw, dtype=np.int64)
+
     def planes(self, hf_name: str) -> tuple[np.ndarray, np.ndarray]:
         """Deinterleaved (codes int8 [n, groups, 32], scales fp16 [n, groups])."""
         cached = self._planes.get(hf_name)
@@ -243,6 +257,10 @@ class GgufRepackSource:
             n, k // _GROUP, block_bytes
         )
         codes, scales = decoder(raw)
+        row_map = self.row_map(hf_name)
+        if row_map is not None:
+            codes = codes[row_map]
+            scales = scales.reshape(n, k // _GROUP)[row_map]
         codes = np.ascontiguousarray(codes)
         scales = np.ascontiguousarray(scales).reshape(n, k // _GROUP)
         self._planes[hf_name] = (codes, scales)
@@ -408,7 +426,9 @@ class GgufRepackSource:
         data = self._memmap()
         if offset < 0 or offset + nbytes > data.shape[0]:
             raise RepackError(f"{hf_name}: quantized payload is outside the GGUF file")
-        return np.asarray(data[offset : offset + nbytes]).reshape(n, row_bytes)
+        rows_out = np.asarray(data[offset : offset + nbytes]).reshape(n, row_bytes)
+        row_map = self.row_map(hf_name)
+        return rows_out if row_map is None else rows_out[row_map]
 
     def payload_for_native(
         self,
@@ -491,6 +511,10 @@ class GgufRepackSource:
             source_type = str(self.sources[name]["type"])
             if (k // native_block_values(source_type)) * NATIVE_TYPES[source_type] != row_bytes:
                 raise RepackError(f"{spec.name}: {name} has a different row width")
+            row_map = self.row_map(name)
+            if row_map is not None:
+                mask = source_of == index
+                row_of = np.where(mask, row_map[np.clip(row_of, 0, len(row_map) - 1)], row_of)
 
         # A new run starts wherever the source changes or the source row is not the next one.
         breaks = np.ones(rows.shape[0], dtype=bool)
@@ -545,6 +569,13 @@ class GgufRepackSource:
             source_of = rows // _SOURCE_STRIDE
             row_of = rows % _SOURCE_STRIDE
             base = [int(self.sources[source]["offset"]) for source in program.sources]
+            for index, source in enumerate(program.sources):
+                row_map = self.row_map(source)
+                if row_map is not None:
+                    mask = source_of == index
+                    row_of = np.where(
+                        mask, row_map[np.clip(row_of, 0, len(row_map) - 1)], row_of
+                    )
             breaks = np.ones(rows.shape[0], dtype=bool)
             if rows.shape[0] > 1:
                 breaks[1:] = (source_of[1:] != source_of[:-1]) | (row_of[1:] != row_of[:-1] + 1)

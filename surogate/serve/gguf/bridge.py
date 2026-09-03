@@ -225,26 +225,32 @@ def build_hf_dir_from_gguf(
         for tensor in reader.tensors:
             hf = (_family_or_generic(fam, tensor.name, n_main, name_map) if qwen35_family
                   else name_map.get(tensor.name))
-            if (
-                hf is not None
-                and len(tensor.shape) >= 2
-                and (not qwen35_family or fam.inverse_is_row_identity(hf, geom))
-            ):
-                # GGUF ne order is innermost-first, so the checkpoint shape is its reverse.
-                # Rank is carried whole: a routed MoE stacks its experts, and [experts, out, in]
-                # is [experts*out, in] to the row algebra.
-                shape = tuple(int(extent) for extent in reversed(tensor.shape))
-                rows = 1
-                for extent in shape[:-1]:
-                    rows *= extent
-                candidates[hf] = {
-                    "name": tensor.name,
-                    "shape": list(shape),
-                    "rows": rows,
-                    "k": shape[-1],
-                    "offset": int(tensor.data_offset),
-                    "type": tensor.type_name,
-                }
+            if hf is None or len(tensor.shape) < 2:
+                continue
+            # GGUF ne order is innermost-first, so the checkpoint shape is its reverse.
+            # Rank is carried whole: a routed MoE stacks its experts, and [experts, out, in]
+            # is [experts*out, in] to the row algebra.
+            shape = tuple(int(extent) for extent in reversed(tensor.shape))
+            rows = 1
+            for extent in shape[:-1]:
+                rows *= extent
+            # A tensor whose inverse is a row permutation is still readable from the file: the
+            # candidate carries the map and the planner turns it into runs. Only a *value*
+            # transform forces the dequantise path.
+            row_perm = (
+                fam.inverse_row_permutation(hf, geom, rows) if qwen35_family else None
+            )
+            if qwen35_family and row_perm is None and not fam.inverse_is_row_identity(hf, geom):
+                continue
+            candidates[hf] = {
+                "name": tensor.name,
+                "shape": list(shape),
+                "rows": rows,
+                "k": shape[-1],
+                "offset": int(tensor.data_offset),
+                "type": tensor.type_name,
+                "row_perm": None if row_perm is None else [int(v) for v in row_perm],
+            }
         repack_sources = repack_planner(gguf_path, candidates)
         if set(repack_sources) - set(candidates):
             raise SystemExit("surogate serve: repack planner returned non-candidate sources.")

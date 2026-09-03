@@ -207,6 +207,33 @@ def inverse_is_row_identity(hf_name: str, g: GdnGeometry) -> bool:
     )
 
 
+def inverse_row_permutation(hf_name: str, g: GdnGeometry, rows: int) -> torch.Tensor | None:
+    """The inverse as a row map, when it is one, so the rows can be gathered from the file.
+
+    `invert_tensor` is three different things depending on the tensor: a value transform for
+    A_log and the plus-one norms, a shape change for conv1d, and for the projections a pure
+    permutation of rows. Only the last is expressible as a gather, and only that one lets a
+    quantised weight be read from the GGUF instead of dequantised and rebuilt. Returns None for
+    everything else, including when the geometry is symmetric and the inverse is the identity --
+    the caller already has a cheaper answer for that.
+    """
+    if not g.reordered:
+        return None
+    if hf_name.endswith("linear_attn.in_proj_qkv.weight"):
+        # [q | k | v]; only the V segment moved.
+        qk = g.head_k_dim * g.num_k_heads * 2
+        if rows <= qk:
+            return None
+        index = torch.arange(rows, dtype=torch.long)
+        index[qk:] = qk + _inverse_perm(g, g.head_v_dim)
+        return index
+    if hf_name.endswith("linear_attn.in_proj_z.weight"):
+        return _inverse_perm(g, g.head_v_dim)
+    if hf_name.endswith(("linear_attn.in_proj_a.weight", "linear_attn.in_proj_b.weight")):
+        return _inverse_perm(g, 1)
+    return None
+
+
 def invert_tensor(hf_name: str, t: torch.Tensor, g: GdnGeometry) -> torch.Tensor:
     """Undo every llama.cpp numeric/layout transform for one HF-named tensor."""
     t = t.float() if t.dtype not in (torch.float32, torch.float64) else t
