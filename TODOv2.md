@@ -132,7 +132,7 @@ stored once.
    block-scaled and has no runtime format at all.
 5. **[ ] N — NVFP4 ModelOpt ingest.** `weight_scale_2` is a multiplier where
    compressed-tensors' global scale is a divisor; parents split per component.
-6. **[~] M2 — one directory per architecture.** `qwen3_5_{0_8b,2b,4b}` are
+6. **[x] M2 — one directory per architecture (2026-09-03).** `qwen3_5_{0_8b,2b,4b}` are
    ~1,750 lines each for seven integers; `variant.h` differs by 2 lines across
    the three. Nothing requires the split: all 52 headers in
    `csrc/src/serve/api/ops/` take runtime shapes, and the attention kernel is
@@ -170,15 +170,22 @@ stored once.
    did. The w8 linear dispatcher no longer refuses a shape it has no measured
    route for: its launchers take n, k and T at runtime, so unregistered shapes
    take the family's default bands and the measured entries stay measured.
-   **Left: the three Qwen3.5 directories.** Their binders, variants and
-   converters now bind against the declared geometry and the artifacts state
-   it, so the mechanism is in place. The collapse itself is not done, and it is
-   not just a rename: the 2B carries a vision tower the other two do not, so a
-   merged target has to take that path with it. Two dimensions also stay
-   compiled in the hybrid forward interface and are marked in the code -- the
-   attention head width (the family's at every size) and the GDN output-gate
-   width (no runtime handle; the split projection payload would have to carry
-   it).
+   **The three Qwen3.5 directories are one.** `qwen3_5` compiles a reference
+   size (the 2B) and the family's vision tower, and both the 0.8B and the 2B
+   serve through it from their GGUFs: 3,932 lines deleted. An artifact is
+   probed for the tower rather than assumed to have it, the draft head's columns
+   follow the hidden state, and the package answers for every model id of the
+   family. It left the generated-config set, because no text `config.json`
+   carries the tower's dimensions -- the same reason the 2B was hand-written
+   before the merge. The converters stay per size (their recipes spell their
+   shapes out), so the GGUF path distinguishes the engine target from the
+   converter module.
+   Two dimensions stay compiled in the hybrid forward interface and are marked
+   where they are: the attention head width (the family's at every size, so the
+   head counts come from the tensors' rows) and the GDN output-gate width, which
+   has no runtime handle -- the split projection payload would have to carry it.
+   `csrc/src/serve/targets/` now holds one directory per architecture:
+   gemma3, llama, qwen3, qwen3_5, qwen3_6_27b, qwen3_6_35b_a3b, qwen4exp.
 7. **[ ] M4 — unify weight loading with the trainer.** Serve's `recipe.py` +
    `inventory.py` per target restate what the trainer's `hf_mapping` DSL already
    declares (`fuse`, `split`, `stack_experts`); the trainer's
