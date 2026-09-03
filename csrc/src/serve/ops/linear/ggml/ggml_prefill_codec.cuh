@@ -18,6 +18,7 @@
 #include "ops/linear/ggml/ggml_dequant.cuh"
 
 #include <cuda_bf16.h>
+#include <cstddef>
 #include <cstdint>
 
 namespace sinfer::ops::detail::ggml {
@@ -39,24 +40,18 @@ struct GgmlQ4KPrefill {
     /// this is the only K-quant whose gate/up fits three blocks to an SM.
     static constexpr int kMinBlocks   = 3;
 
-    /// `blocks` is already advanced to the row's first superblock.
-    __device__ static __forceinline__ const std::uint8_t* tile_source(const void* blocks,
-                                                                      int tile) {
-        const auto* b = static_cast<const block_q4_K*>(blocks) + tile / kTilesPerBlock;
-        return b->qs + 32 * (tile % kTilesPerBlock);
+    /// Byte offset of one staged chunk from the row's first superblock. Row-independent by
+    /// construction: the row's base already costs a 64-bit multiply, and folding the block
+    /// stride in there too made it two per staged chunk rather than one per row.
+    __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
+        return (tile / kTilesPerBlock) * kBlockBytes + offsetof(block_q4_K, qs) +
+               32 * (tile % kTilesPerBlock) + 16 * chunk;
+    }
+    __device__ static __forceinline__ int header_offset(int tile) {
+        return (tile / kTilesPerBlock) * kBlockBytes; // dm leads the block
     }
 
-    __device__ static __forceinline__ const std::uint8_t* header_source(const void* blocks,
-                                                                        int block) {
-        return reinterpret_cast<const std::uint8_t*>(
-            &(static_cast<const block_q4_K*>(blocks) + block)->dm);
-    }
 
-    /// One sixteen-byte run of the tile, for staging.
-    __device__ static __forceinline__ const std::uint8_t* chunk_source(const void* blocks, int tile,
-                                                                       int chunk) {
-        return tile_source(blocks, tile) + 16 * chunk;
-    }
 
     __device__ static __forceinline__ __nv_bfloat162 decode(const std::uint8_t* tile,
                                                             const std::uint8_t* header, int lane,
@@ -93,24 +88,17 @@ struct GgmlQ5KPrefill {
     static constexpr bool kCpAsync   = true;
     static constexpr int kMinBlocks  = 2; // its header carries qh as well, so the tile costs more
 
-    __device__ static __forceinline__ const std::uint8_t* tile_source(const void* blocks,
-                                                                      int tile) {
-        const auto* b = static_cast<const block_q5_K*>(blocks) + tile / kTilesPerBlock;
-        return b->qs + 32 * (tile % kTilesPerBlock);
+    __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
+        return (tile / kTilesPerBlock) * kBlockBytes + offsetof(block_q5_K, qs) +
+               32 * (tile % kTilesPerBlock) + 16 * chunk;
+    }
+    __device__ static __forceinline__ int header_offset(int tile) {
+        return (tile / kTilesPerBlock) * kBlockBytes;
     }
 
     /// `dm`, `scales` and `qh` are contiguous in that order inside the block, so the header is
     /// one run; `qs` follows them and is staged per tile instead.
-    __device__ static __forceinline__ const std::uint8_t* header_source(const void* blocks,
-                                                                        int block) {
-        return reinterpret_cast<const std::uint8_t*>(
-            &(static_cast<const block_q5_K*>(blocks) + block)->dm);
-    }
 
-    __device__ static __forceinline__ const std::uint8_t* chunk_source(const void* blocks, int tile,
-                                                                       int chunk) {
-        return tile_source(blocks, tile) + 16 * chunk;
-    }
 
     __device__ static __forceinline__ __nv_bfloat162 decode(const std::uint8_t* tile,
                                                             const std::uint8_t* header, int lane,
@@ -152,31 +140,19 @@ struct GgmlQ6KPrefill {
     static constexpr bool kCpAsync   = false;
     static constexpr int kMinBlocks  = 2;
 
-    __device__ static __forceinline__ const std::uint8_t* tile_source(const void* blocks,
-                                                                      int tile) {
-        const auto* b = static_cast<const block_q6_K*>(blocks) + tile / kTilesPerBlock;
-        return b->ql + 64 * ((tile % kTilesPerBlock) >> 1);
+    /// The tile's first sixty-four bytes come from `ql`, its last thirty-two from `qh`, which
+    /// does not follow `ql` contiguously for the half in question.
+    __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
+        const int block = (tile / kTilesPerBlock) * kBlockBytes;
+        const int half  = (tile % kTilesPerBlock) >> 1;
+        return chunk < 4 ? block + offsetof(block_q6_K, ql) + 64 * half + 16 * chunk
+                         : block + offsetof(block_q6_K, qh) + 32 * half + 16 * (chunk - 4);
     }
-    /// `qh` does not follow `ql` contiguously for the half in question, so it is staged as its
-    /// own run and lands directly after the ninety-six-byte tile's first sixty-four.
-    __device__ static __forceinline__ const std::uint8_t*
-    tile_high_source(const void* blocks, int tile) {
-        const auto* b = static_cast<const block_q6_K*>(blocks) + tile / kTilesPerBlock;
-        return b->qh + 32 * ((tile % kTilesPerBlock) >> 1);
-    }
-
-    __device__ static __forceinline__ const std::uint8_t* header_source(const void* blocks,
-                                                                        int block) {
-        return reinterpret_cast<const std::uint8_t*>(
-            (static_cast<const block_q6_K*>(blocks) + block)->scales);
+    __device__ static __forceinline__ int header_offset(int tile) {
+        return (tile / kTilesPerBlock) * kBlockBytes + offsetof(block_q6_K, scales);
     }
 
-    /// The tile's first sixty-four bytes come from `ql`, its last thirty-two from `qh`.
-    __device__ static __forceinline__ const std::uint8_t* chunk_source(const void* blocks, int tile,
-                                                                       int chunk) {
-        return chunk < 4 ? tile_source(blocks, tile) + 16 * chunk
-                         : tile_high_source(blocks, tile) + 16 * (chunk - 4);
-    }
+
 
     __device__ static __forceinline__ __nv_bfloat162 decode(const std::uint8_t* tile,
                                                             const std::uint8_t* header, int lane,

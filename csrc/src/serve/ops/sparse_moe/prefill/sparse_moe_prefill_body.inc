@@ -732,14 +732,14 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
 /// Staging a row's tile: sixteen-byte `cp_async` where the block size allows it, scalar pairs for
 /// Q6_K, whose 210-byte block leaves consecutive blocks only two-byte aligned.
 template <class Codec>
-__device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const void* row_blocks, int tile,
-                                                int unit) {
+__device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const std::uint8_t* row_base,
+                                                int tile, int unit) {
     if constexpr (Codec::kCpAsync) {
-        cp_async<16, Cache::cg>(dst + 16 * unit, Codec::chunk_source(row_blocks, tile, unit));
+        cp_async<16, Cache::cg>(dst + 16 * unit, row_base + Codec::chunk_offset(tile, unit));
     } else {
-        const auto* src =
-            reinterpret_cast<const std::uint16_t*>(Codec::chunk_source(row_blocks, tile, unit / 8));
-        auto* out              = reinterpret_cast<std::uint16_t*>(dst + 16 * (unit / 8));
+        const auto* src = reinterpret_cast<const std::uint16_t*>(
+            row_base + Codec::chunk_offset(tile, unit / 8));
+        auto* out     = reinterpret_cast<std::uint16_t*>(dst + 16 * (unit / 8));
         out[unit % 8] = src[unit % 8];
     }
 }
@@ -749,9 +749,9 @@ __device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const void* r
 /// gate/up -- enough to lose a block per SM -- and re-read them through an uncoalesced prologue
 /// on every work item.
 template <class Codec>
-__device__ __forceinline__ void stage_ggml_header(std::uint8_t* dst, const void* row_blocks,
+__device__ __forceinline__ void stage_ggml_header(std::uint8_t* dst, const std::uint8_t* row_base,
                                                   int tile, int unit) {
-    const std::uint8_t* src = Codec::header_source(row_blocks, tile / ggml::kTilesPerBlock);
+    const std::uint8_t* src = row_base + Codec::header_offset(tile);
     if constexpr (Codec::kCpAsync) {
         cp_async<16, Cache::cg>(dst + 16 * unit, src + 16 * unit);
     } else {
