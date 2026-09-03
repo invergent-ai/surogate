@@ -81,7 +81,7 @@ stored once.
    prefill only against the BF16-activation kernel, and with the int8 route it
    measures 13,195 tok/s against the row-split path's 13,700 from an earlier
    pass, so one same-session comparison settles it. Decode is unaffected.
-3. **[~] GGUF coverage beyond the Qwen3.5/3.6 families.** A GGUF is servable only
+3. **[x] GGUF coverage beyond the Qwen3.5/3.6 families (2026-09-03).** A GGUF is servable only
    if `gguf_target_key` resolves it, and until today that was four Qwen shapes.
    Qwen3 now resolves and serves (a `Qwen3-0.6B` Q4_K_M converts, caches and
    answers), on two pieces of new machinery: `config.json` is **synthesised from
@@ -106,6 +106,11 @@ stored once.
    covers *those* sizes, not those families — Qwen3-8B still has nowhere to go.
    A GGUF published without a chat template is also refused, which is what the
    base `google.gemma-3-270m` files are.
+   **Any size of those three families now serves** (see item 6): the gates ask
+   for the architecture, the binders validate against the artifact's declared
+   dimensions, and Qwen3-1.7B is served by the target compiled for the 0.6B.
+   Llama and Gemma 3 took the same treatment; no second size of either was on
+   this machine to prove it with.
    **The official unsloth `Qwen3-0.6B-Q4_K_M.gguf` now serves**, after two
    things that only a published export exposes. It declares `<|vision_pad|>`
    where the Qwen repository declares `<|endoftext|>`, and the frontend asserted
@@ -139,24 +144,53 @@ stored once.
    `TextContext::cfg_` (324 call sites); the qwen3 converter writing the block,
    with `token_domain` taken from the tokenizer rather than the padded
    `vocab_size`.
-   Left: the runtime consumes it (the planner takes a geometry, the 49
-   `layouts_impl.h` reads and the ~59 scattered ones become `cfg` reads, five
-   `std::array` members sized by a compiled extent become vectors); the qwen3
-   target proves it on two sizes (0.6B and 1.7B share the registered
-   `Gqa128_16q8` shape); then the three Qwen3.5 directories collapse into one.
+   **The runtime consumes it, and one target serves every size of its family.**
+   `Qwen3-1.7B` is served by the target compiled for `Qwen3-0.6B`, from its
+   GGUF, through `surogate serve`; the 0.6B is unchanged to the token. What that
+   took: the planner and the sequence plan carry the geometry and the 49 layout
+   reads follow it; the workspace recipe (the shape contract the layout
+   simulation and the real schedule share) is parameterised by it, as are all
+   twelve projection workspace sizers across the nine targets; the program core
+   holds it and the scattered reads in decode, prefill, MTP, DFlash and the
+   request planner read it; the model view and the binding plans size their
+   layer storage when the weights are bound. The residual width is derived from
+   the hidden state for a family that does not widen it -- leaving it compiled
+   is a mismatch only the first embedding lookup finds.
+   Two kernel tables were the real gate, and both were policy rather than
+   limit. The fused ungated attention projection gained the 4096-row parent at
+   hidden 2048 (same row split as the 0.6B, so only K moves), and a K-quant
+   parent now splits by row range at any width, the way the gated one already
+   did. The w8 linear dispatcher no longer refuses a shape it has no measured
+   route for: its launchers take n, k and T at runtime, so unregistered shapes
+   take the family's default bands and the measured entries stay measured.
+   **Left: the three Qwen3.5 directories.** Their binders, variants and
+   converters now bind against the declared geometry and the artifacts state
+   it, so the mechanism is in place. The collapse itself is not done, and it is
+   not just a rename: the 2B carries a vision tower the other two do not, so a
+   merged target has to take that path with it. Two dimensions also stay
+   compiled in the hybrid forward interface and are marked in the code -- the
+   attention head width (the family's at every size) and the GDN output-gate
+   width (no runtime handle; the split projection payload would have to carry
+   it).
 7. **[ ] M4 — unify weight loading with the trainer.** Serve's `recipe.py` +
    `inventory.py` per target restate what the trainer's `hf_mapping` DSL already
    declares (`fuse`, `split`, `stack_experts`); the trainer's
    `SafeTensorsReader` is the better reader (multi-shard, GDS, strided).
 8. **[ ] K5c — fused K-quant GDN projection-and-convolution.** Built, measured,
    left off: costs more in kernel launches than it saves in bandwidth.
-9. **[ ] Drift to fix.** The MTP block can only be bound at `W8G32_F16S`/BF16,
-   so a K-quant GGUF that keeps its nextn tensors is refused (see item 11's
-   investigation); the published files strip nextn, which is why this has never
-   surfaced. Also: `--no-cache` is unimplemented, `surogate convert` does
-   not exist, and `surogate/serve/tools/README.md` still tells users to download
-   artifacts from Hugging Face — a posture the owner rejected — while linking
-   three files that do not exist.
+9. **[x] Drift to fix (2026-09-03).** The MTP block's five matrices demanded
+   `W8G32_F16S`, so a GGUF keeping its nextn tensors was refused; nothing in the
+   kernels wanted that, since they dispatch on the weight's qtype. They bind
+   through the same `bind_linear` the text layers use. Proved on our own
+   `surogate quantize` export of Qwen3.5-0.8B, whose q4_k_m mixture puts
+   `eh_proj` at Q4_K: 12 MTP objects across BF16, Q4_K, Q6_K and W8G32_F16S bind
+   and serve, where that file previously failed on `mtp/input_projection`.
+   `--no-cache` was in the help text and did nothing; it now skips cache reuse
+   on every path, which is what you want after editing a converter, since the
+   cache is keyed on the checkpoint. The tools README no longer tells users to
+   download artifacts from Hugging Face and its links resolve.
+   `surogate convert` still does not exist and is not wanted: `surogate serve`
+   converts.
    **The converter is not a tool** (owner, 2026-09-03). `surogate serve` runs it
    on every first load, so `serve/tools/convert/` is now `serve/convert/` and
    `serve/tools/artifact/` is `serve/artifact/`; `serve/tools/` keeps the
