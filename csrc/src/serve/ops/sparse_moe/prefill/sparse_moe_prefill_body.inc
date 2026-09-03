@@ -718,6 +718,375 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// GGML K-quant routed experts. Same tiling, staging and MMA as the row-split kernels above; what
+// differs is where a weight's scale lives. A row-split group is 64 values with one scale, so
+// those kernels feed the MMA raw integer codes and scale the accumulator afterwards. A K-quant's
+// 64-wide tile spans two 32-value sub-blocks (four 16-value ones for Q6_K) with different scales,
+// and Q4_K/Q5_K are affine -- their min term depends on the activation sum over the sub-block and
+// cannot be folded into a post-MMA multiply at all. So these dequantise inside `decode_weight`
+// and let the MMA accumulate finished BF16, which also makes the epilogue shorter.
+// ---------------------------------------------------------------------------------------------
+
+/// Staging a row's tile: sixteen-byte `cp_async` where the block size allows it, scalar pairs for
+/// Q6_K, whose 210-byte block leaves consecutive blocks only two-byte aligned.
+template <class Codec>
+__device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const void* row_blocks, int tile,
+                                                int chunk_or_unit) {
+    if constexpr (Codec::kCpAsync) {
+        cp_async<16, Cache::cg>(dst + 16 * chunk_or_unit,
+                                Codec::chunk_source(row_blocks, tile, chunk_or_unit));
+    } else {
+        const auto* src = reinterpret_cast<const std::uint16_t*>(
+            Codec::chunk_source(row_blocks, tile, chunk_or_unit / 8));
+        auto* out = reinterpret_cast<std::uint16_t*>(dst + 16 * (chunk_or_unit / 8));
+        out[chunk_or_unit % 8] = src[chunk_or_unit % 8];
+    }
+}
+
+template <class Codec, int ExpertWarps, int ExpertBN>
+__global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_gate_up_kernel(
+    const __nv_bfloat16* __restrict__ gathered, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ slot_of_expert, const int* __restrict__ route_job_count,
+    const std::uint8_t* __restrict__ blocks, __nv_bfloat16* __restrict__ activation) {
+    constexpr int ExpertThreads = ExpertWarps * 32;
+    constexpr int BlocksPerRow  = kHidden / ggml::QK_K;
+    constexpr int TileUnits     = Codec::kCpAsync ? Codec::kTileBytes / 16 : Codec::kTileBytes / 2;
+    constexpr int WarpCols      = ExpertBN / ExpertWarps;
+    constexpr int WarpNT        = WarpCols / 8;
+    static_assert(ExpertBN % ExpertWarps == 0 && WarpCols % 8 == 0);
+    __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
+    __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
+    __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * Codec::kTileBytes];
+    __shared__ __align__(16) std::uint8_t Hdr[kExpertBM * BlocksPerRow * Codec::kHeaderBytes];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int a_mat          = lane >> 3;
+    const int a_rin          = lane & 7;
+    const int a_rowoff       = a_rin + ((a_mat & 1) << 3);
+    const int a_coloff       = (a_mat >> 1) << 3;
+    const int b_rin          = lane & 7;
+    const int b_koff         = ((lane >> 3) & 1) << 3;
+    const int gid            = lane >> 2;
+    const int lid            = lane & 3;
+    constexpr int row_blocks = kIntermediate / (kExpertBM / 2);
+    const int total_work     = *route_job_count * row_blocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work;
+         work += static_cast<int>(gridDim.x)) {
+        const int route_job     = work / row_blocks;
+        const int row_block     = work - route_job * row_blocks;
+        const int expert        = route_job_experts[route_job];
+        const int block = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+        if (block < 0) { continue; }
+        const int logical0      = row_block * (kExpertBM / 2);
+        const int begin         = expert_offsets[expert];
+        const int count         = expert_offsets[expert + 1] - begin;
+        const int column_base   = route_job_columns[route_job];
+        const int cols          = count - column_base < ExpertBN ? count - column_base : ExpertBN;
+        float acc[4][WarpNT][4] = {};
+
+        auto global_row = [&](int local_row) {
+            const int logical = logical0 + (local_row & (kExpertBM / 2 - 1));
+            return block * (2 * kIntermediate) + logical +
+                   (local_row >= kExpertBM / 2 ? kIntermediate : 0);
+        };
+        auto row_base = [&](int local_row) {
+            return blocks + static_cast<std::int64_t>(global_row(local_row)) * BlocksPerRow *
+                                Codec::kBlockBytes;
+        };
+
+        // Every tile of a superblock reads the same header, so the row block's headers are staged
+        // once rather than four times over. Scalar: the run is small and its stride is a block.
+        auto stage_headers = [&] {
+            constexpr int PerRow = BlocksPerRow * Codec::kHeaderBytes;
+            for (int item = tid; item < kExpertBM * PerRow; item += ExpertThreads) {
+                const int row  = item / PerRow;
+                const int off  = item - row * PerRow;
+                const int b    = off / Codec::kHeaderBytes;
+                const int byte = off - b * Codec::kHeaderBytes;
+                Hdr[item]      = Codec::header_source(row_base(row), b)[byte];
+            }
+        };
+
+        auto stage_inputs = [&](int stage, int kt) {
+            const int k0 = kt * kExpertBK;
+            for (int item = tid; item < ExpertBN * (kExpertBK / 8); item += ExpertThreads) {
+                const int col        = item / (kExpertBK / 8);
+                const int k8         = item - col * (kExpertBK / 8);
+                const int packed_col = begin + column_base + col;
+                auto* dst            = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
+                const auto* src =
+                    gathered +
+                    static_cast<std::int64_t>(col < cols ? packed_col : begin) * kHidden + k0 +
+                    k8 * 8;
+                cp_async_zfill<16, Cache::cg>(dst, src, col < cols ? 16 : 0);
+            }
+            for (int item = tid; item < kExpertBM * TileUnits; item += ExpertThreads) {
+                const int row  = item / TileUnits;
+                const int unit = item - row * TileUnits;
+                stage_ggml_tile<Codec>(&Cr[stage][row * Codec::kTileBytes], row_base(row), kt, unit);
+            }
+        };
+
+        auto decode_weight = [&](int stage, int kt) {
+            for (int row = warp; row < kExpertBM; row += ExpertWarps) {
+                const __nv_bfloat162 value = Codec::decode(
+                    &Cr[stage][row * Codec::kTileBytes],
+                    &Hdr[(row * BlocksPerRow + kt / ggml::kTilesPerBlock) * Codec::kHeaderBytes],
+                    lane, kt % ggml::kTilesPerBlock);
+                store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
+            }
+        };
+
+        stage_headers();
+#pragma unroll
+        for (int stage = 0; stage < kExpertStages; ++stage) {
+            stage_inputs(stage, stage);
+            cp_commit();
+        }
+
+#pragma unroll 1
+        for (int kt = 0; kt < kHidden / kExpertBK; ++kt) {
+            const int stage = kt & 1;
+            cp_wait<kExpertStages - 1>();
+            __syncthreads();
+            decode_weight(stage, kt);
+            __syncthreads();
+
+            if (warp * WarpCols < cols) {
+#pragma unroll
+                for (int ki = 0; ki < kExpertBK / 16; ++ki) {
+                    unsigned af[4][4];
+                    unsigned bf[WarpNT][2];
+#pragma unroll
+                    for (int mi = 0; mi < 4; ++mi) {
+                        const int row = mi * 16 + a_rowoff;
+                        const int col = ki * 16 + a_coloff;
+                        ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                    }
+#pragma unroll
+                    for (int ni = 0; ni < WarpNT; ++ni) {
+                        const int brow = warp * WarpCols + ni * 8 + b_rin;
+                        const int bcol = ki * 16 + b_koff;
+                        ldmatrix_x2(bf[ni][0], bf[ni][1],
+                                    smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+#pragma unroll
+                        for (int mi = 0; mi < 4; ++mi) {
+                            mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                     af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0],
+                                     bf[ni][1]);
+                        }
+                    }
+                }
+            }
+
+            __syncthreads();
+            const int next = kt + kExpertStages;
+            if (next < kHidden / kExpertBK) { stage_inputs(stage, next); }
+            cp_commit();
+        }
+        cp_wait<0>();
+        __syncthreads();
+
+        if (warp * WarpCols < cols) {
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                const int row0 = logical0 + mi * 16 + gid;
+                const int row1 = row0 + 8;
+#pragma unroll
+                for (int ni = 0; ni < WarpNT; ++ni) {
+                    const int col0       = begin + column_base + warp * WarpCols + ni * 8 + 2 * lid;
+                    const int col1       = col0 + 1;
+                    const int local_col0 = warp * WarpCols + ni * 8 + 2 * lid;
+                    const int local_col1 = local_col0 + 1;
+                    if (local_col0 < cols) {
+                        activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
+                            __float2bfloat16_rn(silu(acc[mi][ni][0]) * acc[mi + 2][ni][0]);
+                        activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
+                            __float2bfloat16_rn(silu(acc[mi][ni][2]) * acc[mi + 2][ni][2]);
+                    }
+                    if (local_col1 < cols) {
+                        activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
+                            __float2bfloat16_rn(silu(acc[mi][ni][1]) * acc[mi + 2][ni][1]);
+                        activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
+                            __float2bfloat16_rn(silu(acc[mi][ni][3]) * acc[mi + 2][ni][3]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <class Codec, int ExpertWarps, int ExpertBN>
+__global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_down_kernel(
+    const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
+    const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
+    const int* __restrict__ slot_of_expert, const int* __restrict__ route_job_count,
+    const std::uint8_t* __restrict__ blocks, __nv_bfloat16* __restrict__ output) {
+    constexpr int ExpertThreads = ExpertWarps * 32;
+    constexpr int BlocksPerRow  = kIntermediate / ggml::QK_K;
+    constexpr int TileUnits     = Codec::kCpAsync ? Codec::kTileBytes / 16 : Codec::kTileBytes / 2;
+    __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
+    __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
+    __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * Codec::kTileBytes];
+    __shared__ __align__(16) std::uint8_t Hdr[kExpertBM * BlocksPerRow * Codec::kHeaderBytes];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int a_mat          = lane >> 3;
+    const int a_rin          = lane & 7;
+    const int a_rowoff       = a_rin + ((a_mat & 1) << 3);
+    const int a_coloff       = (a_mat >> 1) << 3;
+    const int b_rin          = lane & 7;
+    const int b_koff         = ((lane >> 3) & 1) << 3;
+    const int gid            = lane >> 2;
+    const int lid            = lane & 3;
+    constexpr int row_blocks = kHidden / kExpertBM;
+    const int total_work     = *route_job_count * row_blocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work;
+         work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / row_blocks;
+        const int row_block   = work - route_job * row_blocks;
+        const int expert      = route_job_experts[route_job];
+        const int block = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+        if (block < 0) { continue; }
+        const int row0        = row_block * kExpertBM;
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = count - column_base < ExpertBN ? count - column_base : ExpertBN;
+        float acc[4][4]       = {};
+
+        auto row_base = [&](int local_row) {
+            const int global_row = block * kHidden + row0 + local_row;
+            return blocks +
+                   static_cast<std::int64_t>(global_row) * BlocksPerRow * Codec::kBlockBytes;
+        };
+
+        auto stage_headers = [&] {
+            constexpr int PerRow = BlocksPerRow * Codec::kHeaderBytes;
+            for (int item = tid; item < kExpertBM * PerRow; item += ExpertThreads) {
+                const int row  = item / PerRow;
+                const int off  = item - row * PerRow;
+                const int b    = off / Codec::kHeaderBytes;
+                const int byte = off - b * Codec::kHeaderBytes;
+                Hdr[item]      = Codec::header_source(row_base(row), b)[byte];
+            }
+        };
+
+        auto stage_inputs = [&](int stage, int kt) {
+            const int k0 = kt * kExpertBK;
+            for (int item = tid; item < ExpertBN * (kExpertBK / 8); item += ExpertThreads) {
+                const int col        = item / (kExpertBK / 8);
+                const int k8         = item - col * (kExpertBK / 8);
+                const int packed_col = begin + column_base + col;
+                auto* dst            = &Bs[stage][col * kExpertBK + gemm_swz64(col, k8 * 8)];
+                const auto* src =
+                    activation +
+                    static_cast<std::int64_t>(col < cols ? packed_col : begin) * kIntermediate +
+                    k0 + k8 * 8;
+                cp_async_zfill<16, Cache::cg>(dst, src, col < cols ? 16 : 0);
+            }
+            for (int item = tid; item < kExpertBM * TileUnits; item += ExpertThreads) {
+                const int row  = item / TileUnits;
+                const int unit = item - row * TileUnits;
+                stage_ggml_tile<Codec>(&Cr[stage][row * Codec::kTileBytes], row_base(row), kt, unit);
+            }
+        };
+
+        auto decode_weight = [&](int stage, int kt) {
+            for (int row = warp; row < kExpertBM; row += ExpertWarps) {
+                const __nv_bfloat162 value = Codec::decode(
+                    &Cr[stage][row * Codec::kTileBytes],
+                    &Hdr[(row * BlocksPerRow + kt / ggml::kTilesPerBlock) * Codec::kHeaderBytes],
+                    lane, kt % ggml::kTilesPerBlock);
+                store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
+            }
+        };
+
+        stage_headers();
+#pragma unroll
+        for (int stage = 0; stage < kExpertStages; ++stage) {
+            stage_inputs(stage, stage);
+            cp_commit();
+        }
+
+#pragma unroll 1
+        for (int kt = 0; kt < kIntermediate / kExpertBK; ++kt) {
+            const int stage = kt & 1;
+            cp_wait<kExpertStages - 1>();
+            __syncthreads();
+            decode_weight(stage, kt);
+            __syncthreads();
+
+            if (warp * 8 < cols) {
+#pragma unroll
+                for (int ki = 0; ki < kExpertBK / 16; ++ki) {
+                    unsigned af[4][4];
+                    unsigned bf[2];
+#pragma unroll
+                    for (int mi = 0; mi < 4; ++mi) {
+                        const int row = mi * 16 + a_rowoff;
+                        const int col = ki * 16 + a_coloff;
+                        ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                                    smem_addr(&As[row * kExpertBK + gemm_swz64(row, col)]));
+                    }
+                    const int brow = warp * 8 + b_rin;
+                    const int bcol = ki * 16 + b_koff;
+                    ldmatrix_x2(bf[0], bf[1],
+                                smem_addr(&Bs[stage][brow * kExpertBK + gemm_swz64(brow, bcol)]));
+#pragma unroll
+                    for (int mi = 0; mi < 4; ++mi) {
+                        mma_bf16(acc[mi][0], acc[mi][1], acc[mi][2], acc[mi][3], af[mi][0],
+                                 af[mi][1], af[mi][2], af[mi][3], bf[0], bf[1]);
+                    }
+                }
+            }
+
+            __syncthreads();
+            const int next = kt + kExpertStages;
+            if (next < kIntermediate / kExpertBK) { stage_inputs(stage, next); }
+            cp_commit();
+        }
+        cp_wait<0>();
+        __syncthreads();
+
+        if (warp * 8 < cols) {
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi) {
+                const int output_row0 = row0 + mi * 16 + gid;
+                const int output_row1 = output_row0 + 8;
+                const int col0        = begin + column_base + warp * 8 + 2 * lid;
+                const int col1        = col0 + 1;
+                const int local_col0  = warp * 8 + 2 * lid;
+                const int local_col1  = local_col0 + 1;
+                if (local_col0 < cols) {
+                    output[static_cast<std::int64_t>(col0) * kHidden + output_row0] =
+                        __float2bfloat16_rn(acc[mi][0]);
+                    output[static_cast<std::int64_t>(col0) * kHidden + output_row1] =
+                        __float2bfloat16_rn(acc[mi][2]);
+                }
+                if (local_col1 < cols) {
+                    output[static_cast<std::int64_t>(col1) * kHidden + output_row0] =
+                        __float2bfloat16_rn(acc[mi][1]);
+                    output[static_cast<std::int64_t>(col1) * kHidden + output_row1] =
+                        __float2bfloat16_rn(acc[mi][3]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 struct Q5DownMma {
     static constexpr int kHighBytes = Q5RowSplitStorage::kHighBytesPerGroup;
 
@@ -1355,6 +1724,37 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                         weights.slot_of_expert, route_job_count, routed_gate_codes,
                         routed_gate_scales, routed_activation);
             }
+        } else if (weights.routed_gate_up.qtype == QType::Q4_K ||
+                   weights.routed_gate_up.qtype == QType::Q5_K ||
+                   weights.routed_gate_up.qtype == QType::Q6_K) {
+            // A K-quant row is a whole number of 256-value superblocks. Every geometry that
+            // serves one satisfies this; the guard keeps the kernel from being instantiated for
+            // the others, which share this body.
+            if constexpr (kHidden % ggml::QK_K != 0 || kIntermediate % ggml::QK_K != 0) {
+                throw std::invalid_argument(
+                    "sparse_moe prefill: this geometry's rows are not whole superblocks");
+            } else {
+            const auto launch_ggml_gate_up = [&]<class Codec>() {
+                if (wide_plan) {
+                    sparse_moe_prefill_ggml_gate_up_kernel<Codec, 8, 64>
+                        <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                            grouped_io, offsets, route_job_experts, route_job_columns,
+                            weights.slot_of_expert, route_job_count, routed_gate_codes,
+                            routed_activation);
+                } else {
+                    sparse_moe_prefill_ggml_gate_up_kernel<Codec, 4, 32>
+                        <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                            grouped_io, offsets, route_job_experts, route_job_columns,
+                            weights.slot_of_expert, route_job_count, routed_gate_codes,
+                            routed_activation);
+                }
+            };
+            switch (weights.routed_gate_up.qtype) {
+            case QType::Q4_K: launch_ggml_gate_up.operator()<ggml::GgmlQ4KPrefill>(); break;
+            case QType::Q5_K: launch_ggml_gate_up.operator()<ggml::GgmlQ5KPrefill>(); break;
+            default:          launch_ggml_gate_up.operator()<ggml::GgmlQ6KPrefill>(); break;
+            }
+            }
         } else if (weights.routed_gate_up.qtype == QType::W8G32_F16S) {
             sparse_moe_prefill_w8_gate_up_kernel<true>
                 <<<routed_gate_grid, kExpertThreads, 0, stream>>>(
@@ -1433,6 +1833,34 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                     routed_activation, offsets, weights.slot_of_expert, routed_down_codes,
                     routed_down_scales, grouped_io, nullptr, nullptr, nullptr, tokens, nullptr);
             break;
+        case QType::Q4_K:
+        case QType::Q5_K:
+        case QType::Q6_K: {
+            if constexpr (kHidden % ggml::QK_K != 0 || kIntermediate % ggml::QK_K != 0) {
+                throw std::invalid_argument(
+                    "sparse_moe prefill: this geometry's rows are not whole superblocks");
+            } else {
+            const auto launch_ggml_down = [&]<class Codec>() {
+                if (wide_plan) {
+                    sparse_moe_prefill_ggml_down_kernel<Codec, 8, 64>
+                        <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
+                            routed_activation, offsets, route_job_experts, route_job_columns,
+                            weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
+                } else {
+                    sparse_moe_prefill_ggml_down_kernel<Codec, 4, 32>
+                        <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
+                            routed_activation, offsets, route_job_experts, route_job_columns,
+                            weights.slot_of_expert, route_job_count, routed_down_codes, grouped_io);
+                }
+            };
+            switch (weights.routed_down.qtype) {
+            case QType::Q4_K: launch_ggml_down.operator()<ggml::GgmlQ4KPrefill>(); break;
+            case QType::Q5_K: launch_ggml_down.operator()<ggml::GgmlQ5KPrefill>(); break;
+            default:          launch_ggml_down.operator()<ggml::GgmlQ6KPrefill>(); break;
+            }
+            }
+            break;
+        }
         default:
             throw std::invalid_argument("sparse_moe prefill: unsupported down codec");
         }

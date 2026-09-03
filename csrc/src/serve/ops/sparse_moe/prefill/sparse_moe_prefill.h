@@ -18,6 +18,9 @@ namespace sinfer::ops::detail {
 inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
+/// GGML K-quants share the Q4/Q5 tiling, so they cross over where those do; measured, not
+/// assumed -- below this the small-T slices win.
+inline constexpr std::int32_t kSparseMoePrefillGgmlKMin     = 47;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;

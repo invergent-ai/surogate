@@ -19,6 +19,10 @@ std::int32_t prefill_min_tokens(QType routed_gate_up, QType routed_down) noexcep
     if (routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S) {
         return kSparseMoePrefillW8W8Min;
     }
+    const auto is_ggml_k = [](QType qtype) {
+        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K;
+    };
+    if (is_ggml_k(routed_gate_up) && is_ggml_k(routed_down)) { return kSparseMoePrefillGgmlKMin; }
     return 0;
 }
 
