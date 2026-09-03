@@ -355,8 +355,10 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     }
     const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
     if (prefill_interval_first <= max_tokens) {
-        required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(
-                                          geometry, max_tokens, nvfp4_profile));
+        required = std::max(required,
+                            detail::sparse_moe_prefill_workspace_bytes(
+                                geometry, max_tokens, nvfp4_profile,
+                                detail::sparse_moe_routed_int8_profile(routed_gate_up, routed_down)));
     }
     return required;
 }
@@ -436,7 +438,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
             detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down);
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, geometry, plan.slice_tokens,
-                                                          plan.routed_trtllm);
+                                                          plan.routed_trtllm, plan.routed_int8);
         detail::sparse_moe_prefill_launch(geometry, x, weights, destination, plan, views, stream,
                                           round_hook);
         return;

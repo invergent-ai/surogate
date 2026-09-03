@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -1089,6 +1090,14 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                 impl_->tokenizer->render_chat_template(plain, options.add_generation_prompt);
         } else {
             rendered = impl_->chat_template.render(messages, render_options(options));
+        }
+        // `SUROGATE_SERVE_RAW_PROMPT`: a lone text-only user message is the prompt itself, no
+        // template around it. Measurement only -- it is how a perplexity run scores raw text
+        // the way llama-perplexity does, since a chat turn changes what the model predicts.
+        static const bool raw_prompt = std::getenv("SUROGATE_SERVE_RAW_PROMPT") != nullptr;
+        if (raw_prompt && messages.size() == 1 && messages.front().role == ChatRole::User) {
+            rendered      = fi::RenderedChat{};
+            rendered.text = messages.front().rendered_content();
         }
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);

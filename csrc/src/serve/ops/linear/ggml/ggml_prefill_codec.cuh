@@ -40,6 +40,38 @@ struct GgmlQ4KPrefill {
     /// this is the only K-quant whose gate/up fits three blocks to an SM.
     static constexpr int kMinBlocks   = 3;
 
+    // ---- the int8 tensor-core route ----
+    /// Padded row strides in shared memory: the unpack reads one word per row across eight
+    /// consecutive rows, and twelve words a row visits every bank once before repeating.
+    static constexpr int kTileStride   = 48;
+    static constexpr int kHeaderStride = 16;
+    /// Scales per superblock and the width each covers; an MMA group must not straddle one.
+    static constexpr int kScaleGroups = 8;
+    static constexpr int kScaleWidth  = 32;
+    static constexpr bool kHasMin     = true;
+
+    /// The codes of quad `q` (values 4q..4q+3) of both 32-value halves of a 64-wide tile, each
+    /// packed as four int8 in one word with value i in byte i -- the s8 MMA fragment order. The
+    /// codes stay unsigned; the affine correction is the epilogue's.
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)header;
+        (void)tile_in_block;
+        const unsigned w = *reinterpret_cast<const unsigned*>(tile + 4 * q);
+        lo = w & 0x0F0F0F0Fu;
+        hi = (w >> 4) & 0x0F0F0F0Fu;
+    }
+    /// (d*sc, dmin*m) of sub-block `index` of the superblock whose header is given.
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const __half2 dm = *reinterpret_cast<const __half2*>(header);
+        std::uint8_t sc  = 0;
+        std::uint8_t m   = 0;
+        get_scale_min_k4(index, header + 2 * sizeof(__half), sc, m);
+        return make_float2(__low2float(dm) * static_cast<float>(sc),
+                           __high2float(dm) * static_cast<float>(m));
+    }
+
     /// Byte offset of one staged chunk from the row's first superblock. Row-independent by
     /// construction: the row's base already costs a 64-bit multiply, and folding the block
     /// stride in there too made it two per staged chunk rather than one per row.
@@ -87,6 +119,33 @@ struct GgmlQ5KPrefill {
     static constexpr int kBlockBytes = sizeof(block_q5_K); // 176, also a multiple of sixteen
     static constexpr bool kCpAsync   = true;
     static constexpr int kMinBlocks  = 2; // its header carries qh as well, so the tile costs more
+
+    // ---- the int8 tensor-core route ----
+    static constexpr int kTileStride   = 48;
+    static constexpr int kHeaderStride = 48; // dm, scales, qh: already twelve words
+    static constexpr int kScaleGroups  = 8;
+    static constexpr int kScaleWidth   = 32;
+    static constexpr bool kHasMin      = true;
+
+    /// As Q4_K, plus the fifth bit: one `qh` bit position per 32-value sub-block, so the low
+    /// half of the tile takes position `2*tile_in_block` and the high half the one above it.
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        const unsigned w  = *reinterpret_cast<const unsigned*>(tile + 4 * q);
+        const unsigned qh = *reinterpret_cast<const unsigned*>(header + 2 * sizeof(__half) +
+                                                               K_SCALE_SIZE + 4 * q);
+        lo = (w & 0x0F0F0F0Fu) | (((qh >> (2 * tile_in_block)) & 0x01010101u) << 4);
+        hi = ((w >> 4) & 0x0F0F0F0Fu) | (((qh >> (2 * tile_in_block + 1)) & 0x01010101u) << 4);
+    }
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const __half2 dm = *reinterpret_cast<const __half2*>(header);
+        std::uint8_t sc  = 0;
+        std::uint8_t m   = 0;
+        get_scale_min_k4(index, header + 2 * sizeof(__half), sc, m);
+        return make_float2(__low2float(dm) * static_cast<float>(sc),
+                           __high2float(dm) * static_cast<float>(m));
+    }
 
     __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
         return (tile / kTilesPerBlock) * kBlockBytes + offsetof(block_q5_K, qs) +
@@ -139,6 +198,48 @@ struct GgmlQ6KPrefill {
     static constexpr int kBlockBytes = sizeof(block_q6_K);
     static constexpr bool kCpAsync   = false;
     static constexpr int kMinBlocks  = 2;
+
+    // ---- the int8 tensor-core route ----
+    static constexpr int kTileStride   = 112; // 96 bytes of codes; twenty-eight words a row
+    static constexpr int kHeaderStride = 32;
+    /// Sixteen scales of sixteen values each, so this codec's MMA groups are sixteen deep.
+    static constexpr int kScaleGroups = 16;
+    static constexpr int kScaleWidth  = 16;
+    /// Symmetric: the 32 the format subtracts is folded into the codes here, which makes them
+    /// signed int8 and leaves nothing for a min term to do.
+    static constexpr bool kHasMin = false;
+
+    __device__ static __forceinline__ unsigned minus_32(unsigned v) {
+        // Per byte, v - 32 for v in 0..63: keep the low five bits and let bit five's complement
+        // fill the top three (0x20 * 7 == 0xE0, and nothing carries between bytes).
+        return (v & 0x1F1F1F1Fu) | (((v & 0x20202020u) ^ 0x20202020u) * 7u);
+    }
+    /// The low half of the tile is stripe `2*odd`, the high half stripe `2*odd + 1`; a stripe's
+    /// nibble sits in `ql[32 * (stripe & 1) + i]` shifted by `4 * (stripe >> 1)`, and its two
+    /// high bits in `qh[i]` at `2 * stripe`.
+    __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
+                                                  const std::uint8_t* header, int tile_in_block,
+                                                  int q, unsigned& lo, unsigned& hi) {
+        (void)header;
+        const int odd       = tile_in_block & 1;
+        const int shift     = 4 * odd;
+        const unsigned ql0  = *reinterpret_cast<const unsigned*>(tile + 4 * q);
+        const unsigned ql1  = *reinterpret_cast<const unsigned*>(tile + 32 + 4 * q);
+        const unsigned qh   = *reinterpret_cast<const unsigned*>(tile + 64 + 4 * q);
+        const unsigned lo6  = ((ql0 >> shift) & 0x0F0F0F0Fu) |
+                              (((qh >> (4 * odd)) & 0x03030303u) << 4);
+        const unsigned hi6  = ((ql1 >> shift) & 0x0F0F0F0Fu) |
+                              (((qh >> (4 * odd + 2)) & 0x03030303u) << 4);
+        lo = minus_32(lo6);
+        hi = minus_32(hi6);
+    }
+    /// `index` counts sixteen-value groups within the superblock; the format's scale for the
+    /// values a tile reads is `scales[4 * tile_in_block + h]` for its h-th sixteen.
+    __device__ static __forceinline__ float2 scale_pair(const std::uint8_t* header, int index) {
+        const auto* scales = reinterpret_cast<const std::int8_t*>(header);
+        const __half d_all = *reinterpret_cast<const __half*>(header + QK_K / 16);
+        return make_float2(__half2float(d_all) * static_cast<float>(scales[index]), 0.0f);
+    }
 
     /// The tile's first sixty-four bytes come from `ql`, its last thirty-two from `qh`, which
     /// does not follow `ql` contiguously for the half in question.

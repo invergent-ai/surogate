@@ -3,6 +3,7 @@
 #include "core/layout.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace sinfer::ops::detail {
@@ -34,14 +35,27 @@ bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
     return minimum != 0 && tokens >= minimum;
 }
 
+bool sparse_moe_routed_int8_profile(QType routed_gate_up, QType routed_down) noexcept {
+    const auto is_k = [](QType type) {
+        return type == QType::Q4_K || type == QType::Q5_K || type == QType::Q6_K;
+    };
+    static const bool vetoed = [] {
+        const char* env = std::getenv("SUROGATE_SERVE_MOE_INT8");
+        return env != nullptr && env[0] == '0';
+    }();
+    return !vetoed && is_k(routed_gate_up) && is_k(routed_down);
+}
+
 std::size_t sparse_moe_prefill_workspace_bytes(const SparseMoeGeometry& geometry,
-                                               std::int32_t max_tokens, bool routed_trtllm) {
+                                               std::int32_t max_tokens, bool routed_trtllm,
+                                               bool routed_int8) {
     if (max_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: max_tokens must be at least 1");
     }
     const std::int32_t capacity_tokens = std::min(max_tokens, kSparseMoePrefillSliceMax);
     WorkspaceLayoutBuilder layout;
-    (void)allocate_sparse_moe_prefill_workspace(layout, geometry, capacity_tokens, routed_trtllm);
+    (void)allocate_sparse_moe_prefill_workspace(layout, geometry, capacity_tokens, routed_trtllm,
+                                                routed_int8);
     return layout.peak_bytes(1);
 }
 
@@ -58,8 +72,10 @@ SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& ge
     const std::int32_t slice_tokens = std::min(tokens, kSparseMoePrefillSliceMax);
     const bool routed_trtllm =
         routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
+    const bool routed_int8 = sparse_moe_routed_int8_profile(routed_gate_up, routed_down);
     return {tokens, slice_tokens,
-            sparse_moe_prefill_workspace_bytes(geometry, tokens, routed_trtllm), routed_trtllm};
+            sparse_moe_prefill_workspace_bytes(geometry, tokens, routed_trtllm, routed_int8),
+            routed_trtllm, routed_int8};
 }
 
 } // namespace sinfer::ops::detail

@@ -38,7 +38,15 @@ struct SparseMoePrefillPlan {
     /// gather/gate-up/down/reduce chain. Set for the NVFP4 routed profile, whose weights are
     /// stored in that runner's [up; gate] row order and have no kernel of ours.
     bool routed_trtllm = false;
+    /// The routed K-quant experts run on the int8 tensor-core route: activations quantised to
+    /// int8 per 32 values with a (scale, sum) pair each, the way llama.cpp's MMQ feeds them,
+    /// and the weights' own codes as the other MMA operand. Set for the Q4_K/Q5_K/Q6_K routed
+    /// profile unless `SUROGATE_SERVE_MOE_INT8=0` asks for the BF16-activation kernels.
+    bool routed_int8 = false;
 };
+
+/// Whether a routed codec pair takes the int8 tensor-core route.
+[[nodiscard]] bool sparse_moe_routed_int8_profile(QType routed_gate_up, QType routed_down) noexcept;
 
 struct SparseMoePrefillWorkspace {
     Tensor token_ids;
@@ -65,6 +73,15 @@ struct SparseMoePrefillWorkspace {
     Tensor grouped_io;
     Tensor routed_storage;
     Tensor routed_sum;
+    /// Only for a `routed_int8` plan. `column_token` names the token each packed column came
+    /// from, so the gate/up input is quantised once per token and gathered by the kernel; the
+    /// down input is per assignment because the SwiGLU output is. Each `*_ds` plane holds one
+    /// half2 of (scale, sum) per 32 values, stored as FP16 pairs.
+    Tensor column_token;
+    Tensor act_codes;
+    Tensor act_ds;
+    Tensor mid_codes;
+    Tensor mid_ds;
     /// Only allocated for a `routed_trtllm` plan: the runner's own scratch, its BF16 output block
     /// and its permutation map, laid out by `trtllm_moe::workspace_bytes`.
     DeviceSpan trtllm_workspace;
@@ -74,7 +91,8 @@ template <class Arena>
 SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                                                                 const SparseMoeGeometry& geometry,
                                                                 std::int32_t capacity_tokens,
-                                                                bool routed_trtllm = false) {
+                                                                bool routed_trtllm = false,
+                                                                bool routed_int8   = false) {
     SparseMoePrefillWorkspace out;
     const std::int32_t assignments = geometry.experts_per_token * capacity_tokens;
     const std::int32_t experts     = geometry.experts;
@@ -114,6 +132,13 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
 
     out.routed_storage = arena.alloc(DType::BF16, {inter, assignments}, 256);
     out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {hidden, capacity_tokens});
+    if (routed_int8) {
+        out.column_token = arena.alloc(DType::I32, {assignments}, 256);
+        out.act_codes    = arena.alloc(DType::I8, {hidden, capacity_tokens}, 256);
+        out.act_ds       = arena.alloc(DType::FP16, {2 * (hidden / 32), capacity_tokens}, 256);
+        out.mid_codes    = arena.alloc(DType::I8, {inter, assignments}, 256);
+        out.mid_ds       = arena.alloc(DType::FP16, {2 * (inter / 32), assignments}, 256);
+    }
     if (routed_trtllm) {
         out.trtllm_workspace =
             arena.alloc_bytes(trtllm_moe::workspace_bytes(
@@ -130,7 +155,8 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                                            QType routed_down) noexcept;
 [[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(const SparseMoeGeometry& geometry,
                                                              std::int32_t max_tokens,
-                                                             bool routed_trtllm = false);
+                                                             bool routed_trtllm,
+                                                             bool routed_int8 = false);
 [[nodiscard]] SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& geometry,
                                                                    std::int32_t tokens,
                                                                    QType routed_gate_up,

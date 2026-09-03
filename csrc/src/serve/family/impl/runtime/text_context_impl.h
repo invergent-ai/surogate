@@ -9,9 +9,14 @@
 #include "family/impl/runtime/visual_scatter.h"
 #include "family/impl/runtime/vision_context.h"
 #include <array>
+#include <cmath>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <chrono>
 #include <api/family/vision_control.h>
 #include "api/ops/argmax.h"
+#include "api/ops/next_token_nll.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/causal_conv1d_silu.h"
@@ -1218,6 +1223,78 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     }
 }
 
+/// `SUROGATE_SERVE_NLL_DUMP=<path>`: after every eager prefill chunk, append one line per prompt
+/// position holding the token there, the token that follows it, the negative log-likelihood
+/// the model assigned to that following token -- what a perplexity measurement sums -- and the
+/// token the model ranked first. It runs
+/// the head over every prompt column in slices, so it costs a full lm_head pass and a stream
+/// synchronisation per chunk; it is for measurement, never for serving, and cannot run inside
+/// a captured graph (set `SUROGATE_SERVE_PREFILL_GRAPH=0` and `SUROGATE_SERVE_NO_MIXED_GRAPH=1`
+/// to keep prefill eager while measuring).
+template <class Arena>
+void debug_next_token_nll(const Tensor& hidden_all, const Tensor& ids, std::int32_t columns,
+                          const Weight& head, std::int32_t vocab, std::int32_t token_domain,
+                          Arena& work, cudaStream_t stream) {
+    static const char* path = std::getenv("SUROGATE_SERVE_NLL_DUMP");
+    if (path == nullptr || columns < 2) { return; }
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capturing));
+    if (capturing != cudaStreamCaptureStatusNone) { return; } // a graph body: nothing to read
+    // `SUROGATE_SERVE_NLL_SLICE` narrows the head's batch (8 keeps it on the GEMV route).
+    static const std::int32_t kSlice = [] {
+        const char* env = std::getenv("SUROGATE_SERVE_NLL_SLICE");
+        const int value = env != nullptr ? std::atoi(env) : 256;
+        return value > 0 ? value : 256;
+    }();
+    auto scope    = work.scope();
+    Tensor logits = work.alloc(DType::BF16, {vocab, kSlice});
+    Tensor nll    = work.alloc(DType::FP32, {columns});
+    Tensor best   = work.alloc(DType::I32, {columns});
+    for (std::int32_t c0 = 0; c0 < columns - 1; c0 += kSlice) {
+        const std::int32_t n = std::min(kSlice, columns - 1 - c0);
+        Tensor hidden        = hidden_all.slice(1, c0, n);
+        Tensor slice         = logits.slice(1, 0, n);
+        ops::linear(hidden, head, slice, stream);
+        Tensor targets = ids.slice(0, c0 + 1, n);
+        Tensor out     = nll.slice(0, c0, n);
+        Tensor top     = best.slice(0, c0, n);
+        ops::next_token_nll(slice, targets, out, &top, token_domain, stream);
+    }
+    {
+        // The last column has no successor to score; its ranking is still worth a line, since
+        // it is the very column the engine samples from, so the two must agree.
+        Tensor hidden  = hidden_all.slice(1, columns - 1, 1);
+        Tensor slice   = logits.slice(1, 0, 1);
+        ops::linear(hidden, head, slice, stream);
+        Tensor targets = ids.slice(0, columns - 1, 1);
+        Tensor out     = nll.slice(0, columns - 1, 1);
+        Tensor top     = best.slice(0, columns - 1, 1);
+        ops::next_token_nll(slice, targets, out, &top, token_domain, stream);
+    }
+    std::vector<std::int32_t> host_ids(static_cast<std::size_t>(columns));
+    std::vector<float> host_nll(static_cast<std::size_t>(columns));
+    std::vector<std::int32_t> host_best(static_cast<std::size_t>(columns));
+    CUDA_CHECK(cudaMemcpyAsync(host_ids.data(), ids.data, host_ids.size() * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_best.data(), best.data, host_best.size() * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(host_nll.data(), nll.data, host_nll.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::FILE* file = std::fopen(path, "a");
+    if (file == nullptr) { return; }
+    std::fprintf(file, "# chunk %d\n", static_cast<int>(columns));
+    for (std::int32_t p = 0; p + 1 < columns; ++p) {
+        std::fprintf(file, "%d %d %.6f %d\n", host_ids[static_cast<std::size_t>(p)],
+                     host_ids[static_cast<std::size_t>(p) + 1],
+                     host_nll[static_cast<std::size_t>(p)],
+                     host_best[static_cast<std::size_t>(p)]);
+    }
+    std::fprintf(file, "%d -1 nan %d\n", host_ids[static_cast<std::size_t>(columns) - 1],
+                 host_best[static_cast<std::size_t>(columns) - 1]);
+    std::fclose(file);
+}
+
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1465,6 +1542,7 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
     }
     return mixed_chunk_multi(std::span<const MixedPrefillSegment>(&segment, 1), decode, finalize);
 }
+
 
 PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSegment> segments,
                                                   const MixedDecodeSlice& decode,
@@ -1830,6 +1908,9 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         stage_export(x, s);
     } else {
     Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
+    if (prefill_cols > 0) {
+        debug_next_token_nll(xf, ids_device, prefill_cols, *lm_head_, kCfg.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
+    }
 
     if (batch > 0) {
         Tensor xf_decode = xf.slice(1, prefill_cols, batch);
@@ -1938,6 +2019,7 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
     Tensor xf = matrix_window(prefill_hidden_, bucket);
     if (stage_finishes()) {
         Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
+        debug_next_token_nll(xf, ids_device, bucket, *lm_head_, kCfg.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
     } else {
         stage_export(x, s);
     }
@@ -2229,6 +2311,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         return;
     }
     Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
+    debug_next_token_nll(xf, ids_device, prefill_cols, *lm_head_, kCfg.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
 
     if (batch == 0) { return; }
     Tensor xf_decode = xf.slice(1, prefill_cols, batch);
@@ -2535,6 +2618,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
             if (stage_finishes()) {
                 Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
+                debug_next_token_nll(xf, ids_device, len, *lm_head_, kCfg.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
             } else {
                 stage_export(x, s);
             }

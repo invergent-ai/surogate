@@ -17,16 +17,30 @@ of the weights. What lands beside the file is a small index naming the stretches
 of it each object is assembled from.
 
 `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22.13 GB, 34.66 B parameters, 256 experts of
-which 8 route — on one 5090, 654-token prompt, 128 generated, warm, greedy:
+which 8 route — on one 5090, single stream, ~700-token prompt, 128 generated, warm,
+greedy (2026-09-03, both rows the same session; the row-split row is the older 654-token pass):
 
 | | prefill tok/s | decode tok/s |
 |---|---:|---:|
-| **surogate, native K-quant** | **11,100** | **317** |
+| **surogate, native K-quant, int8 tensor-core route** | **13,195** | **315** |
+| surogate, native K-quant, BF16 activations (the path before it) | 10,299 | 316 |
 | llama.cpp, same file | 8,408 | 278 |
 | surogate, dequantised to Q4G64 | 13,700 | 346 |
 
-Ahead of llama.cpp on both. Our own row-split path still leads prefill; that is
-the price of the format rather than a defect, decomposed below.
+Ahead of llama.cpp on both. The int8 route is the routed experts' prefill on
+llama.cpp's own arithmetic -- int8 activations per 32 values with a block sum,
+the weights' codes as the other MMA operand -- and it passed the accuracy gate
+the owner set for it, measured the way llama-perplexity measures:
+
+| wikitext-2 test, 145 windows of 2048, second halves scored | PPL |
+|---|---:|
+| llama.cpp, same file | 6.2311 ± 0.040 |
+| surogate, BF16 activations | 6.2378 ± 0.040 |
+| **surogate, int8 route** | **6.2370 ± 0.040** |
+
+`surogate/serve/tools/eval/perplexity.py` is the harness; the engine's side is
+the NLL probe (`SUROGATE_SERVE_NLL_DUMP`, raw prompts via
+`SUROGATE_SERVE_RAW_PROMPT`, eager prefill). Decode is untouched by the route.
 
 | | |
 |---|---:|
@@ -47,12 +61,14 @@ stored once.
 
 ## Roadmap
 
-1. **[~] Close the native prefill gap — this kernel is at its floor; a different
-   one is needed.** Eleven variants measured. The decode is compute-bound and
-   its per-value structure is the format's: two sub-block scales and an affine
-   min per 64-wide tile. The way through is an int8 tensor-core path where the
-   min is free and the MMA runs at twice the rate — an owner call, because it
-   sets prefill activations to int8-per-32. See *The prefill gap, decomposed*.
+1. **[x] Close the native prefill gap — the int8 tensor-core route (2026-09-03).**
+   The BF16-activation kernel was at its floor (eleven variants); the route
+   that replaced it quantises the prefill activations to int8 per 32 with a
+   block sum, unpacks the weights' codes to int8 once per K tile, and runs the
+   s8 MMA. Accuracy gate: 6.2370 against llama.cpp's 6.2311 (± 0.040). Prefill
+   13,195 against 10,299 tok/s single stream (~700-token prompt) and 17,300
+   against 14,300 at 8k, same session, three prompts each. `SUROGATE_SERVE_MOE_INT8=0`
+   keeps the BF16-activation kernels. See *The prefill gap, decomposed*.
 2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, add `surogate quantize`.** Converters
    stop emitting the home-grown formats; `surogate quantize` writes a BF16 GGUF
    and calls `llama-quantize` (built at `study/llama.cpp-master/build/bin`).
@@ -147,6 +163,32 @@ so arrangements are separated on `nsys` kernel time, which is stable.
 - **`kExpertBM = 32`** to fit every header resident at 3 blocks/SM is now known
   to be pointless — residency was measured at 780,788.
 
+**Resolution (2026-09-03): the int8 route, built.** `sparse_moe_prefill_ggml_i8_*`
+in `sparse_moe_prefill_body.inc`, on the codecs' `unpack`/`scale_pair` in
+`ggml_prefill_codec.cuh`:
+
+- Activations: `quantize_q8_1_planes_launch` writes int8 codes and a (scale,
+  sum) half2 per 32 values as two planes -- a 36-byte `block_q8_1` cannot feed a
+  16-byte `cp_async`, planes can. The gate/up input is quantised once per token
+  and the kernel gathers by a column→token map the gather writes; the down
+  input is per assignment because the SwiGLU output is.
+- Weights: the staged superblock bytes are unpacked nibble → int8 into a
+  row-major tile once per K tile, cooperatively, and read back with `ldmatrix`.
+  Every warp of the block owns every row (the kernel's shape), so per-row work
+  must be shared or it is done eight times: the sub-block scales are likewise
+  decoded once per superblock into a shared `[scale][row]` table.
+- Arithmetic per 32-group, in FP32 on the exact int32 dot:
+  `acc += (d·sc)[row]·d_x[col]·dot − (dmin·m)[row]·Σx[col]` -- the K-quant
+  affine form with the activation sum from the quantiser. Q6_K's scales cover
+  sixteen values, so it runs two `m16n8k16` MMAs per group and folds its −32
+  into the codes (byte-wise sign fix); no min term.
+- Measured per prefill round (`nsys`, 8k prompt): gate_up Q4_K 498 µs
+  against 758 (BF16 path) and 608 (row-split); down Q5_K 316 against
+  505 / 335; down Q6_K 688 against 725 / 337. End to end,
+  8k prompt, median of three distinct prompts, two runs: 17,302 / 17,235 tok/s
+  against 14,317 / 14,264 (+21 %); single stream ~700-token prompt + 128
+  generated: 13,195 against 10,299 (+28 %), decode 315 against 316.
+
 ---
 
 ## Format coverage
@@ -238,6 +280,20 @@ Verified against the artifact the converter wrote for all 150 rearranged objects
 
 Each of these cost real time; none is inferable from the code.
 
+- **A gap is a bug only once the measurement condition matches the reference.**
+  The first perplexity probe read ~600 against llama.cpp's 6.2 and half a day
+  went into kernels, norms, the head and per-layer lenses. The engine was
+  right: the probe scored Wikipedia prose inside a *user turn* of a thinking
+  model, which predicts `<|im_end|>` for most user-text positions, while
+  llama-perplexity scores raw text and does not even parse special tokens. The
+  original BF16 model on CPU (HF transformers, `causal_conv1d` and `fla`
+  blocked so it falls back to torch) reproduced our per-position NLL to two
+  decimals. Hence `SUROGATE_SERVE_RAW_PROMPT`.
+- **`ops::sample` scores rows below `kTokenDomain` (248,077), not the head's
+  248,320.** Anything that reads logits itself must take the same domain.
+- **A greedy prompt under 47 tokens never reaches the MoE prefill kernels.**
+  Coherent short answers prove nothing about them; score a long prompt.
+
 - **A format label mismatch is silent when the sizes agree.** `bind_moe`
   discovered each routed tensor's stored format and kept only the handle, so
   `load_moe` passed the *profile's* expectation on. Q4_K superblocks went to the
@@ -311,6 +367,10 @@ Written down so they are not retried.
 ---
 
 ## Done
+
+- 2026-09-03 — int8 tensor-core route for K-quant routed experts (gate/up and
+  down, Q4_K/Q5_K/Q6_K), on by default; `quantize_q8_1_planes`; the NLL probe
+  and `ops::next_token_nll`; `tools/eval/perplexity.py`; accuracy gate passed.
 
 - **[x] M1 — generic compressed-tensors NVFP4.** RedHatAI's 35B-A3B converts from
   its own directory; the config is the authority, resolved with the library's own

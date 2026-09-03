@@ -6,6 +6,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/linear/ggml/ggml_prefill_codec.cuh"
+#include "ops/linear/ggml/ggml_q8_1.h"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 #include "ops/sparse_moe/marlin/marlin_moe_gemm.h"
 
 #include <cstdlib>
