@@ -136,7 +136,7 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
         return artifact::bind_tensor(binder, name, format, shape, placement);
     };
     const auto bind_stored = [&](std::string_view name, std::int32_t rows, std::int32_t columns) {
-        return artifact::bind_linear(binder, name, rows, columns, placement).object;
+        return artifact::bind_linear(binder, name, rows, columns, placement);
     };
     MoePlan plan{
         .router_shared_gate = bind(prefix + "router_shared_gate", NumericFormat::BF16, {257, 2048}),
@@ -151,24 +151,25 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
     };
     // NVFP4 carries a second-level scale per expert per projection; the row block holds gate and
     // up stacked, so gate/up needs two entries per expert and down one.
-    if (routed_gate_up == NumericFormat::NVFP4) {
+    if (plan.routed_gate_up.format == NumericFormat::NVFP4) {
         plan.routed_gate_up_scale =
             bind(prefix + "routed_gate_up_scale", NumericFormat::FP32, {2 * kRoutedExperts});
         plan.routed_gate_up_act_scale =
             bind(prefix + "routed_gate_up_act_scale", NumericFormat::FP32, {kRoutedExperts});
         plan.routed_gate_up_alpha =
             bind(prefix + "routed_gate_up_alpha", NumericFormat::FP32, {kRoutedExperts});
-        require_identity_divisor(binder, plan.routed_gate_up, prefix + "routed_gate_up", 262144,
-                                 2048);
+        require_identity_divisor(binder, plan.routed_gate_up.object,
+                                 prefix + "routed_gate_up", 262144, 2048);
     }
-    if (routed_down == NumericFormat::NVFP4) {
+    if (plan.routed_down.format == NumericFormat::NVFP4) {
         plan.routed_down_scale =
             bind(prefix + "routed_down_scale", NumericFormat::FP32, {kRoutedExperts});
         plan.routed_down_act_scale =
             bind(prefix + "routed_down_act_scale", NumericFormat::FP32, {kRoutedExperts});
         plan.routed_down_alpha =
             bind(prefix + "routed_down_alpha", NumericFormat::FP32, {kRoutedExperts});
-        require_identity_divisor(binder, plan.routed_down, prefix + "routed_down", 524288, 512);
+        require_identity_divisor(binder, plan.routed_down.object, prefix + "routed_down", 524288,
+                                 512);
     }
     return plan;
 }
@@ -179,16 +180,18 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
         .op = {
             .router_shared_gate = artifact::materialized_weight(
                 materialized, plan.router_shared_gate, NumericFormat::BF16, 257, 2048),
+            // The stored format decides how these bytes are read. Passing the profile's
+            // expectation instead decoded a GGUF's Q4_K/Q5_K superblocks as the groupwise-int
+            // row-split codec: same byte count, entirely different meaning, and every routed
+            // expert silently wrong.
             .routed_gate_up =
-                routed_gate_up == NumericFormat::NVFP4
-                    ? routed_nvfp4_weight(materialized, plan.routed_gate_up, 262144, 2048)
-                    : artifact::materialized_weight(materialized, plan.routed_gate_up,
-                                                    routed_gate_up, 262144, 2048),
+                plan.routed_gate_up.format == NumericFormat::NVFP4
+                    ? routed_nvfp4_weight(materialized, plan.routed_gate_up.object, 262144, 2048)
+                    : artifact::materialized_linear(materialized, plan.routed_gate_up, 262144, 2048),
             .routed_down =
-                routed_down == NumericFormat::NVFP4
-                    ? routed_nvfp4_weight(materialized, plan.routed_down, 524288, 512)
-                    : artifact::materialized_weight(materialized, plan.routed_down, routed_down,
-                                                    524288, 512),
+                plan.routed_down.format == NumericFormat::NVFP4
+                    ? routed_nvfp4_weight(materialized, plan.routed_down.object, 524288, 512)
+                    : artifact::materialized_linear(materialized, plan.routed_down, 524288, 512),
             .shared_gate_up = artifact::materialized_weight(materialized, plan.shared_gate_up,
                                                             NumericFormat::W8G32_F16S, 1024, 2048),
             .shared_down    = artifact::materialized_weight(materialized, plan.shared_down,
@@ -316,12 +319,20 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
-                                           {131072, 2048}, proposal_placement);
+    // A GGUF serves the draft head as its own K-quant; a converted checkpoint as Q4.
+    out.draft_head = artifact::bind_linear(binder, "text/draft_head", 131072, 2048,
+                                           proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
+    // A community GGUF export usually strips the nextn block; the artifact then omits mtp/*
+    // and only `--spec mtp` against such a model is the error.
+    out.has_mtp = binder.has("mtp/input_projection");
+    if (!out.has_mtp && features.mtp()) {
+        throw artifact::ArtifactError(
+            "qwen3.6-35b-a3b: --spec mtp was requested but this artifact carries no MTP block");
+    }
     const artifact::TensorPlacement mtp_placement = features.mtp()
                                                         ? artifact::TensorPlacement::Device
                                                         : artifact::TensorPlacement::ValidateOnly;
@@ -329,28 +340,37 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
                               std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
-    out.mtp.input_projection =
-        bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {2048, 4096});
-    out.mtp.embedding_norm = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {2048});
-    out.mtp.hidden_norm    = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {2048});
-    out.mtp.input_norm     = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {2048});
-    out.mtp.attention.query_key_gate_value = artifact::bind_linear(
-        binder, "mtp/layer/attention/query_key_gate_value", 9216, 2048, mtp_placement);
-    out.mtp.attention.query_norm =
-        bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
-    out.mtp.attention.key_norm =
-        bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
-    out.mtp.attention.output =
-        artifact::bind_linear(binder, "mtp/layer/attention/output", 2048, 4096, mtp_placement);
-    out.mtp.post_attention_norm =
-        bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {2048});
-    out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
-                                  NumericFormat::W8G32_F16S, mtp_placement);
-    out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
-
+    if (out.has_mtp) {
+        out.mtp.input_projection =
+            bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {2048, 4096});
+        out.mtp.embedding_norm = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {2048});
+        out.mtp.hidden_norm    = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {2048});
+        out.mtp.input_norm     = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {2048});
+        out.mtp.attention.query_key_gate_value = artifact::bind_linear(
+            binder, "mtp/layer/attention/query_key_gate_value", 9216, 2048, mtp_placement);
+        out.mtp.attention.query_norm =
+            bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
+        out.mtp.attention.key_norm =
+            bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
+        out.mtp.attention.output =
+            artifact::bind_linear(binder, "mtp/layer/attention/output", 2048, 4096, mtp_placement);
+        out.mtp.post_attention_norm =
+            bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {2048});
+        out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
+                                      NumericFormat::W8G32_F16S, mtp_placement);
+        out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
+    }
+    // Community GGUF exports of this family are text-only; the artifact then omits vision/*
+    // and only `--vision` against such a model is the error.
+    out.has_vision = binder.has("vision/patch_embedding");
+    if (!out.has_vision && features.vision) {
+        throw artifact::ArtifactError(
+            "qwen3.6-35b-a3b: --vision was requested but this artifact carries no vision tower");
+    }
     const artifact::TensorPlacement vision_placement =
         features.vision ? artifact::TensorPlacement::Device
                         : artifact::TensorPlacement::ValidateOnly;
+    if (out.has_vision) {
     out.vision_backbone     = family::bind_vision_backbone<family::VisionBackboneConfig>(binder, vision_placement);
     out.vision_merger_input = family::bind_vision_merger_input<family::VisionBackboneConfig>(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(
@@ -358,6 +378,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     out.vision_merger_fc2_bias = artifact::bind_tensor(
         binder, "vision/merger/fc2_bias", NumericFormat::BF16, {2048}, vision_placement);
     out.vision_merger_norm = family::bind_vision_merger_norm<family::VisionBackboneConfig>(binder, vision_placement);
+    }
 
     // The DFlash drafter is a separate checkpoint the converter may not have
     // had; such artifacts omit every dflash/* object. Probe the family once
@@ -488,8 +509,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     output_head = artifact::materialized_linear(backing, plan.output_head, 248320, 2048);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
-        proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
-                                                           NumericFormat::Q4G64_F16S, 131072, 2048);
+        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, 131072, 2048);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
                                                            NumericFormat::I32, {131072});
     }

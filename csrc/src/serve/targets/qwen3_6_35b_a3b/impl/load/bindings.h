@@ -7,6 +7,7 @@
 #include <api/family/vision.h>
 
 #include "artifact/binder.h"
+#include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
 #include "api/ops/sparse_moe.h"
@@ -25,8 +26,11 @@ inline constexpr std::size_t kDFlashLayers        = 6;
 
 struct MoePlan {
     artifact::ObjectHandle router_shared_gate;
-    artifact::ObjectHandle routed_gate_up;
-    artifact::ObjectHandle routed_down;
+    /// Bound by stored format, not by the profile's expectation: a GGUF serves its routed
+    /// experts as its own K-quant superblocks, and reading those through the groupwise-int
+    /// codec the profile names would decode every expert wrongly.
+    artifact::LinearBinding routed_gate_up;
+    artifact::LinearBinding routed_down;
     artifact::ObjectHandle shared_gate_up;
     artifact::ObjectHandle shared_down;
     /// NVFP4 only: the format's second level plus the W4A4 runner's activation scale and
@@ -125,10 +129,12 @@ struct BindingPlan {
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
     artifact::LinearBinding output_head;
-    artifact::ObjectHandle draft_head;
+    artifact::LinearBinding draft_head; // format read from the artifact
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
+    bool has_mtp = false;
     family::VisionBackbonePlan vision_backbone;
+    bool has_vision = false;
     family::VisionMergerInputPlan vision_merger_input;
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
