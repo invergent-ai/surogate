@@ -25,8 +25,8 @@ which 8 route — on one 5090, 654-token prompt, 128 generated, warm, greedy:
 | llama.cpp, same file | 8,408 | 278 |
 | surogate, dequantised to Q4G64 | 13,700 | 346 |
 
-Ahead of llama.cpp on both. Our own row-split path still leads prefill, which is
-the honest open gap — to ourselves, not to a competitor.
+Ahead of llama.cpp on both. Our own row-split path still leads prefill; that is
+the price of the format rather than a defect, decomposed below.
 
 | | |
 |---|---:|
@@ -117,6 +117,8 @@ consuming `As`, so it also hides less well.
 Closing it means not dequantising to BF16 at all — an integer path, i.e. K3b —
 and that is the thing already measured as the wrong trade: our BF16 wide route
 beats llama.cpp's own MMQ by 1.65×.
+
+---
 
 ## Format coverage
 
