@@ -338,15 +338,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto finish = [](const WorkspaceLayoutBuilder& layout) { return layout.peak_bytes(1); };
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
-        (void)workspace_recipe::text_prefill_roots<TextConfig>(
-            layout, tokens, plan.features.vision ? 3 : 0, plan.features.vision ? tokens : 0);
+        (void)workspace_recipe::text_prefill_roots(
+            layout, plan.geometry, tokens, plan.features.vision ? 3 : 0, plan.features.vision ? tokens : 0);
     };
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                      std::int32_t last, family::TextPhase phase,
                                      std::int32_t batch_size, std::int32_t min_width,
                                      std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
         auto stage = layout.scope();
-        (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
+        (void)workspace_recipe::text_attention_projection(layout, plan.geometry, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         // Marlin-tile residency (PATCHES.md #60) produces the fused parent whole
@@ -356,7 +356,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         // hard failure rather than a fallback.
         scratch(layout, ops::detail::marlin_fused_parent_bytes(
                             plan.geometry.query_size() * 2 + plan.geometry.kv_size() * 2, last));
-        (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
+        (void)workspace_recipe::text_attention_results(layout, plan.geometry, last);
         // QSA indexer (design/INFERENCE.md, phase 4): raw keys, queries and their norm, the
         // per-column block mask and the selection's score scratch. Reserved whenever the target
         // has an indexer — the selection engages only past its budget, but the append runs for
@@ -366,17 +366,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             plan.geometry.query_heads, plan.geometry.kv_heads, plan.kv_dtype, envelope,
                             batch_size, min_width, max_width));
-        scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
-                            plan.weights_profile, phase, first, last));
+        scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(plan.geometry, plan.weights_profile, phase, first, last));
     };
     const auto gdn_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                std::int32_t last, family::TextPhase phase, GdnWorkspacePath path,
                                std::int32_t batch_size, std::int32_t min_width,
                                std::int32_t max_width) {
         auto stage = layout.scope();
-        (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
+        (void)workspace_recipe::gdn_control(layout, plan.geometry, last);
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(first, last));
-        (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
+        (void)workspace_recipe::gdn_projection(layout, plan.geometry, last);
         if (path == GdnWorkspacePath::Snapshot) {
             scratch(layout, Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                                 plan.weights_profile, phase, batch_size, min_width, max_width));
@@ -384,27 +383,27 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(layout, Variant::gdn_input_projection_record_workspace_capacity_bytes(
                                 plan.weights_profile, phase, batch_size, min_width, max_width));
         } else {
-            (void)workspace_recipe::gdn_prefill_conv<TextConfig>(layout, last);
+            (void)workspace_recipe::gdn_prefill_conv(layout, plan.geometry, last);
             scratch(layout, Variant::gdn_input_projection_workspace_capacity_bytes(
                                 plan.weights_profile, phase, first, last));
             scratch(layout, ops::detail::marlin_fused_parent_bytes(
                                 plan.geometry.key_dim() * 2 + plan.geometry.value_dim() * 2, last));
         }
-        (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
+        (void)workspace_recipe::gdn_recurrent_output(layout, plan.geometry, last);
         if (path == GdnWorkspacePath::Prefill) {
             scratch(layout,
                     ops::gated_delta_net_workspace_capacity_bytes(
                         plan.geometry.gdn_key_heads, plan.geometry.gdn_value_heads, true, first, last));
         }
-        (void)workspace_recipe::gdn_normalized_output<TextConfig>(layout, last);
+        (void)workspace_recipe::gdn_normalized_output(layout, plan.geometry, last);
         scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };
     const auto post_mixer_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                       std::int32_t last, family::TextPhase phase) {
         auto stage = layout.scope();
-        (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, last);
-        scratch(layout, Variant::post_mixer_workspace_capacity_bytes(plan.weights_profile, phase,
+        (void)workspace_recipe::post_mixer_hidden(layout, plan.geometry, last);
+        scratch(layout, Variant::post_mixer_workspace_capacity_bytes(plan.geometry, plan.weights_profile, phase,
                                                                      first, last));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
@@ -440,20 +439,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                               bool preembedded) {
-        (void)workspace_recipe::mtp_stem<TextConfig>(layout, tokens, !preembedded);
+        (void)workspace_recipe::mtp_stem(layout, plan.geometry, tokens, !preembedded);
     };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::GqaExecutionEnvelope envelope) {
         auto core = layout.scope();
         mtp_stem(layout, tokens, false);
-        (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
+        (void)workspace_recipe::mtp_attention_projection(layout, plan.geometry, tokens);
         scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
-        (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
+        (void)workspace_recipe::mtp_attention_results(layout, plan.geometry, tokens);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             plan.geometry.query_heads, plan.geometry.kv_heads, plan.kv_dtype, envelope,
                             1, tokens, tokens));
-        (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
-        scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
+        (void)workspace_recipe::mtp_post_attention(layout, plan.geometry, tokens);
+        scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(plan.geometry, tokens, tokens));
     };
     const auto mtp_full_call = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::GqaExecutionEnvelope envelope, bool build_proposal) {
@@ -489,7 +488,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, plan.geometry.hidden, 1);
         matrix(layout, DType::BF16, plan.geometry.hidden, 1);
-        scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(1, 1));
+        scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(plan.geometry, 1, 1));
         proposal_scratch(layout, 1);
     };
 
@@ -504,7 +503,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
-        matrix(ordinary, DType::BF16, residual_width<TextConfig>(), batch);
+        matrix(ordinary, DType::BF16, plan.geometry.residual, batch);
         target_body(ordinary, batch, batch, family::TextPhase::Verify, GdnWorkspacePath::Snapshot,
                     batch, 1, 1, text_envelope);
         scratch(ordinary,
@@ -546,7 +545,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             const std::int32_t aggregate = batch * verify;
             WorkspaceLayoutBuilder target;
-            matrix(target, DType::BF16, residual_width<TextConfig>(), aggregate);
+            matrix(target, DType::BF16, plan.geometry.residual, aggregate);
             target_body(target, aggregate, aggregate, family::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
 
@@ -554,15 +553,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 const std::int32_t tokens = batch * width;
                 auto core                 = layout.scope();
                 mtp_stem(layout, tokens, false);
-                (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
+                (void)workspace_recipe::mtp_attention_projection(layout, plan.geometry, tokens);
                 scratch(layout,
                         Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
-                (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
+                (void)workspace_recipe::mtp_attention_results(layout, plan.geometry, tokens);
                 scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                                     plan.geometry.query_heads, plan.geometry.kv_heads, plan.kv_dtype,
                                     text_envelope, batch, width, width));
-                (void)workspace_recipe::mtp_post_attention<TextConfig>(layout, tokens);
-                scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(tokens, tokens));
+                (void)workspace_recipe::mtp_post_attention(layout, plan.geometry, tokens);
+                scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(plan.geometry, tokens, tokens));
             };
 
             WorkspaceLayoutBuilder alignment;
@@ -636,7 +635,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                  ++batch) {
                 const std::int32_t aggregate = verify * batch;
                 WorkspaceLayoutBuilder target;
-                matrix(target, DType::BF16, residual_width<TextConfig>(), aggregate);
+                matrix(target, DType::BF16, plan.geometry.residual, aggregate);
                 target_body(target, aggregate, aggregate, family::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
                 const std::size_t accept =

@@ -53,20 +53,20 @@ constexpr ops::LinearPolicy kTextPolicy = ops::LinearPolicy::A16Only;
         "the artifact is bound. Reaching here means a speculative round started without one.");
 }
 
-std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
-                                       ops::LinearPolicy policy, std::int32_t first,
-                                       std::int32_t last) {
+std::size_t post_mixer_workspace_bytes(const family::TextGeometry& geometry, QType gate_up_qtype,
+                                       QType down_qtype, ops::LinearPolicy policy,
+                                       std::int32_t first, std::int32_t last) {
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
+    (void)layout.alloc(DType::BF16, {geometry.intermediate, last});
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first, last));
+            gate_up_qtype, 2 * geometry.intermediate, geometry.hidden, policy, first, last));
     }
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-            down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
+            down_qtype, geometry.hidden, geometry.intermediate, policy, first, last));
     }
     return layout.peak_bytes(1);
 }
@@ -129,12 +129,10 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     return 0;
 }
 
-std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
-    WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
+std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    return ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile),
-                                                    TextConfig::hidden, TextConfig::query_size,
-                                                    kTextPolicy, first, last);
+    return ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile), geometry.hidden,
+                                                   geometry.query_size(), kTextPolicy, first, last);
 }
 
 // ---- Post-mixer (SwiGLU MLP) ----------------------------------------------
@@ -142,7 +140,9 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
-    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+    // The width comes from the weight the SwiGLU reads, so this one function serves whatever
+    // size of Qwen3 was bound: gate and up are fused, hence half the rows.
+    Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
     ops::linear_swiglu(hidden, weights.gate_up, activation, kTextPolicy, workspace, stream);
     ops::linear_add(activation, weights.down, residual, kTextPolicy, workspace, stream);
     // down reads the SwiGLU activation, which is exactly the input its adapter
@@ -150,12 +150,12 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     apply_lora(weights.down, 4, activation, residual, stream);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
     const QType qtype = profile_qtype(weights_profile);
-    return post_mixer_workspace_bytes(qtype, qtype, kTextPolicy, first, last);
+    return post_mixer_workspace_bytes(geometry, qtype, qtype, kTextPolicy, first, last);
 }
 
 // ---- Leaves this target cannot run -----------------------------------------

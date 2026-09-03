@@ -18,11 +18,15 @@ using artifact::NumericFormat;
 
 /// Rows of the fused attention input projection: `[query | key | value]`.
 /// The hybrid family's is `2 * query_size + 2 * kv_size` because it fuses an
-/// output gate; Qwen3 has none, and this constant is the difference.
-constexpr std::int32_t kAttentionInputRows = TextConfig::query_size + 2 * TextConfig::kv_size;
-constexpr std::int32_t kMlpGateUpRows      = 2 * TextConfig::intermediate;
+/// output gate; Qwen3 has none, and this is the difference.
+[[nodiscard]] std::int32_t attention_input_rows(const family::TextGeometry& g) {
+    return g.query_size() + 2 * g.kv_size();
+}
 
-static_assert(kAttentionInputRows == 4096);
+[[nodiscard]] std::int32_t mlp_gate_up_rows(const family::TextGeometry& g) {
+    return 2 * g.intermediate;
+}
+
 static_assert(TextConfig::query_projection_rows == TextConfig::query_size,
               "Qwen3 attention is ungated; a gated projection would be read at the wrong stride");
 
@@ -54,39 +58,44 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
 }
 
 DensePostMixerPayload load_mlp(const MlpPlan& plan,
-                               const artifact::MaterializedArtifact& materialized) {
+                               const artifact::MaterializedArtifact& materialized,
+                               const family::TextGeometry& g) {
     DensePostMixerPayload out;
-    out.gate_up = materialized_weight(materialized, plan.gate_up, kMlpGateUpRows, TextConfig::hidden);
-    out.down = materialized_weight(materialized, plan.down, TextConfig::hidden,
-                                   TextConfig::intermediate);
+    out.gate_up = materialized_weight(materialized, plan.gate_up, mlp_gate_up_rows(g), g.hidden);
+    out.down    = materialized_weight(materialized, plan.down, g.hidden, g.intermediate);
     return out;
 }
 
 void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, BindingPlan& out) {
-    const NumericFormat weights = endpoint_format(weights_profile);
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+    const NumericFormat weights   = endpoint_format(weights_profile);
+    const family::TextGeometry& g = out.geometry;
+    // The shapes every tensor is checked against are the checkpoint's, so a differently
+    // sized Qwen3 is bound by the same code: what makes this target a Qwen3 is the object
+    // names and their arrangement, not how wide they are.
+    out.text_layers.resize(static_cast<std::size_t>(g.layers));
+    for (std::size_t layer = 0; layer < out.text_layers.size(); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
         target.input_norm        = artifact::bind_device_tensor(
-            binder, prefix + "input_norm", NumericFormat::BF16, {TextConfig::hidden});
+            binder, prefix + "input_norm", NumericFormat::BF16, {g.hidden});
         target.attention.query_key_value =
             bind_weight(binder, prefix + "attention/query_key_value", weights,
-                        {kAttentionInputRows, TextConfig::hidden});
+                        {attention_input_rows(g), g.hidden});
         // Qwen3 normalises each head of q and k (`use_qk_norm`), over head_dim,
         // and carries no qkv bias (`attention_bias: false` in every released
         // Qwen3 config), which is why no bias object is bound here.
         target.attention.query_norm = artifact::bind_device_tensor(
-            binder, prefix + "attention/query_norm", NumericFormat::BF16, {TextConfig::head_dim});
+            binder, prefix + "attention/query_norm", NumericFormat::BF16, {g.head_dim});
         target.attention.key_norm = artifact::bind_device_tensor(
-            binder, prefix + "attention/key_norm", NumericFormat::BF16, {TextConfig::head_dim});
+            binder, prefix + "attention/key_norm", NumericFormat::BF16, {g.head_dim});
         target.attention.output = bind_weight(binder, prefix + "attention/output", weights,
-                                              {TextConfig::hidden, TextConfig::query_size});
+                                              {g.hidden, g.query_size()});
         target.post_attention_norm = artifact::bind_device_tensor(
-            binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
         target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", weights,
-                                         {kMlpGateUpRows, TextConfig::hidden});
+                                         {mlp_gate_up_rows(g), g.hidden});
         target.mlp.down    = bind_weight(binder, prefix + "mlp/down", weights,
-                                         {TextConfig::hidden, TextConfig::intermediate});
+                                         {g.hidden, g.intermediate});
     }
 }
 
@@ -115,15 +124,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
+    const family::TextGeometry& g         = out.geometry;
     out.token_embedding = bind_weight(binder, "text/token_embedding", vocabulary_format,
-                                      {TextConfig::output_rows, TextConfig::hidden});
+                                      {g.output_rows, g.hidden});
     bind_text_layers(binder, weights_profile, out);
     out.final_norm = artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16,
-                                                  {TextConfig::hidden});
+                                                  {g.hidden});
     // `tie_word_embeddings` is a property of the checkpoint, not of the artifact:
     // the converter resolves it and stores the head as its own object.
     out.output_head = bind_weight(binder, "text/output_head", vocabulary_format,
-                                  {TextConfig::output_rows, TextConfig::hidden});
+                                  {g.output_rows, g.hidden});
 
     load_plan.materialization = binder.finish();
     return load_plan;
@@ -133,43 +143,42 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     // The layer storage is sized here, not by the type: the counts come from the
     // geometry these weights were bound against.
-    runtime.geometry = plan.geometry;
-    runtime.full_layers.resize(kFullAttentionLayers);
+    runtime.geometry              = plan.geometry;
+    const family::TextGeometry& g = runtime.geometry;
+    runtime.full_layers.resize(static_cast<std::size_t>(g.layers));
     runtime.gdn_layers.resize(kGdnLayers);
     frontend = family::take_text_only_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
 
-    runtime.token_embedding = materialized_weight(backing, plan.token_embedding,
-                                                  TextConfig::output_rows, TextConfig::hidden);
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+    runtime.token_embedding =
+        materialized_weight(backing, plan.token_embedding, g.output_rows, g.hidden);
+    for (std::size_t layer = 0; layer < plan.text_layers.size(); ++layer) {
         const TextLayerPlan& source  = plan.text_layers[layer];
         FullAttentionWeights& target = runtime.full_layers.at(layer);
         target.input_norm            = artifact::materialized_tensor(
-            backing, source.input_norm, NumericFormat::BF16, {TextConfig::hidden});
+            backing, source.input_norm, NumericFormat::BF16, {g.hidden});
         target.projection = FusedAttentionProjectionPayload{
             .query_key_value = materialized_weight(backing, source.attention.query_key_value,
-                                                   kAttentionInputRows, TextConfig::hidden),
+                                                   attention_input_rows(g), g.hidden),
         };
         target.query_norm = artifact::materialized_tensor(backing, source.attention.query_norm,
-                                                          NumericFormat::BF16,
-                                                          {TextConfig::head_dim});
+                                                          NumericFormat::BF16, {g.head_dim});
         target.key_norm   = artifact::materialized_tensor(backing, source.attention.key_norm,
-                                                          NumericFormat::BF16,
-                                                          {TextConfig::head_dim});
-        target.output = materialized_weight(backing, source.attention.output, TextConfig::hidden,
-                                            TextConfig::query_size);
+                                                          NumericFormat::BF16, {g.head_dim});
+        target.output = materialized_weight(backing, source.attention.output, g.hidden,
+                                            g.query_size());
         target.post_attention_norm = artifact::materialized_tensor(
-            backing, source.post_attention_norm, NumericFormat::BF16, {TextConfig::hidden});
-        target.post_mixer = load_mlp(source.mlp, backing);
+            backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
+        target.post_mixer = load_mlp(source.mlp, backing, g);
     }
     static_assert(kGdnLayers == 0, "a Qwen3 layer is never a linear mixer");
 
     runtime.final_norm  = artifact::materialized_tensor(backing, plan.final_norm,
-                                                        NumericFormat::BF16, {TextConfig::hidden});
-    runtime.output_head = materialized_weight(backing, plan.output_head, TextConfig::output_rows,
-                                              TextConfig::hidden);
+                                                        NumericFormat::BF16, {g.hidden});
+    runtime.output_head =
+        materialized_weight(backing, plan.output_head, g.output_rows, g.hidden);
 }
 
 } // namespace sinfer::targets::qwen3::detail

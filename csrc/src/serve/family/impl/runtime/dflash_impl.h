@@ -124,7 +124,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         }
 
         const auto context_roots =
-            workspace_recipe::dflash_context<Config>(state.execution.work, columns);
+            workspace_recipe::dflash_context<DFlashConfig>(state.execution.work, columns);
         Tensor projected = context_roots.projected;
         ops::linear(features.view({Config::feature_rows, columns}),
                     state.execution.model.dflash->feature_projection, projected,
@@ -147,7 +147,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                                           ? positions.slice(0, local_offset, local_width)
                                           : positions;
             auto layer_roots =
-                workspace_recipe::dflash_context_layer<Config>(state.execution.work, layer_columns);
+                workspace_recipe::dflash_context_layer<DFlashConfig>(state.execution.work, layer_columns);
             Tensor key_raw =
                 layer_roots.key_raw.view({Config::head_dim, Config::kv_heads, layer_columns});
             Tensor value =
@@ -210,7 +210,7 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
             {
                 auto attention_scope = state.execution.work.scope();
                 auto roots =
-                    workspace_recipe::dflash_attention<Config>(state.execution.work, columns);
+                    workspace_recipe::dflash_attention<DFlashConfig>(state.execution.work, columns);
                 ops::rmsnorm(residual, weight.input_norm, Config::rms_epsilon, false, roots.hidden,
                              state.execution.device.stream);
                 Tensor query_raw =
@@ -257,7 +257,7 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
             }
             {
                 auto mlp_scope = state.execution.work.scope();
-                auto roots = workspace_recipe::dflash_mlp<Config>(state.execution.work, columns);
+                auto roots = workspace_recipe::dflash_mlp<DFlashConfig>(state.execution.work, columns);
                 ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon, false,
                              roots.hidden, state.execution.device.stream);
                 ops::linear_swiglu(roots.hidden, weight.gate_up, roots.intermediate,

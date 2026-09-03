@@ -290,7 +290,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
         QType::W8G32_F16S, 9216, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
 }
 
-std::size_t Variant::attention_output_projection_workspace_capacity_bytes(WeightsProfile weights,
+std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights,
                                                                           family::TextPhase,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
@@ -375,7 +375,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
                                                               TextConfig::hidden, first, last);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     if (weights_profile == WeightsProfile::RoutedNvfp4 ||
@@ -393,7 +393,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
                                                              first, last));
 }
 
-std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                              std::int32_t last) {
     return ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry,
                                                     QType::W8G32_F16S, QType::W8G32_F16S, first,

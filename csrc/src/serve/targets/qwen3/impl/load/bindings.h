@@ -13,12 +13,15 @@
 #include "core/tensor.h"
 
 #include <array>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
 
 namespace sinfer::targets::qwen3::detail {
 
+// The compiled default for a Qwen3-0.6B; an artifact that declares `layers` overrides it,
+// which is what lets this one target serve every size of the family.
 inline constexpr std::size_t kTextLayers          = 28;
 inline constexpr std::size_t kFullAttentionLayers = 28;
 // Every layer is full attention. The empty half of the family's split is not a
@@ -67,7 +70,8 @@ struct BindingPlan {
     family::StartupFeatures features;
 
     WeightPlan token_embedding;
-    std::array<TextLayerPlan, kTextLayers> text_layers;
+    /// One per layer, sized when the artifact is bound rather than by the type.
+    std::vector<TextLayerPlan> text_layers;
     artifact::ObjectHandle final_norm;
     /// Qwen3-0.6B sets `tie_word_embeddings`, but the converter stores the head
     /// as its own object rather than an alias, so this is an ordinary binding.

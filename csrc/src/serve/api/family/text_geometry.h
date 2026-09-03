@@ -25,6 +25,8 @@ namespace sinfer::family {
 /// engine reads and this one does not.
 struct TextGeometry {
     std::int32_t hidden             = 0;
+    /// The width of the residual stream, which is `hidden` unless the family widens it.
+    std::int32_t residual           = 0;
     std::int32_t layers             = 0;
     std::int32_t intermediate       = 0;
     std::int32_t output_rows        = 0;
@@ -64,6 +66,11 @@ struct TextGeometry {
 #define SINFER_TEXT_GEOMETRY_TAKE(member) \
         if constexpr (requires { Config::member; }) { g.member = Config::member; }
         SINFER_TEXT_GEOMETRY_TAKE(hidden)
+        if constexpr (requires { Config::residual; }) {
+            g.residual = Config::residual;
+        } else {
+            g.residual = Config::hidden;
+        }
         SINFER_TEXT_GEOMETRY_TAKE(layers)
         SINFER_TEXT_GEOMETRY_TAKE(intermediate)
         SINFER_TEXT_GEOMETRY_TAKE(output_rows)
@@ -90,6 +97,11 @@ struct TextGeometry {
     [[nodiscard]] static TextGeometry declared(const std::map<std::string, double>& declared) {
         TextGeometry g = compiled<Config>();
         g.override_from(declared);
+        // A family that does not widen its residual stream has one exactly as wide as its
+        // hidden state, at every size. Deriving it here rather than making every artifact
+        // restate it keeps a declaration that names `hidden` alone from leaving the residual
+        // at the compiled width -- which is a mismatch the first embedding lookup finds.
+        if constexpr (!requires { Config::residual; }) { g.residual = g.hidden; }
         return g;
     }
 
@@ -98,6 +110,7 @@ struct TextGeometry {
         struct IntMember { std::string_view name; std::int32_t TextGeometry::* value; };
         static constexpr IntMember kInts[] = {
             {"hidden", &TextGeometry::hidden},
+            {"residual", &TextGeometry::residual},
             {"layers", &TextGeometry::layers},
             {"intermediate", &TextGeometry::intermediate},
             {"output_rows", &TextGeometry::output_rows},

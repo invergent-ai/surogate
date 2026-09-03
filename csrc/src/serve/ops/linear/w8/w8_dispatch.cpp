@@ -312,11 +312,21 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     }
 
-    // Name the geometry: an unregistered (n,k) is the routine way a new model or a
-    // new execution path (speculation widens T) meets this table, and "unsupported
-    // shape or T" alone sends the reader hunting for which one.
-    throw std::invalid_argument("w8 linear: unsupported shape or T (n=" + std::to_string(n) +
-                                ", k=" + std::to_string(k) + ", T=" + std::to_string(t) + ")");
+    // Everything above is a *measured* route: a shape someone benchmarked, with the T bands
+    // the measurements produced. What follows is the same family of launchers at their
+    // default bands, for a shape nobody has measured yet.
+    //
+    // The launchers are shape-generic -- they take n, k and T from the tensors and handle a
+    // partial tile -- so refusing here would be a policy, not a limit, and the policy was
+    // wrong: it made every size of every family a code change. The one real constraint is
+    // the MMA route's 16-byte-aligned scale rows, and a shape that misses it takes the SIMT
+    // route at any width.
+    //
+    // A shape that lands here works but is not tuned. Measure it and give it an entry above.
+    if ((k % kW8MmaScaleRowAlignmentK) != 0) { return launch_w8_simt_r8_c4; }
+    if (t <= 16) { return launch_w8_simt_r8_c4; }
+    if (t <= 128) { return launch_w8_mma_r32_c128; }
+    return launch_w8_mma_r64_c128;
 }
 
 W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

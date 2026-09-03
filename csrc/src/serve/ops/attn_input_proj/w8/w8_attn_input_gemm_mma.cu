@@ -103,14 +103,20 @@ void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (1024 % Schedule::BM) == 0);
-    // Qwen3-0.6B ungated fused qkv (rows 4096 = q2048 | k1024 | v1024, hidden 1024).
+    // Qwen3's ungated fused qkv: rows 4096 = q2048 | k1024 | v1024, at hidden 1024 for the
+    // 0.6B and 2048 for the 1.7B. One row split, two K, because 16 query heads and 8 KV heads
+    // at head dim 128 is the family's attention at both sizes.
     if (weight.n == 4096) {
         using OutputQwen3 = W8SplitOutput3<2048, 1024, 1024>;
         static_assert((2048 % Schedule::BM) == 0 && (1024 % Schedule::BM) == 0);
         const OutputQwen3 output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-        launch_route<Schedule, 4096, 1024>(x, weight, output, stream);
+        if (weight.k == 2048) {
+            launch_route<Schedule, 4096, 2048>(x, weight, output, stream);
+        } else {
+            launch_route<Schedule, 4096, 1024>(x, weight, output, stream);
+        }
         return;
     }
     // TinyLlama-1.1B ungated fused qkv (rows 2560 = q2048 | k256 | v256, hidden
@@ -135,14 +141,20 @@ void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (1024 % Schedule::BM) == 0);
-    // Qwen3-0.6B ungated fused qkv (rows 4096 = q2048 | k1024 | v1024, hidden 1024).
+    // Qwen3's ungated fused qkv: rows 4096 = q2048 | k1024 | v1024, at hidden 1024 for the
+    // 0.6B and 2048 for the 1.7B. One row split, two K, because 16 query heads and 8 KV heads
+    // at head dim 128 is the family's attention at both sizes.
     if (weight.n == 4096) {
         using OutputQwen3 = W8SplitOutput3<2048, 1024, 1024>;
         static_assert((2048 % Schedule::BM) == 0 && (1024 % Schedule::BM) == 0);
         const OutputQwen3 output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-        launch_route<Schedule, 4096, 1024>(x, weight, output, stream);
+        if (weight.k == 2048) {
+            launch_route<Schedule, 4096, 2048>(x, weight, output, stream);
+        } else {
+            launch_route<Schedule, 4096, 1024>(x, weight, output, stream);
+        }
         return;
     }
     // TinyLlama-1.1B ungated fused qkv (rows 2560 = q2048 | k256 | v256, hidden

@@ -116,7 +116,8 @@
         return 0; \
     } \
  \
-    std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t, std::int32_t) { \
+    std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry&, \
+                                                                 std::int32_t, std::int32_t) { \
         return 0; \
     } \
  \

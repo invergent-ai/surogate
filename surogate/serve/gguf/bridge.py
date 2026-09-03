@@ -542,7 +542,9 @@ def gguf_target_key(gguf_path: Path, reader=None):
     # Dense decoders whose engine target is one compiled geometry. The gates below are that
     # geometry: a differently sized Qwen3 or Llama has no target to be served by yet, and is
     # refused with the summary rather than converted against the wrong config.
-    if arch == "qwen3" and hidden == 1024 and layers == 28:
+    # Any size of the plain dense Qwen3: the target reads its dimensions from the artifact
+    # rather than compiling them, so what has to match is the architecture, not the size.
+    if arch == "qwen3" and hidden > 0 and layers > 0:
         return "qwen3"
     if arch == "llama" and hidden == 2048 and layers == 22:
         return "llama"

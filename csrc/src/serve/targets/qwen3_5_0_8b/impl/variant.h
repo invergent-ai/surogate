@@ -3,6 +3,7 @@
 #include "targets/qwen3_5_0_8b/impl/config.h"
 #include "targets/qwen3_5_0_8b/impl/load/bindings.h"
 #include <api/family/runtime.h>
+#include <api/family/text_geometry.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -93,7 +94,7 @@ struct Variant {
                                                   family::TextPhase phase, std::int32_t first,
                                                   std::int32_t last);
     [[nodiscard]] static std::size_t
-    attention_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                          family::TextPhase phase,
                                                          std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
@@ -113,9 +114,9 @@ struct Variant {
     [[nodiscard]] static std::size_t
     gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, family::TextPhase phase,
+    post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase phase,
                                         std::int32_t first, std::int32_t last);
-    [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+    [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                              std::int32_t last);
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>

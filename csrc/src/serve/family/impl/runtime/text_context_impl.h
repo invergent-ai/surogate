@@ -353,7 +353,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     Tensor flat_ids    = ids.view({T});
     Tensor flat_hidden = hidden.view({cfg_.hidden, T});
 
-    auto roots = workspace_recipe::mtp_stem<TextConfig>(work_, T, input_embeddings == nullptr);
+    auto roots = workspace_recipe::mtp_stem(work_, cfg_geometry(), T, input_embeddings == nullptr);
     Tensor emb;
     if (input_embeddings != nullptr) {
         if (input_embeddings->dtype != DType::BF16 || input_embeddings->ne[0] != cfg_.hidden ||
@@ -388,7 +388,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
-    const auto projection = workspace_recipe::mtp_attention_projection<TextConfig>(work_, T);
+    const auto projection = workspace_recipe::mtp_attention_projection(work_, cfg_geometry(), T);
     Tensor q              = projection.query.view({cfg_.head_dim, cfg_.n_q, T});
     Tensor k              = projection.key.view({cfg_.head_dim, cfg_.n_kv, T});
     Tensor gate           = projection.gate.view({cfg_.head_dim, cfg_.n_q, T});
@@ -400,7 +400,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     Variant::mtp_attention_projection(ah, mtp_.payload->attention, q_flat, gate_flat, k_flat,
                                       v_flat, work_, s);
 
-    const auto results = workspace_recipe::mtp_attention_results<TextConfig>(work_, T);
+    const auto results = workspace_recipe::mtp_attention_results(work_, cfg_geometry(), T);
     Tensor qn          = results.normalized_query.view({cfg_.head_dim, cfg_.n_q, T});
     Tensor kn          = results.normalized_key.view({cfg_.head_dim, cfg_.n_kv, T});
     ops::rmsnorm(q, *mtp_.q_norm, cfg_.rms_eps, true, qn, s);
@@ -429,7 +429,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     }
     ops::sigmoid_mul(gate, a, s);
 
-    const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
+    const auto post = workspace_recipe::mtp_post_attention(work_, cfg_geometry(), T);
     Tensor o        = post.output;
     ops::linear(a.view({cfg_.q_size, T}), *mtp_.o_proj, o, s);
     ops::residual_add(o, x, s);
@@ -892,7 +892,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
         throw std::logic_error("Text GQA execution envelope is not set");
     }
 
-    const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
+    const auto projection = workspace_recipe::text_attention_projection(work_, cfg_geometry(), T);
     Tensor h              = projection.hidden;
     debug_probe<Variant>("residual_in", x, s);
     Hooks::attention_norm(x, *w.input_norm, cfg_.rms_eps, *w.projection, h, work_, s);
@@ -912,7 +912,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     debug_probe<Variant>("k_proj_raw", k_flat, s);
     debug_probe<Variant>("v_proj_raw", v_flat, s);
 
-    const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
+    const auto results = workspace_recipe::text_attention_results(work_, cfg_geometry(), T);
     // A target without a per-head query/key norm has nothing to write into the
     // normalised planes, so rope runs in place on the projection's own output.
     Tensor qn = attention_qk_norm<Variant>()
@@ -1099,7 +1099,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     };
     if (sub_timing) { cudaEventRecord(ftimer.sub_begin, s); }
 
-    const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
+    const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), T);
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
@@ -1115,7 +1115,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     }
 
     if (sub_timing) { sub_lap(ftimer.g_ctrl, sub_ctrl); }
-    const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
+    const auto projection = workspace_recipe::gdn_projection(work_, cfg_geometry(), T);
     Tensor z              = projection.output_gate.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, T});
     Tensor qc             = projection.query;
     Tensor kc             = projection.key;
@@ -1152,7 +1152,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 value_output, gate_output, ph, work_, s);
         }
     } else {
-        const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
+        const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), T);
         Tensor qkv      = conv.projected;
         Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
         if (sub_timing) { sub_lap(ftimer.g_proj, sub_proj); }
@@ -1178,7 +1178,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor k_recurrent = kc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, T});
 
     Tensor vv = vc.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, T});
-    Tensor o  = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, T).view(
+    Tensor o  = workspace_recipe::gdn_recurrent_output(work_, cfg_geometry(), T).view(
         {cfg_.gdn_v_dim, cfg_.gdn_v_heads, T});
     if (ph == Phase::Verify) {
         Tensor& recurrent_states = state_.recurrent.at(static_cast<std::size_t>(gidx));
@@ -1214,7 +1214,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         debug_probe<Variant>("gdn_o", o, s);
     }
 
-    Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
+    Tensor on = workspace_recipe::gdn_normalized_output(work_, cfg_geometry(), T).view(
         {cfg_.gdn_v_dim, cfg_.gdn_v_heads, T});
     if (sub_timing) { sub_lap(ftimer.g_scan, sub_scan); }
     ops::gated_rmsnorm(o, *w.gdn_norm, z, cfg_.rms_eps, gdn_output_gate<Variant>(), on, s);
@@ -1304,7 +1304,7 @@ void debug_next_token_nll(const Tensor& hidden_all, const Tensor& ids, std::int3
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
-    Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
+    Tensor h       = workspace_recipe::post_mixer_hidden(work_, cfg_geometry(), T);
     Hooks::post_mixer_norm(x, *post_norm, cfg_.rms_eps, *m.payload, h, work_, s);
 
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
@@ -1578,7 +1578,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
 
     work_.reset();
-    const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(work_, total, 0, 0);
+    const auto roots = workspace_recipe::text_prefill_roots(work_, cfg_geometry(), total, 0, 0);
     Tensor ids_device = roots.ids;
     Tensor ids_decode = ids_device.slice(0, prefill_cols, batch);
     CUDA_CHECK(cudaMemcpyAsync(ids_decode.data, decode.ids.data,
@@ -1662,8 +1662,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             {
                 auto mixer_scope      = work_.scope();
                 if (timing) { cudaEventRecord(timer.begin, s); }
-                const auto projection = workspace_recipe::text_attention_projection<TextConfig>(
-                    work_, total);
+                const auto projection = workspace_recipe::text_attention_projection(
+                    work_, cfg_geometry(), total);
                 Tensor h = projection.hidden;
                 debug_probe<Variant>("residual_in", x, s);
                 Hooks::attention_norm(x, *full.input_norm, cfg_.rms_eps, *full.projection, h,
@@ -1683,7 +1683,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 debug_probe<Variant>("k_proj_raw", k_flat, s);
                 debug_probe<Variant>("v_proj_raw", v_flat, s);
 
-                const auto results = workspace_recipe::text_attention_results<TextConfig>(work_,
+                const auto results = workspace_recipe::text_attention_results(work_, cfg_geometry(),
                                                                                          total);
                 Tensor qn = attention_qk_norm<Variant>()
                                 ? results.normalized_query.view({cfg_.head_dim, cfg_.n_q, total})
@@ -1779,7 +1779,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             {
                 auto mixer_scope   = work_.scope();
                 if (timing) { cudaEventRecord(timer.begin, s); }
-                const auto control = workspace_recipe::gdn_control<TextConfig>(work_, total);
+                const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), total);
                 Tensor h           = control.hidden;
                 Tensor g           = control.g;
                 Tensor beta        = control.beta;
@@ -1789,12 +1789,12 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 float acc_g_ctrl = 0, acc_g_proj = 0, acc_g_conv = 0, acc_g_extract = 0,
                       acc_g_scan = 0, acc_g_norm = 0, acc_g_out = 0;
                 if (timing) { lap(timer.begin, timer.g_ctrl, acc_g_ctrl); cudaEventRecord(timer.begin, s); }
-                const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, total);
+                const auto projection = workspace_recipe::gdn_projection(work_, cfg_geometry(), total);
                 Tensor z  = projection.output_gate.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
                 Tensor qc = projection.query;
                 Tensor kc = projection.key;
                 Tensor vc = projection.value;
-                const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, total);
+                const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), total);
                 Tensor qkv      = conv.projected;
                 debug_probe<Variant>("mixed_gdn_in", x, s);
                 Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
@@ -1833,7 +1833,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 Tensor q_recurrent = qc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor k_recurrent = kc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor vv          = vc.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
-                Tensor o = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, total)
+                Tensor o = workspace_recipe::gdn_recurrent_output(work_, cfg_geometry(), total)
                                .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
                 {
                     for (std::size_t sg = 0; sg < segments.size(); ++sg) {
@@ -1869,7 +1869,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                         state_.recurrent.at(static_cast<std::size_t>(gidx)), Tensor{},
                         decode.linear_state_slots, decode.linear_state_slots, ob, s);
                 }
-                Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, total)
+                Tensor on = workspace_recipe::gdn_normalized_output(work_, cfg_geometry(), total)
                                 .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
                 if (timing) { lap(timer.begin, timer.g_scan, acc_g_scan); cudaEventRecord(timer.begin, s); }
                 ops::gated_rmsnorm(o, *gdn.gdn_norm, z, cfg_.rms_eps, gdn_output_gate<Variant>(), on, s);
@@ -1986,7 +1986,7 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
     cudaStream_t s             = ctx_.stream;
     PrefillGraphFamily& family = *prefill_graph_family_;
     work_.reset();
-    const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(work_, bucket, 0, 0);
+    const auto roots = workspace_recipe::text_prefill_roots(work_, cfg_geometry(), bucket, 0, 0);
 
     Tensor ingress = family.ingress_device();
     CUDA_CHECK(cudaMemcpyAsync(ingress.data, family.ingress_staging(),
@@ -2055,7 +2055,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
 
     work_.reset();
-    const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(work_, total, 0, 0);
+    const auto roots = workspace_recipe::text_prefill_roots(work_, cfg_geometry(), total, 0, 0);
 
     Tensor ingress = family.ingress_device();
     CUDA_CHECK(cudaMemcpyAsync(ingress.data, family.ingress_staging(),
@@ -2113,8 +2113,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
             {
                 auto mixer_scope      = work_.scope();
-                const auto projection = workspace_recipe::text_attention_projection<TextConfig>(
-                    work_, total);
+                const auto projection = workspace_recipe::text_attention_projection(
+                    work_, cfg_geometry(), total);
                 Tensor h = projection.hidden;
                 Hooks::attention_norm(x, *full.input_norm, cfg_.rms_eps, *full.projection, h,
                                       work_, s);
@@ -2129,7 +2129,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 Variant::attention_projection(h, *full.projection, q_flat, gate_flat, k_flat,
                                               v_flat, Phase::Prefill, work_, s);
 
-                const auto results = workspace_recipe::text_attention_results<TextConfig>(work_,
+                const auto results = workspace_recipe::text_attention_results(work_, cfg_geometry(),
                                                                                          total);
                 Tensor qn = attention_qk_norm<Variant>()
                                 ? results.normalized_query.view({cfg_.head_dim, cfg_.n_q, total})
@@ -2213,7 +2213,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
             {
                 auto mixer_scope   = work_.scope();
-                const auto control = workspace_recipe::gdn_control<TextConfig>(work_, total);
+                const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), total);
                 Tensor h           = control.hidden;
                 Tensor g           = control.g;
                 Tensor beta        = control.beta;
@@ -2228,12 +2228,12 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     ops::mask_columns_zero(beta_prefill, valid, s);
                 }
 
-                const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, total);
+                const auto projection = workspace_recipe::gdn_projection(work_, cfg_geometry(), total);
                 Tensor z  = projection.output_gate.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
                 Tensor qc = projection.query;
                 Tensor kc = projection.key;
                 Tensor vc = projection.value;
-                const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, total);
+                const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), total);
                 Tensor qkv      = conv.projected;
                 Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
                 Tensor qkv_c = conv.convolved;
@@ -2263,7 +2263,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 Tensor q_recurrent = qc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor k_recurrent = kc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor vv          = vc.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
-                Tensor o = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, total)
+                Tensor o = workspace_recipe::gdn_recurrent_output(work_, cfg_geometry(), total)
                                .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
                 {
                     Tensor qa = q_recurrent.slice(2, 0, prefill_cols);
@@ -2295,7 +2295,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                         state_.recurrent.at(static_cast<std::size_t>(gidx)), Tensor{},
                         decode.linear_state_slots, decode.linear_state_slots, ob, s);
                 }
-                Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, total)
+                Tensor on = workspace_recipe::gdn_normalized_output(work_, cfg_geometry(), total)
                                 .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
                 ops::gated_rmsnorm(o, *gdn.gdn_norm, z, cfg_.rms_eps, gdn_output_gate<Variant>(), on, s);
                 Variant::gdn_output_projection(on.view({cfg_.value_dim, total}), *gdn.out_proj, x,
@@ -2567,8 +2567,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
 
             const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
-            const auto roots             = workspace_recipe::text_prefill_roots<TextConfig>(
-                work_, len, rope_axes, static_cast<std::int32_t>(local_scatter_indices.size()));
+            const auto roots             = workspace_recipe::text_prefill_roots(
+                work_, cfg_geometry(), len, rope_axes, static_cast<std::int32_t>(local_scatter_indices.size()));
             Tensor ids_device = roots.ids;
             copy_i32(ids.data() + t0, ids_device, s);
 

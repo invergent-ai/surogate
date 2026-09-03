@@ -81,7 +81,22 @@ def test_dequant_and_shape_restore(mini_gguf):
     np.testing.assert_array_equal(back, ref)
 
 
-def test_target_key_rejects_unregistered_geometry(mini_gguf):
+def test_target_key_resolves_by_architecture_not_by_size(mini_gguf):
     path, _, _ = mini_gguf
-    # 64-hidden single-layer toy model must not map to any registered target.
+    # The toy is a 64-hidden single-layer Qwen3. It resolves, because the target reads its
+    # dimensions from the artifact rather than compiling them: what a gate can decide is
+    # whether the engine knows this *architecture*, not whether it knows this size.
+    assert gguf_target_key(path) == "qwen3"
+
+
+def test_target_key_rejects_an_unknown_architecture(tmp_path):
+    path = tmp_path / "unknown.gguf"
+    writer = GGUFWriter(str(path), "not-an-architecture")
+    writer.add_block_count(1)
+    writer.add_embedding_length(64)
+    writer.add_head_count(4)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
     assert gguf_target_key(path) is None

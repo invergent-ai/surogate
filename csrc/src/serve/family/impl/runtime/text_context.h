@@ -96,8 +96,7 @@ struct ModelConfig {
     /// with its own `key_dim`.
     explicit ModelConfig(const family::TextGeometry& geometry)
         : hidden(geometry.hidden),
-          residual(geometry.hidden == TextConfig::hidden ? residual_width<TextConfig>()
-                                                         : geometry.hidden),
+          residual(geometry.residual),
           n_layers(geometry.layers),
           intermediate(geometry.intermediate),
           vocab(geometry.output_rows),
@@ -491,6 +490,10 @@ private:
     /// registered model is unchanged; holding it per context rather than reading a namespace
     /// constant is what lets two engines of different sizes share one process.
     ModelConfig cfg_{};
+    /// The same dimensions as the value the workspace recipe is shaped by.
+    [[nodiscard]] const family::TextGeometry& cfg_geometry() const noexcept {
+        return weights_.geometry;
+    }
     int stage_last_                             = cfg_.n_layers;
     StageSpan stage_{};
     void stage_import(Tensor& x, cudaStream_t stream);

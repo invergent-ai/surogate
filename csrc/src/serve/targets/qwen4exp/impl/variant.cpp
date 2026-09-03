@@ -1795,7 +1795,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
            w8_capacity(TextConfig::query_projection_rows, kHidden, first, last);
 }
 
-std::size_t Variant::attention_output_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
                                                                           family::TextPhase,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
@@ -1843,7 +1843,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
            2 * plane_bytes(heads, last, DType::BF16);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, family::TextPhase,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile, family::TextPhase,
                                                          std::int32_t first, std::int32_t last) {
     return mix_capacity(first, last) + plane_bytes(kHidden, last, DType::BF16) +
            round_up(ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeFlashNextGeometry,
@@ -1851,7 +1851,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, family:
                                                              first, last));
 }
 
-std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t, std::int32_t) {
+std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, std::int32_t) {
     return 0;
 }
 

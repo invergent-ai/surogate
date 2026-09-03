@@ -104,8 +104,13 @@ bool is_companion_shape(const W8AttnInputProblem& problem) noexcept {
 // point and nothing else -- different parent, different hidden, different row
 // split -- so it is keyed separately rather than folded into that predicate.
 bool is_qwen3_ungated_shape(const W8AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 1024 && problem.query_rows == 2048 && problem.kv_rows == 1024 &&
-           problem.parent_rows == 4096 && problem.padded_k == 1024;
+    // Both sizes of the family's ungated attention: 16 query heads and 8 KV heads at head dim
+    // 128, over hidden 1024 (0.6B) or 2048 (1.7B). One row split, two K, so one predicate --
+    // the schedules differ only in the K they were instantiated for.
+    const bool split = problem.query_rows == 2048 && problem.kv_rows == 1024 &&
+                       problem.parent_rows == 4096;
+    return split && problem.input_rows == problem.padded_k &&
+           (problem.padded_k == 1024 || problem.padded_k == 2048);
 }
 
 // The third three-output shape: TinyLlama-1.1B, 32 query heads and 4 KV heads at

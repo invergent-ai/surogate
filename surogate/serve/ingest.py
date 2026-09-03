@@ -86,8 +86,10 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
             return ConverterTarget("qwen3_8_27b_nvfp4", "surogate.serve.convert.qwen3_8_27b.convert_nvfp4",
                                    "Qwen3.8-27B (NVFP4)")
         return ConverterTarget("qwen3_8_27b", "surogate.serve.convert.qwen3_8_27b.convert", "Qwen3.8-27B")
-    if model_type == "qwen3" and hidden == 1024 and layers == 28:
-        return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3-0.6B")
+    # Any size of the plain dense Qwen3: the artifact states its dimensions and the engine
+    # binds against those, so the architecture is the gate.
+    if model_type == "qwen3" and hidden > 0 and layers > 0:
+        return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3")
     if model_type == "llama" and hidden == 2048 and layers == 22:
         return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "TinyLlama-1.1B")
     if model_type in ("gemma3", "gemma3_text") and hidden == 640 and layers == 18:
@@ -177,7 +179,7 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
             f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
             f"layers={s['num_hidden_layers']} quants={s['quant_types']}\n"
             "  Registered today: Qwen3.5-0.8B/2B/4B, Qwen3.6-27B, Qwen3.8-27B, Qwen3.6-35B-A3B,\n"
-            "  Qwen3.8-Flash-Next, Qwen3-0.6B, TinyLlama-1.1B. Each is one compiled geometry;\n"
+            "  Qwen3.8-Flash-Next, Qwen3 (any size), TinyLlama-1.1B. Each is one compiled geometry;\n"
             "  a different size of the same family needs its own target."
         )
 
@@ -519,7 +521,7 @@ def ensure_engine_weights(spec: str, *, echo=print) -> Path:
             "surogate serve: this model is not yet supported by the native engine.\n"
             f"  model_type={config.get('model_type')!r} hidden_size={config.get('hidden_size')} "
             f"layers={config.get('num_hidden_layers')}\n"
-            "  Registered today: Qwen3.6-27B, Qwen3.8-27B (BF16/NVFP4), Qwen3.6-35B-A3B."
+            "  Registered today: Qwen3.6-27B, Qwen3.8-27B (BF16/NVFP4), Qwen3.6-35B-A3B, Qwen3 (any size)."
         )
 
     fp = source_fingerprint(model_dir)

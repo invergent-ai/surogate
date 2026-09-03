@@ -132,8 +132,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     return 0;
 }
 
-std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
-    WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
+std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
     return ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile),
                                                     TextConfig::hidden, TextConfig::query_size,
@@ -153,7 +152,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     apply_lora(weights.down, 4, activation, residual, stream);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);

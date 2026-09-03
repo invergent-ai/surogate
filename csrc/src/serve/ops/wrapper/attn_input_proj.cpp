@@ -357,9 +357,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
         std::int32_t q_rows;
         std::int32_t kv_rows;
     };
-    static constexpr std::array<UngatedSplit, 3> kUngated{{
+    static constexpr std::array<UngatedSplit, 4> kUngated{{
         {6144, 2048, 4096, 1024}, // the qwen3.6 companion
         {4096, 1024, 2048, 1024}, // qwen3-0.6b: 16 query, 8 kv, head dim 128
+        {4096, 2048, 2048, 1024}, // qwen3-1.7b: the same attention over a wider residual
         {2560, 2048, 2048, 256},  // tinyllama-1.1b: 32 query, 4 kv, head dim 64
     }};
     const auto* split = std::find_if(kUngated.begin(), kUngated.end(), [&](const UngatedSplit& e) {

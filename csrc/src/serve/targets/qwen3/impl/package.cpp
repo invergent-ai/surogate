@@ -61,27 +61,28 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
     }
 
     using Binding = ops::LoraStore::ModuleBinding;
-    for (std::size_t layer = 0; layer < TextConfig::layers; ++layer) {
+    const family::TextGeometry& g = runtime.geometry;
+    for (std::size_t layer = 0; layer < runtime.full_layers.size(); ++layer) {
         const auto index      = static_cast<std::int32_t>(layer);
         const auto& attention = runtime.full_layers.at(layer);
         const void* qkv       = attention.projection.query_key_value.qdata;
         store.register_module(
             index, "q_proj",
-            Binding{qkv, 0, TextConfig::hidden, TextConfig::query_heads * TextConfig::head_dim});
+            Binding{qkv, 0, g.hidden, g.query_size()});
         store.register_module(
             index, "k_proj",
-            Binding{qkv, 1, TextConfig::hidden, TextConfig::kv_heads * TextConfig::head_dim});
+            Binding{qkv, 1, g.hidden, g.kv_size()});
         store.register_module(
             index, "v_proj",
-            Binding{qkv, 2, TextConfig::hidden, TextConfig::kv_heads * TextConfig::head_dim});
+            Binding{qkv, 2, g.hidden, g.kv_size()});
         store.register_module(index, "o_proj",
                               Binding{attention.output.qdata, 3,
-                                      TextConfig::query_heads * TextConfig::head_dim,
-                                      TextConfig::hidden});
+                                      g.query_size(),
+                                      g.hidden});
         store.register_module(
             index, "down_proj",
-            Binding{attention.post_mixer.down.qdata, 4, TextConfig::intermediate,
-                    TextConfig::hidden});
+            Binding{attention.post_mixer.down.qdata, 4, g.intermediate,
+                    g.hidden});
     }
     for (const char* module : {"gate_proj", "up_proj"}) {
         store.register_refusal(module,

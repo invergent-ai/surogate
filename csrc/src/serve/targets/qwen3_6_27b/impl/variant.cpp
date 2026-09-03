@@ -387,8 +387,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     throw std::logic_error("invalid 27B weights profile");
 }
 
-std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
-    WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
+std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
@@ -520,7 +519,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
                                                               TextConfig::hidden, first, last);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
@@ -544,7 +543,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
 }
 
-std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                              std::int32_t last) {
     family::validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
