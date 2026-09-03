@@ -10,6 +10,7 @@
 #include <limits>
 #include <span>
 #include <string_view>
+#include <filesystem>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
@@ -324,6 +325,19 @@ struct Reader::Impl {
 
         static constexpr std::array root_members = {"identity", "objects"};
         require_members(directory, root_members, "directory root");
+        // An artifact may serve some of its objects straight out of another file rather than
+        // copying them in. The table is absent from every artifact that does not, and those load
+        // exactly as before.
+        if (directory.contains("external")) {
+            const auto& raw_external = directory.at("external");
+            if (!raw_external.is_array()) { throw ArtifactError("external must be an array"); }
+            for (const auto& entry : raw_external) {
+                ExternalFile out;
+                out.path  = require_string(entry.at("path"), "external path");
+                out.bytes = require_unsigned(entry.at("bytes"), "external bytes", true);
+                external.push_back(std::move(out));
+            }
+        }
         const auto& raw_identity                     = directory.at("identity");
         static constexpr std::array identity_members = {"model_id", "weights_id"};
         require_members(raw_identity, identity_members, "artifact identity");
@@ -355,28 +369,102 @@ struct Reader::Impl {
                 },
                 object);
 
-            if (offset < cursor) {
+            const bool external_object = raw_object.contains("runs");
+            if (!external_object && offset < cursor) {
                 throw ArtifactError("object " + std::string(name) + " overlaps or is out of order");
             }
-            if (offset % alignment != 0) {
+            if (!external_object && offset % alignment != 0) {
                 throw ArtifactError("object " + std::string(name) + " is not " +
                                     std::to_string(alignment) + "-byte aligned");
             }
-            const auto end = checked_add(offset, bytes, "object payload range");
-            if (end > payload_bytes) {
-                throw ArtifactError("object " + std::string(name) + " extends beyond the file");
+            std::vector<PayloadRun> object_runs;
+            if (raw_object.contains("runs")) {
+                // Served from an external file. `offset` and `bytes` still describe the object as
+                // the binder sees it -- one logical, contiguous tensor -- but its bytes are
+                // gathered from the runs rather than read at that offset here.
+                const auto& raw_runs = raw_object.at("runs");
+                if (!raw_runs.is_array() || raw_runs.empty()) {
+                    throw ArtifactError("object " + std::string(name) + " has an empty run list");
+                }
+                std::uint64_t covered = 0;
+                for (const auto& raw_run : raw_runs) {
+                    PayloadRun run;
+                    run.source = static_cast<std::uint32_t>(require_unsigned(raw_run.at("source"), "run source", true));
+                    run.offset = require_unsigned(raw_run.at("offset"), "run offset", false);
+                    run.bytes  = require_unsigned(raw_run.at("bytes"), "run bytes", true);
+                    if (run.source == 0 || run.source > external.size()) {
+                        throw ArtifactError("object " + std::string(name) +
+                                            " names an external source that is not declared");
+                    }
+                    const auto run_end = checked_add(run.offset, run.bytes, "run range");
+                    if (run_end > external[run.source - 1].bytes) {
+                        throw ArtifactError("object " + std::string(name) +
+                                            " runs past the end of " +
+                                            external[run.source - 1].path);
+                    }
+                    covered = checked_add(covered, run.bytes, "object run coverage");
+                    object_runs.push_back(run);
+                }
+                if (covered != bytes) {
+                    throw ArtifactError("object " + std::string(name) + " declares " +
+                                        std::to_string(bytes) + " bytes but its runs cover " +
+                                        std::to_string(covered));
+                }
+            } else {
+                const auto end = checked_add(offset, bytes, "object payload range");
+                if (end > payload_bytes) {
+                    throw ArtifactError("object " + std::string(name) + " extends beyond the file");
+                }
+                object_runs.push_back(PayloadRun{0, checked_add(payload_start, offset,
+                                                                "absolute payload offset"),
+                                                 bytes});
+                cursor = end;
             }
             const auto object_index = entries.size();
             auto [_, inserted]      = index.emplace(std::string(name), object_index);
             if (!inserted) { throw ArtifactError("duplicate object name: " + std::string(name)); }
             entries.push_back(std::move(object));
-            cursor = end;
+            runs.push_back(std::move(object_runs));
         }
+
+        // Mapped last, so a malformed directory fails before any of them is opened. A relative
+        // path is resolved against the artifact's own directory, which keeps a model and the
+        // GGUF it reads movable together.
+        external_maps.reserve(external.size());
+        for (const ExternalFile& entry : external) {
+            std::filesystem::path resolved = entry.path;
+            if (resolved.is_relative()) { resolved = path.parent_path() / resolved; }
+            std::error_code ec;
+            const auto actual = std::filesystem::file_size(resolved, ec);
+            if (ec) {
+                throw ArtifactError("this artifact serves weights from " + resolved.string() +
+                                    ", which cannot be read: " + ec.message());
+            }
+            if (actual != entry.bytes) {
+                throw ArtifactError(resolved.string() + " is " + std::to_string(actual) +
+                                    " bytes but this artifact was written against " +
+                                    std::to_string(entry.bytes) +
+                                    "; the file it serves weights from has changed");
+            }
+            external_maps.push_back(std::make_unique<MappedFile>(resolved));
+        }
+    }
+
+    MappedFile& file_for(std::uint32_t source) {
+        if (source == 0) { return file; }
+        if (source > external_maps.size()) { throw ArtifactError("unknown external source"); }
+        return *external_maps[source - 1];
+    }
+    const MappedFile& file_for(std::uint32_t source) const {
+        return const_cast<Impl*>(this)->file_for(source);
     }
 
     MappedFile file;
     ArtifactIdentity identity;
     std::vector<ObjectDescriptor> entries;
+    std::vector<std::vector<PayloadRun>> runs;
+    std::vector<ExternalFile> external;
+    std::vector<std::unique_ptr<MappedFile>> external_maps; // MappedFile owns an fd and a mapping
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     std::uint64_t payload_start = 0;
 };
@@ -401,16 +489,31 @@ std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.size(); }
 std::uint64_t Reader::payload_offset() const noexcept { return impl_->payload_start; }
 
 PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
-    const auto absolute =
-        checked_add(impl_->payload_start, object_offset(object), "absolute payload offset");
-    const auto end = checked_add(absolute, object_bytes(object), "absolute payload range");
-    if (end > impl_->file.size()) { throw ArtifactError("object payload extends beyond the file"); }
+    const auto index = static_cast<std::size_t>(&object - impl_->entries.data());
+    if (index >= impl_->runs.size() || impl_->runs[index].size() != 1) {
+        throw ArtifactError("object " + std::string(object_name(object)) +
+                            " is assembled from several runs and has no single payload span");
+    }
+    const PayloadRun& run  = impl_->runs[index].front();
+    const MappedFile& file = impl_->file_for(run.source);
+    const auto end         = checked_add(run.offset, run.bytes, "absolute payload range");
+    if (end > file.size()) { throw ArtifactError("object payload extends beyond the file"); }
     return {
-        absolute,
-        std::span<const std::byte>(impl_->file.data() + absolute,
-                                   static_cast<std::size_t>(object_bytes(object))),
+        run.offset,
+        std::span<const std::byte>(file.data() + run.offset, static_cast<std::size_t>(run.bytes)),
+        run.source,
     };
 }
+
+std::span<const PayloadRun> Reader::runs(const ObjectDescriptor& object) const {
+    const auto index = static_cast<std::size_t>(&object - impl_->entries.data());
+    if (index >= impl_->runs.size()) {
+        throw ArtifactError("object does not belong to this reader");
+    }
+    return impl_->runs[index];
+}
+
+const std::vector<ExternalFile>& Reader::external_files() const noexcept { return impl_->external; }
 
 PayloadSpan Reader::payload(std::string_view name) const {
     const auto* object = find(name);
@@ -418,9 +521,9 @@ PayloadSpan Reader::payload(std::string_view name) const {
     return payload(*object);
 }
 
-std::size_t Reader::read_direct(std::uint64_t absolute_offset,
+std::size_t Reader::read_direct(std::uint32_t source, std::uint64_t absolute_offset,
                                 std::span<std::byte> destination) const {
-    return impl_->file.read_direct(absolute_offset, destination);
+    return impl_->file_for(source).read_direct(absolute_offset, destination);
 }
 
 } // namespace sinfer::artifact

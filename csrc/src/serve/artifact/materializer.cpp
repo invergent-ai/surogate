@@ -55,14 +55,18 @@ public:
 };
 
 struct CopyRange {
+    /// Which file the offsets are in: zero is the artifact, one and up an external file it
+    /// serves weights from. Ranges are ordered and coalesced within a source, never across one.
+    std::uint32_t source       = 0;
     std::uint64_t source_begin = 0;
     std::uint64_t source_end   = 0;
     std::byte* destination     = nullptr;
 };
 
 struct ReadSpan {
-    std::uint64_t begin = 0;
-    std::uint64_t end   = 0;
+    std::uint32_t source = 0;
+    std::uint64_t begin  = 0;
+    std::uint64_t end    = 0;
 };
 
 } // namespace
@@ -123,31 +127,47 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     std::uint64_t last_published = 0;
     std::uint64_t total          = 0;
     for (const DeviceMaterialization& placement : plan.device_objects) {
-        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        const auto& descriptor = reader.objects().at(placement.object.index);
+        const auto object_runs = reader.runs(descriptor);
         DeviceSpan storage =
             out.device_arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
                                            static_cast<std::size_t>(placement.alignment));
         const auto actual_offset =
             static_cast<std::uint64_t>(static_cast<std::byte*>(storage.data) -
                                        static_cast<std::byte*>(out.device_arena_->base()));
-        if (actual_offset != placement.offset || payload.data.size() != placement.bytes) {
+        std::uint64_t run_bytes = 0;
+        for (const PayloadRun& run : object_runs) {
+            run_bytes = checked_add(run_bytes, run.bytes, "artifact tensor run bytes overflow u64");
+        }
+        if (actual_offset != placement.offset || run_bytes != placement.bytes) {
             throw ArtifactError("materialization plan does not match artifact payload");
         }
         out.objects_.at(placement.object.index).device = storage.data;
-        ranges.push_back(CopyRange{
-            .source_begin = payload.absolute_offset,
-            .source_end   = checked_add(payload.absolute_offset, placement.bytes,
-                                        "artifact tensor source range overflows u64"),
-            .destination  = static_cast<std::byte*>(storage.data),
-        });
+        // An object gathered from several runs of a GGUF lands as several copies into one
+        // allocation, in the order the runs are declared.
+        auto* cursor_out = static_cast<std::byte*>(storage.data);
+        for (const PayloadRun& run : object_runs) {
+            ranges.push_back(CopyRange{
+                .source       = run.source,
+                .source_begin = run.offset,
+                .source_end   = checked_add(run.offset, run.bytes,
+                                            "artifact tensor source range overflows u64"),
+                .destination  = cursor_out,
+            });
+            cursor_out += run.bytes;
+        }
         total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
     }
     if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
     std::sort(ranges.begin(), ranges.end(), [](const CopyRange& a, const CopyRange& b) {
-        return a.source_begin < b.source_begin;
+        return a.source == b.source ? a.source_begin < b.source_begin : a.source < b.source;
     });
     for (std::size_t i = 1; i < ranges.size(); ++i) {
-        if (ranges[i].source_begin < ranges[i - 1].source_end) {
+        // Two objects may legitimately read the same bytes of a GGUF -- a tied embedding and
+        // output head, say -- so overlap is only an error inside the artifact's own payload,
+        // whose objects the directory already requires to be disjoint and ordered.
+        if (ranges[i].source == ranges[i - 1].source && ranges[i].source == 0 &&
+            ranges[i].source_begin < ranges[i - 1].source_end) {
             throw ArtifactError("materialization source ranges overlap");
         }
     }
@@ -158,9 +178,10 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     std::uint64_t aligned_read_bytes = 0;
     for (const CopyRange& range : ranges) {
         const std::uint64_t begin = align_down(range.source_begin, alignment);
-        if (read_spans.empty() || begin > align_up(read_spans.back().end, alignment,
-                                                   "artifact direct I/O span overflows u64")) {
-            read_spans.push_back(ReadSpan{begin, range.source_end});
+        if (read_spans.empty() || read_spans.back().source != range.source ||
+            begin > align_up(read_spans.back().end, alignment,
+                             "artifact direct I/O span overflows u64")) {
+            read_spans.push_back(ReadSpan{range.source, begin, range.source_end});
         } else {
             read_spans.back().end = std::max(read_spans.back().end, range.source_end);
         }
@@ -197,7 +218,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 align_up(remaining, alignment, "artifact direct I/O request overflows u64")));
             auto destination =
                 std::span<std::byte>(static_cast<std::byte*>(slot.buffer.data()), request);
-            const std::size_t bytes_read = reader.read_direct(source, destination);
+            const std::size_t bytes_read = reader.read_direct(span.source, source, destination);
             const std::uint64_t required = std::min<std::uint64_t>(request, remaining);
             if (bytes_read < required) {
                 throw ArtifactError("direct artifact read ended before the planned tensor range");
@@ -207,11 +228,17 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             const std::uint64_t chunk_end =
                 checked_add(source, bytes_read, "artifact direct I/O result overflows u64");
 
-            while (next_range < ranges.size() && ranges[next_range].source_end <= source) {
+            // Offsets only order within a file, so both walks are gated on the source too:
+            // an external file's small offsets must not match ranges left in the artifact's.
+            while (next_range < ranges.size() &&
+                   (ranges[next_range].source < span.source ||
+                    (ranges[next_range].source == span.source &&
+                     ranges[next_range].source_end <= source))) {
                 ++next_range;
             }
             std::size_t range_index = next_range;
-            while (range_index < ranges.size() && ranges[range_index].source_begin < chunk_end) {
+            while (range_index < ranges.size() && ranges[range_index].source == span.source &&
+                   ranges[range_index].source_begin < chunk_end) {
                 const CopyRange& range         = ranges[range_index];
                 const std::uint64_t copy_begin = std::max(source, range.source_begin);
                 const std::uint64_t copy_end   = std::min(chunk_end, range.source_end);

@@ -126,6 +126,25 @@ std::uint64_t object_bytes(const ObjectDescriptor& object) noexcept;
 struct PayloadSpan {
     std::uint64_t absolute_offset;
     std::span<const std::byte> data;
+    /// Which file the offset is in: zero is this artifact, one and up index `external_files()`.
+    std::uint32_t source = 0;
+};
+
+/// One contiguous run of an object's bytes. An object written into the artifact's own payload is
+/// a single run at source zero -- every artifact before external sources existed is exactly that.
+/// An object served straight from a GGUF is one run per contiguous stretch of that file, which is
+/// more than one whenever the recipe interleaves two of its tensors: a fused routed gate/up takes
+/// each expert's gate rows and then its up rows, and those live in two different GGUF tensors.
+struct PayloadRun {
+    std::uint32_t source = 0;
+    std::uint64_t offset = 0; // absolute within that file
+    std::uint64_t bytes  = 0;
+};
+
+/// A file the artifact serves bytes from without copying them into itself.
+struct ExternalFile {
+    std::string path;
+    std::uint64_t bytes = 0;
 };
 
 struct ArtifactIdentity {
@@ -153,9 +172,15 @@ public:
 
     std::uint64_t file_bytes() const noexcept;
     std::uint64_t payload_offset() const noexcept;
+    /// Valid for any object that is one contiguous run; an object spread over several runs of an
+    /// external file has no single span and must be read through `runs()`.
     PayloadSpan payload(const ObjectDescriptor& object) const;
     PayloadSpan payload(std::string_view name) const;
-    std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;
+    /// The runs an object's bytes are assembled from, in order.
+    std::span<const PayloadRun> runs(const ObjectDescriptor& object) const;
+    const std::vector<ExternalFile>& external_files() const noexcept;
+    std::size_t read_direct(std::uint32_t source, std::uint64_t absolute_offset,
+                            std::span<std::byte> destination) const;
 
 private:
     struct Impl;
