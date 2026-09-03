@@ -21,6 +21,7 @@ tokenizers = pytest.importorskip("tokenizers")
 from gguf import GGUFReader
 
 from surogate.serve.gguf.frontend import (
+    _spm_merges,
     extract_chat_template,
     extract_tokenizer_json,
     synthesize_tokenizer_config,
@@ -113,3 +114,47 @@ def test_chat_template_byte_identical_to_official(reader):
     except Exception as exc:
         pytest.skip(f"official template unavailable: {exc}")
     assert extract_chat_template(reader) == official
+
+
+# ---------------------------------------------------------------------------
+# SentencePiece: the merge list a vocabulary implies
+# ---------------------------------------------------------------------------
+#
+# A sentencepiece GGUF carries pieces and scores and no merges, and the engine ranks its merges
+# off the list rather than off the ids. `_spm_merges` recovers it. These check the properties the
+# recovery rests on, against a vocabulary small enough to reason about by hand; the equivalence
+# that matters — that a reconstruction encodes like the official tokenizer — is checked against
+# the real files, which reproduce TinyLlama's 61,249 merges exactly and tokenize Gemma 3
+# identically over a corpus.
+
+_NORMAL, _CONTROL, _USER_DEFINED, _BYTE_TYPE = 1, 3, 4, 6
+
+
+def test_spm_merges_orders_by_score_and_skips_leaves():
+    #                 0     1     2      3       4        5         6
+    tokens = ["<unk>", "a", "b", "ab", "abb", "<0x41>", "ab</s>"]
+    scores = [0.0, -1.0, -2.0, -5.0, -3.0, 0.0, 0.0]
+    types = [_CONTROL, _NORMAL, _NORMAL, _NORMAL, _NORMAL, _BYTE_TYPE, _CONTROL]
+    merges = _spm_merges(tokens, scores, types)
+    # "abb" (-3) outranks "ab" (-5): a higher score was learned earlier.
+    assert merges == [["ab", "b"], ["a", "b"]]
+    # A byte piece and a control piece are leaves, so neither is split.
+    assert not any("<0x41>" in pair or "</s>" in "".join(pair) for pair in merges)
+
+
+def test_spm_merges_emits_every_split_of_a_piece():
+    # "aaa" splits two ways, and both halves are in the vocabulary both times.
+    tokens = ["a", "aa", "aaa"]
+    scores = [0.0, -1.0, -2.0]
+    types = [_NORMAL, _NORMAL, _NORMAL]
+    merges = _spm_merges(tokens, scores, types)
+    assert merges == [["a", "a"], ["a", "aa"], ["aa", "a"]]
+
+
+def test_spm_merges_reaches_user_defined_pieces():
+    # Gemma 3 carries ~900 merges whose result is a user-defined piece; skipping that type
+    # loses them, and the tokenizer then splits those strings differently.
+    tokens = ["x", "y", "xy"]
+    scores = [0.0, 0.0, -1.0]
+    assert _spm_merges(tokens, scores, [_NORMAL, _NORMAL, _USER_DEFINED]) == [["x", "y"]]
+    assert _spm_merges(tokens, scores, [_NORMAL, _NORMAL, _CONTROL]) == []

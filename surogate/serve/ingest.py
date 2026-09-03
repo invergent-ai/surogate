@@ -90,6 +90,8 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
         return ConverterTarget("qwen3", "surogate.serve.tools.convert.qwen3.convert", "Qwen3-0.6B")
     if model_type == "llama" and hidden == 2048 and layers == 22:
         return ConverterTarget("llama", "surogate.serve.tools.convert.llama.convert", "TinyLlama-1.1B")
+    if model_type in ("gemma3", "gemma3_text") and hidden == 640 and layers == 18:
+        return ConverterTarget("gemma3", "surogate.serve.tools.convert.gemma3.convert", "Gemma3-270M")
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
         return ConverterTarget("qwen3_6_35b_a3b", "surogate.serve.tools.convert.qwen3_6_35b_a3b.convert",
                                "Qwen3.6-35B-A3B", gguf_repack=True)

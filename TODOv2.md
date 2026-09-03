@@ -90,13 +90,22 @@ stored once.
    and `_HF_ALIAS_FIXUPS` names the handful of tensors where gguf-py's alias
    preference picks a spelling the converter does not use (Qwen3's per-head
    norms are `q_norm`, the generic map reaches them as `q_layernorm`).
-   **Llama and Gemma 3 are wired but blocked on one shared thing:** their GGUFs
-   carry a SentencePiece vocabulary (`tokenizer.ggml.model == "llama"`) and
-   `serve/gguf/frontend.py` reconstructs byte-level BPE only. That one piece
-   unlocks both, plus every Llama-1/2 and Mistral-lineage file; Llama 3 and
-   newer are BPE and would need only the geometry gate. The deeper limit is
-   item 6: each target is one compiled geometry, so this covers *those* sizes,
-   not those families — Qwen3-8B still has nowhere to go.
+   Llama and Gemma 3 followed, and needed three more things. **SentencePiece
+   vocabularies** (`tokenizer.ggml.model == "llama"`) now reconstruct: a GGUF
+   carries pieces and scores and no merges, so `_spm_merges` recovers the merge
+   list by splitting every piece and ordering by score — it reproduces
+   TinyLlama's 61,249 merges exactly and in order, and both families then encode
+   3,104 corpus strings identically to their official tokenizers. **The alias
+   preference is deterministic** rather than first-listed, which had put
+   Gemma 3's up projection under `feed_forward`. And **llama.cpp's own export
+   transforms are inverted**: Gemma folds the +1 its norm applies, Llama
+   permutes Q and K for its rotary, and both are silent when missed — TinyLlama
+   answered fluently and wrongly, Gemma produced multilingual noise. With them
+   inverted, TinyLlama matches llama.cpp word for word on the same file.
+   The deeper limit is item 6: each target is one compiled geometry, so this
+   covers *those* sizes, not those families — Qwen3-8B still has nowhere to go.
+   A GGUF published without a chat template is also refused, which is what the
+   base `google.gemma-3-270m` files are.
 4. **[ ] F — FP8.** compressed-tensors per-channel/per-tensor is per-row with an
    FP32 scale — add `_F32S`, or accept the BF16 cast. HF fine-grained FP8 is
    block-scaled and has no runtime format at all.

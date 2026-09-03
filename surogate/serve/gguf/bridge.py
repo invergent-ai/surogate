@@ -90,6 +90,9 @@ _HF_ALIAS_FIXUPS: dict[str, tuple[tuple[str, str], ...]] = {
     # them by their `q_layernorm`/`k_layernorm` alias.
     "qwen3": (("self_attn.q_layernorm", "self_attn.q_norm"),
               ("self_attn.k_layernorm", "self_attn.k_norm")),
+    # Gemma 3 spells them the same way Qwen3 does.
+    "gemma3": (("self_attn.q_layernorm", "self_attn.q_norm"),
+               ("self_attn.k_layernorm", "self_attn.k_norm")),
 }
 
 
@@ -109,10 +112,18 @@ def _hf_name_map(arch: str, n_layers: int) -> dict[str, str]:
     # tmap.mapping is the FORWARD map: {hf_or_gguf alias -> (MODEL_TENSOR,
     # gguf base name)}, with the gguf name itself included as an alias. Invert
     # it, preferring the canonical HF spelling among the aliases.
+    # gguf-py lists every HF spelling any architecture has used for a tensor, and the reverse
+    # map has to choose one. Root first, then spelling: `model.` outranks `language_model.`
+    # (the multimodal wrapper's prefix, which a text-only checkpoint does not carry), and
+    # `.mlp.` outranks `.feed_forward.` (used by Llama 4 and afmoe, where every other family
+    # says `mlp`). Without the second rank the choice is whichever alias gguf-py happened to
+    # list first, which put Gemma 3's up projection under `feed_forward` and lost it.
     def hf_preference(name: str) -> int:
-        if name.startswith(("model.", "lm_head", "language_model.")):
-            return 0
-        return 1
+        rank = 0 if name.startswith(("model.", "lm_head")) else (
+            1 if name.startswith("language_model.") else 2)
+        if ".feed_forward." in name:
+            rank += 4
+        return rank
 
     reverse: dict[str, str] = {}
     for alias, (_tid, gguf_base) in tmap.mapping.items():
@@ -219,7 +230,75 @@ def synthesised_config(reader, arch: str) -> dict | None:
     if arch == "llama":
         return {**common, "architectures": ["LlamaForCausalLM"], "model_type": "llama",
                 "hidden_act": "silu", "mlp_bias": False, "pretraining_tp": 1}
+    if arch == "gemma3":
+        # Gemma 3 alternates five sliding-window layers with one full-attention layer. The GGUF
+        # states the window but not the period, because llama.cpp holds the same 6 as a constant
+        # of the architecture; the converter accepts that period in place of a `layer_types` list.
+        return {**common,
+                "architectures": ["Gemma3ForCausalLM"],
+                "model_type": "gemma3_text",
+                "hidden_activation": "gelu_pytorch_tanh",
+                "sliding_window": int(kv("attention.sliding_window", 0) or 0),
+                "sliding_window_pattern": 6,
+                "rope_local_base_freq": float(kv("rope.local.freq_base", 10000.0) or 10000.0),
+                "query_pre_attn_scalar": common["head_dim"],
+                "use_bidirectional_attention": False,
+                "attn_logit_softcapping": None,
+                "final_logit_softcapping": None}
     return None
+
+
+def _has_export_transform(arch: str, hf_name: str) -> bool:
+    """Whether reading this tensor back means undoing something, which decides whether it can
+    be moved into the artifact bit-exactly or has to go through the dequantise path."""
+    if arch == "gemma3":
+        return hf_name.endswith("norm.weight")
+    if arch == "llama":
+        return hf_name.endswith(("self_attn.q_proj.weight", "self_attn.k_proj.weight"))
+    return False
+
+
+def _invert_export_transform(arch: str, hf_name: str, tensor, heads: int, kv_heads: int):
+    """Undo what llama.cpp's converter did to a tensor's *values* on the way in.
+
+    A GGUF is not a renamed checkpoint. `conversion/` folds things into the weights so its
+    runtime does not have to, and reading the file back means undoing them. Two here, both
+    quoted from that source:
+
+    * Gemma folds the +1 its norm applies (`conversion/gemma.py`: `if
+      name.endswith("norm.weight"): data_torch = data_torch + 1`), so a Gemma GGUF's norm is
+      the checkpoint's plus one — checked exactly against `gemma-3-270m-it`, difference 1.0
+      with no error anywhere in the tensor.
+    * Llama permutes Q and K so its rotary can read halves contiguously
+      (`conversion/llama.py: permute`). The inverse is the same reshape with the swap the
+      other way round. It is a row permutation, not arithmetic, but it still has to happen
+      before the rows mean anything.
+
+    Left alone, neither is loud: TinyLlama answered "The capital of France is" with fluent,
+    confident, wrong text, and Gemma 3 produced multilingual noise.
+    """
+    if arch == "gemma3":
+        # Every norm, and only norms: `_norm.weight` covers input/post/pre/final and the
+        # per-head q_norm/k_norm, all of which Gemma's converter folds.
+        if hf_name.endswith("norm.weight"):
+            return tensor - 1.0
+        return tensor
+    if arch == "llama":
+        if hf_name.endswith("self_attn.q_proj.weight"):
+            return _unpermute(tensor, heads)
+        if hf_name.endswith("self_attn.k_proj.weight"):
+            return _unpermute(tensor, kv_heads)
+        return tensor
+    return tensor
+
+
+def _unpermute(tensor, heads: int):
+    """The inverse of llama.cpp's Q/K permutation: split each head's rows into two halves and
+    interleave them back, which is `permute`'s reshape with the axes swapped the other way."""
+    rows = tensor.shape[0]
+    return (tensor.reshape(heads, rows // heads // 2, 2, *tensor.shape[1:])
+            .swapaxes(1, 2)
+            .reshape(tensor.shape))
 
 
 def build_hf_dir_from_gguf(
@@ -306,6 +385,9 @@ def build_hf_dir_from_gguf(
                 "decode (--spec mtp) will be unavailable for it."
             )
     name_map = _hf_name_map(arch, n_layers)
+    export_heads = int(_arch_kv(reader, arch, "attention.head_count", 0) or 0)
+    export_kv_heads = int(_arch_kv(reader, arch, "attention.head_count_kv", export_heads)
+                          or export_heads)
 
     # Pre-walk: collect candidates, let the converter's recipes pick the
     # subset it will repack; everything else takes the dequant path below.
@@ -355,6 +437,9 @@ def build_hf_dir_from_gguf(
                 "row_perm": None if row_perm is None else [int(v) for v in row_perm],
                 "col_groups": None if col_groups is None else [int(v) for v in col_groups],
             }
+        for name in list(candidates):
+            if _has_export_transform(arch, name):
+                candidates.pop(name)
         repack_sources = repack_planner(gguf_path, candidates)
         if set(repack_sources) - set(candidates):
             raise SystemExit("surogate serve: repack planner returned non-candidate sources.")
@@ -398,6 +483,8 @@ def build_hf_dir_from_gguf(
         if qwen35_family:
             # Undo llama.cpp's export transforms (fp32 math, then narrow).
             t = fam.invert_tensor(hf_name, t, geom)
+        else:
+            t = _invert_export_transform(arch, hf_name, t, export_heads, export_kv_heads)
         t = t.to(torch.bfloat16)
         shard[hf_name] = t
         shard_bytes += t.numel() * 2
@@ -459,6 +546,8 @@ def gguf_target_key(gguf_path: Path, reader=None):
         return "qwen3"
     if arch == "llama" and hidden == 2048 and layers == 22:
         return "llama"
+    if arch == "gemma3" and hidden == 640 and layers == 18:
+        return "gemma3"
     if arch == "qwen4exp":
         # Qwen3.8-Flash-Next: converted straight from the GGUF (no HF bridge).
         return "qwen4exp"

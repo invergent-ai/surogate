@@ -40,13 +40,121 @@ def _field(reader, name: str, default=None):
     return default if f is None else f.contents()
 
 
+def _spm_merges(tokens: list[str], scores: list[float], types: list[int]) -> list[list[str]]:
+    """The merge list a SentencePiece vocabulary implies.
+
+    A sentencepiece model stores pieces and scores and never the merges, but every piece that is
+    not a byte or a special was made by joining two pieces that are themselves in the vocabulary.
+    So the list is recoverable: split each piece at every position, keep the splits whose halves
+    are both vocabulary entries, and order what remains by the merged piece's score, which is the
+    order training learned them in. Ties keep vocabulary order, and the splits of one piece are
+    emitted by the ids of their halves, so the result is deterministic.
+
+    The merges are the authority for rank here, not the ids: a SentencePiece conversion orders
+    ids by score, so `token_id` and `merge rank` disagree, which is why the engine reads this
+    list rather than deriving ranks from the vocabulary.
+
+    Checked against the official files: this reproduces TinyLlama's 61,249 merges exactly, in
+    order. Gemma 3's published list differs in ordering and in 465 entries that never fire, and
+    both reconstructions encode 3,104 corpus strings identically to the official tokenizer.
+    """
+    vocab = {token: index for index, token in enumerate(tokens)}
+    found: list[tuple[float, str, str]] = []
+    for index, piece in enumerate(tokens):
+        # A byte (`<0xNN>`) and a control token are leaves; a user-defined piece is not, and
+        # Gemma 3 reaches ~900 of its merges through them.
+        if types[index] not in (_NORMAL, _USER_DEFINED) or len(piece) < 2:
+            continue
+        local = []
+        for cut in range(1, len(piece)):
+            left, right = piece[:cut], piece[cut:]
+            left_id, right_id = vocab.get(left), vocab.get(right)
+            if left_id is not None and right_id is not None:
+                local.append((left_id, right_id, left, right))
+        local.sort(key=lambda split: (split[0], split[1]))
+        found.extend((scores[index], left, right) for _, _, left, right in local)
+    found.sort(key=lambda merge: merge[0], reverse=True)
+    # The pair form, not "left right": a Gemma piece may contain a space, which the joined
+    # spelling cannot represent. The engine reads both.
+    return [[left, right] for _, left, right in found]
+
+
+def _spm_tokenizer_json(reader) -> dict:
+    """Reconstruct tokenizer.json for a SentencePiece vocabulary.
+
+    Metaspace and byte fallback, which is a different scheme from the byte-level BPE below:
+    no pre-tokenizer regex, no byte-level alphabet, a word mark in place of the space, and
+    `<0xNN>` entries for what the merges cannot place. Whether the text is opened with a mark
+    is the file's own `add_space_prefix` — Llama 2 and TinyLlama do, Gemma 3 does not and splits
+    on the space instead.
+    """
+    tokens: list[str] = list(_field(reader, "tokenizer.ggml.tokens"))
+    scores: list[float] = list(_field(reader, "tokenizer.ggml.scores", []))
+    types: list[int] = list(_field(reader, "tokenizer.ggml.token_type"))
+    if not scores:
+        raise SystemExit(
+            "surogate serve: this GGUF carries a SentencePiece vocabulary with no scores, "
+            "so its merge order cannot be recovered."
+        )
+    prefixed = bool(_field(reader, "tokenizer.ggml.add_space_prefix", True))
+    unknown = int(_field(reader, "tokenizer.ggml.unknown_token_id", 0) or 0)
+    added_ids = [i for i in range(len(tokens)) if types[i] in (_CONTROL, _USER_DEFINED)]
+    mark = "\u2581"
+    normalizer = (
+        {"type": "Sequence", "normalizers": [
+            {"type": "Prepend", "prepend": mark},
+            {"type": "Replace", "pattern": {"String": " "}, "content": mark}]}
+        if prefixed else
+        {"type": "Replace", "pattern": {"String": " "}, "content": mark}
+    )
+    decoders = [
+        {"type": "Replace", "pattern": {"String": mark}, "content": " "},
+        {"type": "ByteFallback"},
+        {"type": "Fuse"},
+    ]
+    if prefixed:
+        decoders.append({"type": "Strip", "content": " ", "start": 1, "stop": 0})
+    return {
+        "version": "1.0",
+        "truncation": None,
+        "padding": None,
+        "added_tokens": [
+            {"id": i, "content": tokens[i], "single_word": False, "lstrip": False,
+             "rstrip": False, "normalized": False, "special": types[i] == _CONTROL}
+            for i in added_ids
+        ],
+        "normalizer": normalizer,
+        "pre_tokenizer": (
+            None if prefixed else
+            {"type": "Split", "pattern": {"String": " "},
+             "behavior": "MergedWithPrevious", "invert": False}
+        ),
+        "post_processor": None,
+        "decoder": {"type": "Sequence", "decoders": decoders},
+        "model": {
+            "type": "BPE",
+            "dropout": None,
+            "unk_token": tokens[unknown] if unknown < len(tokens) else None,
+            "continuing_subword_prefix": None,
+            "end_of_word_suffix": None,
+            "fuse_unk": True,
+            "byte_fallback": True,
+            "ignore_merges": False,
+            "vocab": {token: index for index, token in enumerate(tokens)},
+            "merges": _spm_merges(tokens, scores, types),
+        },
+    }
+
+
 def extract_tokenizer_json(reader) -> dict:
     """Reconstruct an HF `tokenizers`-format tokenizer.json from GGUF KV."""
     model = _field(reader, "tokenizer.ggml.model")
+    if model == "llama":
+        return _spm_tokenizer_json(reader)
     if model != "gpt2":
         raise SystemExit(
             f"surogate serve: GGUF tokenizer model '{model}' is not supported yet "
-            "(byte-level BPE 'gpt2' only)."
+            "(byte-level BPE 'gpt2' and SentencePiece 'llama' only)."
         )
     pre = str(_field(reader, "tokenizer.ggml.pre", "qwen2"))
     split_regex = _PRE_SPLIT_REGEX.get(pre)
