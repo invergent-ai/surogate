@@ -1,3 +1,4 @@
+#include <api/family/text_geometry.h>
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
@@ -180,7 +181,8 @@ int verify_profile_mismatch_rejection() {
     options.prefill_chunk  = 128;
     options.use_cuda_graph = false;
     auto planner =
-        Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt);
+        Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt,
+                          sinfer::family::TextGeometry::compiled<Variant::TextConfig>());
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;

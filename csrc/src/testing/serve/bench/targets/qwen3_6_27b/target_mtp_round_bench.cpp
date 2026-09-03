@@ -1,3 +1,4 @@
+#include <api/family/text_geometry.h>
 #include <api/targets/qwen3_6_27b/package.h>
 
 #include "artifact/binder.h"
@@ -151,7 +152,8 @@ int run(const Options& options) {
     auto frontend = target::Package::make_frontend(*model, engine);
     auto prompt   = frontend.prepare_tokens(seed, false);
 
-    auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
+    auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile,
+                          sinfer::family::TextGeometry::compiled<Variant::TextConfig>());
     const auto resolution = sinfer::runtime::resolve_kv_capacity(
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
     auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
