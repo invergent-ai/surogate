@@ -72,6 +72,17 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
         # spell their shapes out -- so the checkpoint's hidden width picks which one runs,
         # and the artifact it writes states the dimensions the engine binds against.
         module = {1024: "qwen3_5_0_8b", 2048: "qwen3_5_2b", 2560: "qwen3_5_4b"}[hidden]
+        if nvfp4:
+            # ModelOpt NVFP4, which only the 4B has a recipe for so far.
+            if hidden != 2560:
+                raise SystemExit(
+                    "surogate serve: this Qwen3.5 checkpoint is NVFP4, and only the 4B has an "
+                    f"NVFP4 recipe (hidden_size={hidden}). Serve the BF16 checkpoint, or its "
+                    "GGUF."
+                )
+            return ConverterTarget("qwen3_5_nvfp4",
+                                   f"surogate.serve.convert.{module}.convert_nvfp4",
+                                   "Qwen3.5-4B (NVFP4)")
         return ConverterTarget("qwen3_5", f"surogate.serve.convert.{module}.convert",
                                "Qwen3.5", gguf_repack=True)
     if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:

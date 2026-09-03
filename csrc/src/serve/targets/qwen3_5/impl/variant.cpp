@@ -239,8 +239,12 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    // The GDN value width is the output gate's own: its element count over the columns it
+    // is viewed as. Reading it off the tensor rather than a compiled constant is what lets
+    // one target run a checkpoint with more value heads than the one it compiled.
+    const std::int32_t columns = static_cast<std::int32_t>(hidden.ne[1]);
     Tensor output_gate_flat =
-        output_gate.view({kFamilyGeometry.value_dim(), static_cast<int>(hidden.ne[1])});
+        output_gate.view({static_cast<std::int32_t>(output_gate.numel() / columns), columns});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_split(hidden, split->query_key_value, split->z, qkv, output_gate_flat,
@@ -261,7 +265,9 @@ void Variant::gdn_input_projection_snapshot(
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_snapshot_workspace_bytes(hidden, weights, kFamilyGeometry));
     WorkspaceArena leaf_workspace(storage);
-    Tensor output_gate_view = output_gate.view({kFamilyGeometry.value_dim(), hidden.ne[1], hidden.ne[2]});
+    const std::int32_t gate_rows =
+        static_cast<std::int32_t>(output_gate.numel() / (hidden.ne[1] * hidden.ne[2]));
+    Tensor output_gate_view = output_gate.view({gate_rows, hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_snapshot_split(
@@ -286,7 +292,9 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights, kFamilyGeometry));
     WorkspaceArena leaf_workspace(storage);
-    Tensor output_gate_view = output_gate.view({kFamilyGeometry.value_dim(), hidden.ne[1], hidden.ne[2]});
+    const std::int32_t gate_rows =
+        static_cast<std::int32_t>(output_gate.numel() / (hidden.ne[1] * hidden.ne[2]));
+    Tensor output_gate_view = output_gate.view({gate_rows, hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_record_split(
@@ -391,6 +399,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
                         ops::attn_input_proj_workspace_capacity_bytes(
                             QType::Q4_K, 5120, geometry.hidden, ops::LinearPolicy::A16Only,
                             first, last));
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 5120, geometry.hidden, kNvfp4TextPolicy, first, last);
@@ -413,6 +422,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
                         ops::linear_add_workspace_capacity_bytes(
                             QType::Q4_K, geometry.hidden, geometry.query_size(),
                             ops::LinearPolicy::A16Only, first, last));
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, geometry.hidden,
                                                         geometry.query_size(), kNvfp4TextPolicy,
@@ -440,6 +450,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(const family:
                         ops::gdn_input_proj_workspace_capacity_bytes(
                             QType::Q4_K, 8192, geometry.hidden, ops::LinearPolicy::A16Only,
                             first, last));
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 8192, geometry.hidden,
                                                             kNvfp4TextPolicy, first, last);
@@ -463,6 +474,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(cons
                          ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                              QType::Q4_K, 8192, geometry.hidden, ops::LinearPolicy::A16Only,
                              batch_size, first, last)});
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -490,6 +502,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(const 
                          ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                              QType::Q4_K, 8192, geometry.hidden, ops::LinearPolicy::A16Only,
                              batch_size, first, last)});
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -515,6 +528,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family
         return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, geometry.hidden,
                                                         geometry.value_dim(),
                                                         ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, geometry.hidden, geometry.value_dim(), kNvfp4TextPolicy, first, last);
@@ -542,6 +556,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
         return std::max(post_mixer_workspace_bytes(geometry, QType::W8G32_F16S, QType::W8G32_F16S,
                                                    ops::LinearPolicy::A16Only, first, last),
                         post_mixer_workspace_bytes(geometry, QType::Q4_K, QType::Q4_K, ops::LinearPolicy::A16Only, first, last));
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return post_mixer_workspace_bytes(geometry, QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
                                           last);

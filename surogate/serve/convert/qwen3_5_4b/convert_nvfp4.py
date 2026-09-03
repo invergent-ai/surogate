@@ -32,6 +32,35 @@ RECIPE_ID = "qwen3_5_4b-nvfp4-modelopt-v1"
 OUTPUT_BASENAME = "qwen3_5_4b_nvfp4.sinfer"
 
 
+
+def geometry_block(model_dir) -> dict[str, float]:
+    """The dimensions the engine binds against, read from the checkpoint that is being
+    converted rather than restated here. The family's one target reads them from the
+    artifact instead of compiling them."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    config = _json.loads((_Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+    text = config.get("text_config", config)
+    rope = text.get("rope_parameters") or {}
+    return {
+        "hidden": int(text["hidden_size"]),
+        "layers": int(text["num_hidden_layers"]),
+        "intermediate": int(text["intermediate_size"]),
+        "output_rows": int(text["vocab_size"]),
+        "query_heads": int(text["num_attention_heads"]),
+        "kv_heads": int(text["num_key_value_heads"]),
+        "head_dim": int(text["head_dim"]),
+        "gdn_key_heads": int(text["linear_num_key_heads"]),
+        "gdn_key_head_dim": int(text["linear_key_head_dim"]),
+        "gdn_value_heads": int(text["linear_num_value_heads"]),
+        "gdn_value_head_dim": int(text["linear_value_head_dim"]),
+        "gdn_conv_kernel": int(text["linear_conv_kernel_dim"]),
+        "mtp_layers": int(text["mtp_num_hidden_layers"]),
+        "rms_epsilon": float(text["rms_norm_eps"]),
+        "rope_theta": float(rope.get("rope_theta", text.get("rope_theta", 1.0e7))),
+    }
+
 @dataclass(frozen=True, slots=True)
 class ConversionPreflight:
     model_dir: Path
@@ -120,6 +149,7 @@ def convert(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
+            geometry=geometry_block(model_dir),
         ) as writer:
             for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
                 payload: bytes | Iterable[bytes]

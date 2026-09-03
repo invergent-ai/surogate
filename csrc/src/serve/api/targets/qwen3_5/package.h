@@ -37,6 +37,8 @@ enum class WeightsProfile : std::uint8_t {
     Qwen36GroupwiseInt,
     Qwen38GroupwiseInt,
     Qwen36Nvfp4,
+    /// Every projection NVFP4, no BF16 endpoints: what a ModelOpt export of this family is.
+    Qwen35Nvfp4Mixed,
     Qwen38Nvfp4,
 };
 
