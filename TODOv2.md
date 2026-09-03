@@ -69,14 +69,18 @@ stored once.
    13,195 against 10,299 tok/s single stream (~700-token prompt) and 17,300
    against 14,300 at 8k, same session, three prompts each. `SUROGATE_SERVE_MOE_INT8=0`
    keeps the BF16-activation kernels. See *The prefill gap, decomposed*.
-2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64.** A pure deletion: the converters stop
-   quantising, the three formats leave the engine with them, and a checkpoint
-   that arrives as BF16 is served as BF16. There is no replacement command and
-   no quantiser of ours behind it — see the decision below. The prefill cost
-   that used to argue against this has mostly gone with the int8 route: the
-   K-quant path measures 13,195 tok/s against the row-split path's 13,700, from
-   an earlier pass, so one same-session comparison settles what the deletion
-   actually costs. Decode is unaffected. ~140 references in the serving code go.
+2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, and `surogate quantize` in their place.**
+   The converters stop quantising and the three home-grown formats leave the
+   engine with them, roughly 140 references. What replaces them for a model we
+   trained is `surogate quantize`: merged checkpoint → GGUF → K-quant GGUF, on
+   llama.cpp's quantiser, which the engine then serves where it lies. It
+   follows `surogate merge`, the step that already exists. Mechanism to be
+   decided between shelling out to `llama-quantize` (what unsloth does) and
+   vendoring the quantiser into our tree; the licence permits either. The old
+   argument against the deletion is stale: the K-quant path costs ~19 % of
+   prefill only against the BF16-activation kernel, and with the int8 route it
+   measures 13,195 tok/s against the row-split path's 13,700 from an earlier
+   pass, so one same-session comparison settles it. Decode is unaffected.
 3. **[ ] N — NVFP4 ModelOpt ingest.** `weight_scale_2` is a multiplier where
    compressed-tensors' global scale is a divisor; parents split per component.
 4. **[ ] F — FP8.** compressed-tensors per-channel/per-tensor is per-row with an
@@ -258,11 +262,15 @@ Verified against the artifact the converter wrote for all 150 rearranged objects
   the highest performance: GGUF Q\*_K, NVFP4 compressed-tensors and ModelOpt,
   FP8, BF16. GPTQ/AWQ optional and off the roadmap. Where anything else in this
   file disagrees, this wins.
-- **Surogate never quantises** (owner, 2026-09-03). The product serves the model
-  the user provides, in the format they provide it. No `surogate quantize`, no
-  quantiser of ours in any tool, and no BF16-to-small conversion step on the
-  roadmap. A user who wants a smaller checkpoint gets a published GGUF; a
-  checkpoint that arrives as BF16 is served as BF16.
+- **We do not quantise what a user brings us; we do quantise what we train**
+  (owner, 2026-09-03). A checkpoint someone hands the engine is served in the
+  format it arrives in, and nothing in the serving path re-encodes weights. But
+  a model trained here has no published GGUF, so producing one is our job:
+  `surogate quantize` stays, it takes a trained checkpoint to a GGUF, and the
+  quantisation arithmetic is llama.cpp's rather than ours. This is the shape
+  unsloth ships (`study/unsloth-zoo/unsloth_zoo/llama_cpp.py`), and the reason
+  it cannot be Python: the `gguf` package encodes Q8_0 and raises
+  `NotImplementedError` for Q4_K, Q5_K and Q6_K.
 - **`.sinfer` is a transparent cache, never an interchange format** (owner,
   2026-08-24). Never published, never required. The eight-entry hardcoded
   registry in `ingest.py` is the rejected shape.
