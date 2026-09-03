@@ -219,6 +219,20 @@ sequence_len: 2048
 ```
 
 
+## 6) Serve what you trained
+
+A LoRA run leaves an adapter, and the engine serves whole models, so merge first. To serve the
+merged checkpoint quantized, produce a GGUF from it and point the server at that:
+
+```bash
+surogate merge --base-model Qwen/Qwen3.5-0.8B --checkpoint-dir output/step_00000050 --output merged
+surogate quantize --model merged --output merged-Q4_K_M.gguf --type q4_k_m
+surogate serve merged-Q4_K_M.gguf --port 8080
+```
+
+The quantization step is llama.cpp's, and the file it writes is an ordinary GGUF. Skip it to
+serve the merged checkpoint at full precision.
+
 ## Notes
 
 - For private Hugging Face models/datasets, pass `--hub_token`.
@@ -227,6 +241,7 @@ sequence_len: 2048
 ## See also
 
 - [Training modes: Pretraining vs Full Fine-Tuning vs LoRA](training-modes.md)
+- [Serving models](../inference/serving-models.md)
 - [Quickstart: Pretraining](quickstart-pretraining.md)
 - [Configuration](../guides/configuration.md)
 - [Back to docs index](../index.mdx)

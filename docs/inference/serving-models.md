@@ -52,15 +52,26 @@ Notes:
 
 ## GGUF model
 
-Point `surogate serve` at the `.gguf` file. GGUF conversion is mostly *no work*: GGML `Q8_0` and
-the engine's internal 8-bit format are the same layout, so those tensors move across bit-exactly
-with no dequantize and no GPU. Only K-quantised tensors need a real requantisation pass.
+Point `surogate serve` at the `.gguf` file. Nothing is copied and nothing is requantised: the
+K-quant superblocks are read from the file as it stores them, `Q8_0` tensors are rearranged into
+the same numbers the engine's 8-bit format holds, and what lands beside the file is a small index
+naming the stretches each tensor comes from. For a 22 GB `Q4_K_M` that index is about 70 MB and
+takes ~18 seconds to build once.
 
 ```bash
 surogate serve ~/models/Qwen3.6-27B-Q4_K_M.gguf --host 0.0.0.0 --port 8080 --max-num-seqs 16
 ```
 
 For a split GGUF, pass the **first shard** — the rest are found automatically.
+
+A model you trained here is not a GGUF yet. Merge the adapter and quantize it first, then serve
+the result the same way:
+
+```bash
+surogate merge --base-model Qwen/Qwen3.5-0.8B --checkpoint-dir out/step_00000050 --output merged
+surogate quantize --model merged --output merged-Q4_K_M.gguf --type q4_k_m
+surogate serve merged-Q4_K_M.gguf
+```
 
 ### MoE larger than VRAM
 

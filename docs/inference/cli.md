@@ -8,8 +8,9 @@ surogate serve --generate <model> --prompt "..."          # one-shot generation 
 surogate serve --embed <model> [--frontend DIR]           # /v1/embeddings for an encoder model
 ```
 
-`<model>` is a **Hugging Face repo id, a local safetensors directory, or a GGUF file**. The
-first load converts it into a local cache; later loads are instant.
+`<model>` is a **Hugging Face repo id, a local safetensors directory, or a GGUF file**. A GGUF is
+read where it lies, with a small index written beside it on the first start; other sources are
+converted into a local cache once. Later loads are instant either way.
 
 ```bash
 surogate serve Qwen/Qwen3.6-27B
