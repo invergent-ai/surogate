@@ -94,7 +94,11 @@ template <GgmlType type>
 struct GgmlMoeCodec {
     static constexpr bool kGateRowsFirst = true;
     static constexpr int kGroupK         = QK_K;
-    static constexpr bool kPackedWord8   = true;
+    // Both projections take the body's generic packed-word8 loop, the one written against
+    // load_eight; the two specialised D3 shapes assume a plane layout this format does not have.
+    static constexpr bool kPackedWord8         = true;
+    static constexpr bool kD3PackedWord8       = false;
+    static constexpr bool kD3SingleValuePerLane = false;
 
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t*, const std::uint8_t*,

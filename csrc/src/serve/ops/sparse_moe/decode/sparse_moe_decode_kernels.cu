@@ -9,6 +9,7 @@
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
+#include "ops/linear/ggml/ggml_moe_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"

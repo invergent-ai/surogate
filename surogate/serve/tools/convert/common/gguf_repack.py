@@ -65,6 +65,10 @@ from surogate.serve.tools.convert.common.recipe import (
 )
 
 _REPACK_FORMAT = "W8G32_F16S"
+# Every artifact format a quantised linear may be spec'd in. The W8 repack targets only
+# _REPACK_FORMAT because it produces W8 planes; serving a K-quant natively replaces whichever
+# of these the target would otherwise have quantised into, so the native planner considers all.
+_QUANT_LINEAR_FORMATS = ("W8G32_F16S", "Q4G64_F16S", "Q5G64_F16S", "Q6G64_F16S")
 _GROUP = 32
 
 # IQ4_NL codebook (ggml-common.h kvalues_iq4nl): int8 values, so an IQ4_NL
@@ -314,7 +318,7 @@ class GgufRepackSource:
         probe = np.zeros(1, dtype=np.int64) if with_token_ids else None
         planned: dict[str, str] = {}
         for spec in tensor_specs:
-            if getattr(spec, "kind", None) != "tensor" or spec.format != _REPACK_FORMAT:
+            if getattr(spec, "kind", None) != "tensor" or spec.format not in _QUANT_LINEAR_FORMATS:
                 continue
             recipe = recipes_by_name.get(spec.name)
             if recipe is None:

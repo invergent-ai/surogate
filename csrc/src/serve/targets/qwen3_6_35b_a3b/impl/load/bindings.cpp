@@ -135,10 +135,17 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
                           std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, placement);
     };
+    const auto bind_stored = [&](std::string_view name, std::int32_t rows, std::int32_t columns) {
+        return artifact::bind_linear(binder, name, rows, columns, placement).object;
+    };
     MoePlan plan{
         .router_shared_gate = bind(prefix + "router_shared_gate", NumericFormat::BF16, {257, 2048}),
-        .routed_gate_up     = bind(prefix + "routed_gate_up", routed_gate_up, {262144, 2048}),
-        .routed_down        = bind(prefix + "routed_down", routed_down, {524288, 512}),
+        // The routed experts' format comes from the artifact: a GGUF serves them as its own
+        // K-quant superblocks, a converted checkpoint as the groupwise-int or NVFP4 profile.
+        // `routed_gate_up`/`routed_down` remain the profile's expectation for the NVFP4 extras
+        // below, which only that profile carries.
+        .routed_gate_up     = bind_stored(prefix + "routed_gate_up", 262144, 2048),
+        .routed_down        = bind_stored(prefix + "routed_down", 524288, 512),
         .shared_gate_up = bind(prefix + "shared_gate_up", NumericFormat::W8G32_F16S, {1024, 2048}),
         .shared_down    = bind(prefix + "shared_down", NumericFormat::W8G32_F16S, {2048, 512}),
     };

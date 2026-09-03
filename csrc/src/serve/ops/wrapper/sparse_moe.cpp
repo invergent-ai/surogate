@@ -104,6 +104,14 @@ QuantGeometry quant_geometry(QType qtype) {
         // Sixteen values per group, two per code byte, one e4m3 scale byte, and the dense
         // block-scale tiling rather than row-split.
         return {16, 8, 0, 1, QuantLayout::BlockScaleK16M128x4, DType::FP8_E4M3FN};
+    // A GGML K-quant carries its scales inside each 256-value superblock, so there is one plane
+    // and its "code bytes" are the whole block: 144 for Q4_K, 176 for Q5_K, 210 for Q6_K.
+    case QType::Q4_K:
+        return {256, 144, 0, 0, QuantLayout::GgmlBlocks, DType::FP16};
+    case QType::Q5_K:
+        return {256, 176, 0, 0, QuantLayout::GgmlBlocks, DType::FP16};
+    case QType::Q6_K:
+        return {256, 210, 0, 0, QuantLayout::GgmlBlocks, DType::FP16};
     default:
         throw std::invalid_argument("sparse_moe: unsupported quantized weight format");
     }
@@ -118,10 +126,12 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
     const std::size_t high_bytes       = groups * geometry.high_bytes_per_group;
     const std::size_t scale_bytes      = groups * geometry.scale_bytes_per_group;
     const std::size_t required_payload = code_bytes + high_bytes + scale_bytes;
+    // A superblock format keeps its scales inside the block, so it has no scale plane to check.
+    const bool needs_scale_plane = geometry.scale_bytes_per_group != 0;
     if (weight.layout != geometry.layout || weight.scale_dtype != geometry.scale_dtype ||
         weight.group_size != static_cast<std::uint32_t>(geometry.group_size) ||
         weight.group != geometry.group_size || weight.qdata == nullptr ||
-        weight.scales == nullptr || weight.payload_bytes < required_payload ||
+        (needs_scale_plane && weight.scales == nullptr) || weight.payload_bytes < required_payload ||
         weight.high_plane_bytes < high_bytes || !aligned_to(weight.qdata, 16) ||
         !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("sparse_moe: invalid quantized ") + name);
@@ -134,22 +144,29 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
     if (high_bytes != 0) {
         ranges.push_back(address_range(weight.qhigh, high_bytes, std::string(name) + " high"));
     }
-    ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
+    if (needs_scale_plane) {
+        ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
+    }
 }
 
 void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& geometry,
                       std::vector<AddressRange>& ranges) {
     require_router(weights.router_shared_gate, geometry, ranges);
+    const auto is_ggml_k = [](QType qtype) {
+        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K;
+    };
     if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
         weights.routed_gate_up.qtype != QType::W8G32_F16S &&
-        weights.routed_gate_up.qtype != QType::NVFP4) {
-        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4, W8, or NVFP4");
+        weights.routed_gate_up.qtype != QType::NVFP4 && !is_ggml_k(weights.routed_gate_up.qtype)) {
+        throw std::invalid_argument(
+            "sparse_moe: routed_gate_up must be Q4, W8, NVFP4, or a GGML K-quant");
     }
     if (weights.routed_down.qtype != QType::Q5G64_F16S &&
         weights.routed_down.qtype != QType::Q6G64_F16S &&
         weights.routed_down.qtype != QType::W8G32_F16S &&
-        weights.routed_down.qtype != QType::NVFP4) {
-        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, W8, or NVFP4");
+        weights.routed_down.qtype != QType::NVFP4 && !is_ggml_k(weights.routed_down.qtype)) {
+        throw std::invalid_argument(
+            "sparse_moe: routed_down must be Q5, Q6, W8, NVFP4, or a GGML K-quant");
     }
     if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
         weights.shared_down.qtype != QType::W8G32_F16S) {

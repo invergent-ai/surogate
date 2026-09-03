@@ -714,6 +714,18 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
     case QType::NVFP4:
         launch_d3_dependent_codec<Nvfp4CodecFor<kHidden / 16>>(x, weights, workspace, stream);
         break;
+    case QType::Q4_K:
+        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q4_K>>(x, weights, workspace,
+                                                                            stream);
+        break;
+    case QType::Q5_K:
+        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q5_K>>(x, weights, workspace,
+                                                                            stream);
+        break;
+    case QType::Q6_K:
+        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>>(x, weights, workspace,
+                                                                            stream);
+        break;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
     }
@@ -759,6 +771,18 @@ void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
         return;
     case QType::Q6G64_F16S:
         launch_d4_dependent_codec<Q6Codec>(weights, destination, workspace, stream);
+        return;
+    case QType::Q4_K:
+        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q4_K>>(weights, destination,
+                                                                            workspace, stream);
+        return;
+    case QType::Q5_K:
+        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q5_K>>(weights, destination,
+                                                                            workspace, stream);
+        return;
+    case QType::Q6_K:
+        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>>(weights, destination,
+                                                                            workspace, stream);
         return;
     case QType::W8G32_F16S:
         launch_d4_dependent_codec<W8Codec>(weights, destination, workspace, stream);
@@ -896,6 +920,18 @@ void decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
     case QType::W8G32_F16S:
         launch_d3_small_t_codec<W8Codec, false>(x, weights, token_ids, token_activations, tokens,
                                                 schedule, stream, nullptr);
+        return;
+    case QType::Q4_K:
+        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q4_K>, false>(
+            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
+        return;
+    case QType::Q5_K:
+        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q5_K>, false>(
+            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
+        return;
+    case QType::Q6_K:
+        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>, false>(
+            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
         return;
     case QType::NVFP4:
         if (adaptive_route_jobs == nullptr) {
