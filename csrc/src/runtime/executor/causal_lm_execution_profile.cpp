@@ -13,7 +13,8 @@
 #include "utilities/dtype.h"
 
 #include <algorithm>
-#include <stdexcept>
+#include <cstdio>
+#include <mutex>
 #include <string>
 
 namespace dsl {
@@ -168,11 +169,25 @@ CausalLMExecutionProfile::compute_doc_masking(const std::int32_t* position_ids, 
     // backend presents it as a multi-gigabyte std::bad_alloc that mentions
     // neither documents nor position ids. The token floor keeps small real
     // batches (and tests) clear of it.
+    // Warn rather than throw: this runs inside the model forward, which is
+    // replayed under an open cudaStreamBeginCapture (py_train.cpp) with no
+    // try/catch before EndCapture. An exception escaping there would leave the
+    // stream in capture mode and turn a clear diagnostic into an opaque CUDA
+    // failure or a hang. Printing costs nothing and still puts the numbers
+    // directly above the std::bad_alloc that follows, which is all the original
+    // diagnosis was missing. Once per process, so a real run is not spammed.
     if (total_q >= 128 && num_docs * 2 > total_q) {
-        throw std::logic_error("doc masking: " + std::to_string(num_docs) + " documents for " +
-                               std::to_string(total_q) +
-                               " tokens. Nearly every document is one token long, which means position_ids "
-                               "are not resetting per real document -- check the tokenizer that built them.");
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            std::fprintf(stderr,
+                         "[surogate] doc masking: %d documents for %d tokens. Nearly every document is one "
+                         "token long, which means position_ids are not resetting per real document -- check "
+                         "the tokenizer that built them. Attention backward will now try to allocate an "
+                         "arena sized for %d documents.\n",
+                         num_docs,
+                         total_q,
+                         num_docs);
+        });
     }
 
     return CausalLMDocMaskingInfo{std::move(cu_seqlens), num_docs, max_seqlen, total_q};

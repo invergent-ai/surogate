@@ -23,10 +23,12 @@ import pytest
 from surogate.grpo.config import GRPOLossConfig
 from surogate.grpo.loss import compute_native_shifted_grpo_dloss_reference
 
-# A config where only the KL term is live, so the per-token gradient has a closed
-# form: -2 * kl_tau * (trainer_logprob - inference_logprob) on unmasked tokens.
-# Established independently by `test_sparse_outcome_advantage_preserves_full_completion_kl`
-# in test_native_formula.py, which derives the same expression by hand.
+# `ipo_mask_low/high = 1.0` masks nothing (probs_diff is always within +/-1), so
+# the advantage term stays live; it contributes zero only because `_call` passes
+# zero advantages. That leaves the KL term alone, with the closed form
+# -2 * kl_tau * (trainer_logprob - inference_logprob) on unmasked tokens.
+# Derived independently by `test_sparse_outcome_advantage_preserves_full_completion_kl`
+# in test_native_formula.py, which writes out the same expression by hand.
 KL_ONLY = GRPOLossConfig(ipo_mask_low=1.0, ipo_mask_high=1.0, adv_tau=1.0, teacher_tau=0.0, kl_tau=0.1)
 
 TRAINER_LP = np.array([-7.0, -1.2, -0.8, -3.1, -2.0, -0.4, -5.0], dtype=np.float32)
@@ -87,20 +89,26 @@ def test_the_result_is_divided_by_loss_scale():
     np.testing.assert_allclose(_call(loss_scale=4.0), _call(loss_scale=1.0) / 4.0, rtol=1e-6)
 
 
-def test_a_one_token_sample_contributes_nothing():
-    """`end - start > 1` guards the shift, so a length-1 range (a lone trailing
-    pad token) leaves zeros rather than reading out of its own range."""
-    actual = compute_native_shifted_grpo_dloss_reference(
-        trainer_logprobs=TRAINER_LP[:4],
-        inference_logprobs=INFERENCE_LP[:4],
-        advantages=np.zeros(4, dtype=np.float32),
-        loss_mask=np.array([False, True, True, True]),
+def test_a_trailing_one_token_range_leaves_the_sample_before_it_alone():
+    """A lone trailing pad token gets its own range now (see
+    `_find_sample_boundaries`). The sample before it must shift exactly as it
+    would have without that range -- the pad must neither absorb a gradient nor
+    displace one."""
+    grads = _expected_unshifted_grads()
+    split = compute_native_shifted_grpo_dloss_reference(
+        trainer_logprobs=TRAINER_LP,
+        inference_logprobs=INFERENCE_LP,
+        advantages=np.zeros(7, dtype=np.float32),
+        loss_mask=LOSS_MASK,
         loss_config=KL_ONLY,
-        sample_ranges=[(0, 3), (3, 4)],
+        sample_ranges=[(0, 4), (4, 6), (6, 7)],
         teacher_logprobs=None,
         loss_scale=1.0,
     )
-    assert actual[3] == 0.0
+    assert split[4] == pytest.approx(grads[5]), "the shortened sample still shifts"
+    assert split[5] == 0.0, "its last slot receives nothing"
+    assert split[6] == 0.0, "and the 1-token range contributes nothing"
+    np.testing.assert_allclose(split[0:3], grads[1:4], rtol=1e-6, atol=1e-7)
 
 
 # ── the actual CUDA parity, which needs hardware ─────────────────────
@@ -223,9 +231,19 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
     )
     actual = native_trainer.get_grpo_native_metrics()
 
-    assert expected, "the reference must produce metrics to compare against"
-    for key, expected_value in expected.items():
-        assert key in actual, f"the kernel reports no {key}"
+    # The reference also reports terms the kernel has no counterpart for (OPD,
+    # replay, ratio_clipped, policy_sample_count), so compare what the kernel
+    # actually emits rather than demanding it produce all 18 keys.
+    assert actual, "the kernel must report metrics to compare against"
+    core = {"policy_loss", "mismatch_kl", "keep_tokens", "total_tokens"}
+    assert core <= set(actual), f"kernel metrics missing the core terms: {core - set(actual)}"
+
+    compared = 0
+    for key, actual_value in actual.items():
+        if key not in expected:
+            continue
         # bf16 forward, so the logprobs feeding both sides carry real error;
         # the tolerance is on the arithmetic agreeing, not on bit equality.
-        assert actual[key] == pytest.approx(expected_value, rel=1e-3, abs=1e-4), key
+        assert actual_value == pytest.approx(expected[key], rel=1e-3, abs=1e-4), key
+        compared += 1
+    assert compared >= len(core), f"only {compared} metrics were actually compared"

@@ -103,8 +103,12 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
     (``batch.py:22``, and ``batch.py:140`` for padding), so within a sample the
     delta is always 1 and this test is exact rather than heuristic. It is the
     same rule the engine uses to derive attention documents from the same array
-    (``compute_doc_masking``, ``causal_lm_execution_profile.cpp``), so the loss's
-    sample ranges and the attention mask now agree by construction.
+    (``compute_doc_masking``, ``causal_lm_execution_profile.cpp``), so the two no
+    longer disagree about where a sample ends. They are not identical: ranges are
+    built from the unpadded ``position_ids`` while the engine sees the padded
+    row, whose sequence padding continues monotonically and so joins the last
+    document. Nothing depends on that tail agreeing, but do not read this as a
+    guarantee that it does.
 
     This replaced ``pos[i] == 0 and pos[i-1] != 0`` plus a ``pos[i+1] == 1``
     lookahead, which silently dropped the boundary of any 1-token sample: a
