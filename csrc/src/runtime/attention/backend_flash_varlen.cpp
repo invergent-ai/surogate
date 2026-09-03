@@ -11,7 +11,6 @@
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "kernels/kernels.h"
@@ -195,22 +194,6 @@ private:
         if (p.num_docs <= 0 || p.max_doc_seqlen <= 0 || p.total_doc_tokens <= 0) {
             throw std::logic_error("FlashVarlenAttention: varlen document ranges are unset "
                                    "(num_docs / max_doc_seqlen / total_doc_tokens)");
-        }
-        // The backward arena is sized `total_doc_tokens + 128 * num_docs`, so
-        // every document costs 128 padded tokens however short it is. num_docs
-        // approaching total_doc_tokens means nearly every document is a single
-        // token, which no real batch produces -- it means position_ids were not
-        // built per real document, as when a padded region is counted one
-        // document per pad token. Left to run it presents as a multi-gigabyte
-        // std::bad_alloc naming neither documents nor position ids, which is
-        // what turned that into a days-long diagnosis instead of a five-minute
-        // one. The token floor keeps small real batches (and tests) clear of it.
-        if (p.total_doc_tokens >= 128 && p.num_docs * 2 > p.total_doc_tokens) {
-            throw std::logic_error(
-                "FlashVarlenAttention: " + std::to_string(p.num_docs) + " documents for " +
-                std::to_string(p.total_doc_tokens) +
-                " tokens. Nearly every document is one token long, which means position_ids are not "
-                "resetting per real document -- check the tokenizer that built them.");
         }
     }
 };

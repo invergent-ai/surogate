@@ -13,6 +13,7 @@
 #include "utilities/dtype.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 
 namespace dsl {
@@ -155,6 +156,25 @@ CausalLMExecutionProfile::compute_doc_masking(const std::int32_t* position_ids, 
 
     const int num_docs = static_cast<int>(cu_seqlens.size()) - 1;
     const int total_q = cu_seqlens.back();
+
+    // Documents are not free: the flash-varlen backward arena is sized
+    // `total_q + 128 * num_docs`, so each one costs 128 padded tokens however
+    // short it is. num_docs approaching total_q means nearly every document is a
+    // single token, which no real batch produces -- it means position_ids are
+    // not resetting per real document, as when a padded region is counted one
+    // document per pad token. Caught here, where position_ids become documents,
+    // rather than in a backend: every backend sizes something from num_docs, and
+    // this is the one place that can name the cause. Left to run, the flash
+    // backend presents it as a multi-gigabyte std::bad_alloc that mentions
+    // neither documents nor position ids. The token floor keeps small real
+    // batches (and tests) clear of it.
+    if (total_q >= 128 && num_docs * 2 > total_q) {
+        throw std::logic_error("doc masking: " + std::to_string(num_docs) + " documents for " +
+                               std::to_string(total_q) +
+                               " tokens. Nearly every document is one token long, which means position_ids "
+                               "are not resetting per real document -- check the tokenizer that built them.");
+    }
+
     return CausalLMDocMaskingInfo{std::move(cu_seqlens), num_docs, max_seqlen, total_q};
 }
 

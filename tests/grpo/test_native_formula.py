@@ -4,8 +4,7 @@ The three `..._stays_consistent_with_...` tests below check that the native
 reference wrappers agree with the base `compute_grpo_per_token_grads` they are
 built on. That is a real property, but it is NOT parity with the CUDA kernel:
 both sides of those assertions run the same Python function, so they hold
-whatever the formula is. They were previously named as though they proved the
-native path correct, and `trainer.py` cited them as exactly that.
+whatever the formula is.
 
 Independent coverage of the wrappers, and the actual CUDA comparison, live in
 `test_native_parity.py`.

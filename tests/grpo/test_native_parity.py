@@ -1,11 +1,8 @@
 """Parity coverage for the native GRPO loss (E4 in the RL end-to-end findings).
 
-The existing `test_native_formula.py` cannot establish parity with anything. Its
-"expected" helper calls `compute_grpo_per_token_grads`, and so does the function
-it checks (`loss.py:350`), so the assertion is `f(x) == f(x)`: it holds whatever
-the formula is, and would keep holding if the formula were wrong.
-
-Two different things were being conflated, and they are separated here.
+`test_native_formula.py` checks the Python loss against itself (see its module
+docstring); nothing has ever checked it against the kernel. Two different things
+were being conflated, and they are separated here.
 
 1. **The Python wrapper.** What `compute_native_shifted_grpo_dloss_reference`
    adds over the base function is a per-sample next-token shift and a division
@@ -114,12 +111,9 @@ def test_a_one_token_sample_contributes_nothing():
 def test_the_cuda_kernel_matches_the_python_reference_metrics():
     """The gap E4 names: nothing has ever run the kernel against the reference.
 
-    `trainer.py` claims the decomposed path produces gradients identical to the
-    fused `step_grpo_native`, and cites `test_native_formula.py` as the
-    assertion. That test cannot assert it. This one can: both paths see the same
-    weights and the same batch, so the kernel's own metrics -- read back through
-    `get_grpo_native_metrics` -- must match what the Python reference computes
-    from the same logprobs.
+    Both paths see the same weights and the same batch, so the kernel's own
+    metrics -- read back through `get_grpo_native_metrics` -- must match what the
+    Python reference computes from the same logprobs.
 
     Metrics rather than gradients on purpose: they are the kernel's arithmetic
     made observable without reading device memory, and they cover all the loss
@@ -128,7 +122,7 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
     _surogate = pytest.importorskip("surogate._surogate", reason="needs the built extension")
 
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
-    from surogate.grpo.loss import compute_native_grpo_metrics_reference
+    from surogate.grpo.loss import compute_native_grpo_metrics_reference, unshift_to_logical
     from surogate.utils.hf import get_model_weights_path
     from tests.test_onboarding_qwen3 import prepare_mini_model, resolve_model_path
 
@@ -189,13 +183,13 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
         reference_trainer.forward_for_grpo(inputs, targets, position_ids, None)[0, :seq_len],
         dtype=np.float32,
     )
-    # forward_for_grpo returns the negated CE buffer in TARGET slot layout:
-    # buf[t] = log p(input_ids[t+1]). Un-shift into logical layout, the exact
-    # inverse of the shift the kernel applies. Mirrors trainer.py's diagnostic path.
-    trainer_logprobs = np.zeros(seq_len, dtype=np.float32)
-    for start, end in sample_ranges:
-        if end - start > 1:
-            trainer_logprobs[start + 1 : end] = buf[start : end - 1]
+    # The production un-shift, not a copy of it: this test exists to check the
+    # decomposed path against the kernel, and the kernel does its own shift in
+    # C++, so sharing this cannot manufacture agreement between the two sides.
+    trainer_logprobs = unshift_to_logical(buf, sample_ranges)
+    # Nothing reads the reference trainer after this, and holding two full
+    # trainers doubles peak VRAM on a box that is usually busy.
+    del reference_trainer
 
     expected = compute_native_grpo_metrics_reference(
         trainer_logprobs=trainer_logprobs,

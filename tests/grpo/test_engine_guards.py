@@ -1,13 +1,14 @@
 """Guards for two latent GRPO defects (E1, E2 in the RL end-to-end findings).
 
 Neither is reachable from a config, a YAML or Studio today. Both are silent if
-they ever do fire, which is the reason to spend a guard on them rather than
-leave them to be discovered from a training curve that merely looks wrong.
+they ever do fire, which is why they are worth closing rather than leaving to be
+discovered from a training curve that merely looks disappointing.
 """
 
 import numpy as np
 import pytest
 
+from surogate.core.config.grpo_orch_config import GRPOAdvantageConfig
 from surogate.grpo.orchestrator.advantage import compute_advantages
 from surogate.grpo.trainer import _find_sample_boundaries
 
@@ -15,15 +16,8 @@ from surogate.grpo.trainer import _find_sample_boundaries
 
 
 def test_a_missing_advantage_config_is_rejected():
-    """`if not advantage_config: return rewards` handed the raw rewards back as
-    advantages, with no baseline subtracted. That is REINFORCE with all-positive
-    advantages: every completion is pushed up, including the bad ones, variance
-    reduction is gone and the policy can collapse. Silently.
-
-    Not reachable through config today (the builder always yields a truthy
-    `GRPOAdvantageConfig`), so the only way in is a caller passing None directly
-    -- which is a bug in that caller, and should say so rather than train wrong.
-    """
+    """A falsy config used to hand the raw rewards back as advantages, with no
+    baseline subtracted; see `compute_advantages` for why that trains wrong."""
     with pytest.raises(ValueError, match="advantage_config"):
         compute_advantages(
             rewards=[1.0, 2.0, 3.0, 4.0],
@@ -34,10 +28,7 @@ def test_a_missing_advantage_config_is_rejected():
 
 
 def test_a_real_advantage_config_still_centers_rewards():
-    """The guard must not disturb the normal path: equal-length completions in
-    one group come back centered on their own mean."""
-    from surogate.core.config.grpo_orch_config import GRPOAdvantageConfig
-
+    """The guard must not disturb the normal path."""
     out = compute_advantages(
         rewards=[1.0, 3.0],
         completion_lengths=[10, 10],
@@ -53,8 +44,7 @@ def test_a_real_advantage_config_still_centers_rewards():
 
 def test_ordinary_packed_samples_split_where_the_positions_reset():
     """The docstring's own example, and the case every real batch hits."""
-    pos = np.array([0, 1, 2, 0, 1, 0, 1, 2, 3])
-    assert _find_sample_boundaries(pos) == [(0, 3), (3, 5), (5, 9)]
+    assert _find_sample_boundaries(np.array([0, 1, 2, 0, 1, 0, 1, 2, 3])) == [(0, 3), (3, 5), (5, 9)]
 
 
 def test_a_single_unpacked_sample_is_one_range():
@@ -62,35 +52,45 @@ def test_a_single_unpacked_sample_is_one_range():
 
 
 def test_a_lone_trailing_pad_token_becomes_its_own_range():
-    """The one reachable 1-token case. The packer pads with `range(padding_size)`
-    (`batch.py:140`), so a padding block of 1 is a single trailing `0`.
-
-    The `pos[i+1] == 1` lookahead dropped this boundary and merged the pad into
-    the previous sample. Benign either way -- a padding-only range carries no
-    unmasked tokens and `compute_grpo_per_token_grads` skips it -- but splitting
-    it is what the position ids actually say.
-    """
+    """The one reachable 1-token case: a padding block of length 1. The old
+    lookahead dropped this boundary and merged the pad into the previous sample."""
     assert _find_sample_boundaries(np.array([0, 1, 2, 0])) == [(0, 3), (3, 4)]
 
 
 def test_a_multi_token_pad_block_was_already_split():
-    """Padding of 2 or more looks exactly like another sample, which is why only
-    the length-1 pad was ever affected."""
+    """Padding of 2+ looks like any other sample, so only length-1 was affected."""
     assert _find_sample_boundaries(np.array([0, 1, 2, 0, 1, 2])) == [(0, 3), (3, 6)]
 
 
-def test_an_interior_one_token_sample_is_rejected_rather_than_mis_split():
-    """Adjacent zeros cannot be represented in this scheme: `[0,0,1]` is
-    ambiguous between "a 1-token sample then a 2-token sample" and "one sample
-    whose positions start 0,0". No detector can resolve that, so the honest move
-    is to refuse it.
+def test_an_interior_one_token_sample_splits_instead_of_contaminating():
+    """The defect E2 names. `[0,1,2,0,0,1]` used to collapse into one unsplit
+    range, so the next-token shift ran across both joins and one sample's
+    gradient landed on another sample's token.
 
-    Left alone it was worse than ambiguous. `[0,1,2,0,0,1]` produced a single
-    unsplit range covering everything, so the next-token shift ran straight
-    across both boundaries and one sample's gradient landed on another's token.
+    The delta rule reads it correctly: a 3-token sample, a 1-token sample, then
+    a 2-token sample.
     """
-    with pytest.raises(ValueError, match="1-token"):
-        _find_sample_boundaries(np.array([0, 1, 2, 0, 0, 1]))
+    assert _find_sample_boundaries(np.array([0, 1, 2, 0, 0, 1])) == [(0, 3), (3, 4), (4, 6)]
+
+
+def test_the_split_matches_the_rule_the_engine_masks_attention_with():
+    """`compute_doc_masking` (causal_lm_execution_profile.cpp) derives attention
+    documents from the same array with `curr - prev != 1`. The loss used a weaker
+    rule, so the two could disagree about where a sample ended -- silently, since
+    nothing compares them. These are the cases where the old rule differed.
+    """
+    for packed, expected in [
+        ([0, 1, 2, 0, 1, 0, 1, 2, 3], [(0, 3), (3, 5), (5, 9)]),
+        ([0, 1, 2, 0], [(0, 3), (3, 4)]),
+        ([0, 1, 2, 0, 0, 1], [(0, 3), (3, 4), (4, 6)]),
+    ]:
+        position_ids = np.array(packed)
+        # The engine's rule, written out: a boundary is any position that does
+        # not advance its predecessor by exactly one.
+        engine = [0] + [i for i in range(1, len(packed)) if packed[i] - packed[i - 1] != 1]
+        engine_ranges = [(s, engine[k + 1] if k + 1 < len(engine) else len(packed)) for k, s in enumerate(engine)]
+        assert _find_sample_boundaries(position_ids) == expected
+        assert engine_ranges == expected, "the engine and the loss must agree"
 
 
 def test_an_empty_sequence_is_not_an_error():
