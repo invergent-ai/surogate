@@ -44,6 +44,11 @@ enum class QType : std::uint16_t {
     Q4_K                 = 11,
     Q5_K                 = 12,
     Q6_K                 = 13,
+    /// Not a K-quant: 32 values with one binary16 scale and no sub-scales. The same numbers
+    /// W8G32_F16S holds, arranged as the GGUF arranges them -- interleaved per block rather than
+    /// split into planes -- so a K_M quant's attention, GDN and shared-expert projections are
+    /// served from the file instead of repacked.
+    Q8_0                 = 14,
 };
 
 enum class QuantLayout : std::uint16_t {

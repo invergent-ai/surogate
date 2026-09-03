@@ -120,7 +120,7 @@ ROW_SCALE_V1 = Layout(
 GGML_BLOCKS_V1 = Layout(
     "ggml-blocks-v1",
     256,
-    frozenset(("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K")),
+    frozenset(("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0")),
 )
 
 LAYOUTS = MappingProxyType(
@@ -308,11 +308,12 @@ def encoded_size(
         return row_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_BLOCKS_V1:
         if not isinstance(numeric_spec, GgmlBlockFormat):
-            raise ValueError("ggml-blocks-v1 requires a GGML superblock format")
+            raise ValueError("ggml-blocks-v1 requires a GGML block format")
         n, k = _shape(shape, rank=2)
-        if k % 256:
-            raise ValueError("ggml-blocks-v1 requires k to be a multiple of 256")
-        return n * (k // 256) * numeric_spec.block_bytes
+        values = numeric_spec.values_per_block
+        if k % values:
+            raise ValueError("ggml-blocks-v1 requires k to be a whole number of blocks")
+        return n * (k // values) * numeric_spec.block_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
 
 

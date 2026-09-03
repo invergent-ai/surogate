@@ -49,7 +49,7 @@ void run_wide(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
               const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out, void* scratch,
               float beta, cudaStream_t stream) {
     const std::int32_t tile   = rows_per_tile(rows, k);
-    const std::size_t row_bytes = static_cast<std::size_t>(k / QK_K) * block_bytes(type);
+    const std::size_t row_bytes = static_cast<std::size_t>(k / block_values(type)) * block_bytes(type);
     auto* staging             = static_cast<__nv_bfloat16*>(scratch);
     for (std::int32_t first = 0; first < rows; first += tile) {
         const std::int32_t height = std::min(tile, rows - first);
@@ -64,7 +64,7 @@ template <bool Accumulate>
 void run_bf16(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
               const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out, void* scratch,
               std::size_t scratch_bytes, cudaStream_t stream) {
-    if (tokens <= 0 || k <= 0 || (k % QK_K) != 0 || rows <= 0) {
+    if (tokens <= 0 || k <= 0 || (k % block_values(type)) != 0 || rows <= 0) {
         throw std::invalid_argument("ggml linear: W[rows, k] with k a multiple of 256");
     }
     if (scratch == nullptr || scratch_bytes < linear_workspace_bytes(rows, k, tokens) ||
@@ -117,7 +117,7 @@ void linear_add_launch(GgmlType type, const void* blocks, std::int32_t rows, std
 void linear_launch_f32(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
                        const __nv_bfloat16* x, std::int32_t tokens, float* out, void* scratch,
                        std::size_t scratch_bytes, cudaStream_t stream) {
-    if (tokens <= 0 || k <= 0 || (k % QK_K) != 0 || rows <= 0) {
+    if (tokens <= 0 || k <= 0 || (k % block_values(type)) != 0 || rows <= 0) {
         throw std::invalid_argument("ggml linear: W[rows, k] with k a multiple of 256");
     }
     if (scratch == nullptr || scratch_bytes < q8_1_bytes(k, tokens) ||

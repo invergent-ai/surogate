@@ -658,22 +658,35 @@ def convert(
     native_runs: dict = {}
     external: tuple = ()
     if repack is not None:
-        native = repack.plan_native(recipe.BASE_RECIPES_BY_NAME, gguf_specs)
+        # The fused projections and the shared expert run kernels that read the row-split
+        # W8 planes; until those learn the GGUF's interleaved Q8_0 block, those objects are
+        # repacked rather than served from the file. Everything else -- the K-quant experts,
+        # the output head, the embedding table, the attention output -- is read in place.
+        native = repack.plan_native(
+            recipe.BASE_RECIPES_BY_NAME,
+            gguf_specs,
+            exclude_suffixes=recipe.NATIVE_EXCLUDE_SUFFIXES,
+        )
         repacked = repack.plan(recipe.BASE_RECIPES_BY_NAME, gguf_specs)
         if native:
             # By default those objects are not copied at all: the artifact names the GGUF and
             # the stretches of it each object reads. SUROGATE_GGUF_COPY=1 writes the bytes in.
             if os.environ.get("SUROGATE_GGUF_COPY", "0") == "0":
+                # The draft head gathers its rows by shortlist rather than in order, so it needs
+                # the same ids the write path uses. The shortlist is a pure function of the
+                # ranking file and the checkpoint, so computing it here matches what preflight
+                # computes later.
+                draft_ids = draft_head.materialize_draft_head_token_ids(
+                    draft_head.compute_shortlist(_repo_root() / draft_head.DEFAULT_RANKING, model)
+                )
                 native_runs = {
                     spec.name: repack.runs_for_native(
                         spec,
                         recipe.BASE_RECIPES_BY_NAME[spec.name],
-                        draft_head.materialize_draft_head_token_ids(None)
-                        if spec.name == draft_head.DRAFT_HEAD_OBJECT
-                        else None,
+                        draft_ids if spec.name == draft_head.DRAFT_HEAD_OBJECT else None,
                     )
                     for spec in GgufRepackSource.native_specs(gguf_specs, native)
-                    if spec.name in native and spec.name != draft_head.DRAFT_HEAD_OBJECT
+                    if spec.name in native
                 }
                 external = ((str(Path(repack.gguf_path).resolve()),
                              Path(repack.gguf_path).stat().st_size),)

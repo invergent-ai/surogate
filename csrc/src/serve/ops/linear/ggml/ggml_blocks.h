@@ -12,6 +12,14 @@ namespace sinfer::ops::detail::ggml {
 // Superblock geometry shared by every K-quant: 256 values, 12 bytes of 6-bit sub-scales.
 inline constexpr int QK_K         = 256;
 inline constexpr int K_SCALE_SIZE = 12;
+// Q8_0: not a K-quant at all -- 32 values with one scale, no superblock and no sub-scales. A
+// K_M quant leaves the attention, GDN and shared-expert projections in it, so serving it is what
+// keeps those off the dequantise path.
+inline constexpr int QK8_0 = 32;
+inline constexpr int QR8_0 = 1;
+inline constexpr int QI8_0 = QK8_0 / (4 * QR8_0);
+inline constexpr int VDR_Q8_0_Q8_1_MMVQ = 2;
+
 // The int8 activation block the vec-dots consume: 32 values, (d, sum) as half2.
 inline constexpr int QK8_1 = 32;
 inline constexpr int QR8_1 = 1;
@@ -22,6 +30,12 @@ inline constexpr int QR3_K = 4; inline constexpr int QI3_K = QK_K / (4 * QR3_K);
 inline constexpr int QR4_K = 2; inline constexpr int QI4_K = QK_K / (4 * QR4_K);
 inline constexpr int QR5_K = 2; inline constexpr int QI5_K = QK_K / (4 * QR5_K);
 inline constexpr int QR6_K = 2; inline constexpr int QI6_K = QK_K / (4 * QR6_K);
+
+struct block_q8_0 {
+    __half d;          // scale
+    int8_t qs[QK8_0];  // quants
+};
+static_assert(sizeof(block_q8_0) == sizeof(__half) + QK8_0, "wrong q8_0 block size/padding");
 
 struct block_q8_1 {
     __half2 ds;          // d (scale), s (sum of the 32 unquantised values)

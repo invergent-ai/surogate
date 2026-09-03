@@ -17,7 +17,12 @@ namespace sinfer::ops::detail::ggml {
 // other four (convert.cu launches them so, and each thread writes its fixed share of a block).
 // Getting this wrong leaves part of every block unwritten.
 template <GgmlType type>
-__host__ __device__ constexpr int dequant_threads() { return type == GgmlType::Q4_K ? 32 : 64; }
+__host__ __device__ constexpr int dequant_threads() {
+    // llama.cpp launches Q4_K's dequantiser with 32 threads and the other K-quants with 64; a
+    // Q8_0 block is 32 values, one per lane.
+    if constexpr (type == GgmlType::Q8_0) { return QK8_0; }
+    return type == GgmlType::Q4_K ? 32 : 64;
+}
 
 template <typename dst_t> __device__ __forceinline__ dst_t cast_to(float v);
 template <> __device__ __forceinline__ float cast_to<float>(float v) { return v; }
@@ -143,6 +148,16 @@ static __device__ __forceinline__ void dequantize_q5_K(const void * vx, const in
     y[33] = cast_to<dst_t>(d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2);
 }
 
+/// One value per lane: a Q8_0 block is 32 quants and a single scale.
+template <typename dst_t>
+__device__ __forceinline__ void dequantize_q8_0(const void* blocks, std::int64_t ib, dst_t* out,
+                                                int tid) {
+    const block_q8_0* x = static_cast<const block_q8_0*>(blocks) + ib;
+    if (tid < QK8_0) {
+        out[tid] = cast_to<dst_t>(__half2float(x->d) * static_cast<float>(x->qs[tid]));
+    }
+}
+
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_q6_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
     const block_q6_K * x = (const block_q6_K *) vx;
@@ -175,6 +190,7 @@ __device__ __forceinline__ void dequantize_superblock(const void* blocks, std::i
     if constexpr (type == GgmlType::Q4_K) { dequantize_q4_K(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q5_K) { dequantize_q5_K(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q6_K) { dequantize_q6_K(blocks, ib, out, tid); }
+    if constexpr (type == GgmlType::Q8_0) { dequantize_q8_0(blocks, ib, out, tid); }
 }
 
 } // namespace sinfer::ops::detail::ggml

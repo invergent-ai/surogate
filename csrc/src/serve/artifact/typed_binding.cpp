@@ -32,6 +32,7 @@ StorageLayout storage_layout_for(NumericFormat format) {
     case NumericFormat::Q4_K:
     case NumericFormat::Q5_K:
     case NumericFormat::Q6_K:
+    case NumericFormat::Q8_0:
         return StorageLayout::GgmlBlocksV1;
     case NumericFormat::NVFP4:
         return StorageLayout::BlockScaleK16M128x4V1;
@@ -67,6 +68,8 @@ QType qtype_for(NumericFormat format) {
         return QType::Q5_K;
     case NumericFormat::Q6_K:
         return QType::Q6_K;
+    case NumericFormat::Q8_0:
+        return QType::Q8_0;
     case NumericFormat::NVFP4:
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
@@ -212,15 +215,16 @@ Weight ggml_blocks_weight(const MaterializedArtifact& materialized, ObjectHandle
     Weight out{};
     out.payload         = data;
     out.payload_bytes   = bytes;
+    const auto values   = static_cast<std::int32_t>(ggml_block_values(format));
     out.qtype           = qtype_for(format);
-    out.group_size      = 256;
+    out.group_size      = static_cast<std::uint32_t>(values);
     out.ndim            = 2;
     out.qdata           = data;
     out.qhigh           = nullptr;
     out.scales          = nullptr;
     out.n               = rows;
     out.k               = columns;
-    out.group           = 256;
+    out.group           = values;
     out.layout          = QuantLayout::GgmlBlocks;
     out.scale_dtype     = DType::FP16;
     out.shape[0]        = rows;
@@ -285,6 +289,7 @@ bool is_linear_format(NumericFormat format) noexcept {
     case NumericFormat::Q4_K:
     case NumericFormat::Q5_K:
     case NumericFormat::Q6_K:
+    case NumericFormat::Q8_0:
         return true;
     case NumericFormat::FP32:
     case NumericFormat::I32:

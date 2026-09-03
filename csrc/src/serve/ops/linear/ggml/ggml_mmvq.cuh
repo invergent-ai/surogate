@@ -34,6 +34,10 @@ template <> struct Traits<GgmlType::Q5_K> {
     static constexpr int qk = QK_K, qi = QI5_K, vdr = VDR_Q5_K_Q8_1_MMVQ;
     static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_q5_K_q8_1;
 };
+template <> struct Traits<GgmlType::Q8_0> {
+    static constexpr int qk = QK8_0, qi = QI8_0, vdr = VDR_Q8_0_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_q8_0_q8_1;
+};
 template <> struct Traits<GgmlType::Q6_K> {
     static constexpr int qk = QK_K, qi = QI6_K, vdr = VDR_Q6_K_Q8_1_MMVQ;
     static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_q6_K_q8_1;

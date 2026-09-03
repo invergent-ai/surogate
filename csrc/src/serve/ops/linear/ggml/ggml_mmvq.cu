@@ -56,8 +56,8 @@ template <typename DstT, bool Accumulate>
 void mmvq_launch(GgmlType type, const void* blocks, std::int32_t n, std::int32_t k,
                  const block_q8_1* y, std::int32_t tokens, DstT* out, cudaStream_t stream) {
     if (blocks == nullptr || y == nullptr || out == nullptr || n <= 0 || k <= 0 ||
-        (k % QK_K) != 0 || tokens <= 0 || tokens > kMmvqMaxColumns) {
-        throw std::invalid_argument("mmvq: W[n, k] with k a multiple of 256, 1..8 columns");
+        (k % block_values(type)) != 0 || tokens <= 0 || tokens > kMmvqMaxColumns) {
+        throw std::invalid_argument("mmvq: W[n, k] with k a whole number of blocks, 1..8 columns");
     }
     switch (type) {
     case GgmlType::Q2_K: launch_columns<GgmlType::Q2_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
@@ -65,6 +65,7 @@ void mmvq_launch(GgmlType type, const void* blocks, std::int32_t n, std::int32_t
     case GgmlType::Q4_K: launch_columns<GgmlType::Q4_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
     case GgmlType::Q5_K: launch_columns<GgmlType::Q5_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
     case GgmlType::Q6_K: launch_columns<GgmlType::Q6_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
+    case GgmlType::Q8_0: launch_columns<GgmlType::Q8_0, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
     }
     throw std::invalid_argument("mmvq: unknown GGML type");
 }

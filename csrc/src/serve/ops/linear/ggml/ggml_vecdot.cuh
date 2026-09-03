@@ -181,7 +181,22 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     return d*sumf;
 }
 
-static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
+static /// Q8_0 against the quantised activation: a plain dp4a dot, the two scales multiplied out.
+/// Its `qs` sits at a two-byte offset inside the block, so the reads are the two-byte-aligned
+/// accessor rather than the four-byte one the K-quants use.
+__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
+                                                   const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q8_0* bq8_0 = static_cast<const block_q8_0*>(vbq) + kbx;
+    int sumi                = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        sumi = __dp4a(get_int_b2(bq8_0->qs, iqs + i), get_int_b4(bq8_1->qs, iqs + i), sumi);
+    }
+    return __half2float(bq8_0->d) * __half2float(__low2half(bq8_1->ds)) * static_cast<float>(sumi);
+}
+
+__device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_q2_K * bq2_K = (const block_q2_K *) vbq + kbx;

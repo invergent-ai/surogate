@@ -122,7 +122,15 @@ def _planes_iq4_nl(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # GGML K-quants are served in their own superblocks (artifact layout ggml-blocks-v1): the
 # bytes go into the artifact verbatim, row by row, and the kernels read them as the file holds
 # them. Type -> bytes per 256-value superblock.
-NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210}
+# Bytes per stored block, and how many values that block holds: 256 for every K-quant, 32 for
+# Q8_0, which is not one -- it is the plain 8-bit block a K_M quant leaves the attention, GDN and
+# shared-expert projections in.
+NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210, "Q8_0": 34}
+NATIVE_BLOCK_VALUES = {"Q8_0": 32}
+
+
+def native_block_values(gguf_type: str) -> int:
+    return NATIVE_BLOCK_VALUES.get(gguf_type, 256)
 _NATIVE_LAYOUT = "ggml-blocks-v1"
 
 # What a fused object is called once it is stored as two differently-typed halves. The names
@@ -223,8 +231,8 @@ class GgufRepackSource:
         n, k = self.source_rows_k(hf_name)
         if k % _GROUP != 0:
             raise RepackError(f"{hf_name}: k={k} is not a multiple of {_GROUP}")
-        if entry["type"] in NATIVE_TYPES:
-            raise RepackError(f"{hf_name}: {entry['type']} is served natively, not as planes")
+        if entry["type"] in NATIVE_TYPES and native_block_values(str(entry["type"])) == 256:
+            raise RepackError(f"{hf_name}: {entry['type']} is a superblock format, not planes")
         block_bytes, decoder = REPACKABLE_TYPES[entry["type"]]
         offset = int(entry["offset"])
         nbytes = n * (k // _GROUP) * block_bytes
@@ -287,9 +295,14 @@ class GgufRepackSource:
                 program = self._evaluate_rows(recipe.expression, probe)
             if program is None:
                 continue
-            if any(self.native_type_of(name) is not None for name in program.sources):
-                # A source held as a K-quant never deinterleaves into W8 planes: the object
-                # is either served natively (plan_native) or dequantised by the bridge.
+            if any(
+                (t := self.native_type_of(name)) is not None and native_block_values(t) == 256
+                for name in program.sources
+            ):
+                # A source held as a *superblock* K-quant never deinterleaves into W8 planes: the
+                # object is either served natively (plan_native) or dequantised by the bridge.
+                # Q8_0 is not one -- it is the same numbers W8 holds, so it still repacks, which
+                # is what an object whose op has no Q8_0 kernel yet falls back to.
                 continue
             geometry = row_split_geometry(get_format(_REPACK_FORMAT), spec.shape)
             if geometry.k_pad != geometry.k or geometry.k != program.k:
@@ -311,6 +324,7 @@ class GgufRepackSource:
         tensor_specs: Sequence,
         *,
         with_token_ids: bool = True,
+        exclude_suffixes: Sequence[str] = (),
     ) -> dict[str, str]:
         """Objects served as native K-quants: quantized-linear specs whose row program draws
         every row from mapped sources of one K-quant type at the spec's own k. Returns
@@ -327,10 +341,16 @@ class GgufRepackSource:
                 program = self._evaluate_rows(recipe.expression.source, None)
             else:
                 program = self._evaluate_rows(recipe.expression, probe)
-            if program is None or program.k != int(spec.shape[1]) or program.k % 256:
+            if program is None or program.k != int(spec.shape[1]):
                 continue
             types = {self.native_type_of(name) for name in program.sources}
             if len(types) != 1 or None in types:
+                continue
+            if program.k % native_block_values(next(iter(types))):
+                continue
+            # Objects whose op has no kernel for the stored type yet: the caller names them,
+            # because which ops a family routes an object through is the family's knowledge.
+            if any(spec.name.endswith(suffix) for suffix in exclude_suffixes):
                 continue
             only = os.environ.get("SUROGATE_GGUF_NATIVE_ONLY")  # bisection aid: name substrings
             if only and not any(part and part in spec.name for part in only.split(",")):
@@ -379,9 +399,10 @@ class GgufRepackSource:
         entry = self.sources[hf_name]
         n, k = self.source_rows_k(hf_name)
         block_bytes = NATIVE_TYPES[entry["type"]]
-        if k % 256:
-            raise RepackError(f"{hf_name}: k={k} is not a multiple of 256")
-        row_bytes = (k // 256) * block_bytes
+        values = native_block_values(str(entry["type"]))
+        if k % values:
+            raise RepackError(f"{hf_name}: k={k} is not a whole number of {values}-value blocks")
+        row_bytes = (k // values) * block_bytes
         offset = int(entry["offset"])
         nbytes = n * row_bytes
         data = self._memmap()
@@ -417,7 +438,7 @@ class GgufRepackSource:
             types = {self.native_type_of(name) for name in program.sources}
             if types != {spec.format}:
                 raise RepackError(f"{spec.name}: sources are {types}, spec is {spec.format}")
-        row_bytes = (program.k // 256) * NATIVE_TYPES[spec.format]
+        row_bytes = (program.k // native_block_values(spec.format)) * NATIVE_TYPES[spec.format]
         rows = program.rows if row_slice is None else program.rows[row_slice]
         n = int(rows.shape[0])
         out = np.empty((n, row_bytes), dtype=np.uint8)
@@ -460,14 +481,15 @@ class GgufRepackSource:
                 f"{spec.name}: native shape {(int(program.rows.shape[0]), program.k)} "
                 f"!= spec {tuple(spec.shape)}"
             )
-        row_bytes = (program.k // 256) * NATIVE_TYPES[spec.format]
+        row_bytes = (program.k // native_block_values(spec.format)) * NATIVE_TYPES[spec.format]
         rows = np.asarray(program.rows)
         source_of = rows // _SOURCE_STRIDE
         row_of = rows % _SOURCE_STRIDE
         base = [int(self.sources[name]["offset"]) for name in program.sources]
         for index, name in enumerate(program.sources):
             n_rows, k = self.source_rows_k(name)
-            if (k // 256) * NATIVE_TYPES[str(self.sources[name]["type"])] != row_bytes:
+            source_type = str(self.sources[name]["type"])
+            if (k // native_block_values(source_type)) * NATIVE_TYPES[source_type] != row_bytes:
                 raise RepackError(f"{spec.name}: {name} has a different row width")
 
         # A new run starts wherever the source changes or the source row is not the next one.

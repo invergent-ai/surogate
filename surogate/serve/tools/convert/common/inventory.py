@@ -31,7 +31,8 @@ Q3_K = "Q3_K"
 Q4_K = "Q4_K"
 Q5_K = "Q5_K"
 Q6_K = "Q6_K"
-GGML_BLOCK_FORMAT_NAMES = (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)
+Q8_0 = "Q8_0"
+GGML_BLOCK_FORMAT_NAMES = (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0)
 
 DIRECT_FORMATS = frozenset((BF16, FP32, I32))
 # The engine's nine formats and four layouts (csrc/src/serve/artifact/reader.h). Every

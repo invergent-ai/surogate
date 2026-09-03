@@ -9,15 +9,21 @@
 
 namespace sinfer::ops::detail::ggml {
 
-enum class GgmlType : std::uint8_t { Q2_K, Q3_K, Q4_K, Q5_K, Q6_K };
+enum class GgmlType : std::uint8_t { Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 };
 
-constexpr std::int32_t block_bytes(GgmlType type) noexcept {
+/// Values per stored block: 256 for every K-quant, 32 for Q8_0, which has no superblock.
+__host__ __device__ constexpr std::int32_t block_values(GgmlType type) noexcept {
+    return type == GgmlType::Q8_0 ? QK8_0 : QK_K;
+}
+
+__host__ __device__ constexpr std::int32_t block_bytes(GgmlType type) noexcept {
     switch (type) {
     case GgmlType::Q2_K: return sizeof(block_q2_K);
     case GgmlType::Q3_K: return sizeof(block_q3_K);
     case GgmlType::Q4_K: return sizeof(block_q4_K);
     case GgmlType::Q5_K: return sizeof(block_q5_K);
     case GgmlType::Q6_K: return sizeof(block_q6_K);
+    case GgmlType::Q8_0: return sizeof(block_q8_0);
     }
     return 0;
 }

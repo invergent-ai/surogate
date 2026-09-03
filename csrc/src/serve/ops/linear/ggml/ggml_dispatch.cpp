@@ -23,6 +23,7 @@ bool is_ggml_qtype(QType qtype) noexcept {
     case QType::Q4_K:
     case QType::Q5_K:
     case QType::Q6_K:
+    case QType::Q8_0:
         return true;
     default:
         return false;
@@ -36,20 +37,23 @@ GgmlType ggml_type_for(QType qtype) {
     case QType::Q4_K: return GgmlType::Q4_K;
     case QType::Q5_K: return GgmlType::Q5_K;
     case QType::Q6_K: return GgmlType::Q6_K;
+    case QType::Q8_0: return GgmlType::Q8_0;
     default: break;
     }
     throw std::invalid_argument("ggml: weight qtype is not a GGML superblock format");
 }
 
 void require_ggml_weight(const Weight& w, const char* op) {
+    const std::int32_t values = is_ggml_qtype(w.qtype) ? block_values(ggml_type_for(w.qtype)) : 0;
     if (!is_ggml_qtype(w.qtype) || w.layout != QuantLayout::GgmlBlocks || w.qdata == nullptr ||
-        w.ndim != 2 || w.n <= 0 || w.k <= 0 || (w.k % QK_K) != 0 || w.group != QK_K ||
-        w.padded_shape[0] != w.n || w.padded_shape[1] != w.k) {
+        w.ndim != 2 || w.n <= 0 || w.k <= 0 || (w.k % values) != 0 ||
+        w.group != static_cast<std::int32_t>(values) || w.padded_shape[0] != w.n ||
+        w.padded_shape[1] != w.k) {
         throw std::invalid_argument(std::string(op) +
-                                    ": weight must be a GGML K-quant in GgmlBlocks layout, "
-                                    "[n, k] with k a multiple of 256");
+                                    ": weight must be a GGML block format in GgmlBlocks layout, "
+                                    "[n, k] with k a whole number of blocks");
     }
-    const std::size_t expected = static_cast<std::size_t>(w.n) * (w.k / QK_K) *
+    const std::size_t expected = static_cast<std::size_t>(w.n) * (w.k / values) *
                                  static_cast<std::size_t>(block_bytes(ggml_type_for(w.qtype)));
     if (w.payload_bytes < expected) {
         throw std::invalid_argument(std::string(op) + ": GGML weight payload is too small");
@@ -185,7 +189,8 @@ void ggml_project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin,
     }
     require_x_out(x, w.k, out, rows, "ggml project_rows");
     const GgmlType type       = ggml_type_for(w.qtype);
-    const std::size_t row_bytes = static_cast<std::size_t>(w.k / QK_K) * block_bytes(type);
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(w.k / block_values(type)) * block_bytes(type);
     const auto* blocks = static_cast<const std::byte*>(w.qdata) + static_cast<std::size_t>(row_begin) * row_bytes;
     const std::int32_t tokens = x.ne[1];
     // the row range is the matrix this call actually multiplies, so it sizes the tile too
@@ -199,8 +204,8 @@ void ggml_project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin,
 std::size_t ggml_linear_workspace_capacity_bytes(std::int32_t output_rows,
                                                 std::int32_t input_rows,
                                                 std::int32_t max_tokens) {
-    if (output_rows <= 0 || input_rows <= 0 || (input_rows % QK_K) != 0 || max_tokens <= 0) {
-        throw std::invalid_argument("ggml linear workspace: k must be a multiple of 256");
+    if (output_rows <= 0 || input_rows <= 0 || (input_rows % QK8_0) != 0 || max_tokens <= 0) {
+        throw std::invalid_argument("ggml linear workspace: k must be a whole number of blocks");
     }
     return linear_workspace_bytes(output_rows, input_rows, max_tokens) + 256;
 }

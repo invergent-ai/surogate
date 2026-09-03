@@ -92,6 +92,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "Q5_K";
     case NumericFormat::Q6_K:
         return "Q6_K";
+    case NumericFormat::Q8_0:
+        return "Q8_0";
     }
     return {};
 }
@@ -122,6 +124,11 @@ std::uint64_t tensor_alignment(StorageLayout) noexcept { return kTensorAlignment
 
 std::uint64_t resource_alignment(ResourceEncoding) noexcept { return 1; }
 
+/// Values per stored block: a K-quant superblock is 256, Q8_0 is 32.
+std::uint64_t ggml_block_values(NumericFormat format) {
+    return format == NumericFormat::Q8_0 ? 32 : 256;
+}
+
 std::uint64_t ggml_block_bytes(NumericFormat format) {
     switch (format) {
     case NumericFormat::Q2_K: return 84;
@@ -129,6 +136,7 @@ std::uint64_t ggml_block_bytes(NumericFormat format) {
     case NumericFormat::Q4_K: return 144;
     case NumericFormat::Q5_K: return 176;
     case NumericFormat::Q6_K: return 210;
+    case NumericFormat::Q8_0: return 34;
     default: break;
     }
     throw ArtifactError("format is not a GGML superblock format");
@@ -161,10 +169,12 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
         return row_scale_geometry(format, shape).encoded_bytes;
     }
     if (layout == StorageLayout::GgmlBlocksV1) {
-        if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || (shape[1] % 256) != 0) {
-            throw ArtifactError("ggml-blocks-v1 requires a rank-two shape with k a multiple of 256");
+        const auto values = ggml_block_values(format);
+        if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || (shape[1] % values) != 0) {
+            throw ArtifactError(
+                "ggml-blocks-v1 requires a rank-two shape with k a whole number of blocks");
         }
-        const auto blocks = checked_mul(shape[0], shape[1] / 256, "ggml block count");
+        const auto blocks = checked_mul(shape[0], shape[1] / values, "ggml block count");
         return checked_mul(blocks, ggml_block_bytes(format), "ggml encoded size");
     }
     throw ArtifactError("unknown tensor layout");

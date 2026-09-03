@@ -238,6 +238,7 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
     case QType::Q4_K:
     case QType::Q5_K:
     case QType::Q6_K:
+    case QType::Q8_0:
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::ggml::ggml_embedding(ids, table, out, stream);

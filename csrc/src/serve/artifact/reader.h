@@ -33,6 +33,7 @@ enum class NumericFormat {
     Q4_K,
     Q5_K,
     Q6_K,
+    Q8_0,
 };
 
 enum class StorageLayout {
@@ -55,6 +56,8 @@ std::uint64_t tensor_alignment(StorageLayout layout) noexcept;
 std::uint64_t resource_alignment(ResourceEncoding encoding) noexcept;
 /// Bytes of one 256-value superblock for a GGML K-quant format.
 std::uint64_t ggml_block_bytes(NumericFormat format);
+/// Values a stored block holds: 256 for a K-quant superblock, 32 for Q8_0.
+std::uint64_t ggml_block_values(NumericFormat format);
 std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
                                   std::span<const std::uint64_t> shape);
 

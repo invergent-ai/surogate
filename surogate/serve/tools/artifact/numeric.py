@@ -59,17 +59,20 @@ FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
 
 @dataclass(frozen=True, slots=True)
 class GgmlBlockFormat:
-    """A GGML K-quant kept in its own 256-value superblocks, bytes as the GGUF stores them."""
+    """A GGML block format kept as the GGUF stores it. Every K-quant is a 256-value superblock;
+    Q8_0 is a plain 32-value block with one scale and no sub-scales."""
 
     name: str
     bits: float
     block_bytes: int
+    values_per_block: int = 256
 
 Q2_K = GgmlBlockFormat("Q2_K", 2.625, 84)
 Q3_K = GgmlBlockFormat("Q3_K", 3.4375, 110)
 Q4_K = GgmlBlockFormat("Q4_K", 4.5, 144)
 Q5_K = GgmlBlockFormat("Q5_K", 5.5, 176)
 Q6_K = GgmlBlockFormat("Q6_K", 6.5625, 210)
+Q8_0 = GgmlBlockFormat("Q8_0", 8.5, 34, 32)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -86,7 +89,7 @@ FP8_ROW_FORMATS = MappingProxyType(
     {FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S}
 )
 GGML_BLOCK_FORMATS = MappingProxyType(
-    {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)}
+    {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0)}
 )
 NUMERIC_FORMATS = MappingProxyType(
     {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **GGML_BLOCK_FORMATS}
@@ -174,6 +177,7 @@ __all__ = [
     "Q4_K",
     "Q5_K",
     "Q6_K",
+    "Q8_0",
     "BF16",
     "DIRECT_FORMATS",
     "DirectFormat",

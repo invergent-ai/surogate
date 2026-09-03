@@ -40,6 +40,18 @@ DRAFT_RANKING_PATH = (
 )
 
 
+# Objects whose op reads the row-split W8 planes and has no kernel for the GGUF's interleaved
+# Q8_0 block yet, so they are repacked rather than served from the file. Both the converter and
+# the ingest bridge read this: the bridge must keep dequantising exactly what the converter is
+# still going to build. Shrinks as those kernels land.
+NATIVE_EXCLUDE_SUFFIXES = (
+    "attention/query_key_gate_value",
+    "gdn/query_key_value_z",
+    "moe/shared_gate_up",
+    "moe/shared_down",
+)
+
+
 def _attention_part(source_name: str, *, gate: bool) -> Expression:
     return attention_qproj_part(
         source_name,

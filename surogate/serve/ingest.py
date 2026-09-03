@@ -272,7 +272,12 @@ def _repack_planner(root: Path, target_key: str):
         }
         source = GgufRepackSource.from_sources(gguf_path, candidates)
         planned = source.plan(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
-        native = source.plan_native(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
+        native = source.plan_native(
+            recipe.RECIPES_BY_NAME,
+            inventory.TENSOR_SPECS,
+            exclude_suffixes=getattr(recipe, "NATIVE_EXCLUDE_SUFFIXES", ()),
+        )
+
         # A fused parent stored as two typed halves keeps its sources too, or the bridge
         # dequantises them and the converter can no longer see the types it split on.
         halves = source.plan_native_halves(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
