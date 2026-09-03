@@ -86,14 +86,40 @@ def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event):
     try:
         GRPOTrainer(train_config, external_weights=None).train()
     except Exception:
-        logger.exception("Trainer thread crashed")
+        # Set the channel FIRST. This handler used to log first, with
+        # `logger.exception` — a method `LoggerWrapper` does not define — so it
+        # raised inside itself and the line below never ran. The watchdog was
+        # never told, and the run hung in `running` holding its GPUs. Whatever
+        # goes wrong in the logging call, the signal must already be out.
         failure_event.set()
+        logger.error("Trainer thread crashed", exc_info=True)
+
+
+class AbortReason:
+    """Why the watchdog aborted, or None if it did not.
+
+    The watchdog stops the pipeline by signalling its own process, which the
+    main thread receives as a `KeyboardInterrupt` — identical to a user
+    pressing Ctrl-C. Without somewhere to record the cause, the two cases are
+    indistinguishable, and a crashed component exited 0 and finalized as
+    `completed`.
+    """
+
+    def __init__(self, reason: str | None = None):
+        self.reason = reason
+
+
+def _exit_code_for(abort: "AbortReason") -> int:
+    """A recorded reason means a component died; an empty one means the user
+    interrupted, which is not a failure."""
+    return 1 if abort.reason else 0
 
 
 def _watch_components(
     vllm_procs: list[tuple["mp.Process", str]],
     trainer_failed: threading.Event,
     shutdown_event: threading.Event,
+    abort: "AbortReason",
 ) -> None:
     """Watchdog: aborts the pipeline if any vLLM or the trainer dies unexpectedly.
 
@@ -122,6 +148,10 @@ def _watch_components(
     if crashed is None:
         return
     logger.error(f"{crashed} — aborting GRPO pipeline")
+    # Record before signalling: the main thread reads this to tell our own
+    # abort apart from a user's Ctrl-C, and it must be set by the time the
+    # signal lands.
+    abort.reason = crashed
     # Wake the main thread out of asyncio.run; existing finally block tears down.
     os.kill(os.getpid(), signal.SIGINT)
 
@@ -216,9 +246,10 @@ def grpo_split(
     if judge_proc is not None:
         watched_vllms.append((judge_proc, "judge vLLM"))
     shutdown_event = threading.Event()
+    abort = AbortReason()
     watchdog_thread = Thread(
         target=_watch_components,
-        args=(watched_vllms, trainer_failed, shutdown_event),
+        args=(watched_vllms, trainer_failed, shutdown_event, abort),
         daemon=True,
         name="grpo-watchdog",
     )
@@ -229,7 +260,15 @@ def grpo_split(
 
         asyncio.run(orchestrate(orch_config))
     except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
+        # Two very different events arrive here identically. The watchdog stops
+        # the pipeline by signalling this process, so a crashed component looks
+        # exactly like the user pressing Ctrl-C — which is why a dead vLLM used
+        # to exit 0 and finalize as `completed`. The recorded reason is what
+        # tells them apart; the raise happens after teardown, below.
+        if abort.reason:
+            logger.error(f"GRPO pipeline aborted: {abort.reason}")
+        else:
+            logger.warning("Interrupted by user")
     except Exception as e:
         logger.error(f"Split GRPO pipeline error: {e}")
         raise
@@ -273,6 +312,13 @@ def grpo_split(
             _reap_survivors(psutil.Process().children(recursive=True))
         except Exception as e:
             logger.warning(f"Survivor reap failed during shutdown: {e}")
+
+    # After teardown, not instead of it: the finally block above reaps the vLLM
+    # process trees, and exiting early would strand them holding GPUs. Raising
+    # here is what turns a dead component into a non-zero exit, so ops records
+    # the run as failed rather than completed.
+    if _exit_code_for(abort):
+        raise RuntimeError(f"GRPO pipeline aborted: {abort.reason}")
 
 
 def _spawn_vllm(
