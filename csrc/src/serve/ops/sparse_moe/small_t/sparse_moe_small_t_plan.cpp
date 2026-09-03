@@ -35,7 +35,8 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(const SparseMoeGeometry& geo
     // A GGML K-quant decodes eight consecutive values per lane, the same shape W8 and NVFP4 use,
     // so it runs the generic schedules rather than the three-path split, which is Q4/Q5-specific.
     const auto is_ggml_k = [](QType qtype) {
-        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K;
+        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K ||
+               qtype == QType::Q8_0;
     };
     const bool ggml_k_profile = is_ggml_k(routed_gate_up) && is_ggml_k(routed_down);
     if (!main_profile && !w8_profile && !nvfp4_profile && !ggml_k_profile) {

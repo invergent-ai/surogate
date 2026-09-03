@@ -726,6 +726,10 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
         launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>>(x, weights, workspace,
                                                                             stream);
         break;
+    case QType::Q8_0:
+        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q8_0>>(x, weights, workspace,
+                                                                            stream);
+        break;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
     }
@@ -787,6 +791,10 @@ void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
         return;
     case QType::Q6_K:
         launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>>(weights, destination,
+                                                                            workspace, stream);
+        return;
+    case QType::Q8_0:
+        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q8_0>>(weights, destination,
                                                                             workspace, stream);
         return;
     case QType::W8G32_F16S:
@@ -938,6 +946,10 @@ void decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
         launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>, false>(
             x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
         return;
+    case QType::Q8_0:
+        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q8_0>, false>(
+            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
+        return;
     case QType::NVFP4:
         if (adaptive_route_jobs == nullptr) {
             launch_d3_small_t_codec<Nvfp4CodecFor<kHidden / 16>, false>(
@@ -998,6 +1010,11 @@ void decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destinati
         return;
     case QType::Q6_K:
         launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>, false>(
+            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
+            schedule, stream, nullptr);
+        return;
+    case QType::Q8_0:
+        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q8_0>, false>(
             weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
             schedule, stream, nullptr);
         return;

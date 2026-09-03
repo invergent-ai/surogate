@@ -153,7 +153,8 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
                       std::vector<AddressRange>& ranges) {
     require_router(weights.router_shared_gate, geometry, ranges);
     const auto is_ggml_k = [](QType qtype) {
-        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K;
+        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K ||
+               qtype == QType::Q8_0;
     };
     if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
         weights.routed_gate_up.qtype != QType::W8G32_F16S &&
@@ -395,7 +396,8 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     // than the small-T bound fell to the per-token decode loop -- one launch per prompt token.
     // Walking small-T slices instead is the same arrangement NVFP4 uses for the same reason.
     const auto is_ggml_k_qtype = [](QType qtype) {
-        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K;
+        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K ||
+               qtype == QType::Q8_0;
     };
     const bool ggml_k_routed = is_ggml_k_qtype(gate_up) && is_ggml_k_qtype(down);
     const bool use_prefill  = nvfp4_routed

@@ -10,6 +10,7 @@
 // eight never straddles a scale boundary or a nibble half.
 
 #include "ops/linear/ggml/ggml_blocks.h"
+#include "ops/linear/ggml/ggml_mmvq.h"
 #include "ops/linear/ggml/ggml_dequant.cuh"
 
 #include <cstdint>
@@ -88,12 +89,26 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q6_K>(const void* blocks,
     }
 }
 
+template <>
+__device__ __forceinline__ void decode_eight<GgmlType::Q8_0>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    // A Q8_0 block is 32 values, so four lanes cover one rather than thirty-two: `ib` is the
+    // block and `lane` its eighth-of-a-block, exactly as the callers already index.
+    const block_q8_0* x = static_cast<const block_q8_0*>(blocks) + ib;
+    const float d       = __half2float(x->d);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) { w[l] = d * static_cast<float>(x->qs[lane * 8 + l]); }
+}
+
 /// The sparse-MoE codec seam: a 256-value group is one superblock, so a warp's 32 lanes cover it
 /// with eight values each. `high` and `scales` are unused -- a superblock carries its own.
 template <GgmlType type>
 struct GgmlMoeCodec {
     static constexpr bool kGateRowsFirst = true;
-    static constexpr int kGroupK         = QK_K;
+    /// The stored block: a K-quant superblock is 256 values and a warp covers it with eight
+    /// each; Q8_0 is 32, so four lanes do. The body's packed loop derives its lane split from
+    /// this, so both fall out of the same code.
+    static constexpr int kGroupK = block_values(type);
     // Both projections take the body's generic packed-word8 loop, the one written against
     // load_eight; the two specialised D3 shapes assume a plane layout this format does not have.
     static constexpr bool kPackedWord8         = true;
