@@ -589,8 +589,16 @@ Open, in the order they matter:
    formats' only remaining advantage is the prefill gap above.
 3. **Close the native prefill gap** (9,400 -> 13,730): Q6_K's scalar staging and the per-tile
    header re-read are the two named suspects.
-4. **Direct GGUF loading.** The artifact is now a byte-for-byte copy of the file plus an index;
-   a sidecar index over the mmapped `.gguf` removes the copy. Nothing else blocks it.
+4. **Direct GGUF loading — done 2026-09-03.** The artifact directory takes an optional
+   `external` file table and an optional per-object `runs` list; the engine mmaps the GGUF and
+   the materializer copies run by run. **22.30 GB → 1.47 GB** for the 35B, load and throughput
+   unchanged. Runs rather than one offset because the fused objects are not slices: a routed
+   gate/up is 512 runs (81 objects, 20,521 runs total). Q8_0 joined the GGML op family, which
+   took the embedding table, the attention output and the draft head off the copy as well.
+   - Still copied: the fused projections and the shared expert (`NATIVE_EXCLUDE_SUFFIXES` --
+     their kernels read row-split planes and have no Q8_0 path), and `gdn/output`, whose
+     inverse is a column permutation and so is not a row program. Closing those would leave
+     the index holding only the BF16 norms, small enough to build in memory at startup.
 4. **N (NVFP4 ModelOpt ingest)** and **F (FP8 strategies)** — neither blocks GGUF.
 
 M2 (geometry templating), M4 (unified loading) and M5 (`--no-cache`, `surogate convert`) stand behind these.
