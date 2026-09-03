@@ -6,14 +6,16 @@ import struct
 import pytest
 
 from surogate.serve.tools.artifact.container import (
-    MAGIC,
-    PAYLOAD_ALIGNMENT,
-    PREFIX,
     Artifact,
     ArtifactError,
     ArtifactIdentity,
+    MAGIC,
+    PAYLOAD_ALIGNMENT,
+    PREFIX,
     ResourceSpec,
     TensorSpec,
+    encode_directory,
+    parse_geometry,
     write_artifact,
 )
 from surogate.serve.tools.artifact.inspect import artifact_summary
@@ -180,4 +182,47 @@ def test_reader_rejects_v1_with_the_migration_command(tmp_path):
         ArtifactError,
         match=r"python3 -m tools\.artifact\.migrate_v1_to_v2 <artifact>",
     ):
+        Artifact.open(path)
+
+
+def test_geometry_member_round_trips_and_is_optional(tmp_path):
+    identity = ArtifactIdentity("test-model", "test-weights")
+    declared = {"hidden": 2048, "layers": 28, "rms_epsilon": 1e-6, "rope_theta": 1e6}
+    specs = _small_specs()
+    planned = write_artifact(tmp_path / "plain.sinfer", identity, [(s, _payload(s)) for s in specs])
+    assert parse_geometry(encode_directory(identity, planned, geometry=declared)) == declared
+    assert parse_geometry(encode_directory(identity, planned)) == {}
+
+    path = tmp_path / "geometry.sinfer"
+    root = {
+        "identity": {"model_id": "test-model", "weights_id": "test-weights"},
+        "objects": [
+            {
+                "name": "a",
+                "kind": "tensor",
+                "shape": [1],
+                "format": "I32",
+                "layout": "contiguous-le-v1",
+                "offset": 0,
+                "bytes": 4,
+            }
+        ],
+    }
+    _write_raw(path, root, b"\x00" * 4)
+    with Artifact.open(path) as artifact:
+        assert artifact.geometry == {}
+
+    root["geometry"] = declared
+    _write_raw(path, root, b"\x00" * 4)
+    with Artifact.open(path) as artifact:
+        assert artifact.geometry == declared
+
+    root["geometry"] = {"hidden": "2048"}
+    _write_raw(path, root, b"\x00" * 4)
+    with pytest.raises(ArtifactError, match="geometry.hidden must be a number"):
+        Artifact.open(path)
+
+    root["geometry"] = [2048]
+    _write_raw(path, root, b"\x00" * 4)
+    with pytest.raises(ArtifactError, match="geometry must be an object"):
         Artifact.open(path)

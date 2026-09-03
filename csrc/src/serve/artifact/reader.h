@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -195,6 +196,9 @@ public:
     /// The runs an object's bytes are assembled from, in order.
     std::span<const PayloadRun> runs(const ObjectDescriptor& object) const;
     const std::vector<ExternalFile>& external_files() const noexcept;
+    /// The artifact's declared dimensions, keyed as `family::TextGeometry` names them; empty
+    /// for an artifact written without a `geometry` member.
+    const std::map<std::string, double>& geometry() const noexcept;
     std::size_t read_direct(std::uint32_t source, std::uint64_t absolute_offset,
                             std::span<std::byte> destination) const;
 

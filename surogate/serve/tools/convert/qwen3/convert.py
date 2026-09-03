@@ -321,6 +321,40 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     return tuple(payloads)
 
 
+def token_domain(root: Path) -> int:
+    """How many token ids the tokenizer defines: the rows of the head that are real tokens.
+
+    `config.json.vocab_size` is the padded row count of the embedding and the head; the ids a
+    prompt can contain, and the ids sampling may return, stop earlier. The tokenizer is the
+    authority on where -- its vocabulary plus the added tokens -- and the engine restricts
+    sampling to exactly this many rows.
+    """
+    tokenizer = json.loads((root / "tokenizer.json").read_text(encoding="utf-8"))
+    ids = list(tokenizer["model"]["vocab"].values())
+    ids.extend(int(token["id"]) for token in tokenizer.get("added_tokens", ()))
+    return max(ids) + 1
+
+
+def geometry_block(preflight: "ConversionPreflight", root: Path) -> dict[str, float]:
+    """The artifact's `geometry` member: the numbers the engine's one `qwen3` target reads at
+    load instead of compiling, keyed as the family's `TextGeometry` names them."""
+    geometry = preflight.geometry
+    text = preflight.config_summary["text"]
+    return {
+        "hidden": geometry.hidden,
+        "layers": geometry.layers,
+        "intermediate": geometry.intermediate,
+        "output_rows": geometry.vocab,
+        "token_domain": token_domain(root),
+        "query_heads": geometry.query_heads,
+        "kv_heads": geometry.kv_heads,
+        "head_dim": geometry.head_dim,
+        "rotary_dim": geometry.head_dim,
+        "rms_epsilon": float(text["rms_norm_eps"]),
+        "rope_theta": float(text["rope_theta"]),
+    }
+
+
 def _chat_template_from_tokenizer_config(root: Path) -> bytes:
     config = json.loads((root / "tokenizer_config.json").read_text(encoding="utf-8"))
     template = config.get("chat_template")
@@ -490,6 +524,7 @@ def convert(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
+            geometry=geometry_block(preflight, model),
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError("writer object plan differs from completed preflight")
