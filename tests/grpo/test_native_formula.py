@@ -1,3 +1,16 @@
+"""Behaviour of the Python GRPO loss, and consistency of its native wrappers.
+
+The three `..._stays_consistent_with_...` tests below check that the native
+reference wrappers agree with the base `compute_grpo_per_token_grads` they are
+built on. That is a real property, but it is NOT parity with the CUDA kernel:
+both sides of those assertions run the same Python function, so they hold
+whatever the formula is. They were previously named as though they proved the
+native path correct, and `trainer.py` cited them as exactly that.
+
+Independent coverage of the wrappers, and the actual CUDA comparison, live in
+`test_native_parity.py`.
+"""
+
 import numpy as np
 import pytest
 
@@ -35,7 +48,7 @@ def _expected_shifted_dloss(
     return shifted / loss_scale
 
 
-def test_native_shifted_formula_matches_existing_grpo_loss_without_teacher():
+def test_the_shifted_wrapper_stays_consistent_with_the_base_grads_without_teacher():
     trainer_logprobs = np.array([-7.0, -1.2, -0.8, -3.1, -2.0, -0.4, -5.0], dtype=np.float32)
     inference_logprobs = np.array([-7.0, -1.4, -0.7, -2.8, -2.1, -0.5, -4.6], dtype=np.float32)
     advantages = np.array([0.0, 1.5, -0.2, 0.7, 0.0, 2.0, -1.0], dtype=np.float32)
@@ -67,7 +80,7 @@ def test_native_shifted_formula_matches_existing_grpo_loss_without_teacher():
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
 
 
-def test_native_shifted_formula_matches_existing_grpo_loss_with_teacher():
+def test_the_shifted_wrapper_stays_consistent_with_the_base_grads_with_teacher():
     trainer_logprobs = np.array([-6.0, -1.0, -2.2, -0.2, -3.0, -1.1], dtype=np.float32)
     inference_logprobs = np.array([-6.0, -1.2, -2.0, -0.25, -2.7, -1.4], dtype=np.float32)
     teacher_logprobs = np.array([-6.0, -1.5, -1.7, -0.3, -2.9, -1.2], dtype=np.float32)
@@ -100,7 +113,7 @@ def test_native_shifted_formula_matches_existing_grpo_loss_with_teacher():
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
 
 
-def test_native_metrics_reference_matches_existing_grpo_metrics():
+def test_the_metrics_wrapper_stays_consistent_with_the_base_metrics():
     trainer_logprobs = np.array([-7.0, -1.2, -0.8, -3.1, -2.0, -0.4, -5.0], dtype=np.float32)
     inference_logprobs = np.array([-7.0, -1.4, -0.7, -2.8, -2.1, -0.5, -4.6], dtype=np.float32)
     teacher_logprobs = np.array([-7.0, -1.0, -1.1, -3.0, -2.3, -0.9, -4.9], dtype=np.float32)

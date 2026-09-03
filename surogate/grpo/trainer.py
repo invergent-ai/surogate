@@ -97,13 +97,30 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
 
     Packed sequences reset position_ids at each sample boundary (e.g.
     [0,1,2,0,1,0,1,2,3]).  Returns (start, end) tuples for each sample.
+
+    A `0` following a non-`0` is always a new sample start. There used to be an
+    extra `position_ids[i+1] == 1` lookahead, which dropped the boundary of any
+    sample only one token long. The reachable case is a padding block of exactly
+    one token (the packer pads with `range(padding_size)`, `batch.py:140`), which
+    merged harmlessly into the sample before it -- padding carries no unmasked
+    tokens, so `compute_grpo_per_token_grads` skips it either way.
+
+    Two adjacent `0`s are refused rather than guessed at. `[0,0,1]` is genuinely
+    ambiguous between "a 1-token sample, then a 2-token one" and "one sample
+    whose positions begin 0,0", and no detector can tell them apart. Left
+    unchecked it was worse than ambiguous: `[0,1,2,0,0,1]` collapsed into one
+    unsplit range, so the next-token shift ran across both boundaries and one
+    sample's gradient landed on another sample's token.
     """
     boundaries = [0]
     for i in range(1, len(position_ids_flat)):
         if position_ids_flat[i] == 0 and position_ids_flat[i - 1] != 0:
-            # Only treat as a new sample if the next position is 1.
-            if i + 1 < len(position_ids_flat) and position_ids_flat[i + 1] == 1:
-                boundaries.append(i)
+            if i + 1 < len(position_ids_flat) and position_ids_flat[i + 1] == 0:
+                raise ValueError(
+                    f"packed position_ids contain a 1-token sample at index {i} "
+                    f"(adjacent zeros), which cannot be split unambiguously"
+                )
+            boundaries.append(i)
     ranges: list[tuple[int, int]] = []
     for i, start in enumerate(boundaries):
         end = boundaries[i + 1] if i + 1 < len(boundaries) else len(position_ids_flat)
@@ -547,10 +564,15 @@ class GRPOTrainer:
         """Micro-step that also records turn-resolved statistics.
 
         Decomposes the fused native step into forward -> Python loss -> backward
-        so per-token trainer logprobs become visible. The gradients are identical
-        to ``step_grpo_native`` (same reference implementation, asserted by
-        tests/grpo/test_native_formula.py); the only cost is the Python round
-        trip on the [1, T] logprob buffer.
+        so per-token trainer logprobs become visible. The gradients are intended
+        to be identical to ``step_grpo_native``; the only cost is the Python
+        round trip on the [1, T] logprob buffer.
+
+        That identity is asserted by
+        ``tests/grpo/test_native_parity.py::test_the_cuda_kernel_matches_the_python_reference_metrics``,
+        which needs a GPU. This docstring used to cite
+        ``tests/grpo/test_native_formula.py`` instead, which cannot establish it:
+        its expected values come from the same Python function it checks.
         """
         logprobs = self.trainer.forward_for_grpo(input_step, targets_step, pos_step, temp_step)
 
