@@ -127,11 +127,36 @@ stored once.
    a target claiming the registered tokenizer, and the bridge stopped rewriting
    the pad token to match, which had been putting a token in the artifact that
    the file does not claim. Both directions were the same mistake.
-4. **[ ] F — FP8.** compressed-tensors per-channel/per-tensor is per-row with an
-   FP32 scale — add `_F32S`, or accept the BF16 cast. HF fine-grained FP8 is
-   block-scaled and has no runtime format at all.
-5. **[ ] N — NVFP4 ModelOpt ingest.** `weight_scale_2` is a multiplier where
-   compressed-tensors' global scale is a divisor; parents split per component.
+4. **[ ] F — FP8, and the two kinds are not the same job (checked 2026-09-03).**
+   - *compressed-tensors per-channel/per-tensor* is per-row with an FP32 scale.
+     The engine has `FP8_E4M3FN_ROW_BF16S`, so this is either an `_F32S` variant
+     or a documented BF16 cast of the row scales. Small — but **no checkpoint of
+     this kind is on this machine**, so it cannot be written against anything.
+   - *HF fine-grained FP8* is block-scaled, and that is what the three local FP8
+     checkpoints are: `models--surogate--Qwen3.5-{0.8B,2B,4B}-FP8` declare
+     `quant_method: fp8`, `weight_block_size: [128, 128]`, and carry
+     `weight_scale_inv` as a 2-D F32 grid (e.g. `[48, 8]` for a `[6144, 1024]`
+     projection). No runtime format holds a 2-D block scale, so this is a new
+     weight format and GEMM support, not an ingest change.
+5. **[ ] N — NVFP4 ModelOpt ingest, specified against a local checkpoint
+   (2026-09-03).** `models--surogate--Qwen3.5-0.8B-NVFP4` is a ModelOpt export
+   (`quant_method: modelopt`) and is what this item has to read. What it holds,
+   per component: `weight` `[n, k/2]` U8, `weight_scale` `[n, k/16]` E4M3,
+   `weight_scale_2` a scalar F32, `input_scale` a scalar F32. Two differences
+   from the compressed-tensors path the 27B converter already reads:
+   - **The global scale is a multiplier, not a divisor.** The engine binds
+     `weight_scale_divisor` / `input_scale_divisor` and validates them positive
+     and finite, so ingest inverts: `divisor = 1 / weight_scale_2`. Measured on
+     layer 11: `weight_scale_2 = 7.30242e-05`, `input_scale = 8.97507e-03`, and
+     q/k/v share both while `o_proj` has its own -- so the divisor groups the
+     recipe already models are the right shape, they are just per component.
+   - **Parents are split per component.** ModelOpt writes `q_proj`, `k_proj`,
+     `v_proj` separately where the artifact fuses them, so the converter fuses
+     and must check the three share a divisor before it does.
+   What is missing is the converter itself: the family has no `*_nvfp4` recipe
+   or inventory (only the 27B and the 4B do), and `converter_for_config` routes
+   NVFP4 for the 27B alone. The engine side is ready -- `qwen3_5` compiles the
+   `Qwen36Nvfp4` profile and binds NVFP4 parents with both divisors.
 6. **[x] M2 — one directory per architecture (2026-09-03).** `qwen3_5_{0_8b,2b,4b}` are
    ~1,750 lines each for seven integers; `variant.h` differs by 2 lines across
    the three. Nothing requires the split: all 52 headers in
