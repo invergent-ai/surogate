@@ -23,4 +23,10 @@ void moe_gemv_launch(GgmlType type, const void* blocks, std::int32_t rows, std::
                      const block_q8_1* y, const std::int32_t* ids, std::int32_t tokens,
                      std::int32_t slots, std::int32_t ids_stride, float* out, cudaStream_t stream);
 
+/// Decodes `superblocks` consecutive superblocks through the sparse-MoE codec seam, 256 floats
+/// each. The MoE bodies consume a weight this way rather than through the integer vec-dot, so
+/// this is the path that has to agree with the reference dequantisation.
+void moe_codec_decode_launch(GgmlType type, const void* blocks, std::int64_t superblocks,
+                             float* out, cudaStream_t stream);
+
 } // namespace sinfer::ops::detail::ggml

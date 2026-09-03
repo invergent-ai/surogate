@@ -4,6 +4,7 @@
 #include "ops/linear/ggml/ggml_moe.h"
 
 #include "ops/linear/ggml/ggml_mmvq.cuh"
+#include "ops/linear/ggml/ggml_moe_codec.cuh"
 
 #include <stdexcept>
 
@@ -70,7 +71,35 @@ void launch(const void* blocks, std::int32_t rows, std::int32_t k, const block_q
                                                              slots, ids_stride);
 }
 
+template <GgmlType type>
+__global__ void codec_decode_kernel(const std::uint8_t* __restrict__ blocks,
+                                    float* __restrict__ out) {
+    float w[8];
+    GgmlMoeCodec<type>::load_eight(blocks, nullptr, nullptr, blockIdx.x, threadIdx.x, w);
+    float* dst = out + static_cast<std::int64_t>(blockIdx.x) * QK_K + threadIdx.x * 8;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) { dst[l] = w[l]; }
+}
+
+template <GgmlType type>
+void launch_codec(const void* blocks, std::int64_t superblocks, float* out, cudaStream_t stream) {
+    codec_decode_kernel<type><<<static_cast<unsigned>(superblocks), 32, 0, stream>>>(
+        static_cast<const std::uint8_t*>(blocks), out);
+}
+
 } // namespace
+
+void moe_codec_decode_launch(GgmlType type, const void* blocks, std::int64_t superblocks,
+                             float* out, cudaStream_t stream) {
+    switch (type) {
+    case GgmlType::Q4_K: launch_codec<GgmlType::Q4_K>(blocks, superblocks, out, stream); return;
+    case GgmlType::Q5_K: launch_codec<GgmlType::Q5_K>(blocks, superblocks, out, stream); return;
+    case GgmlType::Q6_K: launch_codec<GgmlType::Q6_K>(blocks, superblocks, out, stream); return;
+    default: break;
+    }
+    throw std::invalid_argument(
+        "ggml moe codec: only Q4_K, Q5_K and Q6_K decode through the MoE seam today");
+}
 
 void moe_gemv_launch(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
                      const block_q8_1* y, const std::int32_t* ids, std::int32_t tokens,

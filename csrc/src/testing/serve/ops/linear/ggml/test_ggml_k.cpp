@@ -389,6 +389,33 @@ int run_moe(const Fixture& f, void* d_blocks, void* d_scratch, std::size_t scrat
     return ok ? 0 : 1;
 }
 
+// The sparse-MoE codec decodes eight consecutive values per lane instead of a whole block per
+// CTA; it must agree exactly with the reference dequantisation, or a routed expert would be
+// read differently from every other weight of the same type.
+int run_codec(const Fixture& f, void* d_blocks) {
+    if (f.type == gg::GgmlType::Q2_K || f.type == gg::GgmlType::Q3_K) { return 0; }
+    const std::int64_t superblocks = static_cast<std::int64_t>(f.n) * (f.k / gg::QK_K);
+    float* d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_out, superblocks * gg::QK_K * sizeof(float)));
+    gg::moe_codec_decode_launch(f.type, d_blocks, superblocks, d_out, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::vector<float> got(static_cast<std::size_t>(superblocks) * gg::QK_K);
+    CHECK_CUDA(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaFree(d_out));
+    double worst = 0.0;
+    std::size_t bad = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        const double diff = std::fabs(static_cast<double>(got[i]) - f.dequant[i]);
+        worst = std::fmax(worst, diff / std::fmax(std::fabs(f.dequant[i]), 1e-6));
+        bad += diff > 1e-6 * std::fmax(std::fabs(f.dequant[i]), 1e-3);
+    }
+    const bool ok = bad == 0;
+    std::printf("  %-5s %-10s [%6d,%5d] %-22s %zu of %zu values differ (worst rel %.1e)  %s\n",
+                gg::type_name(f.type), f.label.c_str(), f.n, f.k, "moe codec vs oracle", bad,
+                got.size(), worst, ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main() {
@@ -444,7 +471,8 @@ int main() {
             cases += 2;
             if (!big) {
                 failures += run_moe(f, d_blocks, d_scratch, scratch_bytes);
-                ++cases;
+                failures += run_codec(f, d_blocks);
+                cases += 2;
             }
             CHECK_CUDA(cudaFree(d_scratch));
             CHECK_CUDA(cudaFree(d_blocks));
