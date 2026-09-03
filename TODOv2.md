@@ -87,13 +87,21 @@ stored once.
 The K-quant MoE prefill is ~11,100 tok/s against the row-split path's 13,700 on
 the same model. Per prefill round, `nsys`:
 
-| kernel | row-split | K-quant | cost |
-|---|---:|---:|---:|
-| gate_up ×40 | 608 µs | 758 µs | +6.0 ms |
-| down Q5_K ×37 | 335 µs | 505 µs | +6.3 ms |
-| down Q6_K ×3 | 337 µs | 725 µs | +1.2 ms |
+| kernel | row-split | K-quant | ratio | share |
+|---|---:|---:|---:|---:|
+| gate_up **Q4_K** ×40 | 608 µs | 758 µs | 1.25× | +6.0 ms, 44 % |
+| down **Q5_K** ×37 | 335 µs | 505 µs | 1.51× | +6.3 ms, 46 % |
+| down **Q6_K** ×3 | 337 µs | 725 µs | 2.15× | +1.2 ms, 9 % |
 
-That accounts for the whole of it. Cutting the gate_up kernel apart, one piece
+That accounts for the whole of it. **It is not a Q6_K problem** — Q6_K has the
+worst ratio, being the one whose 210-byte block cannot `cp_async` and stages in
+scalar pairs, but it is `routed_down` on 3 of 40 layers here. Q4_K and Q5_K
+carry nine tenths of the gap between them, and the cause below is common to
+every K-quant. Decode is unaffected: 317 against 346, and ahead of llama.cpp.
+
+Measurement note: end-to-end prefill on the same binary spreads about 10 %
+run to run (10,000–11,100), so the arrangements below are separated on kernel
+time from `nsys`, which is stable, not on the end-to-end figure. Cutting the gate_up kernel apart, one piece
 at a time, says where it goes:
 
 | gate_up variant | ns |
@@ -122,6 +130,8 @@ which is why every rearrangement below loses:
 | every superblock's header staged once in the prologue | 10,300 |
 | whole 144-byte block staged once per superblock | 10,400 |
 | header read from the file in `decode_weight` | 8,800 |
+| two superblocks' headers per staging event | gate_up 770,442 ns (worse) |
+| a quarter of the next superblock's headers on every tile | **races** — block *g+2* shares a slot with *g*, which is still being read; three slots is 2 blocks/SM |
 
 Each alternative trades shared memory for occupancy — 30 KB and 3 blocks
 becomes 36–43 KB and 2 — and loses more than the header staging costs. Two
