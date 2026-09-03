@@ -1094,6 +1094,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/linear/ggml/ggml_dispatch.cpp
   ${SERVE_ROOT}/ops/linear/ggml/ggml_embedding.cu
   ${SERVE_ROOT}/ops/linear/ggml/ggml_dequant.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/ggml/ggml_gdn_input.cu
   ${SERVE_ROOT}/ops/linear/q5/q5_dispatch.cpp
   ${SERVE_ROOT}/ops/linear/q5/q5_rowsplit_gemm_mma.cu
   ${SERVE_ROOT}/ops/linear/q5/q5_rowsplit_gemm_simt.cu

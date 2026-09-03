@@ -8,6 +8,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
+#include "ops/gdn_input_proj/ggml/ggml_gdn_input.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
@@ -1069,6 +1070,20 @@ void gdn_input_proj_conv_snapshot_split(
                         "gdn_input_proj_conv_snapshot", "value");
     require_conv_tensor(z, z_weight.n, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_snapshot", "z");
+    // One token, both halves K-quant: project and convolve in one pass per half, so the
+    // projected plane and the convolution launch that consumed it both disappear. That launch
+    // count is what made the split lose to the fused W8 parent at decode.
+    if (detail::ggml_gdn_input_decode_admits(query_key_value_weight, z_weight, geometry.batch,
+                                             geometry.width)) {
+        auto fused_scope         = workspace.scope();
+        const DeviceSpan fused_y = workspace.alloc_bytes(
+            detail::ggml_gdn_input_decode_workspace_bytes(query_key_value_weight.k), 256);
+        detail::ggml_gdn_input_conv_snapshot_decode_launch(
+            x, query_key_value_weight, z_weight, conv_weight, conv_states, valid_columns,
+            initial_state_slots, snapshot_base_slots, query, key, value, z, fused_y.data,
+            fused_y.bytes, stream);
+        return;
+    }
     if (geometry.batch > 1) {
         compose_batched_snapshot(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                                  snapshot_base_slots, query, key, value, z, kQueryRows, kKeyRows,
@@ -1131,6 +1146,20 @@ void gdn_input_proj_conv_record_split(
                         "gdn_input_proj_conv_record", "value");
     require_conv_tensor(z, z_weight.n, geometry.width, geometry.batch,
                         "gdn_input_proj_conv_record", "z");
+    // One token, both halves K-quant: project and convolve in one pass per half, so the
+    // projected plane and the convolution launch that consumed it both disappear. That launch
+    // count is what made the split lose to the fused W8 parent at decode.
+    if (detail::ggml_gdn_input_decode_admits(query_key_value_weight, z_weight, geometry.batch,
+                                             geometry.width)) {
+        auto fused_scope         = workspace.scope();
+        const DeviceSpan fused_y = workspace.alloc_bytes(
+            detail::ggml_gdn_input_decode_workspace_bytes(query_key_value_weight.k), 256);
+        detail::ggml_gdn_input_conv_record_decode_launch(
+            x, query_key_value_weight, z_weight, conv_weight, conv_states, valid_columns,
+            initial_state_slots, conv_record, query, key, value, z, fused_y.data, fused_y.bytes,
+            stream);
+        return;
+    }
     auto scope         = workspace.scope();
     Tensor x_flat      = flatten_columns(x, x.ne[0], geometry);
     Tensor record_flat = flatten_columns(conv_record, conv_record.ne[0], geometry);
