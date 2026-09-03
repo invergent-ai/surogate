@@ -6,9 +6,7 @@
 #include <api/targets/gemma3/package.h>
 #include <api/targets/llama/package.h>
 #include <api/targets/qwen3/package.h>
-#include <api/targets/qwen3_5_0_8b/package.h>
-#include <api/targets/qwen3_5_2b/package.h>
-#include <api/targets/qwen3_5_4b/package.h>
+#include <api/targets/qwen3_5/package.h>
 #include <api/targets/qwen3_6_27b/package.h>
 #include <api/targets/qwen3_6_35b_a3b/package.h>
 #include <api/targets/qwen4exp/package.h>
@@ -25,9 +23,7 @@ namespace targets {
 using Gemma3          = gemma3_270m::Package;
 using Llama           = llama::Package;
 using Qwen3Dense      = qwen3::Package;
-using Qwen3_5_0_8B    = qwen3_5_0_8b::Package;
-using Qwen3_5_2B      = qwen3_5_2b::Package;
-using Qwen3_5_4B      = qwen3_5_4b::Package;
+using Qwen3_5    = qwen3_5::Package;
 using Qwen3_6_27B    = qwen3_6_27b::Package;
 using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
 using Qwen38FlashNext = qwen4exp::Package;
@@ -83,12 +79,8 @@ using LoadedLlama = LoadedTarget<Llama>;
 using LlamaInstance = TargetInstance<Llama>;
 using LoadedQwen3Dense = LoadedTarget<Qwen3Dense>;
 using Qwen3DenseInstance = TargetInstance<Qwen3Dense>;
-using LoadedQwen3_5_0_8B = LoadedTarget<Qwen3_5_0_8B>;
-using Qwen3_5_0_8BInstance = TargetInstance<Qwen3_5_0_8B>;
-using LoadedQwen3_5_2B = LoadedTarget<Qwen3_5_2B>;
-using Qwen3_5_2BInstance = TargetInstance<Qwen3_5_2B>;
-using LoadedQwen3_5_4B = LoadedTarget<Qwen3_5_4B>;
-using Qwen3_5_4BInstance = TargetInstance<Qwen3_5_4B>;
+using LoadedQwen3_5 = LoadedTarget<Qwen3_5>;
+using Qwen3_5Instance = TargetInstance<Qwen3_5>;
 using LoadedQwen3_6_27B = LoadedTarget<Qwen3_6_27B>;
 using Qwen3_6_27BInstance = TargetInstance<Qwen3_6_27B>;
 using LoadedQwen3_6_35BA3B = LoadedTarget<Qwen3_6_35BA3B>;
@@ -103,9 +95,8 @@ using Qwen3_6_35BA3BPipeline  = runtime::PipelineInstance<Qwen3_6_35BA3BInstance
 
 using ActiveTarget =
     std::variant<std::unique_ptr<Gemma3Instance>, std::unique_ptr<LlamaInstance>, std::unique_ptr<Qwen3DenseInstance>,
-                 std::unique_ptr<Qwen3_5_0_8BInstance>,
-                 std::unique_ptr<Qwen3_5_2BInstance>,
-                 std::unique_ptr<Qwen3_5_4BInstance>, std::unique_ptr<Qwen3_6_27BInstance>,
+                 std::unique_ptr<Qwen3_5Instance>,
+                 std::unique_ptr<Qwen3_6_27BInstance>,
                  std::unique_ptr<Qwen3_6_35BA3BInstance>,
                  std::unique_ptr<Qwen38FlashNextInstance>,
                  std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_6_27BPipeline>,

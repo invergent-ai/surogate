@@ -1,7 +1,7 @@
 #pragma once
 
-#include "targets/qwen3_5_0_8b/impl/config.h"
-#include "targets/qwen3_5_0_8b/impl/load/bindings.h"
+#include "targets/qwen3_5/impl/config.h"
+#include "targets/qwen3_5/impl/load/bindings.h"
 #include <api/family/runtime.h>
 #include <api/family/text_geometry.h>
 
@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace sinfer::targets::qwen3_5_0_8b::detail {
+namespace sinfer::targets::qwen3_5::detail {
 
 using GraphExecutionProfile = family::GraphExecutionProfile;
 
@@ -26,7 +26,7 @@ struct Variant {
     using PostMixerWeights               = detail::DensePostMixerPayload;
     using MtpAttentionProjectionWeights  = detail::MtpAttentionPayload;
     using MtpPostMixerWeights            = detail::DensePostMixerPayload;
-    using VisionWeights                  = family::VisionWeights;
+    using VisionWeights                  = family::VisionWeightsFor<detail::VisionConfig>;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
     static constexpr float attention_scale                     = kAttentionScale;
@@ -126,4 +126,4 @@ struct Variant {
                           std::uint32_t batch_size);
 };
 
-} // namespace sinfer::targets::qwen3_5_0_8b::detail
+} // namespace sinfer::targets::qwen3_5::detail

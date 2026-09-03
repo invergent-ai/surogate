@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <api/family/text_geometry.h>
 
 #include "targets/registry.h"
@@ -310,17 +311,10 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
         return construct_registered<Qwen3Dense, LoadedQwen3Dense, Qwen3DenseInstance>(
             options, device, reader, load_start, Qwen3Dense::target_key);
     }
-    if (identity.model_id == Qwen3_5_0_8B::model_id) {
-        return construct_registered<Qwen3_5_0_8B, LoadedQwen3_5_0_8B, Qwen3_5_0_8BInstance>(
-            options, device, reader, load_start, Qwen3_5_0_8B::target_key);
-    }
-    if (identity.model_id == Qwen3_5_2B::model_id) {
-        return construct_registered<Qwen3_5_2B, LoadedQwen3_5_2B, Qwen3_5_2BInstance>(
-            options, device, reader, load_start, Qwen3_5_2B::target_key);
-    }
-    if (identity.model_id == Qwen3_5_4B::model_id) {
-        return construct_registered<Qwen3_5_4B, LoadedQwen3_5_4B, Qwen3_5_4BInstance>(
-            options, device, reader, load_start, Qwen3_5_4B::target_key);
+    if (std::find(Qwen3_5::model_ids.begin(), Qwen3_5::model_ids.end(), identity.model_id) !=
+        Qwen3_5::model_ids.end()) {
+        return construct_registered<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(
+            options, device, reader, load_start, Qwen3_5::target_key);
     }
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(

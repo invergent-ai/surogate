@@ -1,6 +1,6 @@
-#include "targets/qwen3_5_0_8b/impl/load/bindings.h"
+#include "targets/qwen3_5/impl/load/bindings.h"
 
-#include "targets/qwen3_5_0_8b/impl/config.h"
+#include "targets/qwen3_5/impl/config.h"
 
 #include "artifact/typed_binding.h"
 
@@ -19,7 +19,7 @@
 #include <variant>
 #include <vector>
 
-namespace sinfer::targets::qwen3_5_0_8b::detail {
+namespace sinfer::targets::qwen3_5::detail {
 namespace {
 
 using artifact::NumericFormat;
@@ -44,7 +44,7 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     case WeightsProfile::Qwen38Nvfp4:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
     }
-    throw std::invalid_argument("qwen3_5_0_8b: invalid weights profile");
+    throw std::invalid_argument("qwen3_5: invalid weights profile");
 }
 
 std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
@@ -480,7 +480,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_qwen38_nvfp4_text_layers(binder, out);
         break;
     default:
-        throw std::invalid_argument("qwen3_5_0_8b: invalid weights profile");
+        throw std::invalid_argument("qwen3_5: invalid weights profile");
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {g.hidden});
@@ -493,7 +493,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_linear(binder, "text/draft_head", 131072, 1024,
+    out.draft_head = artifact::bind_linear(binder, "text/draft_head", 131072, g.hidden,
                                            proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
@@ -547,10 +547,34 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {g.hidden});
     }
 
-    // Text-only target: the qwen3_5_0_8b artifact carries no vision objects
-    // (surogate vendor note; --vision is rejected at startup for this target).
-    if (features.vision) {
-        throw std::runtime_error("qwen3.5-0.8b target is text-only: --vision is unsupported");
+    // Some checkpoints of this family ship a vision tower and some do not -- the 0.8B has
+    // none, and the community GGUF exports drop it everywhere. Whether an artifact carries
+    // it is a property of its source, so probe once and bind only what is there. The loader
+    // rejects any object no binder claims, which is why the probe has to happen at all.
+    // Placement is what `--vision` decides: ValidateOnly checks the shapes without spending
+    // device memory, which is what a text-only serve of a multimodal checkpoint wants.
+    out.has_vision = binder.has("vision/patch_embedding");
+    if (!out.has_vision && features.vision) {
+        throw std::runtime_error(
+            "qwen3.5: --vision was requested but this artifact carries no vision tower "
+            "(it was converted from a source that has none)");
+    }
+    if (out.has_vision) {
+        const artifact::TensorPlacement vision_placement =
+            features.vision ? artifact::TensorPlacement::Device
+                            : artifact::TensorPlacement::ValidateOnly;
+        out.vision_backbone =
+            family::bind_vision_backbone<VisionConfig>(binder, vision_placement);
+        out.vision_merger_input =
+            family::bind_vision_merger_input<VisionConfig>(binder, vision_placement);
+        out.vision_merger_fc2 = artifact::bind_tensor(
+            binder, "vision/merger/fc2", NumericFormat::W8G32_F16S,
+            {VisionConfig::output_hidden, VisionConfig::merger_hidden}, vision_placement);
+        out.vision_merger_fc2_bias =
+            artifact::bind_tensor(binder, "vision/merger/fc2_bias", NumericFormat::BF16,
+                                  {VisionConfig::output_hidden}, vision_placement);
+        out.vision_merger_norm =
+            family::bind_vision_merger_norm<VisionConfig>(binder, vision_placement);
     }
 
     load_plan.materialization = binder.finish();
@@ -627,7 +651,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     output_head = materialized_weight(backing, plan.output_head, g.output_rows, g.hidden);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
-        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, 131072, 1024);
+        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, 131072, g.hidden);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
                                                            NumericFormat::I32, {131072});
     }
@@ -665,15 +689,17 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                        NumericFormat::BF16, {g.hidden});
     }
 
-    if (plan.features.vision) {
+    if (plan.features.vision && plan.has_vision) {
         auto& vision  = runtime.vision.emplace();
-        vision.common = family::materialize_vision_common(
+        vision.common = family::materialize_vision_common<VisionConfig>(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
-        vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                               NumericFormat::W8G32_F16S, g.hidden, 4608);
-        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                               NumericFormat::BF16, {g.hidden});
+        vision.merger_fc2 = artifact::materialized_weight(
+            backing, plan.vision_merger_fc2, NumericFormat::W8G32_F16S,
+            VisionConfig::output_hidden, VisionConfig::merger_hidden);
+        vision.merger_fc2_bias = artifact::materialized_tensor(
+            backing, plan.vision_merger_fc2_bias, NumericFormat::BF16,
+            {VisionConfig::output_hidden});
     }
 }
 
-} // namespace sinfer::targets::qwen3_5_0_8b::detail
+} // namespace sinfer::targets::qwen3_5::detail

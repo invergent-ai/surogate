@@ -39,11 +39,16 @@ def emitters():
 
 #: Targets whose `config.h` is emitted from the declaration and must match byte
 #: for byte. Anything here has fully migrated.
-GENERATED_TARGETS = ("qwen3_5_0_8b", "qwen3_5_4b", "gemma3_270m")
+GENERATED_TARGETS = ("gemma3_270m",)
 
 #: Hand-written targets, checked value-by-value instead: forcing a generator to
 #: reproduce prose that records *why* a constant holds would relocate the
 #: duplication rather than remove it.
+#:
+#: `qwen3_5` joined them when its three size-targets became one. What it compiles is the
+#: reference size, and it carries the family's vision tower -- whose dimensions are in no
+#: text `config.json`, so no declaration emits them. The dimensions that vary by size are
+#: checked where they now live: in the artifact, against the binder.
 CHECKED_TARGETS = (("qwen4exp", "models/Qwen3.8-Flash-Next-frontend"),)
 
 #: Every target whose converter inventory is derivable from the declaration, with

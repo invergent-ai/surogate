@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <array>
 #include <string_view>
 
 namespace sinfer {
@@ -24,7 +25,7 @@ struct ArtifactIdentity;
 struct MaterializationPlan;
 } // namespace artifact
 
-namespace targets::qwen3_5_2b {
+namespace targets::qwen3_5 {
 
 struct Package;
 
@@ -43,13 +44,17 @@ using Frontend       = family::Frontend;
 using PreparedPrompt = family::PreparedPrompt;
 using OutputSession  = family::OutputSession;
 
-SINFER_TARGET_LOAD_TYPES(qwen3_5_2b::Package);
+SINFER_TARGET_LOAD_TYPES(qwen3_5::Package);
 
 } // namespace detail
 
 struct Package {
-    static constexpr std::string_view model_id           = "qwen3.5-2b";
-    static constexpr std::string_view target_key         = "qwen3_5_2b";
+    /// The sizes of this family, which one target now serves: the artifact states its own
+    /// dimensions and the binder validates against those.
+    static constexpr std::array<std::string_view, 3> model_ids{"qwen3.5-0.8b", "qwen3.5-2b",
+                                                               "qwen3.5-4b"};
+    static constexpr std::string_view model_id           = model_ids[0];
+    static constexpr std::string_view target_key         = "qwen3_5";
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a
     /// constant: `detail::Variant` is only forward-declared here.
@@ -87,5 +92,5 @@ struct Package {
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
 };
 
-} // namespace targets::qwen3_5_2b
+} // namespace targets::qwen3_5
 } // namespace sinfer

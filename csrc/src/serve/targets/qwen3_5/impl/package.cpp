@@ -1,22 +1,24 @@
-#include <api/targets/qwen3_5_2b/package.h>
-#include "family/impl/lora_bind.h"
+#include <api/targets/qwen3_5/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/prepared_prompt.h>
 
+#include <algorithm>
+
+#include "family/impl/lora_bind.h"
 #include "artifact/reader.h"
-#include "targets/qwen3_5_2b/impl/load/bindings.h"
-#include "targets/qwen3_5_2b/impl/variant.h"
+#include "targets/qwen3_5/impl/load/bindings.h"
+#include "targets/qwen3_5/impl/variant.h"
 
 #include <stdexcept>
 #include <utility>
 
-namespace sinfer::targets::qwen3_5_2b::detail {
+namespace sinfer::targets::qwen3_5::detail {
 
 SINFER_TARGET_LOAD_PIMPL();
 
-} // namespace sinfer::targets::qwen3_5_2b::detail
+} // namespace sinfer::targets::qwen3_5::detail
 
-namespace sinfer::targets::qwen3_5_2b {
+namespace sinfer::targets::qwen3_5 {
 namespace {
 
 // General-task presets published with each exact model. Keep the registrations separate even
@@ -54,7 +56,11 @@ constexpr ModelSamplingDefaults kQwen3_8Defaults{
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
-    if (model == model_id) { return kQwen3_6Defaults; }
+    // The family's defaults, not one size's: every Qwen3.5 checkpoint shares them, and the
+    // three targets that used to answer this each answered it the same way.
+    if (std::find(model_ids.begin(), model_ids.end(), model) != model_ids.end()) {
+        return kQwen3_6Defaults;
+    }
     if (model == qwen3_8_model_id) { return kQwen3_8Defaults; }
     throw std::runtime_error("model '" + std::string(model) +
                              "' has no sampling defaults in target package '" +
@@ -64,13 +70,15 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
+    const bool family_model =
+        std::find(model_ids.begin(), model_ids.end(), identity.model_id) != model_ids.end();
+    if (family_model && identity.weights_id == "groupwise-int") {
         return WeightsProfile::Qwen36GroupwiseInt;
     }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::Qwen38GroupwiseInt;
     }
-    if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
+    if (family_model && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen36Nvfp4;
     }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
@@ -91,6 +99,16 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 
 namespace {
 
+/// Binds decoded adapter payloads to this target's weights.
+///
+/// Keyed by the base weight's device pointer, because that is what the projection
+/// hooks can see. `q_proj` adapts the fused attention projection's query output --
+/// `attn_input_proj` scatters q/k/v into separate contiguous tensors, so the
+/// delta needs no strided add -- and `o_proj` adapts the attention output.
+///
+/// Every payload must find a home. A module this target cannot place is refused
+/// with its name: an adapter half-applied is a model that is neither the base nor
+/// the fine-tune, and it would answer fluently either way.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
     family::bind_lora_hybrid<detail::TextConfig, detail::FusedAttentionProjectionPayload>(
         runtime, options, [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; });
@@ -131,4 +149,4 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 
-} // namespace sinfer::targets::qwen3_5_2b
+} // namespace sinfer::targets::qwen3_5

@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace sinfer::targets::qwen3_5_2b::detail {
+namespace sinfer::targets::qwen3_5::detail {
 
 struct TextConfig {
     static constexpr int hidden       = 2048;
@@ -66,11 +66,10 @@ struct TextConfig {
 static_assert(TextConfig::full_attention_layers() == 6);
 static_assert(TextConfig::gdn_layers() == 18);
 
-// This checkpoint's own tower: 24 layers of 1024, not the 27 of 1152 the family
-// default describes. Spelled out rather than inherited-and-overridden, because
-// `head_dim` and `merger_hidden` are computed from `hidden` in the base — shadowing
-// `hidden` alone would leave both derived from the wrong width, and the shapes
-// would still compile.
+/// The family's vision tower. Only some checkpoints ship one -- the 0.8B does not, and the
+/// community GGUF exports drop it everywhere -- so an artifact is probed for it rather than
+/// assumed to have it. Its dimensions are the same wherever it appears, and they are not
+/// derivable from a text-only `config.json`, which is why this block is written out.
 struct VisionConfig {
     static constexpr int layers              = 24;
     static constexpr int hidden              = 1024;
@@ -111,4 +110,4 @@ inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
-} // namespace sinfer::targets::qwen3_5_2b::detail
+} // namespace sinfer::targets::qwen3_5::detail

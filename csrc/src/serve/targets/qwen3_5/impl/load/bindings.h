@@ -1,13 +1,13 @@
 #pragma once
 
-#include <api/targets/qwen3_5_0_8b/package.h>
+#include <api/targets/qwen3_5/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
 #include <api/family/model_view.h>
 #include <api/family/startup_features.h>
 #include <api/family/vision.h>
 
-#include "targets/qwen3_5_0_8b/impl/config.h"
+#include "targets/qwen3_5/impl/config.h"
 #include "artifact/binder.h"
 #include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
@@ -20,7 +20,7 @@
 #include <utility>
 #include <variant>
 
-namespace sinfer::targets::qwen3_5_0_8b::detail {
+namespace sinfer::targets::qwen3_5::detail {
 
 inline constexpr std::size_t kTextLayers          = 24;
 inline constexpr std::size_t kFullAttentionLayers = 6;
@@ -120,6 +120,9 @@ struct MtpPlan {
 };
 
 struct BindingPlan {
+    /// Whether this artifact carries the vision tower at all, which is a property of its
+    /// source: the 0.8B ships none, and the community GGUF exports drop it everywhere.
+    bool has_vision = false;
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
     family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
@@ -138,7 +141,7 @@ struct BindingPlan {
     bool has_mtp = false;
     MtpPlan mtp;
 
-    family::VisionBackbonePlan vision_backbone;
+    family::VisionBackbonePlanFor<VisionConfig> vision_backbone;
     family::VisionMergerInputPlan vision_merger_input;
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
@@ -211,7 +214,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     family::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<6>>;
+                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<6>, VisionConfig>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
@@ -232,4 +235,4 @@ public:
 
 SINFER_TARGET_LOADED_MODEL_IMPL();
 
-} // namespace sinfer::targets::qwen3_5_0_8b::detail
+} // namespace sinfer::targets::qwen3_5::detail

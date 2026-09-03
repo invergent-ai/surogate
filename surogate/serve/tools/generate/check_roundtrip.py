@@ -44,14 +44,9 @@ class Target(NamedTuple):
 #: serve target name (the C++ namespace) -> where to find an instance of it.
 #: The declaration supplies the architecture; these supply which instance.
 TARGETS = {
-    "qwen3_5_0_8b": Target(
-        "QWEN3_5_0_8B_CONFIG",
-        "~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/*/config.json",
-    ),
-    "qwen3_5_4b": Target(
-        "QWEN3_5_4B_CONFIG",
-        "~/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/*/config.json",
-    ),
+    # `qwen3_5` is absent: one target now serves every size of the family, and what it
+    # compiles is the 2B as a reference size plus the family's vision tower, whose
+    # dimensions appear in no text `config.json`. It is checked value-by-value instead.
     "gemma3_270m": Target(
         "GEMMA3_270M_CONFIG",
         "~/.cache/huggingface/hub/models--google--gemma-3-270m-it/snapshots/*/config.json",

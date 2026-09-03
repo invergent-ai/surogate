@@ -513,6 +513,21 @@ def build_hf_dir_from_gguf(
     return work_dir
 
 
+def gguf_converter_key(gguf_path: Path, reader=None):
+    """Which converter module builds this GGUF's artifact.
+
+    Usually the engine target's own name. The Qwen3.5 family is the exception: one target
+    binds every size, but its converters still spell their shapes out, so the size picks
+    the module. The vendored `resources/<key>/` directories are keyed the same way.
+    """
+    target = gguf_target_key(gguf_path, reader)
+    if target != "qwen3_5":
+        return target
+    summary = read_gguf_summary(gguf_path, reader)
+    hidden = int(summary["hidden_size"] or 0)
+    return {1024: "qwen3_5_0_8b", 2048: "qwen3_5_2b", 2560: "qwen3_5_4b"}.get(hidden, target)
+
+
 def gguf_target_key(gguf_path: Path, reader=None):
     """Map a GGUF file to a registered converter target key, or None.
 
@@ -527,14 +542,10 @@ def gguf_target_key(gguf_path: Path, reader=None):
     layers = int(s["num_hidden_layers"] or 0)
     if arch in ("qwen35", "qwen3_6", "qwen3_5") and hidden == 5120 and layers >= 60:
         return "qwen3_6_27b"
-    if arch in ("qwen35", "qwen3_5") and hidden == 1024 and layers in (24, 25):
-        # 24 = MTP (nextn) block stripped by the exporter; converted as the
-        # no-MTP artifact variant (PATCHES.md #15).
-        return "qwen3_5_0_8b"
-    if arch in ("qwen35", "qwen3_5") and hidden == 2048 and layers in (24, 25):
-        return "qwen3_5_2b"
-    if arch in ("qwen35", "qwen3_5") and hidden == 2560 and layers in (32, 33):
-        return "qwen3_5_4b"
+    # Every size of the dense Qwen3.5 family is one target: it binds against the dimensions
+    # the artifact declares.
+    if arch in ("qwen35", "qwen3_5") and hidden > 0 and layers > 0:
+        return "qwen3_5"
     if arch in ("qwen38", "qwen3_8") and hidden == 5120:
         return "qwen3_8_27b"
     if arch in ("qwen35moe", "qwen3moe", "qwen3_6_moe", "qwen3_5_moe") and hidden > 0:

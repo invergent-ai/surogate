@@ -1,11 +1,14 @@
-#include "targets/qwen3_5_4b/impl/variant.h"
+#include "targets/qwen3_5/impl/variant.h"
 
-#include "family/impl/lora_hook.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
 #include "api/ops/linear.h"
 #include "api/ops/linear_add.h"
+#include <cstdio>
+#include <cstdlib>
+
+#include "family/impl/lora_hook.h"
 #include "api/ops/linear_pair.h"
 #include "api/ops/linear_swiglu.h"
 #include "api/ops/mtp_pack.h"
@@ -15,13 +18,24 @@
 #include <algorithm>
 #include <stdexcept>
 
-#define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_5_4b::detail::Variant
-#define SINFER_FAMILY_RUNTIME_NS qwen3_5_4b_runtime
+#define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_5::detail::Variant
+#define SINFER_FAMILY_RUNTIME_NS qwen3_5_runtime
 #include "family/impl/runtime/instantiate.h"
 #include "family/impl/runtime/target_support.h"
 
-namespace sinfer::targets::qwen3_5_4b::detail {
+namespace sinfer::targets::qwen3_5::detail {
 namespace {
+
+/// This family's attention head width. It is the same at every size -- what changes between
+/// checkpoints is how many heads there are, and that follows the tensors' own rows.
+constexpr std::int32_t kHeadDim = TextConfig::head_dim;
+
+/// The compiled geometry, for the two GDN scratch sizers a forward call reaches. Those read
+/// the fused parent's own rows when the projection is fused and this family's convolution
+/// widths when it is split; the split widths are not on the weights, so this is where they
+/// come from until the split payload carries them.
+inline const family::TextGeometry kFamilyGeometry =
+    family::TextGeometry::compiled<TextConfig>();
 
 
 
@@ -46,15 +60,16 @@ ops::LinearPolicy text_policy(const Weight& weight) {
 constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
 std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
-                                         const Variant::GdnProjectionWeights& weights) {
+                                         const Variant::GdnProjectionWeights& weights,
+                                         const family::TextGeometry& g) {
     const std::int32_t batch = hidden.ne[2];
     const std::int32_t width = hidden.ne[1];
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_split_workspace_capacity_bytes(
-                            split->query_key_value.qtype, TextConfig::convolution_dim,
-                            TextConfig::value_dim, TextConfig::hidden,
+                            split->query_key_value.qtype, g.convolution_dim(),
+                            g.value_dim(), g.hidden,
                             text_policy(split->query_key_value), batch, width, width));
     }
     const Weight& parent =
@@ -66,15 +81,16 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
 }
 
 std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
-                                       const Variant::GdnProjectionWeights& weights) {
+                                       const Variant::GdnProjectionWeights& weights,
+                                       const family::TextGeometry& g) {
     const std::int32_t batch = hidden.ne[2];
     const std::int32_t width = hidden.ne[1];
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_split_workspace_capacity_bytes(
-                            split->query_key_value.qtype, TextConfig::convolution_dim,
-                            TextConfig::value_dim, TextConfig::hidden,
+                            split->query_key_value.qtype, g.convolution_dim(),
+                            g.value_dim(), g.hidden,
                             text_policy(split->query_key_value), batch, width, width));
     }
     const Weight& parent =
@@ -85,20 +101,20 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
             parent.qtype, parent.n, parent.k, text_policy(parent), batch, width, width));
 }
 
-std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
-                                       ops::LinearPolicy policy, std::int32_t first,
-                                       std::int32_t last) {
+std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType gate_up_qtype,
+                                       QType down_qtype, ops::LinearPolicy policy,
+                                       std::int32_t first, std::int32_t last) {
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
+    (void)layout.alloc(DType::BF16, {g.intermediate, last});
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-            gate_up_qtype, 2 * TextConfig::intermediate, TextConfig::hidden, policy, first, last));
+            gate_up_qtype, 2 * g.intermediate, g.hidden, policy, first, last));
     }
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-            down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
+            down_qtype, g.hidden, g.intermediate, policy, first, last));
     }
     return layout.peak_bytes(1);
 }
@@ -145,6 +161,26 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t,
     return {};
 }
 
+
+namespace {
+
+/// Adds the round's adapter deltas to a projection that has just been written.
+///
+/// Keyed by the base weight's device pointer, which is this layer's identity --
+/// the variant methods take weights, not a layer index. Every token in the round
+/// may name a different adapter (or none), which is why this reads the round's
+/// slot vector rather than a single active adapter.
+///
+/// The ids and the scratch both come from the decode frame, published by the
+/// schedule. They must: a captured graph records their addresses once and replays
+/// against whatever the round wrote, and a buffer allocated per call inside the
+/// hook is baked in by address instead -- which is what made an earlier version
+/// of this give a different answer on every replay.
+using family::apply_lora;
+using family::apply_lora_qkv;
+
+} // namespace
+
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, family::TextPhase,
@@ -157,14 +193,14 @@ void Variant::attention_projection(const Tensor& hidden,
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
     ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
                          stream);
-    family::apply_lora_qkv(fused, hidden, query, key, value, stream);
+    apply_lora_qkv(fused, hidden, query, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
-    family::apply_lora(weight, 3, attention, residual, stream);
+    apply_lora(weight, 3, attention, residual, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -173,18 +209,24 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
                                        WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
-    Tensor packed  = workspace.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, cols});
+    Tensor packed  = workspace.alloc(DType::BF16, {weights.packed.n, cols});
     ops::linear(hidden, weights.packed, packed, stream);
-    Tensor query_heads = query.view({TextConfig::head_dim, TextConfig::query_heads, cols});
-    Tensor key_heads   = key.view({TextConfig::head_dim, TextConfig::kv_heads, cols});
-    Tensor gate_heads  = gate.view({TextConfig::head_dim, TextConfig::query_heads, cols});
-    Tensor value_heads = value.view({TextConfig::head_dim, TextConfig::kv_heads, cols});
+    Tensor query_heads = query.view({kHeadDim, query.ne[0] / kHeadDim, cols});
+    Tensor key_heads   = key.view({kHeadDim, key.ne[0] / kHeadDim, cols});
+    Tensor gate_heads  = gate.view({kHeadDim, gate.ne[0] / kHeadDim, cols});
+    Tensor value_heads = value.view({kHeadDim, value.ne[0] / kHeadDim, cols});
     ops::mtp_split_attn_in(packed, query_heads, key_heads, gate_heads, value_heads, stream);
 }
 
 void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
                                 Tensor& key, Tensor& value, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
+    // The fused pair carries tuned route tables for the 27B and 35B geometries
+    // only (K 5120/2048 into 1024 rows). This target's MTP block projects 2 kv
+    // heads -- 512 rows -- so it takes the unfused pair, exactly as its q/gate
+    // sibling below already does. Correctness first; the fusion can follow if a
+    // route table is ever measured for this shape.
+    ops::linear(hidden, weights.key, key, stream);
+    ops::linear(hidden, weights.value, value, stream);
 }
 
 void Variant::mtp_q_gate_projection(const Tensor& hidden,
@@ -198,7 +240,7 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
                                    Tensor& qkv, Tensor& output_gate, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_flat =
-        output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
+        output_gate.view({kFamilyGeometry.value_dim(), static_cast<int>(hidden.ne[1])});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_split(hidden, split->query_key_value, split->z, qkv, output_gate_flat,
@@ -217,9 +259,9 @@ void Variant::gdn_input_projection_snapshot(
     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
     Tensor& output_gate, family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto workspace_scope     = workspace.scope();
-    const DeviceSpan storage = workspace.alloc_bytes(gdn_snapshot_workspace_bytes(hidden, weights));
+    const DeviceSpan storage = workspace.alloc_bytes(gdn_snapshot_workspace_bytes(hidden, weights, kFamilyGeometry));
     WorkspaceArena leaf_workspace(storage);
-    Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
+    Tensor output_gate_view = output_gate.view({kFamilyGeometry.value_dim(), hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_snapshot_split(
@@ -242,9 +284,9 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                           Tensor& value, Tensor& output_gate, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto workspace_scope     = workspace.scope();
-    const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights));
+    const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights, kFamilyGeometry));
     WorkspaceArena leaf_workspace(storage);
-    Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
+    Tensor output_gate_view = output_gate.view({kFamilyGeometry.value_dim(), hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_record_split(
@@ -286,27 +328,28 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
-    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
+    Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
                        stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
                     stream);
-    // down reads the SwiGLU activation, which is exactly the input its adapter
-    // was trained against.
-    family::apply_lora(weights.down, 4, activation, residual, stream);
+    // down reads the SwiGLU activation, which is exactly the input its adapter was
+    // trained against.
+    apply_lora(weights.down, 4, activation, residual, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
-    Tensor gate_up = workspace.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, cols});
+    Tensor gate_up = workspace.alloc(DType::BF16, {weights.gate_up.n, cols});
     ops::linear(hidden, weights.gate_up, gate_up, stream);
-    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, cols});
-    ops::silu_mul(gate_up.slice(0, 0, TextConfig::intermediate),
-                  gate_up.slice(0, TextConfig::intermediate, TextConfig::intermediate), activation,
+    const std::int32_t intermediate = weights.gate_up.n / 2;
+    Tensor activation = workspace.alloc(DType::BF16, {intermediate, cols});
+    ops::silu_mul(gate_up.slice(0, 0, intermediate),
+                  gate_up.slice(0, intermediate, intermediate), activation,
                   stream);
-    Tensor delta = workspace.alloc(DType::BF16, {TextConfig::hidden, cols});
+    Tensor delta = workspace.alloc(DType::BF16, {hidden.ne[0], cols});
     ops::linear(activation, weights.down, delta, stream);
     ops::residual_add(delta, residual, stream);
 }
@@ -315,7 +358,7 @@ std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(const fam
                                                                        std::int32_t last) {
     family::validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
+    (void)layout.alloc(DType::BF16, {geometry.mtp_attention_input_rows(), last});
     return layout.peak_bytes(1);
 }
 
@@ -341,16 +384,19 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): the W8 profile opts into
         // AllowA8; the wrapper sizes the large-T IMMA workspace.
-        return ops::attn_input_proj_workspace_capacity_bytes(
-            QType::W8G32_F16S, 10240, TextConfig::hidden, ops::LinearPolicy::AllowA8, first,
-            last);
-    case WeightsProfile::Qwen35Nvfp4Mixed:
+        return std::max(ops::attn_input_proj_workspace_capacity_bytes(
+                            QType::W8G32_F16S, 5120, geometry.hidden, ops::LinearPolicy::AllowA8,
+                            first, last),
+                        // a GGUF served natively: the K-quant route's int8 activation scratch
+                        ops::attn_input_proj_workspace_capacity_bytes(
+                            QType::Q4_K, 5120, geometry.hidden, ops::LinearPolicy::A16Only,
+                            first, last));
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
-            QType::NVFP4, 10240, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+            QType::NVFP4, 5120, geometry.hidden, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 10240, TextConfig::hidden, kFp8TextPolicy, first, last);
+            QType::FP8_E4M3FN_ROW_BF16S, 5120, geometry.hidden, kFp8TextPolicy, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -362,19 +408,18 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
         return std::max(ops::linear_add_workspace_capacity_bytes(
-                            QType::W8G32_F16S, TextConfig::hidden, TextConfig::query_size,
+                            QType::W8G32_F16S, geometry.hidden, geometry.query_size(),
                             ops::LinearPolicy::AllowA8, first, last),
                         ops::linear_add_workspace_capacity_bytes(
-                            QType::Q4_K, TextConfig::hidden, TextConfig::query_size,
+                            QType::Q4_K, geometry.hidden, geometry.query_size(),
                             ops::LinearPolicy::A16Only, first, last));
-    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
-        return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
-                                                        TextConfig::query_size, kNvfp4TextPolicy,
+        return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, geometry.hidden,
+                                                        geometry.query_size(), kNvfp4TextPolicy,
                                                         first, last);
     case WeightsProfile::Qwen38Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
-                                                        TextConfig::hidden, TextConfig::query_size,
+                                                        geometry.hidden, geometry.query_size(),
                                                         kFp8TextPolicy, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
@@ -390,18 +435,17 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(const family:
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
         return std::max(ops::gdn_input_proj_workspace_capacity_bytes(
-                            QType::W8G32_F16S, 12288, TextConfig::hidden, ops::LinearPolicy::AllowA8,
+                            QType::W8G32_F16S, 8192, geometry.hidden, ops::LinearPolicy::AllowA8,
                             first, last),
                         ops::gdn_input_proj_workspace_capacity_bytes(
-                            QType::Q4_K, 12288, TextConfig::hidden, ops::LinearPolicy::A16Only,
+                            QType::Q4_K, 8192, geometry.hidden, ops::LinearPolicy::A16Only,
                             first, last));
-    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
-        return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 12288, TextConfig::hidden,
+        return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 8192, geometry.hidden,
                                                             kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 12288, TextConfig::hidden, kFp8TextPolicy, first, last);
+            QType::FP8_E4M3FN_ROW_BF16S, 8192, geometry.hidden, kFp8TextPolicy, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -412,20 +456,22 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(cons
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
-                            batch_size, first, last));
-    case WeightsProfile::Qwen35Nvfp4Mixed:
+        return std::max({kMinimumLeafWorkspaceBytes,
+                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                             geometry.key_dim(), geometry.key_dim(), geometry.value_dim(),
+                             batch_size, first, last),
+                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                             QType::Q4_K, 8192, geometry.hidden, ops::LinearPolicy::A16Only,
+                             batch_size, first, last)});
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                            QType::NVFP4, 12288, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
+                            QType::NVFP4, 8192, geometry.hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                            QType::FP8_E4M3FN_ROW_BF16S, 12288, TextConfig::hidden, kFp8TextPolicy,
+                            QType::FP8_E4M3FN_ROW_BF16S, 8192, geometry.hidden, kFp8TextPolicy,
                             batch_size, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
@@ -437,20 +483,22 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(const 
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
-                            batch_size, first, last));
-    case WeightsProfile::Qwen35Nvfp4Mixed:
+        return std::max({kMinimumLeafWorkspaceBytes,
+                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                             geometry.key_dim(), geometry.key_dim(), geometry.value_dim(),
+                             batch_size, first, last),
+                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                             QType::Q4_K, 8192, geometry.hidden, ops::LinearPolicy::A16Only,
+                             batch_size, first, last)});
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                            QType::NVFP4, 12288, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
+                            QType::NVFP4, 8192, geometry.hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                            QType::FP8_E4M3FN_ROW_BF16S, 12288, TextConfig::hidden, kFp8TextPolicy,
+                            QType::FP8_E4M3FN_ROW_BF16S, 8192, geometry.hidden, kFp8TextPolicy,
                             batch_size, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
@@ -464,16 +512,15 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
-                                                        TextConfig::value_dim,
+        return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, geometry.hidden,
+                                                        geometry.value_dim(),
                                                         ops::LinearPolicy::A16Only, first, last);
-    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
-            QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
+            QType::NVFP4, geometry.hidden, geometry.value_dim(), kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
-                                                        TextConfig::hidden, TextConfig::value_dim,
+                                                        geometry.hidden, geometry.value_dim(),
                                                         kFp8TextPolicy, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
@@ -481,8 +528,8 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                           std::int32_t last) {
-    return ops::gdn_norm_gating_proj_workspace_capacity_bytes(TextConfig::gdn_value_heads,
-                                                              TextConfig::hidden, first, last);
+    return ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.gdn_value_heads,
+                                                              geometry.hidden, first, last);
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
@@ -492,31 +539,30 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return std::max(post_mixer_workspace_bytes(QType::W8G32_F16S, QType::W8G32_F16S, ops::LinearPolicy::A16Only, first, last),
-                        post_mixer_workspace_bytes(QType::Q4_K, QType::Q4_K, ops::LinearPolicy::A16Only, first, last));
-    case WeightsProfile::Qwen35Nvfp4Mixed:
+        return std::max(post_mixer_workspace_bytes(geometry, QType::W8G32_F16S, QType::W8G32_F16S,
+                                                   ops::LinearPolicy::A16Only, first, last),
+                        post_mixer_workspace_bytes(geometry, QType::Q4_K, QType::Q4_K, ops::LinearPolicy::A16Only, first, last));
     case WeightsProfile::Qwen36Nvfp4:
-        return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
+        return post_mixer_workspace_bytes(geometry, QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
                                           last);
     case WeightsProfile::Qwen38Nvfp4: {
         const std::size_t nvfp4 =
-            post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);
-        const std::size_t fp8 = post_mixer_workspace_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, kFp8TextPolicy, first, last);
+            post_mixer_workspace_bytes(geometry, QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);
+        const std::size_t fp8 = post_mixer_workspace_bytes(geometry, QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, kFp8TextPolicy, first, last);
         return std::max(nvfp4, fp8);
     }
     }
-    throw std::invalid_argument("qwen3_5_4b: invalid weights profile");
+    throw std::invalid_argument("qwen3_5: invalid weights profile");
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                              std::int32_t last) {
     family::validate_token_interval(first, last);
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_mlp_gate_up_rows, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
+    (void)layout.alloc(DType::BF16, {geometry.mtp_mlp_gate_up_rows(), last});
+    (void)layout.alloc(DType::BF16, {geometry.intermediate, last});
+    (void)layout.alloc(DType::BF16, {geometry.hidden, last});
     return layout.peak_bytes(1);
 }
 
-} // namespace sinfer::targets::qwen3_5_4b::detail
+} // namespace sinfer::targets::qwen3_5::detail

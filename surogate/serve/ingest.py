@@ -67,15 +67,13 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
 
     # Registered geometries (vendored targets). Text-config nesting (VL-style
     # configs) is flattened by callers before this point.
-    if model_type == "qwen3_5" and hidden == 1024 and layers == 24:
-        return ConverterTarget("qwen3_5_0_8b", "surogate.serve.convert.qwen3_5_0_8b.convert",
-                               "Qwen3.5-0.8B", gguf_repack=True)
-    if model_type == "qwen3_5" and hidden == 2048 and layers == 24:
-        return ConverterTarget("qwen3_5_2b", "surogate.serve.convert.qwen3_5_2b.convert",
-                               "Qwen3.5-2B", gguf_repack=True)
-    if model_type == "qwen3_5" and hidden == 2560 and layers == 32:
-        return ConverterTarget("qwen3_5_4b", "surogate.serve.convert.qwen3_5_4b.convert",
-                               "Qwen3.5-4B", gguf_repack=True)
+    if model_type == "qwen3_5" and hidden in (1024, 2048, 2560):
+        # One engine target for the family. The converter is still per size -- its recipes
+        # spell their shapes out -- so the checkpoint's hidden width picks which one runs,
+        # and the artifact it writes states the dimensions the engine binds against.
+        module = {1024: "qwen3_5_0_8b", 2048: "qwen3_5_2b", 2560: "qwen3_5_4b"}[hidden]
+        return ConverterTarget("qwen3_5", f"surogate.serve.convert.{module}.convert",
+                               "Qwen3.5", gguf_repack=True)
     if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:
         if nvfp4:
             return ConverterTarget("qwen3_6_27b_nvfp4", "surogate.serve.convert.qwen3_6_27b.convert_nvfp4",
@@ -191,8 +189,9 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
-    repack_targets = {"qwen3_5_0_8b", "qwen3_5_2b", "qwen3_5_4b", "qwen3_6_35b_a3b"}
-    planner = _repack_planner(root, target_key) if target_key in repack_targets else None
+    repack_targets = {"qwen3_5", "qwen3_6_35b_a3b"}
+    converter_key = serve_gguf.gguf_converter_key(gguf_path, reader)
+    planner = _repack_planner(root, converter_key) if target_key in repack_targets else None
     # No-MTP variant (PATCHES.md #15): community exports may strip nextn.
     arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
     nextn = reader.kv(f"{arch}.nextn_predict_layers", 0)
@@ -200,7 +199,7 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     work = cache_dir() / f"gguf-bridge-{fp}"
     try:
         model_dir = serve_gguf.build_hf_dir_from_gguf(
-            gguf_path, target_key, work, repack_planner=planner, reader=reader, echo=echo
+            gguf_path, converter_key, work, repack_planner=planner, reader=reader, echo=echo
         )
         repack_map = model_dir / "gguf_repack.json"
         return _run_converter_cached(
