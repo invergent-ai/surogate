@@ -136,7 +136,6 @@ Options:
 
 - `--api-base <url>`: OpenAI-compatible base URL of a served teacher, e.g. `http://localhost:8000/v1` (overrides `distillation.teacher_api_base`). Requires a vLLM-compatible server started with `--max-logprobs >= distillation.top_k`
 - `--device <device>`: device to run the local teacher model on (default `cuda:0`); ignored with a warning in API mode
-- `--allow-cross-doc-attention`: allow the sdpa fallback when flash-attention-2 is unavailable; packed documents will attend across document boundaries during capture; ignored with a warning in API mode
 - `--hub_token <token>`: optional, Hugging Face token for private model access
 
 ### `transplant-tokenizer`

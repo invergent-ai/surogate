@@ -10,8 +10,8 @@
 #
 # The teacher and student MUST share a tokenizer. Qwen3-0.6B and Qwen3-1.7B
 # are both Qwen3 dense models and use the identical Qwen3 tokenizer.
-# Capture requires flash-attention-2 for packed data (or pass
-# --allow-cross-doc-attention to accept the sdpa approximation).
+# Packed documents are isolated during capture by transformers' packed-sequence
+# support, driven by the shard's position_ids resets; no flash-attn needed.
 
 model: Qwen/Qwen3-0.6B
 output_dir: ./output

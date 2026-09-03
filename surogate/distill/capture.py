@@ -14,7 +14,9 @@ Rows past the last full window are zero-filled.
 
 Two teacher backends:
 - Local HF model (default): teacher loaded via transformers, whole windows per
-  forward, flash-attention-2 varlen for per-document isolation.
+  forward. Packed documents are isolated by transformers' own packed-sequence
+  support, which reads the shard's `position_ids` resets (requires
+  `use_cache=False`).
 - OpenAI-compatible API (`distillation.teacher_api_base`): one vLLM
   `prompt_logprobs` completions request per document (split at position-id
   resets, one-token lookahead), which gives exact context isolation with no
@@ -35,6 +37,7 @@ from pathlib import Path
 import numpy as np
 
 from surogate.core.config.sft_config import SFTConfig
+from surogate.distill.packed import teacher_logits, verify_isolation
 from surogate.distill.sidecar import (
     SidecarWriter,
     read_token_shard_header,
@@ -60,31 +63,15 @@ def _read_shard(path: str) -> tuple[np.ndarray, np.ndarray | None, int]:
     return tokens, position_ids, n_tokens
 
 
-def _load_teacher(teacher_model: str, device: str, allow_cross_doc_attention: bool):
+def _load_teacher(teacher_model: str, device: str):
     import torch
     from transformers import AutoModelForCausalLM
-    from transformers.utils import is_flash_attn_2_available
 
-    if is_flash_attn_2_available():
-        attn_implementation = "flash_attention_2"
-    elif allow_cross_doc_attention:
-        attn_implementation = "sdpa"
-        logger.warning(
-            "flash-attention-2 is not available; falling back to sdpa. Packed documents will "
-            "attend across document boundaries during capture (--allow-cross-doc-attention)."
-        )
-    else:
-        raise RuntimeError(
-            "distill-capture requires flash-attention-2 for per-document attention isolation "
-            "(position_ids resets -> varlen). Install flash-attn, or pass "
-            "--allow-cross-doc-attention to accept the cross-document approximation with sdpa."
-        )
-
-    logger.info(f"Loading teacher model '{teacher_model}' ({attn_implementation}, bf16) on {device}...")
+    logger.info(f"Loading teacher model '{teacher_model}' (sdpa, bf16) on {device}...")
     model = AutoModelForCausalLM.from_pretrained(
         teacher_model,
         torch_dtype=torch.bfloat16,
-        attn_implementation=attn_implementation,
+        attn_implementation="sdpa",
     )
     model.to(device)
     model.eval()
@@ -96,7 +83,10 @@ def _topk_logprobs(logits, top_k: int):
 
     topk indices over raw logits equal those over log_softmax (monotone shift);
     the fp32 normalizer is computed one window at a time to avoid materializing
-    a full fp32 copy of the (bsz, S, V) logits.
+    a full fp32 copy of the (bsz, S, V) logits. This relies on `logits` arriving
+    as [B, S, V], one row per window - capture used to flatten to [1, B*S] for
+    flash-attention's padding-free path, which silently collapsed this loop to a
+    single iteration over the whole batch.
     """
     import torch
 
@@ -117,9 +107,6 @@ def capture_shard(
     tokenize_hash: str,
     device: str,
 ) -> None:
-    import torch
-    from tqdm import tqdm
-
     tokens, position_ids, n_tokens = _read_shard(shard_path)
     student_vocab = read_token_shard_header(shard_path).vocab_size
     max_token_id = int(tokens.max()) if n_tokens > 0 else -1
@@ -140,6 +127,52 @@ def capture_shard(
         )
 
     tmp_path = sidecar_path + ".tmp"
+    try:
+        _capture_shard_into(
+            model, tmp_path, tokens, position_ids, n_tokens, n_windows,
+            top_k=top_k, sequence_len=sequence_len,
+            teacher_batch_size=teacher_batch_size,
+            teacher_vocab_size=teacher_vocab_size,
+            student_vocab=student_vocab, tokenize_hash=tokenize_hash,
+            device=device, shard_path=shard_path,
+        )
+    except BaseException:
+        # SidecarWriter preallocates the full file up front, so an abort part way
+        # through would otherwise strand a full-size .tmp that nothing ever cleans
+        # up -- and the isolation check makes aborting an expected outcome, not
+        # just a crash path.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp_path, sidecar_path)
+    tail = n_tokens - n_windows * sequence_len
+    logger.info(
+        f"Wrote {sidecar_path}: {n_windows * sequence_len} rows captured, {tail} tail rows zero-filled."
+    )
+
+
+def _capture_shard_into(
+    model,
+    tmp_path: str,
+    tokens,
+    position_ids,
+    n_tokens: int,
+    n_windows: int,
+    *,
+    top_k: int,
+    sequence_len: int,
+    teacher_batch_size: int,
+    teacher_vocab_size: int,
+    student_vocab: int,
+    tokenize_hash: str,
+    device: str,
+    shard_path: str,
+) -> None:
+    import torch
+    from tqdm import tqdm
+
     with SidecarWriter(
         tmp_path,
         n_tokens=n_tokens,
@@ -155,37 +188,34 @@ def capture_shard(
             ):
                 w1 = min(w0 + teacher_batch_size, n_windows)
                 span = slice(w0 * sequence_len, w1 * sequence_len)
-                n_flat = (w1 - w0) * sequence_len
-                # Flatten the window batch to a single row and pass explicit
-                # varlen boundaries. Batched [B, S] position_ids do NOT trigger
-                # transformers' padding-free flash-attention path, so without
-                # this the teacher silently attends across packed documents.
-                # Segments start at every window boundary and at every
-                # position-id reset (packed doc starts).
-                flat_ids = torch.from_numpy(np.ascontiguousarray(tokens[span], dtype=np.int64)).to(device)
+                bsz = w1 - w0
+                # One row per window. transformers derives the packed-document
+                # boundaries from position_ids itself and builds the
+                # block-diagonal causal mask, so each packed document is isolated
+                # without a hand-rolled mask -- and sliding-window teachers keep
+                # their sliding layers, which a 4D attention_mask would override.
+                #
+                # use_cache=False is load-bearing: with a cache allocated,
+                # _preprocess_mask_arguments skips the packed detection entirely
+                # and the teacher attends straight across document boundaries.
+                batch_ids = torch.from_numpy(
+                    np.ascontiguousarray(tokens[span], dtype=np.int64)
+                ).view(bsz, sequence_len).to(device)
+                batch_pos = None
                 if position_ids is not None:
-                    flat_pos = torch.from_numpy(
+                    batch_pos = torch.from_numpy(
                         np.ascontiguousarray(position_ids[span], dtype=np.int64)
-                    ).to(device)
-                else:
-                    flat_pos = (
-                        torch.arange(sequence_len, dtype=torch.int64, device=device)
-                        .repeat(w1 - w0)
-                    )
-                idx = torch.arange(n_flat, device=device)
-                seg_starts = torch.nonzero((idx % sequence_len == 0) | (flat_pos == 0)).view(-1)
-                cu_seqlens = torch.cat(
-                    [seg_starts.to(torch.int32), torch.tensor([n_flat], dtype=torch.int32, device=device)]
-                )
-                max_len = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
-                logits = model(
-                    input_ids=flat_ids.unsqueeze(0),
-                    position_ids=flat_pos.unsqueeze(0),
-                    cu_seq_lens_q=cu_seqlens,
-                    cu_seq_lens_k=cu_seqlens,
-                    max_length_q=max_len,
-                    max_length_k=max_len,
-                ).logits
+                    ).view(bsz, sequence_len).to(device)
+                # Pre-v3 shards carry no position_ids: transformers defaults to
+                # arange per row, i.e. one document per window, plain causal.
+                logits = teacher_logits(model, batch_ids, batch_pos)
+                if w0 == 0 and batch_pos is not None:
+                    # Once per shard, against the batch just computed: losing
+                    # isolation is invisible in the output, so prove it held
+                    # rather than write a plausible-looking sidecar built from
+                    # cross-document context. Searches every row of the batch for
+                    # a usable probe; costs one forward over <= 32 tokens.
+                    verify_isolation(model, batch_ids, batch_pos, logits)
                 logprobs, ids = _topk_logprobs(logits, top_k)
                 ids = ids.reshape(-1, top_k).cpu().numpy()
                 logprobs = logprobs.reshape(-1, top_k).cpu().numpy()
@@ -201,11 +231,6 @@ def capture_shard(
                     ids.astype(np.uint32),
                     logprobs.astype(np.float16),
                 )
-    os.replace(tmp_path, sidecar_path)
-    tail = n_tokens - n_windows * sequence_len
-    logger.info(
-        f"Wrote {sidecar_path}: {n_windows * sequence_len} rows captured, {tail} tail rows zero-filled."
-    )
 
 
 def _api_guidance(api_base: str, top_k: int) -> str:
@@ -415,7 +440,6 @@ def run_capture(
     shard_paths: list[str],
     tokenize_hash: str,
     device: str = "cuda:0",
-    allow_cross_doc_attention: bool = False,
 ) -> None:
     dist = config.distillation
     logger.warning(
@@ -471,7 +495,7 @@ def run_capture(
         finally:
             client.close()
     else:
-        model = _load_teacher(dist.teacher_model, device, allow_cross_doc_attention)
+        model = _load_teacher(dist.teacher_model, device)
         teacher_vocab_size = int(model.config.vocab_size)
         if dist.top_k > teacher_vocab_size:
             raise ValueError(
@@ -507,11 +531,9 @@ def distill_capture_main(config: SFTConfig, args: DictDefault) -> None:
 
     if args.get("api_base"):
         config.distillation.teacher_api_base = args["api_base"]
-    if config.distillation.teacher_api_base and (
-        args.get("device") or args.get("allow_cross_doc_attention")
-    ):
+    if config.distillation.teacher_api_base and args.get("device"):
         logger.warning(
-            "--device / --allow-cross-doc-attention are ignored in API mode "
+            "--device is ignored in API mode "
             "(the teacher runs on the server; per-document requests give exact context isolation)."
         )
 
@@ -541,5 +563,4 @@ def distill_capture_main(config: SFTConfig, args: DictDefault) -> None:
         train_files,
         tokenize_hash,
         device=args.get("device") or "cuda:0",
-        allow_cross_doc_attention=bool(args.get("allow_cross_doc_attention", False)),
     )
