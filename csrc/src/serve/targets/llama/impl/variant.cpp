@@ -120,7 +120,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     apply_lora(weight, 3, attention, residual, stream);
 }
 
-std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+std::size_t Variant::attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {

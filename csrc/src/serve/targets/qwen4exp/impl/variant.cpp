@@ -1773,19 +1773,19 @@ void Variant::mtp_post_mixer(const Tensor&, const MtpPostMixerWeights&, Tensor&,
 
 // --- workspace capacities ----------------------------------------------------------------------
 
-std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t, std::int32_t) {
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, std::int32_t) {
     return 0;
 }
 
-std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t, std::int32_t) {
+std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, std::int32_t) {
     return 0;
 }
 
-std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t, std::int32_t) {
+std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, std::int32_t) {
     return 0;
 }
 
-std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
@@ -1803,7 +1803,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
            w8_capacity(kHidden, TextConfig::query_size, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
@@ -1811,16 +1811,15 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
            w8_capacity(TextConfig::gdn_projection_rows, kHidden, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
-    WeightsProfile profile, family::TextPhase phase, std::int32_t batch_size,
+std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile profile, family::TextPhase phase, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
     const std::int32_t tokens = batch_size * max_width;
     return 2 * plane_bytes(TextConfig::convolution_dim, tokens, DType::BF16) +
-           gdn_input_projection_workspace_capacity_bytes(profile, phase, batch_size * min_width,
+           gdn_input_projection_workspace_capacity_bytes(geometry, profile, phase, batch_size * min_width,
                                                          tokens);
 }
 
-std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
                                                                           family::TextPhase,
                                                                           std::int32_t,
                                                                           std::int32_t,
@@ -1828,7 +1827,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(Weight
     return 0;
 }
 
-std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile,
+std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
                                                                     family::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
@@ -1836,7 +1835,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
            w8_capacity(kHidden, TextConfig::value_dim, first, last);
 }
 
-std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                           std::int32_t last) {
     const std::int32_t heads = TextConfig::gdn_value_heads;
     return mix_capacity(first, last) + plane_bytes(2 * heads, last, DType::BF16) +

@@ -14,6 +14,7 @@
 #include "core/tensor.h"
 
 #include <array>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -119,7 +120,8 @@ struct BindingPlan {
     family::StartupFeatures features;
 
     WeightPlan token_embedding;
-    std::array<TextLayerPlan, kTextLayers> text_layers;
+    /// One per layer, sized when the artifact is bound rather than by the type.
+    std::vector<TextLayerPlan> text_layers;
     artifact::ObjectHandle final_norm;
     WeightPlan output_head;
     artifact::LinearBinding draft_head; // format read from the artifact

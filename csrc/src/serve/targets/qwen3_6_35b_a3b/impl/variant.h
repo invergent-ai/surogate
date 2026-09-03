@@ -91,13 +91,13 @@ struct Variant {
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
     [[nodiscard]] static std::size_t
-    mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
-    [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
+    mtp_attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                                 std::int32_t last);
     [[nodiscard]] static std::size_t
-    mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    mtp_q_gate_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                   family::TextPhase phase, std::int32_t first,
                                                   std::int32_t last);
     [[nodiscard]] static std::size_t
@@ -105,21 +105,19 @@ struct Variant {
                                                          family::TextPhase phase,
                                                          std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    gdn_input_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                   family::TextPhase phase, std::int32_t first,
                                                   std::int32_t last);
-    [[nodiscard]] static std::size_t gdn_input_projection_snapshot_workspace_capacity_bytes(
-        WeightsProfile weights_profile, family::TextPhase phase, std::int32_t batch_size,
+    [[nodiscard]] static std::size_t gdn_input_projection_snapshot_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase phase, std::int32_t batch_size,
         std::int32_t first, std::int32_t last);
-    [[nodiscard]] static std::size_t gdn_input_projection_record_workspace_capacity_bytes(
-        WeightsProfile weights_profile, family::TextPhase phase, std::int32_t batch_size,
+    [[nodiscard]] static std::size_t gdn_input_projection_record_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase phase, std::int32_t batch_size,
         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+    gdn_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                                                    family::TextPhase phase, std::int32_t first,
                                                    std::int32_t last);
     [[nodiscard]] static std::size_t
-    gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    gdn_norm_control_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase phase,
                                         std::int32_t first, std::int32_t last);

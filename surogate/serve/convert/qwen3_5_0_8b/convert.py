@@ -93,6 +93,7 @@ ObjectPlan = family_conversion.ObjectPlan
 @dataclass(frozen=True, slots=True)
 class ConversionPreflight:
     model_dir: Path
+    config: dict[str, object]
     config_summary: dict[str, object]
     source: recipe.SourcePreflight
     resources: tuple[ResourcePayload, ...]
@@ -116,6 +117,34 @@ def _check_members(
 ) -> None:
     family_conversion.check_members(scope, actual, expected)
 
+
+
+def geometry_block(config: Mapping[str, object]) -> dict[str, float]:
+    """The artifact's `geometry` member: the dimensions the engine reads at load.
+
+    This target is one compiled size, and these are the numbers that make it that size.
+    Stating them in the artifact is what lets one engine target serve every size of the
+    family, and it is the checkpoint's own config that states them here.
+    """
+    text = config["text_config"]
+    rope = text["rope_parameters"]
+    return {
+        "hidden": int(text["hidden_size"]),
+        "layers": int(text["num_hidden_layers"]),
+        "intermediate": int(text["intermediate_size"]),
+        "output_rows": int(text["vocab_size"]),
+        "query_heads": int(text["num_attention_heads"]),
+        "kv_heads": int(text["num_key_value_heads"]),
+        "head_dim": int(text["head_dim"]),
+        "gdn_key_heads": int(text["linear_num_key_heads"]),
+        "gdn_key_head_dim": int(text["linear_key_head_dim"]),
+        "gdn_value_heads": int(text["linear_num_value_heads"]),
+        "gdn_value_head_dim": int(text["linear_value_head_dim"]),
+        "gdn_conv_kernel": int(text["linear_conv_kernel_dim"]),
+        "mtp_layers": int(text["mtp_num_hidden_layers"]),
+        "rms_epsilon": float(text["rms_norm_eps"]),
+        "rope_theta": float(rope["rope_theta"]),
+    }
 
 def validate_config(config: Mapping[str, object]) -> dict[str, object]:
     """Validate the exact registered checkpoint dimensions and summarize them."""
@@ -262,7 +291,8 @@ def preflight_conversion(
     """Finish all checkpoint, inventory, shortlist, and offset work before writing."""
 
     model = Path(model_dir)
-    config_summary = validate_config(_load_config(model))
+    config = _load_config(model)
+    config_summary = validate_config(config)
     preflight_inventory()
     recipes = active_recipes(mtp=mtp)
     if planned or not mtp:
@@ -285,6 +315,7 @@ def preflight_conversion(
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
         model_dir=model,
+        config=config,
         config_summary=config_summary,
         source=source,
         resources=resources,
@@ -440,6 +471,7 @@ def convert(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
+            geometry=geometry_block(preflight.config),
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError("writer object plan differs from completed preflight")
