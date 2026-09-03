@@ -70,7 +70,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::overflow_error("prompt token count exceeds uint32");
     }
     for (const TokenId id : prompt.token_ids) {
-        if (id < 0 || id >= TextConfig::token_domain) {
+        if (id < 0 || id >= cfg.token_domain) {
             throw std::invalid_argument("prompt contains token outside the 248077-token domain");
         }
     }

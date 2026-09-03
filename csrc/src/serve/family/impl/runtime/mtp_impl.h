@@ -172,8 +172,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             Tensor valid =
                 ar_valid_columns.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
             Tensor previous_batch    = previous.view({1, batch_size});
-            Tensor hidden_batch      = ar_hidden.view({TextConfig::hidden, 1, batch_size});
-            Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
+            Tensor hidden_batch      = ar_hidden.view({state.execution.model.geometry.hidden, 1, batch_size});
+            Tensor next_hidden_batch = next_hidden.view({state.execution.model.geometry.hidden, 1, batch_size});
             card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
                                           mtp_rows, envelopes.ar[step], next_hidden_batch);
             card.mtp_propose_batch(next_hidden, proposal_logits, next);

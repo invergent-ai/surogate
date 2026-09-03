@@ -286,10 +286,11 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
         if (state.execution.proposal_head == ProposalHead::Full) {
             Tensor logits = state.execution.work.alloc(
-                DType::BF16, {TextConfig::output_rows, static_cast<std::int32_t>(k) * batch_size});
+                DType::BF16, {state.execution.model.geometry.output_rows,
+                              static_cast<std::int32_t>(k) * batch_size});
             ops::linear(proposal_hidden, state.execution.model.output_head, logits,
                         state.execution.device.stream);
-            ops::argmax(logits, flat_drafts, TextConfig::token_domain,
+            ops::argmax(logits, flat_drafts, state.execution.model.geometry.token_domain,
                         state.execution.device.stream);
         } else {
             if (!state.execution.model.optimized_proposal.has_value()) {

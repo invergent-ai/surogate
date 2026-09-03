@@ -1,4 +1,6 @@
 #pragma once
+#include <api/family/text_geometry.h>
+
 #include "runtime/contract/round_lifecycle.h"
 #include "family/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
@@ -213,6 +215,10 @@ class ProgramImplCore {
 public:
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
                     DeviceContext& device);
+
+    /// The dimensions this program runs at: the weights' own, which is the target's compiled
+    /// config with the artifact's declaration laid over it.
+    family::TextGeometry cfg;
     ~ProgramImplCore() noexcept;
 
     [[nodiscard]] RequestBasePlan
@@ -281,7 +287,7 @@ public:
     [[nodiscard]] std::int32_t stage_boundary_columns() const noexcept { return stage.columns; }
     /// True for a program that runs only part of the model (a pipeline stage).
     [[nodiscard]] bool pipeline_stage() const noexcept {
-        return stage.first > 0 || (stage.last >= 0 && stage.last < static_cast<int>(TextConfig::layers));
+        return stage.first > 0 || (stage.last >= 0 && stage.last < cfg.layers);
     }
     void configure_stage(const SequencePlanImpl& plan);
     /// Pipeline stages without the head record a placeholder token per round; the driver

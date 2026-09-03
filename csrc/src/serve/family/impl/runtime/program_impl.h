@@ -238,7 +238,7 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 
 void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     if (plan.pipeline_stage_first == 0 && plan.pipeline_stage_last == 0) { return; }
-    constexpr int layers = static_cast<int>(TextConfig::layers);
+    const int layers = cfg.layers;
     if (plan.pipeline_stage_first < 0 || plan.pipeline_stage_last > layers ||
         plan.pipeline_stage_first >= plan.pipeline_stage_last) {
         throw std::invalid_argument("pipeline stage layer range is invalid");
@@ -272,7 +272,8 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in)
-    : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
+    : cfg(model_in.geometry), model(model_in), device(device_in), capacity(plan.capacity),
+      kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
@@ -1791,7 +1792,7 @@ void ProgramImplCore::prepare_graphs() {
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
-                        .view({TextConfig::token_domain});
+                        .view({cfg.token_domain});
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
     request.sampling_host     = config;
     request.speculative_stats = SpeculativeStats{
@@ -1811,7 +1812,7 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
-    if (source.dtype != DType::BF16 || source.ne[0] != TextConfig::hidden || source.ne[1] != 1) {
+    if (source.dtype != DType::BF16 || source.ne[0] != cfg.hidden || source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
     }
     CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
@@ -1896,7 +1897,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
 void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) const {
     for (const TokenId token : tokens) {
-        if (token < 0 || token >= TextConfig::token_domain) {
+        if (token < 0 || token >= cfg.token_domain) {
             throw std::runtime_error("target returned a token outside the 248077-token domain");
         }
     }
@@ -2745,7 +2746,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows);
             Tensor lanes_tensor    = ordinary.lanes.slice(0, 0, rows);
             ops::scatter(slice.hidden, lanes_tensor, tail_hidden_store, device.stream);
-            ops::sample(slice.logits, sampled, TextConfig::token_domain, ordinary.sampling,
+            ops::sample(slice.logits, sampled, cfg.token_domain, ordinary.sampling,
                         cache_positions, ops::kSamplePurposeDecode, work, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(ordinary_host_egress, ordinary.egress.data,
                                        sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,

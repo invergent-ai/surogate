@@ -176,7 +176,7 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose) {
-    if (hidden.dtype != DType::BF16 || hidden.ne[0] != TextConfig::hidden || hidden.ne[1] != 1 ||
+    if (hidden.dtype != DType::BF16 || hidden.ne[0] != state.execution.model.geometry.hidden || hidden.ne[1] != 1 ||
         hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
         throw std::invalid_argument("sample_from_hidden requires BF16 [hidden,1]");
     }
@@ -186,7 +186,8 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
-    ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
+    ops::sample(logits, state.execution.io.token,
+                state.execution.model.geometry.token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
     state.execution.work.reset();

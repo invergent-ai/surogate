@@ -5,6 +5,8 @@
 // which are the family's original ops; a Variant with several residual streams (hyper
 // connections) supplies the members the `requires` clauses probe for.
 
+#include <api/family/text_geometry.h>
+
 #include "api/ops/embedding.h"
 #include "api/ops/gated_rmsnorm.h"
 #include "api/ops/rmsnorm.h"
@@ -85,12 +87,16 @@ template <class Variant>
 /// ones, so a single `rope_theta` cannot describe the model. A config that says
 /// nothing keeps the one base it always had, which is every target but that one.
 template <class TextConfig>
-[[nodiscard]] constexpr float layer_rope_theta(int layer) {
+[[nodiscard]] constexpr float layer_rope_theta(int layer, const family::TextGeometry& geometry) {
     if constexpr (requires { TextConfig::layer_rope_theta(layer); }) {
+        // Two bases keyed on the schedule: compiled, because which layers are windowed is
+        // the family's pattern. Their values are still the checkpoint's to state, which is
+        // what a per-layer geometry would carry.
+        (void)geometry;
         return TextConfig::layer_rope_theta(layer);
     } else {
         (void)layer;
-        return TextConfig::rope_theta;
+        return geometry.rope_theta;
     }
 }
 
@@ -104,16 +110,18 @@ template <class TextConfig>
 /// `layer_rope_theta` takes -- the two must agree, because a windowed layer is
 /// exactly the layer that rotates at the local base.
 template <class TextConfig>
-[[nodiscard]] constexpr std::int32_t layer_sliding_window(int layer) {
+[[nodiscard]] constexpr std::int32_t layer_sliding_window(int layer,
+                                                          const family::TextGeometry& geometry) {
     if constexpr (requires {
                       TextConfig::sliding_window;
                       TextConfig::is_windowed_attention(layer);
                   }) {
-        return TextConfig::is_windowed_attention(layer)
-                   ? static_cast<std::int32_t>(TextConfig::sliding_window)
-                   : 0;
+        // Which layers are windowed is the family's pattern and stays compiled; how wide the
+        // window is belongs to the checkpoint, so it comes from the geometry.
+        return TextConfig::is_windowed_attention(layer) ? geometry.sliding_window : 0;
     } else {
         (void)layer;
+        (void)geometry;
         return 0;
     }
 }

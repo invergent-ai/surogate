@@ -58,7 +58,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         if (lora_round) { ops::lora_clear_round(); }
         if (!card.stage_finishes()) { return; } // a pipeline stage without the head: nothing to sample
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
-        ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
+        ops::sample(logits, sampled, state.execution.model.geometry.token_domain,
+                    ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
@@ -114,7 +115,8 @@ auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch
         if (lora_round) { ops::lora_clear_round(); }
         if (!card.stage_finishes()) { return; } // a pipeline stage without the head: nothing to sample
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
-        ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
+        ops::sample(logits, sampled, state.execution.model.geometry.token_domain,
+                    ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,

@@ -932,7 +932,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer), qn, kn, s);
+    ops::rope(rope_for_op, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn, s);
     debug_probe<Variant>("q_post_rope", qn.view({cfg_.q_size, T}), s);
     debug_probe<Variant>("k_post_rope", kn.view({cfg_.kv_size, T}), s);
 
@@ -951,7 +951,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     // says how many of them this layer may look at. Stamp the layer's window onto a
     // copy -- widening the round binding could not express an alternating stack.
     ops::GqaExecutionEnvelope layer_envelope = *active_gqa_envelope_;
-    layer_envelope.sliding_window            = layer_sliding_window<TextConfig>(layer);
+    layer_envelope.sliding_window            = layer_sliding_window<TextConfig>(layer, weights_.geometry);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1710,11 +1710,11 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                    sizeof(std::int32_t),
                                                cudaMemcpyDeviceToDevice, s));
                 }
-                ops::rope(rope_all, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer), qn, kn,
+                ops::rope(rope_all, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn,
                           s);
                 // A windowed layer looks at fewer keys than the round is sized for;
                 // see layer_sliding_window() in residual_policy.h.
-                const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer);
+                const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer, weights_.geometry);
                 debug_probe<Variant>("q_post_rope", qn.view({cfg_.q_size, total}), s);
                 debug_probe<Variant>("k_post_rope", kn.view({cfg_.kv_size, total}), s);
 
@@ -2151,11 +2151,11 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                                    sizeof(std::int32_t),
                                                cudaMemcpyDeviceToDevice, s));
                 }
-                ops::rope(rope_all, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer), qn, kn,
+                ops::rope(rope_all, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn,
                           s);
                 // A windowed layer looks at fewer keys than the round is sized for;
                 // see layer_sliding_window() in residual_policy.h.
-                const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer);
+                const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer, weights_.geometry);
                 ops::GqaExecutionEnvelope prefill_layer_envelope = prefill_envelope;
                 prefill_layer_envelope.sliding_window                = layer_window;
                 ops::GqaExecutionEnvelope decode_layer_envelope = decode_envelope;
