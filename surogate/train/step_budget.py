@@ -17,15 +17,23 @@ def _starved(num_chunks, chunks_per_step, dataset_tokens, tokens_per_step) -> bo
     """Whether the data cannot fill a single optimizer step.
 
     Chunks are what the loader actually serves, so prefer them: they are
-    counted **per file** with a floor (``NumTokens / seq_len``), which means a
-    dataset of many files each shorter than ``sequence_len`` yields zero chunks
-    while its token total looks healthy. Token count is the fallback for the
-    Ray path, which reaches its loader over RPC and does not expose the chunk
-    count today; it is an approximation that misses exactly that case.
+    counted **per file** with a floor, which means a dataset of many files each
+    shorter than the loader's chunk size yields zero chunks while its token
+    total looks healthy. Token count is the fallback for the Ray path, which
+    reaches its loader over RPC and exposes no chunk count today; it is an
+    approximation that misses exactly that case.
+
+    *chunks_per_step* must be supplied by the caller, not derived here: the
+    loader is constructed with ``chunk_size`` as its unit, not ``sequence_len``
+    (``trainer.py`` passes ``self.chunk_size``), and dispatch-pp redefines the
+    relationship again. Only the caller knows the ratio it actually built.
+
+    A non-positive *dataset_tokens* means "unknown", not "empty": the
+    multimodal path reports ``-1`` when it cannot measure the dataset.
     """
     if num_chunks is not None and chunks_per_step:
         return num_chunks < chunks_per_step
-    if dataset_tokens is not None and tokens_per_step:
+    if dataset_tokens is not None and dataset_tokens > 0 and tokens_per_step:
         return dataset_tokens < tokens_per_step
     return False
 
@@ -35,6 +43,7 @@ def check_step_budget(
     *,
     config=None,
     num_chunks: int | None = None,
+    chunks_per_step: int | None = None,
     dataset_tokens: int | None = None,
     tokens_per_step: int | None = None,
 ) -> None:
@@ -49,11 +58,9 @@ def check_step_budget(
     one epoch holds is normal, the loader wraps between steps. Only a dataset
     too small for a single step is a defect.
 
-    *config* is used only to shape the message and to convert tokens-per-step
-    into chunks-per-step; the two counts come from the loader.
+    *config* is used only to shape the message; every count comes from the
+    caller, which is the only place that knows what the loader was built with.
     """
-    seq_len = getattr(config, "sequence_len", None)
-    chunks_per_step = tokens_per_step // seq_len if (tokens_per_step and seq_len) else None
     starved = _starved(num_chunks, chunks_per_step, dataset_tokens, tokens_per_step)
 
     if max_steps > 0 and not starved:
@@ -62,9 +69,32 @@ def check_step_budget(
     # Covers both causes without claiming a step count the user did not ask
     # for: someone who set max_steps=5 should not be told they asked for 0.
     detail = ""
-    if starved and dataset_tokens is not None and tokens_per_step:
+    chunk_starved = num_chunks is not None and chunks_per_step and num_chunks < chunks_per_step
+    if chunk_starved:
+        # Report the unit that actually ran out. Token totals can look ample
+        # here, because chunks are floored per file.
+        detail = f" The dataset yields {num_chunks:,} loadable chunk(s) but one step needs {chunks_per_step:,}"
+        if dataset_tokens is not None and dataset_tokens > 0:
+            detail += (
+                f"; its {dataset_tokens:,} tokens did not fill them, which usually "
+                f"means individual files are shorter than one chunk"
+            )
+        detail += "."
+    elif starved and dataset_tokens is not None and tokens_per_step:
         detail = f" The dataset holds {dataset_tokens:,} tokens but one step consumes {tokens_per_step:,}"
-        if config is not None:
+        # Only print the factorisation when it actually multiplies out: the Ray
+        # path scales by num_nodes and dispatch-pp redefines the product, so a
+        # blindly printed factor list would contradict the total beside it.
+        if (
+            config is not None
+            and (
+                config.per_device_train_batch_size
+                * config.sequence_len
+                * config.gpus
+                * config.gradient_accumulation_steps
+            )
+            == tokens_per_step
+        ):
             detail += (
                 f" (per_device_train_batch_size={config.per_device_train_batch_size}"
                 f" x sequence_len={config.sequence_len}"

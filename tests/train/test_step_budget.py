@@ -100,11 +100,59 @@ def test_unknown_dataset_size_does_not_raise():
     check_step_budget(5, dataset_tokens=None, tokens_per_step=16384)
 
 
+def test_a_healthy_chunk_count_is_not_rejected():
+    """The ratio must come from the caller, not be derived from sequence_len.
+
+    The loader is built with `chunk_size` (= bsz x seq x gpus) as its unit, so
+    a step needs `total_batch_size // chunk_size` chunks, which is grad_accum.
+    Deriving it as `tokens_per_step // sequence_len` overstates it by
+    `bsz x gpus` and rejects runs that train fine.
+    """
+    check_step_budget(
+        5,
+        config=Cfg(),
+        num_chunks=6,
+        chunks_per_step=4,
+        dataset_tokens=24_577,
+        tokens_per_step=16_384,
+    )
+
+
+def test_unknown_dataset_size_is_not_treated_as_empty():
+    """The multimodal path reports -1 when it cannot measure the dataset."""
+    check_step_budget(5, config=Cfg(), dataset_tokens=-1, tokens_per_step=16_384)
+
+
+def test_chunk_starvation_reports_chunks_not_a_negative_shortfall():
+    """Tokens can look ample when chunks are the thing that ran out, because
+    chunks are floored per file."""
+    with pytest.raises(ZeroStepBudgetError) as exc:
+        check_step_budget(
+            5,
+            config=Cfg(),
+            num_chunks=1,
+            chunks_per_step=4,
+            dataset_tokens=24_577,
+            tokens_per_step=16_384,
+        )
+    msg = str(exc.value)
+    assert "chunk" in msg
+    assert "short by -" not in msg
+
+
+def test_the_factor_list_is_omitted_when_it_would_not_multiply_out():
+    """The Ray path scales by num_nodes, so a blindly printed factorisation
+    would contradict the total beside it."""
+    with pytest.raises(ZeroStepBudgetError) as exc:
+        check_step_budget(0, config=Cfg(), dataset_tokens=500, tokens_per_step=32_768)
+    assert "per_device_train_batch_size=" not in str(exc.value)
+
+
 def test_chunks_beat_tokens_when_the_two_disagree():
     """The token count is a proxy and it misses a real case.
 
     Chunks are counted per file with a floor, so a dataset of many files each
-    shorter than `sequence_len` yields zero chunks while its token total looks
+    shorter than one chunk yields zero chunks while its token total looks
     healthy. Before the chunk predicate this passed the guard and then died in
     the loader with `No more files to load`.
     """
@@ -112,14 +160,15 @@ def test_chunks_beat_tokens_when_the_two_disagree():
         check_step_budget(
             5,
             config=Cfg(),
-            num_chunks=0,  # 100 files x 2048 tokens, seq_len 2048
-            dataset_tokens=204_800,  # ... looks like ample data
+            num_chunks=0,  # 100 files, each shorter than one chunk
+            chunks_per_step=4,
+            dataset_tokens=204_800,  # ... while the token total looks ample
             tokens_per_step=16_384,
         )
 
 
 def test_enough_chunks_passes_even_with_a_modest_token_count():
-    check_step_budget(5, config=Cfg(), num_chunks=8, tokens_per_step=16_384)
+    check_step_budget(5, config=Cfg(), num_chunks=8, chunks_per_step=4, tokens_per_step=16_384)
 
 
 def test_no_negative_shortfall_in_the_message():

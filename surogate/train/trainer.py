@@ -429,6 +429,12 @@ class SurogateTrainerWrapper:
                 prefetch,
             )
 
+        if self.config.from_scratch:
+            # Chinchilla token budget (optimal tokens ≈ 20 × params)
+            self.num_params = estimate_model_parameters(config.model_info.config)
+            self.chinchilla_tokens = 20 * self.num_params
+            self.tokens_per_step = self.total_batch_size
+
         # Determine max_steps
         if config.max_steps > 0:
             self.max_steps = config.max_steps
@@ -461,6 +467,10 @@ class SurogateTrainerWrapper:
             self.max_steps,
             config=config,
             num_chunks=self.train_loader.num_chunks if self.train_loader else None,
+            # The loader was built with chunk_size as its unit, so a step is
+            # this many of them. dispatch-pp redefines total_batch_size, and
+            # this ratio follows it.
+            chunks_per_step=self.total_batch_size // self.chunk_size if self.chunk_size else None,
             dataset_tokens=self.train_loader.num_tokens if self.train_loader else None,
             tokens_per_step=self.total_batch_size,
         )
@@ -567,13 +577,6 @@ class SurogateTrainerWrapper:
                     memcpy_all_gather=config.memcpy_all_gather,
                     memcpy_send_recv=config.memcpy_send_recv,
                 )
-
-        if self.config.from_scratch:
-            # Chinchilla token budget (optimal tokens ≈ 20 × params)
-            self.num_params = estimate_model_parameters(config.model_info.config)
-            self.chinchilla_tokens = 20 * self.num_params
-            self.tokens_per_step = self.total_batch_size
-
 
         # Apply warmup_ratio if warmup_steps is 0
         self.warmup_steps = config.warmup_steps
