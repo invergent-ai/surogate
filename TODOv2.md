@@ -252,13 +252,37 @@ stored once.
    `serve/tools/artifact/` is `serve/artifact/`; `serve/tools/` keeps the
    workflows an owner runs by hand (bench, eval, parity, probe, reference,
    smoke, generate). The README above is what is left of that drift.
-10. **[ ] Q6_K down, the one tensor the int8 route did not fix. Not attempted;
-   what an attempt needs first (2026-09-03): the op benchmark
-   (`csrc/src/testing/serve/bench/ops/sparse_moe_bench.cu`) covers the row-split
-   codecs only -- `Q4G64`, `Q5G64`, `Q6G64`, `W8G32` -- so it cannot measure the
-   native K-quant kernels at all. Extending it to the GGML codecs is the first
-   step, because neither idea below can be judged without a measurement that
-   isolates this kernel.** 688 µs against
+10. **[ ] Q6_K down. Measured and root-caused 2026-09-03; the fix is written
+   down below and not built.** The op benchmark now carries the native codecs
+   (`--codec q4_k-q4_k`, `--codec q4_k-q6_k`), which it did not before -- it
+   measured only the formats the converter produces. One 5090, 256 unique
+   experts, warm, median of three:
+
+   | tokens | q4_k-q4_k | q4_k-q6_k |
+   |---|---:|---:|
+   | 128 | 518 us | 999 us |
+   | 512 | 655 us | 1,346 us |
+   | 1024 | 764 us | 1,178 us |
+
+   So Q6_K down roughly **doubles the whole MoE body**, a larger gap than the
+   layer-level 688-vs-337 us recorded before, and it reproduces in seconds
+   rather than needing a 22 GB model. The kernel runs at 21.9 % of peak
+   bandwidth where the Q4_K one reaches 38.9 %.
+   **Why, exactly.** A Q6_K block is 210 bytes, so block `b` starts at a
+   16-byte misalignment of `2b mod 16`, cycling with period eight. `cp_async`
+   needs 4-, 8- or 16-byte alignment, so this codec sets `kCpAsync = false` and
+   stages its 96-byte tile as **48 two-byte scalar loads** where every other
+   codec issues 6 sixteen-byte async copies. That is the whole gap; the two
+   `m16n8k16` MMAs the sixteen-wide scales force are the smaller half.
+   **The fix that follows from it.** Within a block the chunks are 16 bytes
+   apart, so a tile's misalignment `off` is constant across its chunks. Stage
+   seven aligned 16-byte chunks from `src & ~15` instead of six from `src`, and
+   the tile's bytes land at shared offset `off`; the shared tile stride is
+   already 112 bytes for the int8 route, so it fits. The consumer then reads
+   `__funnelshift_r(w[0], w[1], 8 * ((off + byte) & 3))` over two aligned words
+   instead of one unaligned one -- twice the shared traffic to remove seven
+   eighths of the global staging. `off` varies per row, so the shift is
+   per-thread and must stay branchless. 688 µs against
    the row-split kernel's 337, where Q4_K and Q5_K now beat theirs (498/608 and
    316/335). It is `routed_down` on 3 of 40 layers, so it costs ~1 ms of a
    35 ms round. The cause is structural: Q6_K's scales cover sixteen values, so
