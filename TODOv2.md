@@ -218,10 +218,18 @@ stored once.
    has no runtime handle -- the split projection payload would have to carry it.
    `csrc/src/serve/targets/` now holds one directory per architecture:
    gemma3, llama, qwen3, qwen3_5, qwen3_6_27b, qwen3_6_35b_a3b, qwen4exp.
-7. **[ ] M4 — unify weight loading with the trainer.** Serve's `recipe.py` +
-   `inventory.py` per target restate what the trainer's `hf_mapping` DSL already
-   declares (`fuse`, `split`, `stack_experts`); the trainer's
-   `SafeTensorsReader` is the better reader (multi-shard, GDS, strided).
+7. **[ ] M4 — unify weight loading with the trainer, still true but smaller
+   than it was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per
+   target restate what the trainer's declarations in `surogate/dsl/models/`
+   already say. Both sides describe the same nineteen architectures: the DSL has
+   `qwen3.py`, `qwen3_5.py`, `llama.py`, `gemma3.py` and fifteen more, and serve
+   has a recipe per converter -- 4,468 lines of them.
+   What changed today is the shape of the remaining duplication. The recipes no
+   longer have to restate *dimensions*, because the artifact carries them and the
+   binder validates against them; what they still restate is the *mapping* --
+   which checkpoint tensor becomes which artifact object, and how fused objects
+   are assembled. That is the part worth unifying, and it is the part the DSL's
+   `hf_mapping` already spells out.
 8. **[x] K5c — fused K-quant GDN projection-and-convolution: closed, negative
    (2026-09-03).** Built and measured; it costs more in kernel launches than it
    saves in bandwidth, so it was left off and the code is not in the tree. A
@@ -244,7 +252,13 @@ stored once.
    `serve/tools/artifact/` is `serve/artifact/`; `serve/tools/` keeps the
    workflows an owner runs by hand (bench, eval, parity, probe, reference,
    smoke, generate). The README above is what is left of that drift.
-10. **[ ] Q6_K down, the one tensor the int8 route did not fix.** 688 µs against
+10. **[ ] Q6_K down, the one tensor the int8 route did not fix. Not attempted;
+   what an attempt needs first (2026-09-03): the op benchmark
+   (`csrc/src/testing/serve/bench/ops/sparse_moe_bench.cu`) covers the row-split
+   codecs only -- `Q4G64`, `Q5G64`, `Q6G64`, `W8G32` -- so it cannot measure the
+   native K-quant kernels at all. Extending it to the GGML codecs is the first
+   step, because neither idea below can be judged without a measurement that
+   isolates this kernel.** 688 µs against
    the row-split kernel's 337, where Q4_K and Q5_K now beat theirs (498/608 and
    316/335). It is `routed_down` on 3 of 40 layers, so it costs ~1 ms of a
    35 ms round. The cause is structural: Q6_K's scales cover sixteen values, so
