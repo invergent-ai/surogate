@@ -147,7 +147,7 @@ def _gguf_fingerprint(path: Path) -> str:
     return h.hexdigest()[:24]
 
 
-def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
+def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) -> Path:
     """GGUF → temp HF dir (dequant BF16) → vendored converter → cached weights.
 
     v0 bridge (surogate/serve/gguf/bridge.py): correctness inherits the converter's
@@ -165,7 +165,7 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     # so a hit returns without touching the GGUF — gguf-py's eager KV parse
     # costs ~10s on a 250k-token vocabulary and must stay off this path.
     fp = _gguf_fingerprint(gguf_path)
-    for cached in cache_dir().glob(f"*-gguf-{fp}.sinfer"):
+    for cached in cache_dir().glob(f"*-gguf-{fp}.sinfer") if reuse_cache else ():
         if cached.is_file() and cached.stat().st_size > 0:
             echo(f"surogate serve: using cached engine weights ({cached.name})")
             return cached
@@ -436,7 +436,8 @@ def _encoder_frontend(gguf_path: Path, frontend: str | None) -> Path:
     )
 
 
-def ensure_encoder_weights(spec: str, *, frontend: str | None = None, echo=print) -> Path:
+def ensure_encoder_weights(spec: str, *, frontend: str | None = None,
+                           reuse_cache: bool = True, echo=print) -> Path:
     """Resolve `spec` to encoder-loadable weights, converting through the cache.
 
     Accepts an internal artifact (passthrough) or a `.gguf` file. Raises
@@ -464,7 +465,7 @@ def ensure_encoder_weights(spec: str, *, frontend: str | None = None, echo=print
 
     fp = _gguf_fingerprint(gguf_path)
     out = cache_dir() / f"{key}-gguf-{fp}.sinfer"
-    if out.is_file() and out.stat().st_size > 0:
+    if reuse_cache and out.is_file() and out.stat().st_size > 0:
         echo(f"surogate serve: using cached encoder weights ({out.name})")
         return out
 
@@ -486,7 +487,7 @@ def ensure_encoder_weights(spec: str, *, frontend: str | None = None, echo=print
     return out
 
 
-def ensure_engine_weights(spec: str, *, echo=print) -> Path:
+def ensure_engine_weights(spec: str, *, reuse_cache: bool = True, echo=print) -> Path:
     """Resolve `spec` (safetensors dir | HF repo id | GGUF | internal artifact)
     to an engine-loadable weights file, converting through the transparent
     cache when needed. Raises SystemExit with a clear message on refusal."""
@@ -497,7 +498,7 @@ def ensure_engine_weights(spec: str, *, echo=print) -> Path:
         return Path(spec)
 
     if kind == "gguf":
-        return _ensure_from_gguf(Path(spec).resolve(), echo=echo)
+        return _ensure_from_gguf(Path(spec).resolve(), reuse_cache=reuse_cache, echo=echo)
 
     if kind == "hf_repo_id":
         echo(f"surogate serve: resolving Hugging Face repo '{spec}'...")
@@ -526,7 +527,7 @@ def ensure_engine_weights(spec: str, *, echo=print) -> Path:
 
     fp = source_fingerprint(model_dir)
     out = cache_dir() / f"{target.key}-{fp}.sinfer"
-    if out.is_file() and out.stat().st_size > 0:
+    if reuse_cache and out.is_file() and out.stat().st_size > 0:
         echo(f"surogate serve: using cached engine weights ({out.name})")
         return out
     return _run_converter_cached(model_dir, out, echo=echo)

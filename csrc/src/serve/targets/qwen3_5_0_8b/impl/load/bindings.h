@@ -99,6 +99,13 @@ struct TextLayerPlan {
 };
 
 struct MtpPlan {
+    /// The five matrices of the draft block, bound at whatever format the artifact
+    /// declares. A K-quant GGUF that keeps its nextn tensors quantises them like every
+    /// other matrix, and demanding one format here refused such a file for no reason the
+    /// kernels have: they dispatch on the weight's qtype.
+    WeightPlan input_projection_w;
+    WeightPlan query_key_gate_value_w;
+    WeightPlan output_w;
     artifact::ObjectHandle input_projection;
     artifact::ObjectHandle embedding_norm;
     artifact::ObjectHandle hidden_norm;

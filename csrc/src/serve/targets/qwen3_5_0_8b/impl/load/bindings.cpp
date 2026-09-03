@@ -78,6 +78,16 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
 // A linear or table object bound by shape alone: the stored format is read from the
 // artifact (W8 from a BF16 conversion, a GGML K-quant from a GGUF served natively) and
 // materialized_weight builds the Weight the ops dispatch on.
+/// A matrix at whatever format the artifact declares, with an explicit placement: the draft
+/// block is bound but not materialised when speculation is off.
+WeightPlan bind_linear_weight_at(artifact::Binder& binder, std::string_view name,
+                                 std::int32_t rows, std::int32_t columns,
+                                 artifact::TensorPlacement placement) {
+    const artifact::LinearBinding binding =
+        artifact::bind_linear(binder, name, rows, columns, placement);
+    return WeightPlan{.object = binding.object, .format = binding.format};
+}
+
 WeightPlan bind_linear_weight(artifact::Binder& binder, std::string_view name,
                               std::initializer_list<std::uint64_t> shape) {
     if (shape.size() != 2) { throw std::logic_error("bind_linear_weight: rank-two shape"); }
@@ -509,25 +519,31 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
     if (out.has_mtp) {
-    out.mtp.input_projection =
-        bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {g.hidden, g.query_size()});
+    // The matrices take whatever format the artifact declares; the norms are BF16 in every
+    // export. `bind_linear` is the same call the text layers use, so a K-quant draft block
+    // binds exactly like a K-quant layer.
+    out.mtp.input_projection_w =
+        bind_linear_weight_at(binder, "mtp/input_projection", g.hidden, g.query_size(),
+                              mtp_placement);
+    out.mtp.input_projection = out.mtp.input_projection_w.object;
     out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {g.hidden});
     out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {g.hidden});
     out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {g.hidden});
-    out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
-                                            NumericFormat::W8G32_F16S, {g.mtp_attention_input_rows(), g.hidden});
+    out.mtp.query_key_gate_value_w =
+        bind_linear_weight_at(binder, "mtp/layer/attention/query_key_gate_value",
+                              g.mtp_attention_input_rows(), g.hidden, mtp_placement);
+    out.mtp.query_key_gate_value = out.mtp.query_key_gate_value_w.object;
     out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {g.head_dim});
     out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {g.head_dim});
-    out.mtp.output =
-        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {g.hidden, g.query_size()});
+    out.mtp.output_w = bind_linear_weight_at(binder, "mtp/layer/attention/output", g.hidden,
+                                            g.query_size(), mtp_placement);
+    out.mtp.output   = out.mtp.output_w.object;
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {g.hidden});
-    out.mtp.mlp.gate_up = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {2 * g.intermediate, g.hidden}),
-        .format = NumericFormat::W8G32_F16S};
-    out.mtp.mlp.down = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {g.hidden, g.intermediate}),
-        .format = NumericFormat::W8G32_F16S};
+    out.mtp.mlp.gate_up = bind_linear_weight_at(binder, "mtp/layer/mlp/gate_up",
+                                               2 * g.intermediate, g.hidden, mtp_placement);
+    out.mtp.mlp.down    = bind_linear_weight_at(binder, "mtp/layer/mlp/down", g.hidden,
+                                               g.intermediate, mtp_placement);
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {g.hidden});
     }
 
@@ -619,7 +635,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     if (plan.features.mtp() && plan.has_mtp) {
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(
-            backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, g.hidden, g.query_size());
+            backing, plan.mtp.input_projection, plan.mtp.input_projection_w.format, g.hidden,
+            g.query_size());
         mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
                                                              NumericFormat::BF16, {g.hidden});
         mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,
@@ -627,7 +644,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
                                                              NumericFormat::BF16, {g.hidden});
         mtp.attention.packed = artifact::materialized_weight(
-            backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, g.mtp_attention_input_rows(), g.hidden);
+            backing, plan.mtp.query_key_gate_value, plan.mtp.query_key_gate_value_w.format,
+            g.mtp_attention_input_rows(), g.hidden);
         // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv rows
         // (q 2048 | k 512 | gate 2048 | v 512), not the 27B extents.
         mtp.attention.query       = row_view(mtp.attention.packed, 0, g.query_size());
@@ -638,8 +656,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {g.head_dim});
         mtp.key_norm =
             artifact::materialized_tensor(backing, plan.mtp.key_norm, NumericFormat::BF16, {g.head_dim});
-        mtp.output              = artifact::materialized_weight(backing, plan.mtp.output,
-                                                                NumericFormat::W8G32_F16S, g.hidden, g.query_size());
+        mtp.output              = artifact::materialized_weight(
+            backing, plan.mtp.output, plan.mtp.output_w.format, g.hidden, g.query_size());
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {g.hidden});
         mtp.post_mixer = load_mlp(plan.mtp.mlp, backing, g);

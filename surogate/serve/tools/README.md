@@ -51,9 +51,9 @@ Inspect either result:
 python -m surogate.serve.artifact.inspect out/qwen3_6_27b.sinfer --objects
 ```
 
-The exact source revisions, inventories, formats, and conversion recipes are recorded in
-[`docs/maintainer/`](../docs/maintainer/). Published users download the completed artifacts from
-Hugging Face instead of running these workflows.
+The inventories, formats and conversion recipes live beside the converters themselves, in
+[`../convert/`](../convert/). Nobody downloads an artifact: `surogate serve model.gguf` reads
+the GGUF where it lies and builds whatever index it needs in a local cache.
 
 ## Python references and parity
 

@@ -36,6 +36,7 @@ Common server options (full list: surogate serve --engine-help):
   --kv-capacity N|auto           KV pool size ('auto' = free VRAM minus 1 GiB)
   --max-num-seqs N               concurrent lanes (default 1)
   --kv-cache-dtype fp8|bf16      KV cache precision (default fp8)
+  --no-cache                     rebuild the conversion cache instead of reusing it
   --spec mtp --draft-tokens 3    speculative decoding
 
 --generate runs one shot and has its own spellings for a few options
@@ -113,6 +114,12 @@ def maybe_exec_serve() -> None:
         )
         sys.exit(127)
 
+    # `--no-cache` rebuilds the index instead of reusing one that is already there. It is
+    # for a converter change: the cache is keyed on the *checkpoint*, so editing a recipe
+    # leaves the stale entry looking valid. It is consumed here, not passed to the engine.
+    reuse_cache = "--no-cache" not in rest
+    rest = [a for a in rest if a != "--no-cache"]
+
     # Resolve the model spec (first non-flag argument) through the ingest
     # layer: safetensors dirs / HF repo ids convert transparently into the
     # internal cache; GGUF and unsupported models get clear messages.
@@ -144,12 +151,13 @@ def maybe_exec_serve() -> None:
         from surogate.serve.ingest import ensure_encoder_weights
 
         resolved = ensure_encoder_weights(rest[model_index], frontend=frontend,
+                                          reuse_cache=reuse_cache,
                                           echo=lambda m: print(m, file=sys.stderr))
         rest = [*rest[:model_index], str(resolved), *rest[model_index + 1:]]
     elif model_index is not None:
         from surogate.serve.ingest import ensure_engine_weights
 
-        resolved = ensure_engine_weights(rest[model_index],
+        resolved = ensure_engine_weights(rest[model_index], reuse_cache=reuse_cache,
                                          echo=lambda m: print(m, file=sys.stderr))
         rest = [*rest[:model_index], str(resolved), *rest[model_index + 1:]]
 
