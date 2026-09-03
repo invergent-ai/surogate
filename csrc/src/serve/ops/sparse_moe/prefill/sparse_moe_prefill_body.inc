@@ -733,20 +733,36 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
 /// Q6_K, whose 210-byte block leaves consecutive blocks only two-byte aligned.
 template <class Codec>
 __device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const void* row_blocks, int tile,
-                                                int chunk_or_unit) {
+                                                int unit) {
     if constexpr (Codec::kCpAsync) {
-        cp_async<16, Cache::cg>(dst + 16 * chunk_or_unit,
-                                Codec::chunk_source(row_blocks, tile, chunk_or_unit));
+        cp_async<16, Cache::cg>(dst + 16 * unit, Codec::chunk_source(row_blocks, tile, unit));
     } else {
-        const auto* src = reinterpret_cast<const std::uint16_t*>(
-            Codec::chunk_source(row_blocks, tile, chunk_or_unit / 8));
-        auto* out = reinterpret_cast<std::uint16_t*>(dst + 16 * (chunk_or_unit / 8));
-        out[chunk_or_unit % 8] = src[chunk_or_unit % 8];
+        const auto* src =
+            reinterpret_cast<const std::uint16_t*>(Codec::chunk_source(row_blocks, tile, unit / 8));
+        auto* out              = reinterpret_cast<std::uint16_t*>(dst + 16 * (unit / 8));
+        out[unit % 8] = src[unit % 8];
+    }
+}
+
+/// The superblock header of the tile's block, staged into the same double buffer as the body.
+/// Holding all of a row's headers instead cost eight kilobytes of shared memory on a 2048-wide
+/// gate/up -- enough to lose a block per SM -- and re-read them through an uncoalesced prologue
+/// on every work item.
+template <class Codec>
+__device__ __forceinline__ void stage_ggml_header(std::uint8_t* dst, const void* row_blocks,
+                                                  int tile, int unit) {
+    const std::uint8_t* src = Codec::header_source(row_blocks, tile / ggml::kTilesPerBlock);
+    if constexpr (Codec::kCpAsync) {
+        cp_async<16, Cache::cg>(dst + 16 * unit, src + 16 * unit);
+    } else {
+        reinterpret_cast<std::uint16_t*>(dst)[unit] =
+            reinterpret_cast<const std::uint16_t*>(src)[unit];
     }
 }
 
 template <class Codec, int ExpertWarps, int ExpertBN>
-__global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_gate_up_kernel(
+__global__ __launch_bounds__(ExpertWarps * 32, Codec::kMinBlocks) void
+sparse_moe_prefill_ggml_gate_up_kernel(
     const __nv_bfloat16* __restrict__ gathered, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
     const int* __restrict__ slot_of_expert, const int* __restrict__ route_job_count,
@@ -754,13 +770,15 @@ __global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_g
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int BlocksPerRow  = kHidden / ggml::QK_K;
     constexpr int TileUnits     = Codec::kCpAsync ? Codec::kTileBytes / 16 : Codec::kTileBytes / 2;
+    constexpr int HeaderUnits =
+        Codec::kCpAsync ? Codec::kHeaderBytes / 16 : Codec::kHeaderBytes / 2;
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
     constexpr int WarpNT        = WarpCols / 8;
     static_assert(ExpertBN % ExpertWarps == 0 && WarpCols % 8 == 0);
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * Codec::kTileBytes];
-    __shared__ __align__(16) std::uint8_t Hdr[kExpertBM * BlocksPerRow * Codec::kHeaderBytes];
+    __shared__ __align__(16) std::uint8_t Hdr[kExpertStages][kExpertBM * Codec::kHeaderBytes];
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -800,19 +818,6 @@ __global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_g
                                 Codec::kBlockBytes;
         };
 
-        // Every tile of a superblock reads the same header, so the row block's headers are staged
-        // once rather than four times over. Scalar: the run is small and its stride is a block.
-        auto stage_headers = [&] {
-            constexpr int PerRow = BlocksPerRow * Codec::kHeaderBytes;
-            for (int item = tid; item < kExpertBM * PerRow; item += ExpertThreads) {
-                const int row  = item / PerRow;
-                const int off  = item - row * PerRow;
-                const int b    = off / Codec::kHeaderBytes;
-                const int byte = off - b * Codec::kHeaderBytes;
-                Hdr[item]      = Codec::header_source(row_base(row), b)[byte];
-            }
-        };
-
         auto stage_inputs = [&](int stage, int kt) {
             const int k0 = kt * kExpertBK;
             for (int item = tid; item < ExpertBN * (kExpertBK / 8); item += ExpertThreads) {
@@ -831,19 +836,31 @@ __global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_g
                 const int unit = item - row * TileUnits;
                 stage_ggml_tile<Codec>(&Cr[stage][row * Codec::kTileBytes], row_base(row), kt, unit);
             }
+            // Four tiles share a superblock, so its header is staged when the superblock
+            // changes rather than once per tile -- a third of this kernel's weight traffic
+            // otherwise. The buffer is indexed by the superblock's parity, which differs from
+            // the one being decoded exactly when a new superblock is being staged.
+            if (kt % ggml::kTilesPerBlock == 0) {
+                const int slot = (kt / ggml::kTilesPerBlock) & 1;
+                for (int item = tid; item < kExpertBM * HeaderUnits; item += ExpertThreads) {
+                    const int row  = item / HeaderUnits;
+                    const int unit = item - row * HeaderUnits;
+                    stage_ggml_header<Codec>(&Hdr[slot][row * Codec::kHeaderBytes], row_base(row),
+                                             kt, unit);
+                }
+            }
         };
 
         auto decode_weight = [&](int stage, int kt) {
             for (int row = warp; row < kExpertBM; row += ExpertWarps) {
                 const __nv_bfloat162 value = Codec::decode(
                     &Cr[stage][row * Codec::kTileBytes],
-                    &Hdr[(row * BlocksPerRow + kt / ggml::kTilesPerBlock) * Codec::kHeaderBytes],
-                    lane, kt % ggml::kTilesPerBlock);
+                    &Hdr[(kt / ggml::kTilesPerBlock) & 1][row * Codec::kHeaderBytes], lane,
+                    kt % ggml::kTilesPerBlock);
                 store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
             }
         };
 
-        stage_headers();
 #pragma unroll
         for (int stage = 0; stage < kExpertStages; ++stage) {
             stage_inputs(stage, stage);
@@ -925,7 +942,8 @@ __global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_g
 }
 
 template <class Codec, int ExpertWarps, int ExpertBN>
-__global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_down_kernel(
+__global__ __launch_bounds__(ExpertWarps * 32, Codec::kMinBlocks) void
+sparse_moe_prefill_ggml_down_kernel(
     const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
     const int* __restrict__ slot_of_expert, const int* __restrict__ route_job_count,
@@ -933,10 +951,12 @@ __global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_d
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int BlocksPerRow  = kIntermediate / ggml::QK_K;
     constexpr int TileUnits     = Codec::kCpAsync ? Codec::kTileBytes / 16 : Codec::kTileBytes / 2;
+    constexpr int HeaderUnits =
+        Codec::kCpAsync ? Codec::kHeaderBytes / 16 : Codec::kHeaderBytes / 2;
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * Codec::kTileBytes];
-    __shared__ __align__(16) std::uint8_t Hdr[kExpertBM * BlocksPerRow * Codec::kHeaderBytes];
+    __shared__ __align__(16) std::uint8_t Hdr[kExpertStages][kExpertBM * Codec::kHeaderBytes];
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -972,17 +992,6 @@ __global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_d
                    static_cast<std::int64_t>(global_row) * BlocksPerRow * Codec::kBlockBytes;
         };
 
-        auto stage_headers = [&] {
-            constexpr int PerRow = BlocksPerRow * Codec::kHeaderBytes;
-            for (int item = tid; item < kExpertBM * PerRow; item += ExpertThreads) {
-                const int row  = item / PerRow;
-                const int off  = item - row * PerRow;
-                const int b    = off / Codec::kHeaderBytes;
-                const int byte = off - b * Codec::kHeaderBytes;
-                Hdr[item]      = Codec::header_source(row_base(row), b)[byte];
-            }
-        };
-
         auto stage_inputs = [&](int stage, int kt) {
             const int k0 = kt * kExpertBK;
             for (int item = tid; item < ExpertBN * (kExpertBK / 8); item += ExpertThreads) {
@@ -1001,19 +1010,31 @@ __global__ __launch_bounds__(ExpertWarps * 32, 2) void sparse_moe_prefill_ggml_d
                 const int unit = item - row * TileUnits;
                 stage_ggml_tile<Codec>(&Cr[stage][row * Codec::kTileBytes], row_base(row), kt, unit);
             }
+            // Four tiles share a superblock, so its header is staged when the superblock
+            // changes rather than once per tile -- a third of this kernel's weight traffic
+            // otherwise. The buffer is indexed by the superblock's parity, which differs from
+            // the one being decoded exactly when a new superblock is being staged.
+            if (kt % ggml::kTilesPerBlock == 0) {
+                const int slot = (kt / ggml::kTilesPerBlock) & 1;
+                for (int item = tid; item < kExpertBM * HeaderUnits; item += ExpertThreads) {
+                    const int row  = item / HeaderUnits;
+                    const int unit = item - row * HeaderUnits;
+                    stage_ggml_header<Codec>(&Hdr[slot][row * Codec::kHeaderBytes], row_base(row),
+                                             kt, unit);
+                }
+            }
         };
 
         auto decode_weight = [&](int stage, int kt) {
             for (int row = warp; row < kExpertBM; row += ExpertWarps) {
                 const __nv_bfloat162 value = Codec::decode(
                     &Cr[stage][row * Codec::kTileBytes],
-                    &Hdr[(row * BlocksPerRow + kt / ggml::kTilesPerBlock) * Codec::kHeaderBytes],
-                    lane, kt % ggml::kTilesPerBlock);
+                    &Hdr[(kt / ggml::kTilesPerBlock) & 1][row * Codec::kHeaderBytes], lane,
+                    kt % ggml::kTilesPerBlock);
                 store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
             }
         };
 
-        stage_headers();
 #pragma unroll
         for (int stage = 0; stage < kExpertStages; ++stage) {
             stage_inputs(stage, stage);

@@ -35,6 +35,9 @@ struct GgmlQ4KPrefill {
     static constexpr int kHeaderBytes = 2 * sizeof(__half) + K_SCALE_SIZE; // per row, per block
     static constexpr int kBlockBytes  = sizeof(block_q4_K);     // 144: a multiple of sixteen,
     static constexpr bool kCpAsync    = true;                   // so `cp_async<16>` is in bounds
+    /// Its header is one aligned sixteen-byte run, and its tile the narrowest of the three, so
+    /// this is the only K-quant whose gate/up fits three blocks to an SM.
+    static constexpr int kMinBlocks   = 3;
 
     /// `blocks` is already advanced to the row's first superblock.
     __device__ static __forceinline__ const std::uint8_t* tile_source(const void* blocks,
@@ -88,6 +91,7 @@ struct GgmlQ5KPrefill {
         2 * sizeof(__half) + K_SCALE_SIZE + QK_K / 8; // dm, scales, qh
     static constexpr int kBlockBytes = sizeof(block_q5_K); // 176, also a multiple of sixteen
     static constexpr bool kCpAsync   = true;
+    static constexpr int kMinBlocks  = 2; // its header carries qh as well, so the tile costs more
 
     __device__ static __forceinline__ const std::uint8_t* tile_source(const void* blocks,
                                                                       int tile) {
@@ -146,6 +150,7 @@ struct GgmlQ6KPrefill {
     /// Q6_K through its two-byte-aligned accessors for the same reason.
     static constexpr int kBlockBytes = sizeof(block_q6_K);
     static constexpr bool kCpAsync   = false;
+    static constexpr int kMinBlocks  = 2;
 
     __device__ static __forceinline__ const std::uint8_t* tile_source(const void* blocks,
                                                                       int tile) {
