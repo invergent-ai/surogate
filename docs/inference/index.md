@@ -105,12 +105,20 @@ Recognised automatically from the checkpoint:
 
 | Family | Sizes | Notes |
 |---|---|---|
-| Qwen3.5 | 0.8B, 2B, 4B | dense; NVFP4 for the 4B |
+| Qwen3 | any | dense |
+| Llama | any | dense |
+| Gemma 3 | any | dense; sliding-window attention |
+| Qwen3.5 | any | dense; NVFP4 for the 4B |
 | Qwen3.6 | 27B | dense; BF16 and NVFP4 |
 | Qwen3.6 MoE | 35B-A3B | routed experts; optional draft head |
 | Qwen3.8 | 27B | BF16 and NVFP4 |
 | Qwen3.8 Flash-Next | MoE | GGUF source; the CPU-offload tier |
 | EmbeddingGemma | 300M | encoder; GPU and CPU |
+
+"Any" means what it says. A checkpoint states its own dimensions in the index built beside
+it, and the engine binds against those, so a family listed that way serves whatever size you
+hand it -- Qwen3-1.7B is served by the same code as Qwen3-0.6B, with nothing to register. The
+sizes named for the other families are the ones their loaders are still written around.
 
 An unrecognised model is refused at load with the reason printed, never served incorrectly.
 

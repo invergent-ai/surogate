@@ -52,6 +52,7 @@ The most common ones; `--engine-help` has the rest.
 | `--elastic-kv-overcommit` | off | Let co-resident models share the GPU's idle KV: each model is guaranteed only its `--kv-capacity`, and every page past that is admitted against the memory actually free |
 | `--kv-cache-dtype auto\|fp8\|bf16\|int8` | `fp8` | Cache precision; `auto` = fp8 (e4m3) |
 | `--kv-cache-dtype-skip-layers L,...` | none | Hold these full-attention layers at BF16 |
+| `--no-cache` | off | Rebuild the index beside the model instead of reusing one |
 | `--no-prefix-reuse` | off | Disable compatible-prefix caching |
 | `--rewrite-checkpoints` | off | Keep a per-lane GDN checkpoint so an edited last turn resumes from its prefix |
 | `--enforce-eager` | off | Skip CUDA graph capture (debugging) |
