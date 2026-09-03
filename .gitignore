@@ -39,3 +39,5 @@ watch-run.yaml*
 csrc/build*
 models/**
 design/
+
+.env
