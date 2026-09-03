@@ -501,6 +501,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                family::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
+    // The checkpoint's own dimensions, where it states them: absent members keep the
+    // target's compiled value, so an artifact written before the member existed binds
+    // exactly as it did.
+    out.geometry = family::TextGeometry::declared<TextConfig>(binder.reader().geometry());
     out.frontend     = family::bind_frontend_resources(binder);
     out.features     = features;
 

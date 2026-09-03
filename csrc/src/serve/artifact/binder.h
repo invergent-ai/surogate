@@ -51,6 +51,10 @@ public:
     // surogate vendor patch (PATCHES.md #15): presence probe for optional
     // object families (e.g. targets whose artifacts may omit the MTP block).
     [[nodiscard]] bool has(std::string_view name) const noexcept;
+    /// The artifact being bound. A target reads its declared `geometry` from here: the
+    /// dimensions belong to the checkpoint, and the binder is where the checkpoint and the
+    /// target's contract meet.
+    [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
 
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
