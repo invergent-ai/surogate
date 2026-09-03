@@ -11,6 +11,8 @@
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/ggml/ggml_embedding.h"
 #include "ops/linear/ggml/ggml_linear.h"
+#include "ops/linear/ggml/ggml_moe.h"
+#include "ops/linear/ggml/ggml_q8_1.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -337,6 +339,56 @@ int run_gather(const Fixture& f, bool through_wrapper, void* d_blocks) {
     return ok ? 0 : 1;
 }
 
+// The routed-expert GEMV: the same weight read as [experts, rows, k], each token routed to
+// `slots` experts by an id table, against the same reference the plain GEMV is held to.
+int run_moe(const Fixture& f, void* d_blocks, void* d_scratch, std::size_t scratch_bytes) {
+    constexpr int kExperts = 4, kTokens = 3, kSlots = 2;
+    const int k = f.k, rows = f.n / kExperts;
+    if (rows <= 0 || f.n % kExperts != 0) { return 0; }
+    const auto x = random_activation(k, kTokens, 31337u);
+    const std::vector<double> y = quantised_activation(x, k, kTokens);
+    std::mt19937 rng(5150);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(kTokens) * kSlots);
+    for (auto& id : ids) { id = static_cast<std::int32_t>(rng() % kExperts); }
+
+    std::vector<double> ref(static_cast<std::size_t>(kTokens) * kSlots * rows, 0.0);
+    for (int t = 0; t < kTokens; ++t) {
+        for (int slot = 0; slot < kSlots; ++slot) {
+            const int expert = ids[static_cast<std::size_t>(t) * kSlots + slot];
+            for (int row = 0; row < rows; ++row) {
+                const float* w  = &f.dequant[(static_cast<std::size_t>(expert) * rows + row) * k];
+                const double* yt = &y[static_cast<std::size_t>(t) * k];
+                double acc = 0.0;
+                for (int i = 0; i < k; ++i) { acc += static_cast<double>(w[i]) * yt[i]; }
+                ref[(static_cast<std::size_t>(t) * kSlots + slot) * rows + row] = acc;
+            }
+        }
+    }
+    __nv_bfloat16* d_x  = nullptr;
+    std::int32_t* d_ids = nullptr;
+    float* d_out        = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&d_ids, ids.size() * sizeof(std::int32_t)));
+    CHECK_CUDA(cudaMalloc(&d_out, ref.size() * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_ids, ids.data(), ids.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    gg::quantize_q8_1_launch(d_x, k, kTokens, static_cast<gg::block_q8_1*>(d_scratch), nullptr);
+    gg::moe_gemv_launch(f.type, d_blocks, rows, k, static_cast<gg::block_q8_1*>(d_scratch), d_ids,
+                        kTokens, kSlots, kSlots, d_out, nullptr);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::vector<float> got(ref.size());
+    CHECK_CUDA(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaFree(d_x));
+    CHECK_CUDA(cudaFree(d_ids));
+    CHECK_CUDA(cudaFree(d_out));
+    const Score sc = score(got, ref);
+    const bool ok  = sc.rel_l2 <= 2e-5 && sc.max_abs <= 2e-4 * sc.max_ref;
+    std::printf("  %-5s %-10s [%6d,%5d] %-22s %dx%d routed: rel_l2=%.2e  %s\n", gg::type_name(f.type),
+                f.label.c_str(), rows, k, "moe_gemv (4 experts)", kTokens, kSlots, sc.rel_l2,
+                ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main() {
@@ -390,6 +442,10 @@ int main() {
             failures += run_gather(f, false, d_blocks);
             failures += run_gather(f, true, d_blocks);
             cases += 2;
+            if (!big) {
+                failures += run_moe(f, d_blocks, d_scratch, scratch_bytes);
+                ++cases;
+            }
             CHECK_CUDA(cudaFree(d_scratch));
             CHECK_CUDA(cudaFree(d_blocks));
         }
