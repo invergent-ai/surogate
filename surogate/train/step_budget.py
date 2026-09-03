@@ -1,104 +1,80 @@
 """Guard against a run that cannot take a single optimizer step.
 
-The step budget is computed in *tokens*, not rows::
-
-    tokens_per_step = per_device_train_batch_size * sequence_len * gpus
-                      * gradient_accumulation_steps
-    steps_per_epoch = dataset_tokens // tokens_per_step
-
-so a dataset smaller than one step's worth of tokens yields ``0`` and the
-training loop runs zero times. Left unchecked the run then logs
-"Training loop completed successfully after step -1", writes out an
-adapter that never saw a gradient, and reports success — indistinguishable
-from a real run to anyone reading the UI.
+Left unchecked, such a run loops zero times, writes out an adapter that never
+saw a gradient, and reports success, or else dies inside the native dataloader
+with ``No more files to load`` (``csrc/.../dataloader.cpp``) naming neither the
+dataset nor the batch settings. Both are the same config defect: the data is
+smaller than one step. Only the Python side knows the knobs, which is why the
+check lives here rather than in the loader.
 """
-
-from __future__ import annotations
 
 
 class ZeroStepBudgetError(ValueError):
-    """The configured budget yields no optimizer steps."""
+    """The configured budget cannot complete one optimizer step."""
+
+
+def _starved(num_chunks, chunks_per_step, dataset_tokens, tokens_per_step) -> bool:
+    """Whether the data cannot fill a single optimizer step.
+
+    Chunks are what the loader actually serves, so prefer them: they are
+    counted **per file** with a floor (``NumTokens / seq_len``), which means a
+    dataset of many files each shorter than ``sequence_len`` yields zero chunks
+    while its token total looks healthy. Token count is the fallback for the
+    Ray path, which reaches its loader over RPC and does not expose the chunk
+    count today; it is an approximation that misses exactly that case.
+    """
+    if num_chunks is not None and chunks_per_step:
+        return num_chunks < chunks_per_step
+    if dataset_tokens is not None and tokens_per_step:
+        return dataset_tokens < tokens_per_step
+    return False
 
 
 def check_step_budget(
     max_steps: int,
     *,
+    config=None,
+    num_chunks: int | None = None,
     dataset_tokens: int | None = None,
     tokens_per_step: int | None = None,
-    batch_size: int | None = None,
-    sequence_len: int | None = None,
-    gpus: int | None = None,
-    gradient_accumulation_steps: int | None = None,
 ) -> None:
-    """Raise if the run cannot take a full optimizer step.
+    """Raise if the run cannot complete a full optimizer step.
 
-    Two ways that happens, and both must be caught here:
+    Two ways that happens and both must be caught here: the budget resolved to
+    zero, which is what an epochs-based run yields when the floor divide gives
+    0; or the dataset cannot fill one step even though ``max_steps`` was given
+    explicitly. A typed-in number is not evidence the data exists.
 
-    * the budget resolved to zero, which is what an epochs-based run yields
-      when ``dataset_tokens // tokens_per_step`` floors to 0; and
-    * the dataset cannot fill a single step even though ``max_steps`` was
-      given explicitly. A typed-in number is not evidence the data exists,
-      and left unchecked the run dies later in the dataloader with
-      ``No more files to load``, which names neither the dataset nor the
-      batch settings.
+    Deliberately *not* "fewer steps than requested": asking for more steps than
+    one epoch holds is normal, the loader wraps between steps. Only a dataset
+    too small for a single step is a defect.
 
-    Note this is deliberately *not* "fewer steps than requested". Asking for
-    more steps than one epoch holds is normal, the loader wraps. Only a
-    dataset too small for one step is a defect.
-
-    Everything after ``max_steps`` is optional and only shapes the message:
-    the point of the error is to say which knob to turn, since "0 steps" on
-    its own sends people looking at their data when the batch settings are
-    usually what's wrong.
+    *config* is used only to shape the message and to convert tokens-per-step
+    into chunks-per-step; the two counts come from the loader.
     """
-    starved = (
-        dataset_tokens is not None
-        and tokens_per_step
-        and dataset_tokens < tokens_per_step
-    )
+    seq_len = getattr(config, "sequence_len", None)
+    chunks_per_step = tokens_per_step // seq_len if (tokens_per_step and seq_len) else None
+    starved = _starved(num_chunks, chunks_per_step, dataset_tokens, tokens_per_step)
+
     if max_steps > 0 and not starved:
         return
 
+    # Covers both causes without claiming a step count the user did not ask
+    # for: someone who set max_steps=5 should not be told they asked for 0.
     detail = ""
-    if dataset_tokens is not None and tokens_per_step:
-        shortfall = tokens_per_step - dataset_tokens
-        detail = (
-            f" The dataset holds {dataset_tokens:,} tokens but one step "
-            f"consumes {tokens_per_step:,}"
-        )
-        parts = [
-            f"per_device_train_batch_size={batch_size}" if batch_size else "",
-            f"sequence_len={sequence_len}" if sequence_len else "",
-            f"gpus={gpus}" if gpus else "",
-            (
-                f"gradient_accumulation_steps={gradient_accumulation_steps}"
-                if gradient_accumulation_steps else ""
-            ),
-        ]
-        parts = [p for p in parts if p]
-        if parts:
-            detail += " (" + " x ".join(parts) + ")"
-        detail += f", short by {shortfall:,}."
+    if starved and dataset_tokens is not None and tokens_per_step:
+        detail = f" The dataset holds {dataset_tokens:,} tokens but one step consumes {tokens_per_step:,}"
+        if config is not None:
+            detail += (
+                f" (per_device_train_batch_size={config.per_device_train_batch_size}"
+                f" x sequence_len={config.sequence_len}"
+                f" x gpus={config.gpus}"
+                f" x gradient_accumulation_steps={config.gradient_accumulation_steps})"
+            )
+        detail += f", short by {tokens_per_step - dataset_tokens:,}."
 
-    # Two different situations, and telling them apart matters: one is a
-    # budget that resolved to nothing, the other is a budget that was asked
-    # for and cannot be met.
-    if starved and max_steps > 0:
-        headline = (
-            f"The dataset cannot fill a single optimizer step, so the "
-            f"requested {max_steps} step(s) cannot run."
-        )
-    else:
-        headline = (
-            "This configuration trains for 0 optimizer steps, so the run "
-            "would produce an untrained model."
-        )
-
-    # Deliberately no longer suggests setting max_steps. That never let
-    # anyone train: it only swapped this message for the dataloader's
-    # `No more files to load`, since the data is still absent either way.
     raise ZeroStepBudgetError(
-        headline + detail +
-        " Use a larger dataset, a shorter sequence_len, or a smaller "
-        "effective batch (batch size x gradient accumulation)."
+        "This run cannot complete a single optimizer step, so it would produce "
+        "an untrained model." + detail + " Use a larger dataset, a shorter sequence_len, or a smaller effective "
+        "batch (batch size x gradient accumulation)."
     )

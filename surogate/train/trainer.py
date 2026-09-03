@@ -17,8 +17,8 @@ from surogate.train.adapter_init import (
 from surogate.train.early_stopping import EarlyStopping
 from surogate.train.gradient_tracker import GradientTracker
 from surogate.train.loss_guard import LossGuard
-from surogate.train.step_budget import check_step_budget
 from surogate.train.lr_schedule import LRSchedule
+from surogate.train.step_budget import check_step_budget
 from surogate.train.metrics import MoEMetrics, StepMetrics
 from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.phase_detector import PhaseDetector
@@ -429,6 +429,42 @@ class SurogateTrainerWrapper:
                 prefetch,
             )
 
+        # Determine max_steps
+        if config.max_steps > 0:
+            self.max_steps = config.max_steps
+        elif self._train_vision:
+            if self.steps_per_epoch == 0:
+                raise ValueError("train_vision requires max_steps when dataset length is unknown.")
+            self.max_steps = self.steps_per_epoch * self.config.num_epochs
+            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
+        elif config.epoch_adjustment and self.config.from_scratch:
+            # Adjust epochs to reach Chinchilla-optimal token budget
+            chinchilla_epochs = max(1, int(np.ceil(self.chinchilla_tokens / max(self.train_loader.num_tokens, 1))))
+            if chinchilla_epochs != self.config.num_epochs:
+                logger.info(
+                    f"Epoch adjustment: {self.config.num_epochs} -> {chinchilla_epochs} epochs "
+                    f"(Chinchilla budget {self.chinchilla_tokens / 1e9:.1f}B tokens, "
+                    f"dataset {self.train_loader.num_tokens / 1e9:.1f}B tokens)"
+                )
+                self.config.num_epochs = chinchilla_epochs
+            self.max_steps = self.steps_per_epoch * self.config.num_epochs
+            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s) (epoch_adjustment)")
+        else:
+            self.max_steps = self.steps_per_epoch * self.config.num_epochs
+            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
+
+        # Refuse before the expensive setup below rather than after it: this
+        # used to sit past trainer construction, so a config already known to
+        # be unrunnable still paid for the CUDA context, NCCL bring-up and a
+        # full weight import first.
+        check_step_budget(
+            self.max_steps,
+            config=config,
+            num_chunks=self.train_loader.num_chunks if self.train_loader else None,
+            dataset_tokens=self.train_loader.num_tokens if self.train_loader else None,
+            tokens_per_step=self.total_batch_size,
+        )
+
         # Create trainer
         self.start_step = 0
         if config.resume_from_checkpoint:
@@ -538,41 +574,6 @@ class SurogateTrainerWrapper:
             self.chinchilla_tokens = 20 * self.num_params
             self.tokens_per_step = self.total_batch_size
 
-        # Determine max_steps
-        if config.max_steps > 0:
-            self.max_steps = config.max_steps
-        elif self._train_vision:
-            if self.steps_per_epoch == 0:
-                raise ValueError("train_vision requires max_steps when dataset length is unknown.")
-            self.max_steps = self.steps_per_epoch * self.config.num_epochs
-            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
-        elif config.epoch_adjustment and self.config.from_scratch:
-            # Adjust epochs to reach Chinchilla-optimal token budget
-            chinchilla_epochs = max(1, int(np.ceil(self.chinchilla_tokens / max(self.train_loader.num_tokens, 1))))
-            if chinchilla_epochs != self.config.num_epochs:
-                logger.info(
-                    f"Epoch adjustment: {self.config.num_epochs} -> {chinchilla_epochs} epochs "
-                    f"(Chinchilla budget {self.chinchilla_tokens / 1e9:.1f}B tokens, "
-                    f"dataset {self.train_loader.num_tokens / 1e9:.1f}B tokens)"
-                )
-                self.config.num_epochs = chinchilla_epochs
-            self.max_steps = self.steps_per_epoch * self.config.num_epochs
-            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s) (epoch_adjustment)")
-        else:
-            self.max_steps = self.steps_per_epoch * self.config.num_epochs
-            logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
-
-        # A budget of 0 steps must fail here, not sail through the loop and
-        # save an untrained adapter as a "successful" run.
-        check_step_budget(
-            self.max_steps,
-            dataset_tokens=getattr(self.train_loader, "num_tokens", None),
-            tokens_per_step=self.total_batch_size,
-            batch_size=config.per_device_train_batch_size,
-            sequence_len=config.sequence_len,
-            gpus=config.gpus,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-        )
 
         # Apply warmup_ratio if warmup_steps is 0
         self.warmup_steps = config.warmup_steps

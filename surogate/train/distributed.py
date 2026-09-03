@@ -1158,12 +1158,12 @@ class RayDistributedTrainer:
         from surogate.train.gradient_tracker import GradientTracker
         from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
-        from surogate.train.step_budget import check_step_budget
         from surogate.train.metrics import MoEMetrics, StepMetrics
         from surogate.train.moe_monitor import MoEMonitor
         from surogate.train.phase_detector import PhaseDetector
         from surogate.train.plateau_detector import PlateauDetector
         from surogate.train.reporter import training_logger_context
+        from surogate.train.step_budget import check_step_budget
         from surogate.train.training_advisor import TrainingAdvisor
         from surogate.train.training_plot import generate_training_plot
         from surogate.utils.logger import get_logger
@@ -1220,14 +1220,16 @@ class RayDistributedTrainer:
 
         # Same guard as the single-node path: 0 steps must fail loudly
         # rather than complete with an untrained model.
+        # Tokens rather than chunks here: the loader lives on the node actors
+        # and is reached over RPC, which exposes no chunk count today. Tokens
+        # miss the case of many files each shorter than sequence_len, where the
+        # per-file floor yields no chunks at all. The single-node path uses the
+        # exact count.
         check_step_budget(
             max_steps,
+            config=config,
             dataset_tokens=num_tokens,
             tokens_per_step=total_tokens_per_step,
-            batch_size=config.per_device_train_batch_size,
-            sequence_len=config.sequence_len,
-            gpus=config.gpus,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
         )
 
         # Apply warmup_ratio if warmup_steps is 0
