@@ -12,11 +12,14 @@ Status legend: `[ ]` open · `[~]` in progress · `[x]` done (commit) · `[?]` o
 **A GGUF's weights are served where they lie.** `surogate serve <file>.gguf` no
 longer copies the file. For `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22.13 GB, 34.66 B
 parameters, 256 experts of which 8 route — what lands on disk beside it is a
-**337 MB index**: the artifact directory names the GGUF and, per object, the
+**70 MB index**: the artifact directory names the GGUF and, per object, the
 stretches of it that object is assembled from. It was a 22.30 GB copy this
-morning. Load 11.9 s, prefill 11,100 tok/s, decode 317.
+morning. Load 12.6 s, prefill 11,100 tok/s, decode 314.
 
-Three mechanisms got it there, in the order they were needed:
+Nothing large is computed any more. Of the 70 MB, 42 is the router, 10 the
+tokenizer, and the rest BF16 norms and the draft head's token ids.
+
+Four mechanisms got it there, in the order they were needed:
 
 - **Runs.** An object may be gathered from several stretches of an external
   file, because our fused objects are not slices of it: a routed gate/up
@@ -27,10 +30,15 @@ Three mechanisms got it there, in the order they were needed:
   are read from the file too and rearranged on the device at load.
 - **A source that is a row permutation.** llama.cpp reorders a GDN projection's
   V heads; expressing our inverse as a map rather than a materialised transform
-  turned the last 802 MB object into 64 runs.
+  turned an 802 MB object into 64 runs.
+- **A column permutation on the transform.** `gdn/output` reads those same
+  reordered heads, which moves *columns*, and runs describe rows. But a head is
+  128 columns and a block is 32, so the permutation moves whole blocks: the
+  transform carries a `group_map`, one entry per 32 columns, shared by every
+  row.
 
-Checked against the artifact the converter wrote for the same 120 rearranged
-objects: every decoded weight identical.
+Checked against the artifact the converter wrote for all 150 rearranged
+objects, 30 of them carrying a column map: every decoded weight identical.
 
 **And the routed experts are served as the file's own K-quants**, decode and
 prefill both (§7 K4). One 5090, 654-token prompt, warm, greedy:
@@ -51,11 +59,11 @@ stored once.
 
 **The four things worth doing next**, in order — §7's K-line has the detail:
 
-1. **`gdn/output`, the last 267 MB of the index.** Its inverse is a *column*
-   permutation, which runs structurally cannot express. It needs either a
-   kernel that permutes at read time or a second load transform. The remaining
-   70 MB (router, BF16 norms, tokenizer) is genuinely computed or genuinely
-   data, and a 70 MB index could be built in memory at startup — no file.
+1. **Build the index in memory and stop writing a file.** At 70 MB there is
+   nothing left worth caching: the router and the norms are cheap to compute,
+   the tokenizer comes from the GGUF's own metadata. `surogate serve
+   model.gguf` would then be literally that, with no artifact and no one-time
+   step. This is the last thing between us and the product claim.
 2. **Close the native prefill gap**, 11,100 against the row-split path's
    13,700. Q6_K's scalar staging and the K-quant decode's per-tile scale work
    are the two named suspects.
@@ -641,10 +649,9 @@ and heads in place today. Everything else is read in place too, through the load
 
 Open, in the order they matter:
 
-1. **`gdn/output`, the last 267 MB of the index.** llama.cpp's inverse for it is a *column*
-   permutation; runs describe rows, so they cannot express it. Either a kernel that permutes at
-   read time, or a second load transform. After that the index is ~70 MB of router, BF16 norms
-   and tokenizer — small enough to build in memory at startup, and then there is no file at all.
+1. **Build the index in memory; stop writing a file.** 70 MB is router, tokenizer, BF16 norms
+   and the draft head's token ids — all cheap to compute or already in the GGUF's metadata. That
+   is the last step to `surogate serve model.gguf` with no artifact at all.
 2. **Close the native prefill gap**, 11,100 against the row-split path's 13,700 on the same
    model. Q6_K's scalar staging (its 210-byte block leaves consecutive blocks 2-byte aligned, so
    it cannot `cp_async<16>`) and the K-quant decode's per-tile scale work are the two suspects.
@@ -665,16 +672,20 @@ because the previous one ran out:
   head), so overlap stays an error only inside the artifact's own payload. **22.30 → 2.32 GB.**
 - **Q8_0 as a served format**, which took the embedding table, the attention output and the
   draft head's shortlist gather off the copy. **2.32 → 1.47 GB.**
-- **A load `transform`, and a source that is a row permutation.** `q8_0-to-w8g32` rearranges the
+- **A load `transform`, a source that is a row permutation, and a column permutation on the
+  transform.** `q8_0-to-w8g32` rearranges the
   file's blocks into the row-split planes on the device, so the weights whose kernels have no
   Q8_0 path need no copy either. And llama.cpp reorders a GDN projection's V heads: our inverse
   was applied by the bridge, which made the recipe's row program describe rows the file does not
   hold. Expressed as a map instead — it is a *pure* row permutation, unlike A_log's logarithm or
   a plus-one norm's subtraction — a permuted 128-row head is one run, and the 802 MB fused
-  projection became 64. **1.47 → 0.337 GB.**
+  projection became 64. **1.47 → 0.337 GB.** `gdn/output` reads the same reordered heads but
+  along its *columns*, which runs cannot describe; since a head is 128 columns and a block 32,
+  the permutation moves whole blocks and rides on the transform as a `group_map`, one entry per
+  32 columns. **0.337 → 0.070 GB.**
 
-Verified against the artifact the converter wrote for the same 120 rearranged objects: every
-decoded weight identical. Eight rows differ in *bytes* only — their scale is zero and the
+Verified against the artifact the converter wrote for all 150 rearranged objects, 30 of them
+carrying a column map: every decoded weight identical. Eight rows differ in *bytes* only — their scale is zero and the
 dequantise path had normalised the codes the file carries, so that path was the lossy one.
 Compare decoded values, not bytes, whenever the oracle went through BF16.
 
