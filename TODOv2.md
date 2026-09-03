@@ -47,15 +47,18 @@ stored once.
 
 ## Roadmap
 
-1. **[ ] Close the native prefill gap** — 11,100 against the row-split path's
-   13,700 on the same model. Everything else on this list is smaller. The scale
-   arithmetic is *not* the cause (measured — see *Rejected*); the remaining
-   named suspects are Q6_K's scalar staging and the tile's `cp_async` shape.
+1. **[x] The native prefill gap is a floor, not a defect — measured.** It does
+   not close by tuning this kernel; see *The prefill gap, decomposed*. What
+   remains for someone who wants it is a different algorithm (an integer path
+   that never materialises BF16), and the evidence says that algorithm is
+   slower here, not faster.
 2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, add `surogate quantize`.** Converters
    stop emitting the home-grown formats; `surogate quantize` writes a BF16 GGUF
    and calls `llama-quantize` (built at `study/llama.cpp-master/build/bin`).
-   Gated on 1: retiring them sends every converted checkpoint down the K-quant
-   path, so the gap would become a regression.
+   **No longer gated on 1** — it is now an owner call, not an engineering
+   blocker: retiring them sends every converted checkpoint down the K-quant
+   path, which costs ~19 % of prefill and buys the removal of a lossy format
+   family. Decode is unaffected.
 3. **[ ] N — NVFP4 ModelOpt ingest.** `weight_scale_2` is a multiplier where
    compressed-tensors' global scale is a divisor; parents split per component.
 4. **[ ] F — FP8.** compressed-tensors per-channel/per-tensor is per-row with an
@@ -77,6 +80,43 @@ stored once.
    three files that do not exist.
 
 ---
+
+## The prefill gap, decomposed
+
+The K-quant MoE prefill is 11,100 tok/s against the row-split path's 13,700 on
+the same model. Per prefill round, `nsys`:
+
+| kernel | row-split | K-quant | cost |
+|---|---:|---:|---:|
+| gate_up ×40 | 608 µs | 758 µs | +6.0 ms |
+| down Q5_K ×37 | 335 µs | 505 µs | +6.3 ms |
+| down Q6_K ×3 | 337 µs | 725 µs | +1.2 ms |
+
+That accounts for the whole of it. Gutting the gate_up kernel's decode in
+stages says where it goes:
+
+| gate_up variant | ns |
+|---|---:|
+| real | 758,000 |
+| decode arithmetic removed | 689,245 |
+| weight staging removed too | 470,716 |
+| **row-split, real** | **607,736** |
+
+So decode arithmetic is 72 µs of the 150 µs gap; weight staging is 218 µs
+against the row-split kernel's ≤137 for staging *and* decode. Both kernels run
+**3 blocks/SM** with near-identical registers (80 vs 70) — verified with
+`cuobjdump -res-usage`, not inferred — so occupancy is not in it.
+
+What is left is the format. Q4_K reads 0.5625 B/weight against Q4G64's 0.53;
+it is affine, so every value costs an extra fma that a symmetric format does
+not pay; its scales are 6-bit packed and shared across sub-blocks rather than
+one fp16 per group; and its nibble layout splits a lane's pair across two
+bytes. That arithmetic sits between the `cp_async` completing and the MMA
+consuming `As`, so it also hides less well.
+
+Closing it means not dequantising to BF16 at all — an integer path, i.e. K3b —
+and that is the thing already measured as the wrong trade: our BF16 wide route
+beats llama.cpp's own MMQ by 1.65×.
 
 ## Format coverage
 
@@ -218,6 +258,14 @@ Written down so they are not retried.
   One lane computes the 6-bit scale and shuffles it to the other fifteen:
   **slower**, 9,700–10,300 against 11,100. The two `__shfl_sync` calls cost more
   in the inner loop than the unpack they remove.
+- **Folding a lane's two code bytes into one 16-bit load.** GGML's nibble layout
+  puts a lane's pair in two different bytes; reading them as one `uint16` is
+  exactly neutral. The compiler was already coalescing them.
+- **Giving the Q5_K down kernel a third block per SM** by moving `qh` out of the
+  staged header and reading it from the file. It works — 34 KB to 30 KB, two
+  blocks to three — and the kernel time does not move (507,962 → 507,498 ns).
+  That is the proof these kernels are not occupancy-bound; it was reverted
+  because global `qh` then cost Q5_K ~7 µs.
 - **llama.cpp's small-K mmvq schedule.** 862 → 847 here; disabled with the
   measurement beside the condition.
 - **K5c's split of a mixed-format fused parent.** Above.
