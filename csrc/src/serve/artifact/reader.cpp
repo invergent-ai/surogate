@@ -138,7 +138,8 @@ TensorDescriptor parse_tensor(const Json& value) {
         "name", "kind", "shape", "format", "layout", "offset", "bytes",
     };
     require_members(value, members, "tensor entry",
-                    (value.contains("runs") ? 1 : 0) + (value.contains("transform") ? 1 : 0));
+                    (value.contains("runs") ? 1 : 0) + (value.contains("transform") ? 1 : 0) +
+                        (value.contains("group_map") ? 1 : 0));
 
     const auto name        = require_string(value.at("name"), "tensor name");
     const auto format      = parse_format(require_string(value.at("format"), "tensor format"));
@@ -146,6 +147,18 @@ TensorDescriptor parse_tensor(const Json& value) {
     const auto offset      = require_unsigned(value.at("offset"), "tensor offset", false);
     const auto stored_size = require_unsigned(value.at("bytes"), "tensor bytes", true);
     auto transform         = PayloadTransform::None;
+    std::vector<std::int32_t> group_map;
+    if (value.contains("group_map")) {
+        const auto& raw = value.at("group_map");
+        if (!raw.is_array() || raw.empty()) {
+            throw ArtifactError("group_map must be a nonempty array");
+        }
+        group_map.reserve(raw.size());
+        for (const auto& entry : raw) {
+            group_map.push_back(
+                static_cast<std::int32_t>(require_unsigned(entry, "group_map entry", false)));
+        }
+    }
     if (value.contains("transform")) {
         const auto& name = require_string(value.at("transform"), "tensor transform");
         if (name == "q8_0-to-w8g32") {
@@ -168,7 +181,23 @@ TensorDescriptor parse_tensor(const Json& value) {
         throw ArtifactError("tensor " + name + " stores " + std::to_string(stored_size) +
                             " bytes; layout requires " + std::to_string(expected_size));
     }
-    return {name, std::move(shape), format, layout, offset, stored_size, transform};
+    if (!group_map.empty()) {
+        if (transform == PayloadTransform::None) {
+            throw ArtifactError("tensor " + name + " has a group_map but no transform to apply it");
+        }
+        const auto groups = shape.at(1) / 32;
+        if (group_map.size() != groups) {
+            throw ArtifactError("tensor " + name + " has " + std::to_string(group_map.size()) +
+                                " group_map entries for " + std::to_string(groups) + " groups");
+        }
+        for (const std::int32_t entry : group_map) {
+            if (entry < 0 || static_cast<std::uint64_t>(entry) >= groups) {
+                throw ArtifactError("tensor " + name + " has a group_map entry out of range");
+            }
+        }
+    }
+    return {name,   std::move(shape), format,    layout,
+            offset, stored_size,      transform, std::move(group_map)};
 }
 
 ResourceDescriptor parse_resource(const Json& value) {

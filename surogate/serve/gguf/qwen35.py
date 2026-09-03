@@ -234,6 +234,24 @@ def inverse_row_permutation(hf_name: str, g: GdnGeometry, rows: int) -> torch.Te
     return None
 
 
+def inverse_column_group_map(hf_name: str, g: GdnGeometry, group: int) -> torch.Tensor | None:
+    """The inverse as a map over column groups, when it is a column permutation.
+
+    Only `out_proj` has one: llama.cpp reorders the V heads it reads, which moves whole columns
+    rather than rows. Runs describe rows, so this cannot be a gather — but the heads are
+    `head_v_dim` wide and that divides the quantisation group, so the permutation moves whole
+    groups and the loader can carry it as one small map. Returns None when there is nothing to
+    do, or when the heads do not divide the group and the permutation is not expressible.
+    """
+    if not g.reordered or not hf_name.endswith("linear_attn.out_proj.weight"):
+        return None
+    if g.head_v_dim % group:
+        return None
+    columns = _inverse_perm(g, g.head_v_dim)
+    per_head = g.head_v_dim // group
+    return columns.reshape(-1, group)[:, 0] // group if per_head else None
+
+
 def invert_tensor(hf_name: str, t: torch.Tensor, g: GdnGeometry) -> torch.Tensor:
     """Undo every llama.cpp numeric/layout transform for one HF-named tensor."""
     t = t.float() if t.dtype not in (torch.float32, torch.float64) else t

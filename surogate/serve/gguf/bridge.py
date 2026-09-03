@@ -240,7 +240,17 @@ def build_hf_dir_from_gguf(
             row_perm = (
                 fam.inverse_row_permutation(hf, geom, rows) if qwen35_family else None
             )
-            if qwen35_family and row_perm is None and not fam.inverse_is_row_identity(hf, geom):
+            # A column permutation cannot be a gather -- runs describe rows -- but when it moves
+            # whole quantisation groups the loader carries it as a map instead.
+            col_groups = (
+                fam.inverse_column_group_map(hf, geom, 32) if qwen35_family else None
+            )
+            if (
+                qwen35_family
+                and row_perm is None
+                and col_groups is None
+                and not fam.inverse_is_row_identity(hf, geom)
+            ):
                 continue
             candidates[hf] = {
                 "name": tensor.name,
@@ -250,6 +260,7 @@ def build_hf_dir_from_gguf(
                 "offset": int(tensor.data_offset),
                 "type": tensor.type_name,
                 "row_perm": None if row_perm is None else [int(v) for v in row_perm],
+                "col_groups": None if col_groups is None else [int(v) for v in col_groups],
             }
         repack_sources = repack_planner(gguf_path, candidates)
         if set(repack_sources) - set(candidates):

@@ -52,6 +52,9 @@ class TensorSpec:
     #: GGUF's Q8_0 blocks into the row-split planes the kernels read, which is a permutation of
     #: bytes and so costs nothing but the load-time pass.
     transform: str = ""
+    #: Source group for each destination group, when the transform also carries a column
+    #: permutation. Empty when the columns are in order.
+    group_map: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +77,7 @@ class TensorObject:
     bytes: int
     runs: tuple[tuple[int, int, int], ...] = ()
     transform: str = ""
-    transform: str = ""
+    group_map: tuple[int, ...] = ()
 
     @property
     def kind(self) -> str:
@@ -91,7 +94,8 @@ class TensorObject:
             "bytes": self.bytes,
         } | ({"runs": [{"source": s, "offset": o, "bytes": b}
                     for s, o, b in self.runs]} if self.runs else {}) | (
-            {"transform": self.transform} if self.transform else {})
+            {"transform": self.transform} if self.transform else {}) | (
+            {"group_map": list(self.group_map)} if self.group_map else {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +192,7 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
                         bytes=payload_bytes,
                         runs=tuple((int(a), int(b), int(c)) for a, b, c in spec.runs),
                         transform=spec.transform,
+                        group_map=tuple(int(v) for v in spec.group_map),
                     )
                 )
                 continue

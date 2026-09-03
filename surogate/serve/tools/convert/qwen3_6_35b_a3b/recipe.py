@@ -40,13 +40,15 @@ DRAFT_RANKING_PATH = (
 )
 
 
-# Objects whose op reads the row-split W8 planes and has no kernel for the GGUF's interleaved
-# Q8_0 block yet, so they are repacked rather than served from the file. Both the converter and
-# the ingest bridge read this: the bridge must keep dequantising exactly what the converter is
-# still going to build. Shrinks as those kernels land.
+# Objects whose op reads the row-split W8 planes. Their weights are still read from the GGUF --
+# Q8_0 and W8G32_F16S hold the same numbers, so the loader rearranges them on the device -- and
+# this list is what tells the planner to take that route rather than the native one. Both the
+# converter and the ingest bridge read it, because the bridge must keep dequantising exactly what
+# the converter still builds itself.
 NATIVE_EXCLUDE_SUFFIXES = (
     "attention/query_key_gate_value",
     "gdn/query_key_value_z",
+    "gdn/output",
     "moe/shared_gate_up",
     "moe/shared_down",
 )

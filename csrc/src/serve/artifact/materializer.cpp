@@ -71,6 +71,9 @@ struct CopyRange {
 
 struct PendingTransform {
     PayloadTransform transform = PayloadTransform::None;
+    /// The object's column permutation, if it has one; uploaded with the scratch.
+    std::vector<std::int32_t> host_map;
+    const std::int32_t* group_map = nullptr;
     std::uint64_t source       = 0; // offset into the scratch
     std::byte* destination     = nullptr;
     std::uint64_t bytes        = 0;
@@ -172,6 +175,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         if (transform != PayloadTransform::None) {
             transforms.push_back(PendingTransform{
                 .transform   = transform,
+                .host_map    = tensor->group_map,
                 .source      = staged_bytes,
                 .destination = cursor_out,
                 .bytes       = run_bytes,
@@ -207,6 +211,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     // Scratch for the objects that are rearranged rather than copied. It is transient: the reads
     // land here, the rearranging writes their real allocations, and it is freed before serving.
     std::unique_ptr<DeviceArena> staging;
+    std::unique_ptr<DeviceArena> group_maps;
     if (staged_bytes != 0) {
         staging = std::make_unique<DeviceArena>(static_cast<std::size_t>(staged_bytes));
         auto* base = static_cast<std::byte*>(
@@ -217,6 +222,25 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         for (PendingTransform& pending : transforms) { pending.source += 0; }
         for (std::size_t i = 0; i < transforms.size(); ++i) {
             transforms[i].source = reinterpret_cast<std::uint64_t>(base + transforms[i].source);
+        }
+        // The column permutations, gathered into one small upload: one entry per 32 columns,
+        // shared by every row of an object, so a whole model's worth is a few kilobytes.
+        std::vector<std::int32_t> flat;
+        for (const PendingTransform& pending : transforms) {
+            flat.insert(flat.end(), pending.host_map.begin(), pending.host_map.end());
+        }
+        if (!flat.empty()) {
+            group_maps = std::make_unique<DeviceArena>(flat.size() * sizeof(std::int32_t));
+            auto* maps = static_cast<std::int32_t*>(
+                group_maps->alloc_bytes(flat.size() * sizeof(std::int32_t), 256).data);
+            CUDA_CHECK(cudaMemcpyAsync(maps, flat.data(), flat.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, device.load_stream));
+            std::size_t cursor = 0;
+            for (PendingTransform& pending : transforms) {
+                if (pending.host_map.empty()) { continue; }
+                pending.group_map = maps + cursor;
+                cursor += pending.host_map.size();
+            }
         }
     }
     std::sort(ranges.begin(), ranges.end(), [](const CopyRange& a, const CopyRange& b) {
@@ -340,7 +364,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         case PayloadTransform::Q8ToW8RowSplit:
             ops::detail::ggml::q8_0_to_w8_rowsplit_launch(
                 reinterpret_cast<const void*>(pending.source), pending.destination, pending.rows,
-                pending.columns, static_cast<std::size_t>(pending.stored), device.load_stream);
+                pending.columns, static_cast<std::size_t>(pending.stored), pending.group_map,
+                device.load_stream);
             break;
         case PayloadTransform::None:
             throw ArtifactError("a pending transform must name one");
@@ -348,6 +373,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     }
     if (!transforms.empty()) { CUDA_CHECK(cudaStreamSynchronize(device.load_stream)); }
     staging.reset();
+    group_maps.reset();
     out.stats_.h2d_bytes = copied;
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

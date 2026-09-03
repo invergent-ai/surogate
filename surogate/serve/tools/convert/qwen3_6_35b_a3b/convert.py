@@ -709,7 +709,7 @@ def convert(
             )
             if in_place:
                 gguf_specs = GgufRepackSource.in_place_specs(gguf_specs, in_place)
-                moved = sum(sum(r[2] for r in runs) for runs, _ in in_place.values())
+                moved = sum(sum(r[2] for r in entry[0]) for entry in in_place.values())
                 print(f"rearranged at load: {len(in_place)} objects read from the GGUF "
                       f"({moved / 1e9:.1f} GB not copied)", flush=True)
                 repacked = tuple(n for n in repacked if n not in in_place)

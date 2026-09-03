@@ -121,6 +121,9 @@ struct TensorDescriptor {
     std::uint64_t offset;
     std::uint64_t bytes;
     PayloadTransform transform = PayloadTransform::None;
+    /// `k / 32` entries naming the source block each destination block takes, when the transform
+    /// also carries a column permutation. Empty when the columns are in order.
+    std::vector<std::int32_t> group_map;
 };
 
 struct ResourceDescriptor {

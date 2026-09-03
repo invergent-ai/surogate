@@ -54,6 +54,9 @@ class TensorSpec:
     #: `surogate.serve.tools.artifact.container.TensorSpec.runs`.
     runs: tuple[tuple[int, int, int], ...] = ()
     transform: str = ""
+    #: Source group for each destination group, when the transform also carries a column
+    #: permutation. Empty when the columns are in order.
+    group_map: tuple[int, ...] = ()
 
     @property
     def kind(self) -> str:

@@ -139,7 +139,7 @@ def build_object_plan(
             specs.append(
                 ArtifactTensorSpec(
                     spec.name, spec.shape, spec.format, spec.layout, getattr(spec, "runs", ()),
-                    getattr(spec, "transform", ""),
+                    getattr(spec, "transform", ""), getattr(spec, "group_map", ()),
                 )
             )
         else:

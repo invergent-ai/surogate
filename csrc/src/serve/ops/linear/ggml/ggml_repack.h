@@ -20,7 +20,14 @@ std::size_t q8_0_source_bytes(std::int32_t rows, std::int32_t k);
 ///
 /// `blocks` is the tensor's Q8_0 bytes in the object's own row order, `out` its planes. Both are
 /// device pointers, and `out` must have room for the format's full encoded size.
+///
+/// `group_map`, when given, is `k / 32` entries naming the source block each destination block
+/// takes, the same for every row. It carries a *column* permutation that runs cannot: runs
+/// describe rows, and a permutation within a row would be one run per block. llama.cpp reorders
+/// the V heads a GDN output projection reads, in units of 128 columns, which is four whole
+/// blocks -- so the permutation is expressible here and costs one indirection.
 void q8_0_to_w8_rowsplit_launch(const void* blocks, void* out, std::int32_t rows, std::int32_t k,
-                                std::size_t out_bytes, cudaStream_t stream);
+                                std::size_t out_bytes, const std::int32_t* group_map,
+                                cudaStream_t stream);
 
 } // namespace sinfer::ops::detail::ggml

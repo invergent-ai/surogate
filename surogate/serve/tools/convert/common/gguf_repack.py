@@ -236,6 +236,18 @@ class GgufRepackSource:
         raw = entry.get("row_perm")
         return None if raw is None else np.asarray(raw, dtype=np.int64)
 
+    def column_group_map(self, hf_name: str) -> np.ndarray | None:
+        """Source group for each destination group, when the source's inverse permutes columns.
+
+        Unlike `row_map` this cannot be applied by gathering rows, so the paths that read a
+        source's bytes directly refuse it and only the in-place transform carries it.
+        """
+        entry = self.sources.get(hf_name)
+        if entry is None:
+            return None
+        raw = entry.get("col_groups")
+        return None if raw is None else np.asarray(raw, dtype=np.int64)
+
     def planes(self, hf_name: str) -> tuple[np.ndarray, np.ndarray]:
         """Deinterleaved (codes int8 [n, groups, 32], scales fp16 [n, groups])."""
         cached = self._planes.get(hf_name)
@@ -243,6 +255,9 @@ class GgufRepackSource:
             return cached
         entry = self.sources[hf_name]
         n, k = self.source_rows_k(hf_name)
+        if self.column_group_map(hf_name) is not None:
+            raise RepackError(f"{hf_name}: its inverse permutes columns; only the in-place "
+                              "transform carries that")
         if k % _GROUP != 0:
             raise RepackError(f"{hf_name}: k={k} is not a multiple of {_GROUP}")
         if entry["type"] in NATIVE_TYPES and native_block_values(str(entry["type"])) == 256:
@@ -426,6 +441,9 @@ class GgufRepackSource:
         data = self._memmap()
         if offset < 0 or offset + nbytes > data.shape[0]:
             raise RepackError(f"{hf_name}: quantized payload is outside the GGUF file")
+        if self.column_group_map(hf_name) is not None:
+            raise RepackError(f"{hf_name}: its inverse permutes columns; only the in-place "
+                              "transform carries that")
         rows_out = np.asarray(data[offset : offset + nbytes]).reshape(n, row_bytes)
         row_map = self.row_map(hf_name)
         return rows_out if row_map is None else rows_out[row_map]
@@ -538,7 +556,7 @@ class GgufRepackSource:
         suffixes: Sequence[str],
         *,
         with_token_ids: bool = True,
-    ) -> dict[str, tuple[tuple[tuple[int, int, int], ...], str]]:
+    ) -> dict[str, tuple[tuple[tuple[int, int, int], ...], str, tuple[int, ...]]]:
         """{object: (runs, transform)} for the W8 objects whose rows are all Q8_0.
 
         Q8_0 and W8G32_F16S hold the same numbers -- signed int8 with one binary16 scale per 32 --
@@ -548,7 +566,7 @@ class GgufRepackSource:
         kernels that have no Q8_0 path is the family's knowledge.
         """
         probe = np.zeros(1, dtype=np.int64) if with_token_ids else None
-        planned: dict[str, tuple[tuple[tuple[int, int, int], ...], str]] = {}
+        planned: dict[str, tuple[tuple[tuple[int, int, int], ...], str, tuple[int, ...]]] = {}
         for spec in tensor_specs:
             name = getattr(spec, "name", None)
             if getattr(spec, "kind", None) != "tensor" or spec.format != _REPACK_FORMAT:
@@ -564,6 +582,15 @@ class GgufRepackSource:
             types = {self.native_type_of(source) for source in program.sources}
             if types != {"Q8_0"}:
                 continue
+            # A column permutation travels as a map rather than in the runs, so it must be the
+            # same for every source the object draws from.
+            maps = {
+                None if (m := self.column_group_map(source)) is None else tuple(int(v) for v in m)
+                for source in program.sources
+            }
+            if len(maps) != 1:
+                continue
+            column_map = next(iter(maps)) or ()
             row_bytes = (program.k // 32) * NATIVE_TYPES["Q8_0"]
             rows = np.asarray(program.rows)
             source_of = rows // _SOURCE_STRIDE
@@ -591,6 +618,7 @@ class GgufRepackSource:
                     for begin, end in zip(starts, ends)
                 ),
                 "q8_0-to-w8g32",
+                column_map,
             )
         return planned
 
@@ -604,8 +632,10 @@ class GgufRepackSource:
             if entry is None:
                 out.append(spec)
             else:
-                runs, transform = entry
-                out.append(replace(spec, runs=runs, transform=transform))
+                runs, transform, column_map = entry
+                out.append(
+                    replace(spec, runs=runs, transform=transform, group_map=column_map)
+                )
         return tuple(out)
 
     def plan_native_halves(
