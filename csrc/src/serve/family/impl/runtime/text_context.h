@@ -35,31 +35,36 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 // data-only: TextContext is constructed on the stack for one schedule recording/execution and owns
 // neither weights nor device state.
 struct ModelConfig {
-    static constexpr int hidden              = TextConfig::hidden;
-    static constexpr int residual            = residual_width<TextConfig>();
-    static constexpr int n_layers            = TextConfig::layers;
-    static constexpr int intermediate        = TextConfig::intermediate;
-    static constexpr int vocab               = TextConfig::output_rows;
-    static constexpr int token_domain        = TextConfig::token_domain;
-    static constexpr int gdn_k_heads         = TextConfig::gdn_key_heads;
-    static constexpr int gdn_k_dim           = TextConfig::gdn_key_head_dim;
-    static constexpr int gdn_v_heads         = TextConfig::gdn_value_heads;
-    static constexpr int gdn_v_dim           = TextConfig::gdn_value_head_dim;
-    static constexpr int n_q                 = TextConfig::query_heads;
-    static constexpr int n_kv                = TextConfig::kv_heads;
-    static constexpr int head_dim            = TextConfig::head_dim;
-    static constexpr int rotary_dim          = TextConfig::rotary_dim;
-    static constexpr int key_dim             = TextConfig::key_dim;
-    static constexpr int value_dim           = TextConfig::value_dim;
-    static constexpr int conv_dim            = TextConfig::convolution_dim;
-    static constexpr int q_size              = TextConfig::query_size;
-    static constexpr int kv_size             = TextConfig::kv_size;
-    static constexpr int mtp_fc_in           = TextConfig::mtp_input_rows;
-    static constexpr int mtp_attn_in         = TextConfig::mtp_attention_input_rows;
-    static constexpr int mtp_mlp_gateup_rows = TextConfig::mtp_mlp_gate_up_rows;
-    static constexpr float rms_eps           = TextConfig::rms_epsilon;
-    static constexpr float rope_theta        = TextConfig::rope_theta;
-    static constexpr int mtp_layers          = TextConfig::mtp_layers;
+    // The geometry, as data. Every member still defaults to the target's compiled `TextConfig`,
+    // so nothing about a registered model changes; what changes is that the runtime now reads
+    // these off an object it could have been handed instead. That is the whole of the
+    // difference between serving one size of a family and serving the family: of the 326 reads
+    // in this runtime, not one needs the value at compile time.
+    int hidden              = TextConfig::hidden;
+    int residual            = residual_width<TextConfig>();
+    int n_layers            = TextConfig::layers;
+    int intermediate        = TextConfig::intermediate;
+    int vocab               = TextConfig::output_rows;
+    int token_domain        = TextConfig::token_domain;
+    int gdn_k_heads         = TextConfig::gdn_key_heads;
+    int gdn_k_dim           = TextConfig::gdn_key_head_dim;
+    int gdn_v_heads         = TextConfig::gdn_value_heads;
+    int gdn_v_dim           = TextConfig::gdn_value_head_dim;
+    int n_q                 = TextConfig::query_heads;
+    int n_kv                = TextConfig::kv_heads;
+    int head_dim            = TextConfig::head_dim;
+    int rotary_dim          = TextConfig::rotary_dim;
+    int key_dim             = TextConfig::key_dim;
+    int value_dim           = TextConfig::value_dim;
+    int conv_dim            = TextConfig::convolution_dim;
+    int q_size              = TextConfig::query_size;
+    int kv_size             = TextConfig::kv_size;
+    int mtp_fc_in           = TextConfig::mtp_input_rows;
+    int mtp_attn_in         = TextConfig::mtp_attention_input_rows;
+    int mtp_mlp_gateup_rows = TextConfig::mtp_mlp_gate_up_rows;
+    float rms_eps           = TextConfig::rms_epsilon;
+    float rope_theta        = TextConfig::rope_theta;
+    int mtp_layers          = TextConfig::mtp_layers;
 
     [[nodiscard]] static constexpr bool is_full(int layer) {
         return TextConfig::is_full_attention(layer);
@@ -76,7 +81,7 @@ struct ModelConfig {
     [[nodiscard]] static constexpr int gdn_idx(int layer) { return TextConfig::gdn_index(layer); }
 };
 
-inline constexpr ModelConfig kCfg{};
+inline const ModelConfig kCfg{};
 using Hooks = ResidualHooks<Variant>;
 inline constexpr float kAttnScale                     = kAttentionScale;
 // False only for a target whose attention has no output gate (a dense GQA
