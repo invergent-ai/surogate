@@ -104,6 +104,15 @@ struct RowScaleGeometry {
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
+/// How an object's runs become its stored form. `None` is a copy, which is what every object
+/// written into the artifact's own payload is. `Q8ToW8RowSplit` rearranges Q8_0 blocks into the
+/// row-split planes -- the same numbers either way, so the file's bytes can serve a weight whose
+/// kernels want planes without either a copy or a loss.
+enum class PayloadTransform : std::uint8_t {
+    None,
+    Q8ToW8RowSplit,
+};
+
 struct TensorDescriptor {
     std::string name;
     std::vector<std::uint64_t> shape;
@@ -111,6 +120,7 @@ struct TensorDescriptor {
     StorageLayout layout;
     std::uint64_t offset;
     std::uint64_t bytes;
+    PayloadTransform transform = PayloadTransform::None;
 };
 
 struct ResourceDescriptor {

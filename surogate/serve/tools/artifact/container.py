@@ -48,6 +48,10 @@ class TensorSpec:
     #: table. Empty means the bytes live in the artifact's own payload, which is the default and
     #: what every object was before external files existed.
     runs: tuple[tuple[int, int, int], ...] = ()
+    #: How those runs become the stored form. Empty is a copy; ``q8_0-to-w8g32`` rearranges the
+    #: GGUF's Q8_0 blocks into the row-split planes the kernels read, which is a permutation of
+    #: bytes and so costs nothing but the load-time pass.
+    transform: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +73,8 @@ class TensorObject:
     offset: int
     bytes: int
     runs: tuple[tuple[int, int, int], ...] = ()
+    transform: str = ""
+    transform: str = ""
 
     @property
     def kind(self) -> str:
@@ -84,7 +90,8 @@ class TensorObject:
             "offset": self.offset,
             "bytes": self.bytes,
         } | ({"runs": [{"source": s, "offset": o, "bytes": b}
-                    for s, o, b in self.runs]} if self.runs else {})
+                    for s, o, b in self.runs]} if self.runs else {}) | (
+            {"transform": self.transform} if self.transform else {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +172,9 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
             payload_bytes = encoded_size(layout, spec.format, shape)
             if spec.runs:
                 covered = sum(int(run_bytes) for _, _, run_bytes in spec.runs)
-                if covered != payload_bytes:
+                # A transformed object's runs carry its source bytes, a different count from
+                # the stored form they become.
+                if not spec.transform and covered != payload_bytes:
                     raise ArtifactError(
                         f"{name} declares {payload_bytes} bytes but its runs cover {covered}"
                     )
@@ -178,6 +187,7 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
                         offset=0,
                         bytes=payload_bytes,
                         runs=tuple((int(a), int(b), int(c)) for a, b, c in spec.runs),
+                        transform=spec.transform,
                     )
                 )
                 continue

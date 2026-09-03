@@ -865,7 +865,10 @@ add_library(sinfer_artifact STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/artifact/storage_layouts.cpp
   ${SERVE_ROOT}/artifact/binder.cpp
   ${SERVE_ROOT}/artifact/materializer.cpp
-  ${SERVE_ROOT}/artifact/typed_binding.cpp)
+  ${SERVE_ROOT}/artifact/typed_binding.cpp
+  # The one rearranging the materializer does itself: Q8_0 blocks into the row-split planes,
+  # so a weight whose kernels want planes can still be read from the GGUF.
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_repack.cu)
 sinfer_internal_includes(sinfer_artifact)
 target_link_libraries(sinfer_artifact PUBLIC sinfer_core)
 

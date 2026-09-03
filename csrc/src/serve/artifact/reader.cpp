@@ -137,13 +137,23 @@ TensorDescriptor parse_tensor(const Json& value) {
     static constexpr std::array members = {
         "name", "kind", "shape", "format", "layout", "offset", "bytes",
     };
-    require_members(value, members, "tensor entry", value.contains("runs") ? 1 : 0);
+    require_members(value, members, "tensor entry",
+                    (value.contains("runs") ? 1 : 0) + (value.contains("transform") ? 1 : 0));
 
     const auto name        = require_string(value.at("name"), "tensor name");
     const auto format      = parse_format(require_string(value.at("format"), "tensor format"));
     const auto layout      = parse_layout(require_string(value.at("layout"), "tensor layout"));
     const auto offset      = require_unsigned(value.at("offset"), "tensor offset", false);
     const auto stored_size = require_unsigned(value.at("bytes"), "tensor bytes", true);
+    auto transform         = PayloadTransform::None;
+    if (value.contains("transform")) {
+        const auto& name = require_string(value.at("transform"), "tensor transform");
+        if (name == "q8_0-to-w8g32") {
+            transform = PayloadTransform::Q8ToW8RowSplit;
+        } else {
+            throw ArtifactError("unknown payload transform: " + name);
+        }
+    }
 
     const auto& raw_shape = value.at("shape");
     if (!raw_shape.is_array()) { throw ArtifactError("tensor shape must be an array"); }
@@ -158,7 +168,7 @@ TensorDescriptor parse_tensor(const Json& value) {
         throw ArtifactError("tensor " + name + " stores " + std::to_string(stored_size) +
                             " bytes; layout requires " + std::to_string(expected_size));
     }
-    return {name, std::move(shape), format, layout, offset, stored_size};
+    return {name, std::move(shape), format, layout, offset, stored_size, transform};
 }
 
 ResourceDescriptor parse_resource(const Json& value) {
@@ -409,10 +419,18 @@ struct Reader::Impl {
                     covered = checked_add(covered, run.bytes, "object run coverage");
                     object_runs.push_back(run);
                 }
-                if (covered != bytes) {
+                // A transformed object's runs carry its *source* bytes, which is a different
+                // count from the stored form they become.
+                const auto* tensor = std::get_if<TensorDescriptor>(&object);
+                const bool transformed =
+                    tensor != nullptr && tensor->transform != PayloadTransform::None;
+                if (!transformed && covered != bytes) {
                     throw ArtifactError("object " + std::string(name) + " declares " +
                                         std::to_string(bytes) + " bytes but its runs cover " +
                                         std::to_string(covered));
+                }
+                if (transformed && object_runs.empty()) {
+                    throw ArtifactError("object " + std::string(name) + " has no source runs");
                 }
             } else {
                 const auto end = checked_add(offset, bytes, "object payload range");

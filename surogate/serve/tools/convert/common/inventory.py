@@ -53,6 +53,7 @@ class TensorSpec:
     #: Stretches of a file the artifact serves this object from instead of storing it; see
     #: `surogate.serve.tools.artifact.container.TensorSpec.runs`.
     runs: tuple[tuple[int, int, int], ...] = ()
+    transform: str = ""
 
     @property
     def kind(self) -> str:

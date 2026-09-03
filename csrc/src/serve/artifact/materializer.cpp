@@ -1,5 +1,7 @@
 #include "artifact/materializer.h"
 
+#include "ops/linear/ggml/ggml_repack.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -61,6 +63,20 @@ struct CopyRange {
     std::uint64_t source_begin = 0;
     std::uint64_t source_end   = 0;
     std::byte* destination     = nullptr;
+    /// Offset into the transform scratch, for a range whose object is rearranged rather than
+    /// copied; `destination` is resolved from it once the scratch is allocated.
+    std::uint64_t staged_at = 0;
+    bool staged             = false;
+};
+
+struct PendingTransform {
+    PayloadTransform transform = PayloadTransform::None;
+    std::uint64_t source       = 0; // offset into the scratch
+    std::byte* destination     = nullptr;
+    std::uint64_t bytes        = 0;
+    std::uint64_t stored       = 0;
+    std::int32_t rows          = 0;
+    std::int32_t columns       = 0;
 };
 
 struct ReadSpan {
@@ -123,6 +139,9 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
 
     std::vector<CopyRange> ranges;
     ranges.reserve(plan.device_objects.size());
+    std::vector<PendingTransform> transforms;
+    std::vector<std::size_t> staged_ranges;
+    std::uint64_t staged_bytes = 0;
     std::uint64_t copied         = 0;
     std::uint64_t last_published = 0;
     std::uint64_t total          = 0;
@@ -139,26 +158,67 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         for (const PayloadRun& run : object_runs) {
             run_bytes = checked_add(run_bytes, run.bytes, "artifact tensor run bytes overflow u64");
         }
-        if (actual_offset != placement.offset || run_bytes != placement.bytes) {
+        const auto* tensor = std::get_if<TensorDescriptor>(&descriptor);
+        const auto transform =
+            tensor != nullptr ? tensor->transform : PayloadTransform::None;
+        if (actual_offset != placement.offset ||
+            (transform == PayloadTransform::None && run_bytes != placement.bytes)) {
             throw ArtifactError("materialization plan does not match artifact payload");
         }
         out.objects_.at(placement.object.index).device = storage.data;
+        // A transformed object's runs are its source bytes, which land in scratch and are
+        // rearranged into `storage` once every read has finished.
+        std::byte* cursor_out = static_cast<std::byte*>(storage.data);
+        if (transform != PayloadTransform::None) {
+            transforms.push_back(PendingTransform{
+                .transform   = transform,
+                .source      = staged_bytes,
+                .destination = cursor_out,
+                .bytes       = run_bytes,
+                .stored      = placement.bytes,
+                .rows        = static_cast<std::int32_t>(tensor->shape.at(0)),
+                .columns     = static_cast<std::int32_t>(tensor->shape.at(1)),
+            });
+            cursor_out    = nullptr; // filled in below, once scratch exists
+            staged_bytes  = checked_add(staged_bytes, run_bytes, "artifact staging overflow u64");
+            staged_ranges.push_back(ranges.size());
+        }
         // An object gathered from several runs of a GGUF lands as several copies into one
         // allocation, in the order the runs are declared.
-        auto* cursor_out = static_cast<std::byte*>(storage.data);
+        std::uint64_t within = 0;
         for (const PayloadRun& run : object_runs) {
             ranges.push_back(CopyRange{
                 .source       = run.source,
                 .source_begin = run.offset,
                 .source_end   = checked_add(run.offset, run.bytes,
                                             "artifact tensor source range overflows u64"),
-                .destination  = cursor_out,
+                .destination  = cursor_out == nullptr ? nullptr : cursor_out + within,
+                .staged_at    = cursor_out == nullptr
+                                    ? transforms.back().source + within
+                                    : 0,
+                .staged       = cursor_out == nullptr,
             });
-            cursor_out += run.bytes;
+            within += run.bytes;
         }
-        total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
+        total = checked_add(total, transform == PayloadTransform::None ? placement.bytes : run_bytes,
+                            "artifact tensor byte count overflows u64");
     }
     if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
+    // Scratch for the objects that are rearranged rather than copied. It is transient: the reads
+    // land here, the rearranging writes their real allocations, and it is freed before serving.
+    std::unique_ptr<DeviceArena> staging;
+    if (staged_bytes != 0) {
+        staging = std::make_unique<DeviceArena>(static_cast<std::size_t>(staged_bytes));
+        auto* base = static_cast<std::byte*>(
+            staging->alloc_bytes(static_cast<std::size_t>(staged_bytes), 256).data);
+        for (CopyRange& range : ranges) {
+            if (range.staged) { range.destination = base + range.staged_at; }
+        }
+        for (PendingTransform& pending : transforms) { pending.source += 0; }
+        for (std::size_t i = 0; i < transforms.size(); ++i) {
+            transforms[i].source = reinterpret_cast<std::uint64_t>(base + transforms[i].source);
+        }
+    }
     std::sort(ranges.begin(), ranges.end(), [](const CopyRange& a, const CopyRange& b) {
         return a.source == b.source ? a.source_begin < b.source_begin : a.source < b.source;
     });
@@ -275,6 +335,19 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     if (copied != total || next_range != ranges.size()) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
     }
+    for (const PendingTransform& pending : transforms) {
+        switch (pending.transform) {
+        case PayloadTransform::Q8ToW8RowSplit:
+            ops::detail::ggml::q8_0_to_w8_rowsplit_launch(
+                reinterpret_cast<const void*>(pending.source), pending.destination, pending.rows,
+                pending.columns, static_cast<std::size_t>(pending.stored), device.load_stream);
+            break;
+        case PayloadTransform::None:
+            throw ArtifactError("a pending transform must name one");
+        }
+    }
+    if (!transforms.empty()) { CUDA_CHECK(cudaStreamSynchronize(device.load_stream)); }
+    staging.reset();
     out.stats_.h2d_bytes = copied;
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();

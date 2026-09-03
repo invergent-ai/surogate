@@ -507,6 +507,76 @@ class GgufRepackSource:
             for begin, end in zip(starts, ends)
         )
 
+    def plan_repack_in_place(
+        self,
+        recipes_by_name: Mapping[str, TensorRecipe],
+        tensor_specs: Sequence,
+        suffixes: Sequence[str],
+        *,
+        with_token_ids: bool = True,
+    ) -> dict[str, tuple[tuple[tuple[int, int, int], ...], str]]:
+        """{object: (runs, transform)} for the W8 objects whose rows are all Q8_0.
+
+        Q8_0 and W8G32_F16S hold the same numbers -- signed int8 with one binary16 scale per 32 --
+        and differ only in arrangement, so an object whose kernels want the row-split planes can
+        still be read from the file: the runs gather its rows as the GGUF holds them and the
+        loader rearranges them on the device. Named per family, because which objects run on
+        kernels that have no Q8_0 path is the family's knowledge.
+        """
+        probe = np.zeros(1, dtype=np.int64) if with_token_ids else None
+        planned: dict[str, tuple[tuple[tuple[int, int, int], ...], str]] = {}
+        for spec in tensor_specs:
+            name = getattr(spec, "name", None)
+            if getattr(spec, "kind", None) != "tensor" or spec.format != _REPACK_FORMAT:
+                continue
+            if not any(str(name).endswith(suffix) for suffix in suffixes):
+                continue
+            recipe = recipes_by_name.get(name)
+            if recipe is None or isinstance(recipe.expression, GatherRows):
+                continue
+            program = self._evaluate_rows(recipe.expression, probe)
+            if program is None or program.k != int(spec.shape[1]):
+                continue
+            types = {self.native_type_of(source) for source in program.sources}
+            if types != {"Q8_0"}:
+                continue
+            row_bytes = (program.k // 32) * NATIVE_TYPES["Q8_0"]
+            rows = np.asarray(program.rows)
+            source_of = rows // _SOURCE_STRIDE
+            row_of = rows % _SOURCE_STRIDE
+            base = [int(self.sources[source]["offset"]) for source in program.sources]
+            breaks = np.ones(rows.shape[0], dtype=bool)
+            if rows.shape[0] > 1:
+                breaks[1:] = (source_of[1:] != source_of[:-1]) | (row_of[1:] != row_of[:-1] + 1)
+            starts = np.flatnonzero(breaks)
+            ends = np.append(starts[1:], rows.shape[0])
+            planned[str(name)] = (
+                tuple(
+                    (
+                        1,
+                        base[int(source_of[begin])] + int(row_of[begin]) * row_bytes,
+                        int(end - begin) * row_bytes,
+                    )
+                    for begin, end in zip(starts, ends)
+                ),
+                "q8_0-to-w8g32",
+            )
+        return planned
+
+    @staticmethod
+    def in_place_specs(tensor_specs: Sequence, plan: Mapping[str, tuple]) -> tuple:
+        """The specs with each in-place object's runs and transform attached; format and layout
+        are unchanged, because the stored form the kernels read is unchanged."""
+        out = []
+        for spec in tensor_specs:
+            entry = plan.get(getattr(spec, "name", None))
+            if entry is None:
+                out.append(spec)
+            else:
+                runs, transform = entry
+                out.append(replace(spec, runs=runs, transform=transform))
+        return tuple(out)
+
     def plan_native_halves(
         self,
         recipes_by_name: Mapping[str, TensorRecipe],

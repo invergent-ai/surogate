@@ -138,7 +138,8 @@ def build_object_plan(
         elif isinstance(spec, TensorSpec):
             specs.append(
                 ArtifactTensorSpec(
-                    spec.name, spec.shape, spec.format, spec.layout, getattr(spec, "runs", ())
+                    spec.name, spec.shape, spec.format, spec.layout, getattr(spec, "runs", ()),
+                    getattr(spec, "transform", ""),
                 )
             )
         else:

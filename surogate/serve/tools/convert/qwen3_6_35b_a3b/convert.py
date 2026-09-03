@@ -656,6 +656,7 @@ def convert(
         print(f"this export carries no {', '.join(p.rstrip('/') for p in dropped_prefixes)} — "
               "omitting those objects", flush=True)
     native_runs: dict = {}
+    in_place: dict = {}
     external: tuple = ()
     if repack is not None:
         # The fused projections and the shared expert run kernels that read the row-split
@@ -699,9 +700,22 @@ def convert(
                       flush=True)
         if repacked:
             print(f"bit-exact repack: {len(repacked)} objects", flush=True)
+        # The objects whose kernels want the row-split planes: their rows are all Q8_0, which is
+        # the same numbers in a different arrangement, so they are read from the file too and the
+        # loader rearranges them.
+        if os.environ.get("SUROGATE_GGUF_COPY", "0") == "0":
+            in_place = repack.plan_repack_in_place(
+                recipe.BASE_RECIPES_BY_NAME, gguf_specs, recipe.NATIVE_EXCLUDE_SUFFIXES
+            )
+            if in_place:
+                gguf_specs = GgufRepackSource.in_place_specs(gguf_specs, in_place)
+                moved = sum(sum(r[2] for r in runs) for runs, _ in in_place.values())
+                print(f"rearranged at load: {len(in_place)} objects read from the GGUF "
+                      f"({moved / 1e9:.1f} GB not copied)", flush=True)
+                repacked = tuple(n for n in repacked if n not in in_place)
     preflight = preflight_conversion(
         model, dflash_model, routed_nvfp4_dir, shared_expert=shared_expert,
-        covered=tuple(native) + tuple(repacked) + tuple(
+        covered=tuple(native) + tuple(repacked) + tuple(in_place) + tuple(
             n for n in recipe.BASE_RECIPES_BY_NAME if n.startswith(dropped_prefixes)
         ) if dropped_prefixes or native or repacked else (),
         object_specs=gguf_specs if (native or repacked or dropped_prefixes) else None,
@@ -767,7 +781,9 @@ def convert(
                 model / "model.safetensors.index.json"
             ) as reader:
                 for spec in base_specs:
-                    if repack is not None and (spec.name in native or spec.name in repacked):
+                    if repack is not None and (
+                        spec.name in native or spec.name in repacked or spec.name in in_place
+                    ):
                         # The draft head gathers its rows by shortlist rather than in order.
                         token_ids = (
                             draft_head.materialize_draft_head_token_ids(preflight.draft)
@@ -775,7 +791,7 @@ def convert(
                             else None
                         )
                         source_recipe = recipe.BASE_RECIPES_BY_NAME[spec.name]
-                        if spec.name in native_runs:
+                        if spec.name in native_runs or spec.name in in_place:
                             continue  # read from the GGUF in place; nothing to write here
                         payload = (
                             repack.payload_for_native(spec, source_recipe, token_ids)
