@@ -68,11 +68,12 @@ stored once.
    s8 MMA. Accuracy gate: 6.2370 against llama.cpp's 6.2311 (± 0.040). Prefill
    13,195 against 10,299 tok/s single stream (~700-token prompt) and 17,300
    against 14,300 at 8k, same session, three prompts each. `SUROGATE_SERVE_MOE_INT8=0`
-   keeps the BF16-activation kernels. See *The prefill gap, decomposed*.
+   keeps the BF16-activation kernels. The kernel's design is in the progress log
+   (2026-09-03); what the eleven earlier variants taught is under Traps.
 2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, and `surogate quantize` in their place.**
    The converters stop quantising and the three home-grown formats leave the
    engine with them, roughly 140 references. What replaces them for a model we
-   trained is `surogate quantize`, which is item 9 and deferred: a thin version
+   trained is `surogate quantize`, which is item 10 and deferred: a thin version
    exists, so the capability does not vanish with the formats, but it is not a
    product yet. Until it is, a checkpoint we trained is either served as BF16
    or exported through that command's two llama.cpp passes. The old
@@ -96,13 +97,22 @@ stored once.
 7. **[ ] K5c — fused K-quant GDN projection-and-convolution.** Built, measured,
    left off: costs more in kernel launches than it saves in bandwidth.
 8. **[ ] Drift to fix.** The MTP block can only be bound at `W8G32_F16S`/BF16,
-   so a K-quant GGUF that keeps its nextn tensors is refused (see item 9's
+   so a K-quant GGUF that keeps its nextn tensors is refused (see item 10's
    investigation); the published files strip nextn, which is why this has never
    surfaced. Also: `--no-cache` is unimplemented, `surogate convert` does
    not exist, and `surogate/serve/tools/README.md` still tells users to download
    artifacts from Hugging Face — a posture the owner rejected — while linking
    three files that do not exist.
-9. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+9. **[ ] Q6_K down, the one tensor the int8 route did not fix.** 688 µs against
+   the row-split kernel's 337, where Q4_K and Q5_K now beat theirs (498/608 and
+   316/335). It is `routed_down` on 3 of 40 layers, so it costs ~1 ms of a
+   35 ms round. The cause is structural: Q6_K's scales cover sixteen values, so
+   its groups run two `m16n8k16` MMAs instead of one `m16n8k32`, and its
+   210-byte block is only two-byte aligned, so the tile stages with scalar
+   loads where the others use `cp_async`. Both are worth one attempt: a
+   sixteen-wide scale table read twice, and a staged copy that realigns the
+   block on the way into shared memory.
+10. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -188,99 +198,6 @@ block. The second is the real fix and belongs to the engine, not to this item.
 
 ---
 
-## The prefill gap, decomposed
-
-The K-quant MoE prefill is ~11,100 tok/s against the row-split path's 13,700 on
-the same model. Per prefill round, `nsys`:
-
-| kernel | row-split | K-quant | ratio | share |
-|---|---:|---:|---:|---:|
-| gate_up **Q4_K** ×40 | 608 µs | 758 µs | 1.25× | +6.0 ms, 44 % |
-| down **Q5_K** ×37 | 335 µs | 505 µs | 1.51× | +6.3 ms, 46 % |
-| down **Q6_K** ×3 | 337 µs | 725 µs | 2.15× | +1.2 ms, 9 % |
-
-**It is not a Q6_K problem** — Q6_K has the worst ratio but is `routed_down` on
-3 of 40 layers; Q4_K and Q5_K carry nine tenths of the gap. Decode is
-unaffected: 317 against 346, and ahead of llama.cpp.
-
-**The kernel is compute-bound, and every staging rearrangement was aimed at
-the wrong constraint.** Cutting the gate_up kernel apart:
-
-| gate_up variant | ns |
-|---|---:|
-| real | 758,000 |
-| scale dropped, raw codes fed to the MMA | 691,362 |
-| and the header no longer staged | 493,066 |
-| decode gone entirely | 470,716 |
-| **header fully resident, decode real** | **780,788** |
-| *row-split, real* | *607,736* |
-
-The third row read against the last looked like a 198 µs header-staging cost.
-It is not: the fifth row — headers staged once and never again, with the real
-decode — is no faster than the real kernel. In a pipelined kernel the critical
-path is max(compute, memory), not the sum. At the real kernel, compute is the
-bound and header staging hides beneath it; removing the decode exposed the
-memory path, and *then* the header showed. Both kernels run 3 blocks/SM,
-registers 80 vs 70 (`cuobjdump -res-usage`).
-
-So the decode's compute is what to cut, and its structure resists it. A row-split
-group is 64 values with one scale, so that kernel feeds the MMA raw integer codes
-and scales the accumulator once per row in the epilogue. A K-quant's 64-wide
-tile spans two sub-block scales and carries an affine min that depends on the
-activation sum, so it must dequantise per value — and the per-value work is
-what costs, not the scale unpack: an exact table of each superblock's (d·sc,
-dmin·m) built once and read for four tiles is bit-identical to HEAD and no
-faster. Moving the scale to the epilogue with two half-tile partials and a
-column-sum for the min was costed at *more* fmas than the per-value decode,
-because the accumulator has sixteen elements a thread and the affine term is an
-outer product over them.
-
-Measurement note: end-to-end prefill spreads ~10 % run to run (10,000–11,100),
-so arrangements are separated on `nsys` kernel time, which is stable.
-
-**What would actually change it — a different kernel, not this one tuned:**
-
-- **An int8 tensor-core path** (llama.cpp's MMQ design, our implementation).
-  Activations quantised to int8 per 32 with block sums — the `q8_1` machinery
-  `ggml_q8_1.cu` already has for mmvq. Weights unpack nibble → int8 with no
-  float math. `mma.sync` s8×s8→s32 at twice bf16's rate; `As` and `Bs` halve.
-  The affine min becomes free: `dmin·m × (activation block sum)` in the
-  epilogue, exactly as mmvq folds it. Estimated 450–500 µs against the
-  row-split's 608, from a ~470 µs compute floor with the MMA halved. Cost:
-  prefill activations at int8-per-32 rather than BF16 — the precision llama.cpp
-  runs everywhere, so "matches llama.cpp" holds, but prefill would no longer be
-  *more* precise than it. A new kernel family, not a patch: two to three days.
-- **`kExpertBM = 32`** to fit every header resident at 3 blocks/SM is now known
-  to be pointless — residency was measured at 780,788.
-
-**Resolution (2026-09-03): the int8 route, built.** `sparse_moe_prefill_ggml_i8_*`
-in `sparse_moe_prefill_body.inc`, on the codecs' `unpack`/`scale_pair` in
-`ggml_prefill_codec.cuh`:
-
-- Activations: `quantize_q8_1_planes_launch` writes int8 codes and a (scale,
-  sum) half2 per 32 values as two planes -- a 36-byte `block_q8_1` cannot feed a
-  16-byte `cp_async`, planes can. The gate/up input is quantised once per token
-  and the kernel gathers by a column→token map the gather writes; the down
-  input is per assignment because the SwiGLU output is.
-- Weights: the staged superblock bytes are unpacked nibble → int8 into a
-  row-major tile once per K tile, cooperatively, and read back with `ldmatrix`.
-  Every warp of the block owns every row (the kernel's shape), so per-row work
-  must be shared or it is done eight times: the sub-block scales are likewise
-  decoded once per superblock into a shared `[scale][row]` table.
-- Arithmetic per 32-group, in FP32 on the exact int32 dot:
-  `acc += (d·sc)[row]·d_x[col]·dot − (dmin·m)[row]·Σx[col]` -- the K-quant
-  affine form with the activation sum from the quantiser. Q6_K's scales cover
-  sixteen values, so it runs two `m16n8k16` MMAs per group and folds its −32
-  into the codes (byte-wise sign fix); no min term.
-- Measured per prefill round (`nsys`, 8k prompt): gate_up Q4_K 498 µs
-  against 758 (BF16 path) and 608 (row-split); down Q5_K 316 against
-  505 / 335; down Q6_K 688 against 725 / 337. End to end,
-  8k prompt, median of three distinct prompts, two runs: 17,302 / 17,235 tok/s
-  against 14,317 / 14,264 (+21 %); single stream ~700-token prompt + 128
-  generated: 13,195 against 10,299 (+28 %), decode 315 against 316.
-
----
-
 ## Format coverage
 
 What the serve runtime can route today, per stored format.
@@ -354,7 +271,7 @@ Verified against the artifact the converter wrote for all 150 rearranged objects
   `surogate quantize` stays, it takes a trained checkpoint to a GGUF, and the
   quantisation arithmetic is llama.cpp's rather than ours. **It is a separate
   product and not on the critical path** (owner, 2026-09-03): the serving engine
-  comes first, and the export command is revisited after. See item 9 for what
+  comes first, and the export command is revisited after. See item 10 for what
   exists and what does not.
 - **`.sinfer` is a transparent cache, never an interchange format** (owner,
   2026-08-24). Never published, never required. The eight-entry hardcoded
@@ -403,6 +320,16 @@ Each of these cost real time; none is inferable from the code.
 - **"This code path works" can mean "it has never run."** The GDN V-head
   permutation only applies when `num_k_heads != num_v_heads`; every model
   validated before the 35B had them equal. Check the KV that gates a path.
+- **A pipelined kernel's critical path is max(compute, memory), not the sum.**
+  Eleven staging variants of the BF16-activation K-quant prefill kernel were
+  measured against a reading that turned out to be an artefact: cutting the
+  decode out made the kernel 265 µs faster and made header staging look like a
+  198 µs cost, so the next several attempts chased staging. Making the header
+  fully resident *with the real decode* came out at 780,788 ns against the real
+  kernel's 758,000 — no faster at all. Compute was the bound the whole time and
+  the staging hid beneath it; removing the decode had exposed the memory path,
+  and only then did the header show. Cut a kernel apart to find its bound, but
+  read every cut against the whole, never against another cut.
 - **Where a scale lives decides a kernel's shape.** The row-split MoE prefill
   feeds the MMA raw integer codes and scales the accumulator afterwards, because
   a 64-value group has one scale. A K-quant's 64-wide tile spans two sub-block
