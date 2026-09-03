@@ -43,6 +43,11 @@ class TensorSpec:
     shape: tuple[int, ...]
     format: str
     layout: str
+    #: Stretches of an external file this object's bytes are read from, in order, as
+    #: ``(source, offset, bytes)`` with ``source`` a 1-based index into the artifact's external
+    #: table. Empty means the bytes live in the artifact's own payload, which is the default and
+    #: what every object was before external files existed.
+    runs: tuple[tuple[int, int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +68,7 @@ class TensorObject:
     layout: str
     offset: int
     bytes: int
+    runs: tuple[tuple[int, int, int], ...] = ()
 
     @property
     def kind(self) -> str:
@@ -77,7 +83,8 @@ class TensorObject:
             "layout": self.layout,
             "offset": self.offset,
             "bytes": self.bytes,
-        }
+        } | ({"runs": [{"source": s, "offset": o, "bytes": b}
+                    for s, o, b in self.runs]} if self.runs else {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +163,24 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
             shape = tuple(_require_integer(dim, "shape dimension", positive=True) for dim in spec.shape)
             layout = get_layout(_require_string(spec.layout, "tensor layout"))
             payload_bytes = encoded_size(layout, spec.format, shape)
+            if spec.runs:
+                covered = sum(int(run_bytes) for _, _, run_bytes in spec.runs)
+                if covered != payload_bytes:
+                    raise ArtifactError(
+                        f"{name} declares {payload_bytes} bytes but its runs cover {covered}"
+                    )
+                objects.append(
+                    TensorObject(
+                        name=name,
+                        shape=shape,
+                        format=spec.format,
+                        layout=layout.name,
+                        offset=0,
+                        bytes=payload_bytes,
+                        runs=tuple((int(a), int(b), int(c)) for a, b, c in spec.runs),
+                    )
+                )
+                continue
             offset = align_up(cursor, layout.alignment)
             obj: ArtifactObject = TensorObject(
                 name=name,
@@ -188,11 +213,20 @@ def _require_identity(identity: ArtifactIdentity) -> ArtifactIdentity:
 
 
 def encode_directory(
-    identity: ArtifactIdentity, objects: Sequence[ArtifactObject]
+    identity: ArtifactIdentity,
+    objects: Sequence[ArtifactObject],
+    external: Sequence[tuple[str, int]] = (),
 ) -> bytes:
     checked_identity = _require_identity(identity)
     if not objects:
         raise ArtifactError("objects must not be empty")
+    declared = max(
+        (run[0] for obj in objects for run in getattr(obj, "runs", ())), default=0
+    )
+    if declared > len(external):
+        raise ArtifactError(
+            f"an object reads external source {declared} but only {len(external)} are declared"
+        )
     value = {
         "identity": {
             "model_id": checked_identity.model_id,
@@ -200,6 +234,10 @@ def encode_directory(
         },
         "objects": [obj.to_json() for obj in objects],
     }
+    if external:
+        value["external"] = [
+            {"path": str(path), "bytes": int(size)} for path, size in external
+        ]
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -377,11 +415,13 @@ class ArtifactWriter:
         path: str | Path,
         identity: ArtifactIdentity,
         specs: Sequence[ObjectSpec],
+        external: Sequence[tuple[str, int]] = (),
     ):
         self.path = Path(path)
         self.identity = _require_identity(identity)
         self.objects = plan_objects(specs)
-        directory = encode_directory(self.identity, self.objects)
+        self.external = tuple((str(p), int(n)) for p, n in external)
+        directory = encode_directory(self.identity, self.objects, self.external)
         self.payload_offset = align_up(PREFIX_BYTES + len(directory), PAYLOAD_ALIGNMENT)
         self._file = self.path.open("wb")
         self._file.write(PREFIX.pack(MAGIC, len(directory)))
@@ -394,6 +434,10 @@ class ArtifactWriter:
     def write(self, name: str, payload: Payload) -> None:
         if self._finished:
             raise RuntimeError("artifact writer is already finished")
+        # An object served from an external file has no payload here; the writer walks past it
+        # so callers only produce bytes for what the artifact actually stores.
+        while self._next < len(self.objects) and getattr(self.objects[self._next], "runs", ()):
+            self._next += 1
         if self._next >= len(self.objects):
             raise ArtifactError("artifact already has every planned payload")
         obj = self.objects[self._next]
@@ -416,6 +460,8 @@ class ArtifactWriter:
     def finish(self) -> None:
         if self._finished:
             return
+        while self._next < len(self.objects) and getattr(self.objects[self._next], "runs", ()):
+            self._next += 1
         if self._next != len(self.objects):
             missing = self.objects[self._next].name
             raise ArtifactError(f"artifact is missing payload {missing}")

@@ -137,7 +137,9 @@ def build_object_plan(
             )
         elif isinstance(spec, TensorSpec):
             specs.append(
-                ArtifactTensorSpec(spec.name, spec.shape, spec.format, spec.layout)
+                ArtifactTensorSpec(
+                    spec.name, spec.shape, spec.format, spec.layout, getattr(spec, "runs", ())
+                )
             )
         else:
             raise TypeError(f"unsupported inventory spec: {type(spec).__name__}")

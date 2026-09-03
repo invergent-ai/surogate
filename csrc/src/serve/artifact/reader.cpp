@@ -71,8 +71,8 @@ std::uint64_t read_u64_le(const std::byte* data) noexcept {
 
 template <std::size_t N>
 void require_members(const Json& value, const std::array<const char*, N>& members,
-                     std::string_view label) {
-    if (!value.is_object() || value.size() != N) {
+                     std::string_view label, std::size_t optional = 0) {
+    if (!value.is_object() || value.size() != N + optional) {
         throw ArtifactError(std::string(label) + " has missing or extra members");
     }
     for (const char* member : members) {
@@ -136,7 +136,7 @@ TensorDescriptor parse_tensor(const Json& value) {
     static constexpr std::array members = {
         "name", "kind", "shape", "format", "layout", "offset", "bytes",
     };
-    require_members(value, members, "tensor entry");
+    require_members(value, members, "tensor entry", value.contains("runs") ? 1 : 0);
 
     const auto name        = require_string(value.at("name"), "tensor name");
     const auto format      = parse_format(require_string(value.at("format"), "tensor format"));
@@ -164,7 +164,7 @@ ResourceDescriptor parse_resource(const Json& value) {
     static constexpr std::array members = {
         "name", "kind", "encoding", "offset", "bytes",
     };
-    require_members(value, members, "resource entry");
+    require_members(value, members, "resource entry", value.contains("runs") ? 1 : 0);
     return {
         require_string(value.at("name"), "resource name"),
         parse_encoding(require_string(value.at("encoding"), "resource encoding")),
@@ -323,8 +323,11 @@ struct Reader::Impl {
             throw ArtifactError(std::string("invalid JSON directory: ") + error.what());
         }
 
+        // "external" is the one optional root member: an artifact that stores every object
+        // itself does not carry it, and one that reads a file in place does.
         static constexpr std::array root_members = {"identity", "objects"};
-        require_members(directory, root_members, "directory root");
+        require_members(directory, root_members, "directory root",
+                        directory.contains("external") ? 1 : 0);
         // An artifact may serve some of its objects straight out of another file rather than
         // copying them in. The table is absent from every artifact that does not, and those load
         // exactly as before.

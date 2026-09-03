@@ -356,15 +356,22 @@ class GgufRepackSource:
         return tuple(out)
 
     @staticmethod
-    def native_specs(tensor_specs: Sequence, plan: Mapping[str, str]) -> tuple:
-        """The specs with each natively planned object's format and layout rewritten."""
+    def native_specs(
+        tensor_specs: Sequence,
+        plan: Mapping[str, str],
+        runs: Mapping[str, tuple[tuple[int, int, int], ...]] | None = None,
+    ) -> tuple:
+        """The specs with each natively planned object's format and layout rewritten, and its
+        runs attached when it is served from the file rather than copied into the artifact."""
         out = []
         for spec in tensor_specs:
-            gguf_type = plan.get(getattr(spec, "name", None))
+            name = getattr(spec, "name", None)
+            gguf_type = plan.get(name)
             if gguf_type is None:
                 out.append(spec)
             else:
-                out.append(replace(spec, format=gguf_type, layout=_NATIVE_LAYOUT))
+                extra = {"runs": runs[name]} if runs is not None and name in runs else {}
+                out.append(replace(spec, format=gguf_type, layout=_NATIVE_LAYOUT, **extra))
         return tuple(out)
 
     def _native_rows(self, hf_name: str) -> np.ndarray:
@@ -422,6 +429,61 @@ class GgufRepackSource:
                 continue
             out[mask] = self._native_rows(source_name)[row_of[mask]]
         return out.tobytes()
+
+    def runs_for_native(
+        self,
+        spec,
+        recipe: TensorRecipe,
+        token_ids: torch.Tensor | np.ndarray | None,
+        source: int = 1,
+    ) -> tuple[tuple[int, int, int], ...]:
+        """The object's bytes as stretches of the GGUF, rather than a copy of them.
+
+        The same row program `payload_for_native` gathers from, read as extents: a run is a
+        maximal stretch of output rows drawn from one source tensor at consecutive source rows,
+        which is where the file already holds them side by side. A tensor copied whole is one
+        run; a fused routed gate/up is one run per expert per half, because the file keeps gate
+        and up as separate tensors and the object interleaves them.
+        """
+        ids = None
+        if token_ids is not None:
+            ids = (
+                token_ids.detach().cpu().numpy()
+                if isinstance(token_ids, torch.Tensor)
+                else np.asarray(token_ids)
+            )
+        program = self._evaluate_rows(recipe.expression, ids)
+        if program is None:
+            raise RepackError(f"{spec.name}: expression is not row-repackable")
+        if (int(program.rows.shape[0]), program.k) != tuple(spec.shape):
+            raise RepackError(
+                f"{spec.name}: native shape {(int(program.rows.shape[0]), program.k)} "
+                f"!= spec {tuple(spec.shape)}"
+            )
+        row_bytes = (program.k // 256) * NATIVE_TYPES[spec.format]
+        rows = np.asarray(program.rows)
+        source_of = rows // _SOURCE_STRIDE
+        row_of = rows % _SOURCE_STRIDE
+        base = [int(self.sources[name]["offset"]) for name in program.sources]
+        for index, name in enumerate(program.sources):
+            n_rows, k = self.source_rows_k(name)
+            if (k // 256) * NATIVE_TYPES[str(self.sources[name]["type"])] != row_bytes:
+                raise RepackError(f"{spec.name}: {name} has a different row width")
+
+        # A new run starts wherever the source changes or the source row is not the next one.
+        breaks = np.ones(rows.shape[0], dtype=bool)
+        if rows.shape[0] > 1:
+            breaks[1:] = (source_of[1:] != source_of[:-1]) | (row_of[1:] != row_of[:-1] + 1)
+        starts = np.flatnonzero(breaks)
+        ends = np.append(starts[1:], rows.shape[0])
+        return tuple(
+            (
+                int(source),
+                base[int(source_of[begin])] + int(row_of[begin]) * row_bytes,
+                int(end - begin) * row_bytes,
+            )
+            for begin, end in zip(starts, ends)
+        )
 
     def plan_native_halves(
         self,

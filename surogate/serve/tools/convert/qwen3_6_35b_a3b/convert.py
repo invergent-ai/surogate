@@ -15,6 +15,7 @@ the 35B output head.
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -654,13 +655,35 @@ def convert(
         )
         print(f"this export carries no {', '.join(p.rstrip('/') for p in dropped_prefixes)} — "
               "omitting those objects", flush=True)
+    native_runs: dict = {}
+    external: tuple = ()
     if repack is not None:
         native = repack.plan_native(recipe.BASE_RECIPES_BY_NAME, gguf_specs)
         repacked = repack.plan(recipe.BASE_RECIPES_BY_NAME, gguf_specs)
         if native:
-            gguf_specs = GgufRepackSource.native_specs(gguf_specs, native)
-            print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
-                  flush=True)
+            # By default those objects are not copied at all: the artifact names the GGUF and
+            # the stretches of it each object reads. SUROGATE_GGUF_COPY=1 writes the bytes in.
+            if os.environ.get("SUROGATE_GGUF_COPY", "0") == "0":
+                native_runs = {
+                    spec.name: repack.runs_for_native(
+                        spec,
+                        recipe.BASE_RECIPES_BY_NAME[spec.name],
+                        draft_head.materialize_draft_head_token_ids(None)
+                        if spec.name == draft_head.DRAFT_HEAD_OBJECT
+                        else None,
+                    )
+                    for spec in GgufRepackSource.native_specs(gguf_specs, native)
+                    if spec.name in native and spec.name != draft_head.DRAFT_HEAD_OBJECT
+                }
+                external = ((str(Path(repack.gguf_path).resolve()),
+                             Path(repack.gguf_path).stat().st_size),)
+                copied = sum(sum(r[2] for r in runs) for runs in native_runs.values())
+                print(f"native K-quants: {len(native_runs)} objects read from the GGUF in place "
+                      f"({copied / 1e9:.1f} GB not copied)", flush=True)
+            gguf_specs = GgufRepackSource.native_specs(gguf_specs, native, native_runs)
+            if not native_runs:
+                print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
+                      flush=True)
         if repacked:
             print(f"bit-exact repack: {len(repacked)} objects", flush=True)
     preflight = preflight_conversion(
@@ -691,6 +714,7 @@ def convert(
             else inventory.WEIGHTS_ID,
         ),
         preflight.object_plan.specs,
+        external=external,
     ) as writer:
         index = 0
 
@@ -738,6 +762,8 @@ def convert(
                             else None
                         )
                         source_recipe = recipe.BASE_RECIPES_BY_NAME[spec.name]
+                        if spec.name in native_runs:
+                            continue  # read from the GGUF in place; nothing to write here
                         payload = (
                             repack.payload_for_native(spec, source_recipe, token_ids)
                             if spec.name in native
