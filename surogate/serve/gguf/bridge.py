@@ -81,6 +81,18 @@ def read_gguf_summary(gguf_path: Path, reader=None) -> dict:
     return summary
 
 
+#: gguf-py lists several HF aliases for one tensor, and `hf_preference` below cannot tell which
+#: spelling a given family's checkpoint actually uses — it only prefers `model.`-rooted names.
+#: Where the alias it lands on is not the one the converter's recipe names, say so here. These
+#: are substring rewrites on the HF side of the map, applied after it is built.
+_HF_ALIAS_FIXUPS: dict[str, tuple[tuple[str, str], ...]] = {
+    # Qwen3's per-head norms are `q_norm`/`k_norm` in the checkpoint; the generic map reaches
+    # them by their `q_layernorm`/`k_layernorm` alias.
+    "qwen3": (("self_attn.q_layernorm", "self_attn.q_norm"),
+              ("self_attn.k_layernorm", "self_attn.k_norm")),
+}
+
+
 def _hf_name_map(arch: str, n_layers: int) -> dict[str, str]:
     """gguf tensor name -> HF tensor name, via gguf-py's canonical mapping."""
     import gguf
@@ -110,10 +122,13 @@ def _hf_name_map(arch: str, n_layers: int) -> dict[str, str]:
         if prev is None or hf_preference(alias) < hf_preference(prev):
             reverse[gguf_base] = alias
 
+    fixups = _HF_ALIAS_FIXUPS.get(arch, ())
     out: dict[str, str] = {}
     # Base names are stored without the trailing ".weight"/".bias"; GGUF tensor
     # names carry the suffix. Emit both suffixed forms.
     for gguf_base, hf_base in reverse.items():
+        for wrong, right in fixups:
+            hf_base = hf_base.replace(wrong, right)
         for suffix in (".weight", ".bias"):
             out[gguf_base + suffix] = hf_base + suffix
     return out
@@ -131,6 +146,80 @@ def _family_or_generic(fam, gguf_name: str, n_main: int, name_map: dict[str, str
     without a single hand-written line.
     """
     return fam.hf_name_for(gguf_name, n_main) or name_map.get(gguf_name)
+
+
+def _rounded_eps(value: float) -> float:
+    """A GGUF stores the norm epsilon as float32, so 1e-6 reads back as
+    9.999999974752427e-07 and an exact-match config check fails on it. The value is always a
+    round decimal in the checkpoint it came from, so read it as one."""
+    return float(f"{value:.1e}")
+
+
+def synthesised_config(reader, arch: str) -> dict | None:
+    """`config.json` for an architecture the GGUF fully describes, or None.
+
+    The Qwen3.5 family's config carries things no GGUF holds (per-layer `layer_types`, the
+    attention output gate), so those targets vendor a file under `serve/resources/`. A plain
+    dense decoder does not: every member its converter reads is either a constant of the
+    architecture or a number in the GGUF's own metadata. Synthesising it keeps a family from
+    needing one vendored config per model size, and keeps us from vendoring config files whose
+    licence is not ours to vendor.
+    """
+    def kv(key, default=None):
+        return _arch_kv(reader, arch, key, default)
+
+    hidden = int(kv("embedding_length", 0) or 0)
+    heads = int(kv("attention.head_count", 0) or 0)
+    layers = int(kv("block_count", 0) or 0)
+    if not (hidden and heads and layers):
+        return None
+    tokens = reader.get_field("tokenizer.ggml.tokens")
+    if tokens is None:
+        return None
+    vocab = len(tokens.contents())
+    # Whether the *file* ties, which is not always what the original checkpoint said. Qwen3-0.6B
+    # declares `tie_word_embeddings: true`, and llama.cpp's converter still writes a separate
+    # `output.weight` — at Q6_K, where `token_embd.weight` is Q4_K — because quantising one
+    # shared tensor would damage whichever of the two roles wanted the higher precision. The
+    # GGUF is the checkpoint here, so it decides.
+    tied = reader.tensor("output.weight") is None
+    # The engine seeds its stop tokens from these, and a GGUF always carries them.
+    special = {}
+    for key, member in (("eos_token_id", "eos_token_id"), ("bos_token_id", "bos_token_id"),
+                        ("padding_token_id", "pad_token_id")):
+        field = reader.get_field(f"tokenizer.ggml.{key}")
+        if field is not None:
+            special[member] = int(field.contents())
+    if "eos_token_id" not in special:
+        return None
+    common = {
+        **special,
+        "hidden_size": hidden,
+        "num_hidden_layers": layers,
+        "intermediate_size": int(kv("feed_forward_length", 0) or 0),
+        "num_attention_heads": heads,
+        "num_key_value_heads": int(kv("attention.head_count_kv", heads) or heads),
+        "head_dim": int(kv("attention.key_length", 0) or 0) or hidden // heads,
+        "vocab_size": vocab,
+        "max_position_embeddings": int(kv("context_length", 0) or 0),
+        "rope_theta": float(kv("rope.freq_base", 0.0) or 0.0),
+        "rms_norm_eps": _rounded_eps(float(kv("attention.layer_norm_rms_epsilon", 0.0) or 0.0)),
+        "tie_word_embeddings": tied,
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "rope_scaling": None,
+        "torch_dtype": "bfloat16",
+        "initializer_range": 0.02,
+        "use_cache": True,
+    }
+    if arch == "qwen3":
+        return {**common, "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+                "hidden_act": "silu", "sliding_window": None, "use_sliding_window": False,
+                "max_window_layers": layers}
+    if arch == "llama":
+        return {**common, "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "hidden_act": "silu", "mlp_bias": False, "pretraining_tp": 1}
+    return None
 
 
 def build_hf_dir_from_gguf(
@@ -174,10 +263,14 @@ def build_hf_dir_from_gguf(
         if src.is_file():
             shutil.copy(src, work_dir / fname)
     if not (work_dir / "config.json").is_file():
-        raise SystemExit(
-            f"surogate serve: missing vendored config.json for target '{target_key}' "
-            f"(expected at {static_dir})."
-        )
+        derived = synthesised_config(reader, arch)
+        if derived is None:
+            raise SystemExit(
+                f"surogate serve: missing vendored config.json for target '{target_key}' "
+                f"(expected at {static_dir}), and architecture '{arch}' has no synthesised one."
+            )
+        (work_dir / "config.json").write_text(json.dumps(derived, indent=2))
+        echo(f"surogate serve: config.json synthesised from the GGUF's own metadata ({arch})")
 
     # 2. Dequantize tensors to BF16 and write sharded safetensors with HF names.
     n_layers = int(_arch_kv(reader, arch, "block_count", 0))
@@ -359,6 +452,13 @@ def gguf_target_key(gguf_path: Path, reader=None):
         return "qwen3_8_27b"
     if arch in ("qwen35moe", "qwen3moe", "qwen3_6_moe", "qwen3_5_moe") and hidden > 0:
         return "qwen3_6_35b_a3b"
+    # Dense decoders whose engine target is one compiled geometry. The gates below are that
+    # geometry: a differently sized Qwen3 or Llama has no target to be served by yet, and is
+    # refused with the summary rather than converted against the wrong config.
+    if arch == "qwen3" and hidden == 1024 and layers == 28:
+        return "qwen3"
+    if arch == "llama" and hidden == 2048 and layers == 22:
+        return "llama"
     if arch == "qwen4exp":
         # Qwen3.8-Flash-Next: converted straight from the GGUF (no HF bridge).
         return "qwen4exp"

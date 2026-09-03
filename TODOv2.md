@@ -73,7 +73,7 @@ stored once.
 2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, and `surogate quantize` in their place.**
    The converters stop quantising and the three home-grown formats leave the
    engine with them, roughly 140 references. What replaces them for a model we
-   trained is `surogate quantize`, which is item 10 and deferred: a thin version
+   trained is `surogate quantize`, which is item 11 and deferred: a thin version
    exists, so the capability does not vanish with the formats, but it is not a
    product yet. Until it is, a checkpoint we trained is either served as BF16
    or exported through that command's two llama.cpp passes. The old
@@ -81,29 +81,45 @@ stored once.
    prefill only against the BF16-activation kernel, and with the int8 route it
    measures 13,195 tok/s against the row-split path's 13,700 from an earlier
    pass, so one same-session comparison settles it. Decode is unaffected.
-3. **[ ] N — NVFP4 ModelOpt ingest.** `weight_scale_2` is a multiplier where
-   compressed-tensors' global scale is a divisor; parents split per component.
+3. **[~] GGUF coverage beyond the Qwen3.5/3.6 families.** A GGUF is servable only
+   if `gguf_target_key` resolves it, and until today that was four Qwen shapes.
+   Qwen3 now resolves and serves (a `Qwen3-0.6B` Q4_K_M converts, caches and
+   answers), on two pieces of new machinery: `config.json` is **synthesised from
+   the GGUF's own metadata** for a plain dense decoder, so a family needs no
+   vendored config per size and we vendor no config whose licence is not ours;
+   and `_HF_ALIAS_FIXUPS` names the handful of tensors where gguf-py's alias
+   preference picks a spelling the converter does not use (Qwen3's per-head
+   norms are `q_norm`, the generic map reaches them as `q_layernorm`).
+   **Llama and Gemma 3 are wired but blocked on one shared thing:** their GGUFs
+   carry a SentencePiece vocabulary (`tokenizer.ggml.model == "llama"`) and
+   `serve/gguf/frontend.py` reconstructs byte-level BPE only. That one piece
+   unlocks both, plus every Llama-1/2 and Mistral-lineage file; Llama 3 and
+   newer are BPE and would need only the geometry gate. The deeper limit is
+   item 6: each target is one compiled geometry, so this covers *those* sizes,
+   not those families — Qwen3-8B still has nowhere to go.
 4. **[ ] F — FP8.** compressed-tensors per-channel/per-tensor is per-row with an
    FP32 scale — add `_F32S`, or accept the BF16 cast. HF fine-grained FP8 is
    block-scaled and has no runtime format at all.
-5. **[ ] M2 — one directory per architecture, geometry as a template parameter.**
+5. **[ ] N — NVFP4 ModelOpt ingest.** `weight_scale_2` is a multiplier where
+   compressed-tensors' global scale is a divisor; parents split per component.
+6. **[ ] M2 — one directory per architecture, geometry as a template parameter.**
    `qwen3_5_{0_8b,2b,4b}` are ~1,750 lines each for seven integers; `variant.h`
    differs by 2 lines across the three. Nothing requires the split: all 52
    headers in `csrc/src/serve/api/ops/` take runtime shapes.
-6. **[ ] M4 — unify weight loading with the trainer.** Serve's `recipe.py` +
+7. **[ ] M4 — unify weight loading with the trainer.** Serve's `recipe.py` +
    `inventory.py` per target restate what the trainer's `hf_mapping` DSL already
    declares (`fuse`, `split`, `stack_experts`); the trainer's
    `SafeTensorsReader` is the better reader (multi-shard, GDS, strided).
-7. **[ ] K5c — fused K-quant GDN projection-and-convolution.** Built, measured,
+8. **[ ] K5c — fused K-quant GDN projection-and-convolution.** Built, measured,
    left off: costs more in kernel launches than it saves in bandwidth.
-8. **[ ] Drift to fix.** The MTP block can only be bound at `W8G32_F16S`/BF16,
-   so a K-quant GGUF that keeps its nextn tensors is refused (see item 10's
+9. **[ ] Drift to fix.** The MTP block can only be bound at `W8G32_F16S`/BF16,
+   so a K-quant GGUF that keeps its nextn tensors is refused (see item 11's
    investigation); the published files strip nextn, which is why this has never
    surfaced. Also: `--no-cache` is unimplemented, `surogate convert` does
    not exist, and `surogate/serve/tools/README.md` still tells users to download
    artifacts from Hugging Face — a posture the owner rejected — while linking
    three files that do not exist.
-9. **[ ] Q6_K down, the one tensor the int8 route did not fix.** 688 µs against
+10. **[ ] Q6_K down, the one tensor the int8 route did not fix.** 688 µs against
    the row-split kernel's 337, where Q4_K and Q5_K now beat theirs (498/608 and
    316/335). It is `routed_down` on 3 of 40 layers, so it costs ~1 ms of a
    35 ms round. The cause is structural: Q6_K's scales cover sixteen values, so
@@ -112,7 +128,7 @@ stored once.
    loads where the others use `cp_async`. Both are worth one attempt: a
    sixteen-wide scale table read twice, and a staged copy that realigns the
    block on the way into shared memory.
-10. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+11. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -271,7 +287,7 @@ Verified against the artifact the converter wrote for all 150 rearranged objects
   `surogate quantize` stays, it takes a trained checkpoint to a GGUF, and the
   quantisation arithmetic is llama.cpp's rather than ours. **It is a separate
   product and not on the critical path** (owner, 2026-09-03): the serving engine
-  comes first, and the export command is revisited after. See item 10 for what
+  comes first, and the export command is revisited after. See item 11 for what
   exists and what does not.
 - **`.sinfer` is a transparent cache, never an interchange format** (owner,
   2026-08-24). Never published, never required. The eight-entry hardcoded
