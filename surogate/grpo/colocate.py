@@ -129,9 +129,10 @@ def _run_vllm_server(
                     loop.close()
                 except Exception:
                     pass
-    except Exception as e:
-        logger.error(f"vLLM server error: {e}")
+    except Exception:
+        # Set the channel first, for the same reason as `_run_trainer` below.
         error_event.set()
+        logger.exception("vLLM server error")
         raise
 
 

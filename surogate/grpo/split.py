@@ -82,9 +82,12 @@ def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event):
     orchestrator. Re-raising here would be silently dropped by daemon-thread
     teardown — the event is the propagation channel to the main thread.
     """
-    from surogate.grpo.trainer import GRPOTrainer
-
     try:
+        # Inside the try: an ImportError here is a crash like any other, and
+        # leaving it outside meant the most likely failure on a dependency bump
+        # set no event, raised no signal, and hung the run in `running`.
+        from surogate.grpo.trainer import GRPOTrainer
+
         GRPOTrainer(train_config, external_weights=None).train()
     except Exception:
         # Set the channel FIRST: this used to log first, and the logging call
@@ -125,7 +128,10 @@ def _watch_components(
         if trainer_failed.is_set():
             crashed = "Trainer thread crashed"
             break
-    if crashed is None:
+    # Re-check: a planned teardown kills the vLLM subprocesses, so their
+    # sentinels fire exactly like a crash. Aborting on that would now mark a
+    # successful run as failed.
+    if crashed is None or shutdown_event.is_set():
         return
     logger.error(f"{crashed} — aborting GRPO pipeline")
     # Record before signalling: the main thread reads this to tell our own

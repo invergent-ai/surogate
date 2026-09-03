@@ -49,6 +49,28 @@ def test_the_logger_has_an_exception_method_that_keeps_the_traceback():
     with mock.patch.object(logger, "error") as errored:
         logger.exception("boom")
     assert errored.call_args.kwargs["exc_info"] is True, "the traceback is the point"
+    # Delegating to `error` adds a frame, and the location is read at a fixed
+    # depth, so without the bump every exception log is tagged `logger.py`.
+    assert errored.call_args.kwargs["_depth"] == 3
+
+
+def test_the_formatter_actually_emits_the_traceback():
+    """`exc_info=True` was cosmetic: `ColoredFormatter.format` overrides the base
+    method wholesale and never appended the traceback, so every crash in the
+    codebase logged its one-line message with no stack behind it."""
+    import logging
+
+    from surogate.utils.logger import ColoredFormatter
+
+    try:
+        raise ZeroDivisionError("division by zero")
+    except ZeroDivisionError:
+        record = logging.LogRecord("t", logging.ERROR, __file__, 1, "Trainer thread crashed", None, sys.exc_info())
+
+    rendered = ColoredFormatter().format(record)
+    assert "Trainer thread crashed" in rendered
+    assert "ZeroDivisionError" in rendered, "the stack is the reason exc_info was asked for"
+    assert "Traceback (most recent call last)" in rendered
 
 
 def _crashing_trainer_module():
@@ -118,6 +140,45 @@ def test_the_watchdog_records_why_it_aborted():
     assert abort.reason, "the abort must leave a reason behind"
     assert "rainer" in abort.reason
     assert killed.called, "and it still signals the main thread"
+
+
+def test_a_trainer_import_failure_sets_the_failure_event():
+    """The import used to sit outside the try, so the likeliest crash on a
+    dependency bump -- and the parent commit is a verifiers 0.1.11 -> 0.3.0
+    upgrade -- set no event, sent no signal, and hung the run holding GPUs."""
+    ev = threading.Event()
+    with mock.patch.dict(sys.modules, {"surogate.grpo.trainer": None}):
+        # A None entry in sys.modules makes `from ... import X` raise ImportError.
+        split._run_trainer(mock.MagicMock(), ev)
+    assert ev.is_set(), "an import-time crash is still a crash"
+
+
+def test_a_planned_teardown_is_not_reported_as_a_crash():
+    """Teardown sets `shutdown_event` and then kills the vLLM subprocesses, so
+    their sentinels fire exactly like a crash. The loop's own post-wait check
+    catches the ordinary case; this pins the window underneath it, where the
+    scan has already run and teardown flips the flag before the abort. It used
+    to leave a swallowed SIGINT and a warning. Now that an abort raises, it
+    would mark a successful run as failed.
+    """
+    proc = mock.MagicMock()
+    proc.sentinel = "fd"
+    proc.exitcode = -15
+    abort = AbortReason()
+
+    # is_set() is read three times per pass: the `while`, the post-wait guard,
+    # and the final one. Teardown lands between the second and the third.
+    shutdown = mock.MagicMock()
+    shutdown.is_set.side_effect = [False, False, True]
+
+    with (
+        mock.patch.object(split.multiprocessing.connection, "wait", return_value=["fd"]),
+        mock.patch.object(split.os, "kill") as killed,
+    ):
+        split._watch_components([(proc, "rollout vLLM")], threading.Event(), shutdown, abort)
+
+    assert abort.reason is None, "a planned teardown must not be an abort"
+    assert not killed.called
 
 
 def test_the_colocate_watchdog_records_why_it_aborted():

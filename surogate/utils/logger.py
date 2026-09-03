@@ -78,6 +78,18 @@ class ColoredFormatter(logging.Formatter):
     def format(self, record):
         message = self.formatMessage(record)
 
+        # `logging.Formatter.format` appends the traceback; this override
+        # replaced it wholesale and dropped it, so every `exc_info=True` call in
+        # the codebase logged its message with no stack behind it. Appending
+        # before the timestamp block keeps the traceback lines unprefixed, which
+        # is how that block already treats multi-line messages.
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            message = f"{message}\n{record.exc_text}"
+        if record.stack_info:
+            message = f"{message}\n{self.formatStack(record.stack_info)}"
+
         # Add timestamp if configured
         if hasattr(self, "_show_timestamp") and self._show_timestamp:
             timestamp = self.formatTime(record, self.datefmt)
@@ -101,12 +113,20 @@ class LoggerWrapper:
         self._logger = logger
         self.show_location = show_location
 
-    def _add_location(self, color: str) -> str:
-        """Add file and line number with color."""
+    def _add_location(self, color: str, depth: int = 2) -> str:
+        """Add file and line number with color.
+
+        *depth* is how many frames up the real caller sits. The default of 2
+        suits a log method calling this directly; a method that delegates to
+        another one (``exception`` -> ``error``) has to add its own frame, or
+        the location reads as logger.py instead of the caller.
+        """
         if not self.show_location:
             return ""
 
-        frame = inspect.currentframe().f_back.f_back
+        frame = inspect.currentframe()
+        for _ in range(depth):
+            frame = frame.f_back
         filename = os.path.basename(frame.f_code.co_filename)
         lineno = frame.f_lineno
         return f"{color}{Colors.ITALIC}[{filename}:{lineno}]{Colors.RESET} "
@@ -176,13 +196,13 @@ class LoggerWrapper:
         if cond:
             self.warning(msg)
 
-    def error(self, msg: str, *args, exc_info=None, **kwargs):
+    def error(self, msg: str, *args, exc_info=None, _depth: int = 2, **kwargs):
         if _is_from_libraries():
             self.debug(msg, exc_info=exc_info, *args, **kwargs)
             return
         """Log error message in bright red."""
         prefix = f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET}"
-        colored_msg = f"{prefix} {self._add_location(Colors.BRIGHT_RED)}{Colors.RED}{msg}{Colors.RESET}"
+        colored_msg = f"{prefix} {self._add_location(Colors.BRIGHT_RED, _depth)}{Colors.RED}{msg}{Colors.RESET}"
         self._logger.error(colored_msg, *args, exc_info=exc_info, **kwargs)
 
     def exception(self, msg: str, *args, **kwargs):
@@ -195,7 +215,9 @@ class LoggerWrapper:
         meant to do next never ran. That cost a GRPO run its failure signal.
         """
         kwargs.setdefault("exc_info", True)
-        self.error(msg, *args, **kwargs)
+        # +1 frame: the caller we want to name is above `exception`, not above
+        # `error`.
+        self.error(msg, *args, _depth=3, **kwargs)
 
     def critical(self, msg: str, *args, exc_info=None, **kwargs):
         """Log critical message in bold bright red."""
