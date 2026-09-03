@@ -185,6 +185,18 @@ class LoggerWrapper:
         colored_msg = f"{prefix} {self._add_location(Colors.BRIGHT_RED)}{Colors.RED}{msg}{Colors.RESET}"
         self._logger.error(colored_msg, *args, exc_info=exc_info, **kwargs)
 
+    def exception(self, msg: str, *args, **kwargs):
+        """Log an error with the active traceback, as ``logging.Logger.exception``.
+
+        This is the one member of the stdlib logger API the wrapper otherwise
+        mirrors, and its absence was a landmine rather than a gap: calling
+        ``logger.exception(...)`` inside an ``except`` block raised
+        ``AttributeError`` from the handler itself, so whatever the handler
+        meant to do next never ran. That cost a GRPO run its failure signal.
+        """
+        kwargs.setdefault("exc_info", True)
+        self.error(msg, *args, **kwargs)
+
     def critical(self, msg: str, *args, exc_info=None, **kwargs):
         """Log critical message in bold bright red."""
         prefix = f"{Colors.BOLD}{Colors.BRIGHT_RED}[CRITICAL]{Colors.RESET}"
