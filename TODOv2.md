@@ -7,6 +7,30 @@ pre-existing review items; nothing moves between the two.
 
 Status legend: `[ ]` open · `[~]` in progress · `[x]` done (commit) · `[?]` open question
 
+## Status (2026-09-03)
+
+**Shipped, and the product claim holds end to end.** `surogate serve <file>.gguf`
+converts a K-quant GGUF in seconds, serves the file's own Q4_K/Q5_K/Q6_K blocks
+with no dequantise-and-requantise in the text core, and beats both reference
+engines on one 5090 at the board's shape (512/128, salted prompts, closed loop):
+at one user 802 decode against vLLM 0.27.1's 346 and llama.cpp's 454; at eight,
+2,765 against 1,768 and 683. `llama-bench` on the same file reads 39,511 prefill
+and 809 decode against our 97,062 and 864. Rows in `surogate/serve/BENCHMARKS.md`.
+
+Also shipped: RedHatAI's compressed-tensors NVFP4 35B converts from its own
+directory (§4 M1), BF16 linears run at any 8-aligned shape, text-only GGUF
+exports of a vision family convert, and a tied head is stored once.
+
+**The three things worth doing next**, in order — §7's K-line has the detail:
+
+1. A fused K-quant GDN projection-and-convolution. It unlocks the last 8 % of
+   lossy bytes, which today cost more in kernel launches than they save.
+2. MoE (K4). Needs a small MoE GGUF downloaded first; none is on this disk.
+3. Retire the home-grown Q4G64/Q5G64/Q6G64 and add `surogate quantize` (K6).
+
+§7 is the governing section where it disagrees with §2 or M3: the owner's
+2026-09-02 decision made GGUF K-quants the product, and this file predates it.
+
 ## 0. What the code says (verified 2026-09-02)
 
 Each claim below was checked against the tree, not inferred.
@@ -106,12 +130,13 @@ reason" (`:44`).
 
 What each preset needs from the runtime, against the coverage in §2a:
 
-- [ ] NVFP4 / NVFP4A16 — fp4 pairs, fp8 per-16 block scales, fp32 global scale (compressed-tensors: global scale *divides*; ModelOpt exports invert it). Runtime: `QType::NVFP4` exists; shape-gated, see M1.
+- [~] NVFP4 / NVFP4A16 — fp4 pairs, fp8 per-16 block scales, fp32 global scale. **compressed-tensors ships** (M1 acceptance met): the format is read per tensor from the artifact and the shape gate is gone. ModelOpt's inverted global scale is still unhandled — item N.
 - [ ] FP8 / FP8_DYNAMIC / FP8_BLOCK — e4m3 with per-tensor / per-channel / block scales. Runtime: only `FP8_E4M3FN_ROW_BF16S` (per-row BF16 scale), six registered shapes, no generic path.
 - [ ] W4A16 / W4A16_ASYM / W4A8 — int4 `pack-quantized`, group strategy, optional zero points and actorder. Runtime: `Q4G64_F16S` is symmetric, group 64; asymmetric needs a min plane (`Q4G32AM` exists CPU-only).
-- [ ] W8A8 / W8A16 / INT8. Runtime: `W8G32_F16S` (group 32, fp16 scale) is the broadest-supported format; W8A8 IMMA prefill exists.
+- [ ] W8A8 / W8A16 / INT8 from compressed-tensors. Runtime: `W8G32_F16S` (group 32, fp16 scale) is the broadest-supported format and W8A8 IMMA prefill exists; GGUF's Q8_0, Q4_0, Q5_0 and IQ4_NL already repack into it bit-exactly. What is missing is the *ingest*: a compressed-tensors int8/int4 checkpoint still has no reader.
 - [ ] MXFP4 / MXFP8 — e8m0 block scales. Runtime: nothing in serve; the trainer decodes MXFP4 (`kernels/mxfp4_dequant.cu:231`).
 - [ ] `kv_cache_scheme` — refuse or support; do not ignore silently.
+- [x] **GGML K-quants — Q2_K through Q6_K, shipped (§7).** Not in this table when it was written, because it predates the product decision. Served in their own 256-value superblocks (`ggml-blocks-v1`), byte-for-byte as the file stores them, on two routes: llama.cpp's ported `mul_mat_vec_q` below 65 tokens and a dequantise-once BF16 tensor-core path above it. Q4_0/Q5_0/Q8_0/IQ4_NL keep their exact repack into W8 (K2). There is no Q1_K; the 1-bit types are IQ1_S/IQ1_M i-quants and are refusable.
 
 ## 2. The design
 
@@ -244,7 +269,10 @@ writes the reciprocal and forces the divisor to identity
   loader artifact, not a floor" (pinned bounce buffer → ~1.5–2.5 s). No test
   gates load time and the benchmark board excludes it. A repack-at-load
   design must not regress these; the cache is what keeps it from being paid
-  per start.
+  per start. **Measured since (2026-09-02/03):** the compressed-tensors 35B
+  loads 20.96 GiB in ~7 s, and a K-quant GGUF converts in 1.8 s (0.8B) to
+  3.6 s (2B) — the native path writes fewer bytes than the dequantise path it
+  replaced, so nothing here regressed. Still no test gates load time.
 
 ## 4. Milestones
 
@@ -270,7 +298,7 @@ from its `quantization_config`.
 - [x] C++ suite after the binder changes: 105/105.
 - [x] **C++ load side (M1a) up to the shared expert.** Regression: the existing groupwise-int and routed-NVFP4 35B artifacts answer byte-identically (64-token greedy) through read-format binding against a stash-built baseline of the previous binary; the compressed-tensors artifact loads until `text/layers/0/moe/shared_gate_up`, which the MoE binder still requires fused — the shared-expert decision below. `artifact::bind_linear` / `materialized_linear` (`typed_binding`) bind a Linear in whatever format the artifact stores, asserting shape only, and build the NVFP4 `Weight` that every target used to re-implement (`Binder::require_tensor_shaped` underneath). The 35B target binds every text-core Linear that way — token embedding, attention (split `query/key/gate/value` when the artifact has them, the fused parent otherwise), `attention/output`, GDN (`query_key_value` + `z` or the fused parent), `gdn/output`, `output_head`, MTP attention through the same path — and the leaves run the split through generic `linear` (attention) and the existing `gdn_input_proj_conv_{snapshot,record}_split` ops (GDN), with the call-site policy following the weight's format. Interim `WeightsProfile::CompressedTensors` sizes workspaces until formats reach the planner from the load plan. Regression oracle: the existing groupwise-int and routed-NVFP4 35B artifacts must answer byte-identically to the pre-change binary (stash-built baseline). The compressed-tensors artifact is expected to stop at the shared expert's W8 gate.
 - [x] **RETRACTED — no route defect.** The one-token failure at `[4096,2048]` seed 731 (7.09375 vs 4.13297 at row 6) was chased through four hypotheses — M = 1-specific, first use, stale workspace flags, a sign-bit reading — each refuted by experiment (the padded two-token plan, a zeroed workspace and a repeated invocation all reproduce the identical value; the generator's scales are all positive). The harness's own statistics (`SINFER_OP_REPORT_STATS=1`) then showed what it was: the A4 oracle does not model activation quantisation, its 16 % allowance is applied as whole-output `rel_l2` **and** as a per-element bound of 16 % of the *largest reference in the output*. On uniform random activations this route sits at `rel_l2` 0.157 of 0.16 at one token and 0.10 at 300 — the same noise the in-house W4A4 kernels produce — and at one token on 4,096 outputs the largest reference is smallest (17.7 vs 52.6 at T = 300), so one row landed 4 % over the per-element bound. A statistical edge of the fixture under a T-dependent criterion, not a kernel error. Sampling did not clear it either, so the oracle was fixed instead of the seed (the item above); the workspace memset and the M = 1 padding were removed — neither fixed anything and a fix that fixes nothing is a lie in the tree. Cost: most of an afternoon; lesson recorded in §4a's rules — read the harness's criterion before chasing a kernel.
-- [?] **Shared expert under NVFP4 — owner's call, sized.** The export quantizes `shared_expert.{gate,up,down}_proj` with three distinct global scales; `sparse_moe` computes the shared expert inside all three of its kernel bodies — decode and small-T via `dot_two_rows<W8Codec, …>` on one gate|up matrix, prefill via dedicated launches of the expert GEMM template — and admits W8 only (`sparse_moe.cpp:154`). Sized:
+- [?] **Shared expert under NVFP4 — still the owner's call, and the only thing between this export and a fully native NVFP4 serve.** Option (c) is built and shipped as an opt-in, so nothing is blocked; (a) is the stated destination. The export quantizes `shared_expert.{gate,up,down}_proj` with three distinct global scales; `sparse_moe` computes the shared expert inside all three of its kernel bodies — decode and small-T via `dot_two_rows<W8Codec, …>` on one gate|up matrix, prefill via dedicated launches of the expert GEMM template — and admits W8 only (`sparse_moe.cpp:154`). Sized:
   - (a) *NVFP4 shared codec in the kernels.* The routed path's `Nvfp4CodecFor` is W4A16 (BF16 activations), reads the same 128×4 tiled layout a dense NVFP4 weight has, and is already instantiated for K = 2048 and 512 — the shared expert's own K values. What is missing: the bodies read gate|up as one matrix, and the export's gate and up have different global scales, so each site needs to take the two halves (and their scales) separately, plus the wrapper's admission, a scalar global scale per shared weight on `SparseMoeWeights`, the binder, and an op-test fixture with an NVFP4 shared expert. About a day. Honest: the export's numbers, bit for bit.
   - (b) *Shared expert outside the op.* Generic `linear`×2 + silu·mul + `linear_add` in the leaf, scaled by the op's per-token `shared_scale`, with a no-shared mode in the same three bodies. Not smaller than (a).
   - (c) *Requantize the shared expert to W8 in the converter.* Built as an explicit opt-in (`--shared-expert w8`; default `as-stored`): dequantize the NVFP4 halves through the same words the engine reads (E2M1 table checked byte-for-byte against compressed-tensors' own unpacker), fuse gate|up, encode W8 as the base converter does. Overrides the export for 120 tensors (~3.1 M params per layer). **With it, the artifact loads all 20.96 GiB of weights in 8.0 s** — every text-core object bound in its stored format — and then stops in the frontend: the engine pins `tokenizer_config.json` "prefix semantics" (the C++ half of the same assumption the converter had). It does not decide the question; (a) remains the destination.
@@ -283,16 +311,7 @@ from its `quantization_config`.
   4. `bf16_linear_add_select` likewise, plus a `CublasLt` schedule accumulating into the residual through the same plan (β per call, `bf16_cublaslt_gemm_accumulate`), and the wrapper's own admits-gate above it.
   5. The graph budget then refused 36 MiB against a 12 MiB allowance: the BF16 cuBLASLt plane builds a 32 MiB workspace on first use, and first use was now *inside* the capture window. `program_impl.h` prewarms it beside the NVFP4 and FP8 planes, as qwen4exp already did for itself.
 - [x] **M1 ACCEPTANCE MET.** RedHatAI's `Qwen3.6-35B-A3B-NVFP4` converts from its own directory and serves: *"The capital of France is"* → a coherent reasoning trace naming Paris; the Danube question answered in structure. Zero code names that checkpoint. Regression: both existing 35B artifacts answer byte-identically to the pre-change binary, gemma3-270m and tinyllama still say "Paris.", qwen3.5-0.8b still thinks first, 105/105 C++ tests.
-
-- [?] **Shared expert under NVFP4 — owner's call, sized.** The export quantizes `shared_expert.{gate,up,down}_proj` with three distinct global scales; `sparse_moe` computes the shared expert inside all three of its kernel bodies — decode and small-T via `dot_two_rows<W8Codec, …>` on one gate|up matrix, prefill via dedicated launches of the expert GEMM template — and admits W8 only (`sparse_moe.cpp:154`). Sized:
-  - (a) *NVFP4 shared codec in the kernels.* The routed path's `Nvfp4CodecFor` is W4A16 (BF16 activations), reads the same 128×4 tiled layout a dense NVFP4 weight has, and is already instantiated for K = 2048 and 512 — the shared expert's own K values. What is missing: the bodies read gate|up as one matrix, and the export's gate and up have different global scales, so each site needs to take the two halves (and their scales) separately, plus the wrapper's admission, a scalar global scale per shared weight on `SparseMoeWeights`, the binder, and an op-test fixture with an NVFP4 shared expert. About a day. Honest: the export's numbers, bit for bit.
-  - (b) *Shared expert outside the op.* Generic `linear`×2 + silu·mul + `linear_add` in the leaf, scaled by the op's per-token `shared_scale`, with a no-shared mode in the same three bodies. Not smaller than (a).
-  - (c) *Requantize the shared expert to W8 in the converter.* Built as an explicit opt-in (`--shared-expert w8`; default `as-stored`): dequantize the NVFP4 halves through the same words the engine reads (E2M1 table checked byte-for-byte against compressed-tensors' own unpacker), fuse gate|up, encode W8 as the base converter does. Overrides the export for 120 tensors (~3.1 M params per layer). **With it, the artifact loads all 20.96 GiB of weights in 8.0 s** — every text-core object bound in its stored format — and then stops in the frontend: the engine pins `tokenizer_config.json` "prefix semantics" (the C++ half of the same assumption the converter had). It does not decide the question; (a) remains the destination.
-- [x] `common/inventory.py` gained `NVFP4`, `FP8`, `BLOCK_SCALE_LAYOUT`, `ROW_SCALE_LAYOUT` — every target re-declared the NVFP4 pair beside its own inventory. Two places restated `FORMAT_COUNTS` as a literal and tripped on the zero-count entries (`qwen3_6_27b/test_inventory.py`, the 35B `preflight_inventory`); both now compare present formats only.
-- [x] Frontend resources: the converter pinned the *official* Qwen3.6 `tokenizer.json` hash and refused the export's (re-serialised, 248,044 vocab / 247,587 merges, sha `dd6b…`). A compressed-tensors export ships the frontend it was calibrated with; `load_official_resources(accept_source=True)` records the hash instead of refusing. The env-var "derived frontend" path stays for the GGUF bridge.
-- [~] The C++ half of the same pin: `family/impl/frontend/frontend.cpp:245` rejected the export's `tokenizer_config.json` for "prefix semantics" because it defaults an *absent* `add_bos_token` to true — while its own comment says an absent key means false, and the transformers-5 `TokenizersBackend` config shape (`add_prefix_space: false`, `bos_token: null`, no `add_bos_token` key) is exactly the case. Code aligned with the comment. The next pin behind it: `tokenizer.cpp` required `added_tokens_decoder` in `tokenizer_config.json` — the pre-transformers-5 home of the special tokens, which it *merges* over `tokenizer.json`'s `added_tokens` and cross-checks. The `TokenizersBackend` config has no such key; `tokenizer.json` is the sole authority there, so an absent decoder now means nothing to merge (the conflict check stays when both exist). Both landed (`f93caeab`); the 35B groupwise-int artifact, whose bundled config carries the decoder, answers byte-identically.
-- [~] **Next stop, compute: "bf16 linear: unsupported shape or T".** `select_bf16_a16_launch` (`ops/linear/bf16/bf16_dispatch.cpp`) is a two-shape registry — `[14336,5120]` and `[5120,6144]`, the 27B's — and throws for anything else, while a shape-generic BF16 cuBLASLt GEMM sits beside it unreached. The export's BF16 GDN halves (`[8192,2048]`, `[4096,2048]`) and `lm_head` (`[248320,2048]`) are the first BF16 linears ever run off that table. This is the M2 principle ("a shape off the table degrades to the generic path, tier printed") arriving early. Written: `select_bf16_a16_launch` routes any 8-aligned shape off the table to cuBLASLt at every width, and `bf16_linear_add_select` gains a `CublasLt` schedule that accumulates into the residual through the same plan (β is per call). Build and acceptance rerun in flight.
-- [?] **The export's `tokenizer.json` and the engine's tokenizer.** `test_frontend.cpp`'s new case, pointed at the export's tokenizer, fails encoding plain text ("produced token outside vocabulary: h") while the merge and special-token tests on the same file pass — none of them encodes ordinary text. The file differs from the official one in serialisation only where checked so far (merges as two-element lists, which the parser accepts; `pre_tokenizer`, `normalizer`, `post_processor`, `model.vocab['h']` identical). Being attributed: whether the official-config tokenizer encodes plain text from this file at all, and a full vocab/merges/added-tokens diff.
+- [x] **Resolved — the tokenizer test was a fixture mismatch, not a defect.** `test_frontend.cpp`'s transformers-5 case failed to encode plain text only because it was built on `resources()`'s synthetic four-token vocabulary, which cannot encode "hello"; the export's own `tokenizer.json` and `tokenizer_config.json` — which already carry neither `add_bos_token` nor `added_tokens_decoder` — construct and encode correctly through `official_tokenizer()`. The case now strips the two keys from the fixture's *own* config and requires identical output, and it passes (`7de24bab`). The lesson is recorded: a scripted patch that asserts before its write leaves the file untouched, and a suite's case count is the only proof it ran.
 - [ ] **M1 scope decisions**, recorded so they are not relitigated mid-implementation:
   1. *Unquantized modules stay BF16.* This export leaves GDN `in_proj`/`out_proj`, the routers, norms, `lm_head` and MTP in BF16 deliberately (they are the `ignore` list). The base converters requantize BF16 to W8 for the groupwise-int profile; doing that here would override the exporter's choice. The config is the authority in both directions.
   2. *Descriptor field extension is not M1.* This file uses only `NVFP4` and `BF16`, both existing `NumericFormat`s. The explicit `{bits, type, group, scale_dtype, layout}` fields (§3) are the prerequisite for the *other* presets in §1 and get their own item.
@@ -327,8 +346,8 @@ against gguf-py's dequantize, the lossy ones print their measured error,
 and greedy output on a fixed prompt is compared against the
 safetensors-derived 0.8B artifact.
 
-- [ ] GGML type → runtime format table, per tensor, from the header — never a file-level "quant type".
-- [ ] Decide the K-quant landing: a min plane on the GPU int formats (exact) vs dequant + requant with the loss printed. Measure both on `Qwen3.5-0.8B-Q4_K_M`.
+- [x] GGML type → runtime format table, per tensor, from the header — never a file-level "quant type". `GgufRepackSource.plan_native` reads each tensor's own type and rewrites that object's spec; a Q4_K_M file lands as Q4_K + Q5_K + Q6_K + W8 in one artifact.
+- [x] **K-quant landing decided — neither option.** Measured on `Qwen3.5-0.8B-Q4_K_M`: dequantise+requantise to W8 adds 5.7e-3 relative weight error *and* nearly doubles bytes per weight (0.56 → 1.06); a min plane on the GPU int formats would have been a new grid and a requantisation of its own. The answer was to keep the file's own superblocks and read them (§7): zero added error at 0.56 bytes per weight.
 - [ ] Architecture and hyperparameters from GGUF metadata (`bridge.py` reads `{arch}.embedding_length`, `.block_count`, head counts, ssm.* already); static `config.json` is vendored per target under `serve/resources/` today and must instead be derived.
 - [ ] Tokenizer from GGUF metadata: BPE only today (`frontend.py:45-56`, `tokenizer.ggml.pre` must be in a literal table); SentencePiece GGUFs refused — connect to the tree's own SPM tokenizer (`csrc/src/tokenizer`).
 - [ ] Architecture table `gguf_target_key` (`bridge.py:298-327`) is literal; replace with the same architecture registry M2 produces.
@@ -488,7 +507,6 @@ Same on Q5_K and Q6_K (5.8e-3, 5.7e-3). An 8-bit symmetric grid cannot land on a
 ### K-milestones
 
 - [x] **K0 — the bar**: above.
-- [ ] **K1 — mmvq port.** `ops/linear/ggml/`: `quantize_q8_1` (activation → int8 per 32 + (d, sum)), ported `vec_dot_{q2..q6}_K_q8_1` (+ Q8_0/Q4_0/Q5_0/IQ4_NL, which llama.cpp also has), the `mul_mat_vec_q` body for T ≤ 8, dispatch from `ops::linear` on the new `QType`s. Artifact: `NumericFormat::Q2_K..Q6_K`, `QuantLayout::GgmlBlocks`, `tensor_encoded_size`, converter passthrough (verbatim bytes; the `_planes_*` deinterleave stays only for Q8_0 → W8G32), binder. Tests: each type against a CPU reference that applies the *same* Q8_1 activation quantisation then fp64, on real blocks from the GGUFs on disk and on synthetic ones. **Acceptance:** the 0.8B Q4_K_M's K-quant tensors served natively; greedy tokens identical to llama.cpp's on the same file (llama.cpp is the oracle for "the file's numbers are the served numbers"); tg128 ≥ 803 on a 5090.
 - [x] **K1 (2026-09-02).** Kernel slice `7aea807e`, the rest in the commit after `0a07552b`. Decode-side acceptance met; prefill waits on K3:
   - *Artifact*: `NumericFormat::Q2_K..Q6_K`, `StorageLayout::GgmlBlocksV1` ("ggml-blocks-v1"), `QType::Q2_K..Q6_K`, `QuantLayout::GgmlBlocks`; a K-quant `Weight` is the block array with no scale planes. Python: `GgmlBlockFormat`, the layout, `inventory` names.
   - *Converter*: `GgufRepackSource.plan_native` plans every quantised-linear object whose row program draws from mapped sources of one K type; `native_specs` rewrites the specs; `payload_for_native` gathers block rows verbatim. `plan()` no longer W8-repacks an object with a K-quant source. `surogate serve` keeps native sources in the map; `SUROGATE_GGUF_NATIVE=0` forces the old path (A/B), `SUROGATE_GGUF_NATIVE_ONLY=<substrings>` restricts the plan (bisection). The 0.8B Q4_K_M converts in 2.3 s: **77 objects native** (Q4_K 44, Q5_K 18, Q6_K 15), 922 MB against 1,224 MB through the dequantise path. Checked byte-identical to the GGUF: `mlp/down`, the concatenated `mlp/gate_up`, the 200 MB `token_embedding`, its tied `output_head`, a gathered `gdn/output`.
@@ -556,7 +574,28 @@ Open, in the order they matter:
 
 M2 (geometry templating), M4 (unified loading) and M5 (`--no-cache`, `surogate convert`) stand behind these.
 
-## 6. Progress log
+## 8. Progress log
+
+**2026-09-02 — the K-line, in one sitting.** K0 the bar, K1 the native read
+path, K2 closed by decision, K3 the wide-batch route, K5c built and measured
+and left off, plus two ingest fixes; `7aea807e`, `7de24bab`, `2432825e`,
+`478ab1ae`, `ca656302`, and the docs commits. Three things are worth carrying
+forward from it:
+
+- **MMQ was the wrong port.** The tracker said port `mul_mat_q` for prefill,
+  ~6,000 lines. Dequantising a bounded row tile once and running BF16 tensor
+  cores is ~200 lines, more accurate (the activation is never quantised), and
+  took prefill 8,909 → 95,384 tok/s. The premise behind MMQ — that the
+  activation is worth quantising so the weight can stay packed — is the wrong
+  trade on a card with these tensor cores.
+- **Fewer bytes is not always faster.** K5c removes the last lossy
+  requantisation and 8 % of the bytes, and loses 6 % of decode to two extra
+  kernel launches per layer. Built, measured, left behind a flag, and the
+  reason recorded rather than the result quietly kept.
+- **A green suite proves only the cases it ran.** A patch adding the embedding
+  gather's test silently did not apply; the suite still passed, and the gather
+  was writing half of every Q6_K row. The case count was the tell.
+
 
 - 2026-09-02 — Redesign scoped. Prior boilerplate hoists (`f1a869eb`,
   `3673030c`, `a0d40f05`, `89d96c64`, `bda92164`) treated the symptom; this
