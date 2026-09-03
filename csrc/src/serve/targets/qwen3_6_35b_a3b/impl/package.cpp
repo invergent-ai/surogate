@@ -93,8 +93,14 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
-                                                        WeightsProfile weights_profile) {
-    return family::make_sequence_planner<detail::Variant>(device, options, weights_profile);
+                                                        WeightsProfile weights_profile,
+                                                        const family::TextGeometry& geometry) {
+    return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
+                                                         geometry);
+}
+
+family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
+    return family::TextGeometry::declared<detail::TextConfig>(reader.geometry());
 }
 
 std::unique_ptr<Package::Program>

@@ -43,9 +43,9 @@ class ConversionPreflight:
     draft: "draft_head.DraftHeadContext"
 
 
-def _repo_root() -> Path:
+def _tools_root() -> Path:
     # As in convert_nvfp4: DEFAULT_RANKING is relative to surogate/serve/tools.
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[2] / "tools"
 
 
 def _resources_from_artifact(path: Path) -> tuple:
@@ -85,7 +85,7 @@ def preflight_conversion(
     plan = family_conversion.build_object_plan(
         inventory.OBJECT_SPECS, {item.name: item.data for item in resources}
     )
-    ranking = _repo_root() / draft_head.DEFAULT_RANKING
+    ranking = _tools_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, source)
     return ConversionPreflight(source, plan, resources, draft)
 

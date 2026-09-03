@@ -66,8 +66,9 @@ class ConversionPreflight:
     object_plan: family_conversion.ObjectPlan
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def _tools_root() -> Path:
+    """`serve/tools/`, which holds the fixtures a conversion reads (the draft-head ranking)."""
+    return Path(__file__).resolve().parents[2] / "tools"
 
 
 def _validate_index(model_dir: Path) -> None:
@@ -230,7 +231,7 @@ def preflight_conversion(
     resources = base_convert.load_resources(official)
     resource_map = {resource.name: resource.data for resource in resources}
     object_plan = build_object_plan(resource_map)
-    ranking = _repo_root() / draft_head.DEFAULT_RANKING
+    ranking = _tools_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, official)
     return ConversionPreflight(
         official_dir=official,
@@ -297,12 +298,12 @@ def _build_report(
     final_bytes: int,
     device: torch.device,
 ) -> dict[str, object]:
-    ranking = _repo_root() / draft_head.DEFAULT_RANKING
+    ranking = _tools_root() / draft_head.DEFAULT_RANKING
     report = family_conversion.build_conversion_report(
         identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
-        repo_root=_repo_root(),
+        repo_root=_tools_root(),
         model_dir=preflight.official_dir,
         out_path=output,
         arguments=arguments,

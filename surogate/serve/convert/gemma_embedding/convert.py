@@ -125,7 +125,7 @@ def config_from_gguf(source: GgufSource) -> dict[str, Any]:
 def inventory(config: dict[str, Any]) -> list[dict[str, Any]]:
     """Every object the artifact stores, from the declaration."""
 
-    generate = Path(__file__).resolve().parents[2] / "generate"
+    generate = Path(__file__).resolve().parents[2] / "tools" / "generate"
     if str(generate) not in sys.path:
         sys.path.insert(0, str(generate))
     import emit_inventory  # noqa: PLC0415

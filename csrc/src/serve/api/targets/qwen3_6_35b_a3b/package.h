@@ -4,6 +4,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
 #include <api/family/frontend.h>
+#include <api/family/text_geometry.h>
 #include <api/family/target_package.h>
 #include <api/family/runtime.h>
 
@@ -16,6 +17,7 @@ namespace sinfer {
 struct DeviceContext;
 
 namespace artifact {
+class Reader;
 class Binder;
 class MaterializedArtifact;
 struct ArtifactIdentity;
@@ -82,7 +84,10 @@ struct Package {
                                                 const EngineOptions& options);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,
-                                                               WeightsProfile weights_profile);
+                                                               WeightsProfile weights_profile,
+                                                               const family::TextGeometry& geometry);
+    /// The dimensions this artifact declares, over this target's compiled config.
+    [[nodiscard]] static family::TextGeometry declared_geometry(const artifact::Reader& reader);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
 };

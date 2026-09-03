@@ -467,7 +467,7 @@ def build_conversion_report(
     final_bytes: int,
     device: torch.device,
 ) -> dict:
-    repo_root = Path(__file__).resolve().parents[5]
+    repo_root = Path(__file__).resolve().parents[4]
     return {
         "identity": {
             "model_id": inventory.MODEL_ID,

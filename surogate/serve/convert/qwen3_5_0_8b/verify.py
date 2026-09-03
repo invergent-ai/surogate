@@ -35,7 +35,7 @@ from surogate.serve.convert.common.safetensors import ShardReader
 from . import draft_head, inventory, recipe
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TOOLS_ROOT = Path(__file__).resolve().parents[2] / "tools"
 
 DIRECT_PROBE_OBJECTS = (
     "text/layers/0/input_norm",
@@ -511,7 +511,7 @@ def _load_and_validate_draft_ids(
     if not isinstance(draft_expression, recipe.DraftHeadTokenIds):
         _contract_error("draft ID recipe is not the registered derivation")
     context = draft_head.compute_shortlist(
-        PROJECT_ROOT / draft_expression.ranking_path,
+        TOOLS_ROOT / draft_expression.ranking_path,
         model_dir,
         n=draft_expression.rows,
         vocab=draft_expression.vocab_rows,

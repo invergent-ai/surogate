@@ -80,7 +80,7 @@ def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
     plan = family_conversion.build_object_plan(
         inventory.OBJECT_SPECS, {item.name: item.data for item in resources}
     )
-    ranking = Path(__file__).resolve().parents[2] / draft_head.DEFAULT_RANKING
+    ranking = Path(__file__).resolve().parents[2] / "tools" / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, source)
     return ConversionPreflight(source, plan, resources, draft)
 

@@ -317,9 +317,10 @@ runtime::MixedRoundResult Program<Variant>::consume_mixed_round(runtime::RoundHa
 template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
-                                                        Variant::WeightsProfile weights_profile) {
+                                                        Variant::WeightsProfile weights_profile,
+                                                        const TextGeometry& geometry) {
     return SequencePlanner<Variant>(detail::SINFER_FAMILY_RUNTIME_NS::make_sequence_planner_impl(
-        device, options, weights_profile));
+        device, options, weights_profile, geometry));
 }
 
 template <>

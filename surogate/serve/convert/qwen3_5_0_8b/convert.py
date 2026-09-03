@@ -100,8 +100,9 @@ class ConversionPreflight:
     object_plan: ObjectPlan
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def _tools_root() -> Path:
+    """`serve/tools/`, which holds the fixtures a conversion reads (the draft-head ranking)."""
+    return Path(__file__).resolve().parents[2] / "tools"
 
 
 def _load_config(model_dir: Path) -> dict[str, object]:
@@ -280,7 +281,7 @@ def preflight_conversion(
     resource_map = {resource.name: resource.data for resource in resources}
     object_plan = build_object_plan(resource_map, mtp=mtp, native=native,
                                     object_specs=object_specs)
-    ranking = _repo_root() / draft_head.DEFAULT_RANKING
+    ranking = _tools_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
         model_dir=model,
@@ -355,7 +356,7 @@ def build_conversion_report(
         identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
-        repo_root=_repo_root(),
+        repo_root=_tools_root(),
         model_dir=model_dir,
         out_path=out_path,
         arguments=arguments,
@@ -485,7 +486,7 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    ranking = _repo_root() / draft_head.DEFAULT_RANKING
+    ranking = _tools_root() / draft_head.DEFAULT_RANKING
     arguments = {
         "model": str(model_dir),
         "out": str(out_path),

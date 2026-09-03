@@ -1,3 +1,5 @@
+#include <api/family/text_geometry.h>
+
 #include "targets/registry.h"
 
 #include "artifact/binder.h"
@@ -153,6 +155,7 @@ inline constexpr std::uint32_t kAutoContextProbe = 2048;
 template <class Target>
 std::uint32_t resolve_automatic_context(DeviceContext& device, const EngineOptions& options,
                                         typename Target::WeightsProfile weights_profile,
+                                        const family::TextGeometry& geometry,
                                         std::size_t budget_bytes) {
     const std::uint32_t native = Target::maximum_context();
     if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
@@ -168,7 +171,8 @@ std::uint32_t resolve_automatic_context(DeviceContext& device, const EngineOptio
         EngineOptions probe   = options;
         probe.max_context     = context;
         probe.prefill_chunk   = std::min(options.prefill_chunk, context);
-        return Target::make_sequence_planner(device, probe, weights_profile).capacity_curve();
+        return Target::make_sequence_planner(device, probe, weights_profile, geometry)
+            .capacity_curve();
     };
 
     const runtime::SequenceCapacityCurve probe = plan_at(kAutoContextProbe);
@@ -200,6 +204,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                                        std::string_view target_key) {
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
+    // The dimensions to plan and bind against: this target's compiled config with whatever
+    // the artifact declares laid over it.
+    const family::TextGeometry geometry            = Target::declared_geometry(reader);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
 
     artifact::Binder binder(reader);
@@ -211,12 +218,13 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         derived_residency_bytes);
     EngineOptions effective = options;
     if (effective.max_context == 0) {
-        effective.max_context = resolve_automatic_context<Target>(device, options, weights_profile,
-                                                                  preflight_runtime_bytes);
+        effective.max_context = resolve_automatic_context<Target>(
+            device, options, weights_profile, geometry, preflight_runtime_bytes);
         effective.prefill_chunk = std::min(options.prefill_chunk, effective.max_context);
     }
     if (effective.elastic_kv_overcommit) { effective.elastic_kv = true; }
-    auto sequence_planner = Target::make_sequence_planner(device, effective, weights_profile);
+    auto sequence_planner =
+        Target::make_sequence_planner(device, effective, weights_profile, geometry);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     // Overcommit: the physical cap is a guaranteed floor of one full-context request; every
     // page past it is entitled through the device gate at admission. An automatic policy
@@ -348,7 +356,8 @@ std::uint32_t resolve_automatic_context_for_pipeline(DeviceContext& device,
     const std::size_t budget = subtract_saturating(
         runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
         projected_derived_residency_bytes(binder, plan.materialization()));
-    return resolve_automatic_context<Target>(device, stage_options, weights_profile, budget);
+    return resolve_automatic_context<Target>(device, stage_options, weights_profile,
+                                            Target::declared_geometry(reader), budget);
 }
 
 template <class Target, class Loaded, class Instance, int Layers>

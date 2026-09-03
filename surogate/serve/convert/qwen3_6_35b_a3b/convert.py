@@ -178,8 +178,9 @@ class ConversionPreflight:
     compressed_plan: compressed_tensors_source.SourcePlan | None = None
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def _tools_root() -> Path:
+    """`serve/tools/`, which holds the fixtures a conversion reads (the draft-head ranking)."""
+    return Path(__file__).resolve().parents[2] / "tools"
 
 
 def validate_config(config: Mapping[str, object]) -> dict[str, object]:
@@ -463,7 +464,7 @@ def preflight_conversion(
             specs = tuple(spec for spec in specs if spec not in inventory.DFLASH_TENSOR_SPECS)
         object_plan = family_conversion.build_object_plan(specs, resource_map)
 
-    ranking = _repo_root() / draft_head.DEFAULT_RANKING
+    ranking = _tools_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
         model_dir=model,
@@ -555,7 +556,7 @@ def build_conversion_report(
         identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
-        repo_root=_repo_root(),
+        repo_root=_tools_root(),
         model_dir=model_dir,
         out_path=out_path,
         arguments=arguments,
@@ -678,7 +679,7 @@ def convert(
                 # ranking file and the checkpoint, so computing it here matches what preflight
                 # computes later.
                 draft_ids = draft_head.materialize_draft_head_token_ids(
-                    draft_head.compute_shortlist(_repo_root() / draft_head.DEFAULT_RANKING, model)
+                    draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, model)
                 )
                 native_runs = {
                     spec.name: repack.runs_for_native(
@@ -859,7 +860,7 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    ranking = _repo_root() / draft_head.DEFAULT_RANKING
+    ranking = _tools_root() / draft_head.DEFAULT_RANKING
     arguments = {
         "model": str(model_dir),
         "dflash_model": str(dflash_model_dir) if dflash_model_dir is not None else None,

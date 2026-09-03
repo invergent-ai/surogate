@@ -5,6 +5,7 @@
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/round_lifecycle.h"
+#include <api/family/text_geometry.h>
 #include <api/family/prepared_prompt.h>
 
 #include <cstddef>
@@ -95,7 +96,8 @@ public:
 
     template <class V>
     friend SequencePlanner<V> make_sequence_planner(DeviceContext&, const EngineOptions&,
-                                                    typename V::WeightsProfile);
+                                                    typename V::WeightsProfile,
+                                                    const TextGeometry&);
 };
 
 template <class Variant>
@@ -231,7 +233,8 @@ private:
 template <class Variant>
 [[nodiscard]] SequencePlanner<Variant>
 make_sequence_planner(DeviceContext& device, const EngineOptions& options,
-                      typename Variant::WeightsProfile weights_profile);
+                      typename Variant::WeightsProfile weights_profile,
+                      const TextGeometry& geometry);
 
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
