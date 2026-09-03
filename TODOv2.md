@@ -387,8 +387,8 @@ safetensors-derived 0.8B artifact.
 - [ ] Architecture and hyperparameters from GGUF metadata (`bridge.py` reads `{arch}.embedding_length`, `.block_count`, head counts, ssm.* already); static `config.json` is vendored per target under `serve/resources/` today and must instead be derived.
 - [ ] Tokenizer from GGUF metadata: BPE only today (`frontend.py:45-56`, `tokenizer.ggml.pre` must be in a literal table); SentencePiece GGUFs refused — connect to the tree's own SPM tokenizer (`csrc/src/tokenizer`).
 - [ ] Architecture table `gguf_target_key` (`bridge.py:298-327`) is literal; replace with the same architecture registry M2 produces.
-- [ ] The bridge materializes the whole model as BF16 on disk before converting (2 B/param — ~200 GB of temp for the 106 GB Flash-Next). Reader injection instead.
-- [ ] Export-transform inversion (`gguf/qwen35.py`: norm `+1`, `-exp(A_log)`, conv1d squeeze, V-head tiling) is per family and hand-written; make it part of the architecture's mapping.
+- [x] **The BF16 staging is gone for what the file can serve (2026-09-03).** The bridge dequantises only what is genuinely computed: 1.9 GiB for the 35B, against the 69 GB a full materialisation would have been, and the artifact beside the GGUF is 337 MB rather than a 22.3 GB copy. What still stages is `gdn/output` (a column permutation, which runs cannot express), the router and the BF16 norms.
+- [~] Export-transform inversion (`gguf/qwen35.py`: norm `+1`, `-exp(A_log)`, conv1d squeeze, V-head tiling) is still per family and hand-written, but it is now sorted by *kind*: a **pure row permutation** (the V-head tiling) is returned as a map by `inverse_row_permutation` and composed into the row program, so those weights are read from the file; a **value** transform (the logarithm, the plus-one norm) still forces the dequantise path. That split is the general mechanism; the table of which tensor is which remains family knowledge.
 
 ### M4 — Unified weight loading (C)
 
