@@ -735,9 +735,14 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
 template <class Codec>
 void require_d4_codec_geometry() {
     if constexpr (Codec::kPackedWord8) {
-        if constexpr ((kIntermediate / Codec::kGroupK) % 4 != 0) {
+        // The packed D4 loop walks 32/(kGroupK/8) groups per warp step and does not bound the
+        // last one, so the group count must divide by that step -- four for the 64-wide codecs
+        // (which is where the constant four came from) but one for a 256-wide superblock, where
+        // a whole warp covers a single group and every step is exact.
+        constexpr int kD4GroupsPerWarp = 32 / (Codec::kGroupK / 8);
+        if constexpr ((kIntermediate / Codec::kGroupK) % kD4GroupsPerWarp != 0) {
             throw std::invalid_argument(
-                "sparse_moe: Q5/Q6 routed down needs intermediate % 256 == 0 for this geometry");
+                "sparse_moe: routed down codec needs intermediate divisible by its warp step");
         }
     }
 }
@@ -980,6 +985,21 @@ void decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destinati
         launch_d4_small_t_codec<W8Codec, false>(weights, destination, token_ids, token_alpha,
                                                 shared_scale, token_activations, tokens, schedule,
                                                 stream, nullptr);
+        return;
+    case QType::Q4_K:
+        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q4_K>, false>(
+            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
+            schedule, stream, nullptr);
+        return;
+    case QType::Q5_K:
+        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q5_K>, false>(
+            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
+            schedule, stream, nullptr);
+        return;
+    case QType::Q6_K:
+        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>, false>(
+            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
+            schedule, stream, nullptr);
         return;
     case QType::NVFP4:
         if (adaptive_route_jobs == nullptr) {

@@ -32,7 +32,13 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(const SparseMoeGeometry& geo
     const bool w8_profile =
         routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
     const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
-    if (!main_profile && !w8_profile && !nvfp4_profile) {
+    // A GGML K-quant decodes eight consecutive values per lane, the same shape W8 and NVFP4 use,
+    // so it runs the generic schedules rather than the three-path split, which is Q4/Q5-specific.
+    const auto is_ggml_k = [](QType qtype) {
+        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K;
+    };
+    const bool ggml_k_profile = is_ggml_k(routed_gate_up) && is_ggml_k(routed_down);
+    if (!main_profile && !w8_profile && !nvfp4_profile && !ggml_k_profile) {
         throw std::invalid_argument("sparse_moe small-T: unsupported routed codec profile");
     }
     SparseMoeSmallTPlan plan{tokens, sparse_moe_small_t_workspace_bytes(geometry, tokens)};
@@ -44,6 +50,13 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(const SparseMoeGeometry& geo
                                        : SparseMoeSmallTD3Schedule::PathsAll;
         plan.d4_schedule =
             tokens <= 2 ? SparseMoeSmallTD4Schedule::Rows1 : SparseMoeSmallTD4Schedule::Rows4;
+        return plan;
+    }
+    if (ggml_k_profile) {
+        plan.d3_schedule = tokens <= 5 ? SparseMoeSmallTD3Schedule::Paths1
+                                       : SparseMoeSmallTD3Schedule::PathsAll;
+        plan.d4_schedule =
+            tokens <= 8 ? SparseMoeSmallTD4Schedule::Rows1 : SparseMoeSmallTD4Schedule::Rows4;
         return plan;
     }
     if (w8_profile) {

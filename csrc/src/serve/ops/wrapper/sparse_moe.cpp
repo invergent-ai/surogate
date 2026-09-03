@@ -131,9 +131,9 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
     if (weight.layout != geometry.layout || weight.scale_dtype != geometry.scale_dtype ||
         weight.group_size != static_cast<std::uint32_t>(geometry.group_size) ||
         weight.group != geometry.group_size || weight.qdata == nullptr ||
-        (needs_scale_plane && weight.scales == nullptr) || weight.payload_bytes < required_payload ||
-        weight.high_plane_bytes < high_bytes || !aligned_to(weight.qdata, 16) ||
-        !aligned_to(weight.scales, 16)) {
+                (needs_scale_plane && (weight.scales == nullptr || !aligned_to(weight.scales, 16))) ||
+        weight.payload_bytes < required_payload || weight.high_plane_bytes < high_bytes ||
+        !aligned_to(weight.qdata, 16)) {
         throw std::invalid_argument(std::string("sparse_moe: invalid quantized ") + name);
     }
     if ((high_bytes == 0 && weight.qhigh != nullptr) ||
@@ -391,11 +391,19 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     // [up; gate] row order (`Nvfp4CodecFor::kGateRowsFirst`). Rounds between the small-T bound
     // and the crossover walk small-T in slices, as they did before the runner existed.
     const bool nvfp4_routed = gate_up == QType::NVFP4 && down == QType::NVFP4;
+    // A GGML K-quant has no prefill kernel of this family yet, so without this every round wider
+    // than the small-T bound fell to the per-token decode loop -- one launch per prompt token.
+    // Walking small-T slices instead is the same arrangement NVFP4 uses for the same reason.
+    const auto is_ggml_k_qtype = [](QType qtype) {
+        return qtype == QType::Q4_K || qtype == QType::Q5_K || qtype == QType::Q6_K;
+    };
+    const bool ggml_k_routed = is_ggml_k_qtype(gate_up) && is_ggml_k_qtype(down);
     const bool use_prefill  = nvfp4_routed
                                   ? tokens >= trtllm_min_tokens()
                                   : detail::sparse_moe_uses_prefill(tokens, gate_up, down);
     const bool use_small_t =
-        !use_prefill && (detail::sparse_moe_uses_small_t(tokens) || (nvfp4_routed && tokens > 1));
+        !use_prefill && (detail::sparse_moe_uses_small_t(tokens) ||
+                         ((nvfp4_routed || ggml_k_routed) && tokens > 1));
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
                                               : nvtx::Name::SparseMoeDecode,
