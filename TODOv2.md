@@ -9,24 +9,60 @@ Status legend: `[ ]` open · `[~]` in progress · `[x]` done (commit) · `[?]` o
 
 ## Status (2026-09-03)
 
-**Shipped, and the product claim holds end to end.** `surogate serve <file>.gguf`
-converts a K-quant GGUF in seconds, serves the file's own Q4_K/Q5_K/Q6_K blocks
-with no dequantise-and-requantise in the text core, and beats both reference
-engines on one 5090 at the board's shape (512/128, salted prompts, closed loop):
-at one user 802 decode against vLLM 0.27.1's 346 and llama.cpp's 454; at eight,
-2,765 against 1,768 and 683. `llama-bench` on the same file reads 39,511 prefill
-and 809 decode against our 97,062 and 864. Rows in `surogate/serve/BENCHMARKS.md`.
+**A GGUF's weights are served where they lie.** `surogate serve <file>.gguf` no
+longer copies the file. For `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22.13 GB, 34.66 B
+parameters, 256 experts of which 8 route — what lands on disk beside it is a
+**337 MB index**: the artifact directory names the GGUF and, per object, the
+stretches of it that object is assembled from. It was a 22.30 GB copy this
+morning. Load 11.9 s, prefill 11,100 tok/s, decode 317.
 
-Also shipped: RedHatAI's compressed-tensors NVFP4 35B converts from its own
-directory (§4 M1), BF16 linears run at any 8-aligned shape, text-only GGUF
-exports of a vision family convert, and a tied head is stored once.
+Three mechanisms got it there, in the order they were needed:
 
-**The three things worth doing next**, in order — §7's K-line has the detail:
+- **Runs.** An object may be gathered from several stretches of an external
+  file, because our fused objects are not slices of it: a routed gate/up
+  interleaves each expert's gate rows with its up rows, which the GGUF keeps as
+  two separate tensors, so it is 512 runs.
+- **A load transform.** Q8_0 and W8G32_F16S hold the same numbers and differ
+  only in arrangement, so the weights whose kernels want the row-split planes
+  are read from the file too and rearranged on the device at load.
+- **A source that is a row permutation.** llama.cpp reorders a GDN projection's
+  V heads; expressing our inverse as a map rather than a materialised transform
+  turned the last 802 MB object into 64 runs.
 
-1. A fused K-quant GDN projection-and-convolution. It unlocks the last 8 % of
-   lossy bytes, which today cost more in kernel launches than they save.
-2. MoE (K4). Needs a small MoE GGUF downloaded first; none is on this disk.
-3. Retire the home-grown Q4G64/Q5G64/Q6G64 and add `surogate quantize` (K6).
+Checked against the artifact the converter wrote for the same 120 rearranged
+objects: every decoded weight identical.
+
+**And the routed experts are served as the file's own K-quants**, decode and
+prefill both (§7 K4). One 5090, 654-token prompt, warm, greedy:
+
+| | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| **surogate, native K-quant** | **11,100** | **317** |
+| llama.cpp, same file | 8,408 | 278 |
+| surogate, dequantised to Q4G64 | 13,700 | 346 |
+
+Ahead of llama.cpp on both. The row-split path still leads our own prefill,
+which is the honest remaining performance gap, not a gap to a competitor.
+
+Also shipped earlier in this line: RedHatAI's compressed-tensors NVFP4 35B
+converts from its own directory (§4 M1), BF16 linears run at any 8-aligned
+shape, text-only GGUF exports of a vision family convert, and a tied head is
+stored once.
+
+**The four things worth doing next**, in order — §7's K-line has the detail:
+
+1. **`gdn/output`, the last 267 MB of the index.** Its inverse is a *column*
+   permutation, which runs structurally cannot express. It needs either a
+   kernel that permutes at read time or a second load transform. The remaining
+   70 MB (router, BF16 norms, tokenizer) is genuinely computed or genuinely
+   data, and a 70 MB index could be built in memory at startup — no file.
+2. **Close the native prefill gap**, 11,100 against the row-split path's
+   13,700. Q6_K's scalar staging and the K-quant decode's per-tile scale work
+   are the two named suspects.
+3. **Retire the home-grown Q4G64/Q5G64/Q6G64 and add `surogate quantize`**
+   (K6). With K4 done their only remaining advantage is that prefill gap.
+4. **A fused K-quant GDN projection-and-convolution** (K5c), still off: it
+   costs more in kernel launches than it saves in bandwidth.
 
 §7 is the governing section where it disagrees with §2 or M3: the owner's
 2026-09-02 decision made GGUF K-quants the product, and this file predates it.
@@ -556,9 +592,9 @@ Same on Q5_K and Q6_K (5.8e-3, 5.7e-3). An 8-bit symmetric grid cannot land on a
 - [ ] **K3 — MMQ port (prefill, T > 8)**: `mul_mat_q` body, `load_tiles_{q2..q6}_K`, the int8 mma vec-dots, `quantize_q8_1_mmq`; stream-K fixup second. **Acceptance:** pp512 ≥ 37,945 (0.8B), ≥ 28,081 (2B).
 - [x] **K4 — MoE, done 2026-09-03.** `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` (256 experts, 8 routed) serves
   with its routed experts read as the file's own Q4_K/Q5_K/Q6_K superblocks, decode *and* prefill.
-  One 5090, 654-token prompt, warm, greedy: **prefill 9,400 tok/s, decode 328**, against llama.cpp's
-  **8,408 / 278** — ahead on both. Our own dequantise-to-Q4G64 path still leads prefill at
-  **13,730 / 346**; that, not llama.cpp, is the remaining gap.
+  One 5090, 654-token prompt, warm, greedy: **prefill 11,100 tok/s, decode 317**, against
+  llama.cpp's **8,408 / 278** — ahead on both. Our own dequantise-to-Q4G64 path still leads
+  prefill at **13,700 / 346**; that, not llama.cpp, is the remaining gap.
   - The decode-side codec existed but nothing could reach it: the decode and small-T *plans*
     rejected the profile, D4 small-T had no K-quant case, the payload check demanded an aligned
     scale pointer from a format that has no scale plane, and the D4 geometry guard hard-coded the
@@ -572,45 +608,106 @@ Same on Q5_K and Q6_K (5.8e-3, 5.7e-3). An 8-bit symmetric grid cannot land on a
     K-quants must dequantise *inside* `decode_weight` rather than scaling the accumulator, because
     a 64-wide tile spans two sub-block scales and Q4_K/Q5_K are affine. Q6_K's 210-byte block
     leaves consecutive blocks 2-byte aligned, so it stages in scalar pairs, not `cp_async<16>`.
-- [ ] **K5 — the ops that embed a weight decode**: only three sites switch on `QType` (`linear.cpp`, `sparse_moe.cpp`, `attn_input_proj.cpp`); `linear_add` and the fused GDN/attention projections route K-quant weights through mmvq/MMQ plus their epilogue.
-- [ ] **K6 — retire the home-grown formats.** Converters stop emitting Q4G64/Q5G64/Q6G64; `surogate quantize` produces K-quants by writing a BF16 GGUF (gguf-py) and running `llama-quantize` (their quantiser, imatrix included) — no port of `ggml-quants.c`; regenerate the local artifacts.
+    Then 9,400 → 11,100 by staging a superblock's header once per superblock rather than per
+    tile: four tiles share one, and holding all of a row's headers cost 8 KB of shared memory on
+    a 2048-wide gate/up, which is a block per SM on a 100 KB card.
+- [x] **K5 — the ops that embed a weight decode: closed differently.** The three `QType` switches
+  (`linear.cpp`, `sparse_moe.cpp`, `attn_input_proj.cpp`) all take K-quants now, and the fused
+  projections that read row-split planes never needed a codec at all: their weights are read from
+  the GGUF and rearranged on the device at load, since Q8_0 and W8G32_F16S differ only in
+  arrangement. Six tuned kernels not written.
+- [ ] **K6 — retire the home-grown formats.** Converters stop emitting Q4G64/Q5G64/Q6G64;
+  `surogate quantize` produces K-quants by writing a BF16 GGUF and calling `llama-quantize`
+  (built at `study/llama.cpp-master/build/bin`). Blocked on nothing now that K4 is done — the
+  only thing the home-grown formats still do better is prefill, 13,700 against 11,100, which is
+  open item 2 above.
 - [ ] **N — NVFP4 ModelOpt ingest**: `weight_scale_2` is a multiplier where compressed-tensors' global is a divisor; parents split per component so each keeps its own global (the trainer instead rescales block scales to a shared one, which is lossy).
 - [ ] **F — FP8**: compressed-tensors per-channel/per-tensor is per-row with an FP32 scale (add `_F32S`, or accept the BF16 cast); HF fine-grained block-128 (what the trainer loads as `prequant_fp8`) needs block-indexed scales in the fp8 family and a prefill route.
 - [x] **B — BF16**: correctness done (cuBLASLt off the table, `8d1b9cc4`); the registered shapes keep the hand kernels.
 
-### Where the K-line stands (2026-09-02)
+### Where the K-line stands (2026-09-03)
 
-Done and measured: K0 the bar, K1 the native K-quant read path, K2 Q8_0 by decision, K3 the wide-batch route, K5c built and left off, B BF16. The product claim holds end to end — `surogate serve models/Qwen3.5-0.8B-Q4_K_M.gguf` converts in 1.8 s, serves the file's own Q4_K/Q5_K/Q6_K blocks, and beats both llama.cpp and vLLM on the same card at one and eight users.
+Done and measured: K0 the bar, K1 the native K-quant read path, K2 Q8_0 (now *served*, not just
+decided — see below), K3 the wide-batch route, **K4 the routed MoE, decode and prefill**, K5c
+built and left off, B BF16, and direct GGUF loading.
+
+**K2 was reopened and closed differently.** The 2026-09-02 decision was "Q8_0 and W8G32_F16S are
+the same numeric format, so keep W8G32". True, and that is exactly why the repack could be
+deleted rather than kept: the two differ only in arrangement. Q8_0 is now a `GgmlType` — the op
+family was already written against `Traits<type>::qk`, so the only real change was
+`block_values(type)`, 256 for a superblock and 32 here — and it reaches the plain linears, the
+embedding gather and the routed MoE. A Q8_0-only GGUF (three sit in `models/`) reads its experts
+and heads in place today. Everything else is read in place too, through the load transform.
 
 Open, in the order they matter:
 
-1. **Fused K-quant GDN projection-and-convolution.** Unlocks K5c's 8 % of bytes, which today costs more in launches than it saves in bandwidth.
-2. **K6 — retire Q4G64/Q5G64/Q6G64** and add `surogate quantize`. With K4 done, the home-grown
-   formats' only remaining advantage is the prefill gap above.
-3. **Close the native prefill gap** (9,400 -> 13,730): Q6_K's scalar staging and the per-tile
-   header re-read are the two named suspects.
-4. **Direct GGUF loading — done 2026-09-03.** The artifact directory takes an optional
-   `external` file table and an optional per-object `runs` list; the engine mmaps the GGUF and
-   the materializer copies run by run. **22.30 GB → 1.47 GB** for the 35B, load and throughput
-   unchanged. Runs rather than one offset because the fused objects are not slices: a routed
-   gate/up is 512 runs (81 objects, 20,521 runs total). Q8_0 joined the GGML op family, which
-   took the embedding table, the attention output and the draft head off the copy as well.
-   - **0.337 GB left, done 2026-09-03.** The weights whose kernels want the row-split planes
-     are read from the file too: Q8_0 and W8G32_F16S hold the same numbers and differ only in
-     arrangement, so an object may declare a `transform` beside its runs and the loader
-     rearranges them on the device. And a source may now be a *row permutation* of a file
-     tensor -- llama.cpp reorders a GDN projection's V heads, and expressing that as a map
-     rather than a materialised transform turned the last 802 MB object into 64 runs.
-     Verified against the converter's own output for all 120 rearranged objects: every decoded
-     weight identical.
-   - What is left is what is genuinely computed: `gdn/output` (267 MB), whose inverse is a
-     *column* permutation and so is not a row program at all; the router and the BF16 norms
-     (52 MB); and the tokenizer (10 MB). Serving `gdn/output` in place needs either a kernel
-     that takes the permutation at read time, or a second transform that applies it on load.
+1. **`gdn/output`, the last 267 MB of the index.** llama.cpp's inverse for it is a *column*
+   permutation; runs describe rows, so they cannot express it. Either a kernel that permutes at
+   read time, or a second load transform. After that the index is ~70 MB of router, BF16 norms
+   and tokenizer — small enough to build in memory at startup, and then there is no file at all.
+2. **Close the native prefill gap**, 11,100 against the row-split path's 13,700 on the same
+   model. Q6_K's scalar staging (its 210-byte block leaves consecutive blocks 2-byte aligned, so
+   it cannot `cp_async<16>`) and the K-quant decode's per-tile scale work are the two suspects.
+3. **K6 — retire Q4G64/Q5G64/Q6G64** and add `surogate quantize`. With K4 done, the home-grown
+   formats' only remaining advantage is that prefill gap.
+4. **Fused K-quant GDN projection-and-convolution** (K5c), still off: more in kernel launches
+   than it saves in bandwidth.
 
-M2 (geometry templating), M4 (unified loading) and M5 (`--no-cache`, `surogate convert`) stand behind these.
+**Direct GGUF loading — done 2026-09-03, 22.30 GB → 0.337 GB.** Three mechanisms, each added
+because the previous one ran out:
+
+- **`external` + per-object `runs`.** The directory names files it does not contain and, per
+  object, the stretches it is assembled from. Runs rather than one offset because the fused
+  objects are not slices: a routed gate/up interleaves each expert's gate rows with its up rows,
+  and the GGUF keeps those as two tensors, so it is 512 runs. The materializer orders and
+  coalesces its reads *within* a source, never across one, since offsets only order inside a
+  file. Two objects may legitimately read the same external bytes (a tied embedding and output
+  head), so overlap stays an error only inside the artifact's own payload. **22.30 → 2.32 GB.**
+- **Q8_0 as a served format**, which took the embedding table, the attention output and the
+  draft head's shortlist gather off the copy. **2.32 → 1.47 GB.**
+- **A load `transform`, and a source that is a row permutation.** `q8_0-to-w8g32` rearranges the
+  file's blocks into the row-split planes on the device, so the weights whose kernels have no
+  Q8_0 path need no copy either. And llama.cpp reorders a GDN projection's V heads: our inverse
+  was applied by the bridge, which made the recipe's row program describe rows the file does not
+  hold. Expressed as a map instead — it is a *pure* row permutation, unlike A_log's logarithm or
+  a plus-one norm's subtraction — a permuted 128-row head is one run, and the 802 MB fused
+  projection became 64. **1.47 → 0.337 GB.**
+
+Verified against the artifact the converter wrote for the same 120 rearranged objects: every
+decoded weight identical. Eight rows differ in *bytes* only — their scale is zero and the
+dequantise path had normalised the codes the file carries, so that path was the lossy one.
+Compare decoded values, not bytes, whenever the oracle went through BF16.
 
 ## 8. Progress log
+
+**2026-09-03 — the MoE serves, and the copy goes away.** Two days' worth in one
+sitting: `1b33158b`, `9995f894`, `48a25753`, `700b9a23`, `1455c3b0`, `300f9d26`,
+`0624d4b6`, `7bebf54e`, `db4cc18e`, `d52a5e62`, `0e4a1576`, `3e94fa60`, plus the
+docs commits. Four things are worth carrying forward:
+
+- **The bug that cost most of the day was a format label, not arithmetic.**
+  `bind_moe` discovered each routed tensor's stored format and kept only the
+  handle, so `load_moe` passed the *profile's* expectation to
+  `materialized_weight`: Q4_K superblocks decoded by the groupwise-int row-split
+  codec. Same byte count, different meaning, no exception, every expert noise,
+  and the model emitted token 0 forever. Hours went into verifying weights
+  against the GGUF — all of which matched. A one-line trace of the qtype the
+  kernel actually received found it in seconds. **When output is degenerate but
+  nothing throws, print the qtype the kernel received before auditing anything.**
+- **"This code path works" can mean "this code path has never run."** The GDN
+  V-head permutation only applies when `num_k_heads != num_v_heads`; every model
+  validated before had them equal, so `invert_tensor` had never executed. Check
+  the KV that gates a path before trusting it.
+- **Where a scale lives decides a kernel's shape.** The row-split MoE prefill
+  feeds the MMA raw integer codes and scales the accumulator afterwards, because
+  a 64-value group has one scale. A K-quant's 64-wide tile spans two sub-block
+  scales and carries an affine min that depends on the activation sum, so it
+  must dequantise inside `decode_weight`. That single difference is the whole
+  K-quant prefill kernel.
+- **Alignment is a per-format fact.** Q6_K's 210-byte block leaves consecutive
+  blocks 2-byte aligned, so `cp_async<16>` is illegal on it and it stages in
+  scalar pairs — llama.cpp reads Q6_K through 2-byte accessors for the same
+  reason. Q4_K (144) and Q5_K (176) are fine.
 
 **2026-09-02 — the K-line, in one sitting.** K0 the bar, K1 the native read
 path, K2 closed by decision, K3 the wide-batch route, K5c built and measured
