@@ -18,8 +18,6 @@ using artifact::NumericFormat;
 
 static_assert(TextConfig::query_projection_rows == TextConfig::query_size,
               "Gemma 3 attention is ungated; a gated projection would be read at the wrong stride");
-static_assert(TextConfig::query_size == 1024);
-static_assert(TextConfig::kv_size == 256);
 
 /// The four resources a text-only Gemma 3 artifact carries, matching
 /// `RESOURCE_SPECS` in `surogate/serve/convert/gemma3/inventory.py`. The
@@ -62,61 +60,64 @@ Tensor materialized_norm(const artifact::MaterializedArtifact& materialized,
 }
 
 DensePostMixerPayload load_mlp(const MlpPlan& plan,
-                               const artifact::MaterializedArtifact& materialized) {
+                               const artifact::MaterializedArtifact& materialized,
+                               const family::TextGeometry& g) {
     DensePostMixerPayload out;
-    out.gate = materialized_weight(materialized, plan.gate, TextConfig::intermediate,
-                                   TextConfig::hidden);
-    out.up   = materialized_weight(materialized, plan.up, TextConfig::intermediate,
-                                   TextConfig::hidden);
-    out.down = materialized_weight(materialized, plan.down, TextConfig::hidden,
-                                   TextConfig::intermediate);
+    out.gate = materialized_weight(materialized, plan.gate, g.intermediate,
+                                   g.hidden);
+    out.up   = materialized_weight(materialized, plan.up, g.intermediate,
+                                   g.hidden);
+    out.down = materialized_weight(materialized, plan.down, g.hidden,
+                                   g.intermediate);
     out.post_feedforward_norm =
-        materialized_norm(materialized, plan.post_feedforward_norm, TextConfig::hidden);
+        materialized_norm(materialized, plan.post_feedforward_norm, g.hidden);
     return out;
 }
 
 void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, BindingPlan& out) {
+    const family::TextGeometry& g = out.geometry;
+    out.text_layers.resize(static_cast<std::size_t>(g.layers));
     const NumericFormat weights = endpoint_format(weights_profile);
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
         // Bound in the converter's own order (inventory.py), so a diff of the two
         // lists reads straight down.
         target.input_norm = artifact::bind_device_tensor(binder, prefix + "input_norm",
-                                                         NumericFormat::BF16, {TextConfig::hidden});
+                                                         NumericFormat::BF16, {g.hidden});
         target.attention.post_attention_norm =
             artifact::bind_device_tensor(binder, prefix + "post_attention_norm",
-                                         NumericFormat::BF16, {TextConfig::hidden});
+                                         NumericFormat::BF16, {g.hidden});
         target.pre_feedforward_norm =
             artifact::bind_device_tensor(binder, prefix + "pre_feedforward_norm",
-                                         NumericFormat::BF16, {TextConfig::hidden});
+                                         NumericFormat::BF16, {g.hidden});
         target.mlp.post_feedforward_norm =
             artifact::bind_device_tensor(binder, prefix + "post_feedforward_norm",
-                                         NumericFormat::BF16, {TextConfig::hidden});
+                                         NumericFormat::BF16, {g.hidden});
         // Three matrices, not one fused parent: q is [1024, 640] and k and v are
         // [256, 640] each. Gemma 3 also carries no qkv bias (`attention_bias` is
         // false in every released config), which is why no bias object is bound.
         target.attention.query = bind_weight(binder, prefix + "attention/query", weights,
-                                             {TextConfig::query_size, TextConfig::hidden});
+                                             {g.query_size(), g.hidden});
         target.attention.key   = bind_weight(binder, prefix + "attention/key", weights,
-                                             {TextConfig::kv_size, TextConfig::hidden});
+                                             {g.kv_size(), g.hidden});
         target.attention.value = bind_weight(binder, prefix + "attention/value", weights,
-                                             {TextConfig::kv_size, TextConfig::hidden});
+                                             {g.kv_size(), g.hidden});
         // Per-head q/k norm over head_dim, as Qwen3 has and Llama does not. There
         // is no v norm -- that is Gemma 4's, and this checkpoint ships no such
         // tensor.
         target.attention.query_norm = artifact::bind_device_tensor(
-            binder, prefix + "attention/query_norm", NumericFormat::BF16, {TextConfig::head_dim});
+            binder, prefix + "attention/query_norm", NumericFormat::BF16, {g.head_dim});
         target.attention.key_norm = artifact::bind_device_tensor(
-            binder, prefix + "attention/key_norm", NumericFormat::BF16, {TextConfig::head_dim});
+            binder, prefix + "attention/key_norm", NumericFormat::BF16, {g.head_dim});
         target.attention.output = bind_weight(binder, prefix + "attention/output", weights,
-                                              {TextConfig::hidden, TextConfig::query_size});
+                                              {g.hidden, g.query_size()});
         target.mlp.gate = bind_weight(binder, prefix + "mlp/gate", weights,
-                                      {TextConfig::intermediate, TextConfig::hidden});
+                                      {g.intermediate, g.hidden});
         target.mlp.up   = bind_weight(binder, prefix + "mlp/up", weights,
-                                      {TextConfig::intermediate, TextConfig::hidden});
+                                      {g.intermediate, g.hidden});
         target.mlp.down = bind_weight(binder, prefix + "mlp/down", weights,
-                                      {TextConfig::hidden, TextConfig::intermediate});
+                                      {g.hidden, g.intermediate});
     }
 }
 
@@ -130,6 +131,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.
     out.geometry = family::TextGeometry::declared<TextConfig>(binder.reader().geometry());
+    const family::TextGeometry& g = out.geometry;
     out.frontend     = family::bind_text_only_frontend_resources(binder);
     out.features     = features;
 
@@ -153,10 +155,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // `TextConfig::embedding_scale`, so folding it into the table here would
     // apply it twice.
     out.token_embedding = bind_weight(binder, "text/token_embedding", vocabulary_format,
-                                      {TextConfig::output_rows, TextConfig::hidden});
+                                      {g.output_rows, g.hidden});
     bind_text_layers(binder, weights_profile, out);
     out.final_norm = artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16,
-                                                  {TextConfig::hidden});
+                                                  {g.hidden});
     // The head is the embedding table. Gemma 3 ties them and ships no
     // `lm_head.weight` at all, so the converter stores one table and names
     // `text/output_head` a logical role on it -- `ALIAS_SPECS` in
@@ -172,7 +174,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // load, so the two cannot be collapsed into an unconditional bind.
     out.output_head = binder.has("text/output_head")
                           ? bind_weight(binder, "text/output_head", vocabulary_format,
-                                        {TextConfig::output_rows, TextConfig::hidden})
+                                        {g.output_rows, g.hidden})
                           : out.token_embedding;
 
     load_plan.materialization = binder.finish();
@@ -183,8 +185,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     // The layer storage is sized here, not by the type: the counts come from the
     // geometry these weights were bound against.
-    runtime.geometry = plan.geometry;
-    runtime.full_layers.resize(kFullAttentionLayers);
+    runtime.geometry              = plan.geometry;
+    const family::TextGeometry& g = runtime.geometry;
+    // Every layer of a dense decoder attends.
+    runtime.full_layers.resize(static_cast<std::size_t>(g.layers));
     runtime.gdn_layers.resize(kGdnLayers);
     frontend = family::take_text_only_frontend_resources(backing, plan.frontend);
 
@@ -192,27 +196,27 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.features      = plan.features;
 
     runtime.token_embedding = materialized_weight(backing, plan.token_embedding,
-                                                  TextConfig::output_rows, TextConfig::hidden);
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+                                                  g.output_rows, g.hidden);
+    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         const TextLayerPlan& source  = plan.text_layers[layer];
         FullAttentionWeights& target = runtime.full_layers.at(layer);
-        target.input_norm = materialized_norm(backing, source.input_norm, TextConfig::hidden);
+        target.input_norm = materialized_norm(backing, source.input_norm, g.hidden);
         target.projection = AttentionProjectionPayload{
-            .query = materialized_weight(backing, source.attention.query, TextConfig::query_size,
-                                         TextConfig::hidden),
-            .key   = materialized_weight(backing, source.attention.key, TextConfig::kv_size,
-                                         TextConfig::hidden),
-            .value = materialized_weight(backing, source.attention.value, TextConfig::kv_size,
-                                         TextConfig::hidden),
+            .query = materialized_weight(backing, source.attention.query, g.query_size(),
+                                         g.hidden),
+            .key   = materialized_weight(backing, source.attention.key, g.kv_size(),
+                                         g.hidden),
+            .value = materialized_weight(backing, source.attention.value, g.kv_size(),
+                                         g.hidden),
             .post_attention_norm = materialized_norm(
-                backing, source.attention.post_attention_norm, TextConfig::hidden),
+                backing, source.attention.post_attention_norm, g.hidden),
         };
         target.query_norm =
-            materialized_norm(backing, source.attention.query_norm, TextConfig::head_dim);
+            materialized_norm(backing, source.attention.query_norm, g.head_dim);
         target.key_norm =
-            materialized_norm(backing, source.attention.key_norm, TextConfig::head_dim);
-        target.output = materialized_weight(backing, source.attention.output, TextConfig::hidden,
-                                            TextConfig::query_size);
+            materialized_norm(backing, source.attention.key_norm, g.head_dim);
+        target.output = materialized_weight(backing, source.attention.output, g.hidden,
+                                            g.query_size());
         // The family's slot is named for where Llama's norm sits in the
         // checkpoint; what the runtime does with it is normalise the residual on
         // the way into the post-mixer. That is Gemma's `pre_feedforward_norm`, not
@@ -220,16 +224,16 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         // block's *output* and rides in the projection payload above. Swapping
         // the two compiles, loads, and produces a different model.
         target.post_attention_norm = materialized_norm(backing, source.pre_feedforward_norm,
-                                                       TextConfig::hidden);
-        target.post_mixer          = load_mlp(source.mlp, backing);
+                                                       g.hidden);
+        target.post_mixer          = load_mlp(source.mlp, backing, g);
     }
     static_assert(kGdnLayers == 0, "a Gemma 3 layer is never a linear mixer");
 
-    runtime.final_norm = materialized_norm(backing, plan.final_norm, TextConfig::hidden);
+    runtime.final_norm = materialized_norm(backing, plan.final_norm, g.hidden);
     // Where the head is aliased, `plan.output_head` *is* `plan.token_embedding`,
     // so this reads back the one uploaded table rather than a second copy of it.
-    runtime.output_head = materialized_weight(backing, plan.output_head, TextConfig::output_rows,
-                                              TextConfig::hidden);
+    runtime.output_head = materialized_weight(backing, plan.output_head, g.output_rows,
+                                              g.hidden);
 }
 
 } // namespace sinfer::targets::gemma3_270m::detail

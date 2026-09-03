@@ -13,6 +13,7 @@
 #include "core/tensor.h"
 
 #include <array>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -108,7 +109,8 @@ struct BindingPlan {
     family::StartupFeatures features;
 
     WeightPlan token_embedding;
-    std::array<TextLayerPlan, kTextLayers> text_layers;
+    /// One per layer, sized when the artifact is bound rather than by the type.
+    std::vector<TextLayerPlan> text_layers;
     artifact::ObjectHandle final_norm;
     /// Gemma 3 ties its LM head to the embedding table -- the checkpoint ships no
     /// `lm_head.weight` at all, and `_build_gemma3_mappings` resolves `lm_head`

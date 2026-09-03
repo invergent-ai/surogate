@@ -90,10 +90,10 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     # binds against those, so the architecture is the gate.
     if model_type == "qwen3" and hidden > 0 and layers > 0:
         return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3")
-    if model_type == "llama" and hidden == 2048 and layers == 22:
-        return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "TinyLlama-1.1B")
-    if model_type in ("gemma3", "gemma3_text") and hidden == 640 and layers == 18:
-        return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma3-270M")
+    if model_type == "llama" and hidden > 0 and layers > 0:
+        return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "Llama")
+    if model_type in ("gemma3", "gemma3_text") and hidden > 0 and layers > 0:
+        return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma 3")
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
         return ConverterTarget("qwen3_6_35b_a3b", "surogate.serve.convert.qwen3_6_35b_a3b.convert",
                                "Qwen3.6-35B-A3B", gguf_repack=True)

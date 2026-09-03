@@ -286,15 +286,15 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
     check_optional_members("config", config, _OPTIONAL_CONFIG)
     family_conversion.check_members("config", config, _ENGINE_CONSTANTS)
     geometry = geometry_from_config(config)
-    if geometry != inventory.GEOMETRY:
+    # Any size of the family converts: the artifact states its own dimensions and the engine
+    # binds against those, so what has to hold is that the checkpoint is self-consistent.
+    if geometry.query_heads % geometry.kv_heads != 0:
         raise ValueError(
-            "checkpoint geometry is not the registered gemma3 target:\n"
-            f"  checkpoint {geometry}\n"
-            f"  target     {inventory.GEOMETRY}\n"
-            "csrc/src/serve/targets/gemma3/impl/config.h describes one size; a "
-            "differently sized Gemma3ForCausalLM needs its own target header "
-            "before its artifact can be bound."
+            f"query heads ({geometry.query_heads}) must be a multiple of key/value heads "
+            f"({geometry.kv_heads})"
         )
+    if geometry.hidden <= 0 or geometry.layers <= 0 or geometry.intermediate <= 0:
+        raise ValueError(f"checkpoint geometry has a non-positive dimension: {geometry}")
     check_layer_schedule(config, geometry)
     text = {
         name: config[name]
@@ -708,6 +708,27 @@ def build_object_plan(
     return family_conversion.build_object_plan(object_specs, resources)
 
 
+
+def geometry_block(preflight: "ConversionPreflight") -> dict[str, float]:
+    """The artifact's `geometry` member: the dimensions the engine reads at load, which is
+    what lets one target serve every size of this family."""
+    geometry = preflight.geometry
+    text = preflight.config_summary["text"]
+    return {
+        "hidden": geometry.hidden,
+        "layers": geometry.layers,
+        "intermediate": geometry.intermediate,
+        "output_rows": geometry.vocab,
+        "token_domain": geometry.vocab,
+        "query_heads": geometry.query_heads,
+        "kv_heads": geometry.kv_heads,
+        "head_dim": geometry.head_dim,
+        "rotary_dim": geometry.head_dim,
+        "rms_epsilon": float(text["rms_norm_eps"]),
+        "rope_theta": float(text["rope_theta"]),
+        "sliding_window": int(text["sliding_window"]),
+    }
+
 def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
     model = Path(model_dir)
     config = family_conversion.load_json(model / "config.json")
@@ -830,6 +851,7 @@ def convert(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
+            geometry=geometry_block(preflight),
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError("writer object plan differs from completed preflight")

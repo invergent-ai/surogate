@@ -546,9 +546,9 @@ def gguf_target_key(gguf_path: Path, reader=None):
     # rather than compiling them, so what has to match is the architecture, not the size.
     if arch == "qwen3" and hidden > 0 and layers > 0:
         return "qwen3"
-    if arch == "llama" and hidden == 2048 and layers == 22:
+    if arch == "llama" and hidden > 0 and layers > 0:
         return "llama"
-    if arch == "gemma3" and hidden == 640 and layers == 18:
+    if arch == "gemma3" and hidden > 0 and layers > 0:
         return "gemma3"
     if arch == "qwen4exp":
         # Qwen3.8-Flash-Next: converted straight from the GGUF (no HF bridge).

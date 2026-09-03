@@ -19,10 +19,14 @@ using artifact::NumericFormat;
 /// Rows of the fused attention input projection: `[query | key | value]`.
 /// The hybrid family's is `2 * query_size + 2 * kv_size` because it fuses an
 /// output gate; Llama has none, and this constant is the difference.
-constexpr std::int32_t kAttentionInputRows = TextConfig::query_size + 2 * TextConfig::kv_size;
-constexpr std::int32_t kMlpGateUpRows      = 2 * TextConfig::intermediate;
+[[nodiscard]] std::int32_t attention_input_rows(const family::TextGeometry& g) {
+    return g.query_size() + 2 * g.kv_size();
+}
 
-static_assert(kAttentionInputRows == 2560);
+[[nodiscard]] std::int32_t mlp_gate_up_rows(const family::TextGeometry& g) {
+    return 2 * g.intermediate;
+}
+
 static_assert(TextConfig::query_projection_rows == TextConfig::query_size,
               "Llama attention is ungated; a gated projection would be read at the wrong stride");
 
@@ -54,24 +58,27 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
 }
 
 DensePostMixerPayload load_mlp(const MlpPlan& plan,
-                               const artifact::MaterializedArtifact& materialized) {
+                               const artifact::MaterializedArtifact& materialized,
+                               const family::TextGeometry& g) {
     DensePostMixerPayload out;
-    out.gate_up = materialized_weight(materialized, plan.gate_up, kMlpGateUpRows, TextConfig::hidden);
-    out.down = materialized_weight(materialized, plan.down, TextConfig::hidden,
-                                   TextConfig::intermediate);
+    out.gate_up = materialized_weight(materialized, plan.gate_up, mlp_gate_up_rows(g), g.hidden);
+    out.down = materialized_weight(materialized, plan.down, g.hidden,
+                                   g.intermediate);
     return out;
 }
 
 void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, BindingPlan& out) {
+    const family::TextGeometry& g = out.geometry;
+    out.text_layers.resize(static_cast<std::size_t>(g.layers));
     const NumericFormat weights = endpoint_format(weights_profile);
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
         target.input_norm        = artifact::bind_device_tensor(
-            binder, prefix + "input_norm", NumericFormat::BF16, {TextConfig::hidden});
+            binder, prefix + "input_norm", NumericFormat::BF16, {g.hidden});
         target.attention.query_key_value =
             bind_weight(binder, prefix + "attention/query_key_value", weights,
-                        {kAttentionInputRows, TextConfig::hidden});
+                        {attention_input_rows(g), g.hidden});
         // Llama normalises neither q nor k per head -- `LlamaAttention` ropes the
         // projection's own output -- so unlike Qwen3 there is no `query_norm` or
         // `key_norm` object to bind here, and `Variant::attention_qk_norm` is
@@ -79,13 +86,13 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
         // nothing wrote. Llama also carries no qkv bias
         // (`attention_bias: false`), which is why no bias object is bound either.
         target.attention.output = bind_weight(binder, prefix + "attention/output", weights,
-                                              {TextConfig::hidden, TextConfig::query_size});
+                                              {g.hidden, g.query_size()});
         target.post_attention_norm = artifact::bind_device_tensor(
-            binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
         target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", weights,
-                                         {kMlpGateUpRows, TextConfig::hidden});
+                                         {mlp_gate_up_rows(g), g.hidden});
         target.mlp.down    = bind_weight(binder, prefix + "mlp/down", weights,
-                                         {TextConfig::hidden, TextConfig::intermediate});
+                                         {g.hidden, g.intermediate});
     }
 }
 
@@ -99,6 +106,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.
     out.geometry = family::TextGeometry::declared<TextConfig>(binder.reader().geometry());
+    const family::TextGeometry& g = out.geometry;
     out.frontend     = family::bind_text_only_frontend_resources(binder);
     out.features     = features;
 
@@ -115,14 +123,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
     out.token_embedding = bind_weight(binder, "text/token_embedding", vocabulary_format,
-                                      {TextConfig::output_rows, TextConfig::hidden});
+                                      {g.output_rows, g.hidden});
     bind_text_layers(binder, weights_profile, out);
     out.final_norm = artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16,
-                                                  {TextConfig::hidden});
+                                                  {g.hidden});
     // TinyLlama unties the head: `lm_head.weight` is its own matrix in the
     // checkpoint, and the converter stores it as its own object.
     out.output_head = bind_weight(binder, "text/output_head", vocabulary_format,
-                                  {TextConfig::output_rows, TextConfig::hidden});
+                                  {g.output_rows, g.hidden});
 
     load_plan.materialization = binder.finish();
     return load_plan;
@@ -132,8 +140,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     // The layer storage is sized here, not by the type: the counts come from the
     // geometry these weights were bound against.
-    runtime.geometry = plan.geometry;
-    runtime.full_layers.resize(kFullAttentionLayers);
+    runtime.geometry              = plan.geometry;
+    const family::TextGeometry& g = runtime.geometry;
+    // Every layer of a dense decoder attends.
+    runtime.full_layers.resize(static_cast<std::size_t>(g.layers));
     runtime.gdn_layers.resize(kGdnLayers);
     frontend = family::take_text_only_frontend_resources(backing, plan.frontend);
 
@@ -141,32 +151,32 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.features      = plan.features;
 
     runtime.token_embedding = materialized_weight(backing, plan.token_embedding,
-                                                  TextConfig::output_rows, TextConfig::hidden);
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+                                                  g.output_rows, g.hidden);
+    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         const TextLayerPlan& source  = plan.text_layers[layer];
         FullAttentionWeights& target = runtime.full_layers.at(layer);
         target.input_norm            = artifact::materialized_tensor(
-            backing, source.input_norm, NumericFormat::BF16, {TextConfig::hidden});
+            backing, source.input_norm, NumericFormat::BF16, {g.hidden});
         target.projection = FusedAttentionProjectionPayload{
             .query_key_value = materialized_weight(backing, source.attention.query_key_value,
-                                                   kAttentionInputRows, TextConfig::hidden),
+                                                   attention_input_rows(g), g.hidden),
         };
         // `target.query_norm` and `target.key_norm` stay default-constructed. The
         // family's FullAttentionWeights names them for the targets that have
         // them; this one does not, and the runtime only takes their address --
         // it never reads through it while `attention_qk_norm` is false.
-        target.output = materialized_weight(backing, source.attention.output, TextConfig::hidden,
-                                            TextConfig::query_size);
+        target.output = materialized_weight(backing, source.attention.output, g.hidden,
+                                            g.query_size());
         target.post_attention_norm = artifact::materialized_tensor(
-            backing, source.post_attention_norm, NumericFormat::BF16, {TextConfig::hidden});
-        target.post_mixer = load_mlp(source.mlp, backing);
+            backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
+        target.post_mixer = load_mlp(source.mlp, backing, g);
     }
     static_assert(kGdnLayers == 0, "a Llama layer is never a linear mixer");
 
     runtime.final_norm  = artifact::materialized_tensor(backing, plan.final_norm,
-                                                        NumericFormat::BF16, {TextConfig::hidden});
-    runtime.output_head = materialized_weight(backing, plan.output_head, TextConfig::output_rows,
-                                              TextConfig::hidden);
+                                                        NumericFormat::BF16, {g.hidden});
+    runtime.output_head = materialized_weight(backing, plan.output_head, g.output_rows,
+                                              g.hidden);
 }
 
 } // namespace sinfer::targets::llama::detail

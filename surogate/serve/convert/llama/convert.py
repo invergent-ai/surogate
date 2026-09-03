@@ -140,15 +140,15 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
     family_conversion.check_members("config", config, _REQUIRED_CONFIG)
     check_optional_members("config", config, _OPTIONAL_CONFIG)
     geometry = geometry_from_config(config)
-    if geometry != inventory.GEOMETRY:
+    # Any size of the family converts: the artifact states its own dimensions and the engine
+    # binds against those, so what has to hold is that the checkpoint is self-consistent.
+    if geometry.query_heads % geometry.kv_heads != 0:
         raise ValueError(
-            "checkpoint geometry is not the registered llama target:\n"
-            f"  checkpoint {geometry}\n"
-            f"  target     {inventory.GEOMETRY}\n"
-            "The registered target describes one size; a differently sized "
-            "LlamaForCausalLM needs its own target header before its artifact "
-            "can be bound."
+            f"query heads ({geometry.query_heads}) must be a multiple of key/value heads "
+            f"({geometry.kv_heads})"
         )
+    if geometry.hidden <= 0 or geometry.layers <= 0 or geometry.intermediate <= 0:
+        raise ValueError(f"checkpoint geometry has a non-positive dimension: {geometry}")
     text = {
         name: config[name]
         for name in (
@@ -401,6 +401,26 @@ class ConversionPreflight:
         return {recipe.object_name: recipe for recipe in self.recipes}
 
 
+
+def geometry_block(preflight: "ConversionPreflight") -> dict[str, float]:
+    """The artifact's `geometry` member: the dimensions the engine reads at load, which is
+    what lets one target serve every size of this family."""
+    geometry = preflight.geometry
+    text = preflight.config_summary["text"]
+    return {
+        "hidden": geometry.hidden,
+        "layers": geometry.layers,
+        "intermediate": geometry.intermediate,
+        "output_rows": geometry.vocab,
+        "token_domain": geometry.vocab,
+        "query_heads": geometry.query_heads,
+        "kv_heads": geometry.kv_heads,
+        "head_dim": geometry.head_dim,
+        "rotary_dim": geometry.head_dim,
+        "rms_epsilon": float(text["rms_norm_eps"]),
+        "rope_theta": float(text["rope_theta"]),
+    }
+
 def preflight_inventory() -> None:
     """The inventory the recipe and the writer agree to produce."""
 
@@ -417,9 +437,12 @@ def preflight_inventory() -> None:
     validate_recipe_coverage()
 
 
-def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
-    preflight_inventory()
-    return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
+def build_object_plan(
+    resources: Mapping[str, bytes], geometry: inventory.Geometry = inventory.GEOMETRY
+) -> ObjectPlan:
+    return family_conversion.build_object_plan(
+        inventory.build_object_specs(geometry), resources
+    )
 
 
 def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
@@ -432,10 +455,10 @@ def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
     # the target, so the recipe is rebuilt for the checkpoint in hand rather than
     # the module-level one being used blind.
     recipes = build_recipes(geometry, tied_output_head=tied)
-    _validate_recipe_coverage(recipes, inventory.TENSOR_SPECS)
+    _validate_recipe_coverage(recipes, inventory.build_tensor_specs(geometry))
     source_preflight = preflight_sources(model, recipes)
     resources = load_resources(model)
-    plan = build_object_plan({item.name: item.data for item in resources})
+    plan = build_object_plan({item.name: item.data for item in resources}, geometry)
     return ConversionPreflight(
         model_dir=model,
         geometry=geometry,
@@ -539,11 +562,13 @@ def convert(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
+            geometry=geometry_block(preflight),
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError("writer object plan differs from completed preflight")
-            total = len(inventory.OBJECT_SPECS)
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
+            checkpoint_specs = inventory.build_object_specs(preflight.geometry)
+            total = len(checkpoint_specs)
+            for index, spec in enumerate(checkpoint_specs, start=1):
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
                 else:

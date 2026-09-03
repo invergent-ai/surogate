@@ -95,41 +95,42 @@ void account_linear(WorkspaceLayoutBuilder& layout, QType qtype, std::int32_t ou
                                                                   kTextPolicy, first, last));
 }
 
-std::size_t attention_projection_workspace_bytes(QType qtype, std::int32_t first,
+std::size_t attention_projection_workspace_bytes(const family::TextGeometry& g, QType qtype, std::int32_t first,
                                                  std::int32_t last) {
     // Three GEMMs out of the same hidden state, straight into the family's own
     // query/key/value planes. Nothing is materialized between them, so the whole
     // cost is whichever of the three asks for the most transient storage.
     WorkspaceLayoutBuilder layout;
-    account_linear(layout, qtype, TextConfig::query_size, TextConfig::hidden, first, last);
-    account_linear(layout, qtype, TextConfig::kv_size, TextConfig::hidden, first, last);
-    account_linear(layout, qtype, TextConfig::kv_size, TextConfig::hidden, first, last);
+    account_linear(layout, qtype, g.query_size(), g.hidden, first, last);
+    account_linear(layout, qtype, g.kv_size(), g.hidden, first, last);
+    account_linear(layout, qtype, g.kv_size(), g.hidden, first, last);
     return layout.peak_bytes(1);
 }
 
-std::size_t attention_output_workspace_bytes(QType qtype, std::int32_t first, std::int32_t last) {
+std::size_t attention_output_workspace_bytes(const family::TextGeometry& g, QType qtype,
+                                             std::int32_t first, std::int32_t last) {
     // o_proj into one plane, then `post_attention_norm` accumulating from it onto
     // the residual. One plane, not two: the norm writes where the residual add
     // used to, so nothing holds the normalised copy.
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
-    account_linear(layout, qtype, TextConfig::hidden, TextConfig::query_size, first, last);
+    (void)layout.alloc(DType::BF16, {g.hidden, last});
+    account_linear(layout, qtype, g.hidden, g.query_size(), first, last);
     return layout.peak_bytes(1);
 }
 
-std::size_t post_mixer_workspace_bytes(QType qtype, std::int32_t first, std::int32_t last) {
+std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType qtype, std::int32_t first, std::int32_t last) {
     // gate, up, the gated activation and the down projection. Four planes where
     // Llama's SwiGLU MLP needs one: `gelu_mul` requires its output not to overlap
     // its inputs, so those three stand apart. The normalised copy is gone --
     // the norm accumulates onto the residual instead of through a fifth plane.
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last});
-    account_linear(layout, qtype, TextConfig::intermediate, TextConfig::hidden, first, last);
-    account_linear(layout, qtype, TextConfig::intermediate, TextConfig::hidden, first, last);
-    account_linear(layout, qtype, TextConfig::hidden, TextConfig::intermediate, first, last);
+    (void)layout.alloc(DType::BF16, {g.intermediate, last});
+    (void)layout.alloc(DType::BF16, {g.intermediate, last});
+    (void)layout.alloc(DType::BF16, {g.intermediate, last});
+    (void)layout.alloc(DType::BF16, {g.hidden, last});
+    account_linear(layout, qtype, g.intermediate, g.hidden, first, last);
+    account_linear(layout, qtype, g.intermediate, g.hidden, first, last);
+    account_linear(layout, qtype, g.hidden, g.intermediate, first, last);
     return layout.peak_bytes(1);
 }
 
@@ -180,7 +181,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                 = workspace.scope();
     const std::int32_t columns = attention.ne[1];
-    Tensor projected = workspace.alloc(DType::BF16, {TextConfig::hidden, columns});
+    Tensor projected = workspace.alloc(DType::BF16, {residual.ne[0], columns});
     ops::linear(attention, weight, projected, kTextPolicy, workspace, stream);
     apply_lora(weight, kOutputPort, attention, projected, stream);
     // Zero-centred, like every Gemma norm: the artifact holds `w` and the kernel
@@ -200,12 +201,13 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     family::validate_token_interval(first, last);
-    return attention_projection_workspace_bytes(profile_qtype(weights_profile), first, last);
+    return attention_projection_workspace_bytes(geometry, profile_qtype(weights_profile), first, last);
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    return attention_output_workspace_bytes(profile_qtype(weights_profile), first, last);
+    return attention_output_workspace_bytes(geometry, profile_qtype(weights_profile), first,
+                                            last);
 }
 
 // ---- Post-mixer (gated-GELU MLP, between the other two sandwich norms) ------
@@ -214,10 +216,11 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                 = workspace.scope();
     const std::int32_t columns = hidden.ne[1];
-    Tensor gate       = workspace.alloc(DType::BF16, {TextConfig::intermediate, columns});
-    Tensor up         = workspace.alloc(DType::BF16, {TextConfig::intermediate, columns});
-    Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, columns});
-    Tensor projected  = workspace.alloc(DType::BF16, {TextConfig::hidden, columns});
+    const std::int32_t intermediate = weights.gate.n;
+    Tensor gate       = workspace.alloc(DType::BF16, {intermediate, columns});
+    Tensor up         = workspace.alloc(DType::BF16, {intermediate, columns});
+    Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
+    Tensor projected  = workspace.alloc(DType::BF16, {residual.ne[0], columns});
     
     // Gate and up are separate matrices here, where Llama and the Qwen families
     // fuse them and feed one `linear_swiglu`. That costs a launch and buys two
@@ -242,7 +245,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
-    return post_mixer_workspace_bytes(profile_qtype(weights_profile), first, last);
+    return post_mixer_workspace_bytes(geometry, profile_qtype(weights_profile), first, last);
 }
 
 // ---- Leaves this target cannot run -----------------------------------------

@@ -65,7 +65,8 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
     }
 
     using Binding = ops::LoraStore::ModuleBinding;
-    for (std::size_t layer = 0; layer < TextConfig::layers; ++layer) {
+    const family::TextGeometry& g = runtime.geometry;
+    for (std::size_t layer = 0; layer < runtime.full_layers.size(); ++layer) {
         const auto index      = static_cast<std::int32_t>(layer);
         const auto& attention = runtime.full_layers.at(layer);
         // Ports are the ones `variant.cpp` passes to `apply_lora`; with distinct
@@ -73,29 +74,29 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         // store's key and the two halves have to agree.
         store.register_module(
             index, "q_proj",
-            Binding{attention.projection.query.qdata, 0, TextConfig::hidden,
-                    TextConfig::query_size});
+            Binding{attention.projection.query.qdata, 0, g.hidden,
+                    g.query_size()});
         store.register_module(
             index, "k_proj",
-            Binding{attention.projection.key.qdata, 1, TextConfig::hidden, TextConfig::kv_size});
+            Binding{attention.projection.key.qdata, 1, g.hidden, g.kv_size()});
         store.register_module(
             index, "v_proj",
-            Binding{attention.projection.value.qdata, 2, TextConfig::hidden, TextConfig::kv_size});
+            Binding{attention.projection.value.qdata, 2, g.hidden, g.kv_size()});
         store.register_module(
             index, "o_proj",
-            Binding{attention.output.qdata, 3, TextConfig::query_size, TextConfig::hidden});
+            Binding{attention.output.qdata, 3, g.query_size(), g.hidden});
         store.register_module(
             index, "down_proj",
-            Binding{attention.post_mixer.down.qdata, 4, TextConfig::intermediate,
-                    TextConfig::hidden});
+            Binding{attention.post_mixer.down.qdata, 4, g.intermediate,
+                    g.hidden});
         store.register_module(
             index, "gate_proj",
-            Binding{attention.post_mixer.gate.qdata, 5, TextConfig::hidden,
-                    TextConfig::intermediate});
+            Binding{attention.post_mixer.gate.qdata, 5, g.hidden,
+                    g.intermediate});
         store.register_module(
             index, "up_proj",
-            Binding{attention.post_mixer.up.qdata, 6, TextConfig::hidden,
-                    TextConfig::intermediate});
+            Binding{attention.post_mixer.up.qdata, 6, g.hidden,
+                    g.intermediate});
     }
     store.ensure_banks();
 
