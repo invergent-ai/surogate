@@ -29,17 +29,26 @@ surogate sft config.yaml
 ### Capture CLI flags
 
 ```bash
-surogate distill-capture config.yaml [--api-base URL] [--device cuda:0] [--allow-cross-doc-attention] [--hub_token TOKEN]
+surogate distill-capture config.yaml [--api-base URL] [--device cuda:0] [--hub_token TOKEN]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--api-base` | none | OpenAI-compatible base URL of a served teacher (e.g. `http://localhost:8000/v1`); overrides `distillation.teacher_api_base` and switches capture to the API backend (below). |
 | `--device` | `cuda:0` | Device to run the local teacher model on (e.g. `cuda:1`). Ignored with a warning in API mode. |
-| `--allow-cross-doc-attention` | off | Local backend only: allow the `sdpa` fallback when flash-attention-2 is unavailable. Packed documents will then attend across document boundaries during capture (an approximation). Ignored with a warning in API mode. |
 | `--hub_token` | none | Hugging Face token for private model access |
 
-By default the teacher is loaded locally with `transformers` in bf16. The local backend **requires flash-attention-2** for per-document attention isolation of packed samples (the shard's per-document `position_ids` resets drive varlen attention); without flash-attn it errors out unless you pass `--allow-cross-doc-attention`.
+By default the teacher is loaded locally with `transformers` in bf16 using `sdpa` attention. Packed documents are isolated by transformers' own **packed-sequence support**: it reads the shard's per-document `position_ids` resets and builds a block-diagonal causal mask, so a token can only attend within its own document. **No flash-attn is required.**
+
+This depends on capture passing `use_cache=False`, and the reason is easy to misread from the transformers source. The model's `forward` declares `use_cache: bool | None = None` and allocates a cache only under `if use_cache and past_key_values is None`, which looks as though omitting the argument is safe. It is not: a `@merge_with_config_defaults` decorator substitutes `config.use_cache` (normally `True`) before the body runs, a cache is allocated, packed detection is skipped, and the teacher attends straight across document boundaries — silently. Measured: omitting the argument diverges from per-document gold by 0.535, identical to passing `use_cache=True`.
+
+Measured against a per-document reference (each document run alone, which is what capture is meant to reproduce), scored on the top-64 id set the sidecar stores, at `sequence_len` 2048 with `teacher_batch_size` 4 on one L4: this path reaches **98.46%** overlap versus flash-attention varlen's **98.32%** — a tie inside bf16 kernel noise — while attention with *no* isolation reaches only **42.67%**. Cost is about +18% capture time versus flash-attn, and +0.4% peak memory **at that
+`sequence_len`**. Read the memory figure as scale-dependent: this path materialises a
+dense `[batch, 1, S, S]` mask where flash-attn's varlen kernel materialised none, so it
+grows with the square of `sequence_len`. The mask is a **bool** `(batch, 1, S, S)` tensor
+(1 byte per element), so with `teacher_batch_size` 4 that is roughly **17 MB at 2048,
+268 MB at 8192 and 1073 MB at 16384**. If that ever binds, `attn_implementation="flex_attention"`
+expresses the same mask sparsely and also needs no flash-attn.
 
 ### Remote teacher (vLLM API)
 
@@ -53,7 +62,7 @@ vllm serve Qwen/Qwen3-32B --max-logprobs 64
 surogate distill-capture config.yaml --api-base http://localhost:8000/v1
 ```
 
-How it works: capture sends **token-id prompts** through vLLM's `prompt_logprobs` completions extension — one request per packed document (split at the shard's position-id resets, with a one-token lookahead), which gives **exact per-document context isolation with no flash-attn requirement**. Up to `teacher_api_concurrency` requests are in flight at once (default 8), each with a `teacher_api_timeout` of 1200 s; transient failures (transport errors, HTTP 429/5xx) are retried 3 times with backoff. The API key is read from the environment variable named by `teacher_api_key_var` (default `VLLM_API_KEY`); if unset, `EMPTY` is sent, which local unauthenticated vLLM servers accept.
+How it works: capture sends **token-id prompts** through vLLM's `prompt_logprobs` completions extension — one request per packed document (split at the shard's position-id resets, with a one-token lookahead), which gives **exact per-document context isolation** (one document per request, so there is nothing to mask). Up to `teacher_api_concurrency` requests are in flight at once (default 8), each with a `teacher_api_timeout` of 1200 s; transient failures (transport errors, HTTP 429/5xx) are retried 3 times with backoff. The API key is read from the environment variable named by `teacher_api_key_var` (default `VLLM_API_KEY`); if unset, `EMPTY` is sent, which local unauthenticated vLLM servers accept.
 
 Two hard requirements:
 
@@ -235,9 +244,6 @@ Captures write to a `.tmp` file and rename atomically on completion, so this nor
 
 **Missing `.tokenize_hash`** — `distillation is enabled but no <output_dir>/.tokenize_hash was found...`
 The output dir has shards but no tokenization hash (e.g. partially copied). Re-run tokenization and the capture.
-
-**Capture: flash-attention-2 not available** — `distill-capture requires flash-attention-2 for per-document attention isolation...`
-Install flash-attn, or accept the cross-document-attention approximation with `--allow-cross-doc-attention` (packed documents will then see each other during teacher capture).
 
 **Capture: token id out of teacher vocab** — `Token shard '<path>' contains token id <X> but the teacher vocab size is <Y>. Student and teacher must share a tokenizer. For cross-tokenizer distillation, first transplant the teacher's tokenizer onto the student ... then re-tokenize and re-capture against the transplanted model.`
 Your teacher does not share the student's tokenizer. Pick a teacher from the same family, or follow the error's advice — see [Cross-tokenizer distillation](#cross-tokenizer-distillation).

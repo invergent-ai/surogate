@@ -4,10 +4,11 @@ Builds a tiny packed token shard (multiple docs with position-id resets), runs
 `capture_shard` with a cached small teacher, and compares each captured row
 against a reference computed by feeding EVERY DOCUMENT AS ITS OWN SEQUENCE.
 The per-doc reference makes this test sensitive to cross-document attention
-leaks: if the capture forward did not isolate packed documents (flash-attention
-varlen), rows after the first doc boundary diverge.
+leaks: if the capture forward did not isolate packed documents (transformers'
+packed-sequence support, driven by position_ids and `use_cache=False`), rows
+after the first doc boundary diverge.
 
-Requirements: 1 GPU, flash-attn installed, cached Qwen3 weights
+Requirements: 1 GPU, cached Qwen3 weights
 (QWEN3_MODEL_PATH or HF cache for Qwen/Qwen3-0.6B / Qwen/Qwen3-1.7B /
 Qwen/Qwen3.5-0.8B).
 """
@@ -22,9 +23,13 @@ import pytest
 
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
-pytest.importorskip("flash_attn", reason="capture's document isolation requires flash-attention-2")
 
-from surogate.distill.capture import capture_shard, _load_teacher
+capture = pytest.importorskip(
+    "surogate.distill.capture", reason="requires the built _surogate native module"
+)
+capture_shard = capture.capture_shard
+_load_teacher = capture._load_teacher
+
 from surogate.distill.sidecar import read_sidecar, read_token_shard_header
 
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
@@ -73,7 +78,7 @@ def teacher():
     snapshot = resolve_model_path()
     if snapshot is None:
         pytest.skip(f"No cached teacher. Set {ENV_VAR} or cache one of {CANDIDATE_MODELS}")
-    model = _load_teacher(str(snapshot), "cuda", allow_cross_doc_attention=False)
+    model = _load_teacher(str(snapshot), "cuda")
     yield snapshot, model
     del model
     torch.cuda.empty_cache()
