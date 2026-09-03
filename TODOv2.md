@@ -138,8 +138,16 @@ stored once.
      `weight_scale_inv` as a 2-D F32 grid (e.g. `[48, 8]` for a `[6144, 1024]`
      projection). No runtime format holds a 2-D block scale, so this is a new
      weight format and GEMM support, not an ingest change.
-5. **[ ] N — NVFP4 ModelOpt ingest, specified against a local checkpoint
-   (2026-09-03).** `models--surogate--Qwen3.5-0.8B-NVFP4` is a ModelOpt export
+5. **[~] N — NVFP4 ModelOpt ingest: the 4B serves (2026-09-03).**
+   `surogate serve <Qwen3.5-4B-NVFP4>` works end to end. The 4B's ModelOpt
+   recipe already existed and reads `weight_scale_2`; what was missing was the
+   route (`converter_for_config` sent NVFP4 to the plain converter), the
+   artifact's geometry (the converter now reads it from the checkpoint), and
+   the uniform-NVFP4 profile, which the directory merge had dropped. **Left:
+   the 0.8B and the 2B have no NVFP4 recipe** -- their checkpoints are on this
+   machine and are refused by name until one exists. What such a recipe needs
+   is below.
+    `models--surogate--Qwen3.5-0.8B-NVFP4` is a ModelOpt export
    (`quant_method: modelopt`) and is what this item has to read. What it holds,
    per component: `weight` `[n, k/2]` U8, `weight_scale` `[n, k/16]` E4M3,
    `weight_scale_2` a scalar F32, `input_scale` a scalar F32. Two differences
@@ -153,10 +161,9 @@ stored once.
    - **Parents are split per component.** ModelOpt writes `q_proj`, `k_proj`,
      `v_proj` separately where the artifact fuses them, so the converter fuses
      and must check the three share a divisor before it does.
-   What is missing is the converter itself: the family has no `*_nvfp4` recipe
-   or inventory (only the 27B and the 4B do), and `converter_for_config` routes
-   NVFP4 for the 27B alone. The engine side is ready -- `qwen3_5` compiles the
-   `Qwen36Nvfp4` profile and binds NVFP4 parents with both divisors.
+   The engine side is ready for any size: `qwen3_5` compiles both NVFP4 profiles
+   and binds NVFP4 parents with both divisors, and every width it uses now comes
+   from the artifact.
 6. **[x] M2 — one directory per architecture (2026-09-03).** `qwen3_5_{0_8b,2b,4b}` are
    ~1,750 lines each for seven integers; `variant.h` differs by 2 lines across
    the three. Nothing requires the split: all 52 headers in
