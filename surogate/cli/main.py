@@ -61,6 +61,7 @@ COMMAND_MAPPING: dict[str, str] = {
     "distill-capture": "surogate.cli.distill_capture",
     "transplant-tokenizer": "surogate.cli.transplant",
     "merge": "surogate.cli.merge",
+    "quantize": "surogate.cli.quantize",
     "debug": "surogate.cli.debug",
 }
 
@@ -164,6 +165,12 @@ def parse_args():
     from surogate.cli.merge import prepare_command_parser as merge_prepare_command_parser
 
     merge_prepare_command_parser(subparsers.add_parser("merge", help="Merge a LoRA checkpoint into the base model"))
+    # quantize command
+    from surogate.cli.quantize import prepare_command_parser as quantize_prepare_command_parser
+
+    quantize_prepare_command_parser(
+        subparsers.add_parser("quantize", help="Quantize a trained checkpoint into a GGUF the engine serves")
+    )
 
     # debug command
     from surogate.cli.debug import prepare_command_parser as debug_prepare_command_parser

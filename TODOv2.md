@@ -72,11 +72,10 @@ stored once.
 2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, and `surogate quantize` in their place.**
    The converters stop quantising and the three home-grown formats leave the
    engine with them, roughly 140 references. What replaces them for a model we
-   trained is `surogate quantize`: merged checkpoint → GGUF → K-quant GGUF, on
-   llama.cpp's quantiser, which the engine then serves where it lies. It
-   follows `surogate merge`, the step that already exists. Mechanism to be
-   decided between shelling out to `llama-quantize` (what unsloth does) and
-   vendoring the quantiser into our tree; the licence permits either. The old
+   trained is `surogate quantize`, which is item 9 and deferred: a thin version
+   exists, so the capability does not vanish with the formats, but it is not a
+   product yet. Until it is, a checkpoint we trained is either served as BF16
+   or exported through that command's two llama.cpp passes. The old
    argument against the deletion is stale: the K-quant path costs ~19 % of
    prefill only against the BF16-activation kernel, and with the int8 route it
    measures 13,195 tok/s against the row-split path's 13,700 from an earlier
@@ -96,10 +95,96 @@ stored once.
    `SafeTensorsReader` is the better reader (multi-shard, GDS, strided).
 7. **[ ] K5c — fused K-quant GDN projection-and-convolution.** Built, measured,
    left off: costs more in kernel launches than it saves in bandwidth.
-8. **[ ] Drift to fix.** `--no-cache` is unimplemented, `surogate convert` does
+8. **[ ] Drift to fix.** The MTP block can only be bound at `W8G32_F16S`/BF16,
+   so a K-quant GGUF that keeps its nextn tensors is refused (see item 9's
+   investigation); the published files strip nextn, which is why this has never
+   surfaced. Also: `--no-cache` is unimplemented, `surogate convert` does
    not exist, and `surogate/serve/tools/README.md` still tells users to download
    artifacts from Hugging Face — a posture the owner rejected — while linking
    three files that do not exist.
+9. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+   model we trained.** Revisit once the serving engine is complete (owner,
+   2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
+   turned out to be two subprocess calls; everything a real product needs
+   around it is not, and is listed below.
+
+---
+
+## `surogate quantize`, as investigated (2026-09-03)
+
+A downloaded model is already a GGUF and is served where it lies. A model
+trained here has none, so producing one is ours to do: `surogate sft` →
+`surogate merge` → **this step** → `surogate serve model.gguf`.
+
+**Why it cannot be our own arithmetic, or Python.** Every published GGUF was
+made with llama.cpp's encoders, and they exist nowhere else: the `gguf` package
+writes Q8_0 and raises `NotImplementedError` for Q4_K, Q5_K and Q6_K. Writing
+our own K-quant encoder would mean matching `make_qkx2_quants` and the
+per-tensor type mixture in `llama-quant.cpp` (~1,500 lines over
+`ggml-quants.c`'s 5,667) closely enough that our output is not quietly worse
+than the file a user could have downloaded instead.
+
+**What unsloth does, since the question was whether to follow it.**
+`study/unsloth-zoo/unsloth_zoo/llama_cpp.py` is ~3,500 lines and implements no
+quantisation at all. It locates, downloads or builds llama.cpp, then runs one
+command in `quantize_gguf`:
+
+    llama-quantize [--imatrix f] [--tensor-type pat=TYPE] in.gguf out.gguf q4_k_m <threads>
+
+The type string reaches the shell straight from the user's
+`quantization_method`, validated only as a bare token. Their own presets are
+not formats: `Q2_K_L` is `q2_k` plus `--tensor-type .ffn_down_exps=Q3_K`,
+`--output-tensor-type Q6_K`, `--token-embedding-type Q4_K`. They build five
+llama.cpp targets, of which `llama-quantize` is the one that matters, and it is
+CPU-only — which is why they can ship prebuilt CPU archives for it.
+
+**A K-quant takes two passes, not one.** llama.cpp's converter reads the
+Hugging Face checkpoint and writes a BF16 GGUF, because it holds the
+per-architecture tensor mapping and the tokenizer; `llama-quantize` then reads
+that and applies the mixture. The converter is now a `conversion/` package,
+~21,000 lines with a module per architecture, and it registers
+`Qwen3_5MoeForConditionalGeneration` — the architecture of the 35B we serve and
+train — alongside Qwen3, Qwen3Moe and Gemma3. `llama-quantize` builds clean in
+the vendored tree with one `cmake --build build --target llama-quantize`.
+
+**Measured end to end.** `Qwen3-0.6B`: 311 tensors to a 1.51 GB BF16 GGUF, then
+Q4_K_M at 456 MiB (5.09 bits a weight) in 5.1 s of quantiser time. Qwen3.5-0.8B:
+1.56 GB BF16 → 265 MB Q4_K_M. Both conversions and both quantisations are clean.
+
+**Serving our own export fails, and the blocker is on the engine's side.** The
+0.8B export loads to `tensor descriptor does not match target contract:
+mtp/input_projection`. The cause is not the exporter: our conversion keeps the
+MTP block (`blk.24.nextn.eh_proj.weight` and friends) and llama.cpp's `q4_k_m`
+mixture quantised it to Q4_K, while every MTP binding in the target contract
+demands `W8G32_F16S` or BF16 — eleven bindings across the 0.8B and 2B targets,
+none of which accepts a K-quant. It has never shown up because the published
+0.8B GGUFs we validated against strip the nextn block entirely, so ingest takes
+the no-MTP variant and the bindings are never exercised. Two ways out, and the
+first is one flag: pin the MTP tensors at quantise time
+(`--tensor-type "nextn=q8_0"` and the rest of `blk.<mtp>.`, which is exactly the
+mechanism behind unsloth's presets), or teach the binder to read a K-quant MTP
+block. The second is the real fix and belongs to the engine, not to this item.
+
+**What is deliberately not built, and is the actual work when this comes back:**
+
+- **No importance matrix.** `--imatrix` is passed through, but nothing produces
+  one, and the IQ types require it. Generating one means running the model over
+  a calibration corpus (llama.cpp's `llama-imatrix`), which is a training-side
+  job, not a two-subprocess one.
+- **No mixture of our own.** We accept llama.cpp's `q4_k_m` mixture as given.
+  Whether a Surogate preset should exist — the "UD" mixes are exactly this — is
+  a quality question that wants perplexity evidence per candidate, which the
+  gate in `tools/eval/perplexity.py` can now supply.
+- **The llama.cpp dependency is a checkout, not a dependency.** It resolves to
+  `study/llama.cpp-master`, which is a study tree and not shippable. A product
+  version either vendors the quantiser sources into `csrc` or fetches a pinned
+  release the way unsloth does.
+- **No MoE-specific handling, no vision towers, no sharded output**
+  (`--keep-split`), and no LoRA-adapter GGUF path (`convert_lora_to_gguf.py`
+  exists upstream).
+- **Untested beyond the 0.8B**, and untested on anything we trained ourselves.
+- **No tensor pinning.** The MTP failure above needs it, and so would any other
+  contract that wants a particular format for a particular tensor.
 
 ---
 
@@ -267,10 +352,10 @@ Verified against the artifact the converter wrote for all 150 rearranged objects
   format it arrives in, and nothing in the serving path re-encodes weights. But
   a model trained here has no published GGUF, so producing one is our job:
   `surogate quantize` stays, it takes a trained checkpoint to a GGUF, and the
-  quantisation arithmetic is llama.cpp's rather than ours. This is the shape
-  unsloth ships (`study/unsloth-zoo/unsloth_zoo/llama_cpp.py`), and the reason
-  it cannot be Python: the `gguf` package encodes Q8_0 and raises
-  `NotImplementedError` for Q4_K, Q5_K and Q6_K.
+  quantisation arithmetic is llama.cpp's rather than ours. **It is a separate
+  product and not on the critical path** (owner, 2026-09-03): the serving engine
+  comes first, and the export command is revisited after. See item 9 for what
+  exists and what does not.
 - **`.sinfer` is a transparent cache, never an interchange format** (owner,
   2026-08-24). Never published, never required. The eight-entry hardcoded
   registry in `ingest.py` is the rejected shape.
