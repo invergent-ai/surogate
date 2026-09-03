@@ -47,11 +47,12 @@ stored once.
 
 ## Roadmap
 
-1. **[x] The native prefill gap is a floor, not a defect — measured.** It does
-   not close by tuning this kernel; see *The prefill gap, decomposed*. What
-   remains for someone who wants it is a different algorithm (an integer path
-   that never materialises BF16), and the evidence says that algorithm is
-   slower here, not faster.
+1. **[~] Close the native prefill gap — localised to one thing, not yet closed.**
+   It is *not* the K-quant decode (67 µs of 150). It is staging the superblock
+   header: 198 µs, and without it this kernel beats the row-split one by 19 %.
+   Four rearrangements measured, all worse, each losing a block per SM. The
+   next thing to try is `kExpertBM = 32`, which fits every header resident
+   inside the 3-blocks-per-SM budget. See *The prefill gap, decomposed*.
 2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, add `surogate quantize`.** Converters
    stop emitting the home-grown formats; `surogate quantize` writes a BF16 GGUF
    and calls `llama-quantize` (built at `study/llama.cpp-master/build/bin`).
@@ -83,7 +84,7 @@ stored once.
 
 ## The prefill gap, decomposed
 
-The K-quant MoE prefill is 11,100 tok/s against the row-split path's 13,700 on
+The K-quant MoE prefill is ~11,100 tok/s against the row-split path's 13,700 on
 the same model. Per prefill round, `nsys`:
 
 | kernel | row-split | K-quant | cost |
@@ -92,31 +93,48 @@ the same model. Per prefill round, `nsys`:
 | down Q5_K ×37 | 335 µs | 505 µs | +6.3 ms |
 | down Q6_K ×3 | 337 µs | 725 µs | +1.2 ms |
 
-That accounts for the whole of it. Gutting the gate_up kernel's decode in
-stages says where it goes:
+That accounts for the whole of it. Cutting the gate_up kernel apart, one piece
+at a time, says where it goes:
 
 | gate_up variant | ns |
 |---|---:|
-| real | 758,000 |
-| decode arithmetic removed | 689,245 |
-| weight staging removed too | 470,716 |
-| **row-split, real** | **607,736** |
+| real | 757,996 |
+| scale dropped, raw codes fed to the MMA | 691,362 |
+| **and the header no longer staged** | **493,066** |
+| decode gone entirely | 470,716 |
+| *row-split, real* | *607,736* |
 
-So decode arithmetic is 72 µs of the 150 µs gap; weight staging is 218 µs
-against the row-split kernel's ≤137 for staging *and* decode. Both kernels run
-**3 blocks/SM** with near-identical registers (80 vs 70) — verified with
-`cuobjdump -res-usage`, not inferred — so occupancy is not in it.
+Read the third row against the last. **Without its header staging this kernel
+beats the row-split one by 19 %** — 493 against 608. The K-quant decode is not
+the problem: the whole scale computation, affine min and all, is 67 µs. The
+problem is that a Q4_K block puts a 16-byte header in front of 128 bytes of
+codes, and the two are wanted at different cadences — the header once per
+superblock, the codes once per 64-wide tile. Staging it costs **198 µs**.
 
-What is left is the format. Q4_K reads 0.5625 B/weight against Q4G64's 0.53;
-it is affine, so every value costs an extra fma that a symmetric format does
-not pay; its scales are 6-bit packed and shared across sub-blocks rather than
-one fp16 per group; and its nibble layout splits a lane's pair across two
-bytes. That arithmetic sits between the `cp_async` completing and the MMA
-consuming `As`, so it also hides less well.
+Both kernels run **3 blocks/SM** with near-identical registers (80 vs 70),
+from `cuobjdump -res-usage` — occupancy is not in it, at least not as things
+stand. It becomes the binding constraint the moment you try to fix the header,
+which is why every rearrangement below loses:
 
-Closing it means not dequantising to BF16 at all — an integer path, i.e. K3b —
-and that is the thing already measured as the wrong trade: our BF16 wide route
-beats llama.cpp's own MMQ by 1.65×.
+| arrangement | prefill tok/s |
+|---|---:|
+| **staged per superblock, double-buffered (today)** | **11,100** |
+| every superblock's header staged once in the prologue | 10,300 |
+| whole 144-byte block staged once per superblock | 10,400 |
+| header read from the file in `decode_weight` | 8,800 |
+
+Each alternative trades shared memory for occupancy — 30 KB and 3 blocks
+becomes 36–43 KB and 2 — and loses more than the header staging costs. Two
+probes rule out the obvious explanations for the 198 µs: giving every row the
+*same* header address keeps the instruction count and perfect locality, and is
+**slower still** (895,189 ns — 64 async copies from one line serialise), so it
+is neither purely instruction count nor purely stride.
+
+**Where the win is, for whoever takes it next.** Get all 8 KB of a row block's
+headers resident while staying at 3 blocks per SM. The budget is 33.3 KB and
+the kernel is at 30, so 3.3 KB short of the 8 needed. `As` (8 KB), `Bs`
+(16 KB) and `Cr` (4 KB) are all load-bearing at `kExpertBM = 64`; halving the
+row tile to 32 would fit it at 26 KB, and that is the change worth trying.
 
 ---
 
