@@ -7,7 +7,7 @@ geometry; only checkpoint-invariant Vision recipes are built here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -71,6 +71,20 @@ class DraftHeadTokenIds:
 
 
 @dataclass(frozen=True, slots=True)
+class AnyOf:
+    """The same object, expressed however the checkpoint at hand stores it.
+
+    A routed MoE is the case that forced this: the HF checkpoint fuses gate and up into one
+    `gate_up_proj`, and a GGUF of the same model keeps them as two stacked tensors. Both
+    describe identical rows in identical order, so rather than fork the recipes per input
+    format the object carries both spellings and the resolver takes whichever one the source
+    actually provides. Options are tried in order; the first whose sources are all present wins.
+    """
+
+    options: tuple["Expression", ...]
+
+
+@dataclass(frozen=True, slots=True)
 class GatherRows:
     source: SourceTensor
     token_ids_object: str
@@ -86,6 +100,7 @@ Expression = (
     | Cast
     | DraftHeadTokenIds
     | GatherRows
+    | AnyOf
 )
 
 
@@ -179,6 +194,11 @@ def expression_shape(expression: Expression) -> tuple[int, ...]:
 
     if isinstance(expression, GatherRows):
         return (expression.rows, *expression.source.shape[1:])
+    if isinstance(expression, AnyOf):
+        shapes = {expression_shape(option) for option in expression.options}
+        if len(shapes) != 1:
+            raise ValueError(f"AnyOf options disagree on shape: {sorted(shapes)}")
+        return shapes.pop()
 
     raise TypeError(f"unknown recipe expression {type(expression)!r}")
 
@@ -198,7 +218,36 @@ def expression_sources(expression: Expression) -> tuple[SourceTensor, ...]:
         return (expression.source,)
     if isinstance(expression, DraftHeadTokenIds):
         return ()
+    if isinstance(expression, AnyOf):
+        return tuple(item for option in expression.options for item in expression_sources(option))
     raise TypeError(f"unknown recipe expression {type(expression)!r}")
+
+
+def choose_option(expression: "AnyOf", available) -> "Expression":
+    """The first option whose every source `available(name)` accepts."""
+    for option in expression.options:
+        if all(available(item.name) for item in expression_sources(option)):
+            return option
+    wanted = " | ".join(
+        ", ".join(item.name for item in expression_sources(option))
+        for option in expression.options
+    )
+    raise KeyError(f"no AnyOf option is satisfiable; wanted one of: {wanted}")
+
+
+def resolve_options(expression: "Expression", available) -> "Expression":
+    """`expression` with every AnyOf replaced by the option this checkpoint can satisfy."""
+    if isinstance(expression, AnyOf):
+        return resolve_options(choose_option(expression, available), available)
+    if isinstance(expression, (Slice, Reshape, Transpose, Cast)):
+        return replace(expression, source=resolve_options(expression.source, available))
+    if isinstance(expression, Concat):
+        return replace(
+            expression,
+            sources=tuple(resolve_options(part, available) for part in expression.sources),
+        )
+    return expression
+
 
 
 def build_vision_recipes(
@@ -328,7 +377,13 @@ def preflight_source_reader(
     reader: ShardReader,
     recipes: Sequence[TensorRecipe],
 ) -> SourcePreflight:
-    requirements = source_requirements(recipes)
+    # An AnyOf object lists every spelling it accepts; only the one this checkpoint actually
+    # has may be demanded, so options are resolved against the reader before requirements are
+    # collected.
+    resolved = tuple(
+        replace(item, expression=resolve_options(item.expression, reader.has)) for item in recipes
+    )
+    requirements = source_requirements(resolved)
     metadata = reader.metadata(requirements)
 
     dtype_counts: dict[str, int] = {}
@@ -349,7 +404,7 @@ def preflight_source_reader(
         shards.add(actual.shard)
 
     return SourcePreflight(
-        recipe_count=len(recipes),
+        recipe_count=len(resolved),
         source_tensor_count=len(requirements),
         source_shard_count=len(shards),
         source_dtype_counts=dtype_counts,
@@ -361,6 +416,10 @@ def materialize_expression(
     reader: ShardReader,
     derived_tensors: Mapping[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
+    if isinstance(expression, AnyOf):
+        return materialize_expression(
+            choose_option(expression, reader.has), reader, derived_tensors
+        )
     if isinstance(expression, SourceTensor):
         tensor = reader.get(expression.name)
         if tuple(tensor.shape) != expression.shape:

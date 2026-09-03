@@ -19,6 +19,43 @@ class TensorMetadata:
     dtype: str
 
 
+
+#: Interchangeable module spellings for one tensor, applied in both directions. These are
+#: naming conventions different exporters chose for the same module, not architecture
+#: knowledge, so the list stays short and general rather than growing per model.
+_SEGMENT_ALIASES: tuple[tuple[str, str], ...] = (
+    ("block_sparse_moe.gate", "mlp.gate"),
+    ("block_sparse_moe.experts", "mlp.experts"),
+)
+
+
+def name_spellings(name: str):
+    """Every spelling one tensor may be stored under, most specific first.
+
+    Three format conventions, applied to every checkpoint rather than listed per model: the
+    VL-style `model.language_model.*` nesting folds to `model.*`; a trailing `.weight` is
+    optional, because a stacked-expert tensor is a bare Parameter in some exports and a Module
+    weight in others; and the aliases above name the same module two ways.
+    """
+    seeds = [name]
+    prefix = "model.language_model."
+    if name.startswith(prefix):
+        seeds.append("model." + name[len(prefix):])
+    for seed in list(seeds):
+        for left, right in _SEGMENT_ALIASES:
+            if left in seed:
+                seeds.append(seed.replace(left, right))
+            elif right in seed:
+                seeds.append(seed.replace(right, left))
+    for seed in list(seeds):
+        seeds.append(seed[: -len(".weight")] if seed.endswith(".weight") else seed + ".weight")
+    seen: set[str] = set()
+    for candidate in seeds:
+        if candidate not in seen:
+            seen.add(candidate)
+            yield candidate
+
+
 class ShardReader:
     """Resolve a safetensors source while keeping at most one file handle open."""
 
@@ -78,17 +115,24 @@ class ShardReader:
         return getattr(self, "_aliases", {}).get(name, name)
 
     def _resolve(self, name: str) -> str:
-        # Requirements may use either the stored multimodal naming
-        # (model.language_model.*) or the folded text naming (model.*);
-        # serve both against the folded map.
-        if name in self.weight_map:
-            return name
-        prefix = "model.language_model."
-        if name.startswith(prefix):
-            flat = "model." + name[len(prefix):]
-            if flat in self.weight_map:
-                return flat
+        """The stored name for a requested one, across the spellings of one tensor.
+
+        These are format conventions, not architecture knowledge, so they are applied to every
+        checkpoint rather than listed per model:
+
+        - the VL-style `model.language_model.*` nesting folds to `model.*`;
+        - a trailing `.weight` is optional, because a stacked-expert tensor is a bare Parameter
+          in some exports (`mlp.experts.down_proj`) and a Module weight in others;
+        - a few module names are spelled differently by different families for the same thing,
+          the MoE router above all (`block_sparse_moe.gate` and `mlp.gate`).
+        """
+        for candidate in self._spellings(name):
+            if candidate in self.weight_map:
+                return candidate
         return name
+
+    def _spellings(self, name: str):
+        return name_spellings(name)
 
     def _reset_handle(self) -> None:
         self._current_shard: str | None = None

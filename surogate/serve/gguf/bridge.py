@@ -119,6 +119,20 @@ def _hf_name_map(arch: str, n_layers: int) -> dict[str, str]:
     return out
 
 
+
+def _family_or_generic(fam, gguf_name: str, n_main: int, name_map: dict[str, str]) -> str | None:
+    """A family's own name if it has one, else gguf-py's.
+
+    gguf-py's `get_tensor_name_map` is the universal table -- it is maintained upstream for
+    every architecture llama.cpp supports, so it is the base and a new architecture needs no
+    entry here. A family table exists only to *override* the handful of names where the generic
+    map's alias preference picks wrong for us (ssm_a -> A_log, attn_gate -> self_attn.gate_proj).
+    Anything it does not name falls through, which is how a routed MoE's expert tensors resolve
+    without a single hand-written line.
+    """
+    return fam.hf_name_for(gguf_name, n_main) or name_map.get(gguf_name)
+
+
 def build_hf_dir_from_gguf(
     gguf_path: Path,
     target_key: str,
@@ -209,7 +223,7 @@ def build_hf_dir_from_gguf(
         # types that move into the artifact profile bit-exactly.
         candidates: dict[str, dict] = {}
         for tensor in reader.tensors:
-            hf = (fam.hf_name_for(tensor.name, n_main) if qwen35_family
+            hf = (_family_or_generic(fam, tensor.name, n_main, name_map) if qwen35_family
                   else name_map.get(tensor.name))
             if (
                 hf is not None
@@ -249,7 +263,7 @@ def build_hf_dir_from_gguf(
 
     for i, tensor in enumerate(reader.tensors):
         if qwen35_family:
-            hf_name = fam.hf_name_for(tensor.name, n_main)
+            hf_name = _family_or_generic(fam, tensor.name, n_main, name_map)
         else:
             hf_name = name_map.get(tensor.name)
         if hf_name is None:

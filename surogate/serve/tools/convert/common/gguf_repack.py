@@ -44,6 +44,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from surogate.serve.tools.convert.common.safetensors import name_spellings
 from surogate.serve.tools.convert.common.row_algebra import (
     SOURCE_STRIDE,
     RowProgram,
@@ -166,7 +167,12 @@ class GgufRepackSource:
 
     def _init(self, gguf_path: Path, sources: dict[str, dict]) -> None:
         self.gguf_path = gguf_path
-        self.sources = sources
+        # The recipes and the bridge may spell one tensor differently (a `.weight` suffix, the
+        # VL nesting, a router alias); index every spelling so a lookup finds the entry.
+        self.sources = dict(sources)
+        for stored, entry in list(sources.items()):
+            for spelling in name_spellings(stored):
+                self.sources.setdefault(spelling, entry)
         if not self.gguf_path.is_file():
             raise RepackError(f"repack map points at a missing GGUF: {self.gguf_path}")
         for hf_name, entry in sources.items():

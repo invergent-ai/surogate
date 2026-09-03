@@ -22,6 +22,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from surogate.serve.tools.convert.common.recipe import (
+    AnyOf,
     Concat,
     Expression,
     GatherRows,
@@ -77,6 +78,13 @@ class _Unsupported(Exception):
     pass
 
 
+
+def _names(node) -> set[str]:
+    out: set[str] = set()
+    collect_sources(node, out)
+    return out
+
+
 def evaluate_rows(
     expression: Expression,
     source_shapes: Mapping[str, Sequence[int]],
@@ -104,16 +112,26 @@ def evaluate_rows(
 
     def walk(node: Expression) -> tuple[np.ndarray, int]:
         if isinstance(node, SourceTensor):
-            if len(node.shape) != 2 or node.name not in source_shapes:
+            # Any rank: the last axis is K and everything before it indexes rows, so a stacked
+            # expert tensor [experts, out, in] is just [experts*out, in] with its row axes kept
+            # apart until something concatenates or reshapes them. That is what lets a routed
+            # MoE's fused gate_up be a row program over two stored tensors instead of a
+            # dequantise-and-rebuild.
+            if len(node.shape) < 2 or node.name not in source_shapes:
                 raise _Unsupported()
-            n, k = node.shape
+            k = node.shape[-1]
             actual = tuple(source_shapes[node.name])
-            if actual != (n, k):
+            if actual != tuple(node.shape):
                 raise RowShapeMismatch(
-                    f"{node.name}: source shape {actual} != recipe shape {(n, k)}"
+                    f"{node.name}: source shape {actual} != recipe shape {tuple(node.shape)}"
                 )
             index = source_index(node.name)
-            ids = np.arange(n, dtype=np.int64) + index * SOURCE_STRIDE
+            rows = 1
+            for extent in node.shape[:-1]:
+                rows *= extent
+            ids = (np.arange(rows, dtype=np.int64) + index * SOURCE_STRIDE).reshape(
+                tuple(node.shape[:-1])
+            )
             return ids, k
         if isinstance(node, Reshape):
             ids, k = walk(node.source)
@@ -158,6 +176,12 @@ def evaluate_rows(
                     f"GatherRows: {gathered.shape[0]} ids != declared {node.rows}"
                 )
             return gathered, k
+        if isinstance(node, AnyOf):
+            # Take the first option this source set can satisfy; they describe the same rows.
+            for option in node.options:
+                if all(name in source_shapes for name in _names(option)):
+                    return walk(option)
+            raise _Unsupported()
         raise _Unsupported()  # Cast, DraftHeadTokenIds, unknown nodes
 
     try:
@@ -179,6 +203,9 @@ def collect_sources(node: Expression, out: set[str]) -> None:
             collect_sources(part, out)
     elif isinstance(node, GatherRows):
         collect_sources(node.source, out)
+    elif isinstance(node, AnyOf):
+        for option in node.options:
+            collect_sources(option, out)
 
 
 __all__ = [

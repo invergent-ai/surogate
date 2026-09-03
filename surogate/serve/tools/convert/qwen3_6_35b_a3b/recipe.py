@@ -6,6 +6,7 @@ from pathlib import Path
 
 from surogate.serve.tools.convert.common.safetensors import ShardReader
 from surogate.serve.tools.convert.common.recipe import (
+    AnyOf,
     Cast,
     Concat,
     DraftHeadTokenIds,
@@ -69,10 +70,27 @@ def _moe_recipes(source_prefix: str, object_prefix: str) -> tuple[TensorRecipe, 
         ),
         TensorRecipe(
             object_prefix + "routed_gate_up",
-            Reshape(
-                source(source_prefix + "experts.gate_up_proj", (256, 1024, 2048)),
-                (262144, 2048),
-            ),
+            # Two spellings of the same rows. An HF checkpoint fuses gate and up into one
+            # expert-major tensor; a GGUF of the same model keeps them as two stacked
+            # tensors, and concatenating those on the expert's output axis reproduces
+            # stored_row(e, p, r) = e*1024 + p*512 + r exactly -- so a GGUF's routed experts
+            # are a row gather over blocks, not something that has to be dequantised.
+            AnyOf((
+                Reshape(
+                    source(source_prefix + "experts.gate_up_proj", (256, 1024, 2048)),
+                    (262144, 2048),
+                ),
+                Reshape(
+                    Concat(
+                        (
+                            source(source_prefix + "experts.gate_proj", (256, 512, 2048)),
+                            source(source_prefix + "experts.up_proj", (256, 512, 2048)),
+                        ),
+                        1,
+                    ),
+                    (262144, 2048),
+                ),
+            )),
         ),
         TensorRecipe(
             object_prefix + "routed_down",
