@@ -230,7 +230,7 @@ std::optional<std::string> stated_chat_template(const Json& tokenizer_config) {
         "); the checkpoint does not say which template it serves");
 }
 
-void validate_tokenizer_config(const FrontendResources& resources) {
+void validate_tokenizer_config(const FrontendResources& resources, bool registered_tokenizer) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
     // These defaults encode a byte-level checkpoint's contract: it adds no BOS and
@@ -252,14 +252,18 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json does not match Qwen3.6 tokenizer prefix semantics");
     }
-    // The pad token must be stated, and for a byte-level checkpoint it must be the
-    // family's own: an artifact claiming a different one is not the model this
-    // target was built for. Its identity is not universal, though -- TinyLlama
-    // pads with </s> -- so what is asserted elsewhere is that one is declared.
+    // A pad token must be stated. Which one it is says nothing about the text the
+    // checkpoint tokenizes -- the frontend only resolves it to an id, and no path
+    // pads with it -- and it is not universal even within a family: TinyLlama pads
+    // with </s>, and unsloth's Qwen3 exports pick <|vision_pad|> where the official
+    // repository picks <|endoftext|>. So the literal is asserted only for a target
+    // that claims the registered checkpoint's own tokenizer, where a different pad
+    // means a different model; a target serving whatever a GGUF carries asserts
+    // only that one is declared.
     if (!tokenizer_config.contains("pad_token") || !tokenizer_config.at("pad_token").is_string()) {
         throw std::invalid_argument("tokenizer_config.json declares no pad token");
     }
-    if (!sentencepiece &&
+    if (registered_tokenizer && !sentencepiece &&
         tokenizer_config.at("pad_token").get<std::string>() != "<|endoftext|>") {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");
@@ -282,14 +286,15 @@ void validate_tokenizer_config(const FrontendResources& resources) {
 }
 
 fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
-                                               const std::string& override_template) {
+                                               const std::string& override_template,
+                                               bool registered_tokenizer) {
     if (!override_template.empty()) {
         // The artifact's template is cross-checked against its tokenizer_config;
         // an operator-supplied one cannot be, by definition. Compile it and let a
         // malformed template fail loudly here rather than mid-request.
         return fi::CompiledChatTemplate::resolve(override_template);
     }
-    validate_tokenizer_config(resources);
+    validate_tokenizer_config(resources, registered_tokenizer);
     // The artifact's own template may reference eos_token; the recognised ones
     // write their markers themselves and ignore it.
     const Json tokenizer_config =
@@ -713,7 +718,8 @@ DecoderState terminal_state(DecoderState state) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
-        : chat_template(compile_chat_template(resources, options.chat_template_override)),
+        : chat_template(compile_chat_template(resources, options.chat_template_override,
+                                          options.registered_tokenizer)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
@@ -1009,7 +1015,7 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
 void FrontendTestAccess::check_tokenizer_config(const FrontendResources& resources) {
     // Qualified: unqualified lookup from a member body finds the declaration in
     // the class before the file-local function, and would recurse.
-    sinfer::family::validate_tokenizer_config(resources);
+    sinfer::family::validate_tokenizer_config(resources, true);
 }
 
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
