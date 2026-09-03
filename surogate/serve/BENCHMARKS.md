@@ -108,6 +108,22 @@ dequantise-and-requantise — at 713 MB.
 | vLLM 0.27.1 | 1 | 8 | 10,496 | 1,768 | 12,264 | 0.56 s | surogate **1.6× decode, 1.4× prefill** |
 | llama.cpp | 1 | 8 | 3,721 | 683 | 4,404 | 1.53 s | surogate **4.1× decode and prefill, 4.1× latency** |
 
+**A routed MoE served natively (2026-09-03).** `models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
+(20.6 GiB, 34.66 B parameters, 256 experts of which 8 route) on one idle 5090, single stream,
+a 654-token prompt and 128 generated tokens, warm, greedy. surogate and llama.cpp read the same
+file; surogate's artifact carries the routed experts as the file's own Q4_K, Q5_K and Q6_K
+superblocks, 34.6 B of its 34.7 B parameters copied byte for byte.
+
+| engine | routed expert format | prefill tok/s | decode tok/s | comments |
+|---|---|---:|---:|---|
+| **surogate** | native K-quant | **9,400** | **328** | reads the GGUF's blocks unchanged |
+| llama.cpp | native K-quant | 8,408 | 278 | `llama-bench -ngl 99 -p 512 -n 128 -r 3`: pp512 8,407.89 ± 1,576.40, tg128 277.96 ± 3.65. surogate **1.18x decode, 1.12x prefill** |
+| surogate | dequantised to Q4G64/Q5G64 | 13,730 | 346 | the older path, kept as the ceiling this one is closing on; it re-quantises, so it is not bit-exact |
+
+The native path's remaining prefill gap to our own row-split kernel is the K-quant decode
+itself: a 64-wide tile spans two sub-block scales and carries an affine min, and Q6_K's
+210-byte block forces scalar staging where the others use `cp_async`.
+
 Isolated kernel rates on the same file, `llama-bench -p 512,2048 -n 128 -fa 1` against the
 engine's own accounting: prefill **97,062** vs 39,511 (pp512) and **107,604** vs 42,863
 (pp2048); decode **864** vs 809 (tg128). The concurrency gap is wider than the single-stream
