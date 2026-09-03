@@ -107,6 +107,13 @@ public:
                                                       std::string_view eos_token = {});
 
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
+
+    /// True when this template is reproduced by no hand-written renderer and must be
+    /// rendered from its own Jinja. The frontend hands this to the tokenizer so the
+    /// renderer is built exactly for the artifacts that need it.
+    [[nodiscard]] bool rendered_by_tokenizer() const noexcept {
+        return semantics_ == ChatTemplateSemantics::Jinja;
+    }
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
                                       ChatRenderOptions options = {}) const;
 

@@ -621,12 +621,12 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
 
 } // namespace
 
-namespace spm_delegate {
+namespace project_delegate {
 struct Handle {
     ::tokenizer::Tokenizer inner;
 };
 void destroy(Handle* handle) { delete handle; }
-} // namespace spm_delegate
+} // namespace project_delegate
 
 namespace {
 
@@ -704,48 +704,51 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     has_bpe_merges_         = true;
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
 
-    // A SentencePiece checkpoint is encoded by the project tokenizer, which
-    // implements that scheme. Everything above still applies: the vocabulary,
-    // the added tokens and the stop ids are the artifact's either way, and only
-    // the text-to-ids mapping differs.
-    if (describes_sentencepiece(root)) {
+    // The project tokenizer is built for two reasons that are independent of one
+    // another. A SentencePiece checkpoint is *encoded* by it, because it implements
+    // that scheme; any checkpoint whose template this family does not reproduce by
+    // hand is *rendered* by it, because it owns the Jinja renderer. Everything above
+    // still applies either way: the vocabulary, the added tokens and the stop ids are
+    // the artifact's, and only the text-to-ids mapping differs.
+    delegate_encodes_ = describes_sentencepiece(root);
+    if (delegate_encodes_ || resources.render_chat_template) {
         ::tokenizer::Tokenizer::Sources sources;
         sources.tokenizer_json        = std::string(resources.tokenizer_json);
         sources.tokenizer_config_json = std::string(resources.tokenizer_config_json);
         sources.chat_template_jinja   = std::string(resources.chat_template_jinja);
-        spm_.reset(new spm_delegate::Handle{::tokenizer::Tokenizer::from_sources(sources)});
+        delegate_.reset(new project_delegate::Handle{::tokenizer::Tokenizer::from_sources(sources)});
     }
 }
 
-bool Tokenizer::renders_chat_template() const noexcept { return spm_ != nullptr; }
+bool Tokenizer::renders_chat_template() const noexcept { return delegate_ != nullptr; }
 
 std::string Tokenizer::render_chat_template(
     const std::vector<std::pair<std::string, std::string>>& messages,
     bool add_generation_prompt) const {
-    if (!spm_) {
+    if (!delegate_) {
         throw std::logic_error("Tokenizer::render_chat_template: no template renderer for this "
                                "checkpoint");
     }
     std::vector<::tokenizer::ChatMessage> converted;
     converted.reserve(messages.size());
     for (const auto& [role, content] : messages) { converted.push_back({role, content}); }
-    return spm_->inner.apply_chat_template(converted, add_generation_prompt);
+    return delegate_->inner.apply_chat_template(converted, add_generation_prompt);
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
     if (text.empty()) { return {}; }
-    if (spm_) {
+    if (delegate_encodes_) {
         // The project tokenizer handles added tokens itself, so the option maps
         // onto which of its two entry points to call.
         const std::string owned(text);
         std::vector<int> ids = options.parse_added_tokens
-                                   ? spm_->inner.encode_with_special_tokens(owned)
-                                   : spm_->inner.encode_ordinary(owned);
+                                   ? delegate_->inner.encode_with_special_tokens(owned)
+                                   : delegate_->inner.encode_ordinary(owned);
         // Llama opens every sequence with its BOS. It comes from the
         // post-processor rather than the chat template, so nothing upstream has
         // added it, and a prompt without one is a prompt the model never saw.
-        if (options.parse_added_tokens && spm_->inner.adds_bos()) {
-            ids.insert(ids.begin(), spm_->inner.bos_token_id());
+        if (options.parse_added_tokens && delegate_->inner.adds_bos()) {
+            ids.insert(ids.begin(), delegate_->inner.bos_token_id());
         }
         return ids;
     }
@@ -797,7 +800,7 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
         (!ids.empty() && is_stop_token_id(options.stop_token_ids, ids.back())) ? ids.size() - 1
                                                                                : ids.size();
 
-    if (spm_) {
+    if (delegate_encodes_) {
         // Decoding is not per-token here: the word mark becomes a space only in
         // the finished string, so the ids are handed over whole.
         std::vector<std::int32_t> kept;
@@ -807,7 +810,7 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
             if (options.skip_special_tokens && is_special_token(ids[i])) { continue; }
             kept.push_back(ids[i]);
         }
-        text = spm_->inner.decode(kept);
+        text = delegate_->inner.decode(kept);
         (void)uni::utf8_codepoints(text, "Tokenizer::decode reconstructed output");
         return text;
     }
@@ -822,10 +825,10 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
 }
 
 std::string Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) const {
-    if (spm_) {
+    if (delegate_encodes_) {
         if (skip_special_tokens && is_special_token(id)) { return {}; }
         // One token, not a sequence: the leading space is this token's own.
-        return spm_->inner.decode(std::vector<std::int32_t>{id}, false);
+        return delegate_->inner.decode(std::vector<std::int32_t>{id}, false);
     }
     static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
 

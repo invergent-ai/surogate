@@ -35,21 +35,27 @@ struct TokenizerResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;
     std::string_view generation_config_json;
-    /// The chat template in force. The SentencePiece delegate renders it; a
+    /// The chat template in force. The delegate renders it; a
     /// standalone template takes precedence over tokenizer_config.json's copy,
     /// which is the HF convention the project tokenizer implements.
     std::string_view chat_template_jinja;
+    /// Set when the family reproduces no hand-written renderer for this template, so
+    /// the artifact's own Jinja is the only thing that can render it. Rendering is
+    /// independent of the encoding scheme: a BPE checkpoint carrying its own template
+    /// -- what every GGUF is -- needs the renderer just as a SentencePiece one does.
+    bool render_chat_template = false;
 };
 
-namespace spm_delegate {
+namespace project_delegate {
 /// Opaque holder for the project tokenizer (csrc/src/tokenizer), so this header
-/// does not drag its includes into every frontend translation unit.
+/// does not drag its includes into every frontend translation unit. It is a BPE
+/// tokenizer that also implements SentencePiece, and it owns the Jinja renderer.
 struct Handle;
 void destroy(Handle* handle);
 struct Deleter {
     void operator()(Handle* handle) const { destroy(handle); }
 };
-} // namespace spm_delegate
+} // namespace project_delegate
 
 class Tokenizer {
 public:
@@ -67,7 +73,8 @@ public:
     }
 
     /// True when this checkpoint's chat template is rendered by the project
-    /// tokenizer rather than reproduced by the family's hand-written ChatML.
+    /// tokenizer from the artifact's own Jinja, rather than reproduced by the
+    /// family's hand-written ChatML.
     [[nodiscard]] bool renders_chat_template() const noexcept;
     /// Renders the artifact's own Jinja template. Messages are (role, content).
     [[nodiscard]] std::string render_chat_template(
@@ -92,7 +99,10 @@ private:
     /// byte-level path above cannot represent. Encode and decode delegate to it;
     /// everything else -- the vocabulary, the added tokens, the stop ids -- is
     /// still read here, because the artifact contract is the same either way.
-    std::unique_ptr<spm_delegate::Handle, spm_delegate::Deleter> spm_;
+    std::unique_ptr<project_delegate::Handle, project_delegate::Deleter> delegate_;
+    /// The delegate always renders when present; it encodes only for SentencePiece,
+    /// so a BPE checkpoint keeps the encoder above and gains nothing but the renderer.
+    bool delegate_encodes_ = false;
 };
 
 } // namespace sinfer::family::frontend_internal

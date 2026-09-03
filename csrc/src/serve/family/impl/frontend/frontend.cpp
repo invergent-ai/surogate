@@ -728,7 +728,11 @@ public:
                                      .chat_template_jinja =
                                          options.chat_template_override.empty()
                                              ? resources.chat_template_jinja
-                                             : std::string_view(options.chat_template_override)})),
+                                             : std::string_view(options.chat_template_override),
+                                             // The renderer is independent of the encoding scheme:
+                                             // build it exactly when this frontend has no hand-written
+                                             // reproduction of the template to fall back on.
+                                             .render_chat_template = chat_template.rendered_by_tokenizer()})),
           processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
