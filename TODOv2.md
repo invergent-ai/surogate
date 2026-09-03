@@ -70,7 +70,7 @@ stored once.
    against 14,300 at 8k, same session, three prompts each. `SUROGATE_SERVE_MOE_INT8=0`
    keeps the BF16-activation kernels. The kernel's design is in the progress log
    (2026-09-03); what the eleven earlier variants taught is under Traps.
-2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, and `surogate quantize` in their place.**
+2. **[~] K6 — retire Q4G64/Q5G64/Q6G64, and `surogate quantize` in their place.**
    The converters stop quantising and the three home-grown formats leave the
    engine with them, roughly 140 references. What replaces them for a model we
    trained is `surogate quantize`, which is item 11 and deferred: a thin version
@@ -81,6 +81,13 @@ stored once.
    prefill only against the BF16-activation kernel, and with the int8 route it
    measures 13,195 tok/s against the row-split path's 13,700 from an earlier
    pass, so one same-session comparison settles it. Decode is unaffected.
+   **What the deletion would strand, checked 2026-09-03.** One live path still
+   produces these formats: the 27B's `Qwen36GroupwiseInt` profile, whose
+   endpoints bind `Q6G64_F16S` and whose layers bind `Q4G64_F16S`. Nothing else
+   selects them -- the other targets import the names and use `W8G32_F16S` or
+   NVFP4. So the deletion is one target's safetensors profile, not five, and it
+   is a decision rather than an open task: it costs the 27B its groupwise-int
+   route until `surogate quantize` (item 11) is a product.
 3. **[x] GGUF coverage beyond the Qwen3.5/3.6 families (2026-09-03).** A GGUF is servable only
    if `gguf_target_key` resolves it, and until today that was four Qwen shapes.
    Qwen3 now resolves and serves (a `Qwen3-0.6B` Q4_K_M converts, caches and
@@ -176,8 +183,10 @@ stored once.
    `inventory.py` per target restate what the trainer's `hf_mapping` DSL already
    declares (`fuse`, `split`, `stack_experts`); the trainer's
    `SafeTensorsReader` is the better reader (multi-shard, GDS, strided).
-8. **[ ] K5c — fused K-quant GDN projection-and-convolution.** Built, measured,
-   left off: costs more in kernel launches than it saves in bandwidth.
+8. **[x] K5c — fused K-quant GDN projection-and-convolution: closed, negative
+   (2026-09-03).** Built and measured; it costs more in kernel launches than it
+   saves in bandwidth, so it was left off and the code is not in the tree. A
+   result, not a task: reopening it needs a reason the measurement did not have.
 9. **[x] Drift to fix (2026-09-03).** The MTP block's five matrices demanded
    `W8G32_F16S`, so a GGUF keeping its nextn tensors was refused; nothing in the
    kernels wanted that, since they dispatch on the weight's qtype. They bind
