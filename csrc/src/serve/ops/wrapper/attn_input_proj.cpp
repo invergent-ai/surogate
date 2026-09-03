@@ -338,6 +338,21 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     // dispatch above is: 6144 = q4096 | k1024 | v1024 over hidden 2048 (the
     // Qwen3.6 companion), and 4096 = q2048 | k1024 | v1024 over hidden 1024
     // (Qwen3-0.6B, 16 query heads and 8 KV heads at head dim 128).
+    if (detail::ggml::is_ggml_qtype(query_key_value_weight.qtype)) {
+        // A K-quant parent splits by row range straight into the three outputs, in physical
+        // row order query, key, value. Any width, k a multiple of 256 -- the same generic
+        // route the gated parent above takes, and the reason a GGUF of any size of a family
+        // needs no registered attention shape here.
+        const std::int32_t rows_q = q.ne[0], rows_k = k.ne[0], rows_v = v.ne[0];
+        if (rows_q + rows_k + rows_v != query_key_value_weight.n) {
+            throw std::invalid_argument("attn_input_proj: K-quant parent rows must equal q+k+v");
+        }
+        detail::ggml::ggml_project_rows(x, query_key_value_weight, 0, q, nullptr, stream);
+        detail::ggml::ggml_project_rows(x, query_key_value_weight, rows_q, k, nullptr, stream);
+        detail::ggml::ggml_project_rows(x, query_key_value_weight, rows_q + rows_k, v, nullptr,
+                                        stream);
+        return;
+    }
     const std::int32_t kRows   = query_key_value_weight.n;
     const std::int32_t kHidden = query_key_value_weight.k;
     const std::int32_t cols    = x.ne[1];
