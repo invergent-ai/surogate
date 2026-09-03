@@ -47,12 +47,12 @@ stored once.
 
 ## Roadmap
 
-1. **[~] Close the native prefill gap — localised to one thing, not yet closed.**
-   It is *not* the K-quant decode (67 µs of 150). It is staging the superblock
-   header: 198 µs, and without it this kernel beats the row-split one by 19 %.
-   Four rearrangements measured, all worse, each losing a block per SM. The
-   next thing to try is `kExpertBM = 32`, which fits every header resident
-   inside the 3-blocks-per-SM budget. See *The prefill gap, decomposed*.
+1. **[~] Close the native prefill gap — this kernel is at its floor; a different
+   one is needed.** Eleven variants measured. The decode is compute-bound and
+   its per-value structure is the format's: two sub-block scales and an affine
+   min per 64-wide tile. The way through is an int8 tensor-core path where the
+   min is free and the MMA runs at twice the rate — an owner call, because it
+   sets prefill activations to int8-per-32. See *The prefill gap, decomposed*.
 2. **[ ] K6 — retire Q4G64/Q5G64/Q6G64, add `surogate quantize`.** Converters
    stop emitting the home-grown formats; `surogate quantize` writes a BF16 GGUF
    and calls `llama-quantize` (built at `study/llama.cpp-master/build/bin`).
@@ -93,58 +93,59 @@ the same model. Per prefill round, `nsys`:
 | down **Q5_K** ×37 | 335 µs | 505 µs | 1.51× | +6.3 ms, 46 % |
 | down **Q6_K** ×3 | 337 µs | 725 µs | 2.15× | +1.2 ms, 9 % |
 
-That accounts for the whole of it. **It is not a Q6_K problem** — Q6_K has the
-worst ratio, being the one whose 210-byte block cannot `cp_async` and stages in
-scalar pairs, but it is `routed_down` on 3 of 40 layers here. Q4_K and Q5_K
-carry nine tenths of the gap between them, and the cause below is common to
-every K-quant. Decode is unaffected: 317 against 346, and ahead of llama.cpp.
+**It is not a Q6_K problem** — Q6_K has the worst ratio but is `routed_down` on
+3 of 40 layers; Q4_K and Q5_K carry nine tenths of the gap. Decode is
+unaffected: 317 against 346, and ahead of llama.cpp.
 
-Measurement note: end-to-end prefill on the same binary spreads about 10 %
-run to run (10,000–11,100), so the arrangements below are separated on kernel
-time from `nsys`, which is stable, not on the end-to-end figure. Cutting the gate_up kernel apart, one piece
-at a time, says where it goes:
+**The kernel is compute-bound, and every staging rearrangement was aimed at
+the wrong constraint.** Cutting the gate_up kernel apart:
 
 | gate_up variant | ns |
 |---|---:|
-| real | 757,996 |
+| real | 758,000 |
 | scale dropped, raw codes fed to the MMA | 691,362 |
-| **and the header no longer staged** | **493,066** |
+| and the header no longer staged | 493,066 |
 | decode gone entirely | 470,716 |
+| **header fully resident, decode real** | **780,788** |
 | *row-split, real* | *607,736* |
 
-Read the third row against the last. **Without its header staging this kernel
-beats the row-split one by 19 %** — 493 against 608. The K-quant decode is not
-the problem: the whole scale computation, affine min and all, is 67 µs. The
-problem is that a Q4_K block puts a 16-byte header in front of 128 bytes of
-codes, and the two are wanted at different cadences — the header once per
-superblock, the codes once per 64-wide tile. Staging it costs **198 µs**.
+The third row read against the last looked like a 198 µs header-staging cost.
+It is not: the fifth row — headers staged once and never again, with the real
+decode — is no faster than the real kernel. In a pipelined kernel the critical
+path is max(compute, memory), not the sum. At the real kernel, compute is the
+bound and header staging hides beneath it; removing the decode exposed the
+memory path, and *then* the header showed. Both kernels run 3 blocks/SM,
+registers 80 vs 70 (`cuobjdump -res-usage`).
 
-Both kernels run **3 blocks/SM** with near-identical registers (80 vs 70),
-from `cuobjdump -res-usage` — occupancy is not in it, at least not as things
-stand. It becomes the binding constraint the moment you try to fix the header,
-which is why every rearrangement below loses:
+So the decode's compute is what to cut, and its structure resists it. A row-split
+group is 64 values with one scale, so that kernel feeds the MMA raw integer codes
+and scales the accumulator once per row in the epilogue. A K-quant's 64-wide
+tile spans two sub-block scales and carries an affine min that depends on the
+activation sum, so it must dequantise per value — and the per-value work is
+what costs, not the scale unpack: an exact table of each superblock's (d·sc,
+dmin·m) built once and read for four tiles is bit-identical to HEAD and no
+faster. Moving the scale to the epilogue with two half-tile partials and a
+column-sum for the min was costed at *more* fmas than the per-value decode,
+because the accumulator has sixteen elements a thread and the affine term is an
+outer product over them.
 
-| arrangement | prefill tok/s |
-|---|---:|
-| **staged per superblock, double-buffered (today)** | **11,100** |
-| every superblock's header staged once in the prologue | 10,300 |
-| whole 144-byte block staged once per superblock | 10,400 |
-| header read from the file in `decode_weight` | 8,800 |
-| two superblocks' headers per staging event | gate_up 770,442 ns (worse) |
-| a quarter of the next superblock's headers on every tile | **races** — block *g+2* shares a slot with *g*, which is still being read; three slots is 2 blocks/SM |
+Measurement note: end-to-end prefill spreads ~10 % run to run (10,000–11,100),
+so arrangements are separated on `nsys` kernel time, which is stable.
 
-Each alternative trades shared memory for occupancy — 30 KB and 3 blocks
-becomes 36–43 KB and 2 — and loses more than the header staging costs. Two
-probes rule out the obvious explanations for the 198 µs: giving every row the
-*same* header address keeps the instruction count and perfect locality, and is
-**slower still** (895,189 ns — 64 async copies from one line serialise), so it
-is neither purely instruction count nor purely stride.
+**What would actually change it — a different kernel, not this one tuned:**
 
-**Where the win is, for whoever takes it next.** Get all 8 KB of a row block's
-headers resident while staying at 3 blocks per SM. The budget is 33.3 KB and
-the kernel is at 30, so 3.3 KB short of the 8 needed. `As` (8 KB), `Bs`
-(16 KB) and `Cr` (4 KB) are all load-bearing at `kExpertBM = 64`; halving the
-row tile to 32 would fit it at 26 KB, and that is the change worth trying.
+- **An int8 tensor-core path** (llama.cpp's MMQ design, our implementation).
+  Activations quantised to int8 per 32 with block sums — the `q8_1` machinery
+  `ggml_q8_1.cu` already has for mmvq. Weights unpack nibble → int8 with no
+  float math. `mma.sync` s8×s8→s32 at twice bf16's rate; `As` and `Bs` halve.
+  The affine min becomes free: `dmin·m × (activation block sum)` in the
+  epilogue, exactly as mmvq folds it. Estimated 450–500 µs against the
+  row-split's 608, from a ~470 µs compute floor with the MMA halved. Cost:
+  prefill activations at int8-per-32 rather than BF16 — the precision llama.cpp
+  runs everywhere, so "matches llama.cpp" holds, but prefill would no longer be
+  *more* precise than it. A new kernel family, not a patch: two to three days.
+- **`kExpertBM = 32`** to fit every header resident at 3 blocks/SM is now known
+  to be pointless — residency was measured at 780,788.
 
 ---
 
