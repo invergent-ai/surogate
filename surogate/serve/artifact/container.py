@@ -21,9 +21,11 @@ RAW_BYTES_V1 = "raw-bytes-v1"
 
 _ROOT_MEMBERS = frozenset({"identity", "objects"})
 #: Root members an artifact may carry beyond the two it must: the external file table of an
-#: index that reads a GGUF in place, and the model's dimensions as a flat object of numbers
-#: (`geometry`), which lets one engine target serve every size of its family.
-_ROOT_OPTIONAL = frozenset({"external", "geometry"})
+#: index that reads a GGUF in place, and the model's dimensions as flat objects of numbers,
+#: which let one engine target serve every size of its family. The tower a checkpoint ships is
+#: its own size, independent of the text stack's, so it is declared separately rather than
+#: folded into `geometry` where two members would collide on names like `layers` and `hidden`.
+_ROOT_OPTIONAL = frozenset({"external", "geometry", "vision_geometry"})
 _IDENTITY_MEMBERS = frozenset({"model_id", "weights_id"})
 _TENSOR_MEMBERS = frozenset(
     {"name", "kind", "shape", "format", "layout", "offset", "bytes"}
@@ -236,6 +238,7 @@ def encode_directory(
     objects: Sequence[ArtifactObject],
     external: Sequence[tuple[str, int]] = (),
     geometry: Mapping[str, float] | None = None,
+    vision_geometry: Mapping[str, float] | None = None,
 ) -> bytes:
     checked_identity = _require_identity(identity)
     if not objects:
@@ -260,6 +263,10 @@ def encode_directory(
         ]
     if geometry:
         value["geometry"] = {str(k): _require_number(v, f"geometry.{k}") for k, v in geometry.items()}
+    if vision_geometry:
+        value["vision_geometry"] = {
+            str(k): _require_number(v, f"vision_geometry.{k}") for k, v in vision_geometry.items()
+        }
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
@@ -269,15 +276,24 @@ def _require_number(value: object, field: str) -> float | int:
     return value
 
 
-def parse_geometry(directory: bytes) -> dict[str, float]:
-    """The `geometry` member of an encoded directory, or an empty mapping."""
+def _parse_geometry_member(directory: bytes, member: str) -> dict[str, float]:
     value = json.loads(directory.decode("utf-8"))
-    raw = value.get("geometry") if isinstance(value, dict) else None
+    raw = value.get(member) if isinstance(value, dict) else None
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        raise ArtifactError("geometry must be an object")
-    return {str(k): _require_number(v, f"geometry.{k}") for k, v in raw.items()}
+        raise ArtifactError(f"{member} must be an object")
+    return {str(k): _require_number(v, f"{member}.{k}") for k, v in raw.items()}
+
+
+def parse_geometry(directory: bytes) -> dict[str, float]:
+    """The `geometry` member of an encoded directory, or an empty mapping."""
+    return _parse_geometry_member(directory, "geometry")
+
+
+def parse_vision_geometry(directory: bytes) -> dict[str, float]:
+    """The `vision_geometry` member of an encoded directory, or an empty mapping."""
+    return _parse_geometry_member(directory, "vision_geometry")
 
 
 def _parse_object(value: object) -> ArtifactObject:
@@ -403,6 +419,7 @@ class Artifact:
                 raise ArtifactError("artifact JSON is truncated")
             self.identity, self.objects = parse_directory(directory)
             self.geometry = parse_geometry(directory)
+            self.vision_geometry = parse_vision_geometry(directory)
             payload_bytes = self.file_bytes - self.payload_offset
             self._index = _validate_ranges(self.objects, payload_bytes)
             self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
@@ -461,13 +478,17 @@ class ArtifactWriter:
         specs: Sequence[ObjectSpec],
         external: Sequence[tuple[str, int]] = (),
         geometry: Mapping[str, float] | None = None,
+        vision_geometry: Mapping[str, float] | None = None,
     ):
         self.path = Path(path)
         self.identity = _require_identity(identity)
         self.objects = plan_objects(specs)
         self.external = tuple((str(p), int(n)) for p, n in external)
         self.geometry = dict(geometry) if geometry else {}
-        directory = encode_directory(self.identity, self.objects, self.external, geometry=self.geometry)
+        self.vision_geometry = dict(vision_geometry) if vision_geometry else {}
+        directory = encode_directory(self.identity, self.objects, self.external,
+                                     geometry=self.geometry,
+                                     vision_geometry=self.vision_geometry)
         self.payload_offset = align_up(PREFIX_BYTES + len(directory), PAYLOAD_ALIGNMENT)
         self._file = self.path.open("wb")
         self._file.write(PREFIX.pack(MAGIC, len(directory)))

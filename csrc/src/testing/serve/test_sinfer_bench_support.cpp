@@ -224,7 +224,7 @@ qb::BenchEnvironment sample_environment() {
     env.device_id                         = 0;
     env.artifact_path                     = "model.sinfer";
     env.artifact_file_size_bytes          = 17500000000ULL;
-    env.load                              = {.target               = "qwen3_6_27b",
+    env.load                              = {.target               = "qwen3_6",
                                              .weights_id           = "groupwise-int",
                                              .load_seconds         = 2.5,
                                              .upload_seconds       = 2.0,
@@ -273,7 +273,7 @@ int test_report_contract() {
     failures += expect(report.at("schema_version") == 11, "report schema v11");
     failures += expect(report.at("artifact_type") == "sinfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.sinfer", "artifact path");
-    failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
+    failures += expect(report.at("load").at("target") == "qwen3_6", "load target");
     failures += expect(report.at("load").at("weights_id") == "groupwise-int", "load weights id");
     failures +=
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
@@ -329,7 +329,7 @@ int test_human_and_csv_reports() {
     const qb::BenchEnvironment env = sample_environment();
     const auto results             = sample_results();
     const std::string table        = qb::format_table(env, results);
-    failures += expect(table.find("qwen3_6_27b") != std::string::npos, "table target");
+    failures += expect(table.find("qwen3_6") != std::string::npos, "table target");
     failures += expect(table.find("groupwise-int") != std::string::npos, "table weights id");
     failures += expect(table.find("model.sinfer") != std::string::npos, "table artifact");
     failures +=

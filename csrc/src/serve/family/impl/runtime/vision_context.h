@@ -6,11 +6,12 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include <api/family/text_geometry.h>
 #include <api/family/vision_control.h>
+#include <api/family/vision_geometry.h>
 #include "runtime/contract/transient_region.h"
 #include "family/impl/runtime/vision_prefill.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -24,30 +25,39 @@ struct VisionItemView {
     const family::VisionItemControl* control = nullptr;
 };
 
-struct VisionScheduleConfig {
-    static constexpr int layers              = VisionConfig::layers;
-    static constexpr int hidden              = VisionConfig::hidden;
-    static constexpr int intermediate        = VisionConfig::intermediate;
-    static constexpr int out_hidden          = VisionConfig::output_hidden;
-    static constexpr int heads               = VisionConfig::heads;
-    static constexpr int head_dim            = VisionConfig::head_dim;
-    static constexpr int patch_dim           = VisionConfig::patch_dim;
-    static constexpr int merge_unit          = VisionConfig::merge_unit;
-    static constexpr int merger_hidden       = VisionConfig::merger_hidden;
-    static constexpr int position_embeddings = VisionConfig::position_embeddings;
-    static constexpr int rotary_dim          = VisionConfig::rotary_dim;
-    static constexpr float rope_theta        = VisionConfig::rope_theta;
-    static constexpr float norm_eps          = VisionConfig::norm_epsilon;
-};
+/// The tower this target compiles, as a value. The schedule reads every dimension from a
+/// `VisionGeometry` it is handed rather than from `VisionConfig`, so a context sizes its buffers
+/// from the tower the weights carry; this is the fallback for a caller that has no weights yet.
+[[nodiscard]] inline family::VisionGeometry compiled_vision_geometry() {
+    return family::VisionGeometry::compiled<VisionConfig>();
+}
+
+/// A tower as the schedule must run it. `output_hidden` is the width the merger projects into,
+/// and that is the text model's hidden state -- merged visual tokens join the residual stream --
+/// so it is taken from the text geometry rather than from the tower's own config. Only the text
+/// side knows that width at the checkpoint's size, and the family's shared tower config cannot
+/// name it at all; leaving it compiled while the text hidden moved is a mismatch the merger's
+/// last GEMM finds, and only there.
+[[nodiscard]] inline family::VisionGeometry
+bound_vision_geometry(const family::VisionGeometry& tower, const family::TextGeometry& text) {
+    family::VisionGeometry geometry = tower;
+    geometry.output_hidden          = text.hidden;
+    return geometry;
+}
 
 class VisionContext {
 public:
     VisionContext(DeviceContext& device, const LoadedModelData& model);
 
-    [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
-    [[nodiscard]] static std::size_t workspace_bytes(const family::VisionItemControl& item);
-    [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
+    [[nodiscard]] static std::size_t output_transient_bytes(const family::VisionGeometry& geometry,
+                                                            std::size_t merged_tokens);
+    [[nodiscard]] static std::size_t workspace_bytes(const family::VisionGeometry& geometry,
+                                                     const family::VisionItemControl& item);
+    [[nodiscard]] static std::size_t workspace_capacity_bytes(const family::VisionGeometry& geometry,
+                                                              std::uint32_t max_merged_tokens,
                                                               std::uint32_t max_segments);
+    /// The tower this context encodes with.
+    [[nodiscard]] const family::VisionGeometry& geometry() const noexcept { return cfg_; }
     void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
 
 private:
@@ -76,10 +86,13 @@ private:
     };
 
     DeviceContext& ctx_;
+    family::VisionGeometry cfg_{};
     const Weight* patch_embed_      = nullptr;
     const Tensor* patch_embed_bias_ = nullptr;
     const Tensor* position_embed_   = nullptr;
-    std::array<BlockW, VisionScheduleConfig::layers> blocks_{};
+    /// Sized from the bound weights rather than by the type: two checkpoints of one family
+    /// ship towers of different depths.
+    std::vector<BlockW> blocks_;
     MergerW merger_{};
 };
 

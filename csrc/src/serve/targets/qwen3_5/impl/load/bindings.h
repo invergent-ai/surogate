@@ -58,9 +58,17 @@ struct FullAttentionPlan {
 // tensor, and a K-quant export may quantise them differently (Q5_K and Q4_K in the files on
 // hand), so they cannot share an object. Row order in the fused parent is q|k|v then z, which
 // is exactly this boundary.
-struct SplitGdnInputProjectionPlan {
+struct QkvPlusZGdnInputProjectionPlan {
     WeightPlan query_key_value;
     WeightPlan z;
+};
+
+// The halves the 27B-class groupwise export splits this parent into: query|key in one object
+// and value|z in another, so the two can carry different group-wise types. The boundary falls
+// one component earlier than the K-quant split above.
+struct QkPlusVzGdnInputProjectionPlan {
+    WeightPlan query_key;
+    WeightPlan value_z;
 };
 
 struct FusedGdnInputProjectionPlan {
@@ -84,7 +92,9 @@ struct GdnPlan {
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
     GdnControlProjectionPlan control_projection;
-    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
+    std::variant<QkvPlusZGdnInputProjectionPlan, QkPlusVzGdnInputProjectionPlan,
+                 FusedGdnInputProjectionPlan>
+        input_projection;
     artifact::ObjectHandle norm;
     WeightPlan output;
 };
@@ -136,8 +146,7 @@ struct BindingPlan {
     WeightPlan output_head;
     artifact::LinearBinding draft_head; // format read from the artifact
     artifact::ObjectHandle draft_head_token_ids;
-    // surogate vendor patch (PATCHES.md #15): artifacts from MTP-less GGUF
-    // exports omit the mtp/* objects; speculation requires has_mtp.
+    /// An MTP-less GGUF export omits the mtp/* objects; speculation needs them.
     bool has_mtp = false;
     MtpPlan mtp;
 
@@ -173,9 +182,14 @@ struct FusedAttentionProjectionPayload {
 using FullAttentionProjectionPayload =
     std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload>;
 
-struct SplitGdnInputProjectionPayload {
+struct QkvPlusZGdnInputProjectionPayload {
     Weight query_key_value;
     Weight z;
+};
+
+struct QkPlusVzGdnInputProjectionPayload {
+    Weight query_key;
+    Weight value_z;
 };
 
 struct FusedGdnInputProjectionPayload {
@@ -183,7 +197,8 @@ struct FusedGdnInputProjectionPayload {
 };
 
 using GdnInputProjectionPayload =
-    std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload>;
+    std::variant<QkvPlusZGdnInputProjectionPayload, QkPlusVzGdnInputProjectionPayload,
+                 FusedGdnInputProjectionPayload>;
 
 struct SplitGdnControlProjectionPayload {
     Weight a_projection;

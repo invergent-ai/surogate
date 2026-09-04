@@ -199,6 +199,9 @@ public:
     /// The artifact's declared dimensions, keyed as `family::TextGeometry` names them; empty
     /// for an artifact written without a `geometry` member.
     const std::map<std::string, double>& geometry() const noexcept;
+    /// The declared dimensions of the artifact's vision tower, keyed as `family::VisionGeometry`
+    /// names them; empty for a text-only artifact and for one written before the member existed.
+    const std::map<std::string, double>& vision_geometry() const noexcept;
     std::size_t read_direct(std::uint32_t source, std::uint64_t absolute_offset,
                             std::span<std::byte> destination) const;
 

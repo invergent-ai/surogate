@@ -1,7 +1,7 @@
 #include "runtime/contract/sampling.h"
 
-#include <api/targets/qwen3_6_27b/package.h>
-#include <api/targets/qwen3_6_35b_a3b/package.h>
+#include <api/targets/qwen3_5/package.h>
+#include <api/targets/qwen3_5_moe/package.h>
 
 #include <cmath>
 #include <iostream>
@@ -40,8 +40,8 @@ bool throws_runtime(const auto& operation) {
 } // namespace
 
 int main() {
-    using Dense27 = sinfer::targets::qwen3_6_27b::Package;
-    using Moe35   = sinfer::targets::qwen3_6_35b_a3b::Package;
+    using Dense27 = sinfer::targets::qwen3_5::Package;
+    using Moe35   = sinfer::targets::qwen3_5_moe::Package;
 
     int failures = 0;
 

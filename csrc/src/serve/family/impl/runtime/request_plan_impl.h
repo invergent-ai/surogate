@@ -143,6 +143,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     if (prompt.has_media()) {
         auto control =
             std::make_shared<family::VisionControl>(family::build_vision_control(prompt));
+        // The tower these weights carry, which is what the encode will actually run.
+        const family::VisionGeometry vision =
+            schedule::bound_vision_geometry(model.vision_geometry, model.geometry);
         std::size_t max_merged     = 0;
         std::uint32_t previous_end = 0;
         for (const family::VisionItemControl& item : control->items) {
@@ -160,13 +163,14 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             if (end > base->summary.prompt_tokens) {
                 throw std::invalid_argument("vision item consumer span exceeds prompt");
             }
-            if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
+            if (schedule::VisionContext::workspace_bytes(vision, item) > work.capacity()) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
             previous_end = end;
             max_merged   = std::max(max_merged, item.merged_count);
         }
-        base->vision_transient_bytes = schedule::VisionContext::output_transient_bytes(max_merged);
+        base->vision_transient_bytes =
+            schedule::VisionContext::output_transient_bytes(vision, max_merged);
         base->vision_control         = std::move(control);
     }
 

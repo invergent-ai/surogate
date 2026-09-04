@@ -26,9 +26,14 @@ from surogate.serve.artifact.container import (
     plan_objects,
 )
 from surogate.serve.artifact.layouts import align_up
-from surogate.serve.convert.qwen3_6_27b import inventory as inventory_27b
-from surogate.serve.convert.qwen3_6_35b_a3b import inventory as inventory_35b
+from surogate.serve.convert.qwen3_5 import inventory as family_inventory
+from surogate.serve.convert.qwen3_5_moe import inventory as inventory_35b
 
+
+#: The published v1 27B artifact, whose object list the family converter now builds for
+#: whichever checkpoint it is given.
+_INVENTORY_27B = family_inventory.export_inventory(
+    family_inventory.GROUPWISE_INT, family_inventory.GEOMETRY_27B)
 
 V1_MAGIC = b"NINFER\x00\x01"
 BACKUP_SUFFIX = ".v1-metadata-backup"
@@ -53,11 +58,11 @@ class PublishedV1Artifact:
 
 PUBLISHED_V1_ARTIFACTS = (
     PublishedV1Artifact(
-        model_id=inventory_27b.MODEL_ID,
-        weights_id=inventory_27b.WEIGHTS_ID,
+        model_id=_INVENTORY_27B.MODEL_ID,
+        weights_id=_INVENTORY_27B.WEIGHTS_ID,
         sha256="74fac75f3a6b7ab7b52e08c36969c7a33a8ba23465910eccd72d195adb497127",
         directory_sha256="df352a3e3b8555f15fd00d143be213b9e5ff6fb910a1c2390f0785f9a1e2d386",
-        inventory=inventory_27b.OBJECT_SPECS,
+        inventory=_INVENTORY_27B.OBJECT_SPECS,
     ),
     PublishedV1Artifact(
         model_id=inventory_35b.MODEL_ID,

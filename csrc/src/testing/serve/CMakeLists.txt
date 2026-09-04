@@ -131,10 +131,10 @@ target_include_directories(sinfer_family_tokenizer_config_test PRIVATE
 sinfer_add_test(sinfer_family_runtime_mechanisms_test
   SOURCES family/test_runtime_mechanisms.cpp
   LIBRARIES sinfer_engine sinfer_core)
-sinfer_add_test(sinfer_qwen3_6_27b_prefix_real_test
-  SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
+sinfer_add_test(sinfer_qwen3_5_prefix_real_test
+  SOURCES targets/qwen3_5/test_engine_prefix_real.cpp
   LIBRARIES sinfer_engine)
-set_tests_properties(sinfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(sinfer_qwen3_5_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
 # surogate: 4B prefix/rewrite-checkpoint exercise, run in both checkpoint
 # modes — the "defer" registration is the gate for defaulting
 # SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT on (PATCHES.md #24).
@@ -145,38 +145,38 @@ sinfer_add_test(sinfer_w8_quant_planes_test
   LIBRARIES sinfer_ops)
 set_tests_properties(sinfer_w8_quant_planes_test PROPERTIES SKIP_RETURN_CODE 77)
 sinfer_add_test(sinfer_qwen3_5_4b_prefix_real_test
-  SOURCES targets/qwen3_5_4b/test_engine_prefix_real.cpp
+  SOURCES targets/qwen3_5/test_engine_prefix_real_4b.cpp
   LIBRARIES sinfer_engine)
 set_tests_properties(sinfer_qwen3_5_4b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME sinfer_qwen3_5_4b_prefix_defer_test
   COMMAND sinfer_qwen3_5_4b_prefix_real_test defer)
 set_tests_properties(sinfer_qwen3_5_4b_prefix_defer_test PROPERTIES SKIP_RETURN_CODE 77)
-sinfer_add_test(sinfer_qwen3_6_27b_load_plan_test
-  SOURCES targets/qwen3_6_27b/test_load_plan.cpp
+sinfer_add_test(sinfer_qwen3_5_load_plan_test
+  SOURCES targets/qwen3_5/test_load_plan.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_engine)
-target_include_directories(sinfer_qwen3_6_27b_load_plan_test PRIVATE
+target_include_directories(sinfer_qwen3_5_load_plan_test PRIVATE
   ${SERVE_ROOT}/family/export
-  ${SERVE_ROOT}/targets/qwen3_6_27b/export)
-target_link_libraries(sinfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
-set_tests_properties(sinfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
-sinfer_add_test(sinfer_qwen3_6_35b_a3b_real_test
-  SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
+  ${SERVE_ROOT}/targets/qwen3_5/export)
+target_link_libraries(sinfer_qwen3_5_load_plan_test PRIVATE CUDA::cudart)
+set_tests_properties(sinfer_qwen3_5_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+sinfer_add_test(sinfer_qwen3_5_moe_real_test
+  SOURCES targets/qwen3_5_moe/test_engine_real.cpp
   LIBRARIES sinfer_engine)
-set_tests_properties(sinfer_qwen3_6_35b_a3b_real_test PROPERTIES SKIP_RETURN_CODE 77)
-sinfer_add_test(sinfer_qwen3_6_35b_a3b_dflash_real_test
-  SOURCES targets/qwen3_6_35b_a3b/test_engine_dflash_real.cpp
+set_tests_properties(sinfer_qwen3_5_moe_real_test PROPERTIES SKIP_RETURN_CODE 77)
+sinfer_add_test(sinfer_qwen3_5_moe_dflash_real_test
+  SOURCES targets/qwen3_5_moe/test_engine_dflash_real.cpp
   LIBRARIES sinfer_engine)
-set_tests_properties(sinfer_qwen3_6_35b_a3b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
-sinfer_add_test(sinfer_qwen3_6_35b_a3b_dflash_load_plan_test
-  SOURCES targets/qwen3_6_35b_a3b/test_dflash_load_plan.cpp
+set_tests_properties(sinfer_qwen3_5_moe_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
+sinfer_add_test(sinfer_qwen3_5_moe_dflash_load_plan_test
+  SOURCES targets/qwen3_5_moe/test_dflash_load_plan.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_engine)
-target_include_directories(sinfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE
+target_include_directories(sinfer_qwen3_5_moe_dflash_load_plan_test PRIVATE
   ${SERVE_ROOT}/family/export
-  ${SERVE_ROOT}/targets/qwen3_6_35b_a3b/export)
-target_link_libraries(sinfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE CUDA::cudart)
-set_tests_properties(sinfer_qwen3_6_35b_a3b_dflash_load_plan_test
+  ${SERVE_ROOT}/targets/qwen3_5_moe/export)
+target_link_libraries(sinfer_qwen3_5_moe_dflash_load_plan_test PRIVATE CUDA::cudart)
+set_tests_properties(sinfer_qwen3_5_moe_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 # Product protocol contracts.
@@ -211,10 +211,10 @@ target_include_directories(sinfer_http_error_handler_test PRIVATE
   ${SUROGATE_VENDOR_DIR}/cpp-httplib)
 sinfer_add_test(sinfer_bench_support_test
   SOURCES test_sinfer_bench_support.cpp
-          ${CMAKE_CURRENT_SOURCE_DIR}/bench/targets/qwen3_6_27b/sinfer_bench_support.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/bench/targets/qwen3_5/sinfer_bench_support.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_engine)
-target_include_directories(sinfer_bench_support_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench/targets/qwen3_6_27b)
+target_include_directories(sinfer_bench_support_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench/targets/qwen3_5)
 
 # The encoder CLI: one sequence in, one vector out. Not a ctest — it needs an
 # artifact — but built beside the tests so it stays compiling.
@@ -372,18 +372,18 @@ sinfer_add_fused_linear_test(
   ops/linear_swiglu/test_fp8.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
-sinfer_add_test(sinfer_qwen3_6_27b_visual_scatter_test
-  SOURCES targets/qwen3_6_27b/test_visual_scatter.cpp
+sinfer_add_test(sinfer_qwen3_5_visual_scatter_test
+  SOURCES targets/qwen3_5/test_visual_scatter.cpp
   LIBRARIES sinfer_engine sinfer_core)
-set_tests_properties(sinfer_qwen3_6_27b_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(sinfer_qwen3_5_visual_scatter_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
-set(sinfer_qwen3_6_27b_internal_tests
-  sinfer_qwen3_6_27b_visual_scatter_test)
-foreach(test_target IN LISTS sinfer_qwen3_6_27b_internal_tests)
+set(sinfer_qwen3_5_internal_tests
+  sinfer_qwen3_5_visual_scatter_test)
+foreach(test_target IN LISTS sinfer_qwen3_5_internal_tests)
   target_include_directories(${test_target} PRIVATE
-    ${SERVE_ROOT}/targets/qwen3_6_27b/impl
-    ${SERVE_ROOT}/targets/qwen3_6_27b/export
+    ${SERVE_ROOT}/targets/qwen3_5/impl
+    ${SERVE_ROOT}/targets/qwen3_5/export
     ${SERVE_ROOT}/family/export)
 endforeach()

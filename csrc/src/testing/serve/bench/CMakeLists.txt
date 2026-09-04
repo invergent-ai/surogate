@@ -73,7 +73,7 @@ sinfer_add_op_bench(sinfer_proposal_remap_bench SOURCES ops/proposal_remap_bench
 sinfer_add_op_bench(sinfer_cpu_expert_compute_bench SOURCES ops/cpu_expert_compute_bench.cpp)
 
 # End-to-end product benchmark: public Engine API and native .sinfer artifacts only.
-add_executable(sinfer_bench targets/qwen3_6_27b/sinfer_bench.cpp targets/qwen3_6_27b/sinfer_bench_support.cpp)
+add_executable(sinfer_bench targets/qwen3_5/sinfer_bench.cpp targets/qwen3_5/sinfer_bench_support.cpp)
 target_include_directories(sinfer_bench PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${SERVE_ROOT}
@@ -84,26 +84,26 @@ target_link_libraries(sinfer_bench PRIVATE sinfer_engine CUDA::cudart)
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .sinfer artifact.
-add_executable(sinfer_qwen3_6_27b_mtp_round_bench
-  targets/qwen3_6_27b/target_mtp_round_bench.cpp)
-target_include_directories(sinfer_qwen3_6_27b_mtp_round_bench PRIVATE
+add_executable(sinfer_qwen3_5_mtp_round_bench
+  targets/qwen3_5/target_mtp_round_bench.cpp)
+target_include_directories(sinfer_qwen3_5_mtp_round_bench PRIVATE
   ${SERVE_ROOT}
   ${SERVE_ROOT}
   ${SUROGATE_VENDOR_DIR}
-  ${SERVE_ROOT}/targets/qwen3_6_27b/export
-  ${SERVE_ROOT}/targets/qwen3_6/export)
-target_link_libraries(sinfer_qwen3_6_27b_mtp_round_bench PRIVATE
+  ${SERVE_ROOT}/targets/qwen3_5/export
+  ${SERVE_ROOT}/targets/qwen3_5/export)
+target_link_libraries(sinfer_qwen3_5_mtp_round_bench PRIVATE
   sinfer_engine sinfer_core)
 
 # Complete production DFlash steady round: confirmed-context append, next proposal, target
 # verification/acceptance, and host publication over a real 35B artifact.
-add_executable(sinfer_qwen3_6_35b_a3b_dflash_round_bench
-  targets/qwen3_6_35b_a3b/dflash_round_bench.cpp)
-target_include_directories(sinfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
+add_executable(sinfer_qwen3_5_moe_dflash_round_bench
+  targets/qwen3_5_moe/dflash_round_bench.cpp)
+target_include_directories(sinfer_qwen3_5_moe_dflash_round_bench PRIVATE
   ${SERVE_ROOT}
   ${SERVE_ROOT}
   ${SUROGATE_VENDOR_DIR}
-  ${SERVE_ROOT}/targets/qwen3_6_35b_a3b/export
-  ${SERVE_ROOT}/targets/qwen3_6/export)
-target_link_libraries(sinfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
+  ${SERVE_ROOT}/targets/qwen3_5_moe/export
+  ${SERVE_ROOT}/targets/qwen3_5/export)
+target_link_libraries(sinfer_qwen3_5_moe_dflash_round_bench PRIVATE
   sinfer_engine sinfer_core)

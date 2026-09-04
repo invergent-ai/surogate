@@ -364,26 +364,35 @@ struct Reader::Impl {
             throw ArtifactError(std::string("invalid JSON directory: ") + error.what());
         }
 
-        // "external" is the one optional root member: an artifact that stores every object
+        // "external" is one of the optional root members: an artifact that stores every object
         // itself does not carry it, and one that reads a file in place does.
         static constexpr std::array root_members = {"identity", "objects"};
         require_members(directory, root_members, "directory root",
                         (directory.contains("external") ? 1 : 0) +
-                            (directory.contains("geometry") ? 1 : 0));
-        // "geometry" is the other optional root member: the model's dimensions as a flat
+                            (directory.contains("geometry") ? 1 : 0) +
+                            (directory.contains("vision_geometry") ? 1 : 0));
+        // "geometry" is another optional root member: the model's dimensions as a flat
         // object of numbers, keyed by the names the family's TextGeometry knows. A target lays
         // it over its compiled config, so an artifact without it loads as one size and an
         // artifact with it can be any size of its family.
-        if (directory.contains("geometry")) {
-            const auto& raw_geometry = directory.at("geometry");
-            if (!raw_geometry.is_object()) { throw ArtifactError("geometry must be an object"); }
-            for (const auto& [key, value] : raw_geometry.items()) {
-                if (!value.is_number()) {
-                    throw ArtifactError("geometry." + key + " must be a number");
-                }
-                geometry.emplace(key, value.get<double>());
+        const auto read_geometry = [&](const char* member, std::map<std::string, double>& into) {
+            if (!directory.contains(member)) { return; }
+            const auto& raw = directory.at(member);
+            if (!raw.is_object()) {
+                throw ArtifactError(std::string(member) + " must be an object");
             }
-        }
+            for (const auto& [key, value] : raw.items()) {
+                if (!value.is_number()) {
+                    throw ArtifactError(std::string(member) + "." + key + " must be a number");
+                }
+                into.emplace(key, value.get<double>());
+            }
+        };
+        read_geometry("geometry", geometry);
+        // The tower a checkpoint ships is its own size, independent of the text stack's, so it
+        // is declared separately rather than folded into "geometry" where two members would
+        // collide on names like "layers" and "hidden".
+        read_geometry("vision_geometry", vision_geometry);
         // An artifact may serve some of its objects straight out of another file rather than
         // copying them in. The table is absent from every artifact that does not, and those load
         // exactly as before.
@@ -532,6 +541,7 @@ struct Reader::Impl {
     std::vector<std::vector<PayloadRun>> runs;
     std::vector<ExternalFile> external;
     std::map<std::string, double> geometry;
+    std::map<std::string, double> vision_geometry;
     std::vector<std::unique_ptr<MappedFile>> external_maps; // MappedFile owns an fd and a mapping
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     std::uint64_t payload_start = 0;
@@ -590,6 +600,10 @@ PayloadSpan Reader::payload(std::string_view name) const {
 }
 
 const std::map<std::string, double>& Reader::geometry() const noexcept { return impl_->geometry; }
+
+const std::map<std::string, double>& Reader::vision_geometry() const noexcept {
+    return impl_->vision_geometry;
+}
 
 std::size_t Reader::read_direct(std::uint32_t source, std::uint64_t absolute_offset,
                                 std::span<std::byte> destination) const {

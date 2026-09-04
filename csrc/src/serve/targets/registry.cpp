@@ -12,8 +12,6 @@
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/kv_capacity.h"
 #include "targets/qwen4exp/impl/config.h"
-#include "targets/qwen3_6/impl/config.h"
-#include "targets/qwen3_6_moe/impl/config.h"
 
 #include <chrono>
 #include <cstdio>
@@ -311,27 +309,19 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
         return construct_registered<Qwen3Dense, LoadedQwen3Dense, Qwen3DenseInstance>(
             options, device, reader, load_start, Qwen3Dense::target_key);
     }
-    if (std::find(Qwen3_5::model_ids.begin(), Qwen3_5::model_ids.end(), identity.model_id) !=
-        Qwen3_5::model_ids.end()) {
+    if (std::find(Qwen3_5::model_ids.begin(), Qwen3_5::model_ids.end(),
+                  identity.model_id) != Qwen3_5::model_ids.end()) {
         return construct_registered<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(
-            options, device, reader, load_start, Qwen3_5::target_key);
-    }
-    if (identity.model_id == Qwen3_6::model_id) {
-        return construct_registered<Qwen3_6, LoadedQwen3_6, Qwen3_6Instance>(
-            options, device, reader, load_start, Qwen3_6::target_key);
-    }
-    if (identity.model_id == Qwen3_6::qwen3_8_model_id) {
-        return construct_registered<Qwen3_6, LoadedQwen3_6, Qwen3_6Instance>(
-            options, device, reader, load_start, Qwen3_6::qwen3_8_target_key);
+            options, device, reader, load_start, Qwen3_5::target_key_for(identity.model_id));
     }
     if (identity.model_id == Qwen38FlashNext::model_id) {
         return construct_registered<Qwen38FlashNext, LoadedQwen38FlashNext,
                                     Qwen38FlashNextInstance>(options, device, reader, load_start,
                                                              Qwen38FlashNext::target_key);
     }
-    if (identity.model_id == Qwen3_6_35BA3B::model_id) {
-        return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
-            options, device, reader, load_start, Qwen3_6_35BA3B::target_key);
+    if (identity.model_id == Qwen3_5Moe::model_id) {
+        return construct_registered<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(
+            options, device, reader, load_start, Qwen3_5Moe::target_key);
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");
@@ -354,10 +344,10 @@ std::uint32_t resolve_automatic_context_for_pipeline(DeviceContext& device,
                                             Target::declared_geometry(reader), budget);
 }
 
-template <class Target, class Loaded, class Instance, int Layers>
+template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Reader& reader,
-                                     Clock::time_point load_start, std::string_view target_key) {
-    constexpr int layers  = Layers;
+                                     Clock::time_point load_start, std::string_view target_key,
+                                     int layers) {
     const int stage_count = static_cast<int>(options.devices.size());
     if (stage_count > layers) { throw std::invalid_argument("more pipeline stages than layers"); }
     std::vector<std::unique_ptr<DeviceContext>> devices;
@@ -472,20 +462,20 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
     if (identity.model_id == Qwen38FlashNext::model_id) {
-        return construct_pipeline<Qwen38FlashNext, LoadedQwen38FlashNext, Qwen38FlashNextInstance,
-                                  qwen4exp::detail::TextConfig::layers>(options, reader, load_start,
-                                                                        Qwen38FlashNext::target_key);
+        return construct_pipeline<Qwen38FlashNext, LoadedQwen38FlashNext, Qwen38FlashNextInstance>(
+            options, reader, load_start, Qwen38FlashNext::target_key,
+            Qwen38FlashNext::declared_geometry(reader).layers);
     }
-    if (identity.model_id == Qwen3_6::model_id || identity.model_id == Qwen3_6::qwen3_8_model_id) {
-        return construct_pipeline<Qwen3_6, LoadedQwen3_6, Qwen3_6Instance,
-                                  qwen3_6::detail::TextConfig::layers>(
-            options, reader, load_start,
-            identity.model_id == Qwen3_6::model_id ? Qwen3_6::target_key : Qwen3_6::qwen3_8_target_key);
+    if (std::find(Qwen3_5::model_ids.begin(), Qwen3_5::model_ids.end(),
+                  identity.model_id) != Qwen3_5::model_ids.end()) {
+        return construct_pipeline<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(
+            options, reader, load_start, Qwen3_5::target_key_for(identity.model_id),
+            Qwen3_5::declared_geometry(reader).layers);
     }
-    if (identity.model_id == Qwen3_6_35BA3B::model_id) {
-        return construct_pipeline<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance,
-                                  qwen3_6_moe::detail::TextConfig::layers>(options, reader, load_start,
-                                                                               Qwen3_6_35BA3B::target_key);
+    if (identity.model_id == Qwen3_5Moe::model_id) {
+        return construct_pipeline<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(
+            options, reader, load_start, Qwen3_5Moe::target_key,
+            Qwen3_5Moe::declared_geometry(reader).layers);
     }
     throw std::runtime_error("pipeline parallelism is not wired for artifact '" + identity.model_id + "'");
 }

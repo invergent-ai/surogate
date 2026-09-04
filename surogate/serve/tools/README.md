@@ -18,9 +18,9 @@ for the selected tool.
 | Build the 35B-A3B artifact | [`../convert/qwen3_6_35b_a3b/`](../convert/qwen3_6_35b_a3b/) |
 | Inspect artifact metadata and objects | [`../artifact/inspect.py`](../artifact/inspect.py) |
 | Measure perplexity the way llama-perplexity does | [`eval/perplexity.py`](eval/perplexity.py) |
-| Run the 27B Python reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/README.md) |
-| Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
-| Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
+| Run the `qwen3_5` Python reference, at any size | [`reference/qwen3_5/`](reference/qwen3_5/README.md) |
+| Run the `qwen3_5_moe` Python reference | [`reference/qwen3_5_moe/`](reference/qwen3_5_moe/README.md) |
+| Compare artifact/source Vision activations | [`parity/qwen3_5/`](parity/qwen3_5/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
@@ -58,18 +58,20 @@ the GGUF where it lies and builds whatever index it needs in a local cache.
 ## Python references and parity
 
 ```bash
-python3 -m tools.reference.qwen3_6_27b \
+python3 -m tools.reference.qwen3_5 \
   --weights out/qwen3_6_27b.sinfer \
   --prompt "请简短介绍一下你自己。" --decode 128
 
-python3 -m tools.reference.qwen3_6_35b_a3b \
+python3 -m tools.reference.qwen3_5_moe \
   --weights out/qwen3_6_35b_a3b.sinfer \
   --prompt "请简短介绍一下你自己。" --decode 128
 ```
 
-The Python implementations are independent diagnostic references, not alternate public inference
-products or generated-token goldens for the C++ engine. See the parity README for the direct 27B
-artifact/source Vision comparison command.
+There is one reference package per architecture, never per size: `reference/qwen3_5/` reads the
+decoder's dimensions and its fusion layout from the artifact, so the same command serves the
+0.8B and the 27B with only `--weights` changing. The Python implementations are independent
+diagnostic references, not alternate public inference products or generated-token goldens for
+the C++ engine. See the parity README for the direct artifact/source Vision comparison command.
 
 ## Benchmark orchestration
 

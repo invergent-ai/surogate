@@ -3,6 +3,7 @@
 #include <api/family/startup_features.h>
 #include <api/family/text_geometry.h>
 #include <api/family/vision.h>
+#include <api/family/vision_geometry.h>
 
 #include "core/tensor.h"
 
@@ -84,7 +85,7 @@ template <class FullProjectionPayload, class GdnProjectionPayload, class MainPos
           class MtpAttentionPayload, class MtpPostMixerPayload, class DFlashPayload,
           // The tower a target ships. Defaulted to the family's so every existing
           // instantiation is unchanged; a target with its own overrides it, and the
-          // weights below are sized by it rather than by the family.
+          // vision geometry below starts from it rather than from the family's.
           class VisionCfg = VisionBackboneConfig>
 struct ModelView {
     using FullLayer = FullAttentionWeights<FullProjectionPayload, MainPostMixerPayload>;
@@ -109,6 +110,10 @@ struct ModelView {
     std::optional<OptimizedProposalWeights> optimized_proposal;
     std::optional<MtpLayer> mtp;
     std::optional<DFlashPayload> dflash;
+    /// The tower's dimensions the vision weights were bound against, carried beside them the
+    /// way `geometry` is carried beside the text weights. Defaulted to the target's compiled
+    /// tower, so a target that binds against its own constants is unchanged.
+    VisionGeometry vision_geometry = VisionGeometry::compiled<VisionCfg>();
     std::optional<VisionWeightsFor<VisionCfg>> vision;
 };
 

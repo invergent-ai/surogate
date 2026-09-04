@@ -21,24 +21,10 @@ SINFER_TARGET_LOAD_PIMPL();
 namespace sinfer::targets::qwen3_5 {
 namespace {
 
-// General-task presets published with each exact model. Keep the registrations separate even
-// while their values agree so an upstream model-specific change has one obvious owner.
-constexpr ModelSamplingDefaults kQwen3_6Defaults{
-    .thinking     = {.temperature       = 1.0F,
-                     .top_k             = 20,
-                     .top_p             = 0.95F,
-                     .min_p             = 0.0F,
-                     .presence_penalty  = 0.0F,
-                     .frequency_penalty = 0.0F},
-    .non_thinking = {.temperature       = 0.7F,
-                     .top_k             = 20,
-                     .top_p             = 0.80F,
-                     .min_p             = 0.0F,
-                     .presence_penalty  = 1.5F,
-                     .frequency_penalty = 0.0F},
-};
-
-constexpr ModelSamplingDefaults kQwen3_8Defaults{
+// The general-task presets published with these checkpoints. Every model this target serves
+// ships the same pair, so they are stated once; a checkpoint that later differs gets its own
+// entry and a branch in sampling_defaults.
+constexpr ModelSamplingDefaults kFamilyDefaults{
     .thinking     = {.temperature       = 1.0F,
                      .top_k             = 20,
                      .top_p             = 0.95F,
@@ -56,12 +42,9 @@ constexpr ModelSamplingDefaults kQwen3_8Defaults{
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
-    // The family's defaults, not one size's: every Qwen3.5 checkpoint shares them, and the
-    // three targets that used to answer this each answered it the same way.
     if (std::find(model_ids.begin(), model_ids.end(), model) != model_ids.end()) {
-        return kQwen3_6Defaults;
+        return kFamilyDefaults;
     }
-    if (model == qwen3_8_model_id) { return kQwen3_8Defaults; }
     throw std::runtime_error("model '" + std::string(model) +
                              "' has no sampling defaults in target package '" +
                              std::string(target_key) + "'");
@@ -72,23 +55,28 @@ std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maxi
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
     const bool family_model =
         std::find(model_ids.begin(), model_ids.end(), identity.model_id) != model_ids.end();
-    if (family_model && identity.weights_id == "groupwise-int") {
-        return WeightsProfile::Qwen36GroupwiseInt;
+    if (!family_model) {
+        throw std::runtime_error("artifact identity '" + identity.model_id + "/" +
+                                 identity.weights_id + "' is not supported by target '" +
+                                 std::string(target_key) + "'");
     }
-    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
-        return WeightsProfile::Qwen38GroupwiseInt;
-    }
-    if (family_model && identity.weights_id == "nvfp4-mixed") {
-        return WeightsProfile::Qwen35Nvfp4Mixed;
-    }
-    if (family_model && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Qwen36Nvfp4;
-    }
-    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Qwen38Nvfp4;
+    if (identity.weights_id == "groupwise-int") { return WeightsProfile::GroupwiseInt; }
+    if (identity.weights_id == "nvfp4-mixed") { return WeightsProfile::Nvfp4Uniform; }
+    if (identity.weights_id == "nvfp4-all") { return WeightsProfile::Nvfp4All; }
+    if (identity.weights_id == "nvfp4") {
+        // Asked before the family-wide rule: the 3.8 export leaves attention and GDN in FP8
+        // and only the MLP in NVFP4, which is a different set of objects to bind.
+        return identity.model_id == qwen3_8_model_id ? WeightsProfile::Nvfp4MlpOnly
+                                                     : WeightsProfile::Nvfp4MixedBf16;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
+}
+
+std::string_view Package::target_key_for(std::string_view model) noexcept {
+    if (model == "qwen3.6-27b") { return "qwen3_6"; }
+    if (model == "qwen3.8-27b") { return "qwen3_8"; }
+    return "qwen3_5";
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,

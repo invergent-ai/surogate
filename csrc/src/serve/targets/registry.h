@@ -7,8 +7,7 @@
 #include <api/targets/llama/package.h>
 #include <api/targets/qwen3/package.h>
 #include <api/targets/qwen3_5/package.h>
-#include <api/targets/qwen3_6/package.h>
-#include <api/targets/qwen3_6_moe/package.h>
+#include <api/targets/qwen3_5_moe/package.h>
 #include <api/targets/qwen4exp/package.h>
 
 #include <memory>
@@ -23,9 +22,9 @@ namespace targets {
 using Gemma3          = gemma3_270m::Package;
 using Llama           = llama::Package;
 using Qwen3Dense      = qwen3::Package;
-using Qwen3_5    = qwen3_5::Package;
-using Qwen3_6    = qwen3_6::Package;
-using Qwen3_6_35BA3B = qwen3_6_moe::Package;
+/// One architecture, every size and generation that shares it: Qwen3.5, 3.6 and 3.8.
+using Qwen3_5     = qwen3_5::Package;
+using Qwen3_5Moe  = qwen3_5_moe::Package;
 using Qwen38FlashNext = qwen4exp::Package;
 
 // One loaded model and one live instance, per target.
@@ -81,26 +80,23 @@ using LoadedQwen3Dense = LoadedTarget<Qwen3Dense>;
 using Qwen3DenseInstance = TargetInstance<Qwen3Dense>;
 using LoadedQwen3_5 = LoadedTarget<Qwen3_5>;
 using Qwen3_5Instance = TargetInstance<Qwen3_5>;
-using LoadedQwen3_6 = LoadedTarget<Qwen3_6>;
-using Qwen3_6Instance = TargetInstance<Qwen3_6>;
-using LoadedQwen3_6_35BA3B = LoadedTarget<Qwen3_6_35BA3B>;
-using Qwen3_6_35BA3BInstance = TargetInstance<Qwen3_6_35BA3B>;
+using LoadedQwen3_5Moe = LoadedTarget<Qwen3_5Moe>;
+using Qwen3_5MoeInstance = TargetInstance<Qwen3_5Moe>;
 using LoadedQwen38FlashNext = LoadedTarget<Qwen38FlashNext>;
 using Qwen38FlashNextInstance = TargetInstance<Qwen38FlashNext>;
 
 
 using Qwen38FlashNextPipeline = runtime::PipelineInstance<Qwen38FlashNextInstance>;
-using Qwen3_6Pipeline     = runtime::PipelineInstance<Qwen3_6Instance>;
-using Qwen3_6_35BA3BPipeline  = runtime::PipelineInstance<Qwen3_6_35BA3BInstance>;
+using Qwen3_5Pipeline    = runtime::PipelineInstance<Qwen3_5Instance>;
+using Qwen3_5MoePipeline = runtime::PipelineInstance<Qwen3_5MoeInstance>;
 
 using ActiveTarget =
     std::variant<std::unique_ptr<Gemma3Instance>, std::unique_ptr<LlamaInstance>, std::unique_ptr<Qwen3DenseInstance>,
                  std::unique_ptr<Qwen3_5Instance>,
-                 std::unique_ptr<Qwen3_6Instance>,
-                 std::unique_ptr<Qwen3_6_35BA3BInstance>,
+                 std::unique_ptr<Qwen3_5MoeInstance>,
                  std::unique_ptr<Qwen38FlashNextInstance>,
-                 std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_6Pipeline>,
-                 std::unique_ptr<Qwen3_6_35BA3BPipeline>>;
+                 std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_5Pipeline>,
+                 std::unique_ptr<Qwen3_5MoePipeline>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

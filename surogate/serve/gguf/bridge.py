@@ -301,6 +301,66 @@ def _unpermute(tensor, heads: int):
             .reshape(tensor.shape))
 
 
+
+def _apply_gguf_dimensions(config: dict, reader, arch: str) -> bool:
+    """Overwrite a vendored config's text dimensions with this GGUF's own. True if any moved.
+
+    A vendored config is one size of a family. The file being converted may be another, and
+    every dimension the converter reads has to describe the file, not the template.
+    """
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+
+    def kv(suffix, default=None):
+        try:
+            value = reader.kv(f"{arch}.{suffix}")
+        except Exception:
+            return default
+        return default if value is None else int(value)
+
+    heads = kv("attention.head_count")
+    inner = kv("ssm.inner_size")
+    state = kv("ssm.state_size")
+    moved = False
+    updates = {
+        "num_hidden_layers": kv("block_count"),
+        "hidden_size": kv("embedding_length"),
+        "intermediate_size": kv("feed_forward_length"),
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv("attention.head_count_kv"),
+        "head_dim": kv("attention.key_length"),
+        "linear_num_key_heads": kv("ssm.group_count"),
+        "linear_key_head_dim": state,
+        "linear_value_head_dim": state,
+        "linear_conv_kernel_dim": kv("ssm.conv_kernel"),
+        "linear_num_value_heads": (inner // state) if inner and state else None,
+    }
+    for name, value in updates.items():
+        if value is None or name not in text or text[name] == value:
+            continue
+        text[name] = value
+        moved = True
+    # The layer schedule is one entry per layer, so a template written for another size states
+    # the wrong number of them. It is not free-form: full attention falls on every fourth layer
+    # from the fourth, and the converter refuses a list that says otherwise.
+    layers = updates["num_hidden_layers"]
+    if layers and isinstance(text.get("layer_types"), list) and len(text["layer_types"]) != layers:
+        interval = 4
+        text["layer_types"] = [
+            "full_attention" if layer >= interval - 1 and (layer - (interval - 1)) % interval == 0
+            else "linear_attention"
+            for layer in range(layers)
+        ]
+        moved = True
+    # Two generations share these dimensions and differ only in how their exports quantise, so
+    # the architecture is the only thing that tells them apart.
+    if arch in ("qwen38", "qwen3_8"):
+        for holder in (config, text):
+            if holder.get("model_type", "").startswith("qwen3_5"):
+                holder["model_type"] = holder["model_type"].replace("qwen3_5", "qwen3_8")
+                moved = True
+    return moved
+
+
 def build_hf_dir_from_gguf(
     gguf_path: Path,
     target_key: str,
@@ -341,7 +401,16 @@ def build_hf_dir_from_gguf(
         src = static_dir / fname
         if src.is_file():
             shutil.copy(src, work_dir / fname)
-    if not (work_dir / "config.json").is_file():
+    if (work_dir / "config.json").is_file():
+        # A vendored config describes one size of the family -- the tower, the rope
+        # parameters, the special token ids -- and this file may be another size. Take the
+        # dimensions from the GGUF, which is the checkpoint actually being converted, and
+        # leave everything else as vendored.
+        vendored = json.loads((work_dir / "config.json").read_text(encoding="utf-8"))
+        if _apply_gguf_dimensions(vendored, reader, arch):
+            (work_dir / "config.json").write_text(json.dumps(vendored, indent=2))
+            echo("surogate serve: config dimensions taken from the GGUF, the rest vendored")
+    else:
         derived = synthesised_config(reader, arch)
         if derived is None:
             raise SystemExit(
@@ -516,21 +585,10 @@ def build_hf_dir_from_gguf(
 def gguf_converter_key(gguf_path: Path, reader=None):
     """Which converter module builds this GGUF's artifact.
 
-    Usually the engine target's own name. The Qwen3.5 family is the exception: one target
-    binds every size, but its converters still spell their shapes out, so the size picks
-    the module. The vendored `resources/<key>/` directories are keyed the same way.
+    The engine target's own name. One target per architecture and one converter to match, so
+    the two agree; the vendored `resources/<key>/` directories are keyed the same way.
     """
-    target = gguf_target_key(gguf_path, reader)
-    #: The engine target a converter and its vendored resources belong to, where the two names
-    #: differ: one target per architecture, one converter per size it was written for.
-    per_size = {"qwen3_6": "qwen3_6_27b", "qwen3_8": "qwen3_8_27b", "qwen3_6_moe": "qwen3_6_35b_a3b"}
-    if target in per_size:
-        return per_size[target]
-    if target != "qwen3_5":
-        return target
-    summary = read_gguf_summary(gguf_path, reader)
-    hidden = int(summary["hidden_size"] or 0)
-    return {1024: "qwen3_5_0_8b", 2048: "qwen3_5_2b", 2560: "qwen3_5_4b"}.get(hidden, target)
+    return gguf_target_key(gguf_path, reader)
 
 
 def gguf_target_key(gguf_path: Path, reader=None):
@@ -545,16 +603,13 @@ def gguf_target_key(gguf_path: Path, reader=None):
     arch = s["architecture"]
     hidden = int(s["hidden_size"] or 0)
     layers = int(s["num_hidden_layers"] or 0)
-    if arch in ("qwen35", "qwen3_6", "qwen3_5") and hidden == 5120 and layers >= 60:
-        return "qwen3_6"
-    # Every size of the dense Qwen3.5 family is one target: it binds against the dimensions
-    # the artifact declares.
-    if arch in ("qwen35", "qwen3_5") and hidden > 0 and layers > 0:
-        return "qwen3_5"
-    if arch in ("qwen38", "qwen3_8") and hidden == 5120:
-        return "qwen3_8"
+    # Qwen3.5, 3.6 and 3.8 are one interleaved gated-delta architecture at different sizes, so
+    # they are one target and one converter; the artifact declares the dimensions it binds
+    # against, and the architecture string tells 3.8 apart where the dimensions cannot.
     if arch in ("qwen35moe", "qwen3moe", "qwen3_6_moe", "qwen3_5_moe") and hidden > 0:
-        return "qwen3_6_moe"
+        return "qwen3_5_moe"
+    if arch in ("qwen35", "qwen3_5", "qwen3_6", "qwen38", "qwen3_8") and hidden > 0 and layers > 0:
+        return "qwen3_5"
     # Dense decoders whose engine target is one compiled geometry. The gates below are that
     # geometry: a differently sized Qwen3 or Llama has no target to be served by yet, and is
     # refused with the summary rather than converted against the wrong config.

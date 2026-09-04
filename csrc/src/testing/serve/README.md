@@ -18,10 +18,10 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
   stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
   alignment, Vision control, and family runtime mechanisms;
-- `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
+- `targets/qwen3_5/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
   prefix test;
-- `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
+- `targets/qwen3_5_moe/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
 - `test_sinfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
@@ -98,7 +98,7 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
+  tests/artifact tests/targets/qwen3_5 tests/targets/qwen3_5_moe \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
 
@@ -113,14 +113,14 @@ runs the real engine:
 
 ```bash
 SINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.sinfer \
-  ctest --test-dir build -R sinfer_qwen3_6_27b_prefix_real_test --output-on-failure
+  ctest --test-dir build -R sinfer_qwen3_5_prefix_real_test --output-on-failure
 ```
 
 Run the peer 35B-A3B route independently:
 
 ```bash
 SINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.sinfer \
-  ctest --test-dir build -R sinfer_qwen3_6_35b_a3b_real_test --output-on-failure
+  ctest --test-dir build -R sinfer_qwen3_5_moe_real_test --output-on-failure
 ```
 
 Without the corresponding variable CTest marks each C++ integration test as skipped. Neither test

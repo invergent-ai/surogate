@@ -16,7 +16,7 @@ def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                 "artifact": {"path": "model.sinfer"},
                 "environment": {"gpu_name": "RTX 5090"},
                 "load": {
-                    "target": "qwen3_6_27b",
+                    "target": "qwen3_6",
                     "weights_id": "nvfp4",
                     "load_seconds": 2.5,
                     "upload_seconds": 2.0,
@@ -86,7 +86,7 @@ def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
         "tg",
     )
     assert (row["target"], row["weights_id"], row["artifact_path"], row["gpu_name"]) == (
-        "qwen3_6_27b",
+        "qwen3_6",
         "nvfp4",
         "model.sinfer",
         "RTX 5090",

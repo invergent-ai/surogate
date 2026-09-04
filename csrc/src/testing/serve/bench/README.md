@@ -118,8 +118,8 @@ They are compact performance surveys, not copies of the production selector or n
 matrix:
 
 ```bash
-./build/bench/sinfer_linear_bench --suite qwen3_6_27b
-./build/bench/sinfer_linear_bench --suite qwen3_6_35b_a3b
+./build/bench/sinfer_linear_bench --suite qwen3_5
+./build/bench/sinfer_linear_bench --suite qwen3_5_moe
 ./build/bench/sinfer_linear_bench --suite all
 ```
 
@@ -620,28 +620,28 @@ cmake --build build --parallel --target sinfer_mtp_pack_bench
 
 ## Target MTP round benchmark
 
-`sinfer_qwen3_6_27b_mtp_round_bench` measures the registered target's native proposal and
+`sinfer_qwen3_5_mtp_round_bench` measures the registered target's native proposal and
 verification round without introducing a second generation controller. It loads the same `.sinfer`
 artifact through the target-private package facade, prepares a real prompt with that target's
 Frontend, and reports draft/accept statistics for the target-owned MTP schedule:
 
 ```bash
-cmake --build build --parallel --target sinfer_qwen3_6_27b_mtp_round_bench
-./build/bench/sinfer_qwen3_6_27b_mtp_round_bench \
+cmake --build build --parallel --target sinfer_qwen3_5_mtp_round_bench
+./build/bench/sinfer_qwen3_5_mtp_round_bench \
   --artifact out/qwen3_6_27b.sinfer
 ```
 
 ## 35B complete DFlash round benchmark
 
-`sinfer_qwen3_6_35b_a3b_dflash_round_bench` drives the production Program through consecutive
+`sinfer_qwen3_5_moe_dflash_round_bench` drives the production Program through consecutive
 steady DFlash rounds. A measured round includes the previous confirmed feature-to-context append,
 the six-layer proposal, target verify/accept, and host publication. It reports GPU and wall latency,
 real acceptance, per-position acceptance, mean licensed length, and published tokens/s:
 
 ```bash
 cmake --build build --parallel \
-  --target sinfer_qwen3_6_35b_a3b_dflash_round_bench
-./build/bench/sinfer_qwen3_6_35b_a3b_dflash_round_bench \
+  --target sinfer_qwen3_5_moe_dflash_round_bench
+./build/bench/sinfer_qwen3_5_moe_dflash_round_bench \
   --artifact out/qwen3_6_35b_a3b.sinfer \
   --context 4096 --draft-tokens 15 --proposal-head optimized
 ```

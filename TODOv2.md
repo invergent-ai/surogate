@@ -16,9 +16,11 @@ own bytes: no dequantise-and-requantise on the text path and no copy of the
 weights. What lands beside it is a small index.
 
 **One target per architecture, serving every size of its family.**
-`csrc/src/serve/targets/` holds gemma3, llama, qwen3, qwen3_5, qwen3_6,
-qwen3_6_moe and qwen4exp. Qwen3, Llama, Gemma 3 and Qwen3.5 take any size of
-their family; the rest are the sizes their loaders are still written around.
+`csrc/src/serve/targets/` holds gemma3, llama, qwen3, qwen3_5, qwen3_5_moe and
+qwen4exp. Qwen3, Llama, Gemma 3 and Qwen3.5 take any size of their family; the
+rest are the sizes their loaders are still written around. Qwen3.5, 3.6 and 3.8
+are one architecture and share one target, which is what their own checkpoints
+say: every one declares `model_type: qwen3_5`.
 
 `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22.13 GB, 34.66 B parameters, 256 experts of
 which 8 route — on one 5090, single stream, ~700-token prompt, 128 generated,
@@ -111,14 +113,16 @@ Q6_K down kernel (10).
    The engine side is ready for any size: `qwen3_5` compiles both NVFP4 profiles
    and binds NVFP4 parents with both divisors.
 6. **[x] M2 — one directory per architecture (2026-09-04).**
-   `csrc/src/serve/targets/` holds seven directories — gemma3, llama, qwen3,
-   qwen3_5, qwen3_6, qwen3_6_moe, qwen4exp — and none names a size. A checkpoint
-   states its dimensions in the index built beside it and the engine binds
-   against those, so a target serves every size of its family: Qwen3-1.7B runs
-   on the code compiled for Qwen3-0.6B, and Qwen3.5-0.8B and 2B share one
-   directory where three stood. 3,932 lines deleted.
-   Two dimensions stay compiled in the hybrid forward interface, marked where
-   they are: the attention head width and the GDN output-gate width.
+   `csrc/src/serve/targets/` holds six directories — gemma3, llama, qwen3,
+   qwen3_5, qwen3_5_moe, qwen4exp — and none names a size or a generation. A
+   checkpoint states its dimensions in the index built beside it and the engine
+   binds against those, so a target serves every size and generation of its
+   family: Qwen3-1.7B runs on the code compiled for Qwen3-0.6B, and Qwen3.5,
+   Qwen3.6 and Qwen3.8 share one target where five directories stood. The
+   converter, the reference implementation and the vendored resources are keyed
+   the same way. Two dimensions stay compiled in the hybrid forward interface,
+   marked where they are: the attention head width and the GDN output-gate
+   width.
 7. **[ ] M4 — unify weight loading with the trainer, still true but smaller
    than it was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per
    target restate what the trainer's declarations in `surogate/dsl/models/`
@@ -446,10 +450,18 @@ Written down so they are not retried.
 
 ## Done
 
-- 2026-09-04 — **one directory per architecture**. The last two size-named
-  targets became `qwen3_6` and `qwen3_6_moe`, and their binders stopped
-  spelling the size out inline (95 occurrences of 5120 in one, 84 of 2048 in
-  the other). Seven directories, none naming a checkpoint.
+- 2026-09-04 — **the engine binds on the device it was asked for**. The
+  executor's worker thread never called `cudaSetDevice`, so every kernel
+  launched on device 0 while the weights sat on the requested one. `--device 0`
+  worked by coincidence and every other device failed in warmup.
+- 2026-09-04 — **one directory per architecture, end to end**. Qwen3.5, 3.6 and
+  3.8 are one architecture, so they are one target, one converter, one Python
+  reference and one vendored config; the MoE sibling keeps its own. Five
+  directories became two on each of those four axes. Quantisation is a
+  parameter, not a directory: one object contract with a table of five export
+  profiles, named as the engine names them. The 27B-class binder stopped
+  spelling its size out inline (95 occurrences of 5120 in one, 84 of 2048 in
+  the other).
 - 2026-09-03 — **geometry as data**: the artifact declares its dimensions, the
   binder validates against them, and one target serves every size of its
   family (Qwen3-1.7B on the 0.6B's code; three Qwen3.5 directories into one,

@@ -109,7 +109,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     // Determine block type for this layer (hybrid-aware)
     BlockType bt = BlockType::Dense;  // default: allocate everything
     bool is_hybrid = false;
-    bool is_qwen3_hybrid = false;
+    bool is_qwen3_5 = false;
     bool is_qwen3_5 = false;
     if (mConfig.model_config) {
         auto contains_ci = [](std::string_view haystack, std::string_view needle) {
@@ -131,7 +131,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
                      contains_ci(mConfig.model_config->ModelTypeName, "qwen3.5") ||
                      contains_ci(mConfig.model_config->ArchitectureName, "qwen3_5") ||
                      contains_ci(mConfig.model_config->ArchitectureName, "qwen3.5");
-        is_qwen3_hybrid = is_hybrid && is_qwen3_family;
+        is_qwen3_5 = is_hybrid && is_qwen3_family;
     }
     if (is_qwen3_5) {
         // Qwen3.5 full-attention q_proj emits [q, gate] => 2 * (Hq * head_dim).
@@ -174,8 +174,8 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     // - Dense (non-MoE) or MLP block types
     // - Qwen3.5 hybrid blocks (both full-attention and linear-attention)
     //   contain standard MLP up/down/gate projections.
-    const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_hybrid;
-    const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_hybrid;
+    const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_5;
+    const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_5;
     bool layer_is_dense_mlp = (bt == BlockType::MLP) || (bt == BlockType::Dense && !has_global_moe) ||
                               layer_is_qwen3_linear_mlp || layer_is_qwen3_attention_mlp;
 

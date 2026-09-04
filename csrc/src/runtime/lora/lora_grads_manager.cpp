@@ -148,13 +148,13 @@ void ModularLoRAGradsManager::allocate_gradients() {
         // Determine block type for this layer (hybrid-aware)
         BlockType bt = BlockType::Dense;
         bool is_hybrid = false;
-        bool is_qwen3_hybrid = false;
+        bool is_qwen3_5 = false;
         if (mConfig.model_config) {
             bt = mConfig.model_config->get_block_type(l);
             is_hybrid = (mConfig.model_config->architecture == ArchitectureType::Hybrid);
             const bool is_qwen3_family = contains_ci(mConfig.model_config->ModelTypeName, "qwen3") ||
                                          contains_ci(mConfig.model_config->ArchitectureName, "qwen3");
-            is_qwen3_hybrid = is_hybrid && is_qwen3_family;
+            is_qwen3_5 = is_hybrid && is_qwen3_family;
         }
         const auto layer_dims = resolve_layer_dims(l);
         const int layer_q_out = layer_dims.q_out;
@@ -192,8 +192,8 @@ void ModularLoRAGradsManager::allocate_gradients() {
             (bt == BlockType::MoE || bt == BlockType::SwitchMoE) || (bt == BlockType::Dense && has_global_moe);
         // Qwen3.5 hybrid blocks (both linear-attention and full-attention)
         // contain standard MLP projections that should support LoRA.
-        const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_hybrid;
-        const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_hybrid;
+        const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_5;
+        const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_5;
         bool layer_is_dense_mlp = (bt == BlockType::MLP) || (bt == BlockType::Dense && !has_global_moe) ||
                                   layer_is_qwen3_linear_mlp || layer_is_qwen3_attention_mlp;
 

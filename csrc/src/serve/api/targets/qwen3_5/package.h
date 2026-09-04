@@ -34,12 +34,18 @@ namespace detail {
 struct Variant;
 
 enum class WeightsProfile : std::uint8_t {
-    Qwen36GroupwiseInt,
-    Qwen38GroupwiseInt,
-    Qwen36Nvfp4,
-    /// Every projection NVFP4, no BF16 endpoints: what a ModelOpt export of this family is.
-    Qwen35Nvfp4Mixed,
-    Qwen38Nvfp4,
+    /// Group-wise integer throughout. The endpoints carry whatever the artifact says, so a
+    /// K-quant GGUF and a Q6/W8 export both land here.
+    GroupwiseInt,
+    /// NVFP4 projections with a handful of layers left BF16, as the export wrote them.
+    Nvfp4MixedBf16,
+    /// Every projection NVFP4, no BF16 exceptions: what a ModelOpt export of this family is.
+    Nvfp4Uniform,
+    /// Only the MLP is NVFP4; the attention and GDN projections stay FP8, because that is
+    /// what the export quantised.
+    Nvfp4MlpOnly,
+    /// Every language linear NVFP4, from the export that quantises them all.
+    Nvfp4All,
 };
 
 using Frontend       = family::Frontend;
@@ -51,18 +57,23 @@ SINFER_TARGET_LOAD_TYPES(qwen3_5::Package);
 } // namespace detail
 
 struct Package {
-    /// The sizes of this family, which one target now serves: the artifact states its own
-    /// dimensions and the binder validates against those.
-    static constexpr std::array<std::string_view, 3> model_ids{"qwen3.5-0.8b", "qwen3.5-2b",
-                                                               "qwen3.5-4b"};
-    static constexpr std::string_view model_id           = model_ids[0];
-    static constexpr std::string_view target_key         = "qwen3_5";
+    /// Every checkpoint this architecture serves. The interleaved gated-delta / full-attention
+    /// decoder is the same graph at every one of these sizes and across the model generations
+    /// that share it, so the target is the architecture and the artifact states its dimensions.
+    static constexpr std::array<std::string_view, 5> model_ids{
+        "qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.6-27b", "qwen3.8-27b"};
+    static constexpr std::string_view model_id   = model_ids[0];
+    static constexpr std::string_view target_key = "qwen3_5";
+    /// The 3.8 export quantises differently from the 3.6 one at the same dimensions, so the
+    /// two are told apart by model id where the weights profile is chosen.
+    static constexpr std::string_view qwen3_8_model_id = "qwen3.8-27b";
+    /// What a run reports itself as. One target serves the family; a reader still wants to see
+    /// which model ran, so the label follows the checkpoint rather than the folder.
+    [[nodiscard]] static std::string_view target_key_for(std::string_view model) noexcept;
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a
     /// constant: `detail::Variant` is only forward-declared here.
     [[nodiscard]] static std::uint32_t maximum_context() noexcept;
-    static constexpr std::string_view qwen3_8_model_id   = "qwen3.8-27b";
-    static constexpr std::string_view qwen3_8_target_key = "qwen3_8";
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;

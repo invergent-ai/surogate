@@ -64,7 +64,7 @@ int main() {
     };
 
     sinfer::LoadSummary load;
-    load.target               = "qwen3_6_27b";
+    load.target               = "qwen3_6";
     load.model_id             = "qwen3.6-27b";
     load.weights_id           = "groupwise-int";
     load.load_seconds         = 1.234567890123;
@@ -117,7 +117,7 @@ int main() {
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
-    failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
+    failures += check(server.at("artifact").at("target") == "qwen3_6", "server target missing");
     failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");

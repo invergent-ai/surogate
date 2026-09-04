@@ -4,7 +4,7 @@
 //   ./build/bench/sinfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
 //   ./build/bench/sinfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
 //   ./build/bench/sinfer_linear_bench --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
-//   ./build/bench/sinfer_linear_bench --suite qwen3_6_27b
+//   ./build/bench/sinfer_linear_bench --suite qwen3_5
 //   ncu --profile-from-start off ./build/bench/sinfer_linear_bench \
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
@@ -327,7 +327,7 @@ void usage(const char* argv0) {
                  "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
                  "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
-                 "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
+                 "  %s --suite qwen3_5|qwen3_5_moe|all [options]\n\n"
                  "Options:\n"
                  "  --policy a16|a8|a4 Activation-compute policy (default a16).\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
@@ -393,8 +393,8 @@ Options parse_args(int argc, char** argv) {
         throw std::invalid_argument("--t and --sweep are mutually exclusive");
     }
     if (opt.have_suite) {
-        if (opt.suite != "qwen3_6_27b" && opt.suite != "qwen3_6_35b_a3b" && opt.suite != "all") {
-            throw std::invalid_argument("--suite must be qwen3_6_27b, qwen3_6_35b_a3b, or all");
+        if (opt.suite != "qwen3_5" && opt.suite != "qwen3_5_moe" && opt.suite != "all") {
+            throw std::invalid_argument("--suite must be qwen3_5, qwen3_5_moe, or all");
         }
         if (opt.have_qtype || opt.have_n || opt.have_k || opt.have_t || opt.have_sweep) {
             throw std::invalid_argument("--suite cannot be combined with an explicit point");
@@ -456,10 +456,10 @@ void append_suite(std::vector<BenchPoint>& points, const SuiteEntry (&entries)[N
 std::vector<BenchPoint> expand_points(const Options& opt) {
     std::vector<BenchPoint> points;
     if (opt.have_suite) {
-        if (opt.suite == "qwen3_6_27b" || opt.suite == "all") {
+        if (opt.suite == "qwen3_5" || opt.suite == "all") {
             append_suite(points, kQwen27bEntries);
         }
-        if (opt.suite == "qwen3_6_35b_a3b" || opt.suite == "all") {
+        if (opt.suite == "qwen3_5_moe" || opt.suite == "all") {
             append_suite(points, kQwen35bEntries);
         }
         return points;

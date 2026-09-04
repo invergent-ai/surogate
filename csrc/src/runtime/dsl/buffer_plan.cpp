@@ -985,14 +985,14 @@ namespace {
 /// Qwen3.5 hybrid blocks (Mamba + Attention + MLP) under LoRA hit a backward
 /// peak around SwiGLU + LoRA hooks that is not captured by either the plan
 /// or the graph walk. Gate the extra slacks with this predicate.
-[[nodiscard]] bool is_qwen3_hybrid_lora(const BufferPlan& plan, const PretrainedConfig& cfg) {
+[[nodiscard]] bool is_qwen3_5_lora(const BufferPlan& plan, const PretrainedConfig& cfg) {
     if (!plan.lora_only || !plan.is_hybrid) return false;
     return cfg.Architecture == PretrainedConfig::QWEN3;
 }
 
-/// Extra bytes to add to the heuristic when `is_qwen3_hybrid_lora` holds,
+/// Extra bytes to add to the heuristic when `is_qwen3_5_lora` holds,
 /// accounting for the unmodeled SwiGLU-backward + LoRA-hook transient peak.
-[[nodiscard]] long qwen3_hybrid_lora_heuristic_slack(const BufferPlan& plan, const RuntimeOptions& options) {
+[[nodiscard]] long qwen3_5_lora_heuristic_slack(const BufferPlan& plan, const RuntimeOptions& options) {
     const long dtype_bytes = static_cast<long>(get_dtype_size(plan.act_dtype));
     const long swiglu_peak = plan.B * plan.T * plan.MUp * dtype_bytes;
     long slack = std::max(128L * 1024 * 1024, swiglu_peak + 64L * 1024 * 1024);
@@ -1007,8 +1007,8 @@ namespace {
 /// Minimum stack floor for Qwen3.5 hybrid LoRA — higher with CUDA graphs
 /// because capture pins more state. Returns 0 when the predicate doesn't hold.
 [[nodiscard]] long
-qwen3_hybrid_lora_floor(const BufferPlan& plan, const PretrainedConfig& cfg, const RuntimeOptions& options) {
-    if (!is_qwen3_hybrid_lora(plan, cfg)) return 0;
+qwen3_5_lora_floor(const BufferPlan& plan, const PretrainedConfig& cfg, const RuntimeOptions& options) {
+    if (!is_qwen3_5_lora(plan, cfg)) return 0;
     return options.UseCudaGraphs ? (1536L * 1024 * 1024) : (1024L * 1024 * 1024);
 }
 
@@ -1078,8 +1078,8 @@ static long heuristic_required_bytes(const BufferPlan& plan,
                                                    : (512L * 1024 * 1024);
     required += slack_bytes;
 
-    if (is_qwen3_hybrid_lora(plan, cfg)) {
-        required += qwen3_hybrid_lora_heuristic_slack(plan, options);
+    if (is_qwen3_5_lora(plan, cfg)) {
+        required += qwen3_5_lora_heuristic_slack(plan, options);
     }
 
     required += moe_stack_slack;
@@ -1114,7 +1114,7 @@ static long min_stack_floor(const BufferPlan& plan, const PretrainedConfig& cfg,
     if (options.UseCudaGraphs) {
         floor = std::max(floor, plan.lora_only ? (1024L * 1024 * 1024) : (4L * 1024 * 1024 * 1024));
     }
-    floor = std::max(floor, qwen3_hybrid_lora_floor(plan, cfg, options));
+    floor = std::max(floor, qwen3_5_lora_floor(plan, cfg, options));
     if (const char* env = std::getenv("SUROGATE_MIN_STACK_MB")) {
         const long mb = std::max(64L, std::atol(env));
         floor = mb * 1024 * 1024;

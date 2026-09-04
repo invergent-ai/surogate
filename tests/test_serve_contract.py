@@ -45,30 +45,31 @@ GENERATED_TARGETS = ("gemma3_270m",)
 #: reproduce prose that records *why* a constant holds would relocate the
 #: duplication rather than remove it.
 #:
-#: `qwen3_5` joined them when its three size-targets became one. What it compiles is the
-#: reference size, and it carries the family's vision tower -- whose dimensions are in no
-#: text `config.json`, so no declaration emits them. The dimensions that vary by size are
-#: checked where they now live: in the artifact, against the binder.
+#: `qwen3_5` joined them when every size and generation of the interleaved gated-delta
+#: architecture became one target. What it compiles is a reference size, and it carries a
+#: vision tower whose dimensions are in no text `config.json`, so no declaration emits them.
+#: The dimensions that vary by checkpoint are checked where they now live: in the artifact,
+#: against the binder.
 CHECKED_TARGETS = (("qwen4exp", "models/Qwen3.8-Flash-Next-frontend"),)
 
 #: Every target whose converter inventory is derivable from the declaration, with
-#: where its checkpoint config lives. `qwen3_6_27b` and `qwen3_8_27b` are absent
-#: only because their configs are not on this machine — nothing about them is
-#: known to be undeclarable.
+#: where its checkpoint config lives. The 27B checkpoints are absent only because their
+#: configs are not on this machine — nothing about them is known to be undeclarable.
 #: (target, config source, what the target's C++ binder consumes). The engine
 #: refuses to load an artifact holding an object no binder consumes, so an
 #: artifact carries a capability's objects only when its target implements it —
-#: the three Qwen3.5 targets and qwen4exp are text-only in C++ today.
+#: the dense hybrid target and qwen4exp are text-only in C++ today.
 INVENTORY_TARGETS = (
     # Flash-Next ships the 27x1152 tower the vision kernels implement, and its
     # binder consumes it, so its artifact carries it.
     ("qwen4exp", "dir:models/Qwen3.8-Flash-Next-frontend", {"text", "vision"}),
-    ("qwen3_5_0_8b", "hub:models--Qwen--Qwen3.5-0.8B", {"text"}),
-    # The 2B binds its tower so the artifact is complete, but serving it is
-    # gated: its head_dim is 64 and the vision kernels implement 72.
-    ("qwen3_5_2b", "hub:models--Qwen--Qwen3.5-2B", {"text", "vision"}),
-    ("qwen3_5_4b", "hub:models--Qwen--Qwen3.5-4B", {"text"}),
-    ("qwen3_6_35b_a3b", "hub:models--Qwen--Qwen3.6-35B-A3B", {"text", "vision", "dflash"}),
+    # One converter serves the family, so it is checked against each size's checkpoint.
+    # The 2B binds its tower so the artifact is complete, but serving it is gated: its
+    # head_dim is 64 and the vision kernels implement 72.
+    ("qwen3_5", "hub:models--Qwen--Qwen3.5-0.8B", {"text"}),
+    ("qwen3_5", "hub:models--Qwen--Qwen3.5-2B", {"text", "vision"}),
+    ("qwen3_5", "hub:models--Qwen--Qwen3.5-4B", {"text"}),
+    ("qwen3_5_moe", "hub:models--Qwen--Qwen3.6-35B-A3B", {"text", "vision", "dflash"}),
 )
 
 
@@ -100,7 +101,16 @@ def test_artifact_inventory_derives_from_the_declaration(emitters, target, sourc
     derived = emit_inventory.inventory_for(architecture, hf_config, capabilities=capabilities)
 
     inventory = importlib.import_module(f"surogate.serve.convert.{target}.inventory")
-    committed = {s.name: (tuple(s.shape), s.format) for s in inventory.TENSOR_SPECS}
+    # A converter that serves a whole family builds its list for the checkpoint in hand;
+    # the module-level one describes only the size it registers.
+    if hasattr(inventory, "geometry_from_config") and hasattr(inventory, "active_specs"):
+        geometry = inventory.geometry_from_config(hf_config)
+        specs, _ = inventory.active_specs(
+            mtp=True, vision="vision" in capabilities, geometry=geometry
+        )
+    else:
+        specs = inventory.TENSOR_SPECS
+    committed = {s.name: (tuple(s.shape), s.format) for s in specs}
     emitted = {o["name"]: (o["shape"], o["format"]) for o in derived}
 
     assert set(emitted) == set(committed), (
@@ -242,11 +252,8 @@ def test_fused_serve_objects_name_their_components(emitters, target, model_dir):
 #: the inventory exactly — an inventory that grows without its recipe produces a
 #: converter that cannot build the artifact it promises.
 RECIPE_TARGETS = (
-    "qwen3_5_0_8b",
-    "qwen3_5_2b",
-    "qwen3_5_4b",
-    "qwen3_6_27b",
-    "qwen3_6_35b_a3b",
+    "qwen3_5",
+    "qwen3_5_moe",
 )
 
 

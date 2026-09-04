@@ -648,8 +648,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         constexpr std::uint32_t kFrontendMergedLimit  = 32768;
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
+        // The planner has no artifact in hand, so it sizes the envelope for the tower this
+        // target compiles. A checkpoint that declares a wider one is caught at admission,
+        // where the item's own workspace is measured against this capacity.
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
-            merged, std::min(merged, kFrontendSegmentLimit));
+            schedule::compiled_vision_geometry(), merged,
+            std::min(merged, kFrontendSegmentLimit));
     }
 
     out.capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
@@ -770,8 +774,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     if (impl->features.vision) {
         constexpr std::uint32_t kFrontendMergedLimit = 32768;
         const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
+        // The planner has no artifact in hand, so it reserves for the tower this target
+        // compiles -- but at the text width the checkpoint declared, since that is what the
+        // merger writes and what every per-request transient will be measured against.
+        const family::VisionGeometry vision = schedule::bound_vision_geometry(
+            schedule::compiled_vision_geometry(), impl->geometry);
         impl->request_transient_capacity_bytes =
-            schedule::VisionContext::output_transient_bytes(merged);
+            schedule::VisionContext::output_transient_bytes(vision, merged);
     }
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for

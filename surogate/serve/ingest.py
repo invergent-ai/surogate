@@ -67,35 +67,12 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
 
     # Registered geometries (vendored targets). Text-config nesting (VL-style
     # configs) is flattened by callers before this point.
-    if model_type == "qwen3_5" and hidden in (1024, 2048, 2560):
-        # One engine target for the family. The converter is still per size -- its recipes
-        # spell their shapes out -- so the checkpoint's hidden width picks which one runs,
-        # and the artifact it writes states the dimensions the engine binds against.
-        module = {1024: "qwen3_5_0_8b", 2048: "qwen3_5_2b", 2560: "qwen3_5_4b"}[hidden]
-        if nvfp4:
-            # ModelOpt NVFP4, which only the 4B has a recipe for so far.
-            if hidden != 2560:
-                raise SystemExit(
-                    "surogate serve: this Qwen3.5 checkpoint is NVFP4, and only the 4B has an "
-                    f"NVFP4 recipe (hidden_size={hidden}). Serve the BF16 checkpoint, or its "
-                    "GGUF."
-                )
-            return ConverterTarget("qwen3_5_nvfp4",
-                                   f"surogate.serve.convert.{module}.convert_nvfp4",
-                                   "Qwen3.5-4B (NVFP4)")
-        return ConverterTarget("qwen3_5", f"surogate.serve.convert.{module}.convert",
-                               "Qwen3.5", gguf_repack=True)
-    if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:
-        if nvfp4:
-            return ConverterTarget("qwen3_6_nvfp4", "surogate.serve.convert.qwen3_6_27b.convert_nvfp4",
-                                   "Qwen3.6-27B (NVFP4)")
-        return ConverterTarget("qwen3_6", "surogate.serve.convert.qwen3_6_27b.convert", "Qwen3.6",
-                               gguf_repack=True)
-    if model_type == "qwen3_8" and hidden == 5120:
-        if nvfp4:
-            return ConverterTarget("qwen3_8_nvfp4", "surogate.serve.convert.qwen3_8_27b.convert_nvfp4",
-                                   "Qwen3.8-27B (NVFP4)")
-        return ConverterTarget("qwen3_8", "surogate.serve.convert.qwen3_8_27b.convert", "Qwen3.8")
+    # One converter for the whole interleaved gated-delta architecture, at every size and
+    # generation that shares it. The checkpoint states its dimensions and its quantisation, and
+    # the converter reads both, so neither size nor export picks the module.
+    if model_type in ("qwen3_5", "qwen3_6", "qwen3_8") and hidden > 0 and layers > 0:
+        return ConverterTarget("qwen3_5", "surogate.serve.convert.qwen3_5.convert",
+                               "Qwen3.5/3.6/3.8", gguf_repack=True)
     # Any size of the plain dense Qwen3: the artifact states its dimensions and the engine
     # binds against those, so the architecture is the gate.
     if model_type == "qwen3" and hidden > 0 and layers > 0:
@@ -108,7 +85,8 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
         return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma 3",
                                gguf_repack=True)
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
-        return ConverterTarget("qwen3_6_moe", "surogate.serve.convert.qwen3_6_35b_a3b.convert",
+        return ConverterTarget("qwen3_5_moe",
+                               "surogate.serve.convert.qwen3_5_moe.convert",
                                "Qwen3.6-35B-A3B", gguf_repack=True)
     return None
 
@@ -206,7 +184,7 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
     # Every target reads its GGUF where it lies: the bridge dequantises only what a value
     # transform forces, not the whole checkpoint.
-    repack_targets = {"qwen3", "llama", "gemma3", "qwen3_5", "qwen3_6", "qwen3_6_moe"}
+    repack_targets = {"qwen3", "llama", "gemma3", "qwen3_5", "qwen3_5_moe"}
     converter_key = serve_gguf.gguf_converter_key(gguf_path, reader)
     planner = _repack_planner(root, converter_key) if target_key in repack_targets else None
     # No-MTP variant (PATCHES.md #15): community exports may strip nextn.
@@ -284,8 +262,16 @@ def _gguf_geometry(recipe_module, inventory_module, gguf_path: Path):
     from surogate.serve.gguf import bridge as serve_gguf
     from surogate.serve.gguf.lean import LeanGguf
 
+    if not hasattr(recipe_module, "build_recipes"):
+        return None
     with LeanGguf(gguf_path) as reader:
         arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
+        # A converter may read the file's key-values directly -- a hybrid's linear-attention
+        # widths are in no synthesised `config.json` -- or take the synthesised config.
+        if hasattr(inventory_module, "geometry_from_gguf"):
+            return inventory_module.geometry_from_gguf(reader.kv)
+        if not hasattr(recipe_module, "geometry_from_config"):
+            return None
         config = serve_gguf.synthesised_config(reader, arch)
     return recipe_module.geometry_from_config(config)
 
@@ -310,12 +296,19 @@ def _repack_planner(root: Path, target_key: str):
             recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.recipe")
         except ModuleNotFoundError:
             recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.convert")
-        recipes_by_name = getattr(recipe, "RECIPES_BY_NAME", None)
-        tensor_specs = getattr(inventory, "TENSOR_SPECS", None)
-        if recipes_by_name is None or tensor_specs is None:
-            geometry = _gguf_geometry(recipe, inventory, gguf_path)
+        # The plan must describe *this* checkpoint, not the size the converter registers, so
+        # a converter that can build from a geometry is asked to.
+        geometry = _gguf_geometry(recipe, inventory, gguf_path)
+        if geometry is not None:
             recipes_by_name = {r.object_name: r for r in recipe.build_recipes(geometry)}
-            tensor_specs = inventory.build_tensor_specs(geometry)
+            tensor_specs = (
+                inventory.build_tensor_specs(geometry)
+                if hasattr(inventory, "build_tensor_specs")
+                else inventory.active_specs(mtp=True, vision=True, geometry=geometry)[0]
+            )
+        else:
+            recipes_by_name = recipe.RECIPES_BY_NAME
+            tensor_specs = inventory.TENSOR_SPECS
 
         candidates = {
             hf: entry
