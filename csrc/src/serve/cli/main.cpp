@@ -93,7 +93,12 @@ std::string format_finish(sinfer::FinishReason reason) {
 }
 
 std::string format_kv_cache(sinfer::KvCacheStorage storage) {
-    return storage == sinfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
+    switch (storage) {
+    case sinfer::KvCacheStorage::BFloat16: return "bf16";
+    case sinfer::KvCacheStorage::Fp8E4M3: return "fp8-e4m3";
+    case sinfer::KvCacheStorage::Int8Group64: return "int8-group64";
+    default: return "auto";
+    }
 }
 
 std::string format_kv_capacity_mode(sinfer::KvCapacityMode mode) {

@@ -268,6 +268,13 @@ llama.cpp's MMQ computes on. Two consequences worth writing down:
 
 ## Accuracy gates (2026-09-04)
 
+**The KV cache default is `auto` (2026-09-04).** The `qwen3` target's 1-3 % offset against
+llama.cpp was the FP8 KV cache: e4m3's three mantissa bits are ~2 % of noise on every K and V,
+and a pure-attention stack pays it in every layer (attention output 3e-2 from exact on the
+engine's own q/k/v; 1.5e-3 with a BF16 cache), while a 3:1 GDN stack pays 0-0.4 % and keeps the
+halved cache. `auto` is BF16 where every layer is attention and e4m3 otherwise;
+`--kv-cache-dtype bf16|fp8` pins either.
+
 Perplexity on wikitext-2 test, llama-perplexity's own 2048-token windows (the first 40),
 ours eager with the raw prompt (`surogate/serve/tools/eval/perplexity.py`) against
 `llama-perplexity` on the same file and windows. The bar is "no worse than llama.cpp".
@@ -276,6 +283,9 @@ ours eager with the raw prompt (`surogate/serve/tools/eval/perplexity.py`) again
 |---|---|---:|---:|
 | Qwen3.6-35B-A3B-UD-Q4_K_M (145 windows, 2026-09-03) | Q4_K/Q5_K/Q6_K | 6.2370 +/- 0.040 | 6.2311 +/- 0.040 |
 | Qwen3.6-35B-A3B-UD-Q4_K_M (145 windows, 2026-09-04, int8 planes carry d·Σq; the windows differ from the row above, so compare gaps: 0.054 % against 0.095 %) | Q4_K/Q5_K/Q6_K | 5.9118 +/- 0.037 | 5.9086 +/- 0.037 |
+| Qwen3-0.6B-Q4_K_M (40 windows, 2026-09-04, **BF16 KV cache** -- the new `auto` default for a pure-attention stack; fp32 reference over the same weights 17.4127) | Q4_K/Q6_K | 17.4315 +/- 0.281 | 17.5103 +/- 0.281 |
+| Qwen3-0.6B-IQ4_XS (40 windows, 2026-09-04, BF16 KV cache; the FP8 row above read 18.330) | IQ4_XS/Q6_K | 17.8580 +/- 0.286 | 17.8659 +/- 0.286 |
+| Qwen3.8-27B-UD-Q4_K_M (8 windows, 2026-09-04, BF16 KV cache; FP8 read 5.1699) | Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_S | 5.1495 +/- 0.133 | 5.0166 +/- 0.127 |
 | Qwen3.5-0.8B-IQ4_XS | IQ4_XS 50 %, Q6_K 43 % | **15.094 +/- 0.225** | 15.151 +/- 0.226 |
 | Qwen3.5-0.8B-UD-Q2_K_XL | Q2_K/Q3_K, IQ3_S/IQ3_XXS/IQ2_S/IQ4_XS | 20.209 +/- 0.305 | 20.016 +/- 0.302 |
 | Qwen3-0.6B-UD-IQ2_M | IQ2_S 34 %, IQ3_S 16 %, IQ3_XXS | **40.128 +/- 0.702** | 42.045 +/- 0.743 |

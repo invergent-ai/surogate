@@ -35,7 +35,8 @@ Common server options (full list: surogate serve --engine-help):
   --max-model-len N              per-sequence context ceiling
   --kv-capacity N|auto           KV pool size ('auto' = free VRAM minus 1 GiB)
   --max-num-seqs N               concurrent lanes (default 1)
-  --kv-cache-dtype fp8|bf16      KV cache precision (default fp8)
+  --kv-cache-dtype auto|fp8|bf16 KV cache precision (default auto: bf16 for a pure-attention
+                                 model, fp8 where linear-attention layers carry the stack)
   --no-cache                     rebuild the conversion cache instead of reusing it
   --spec mtp --draft-tokens 3    speculative decoding
 

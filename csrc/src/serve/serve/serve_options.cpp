@@ -51,12 +51,12 @@ std::uint64_t parse_u64(const char* text, const char* label) {
 
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
-    // "auto" means "let the engine choose", and the engine chooses e4m3, which
-    // is also the default when the flag is absent. This is a deliberate
-    // divergence: vLLM reads auto as the model's own dtype. Ask for bf16 by
-    // name to get a full-precision cache.
+    // "auto", also the default when the flag is absent, lets the target choose once
+    // its geometry is known: bf16 for a pure-attention stack, e4m3 where
+    // linear-attention layers carry it (KvCacheStorage::Auto has the measurements).
+    // vLLM reads auto as the model's own dtype; ask for bf16 or fp8 by name to pin it.
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
-    if (value == "auto") { return KvCacheStorage::Fp8E4M3; }
+    if (value == "auto") { return KvCacheStorage::Auto; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     // vLLM spells the e4m3 cache both ways and treats them as one setting.
     if (value == "fp8" || value == "fp8_e4m3") { return KvCacheStorage::Fp8E4M3; }

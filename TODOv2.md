@@ -25,8 +25,8 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Nine open or partly done. Two are decisions waiting on `surogate quantize` as a
-product rather than tasks (1 and 9); the rest are work.
+Eight open or partly done. Two are decisions waiting on `surogate quantize` as a
+product rather than tasks (1 and 8); the rest are work.
 
 1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
@@ -39,7 +39,7 @@ product rather than tasks (1 and 9); the rest are work.
    selects them — the other targets import the names and use `W8G32_F16S` or
    NVFP4. So this is one target's safetensors profile, not five, and it is a
    decision rather than a task: it costs the 27B its groupwise-int route until
-   `surogate quantize` (item 9) is a product.
+   `surogate quantize` (item 8) is a product.
 2. **[ ] FP8, and the two kinds are not the same job (checked 2026-09-03).**
    - *compressed-tensors per-channel/per-tensor* is per-row with an FP32 scale.
      The engine has `FP8_E4M3FN_ROW_BF16S`, so this is either an `_F32S` variant
@@ -91,9 +91,16 @@ product rather than tasks (1 and 9); the rest are work.
    where llama.cpp's integer form truncates. The 0.6B IQ4_XS row is 2.6 % behind (1.6
    sigma) while the 0.8B IQ4_XS row is not. The Q4_K_M control on the same target reads
    17.675 +/- 0.28 against llama.cpp's 17.510 +/- 0.28 (+0.9 %, old types only), so the offset
-   is the `qwen3` target's, not the codec's: something in that family's arithmetic (its Q6_K
-   endpoints, attention or rope precision) sits 1-3 % behind llama.cpp where `qwen3_5` matches.
-   Its own item below. Left:
+   was the `qwen3` target's, not the codec's. **Found (2026-09-04): the FP8 KV cache.** A
+   probe ladder against an fp32 transformers forward over the same GGUF weights put every
+   attention *input* at BF16 noise (5e-3) and the attention *output* at 3e-2; recomputing the
+   attention from the engine's own q/k/v in fp32 reproduced the 3e-2, and a BF16 cache took it
+   to 1.5e-3. e4m3's three mantissa bits are ~2 % of noise on every K and V, which a
+   pure-attention stack pays in every layer: with a BF16 cache Qwen3-0.6B-Q4_K_M reads
+   **17.4315** (llama.cpp 17.5103; fp32 reference 17.4127) and IQ4_XS **17.8580** (17.8659).
+   The 27B, a 3:1 GDN stack, moves only 5.1699 -> 5.1495 against 5.0166, so its gap is
+   elsewhere (below). The KV default is now `auto`: BF16 for a pure-attention target, e4m3
+   where linear-attention layers carry the stack -- "Decisions that govern". Left:
    **The 27B-class GGUF serves, with MTP (2026-09-04).** `unsloth/Qwen3.8-27B-GGUF`
    UD-Q4_K_M: 46.5 tok/s decode with `--spec mtp --draft-tokens 1` against llama.cpp's 44.8 on
    the same file, TTFT 0.23 s against 1.18 s, perplexity 5.1699 +/- 0.134 against 5.0166 +/-
@@ -125,13 +132,7 @@ product rather than tasks (1 and 9); the rest are work.
    of the int8 tile itself, fixed here: its activation planes carried the raw Σx and now
    carry d·Σq, matching the GEMV route (real-tensor error 1.25e-2 -> 1.77e-3 relative).
 
-5. **[ ] The `qwen3` dense target scores 1-3 % behind llama.cpp where `qwen3_5` matches
-   (2026-09-04).** Same corpus, same windows, same method: Qwen3-0.6B-Q4_K_M 17.675 vs 17.510,
-   IQ4_XS 18.330 vs 17.866; Qwen3.5-0.8B-IQ4_XS 15.094 vs 15.151. The codecs are shared, so
-   the difference is in what only this target does -- its Q6_K vocabulary endpoints on the
-   GGML route, its attention or rope arithmetic. Bisect by swapping one route at a time
-   against the BF16 reference (`tools/reference/`), as the 27B drift was found.
-6. **[ ] Unify weight loading with the trainer, still true but smaller than it
+5. **[ ] Unify weight loading with the trainer, still true but smaller than it
    was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per target
    restate what the trainer's declarations in `surogate/dsl/models/` already say.
    Both sides describe the same nineteen architectures: the DSL has `qwen3.py`,
@@ -143,7 +144,7 @@ product rather than tasks (1 and 9); the rest are work.
    checkpoint tensor becomes which artifact object, and how fused objects are
    assembled. That is the part worth unifying, and the part `hf_mapping` already
    spells out.
-7. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
+6. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.
    - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
@@ -162,7 +163,7 @@ product rather than tasks (1 and 9); the rest are work.
      the file's blocks (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`).
    - **The 28k-prompt board row** (long-context ingestion) has not been re-measured
      since the native path landed.
-8. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
+7. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
    (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
    acceptance — which is the evidence the graph is right — but decode moves
    30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
@@ -170,7 +171,7 @@ product rather than tasks (1 and 9); the rest are work.
    more distinct experts than a single token and pays more PCIe gathers with
    3,172 of 5,110 experts resident. The graph and the levers are in memory
    `project_serve_qwen4exp_mtp`.
-9. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+8. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -336,6 +337,12 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
   why the native path exists.
 
 ---
+
+- **The KV cache default is `auto` (2026-09-04): BF16 where every layer is
+  attention, e4m3 where linear-attention layers carry the stack.** e4m3 halves
+  the cache and costs a 3:1 GDN stack 0-0.4 % of perplexity; it costs a
+  pure-attention model 1.5-2.6 %, which is the whole of the `qwen3` target's
+  offset against llama.cpp's f16 cache. `--kv-cache-dtype bf16|fp8` pins either.
 
 ## Traps
 

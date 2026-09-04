@@ -124,13 +124,22 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
+/// The storage a request for `Auto` resolves to for this geometry: BF16 when every layer
+/// is attention, e4m3 when linear-attention layers carry the stack. KvCacheStorage::Auto
+/// documents the measurements behind the split.
+KvCacheStorage resolve_kv_storage(KvCacheStorage storage, const family::TextGeometry& geometry) {
+    if (storage != KvCacheStorage::Auto) { return storage; }
+    return geometry_gdn_layers(geometry) == 0 ? KvCacheStorage::BFloat16 : KvCacheStorage::Fp8E4M3;
+}
+
 DType kv_storage_dtype(KvCacheStorage storage) {
     switch (storage) {
     case KvCacheStorage::BFloat16: return DType::BF16;
     case KvCacheStorage::Int8Group64: return DType::I8;
     case KvCacheStorage::Fp8E4M3: return DType::FP8_E4M3FN;
+    case KvCacheStorage::Auto: break; // resolved against the geometry before this
     }
-    throw std::invalid_argument("unknown KV cache storage");
+    throw std::invalid_argument("KV cache storage must be resolved before it is a dtype");
 }
 
 std::uint32_t page_count(std::uint32_t capacity) {
@@ -854,6 +863,16 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
                            const family::TextGeometry& geometry) {
     validate_target_options(device, options);
+    const KvCacheStorage kv_storage = resolve_kv_storage(options.kv_cache, geometry);
+    if (kv_storage == KvCacheStorage::Fp8E4M3 &&
+        options.speculative.backend == SpeculativeBackend::DFlash) {
+        // DFlash commits its draft through kv_cache_append_prefix, which has no e4m3
+        // path. Refuse the pair at startup: the alternative is an exception thrown
+        // mid-round once a draft first lands.
+        throw std::invalid_argument(
+            "--spec dflash needs a bf16 KV cache (pass --kv-cache-dtype bf16); its draft commit "
+            "has no fp8 path");
+    }
 
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
@@ -863,9 +882,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = kv_storage_dtype(options.kv_cache),
-        .kv_quant_group = options.kv_cache == KvCacheStorage::Int8Group64 ? family::kKvQuantGroup
-                                                                         : 0,
+        .kv_dtype       = kv_storage_dtype(kv_storage),
+        .kv_quant_group = kv_storage == KvCacheStorage::Int8Group64 ? family::kKvQuantGroup : 0,
         .kv_skip_layers = options.kv_cache_skip_layers,
         .rewrite_checkpoints = options.rewrite_checkpoints,
         .elastic_kv     = options.elastic_kv,

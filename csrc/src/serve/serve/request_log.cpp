@@ -96,6 +96,7 @@ const char* kv_cache_name(sinfer::KvCacheStorage storage) {
     case sinfer::KvCacheStorage::BFloat16: return "bf16";
     case sinfer::KvCacheStorage::Int8Group64: return "int8-group64";
     case sinfer::KvCacheStorage::Fp8E4M3: return "fp8-e4m3";
+    case sinfer::KvCacheStorage::Auto: return "auto";
     }
     return "unknown";
 }

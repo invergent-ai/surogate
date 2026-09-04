@@ -81,7 +81,7 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     std::vector<int> devices;                    // --devices a,b,c (pipeline stages, in order)
-    KvCacheStorage kv_cache                = KvCacheStorage::Fp8E4M3;
+    KvCacheStorage kv_cache                = KvCacheStorage::Auto;
     std::vector<std::uint32_t> kv_cache_skip_layers;
     bool rewrite_checkpoints = false;
     bool elastic_kv          = true;  // default; --no-elastic-kv puts the Main KV planes in the arena

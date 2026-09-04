@@ -1150,7 +1150,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     // A dense stack writes no gate rows; see attention_output_gate<Variant>().
     if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
 
+    debug_probe<Variant>("attn_core", a.view({cfg_.q_size, T}), s);
     Hooks::attention_output(a.view({cfg_.q_size, T}), *w.o_proj, *w.projection, x, ph, work_, s);
+    debug_probe<Variant>("post_attention_residual", x, s);
 }
 
 struct PrefillFamilyTimer {
@@ -1492,8 +1494,10 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden(work_, cfg_geometry(), T);
     Hooks::post_mixer_norm(x, *post_norm, cfg_.rms_eps, *m.payload, h, work_, s);
+    debug_probe<Variant>("post_attention_norm", h, s);
 
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    debug_probe<Variant>("post_mlp_residual", x, s);
 }
 
 // Per-family prefill timing behind SUROGATE_SERVE_PREFILL_TIMING: events

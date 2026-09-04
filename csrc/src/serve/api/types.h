@@ -34,6 +34,14 @@ enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
     Fp8E4M3,
+    /// Resolved per target once its geometry is known: BFloat16 where every layer is
+    /// attention, Fp8E4M3 where linear-attention layers carry the stack. Measured on the
+    /// perplexity gate (2026-09-04): e4m3's three mantissa bits put ~2 % of noise on every
+    /// K and V, which a pure-attention Qwen3-0.6B pays as +1.5 % (Q4_K_M) and +2.6 %
+    /// (IQ4_XS) of perplexity against llama.cpp's f16 cache -- both rows match llama.cpp
+    /// once the cache is BF16 -- while a 3:1 GDN stack pays 0.4 % (27B) to nothing (35B,
+    /// 0.8B) and keeps the halved cache.
+    Auto,
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -163,10 +171,12 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
 
-    // e4m3 by default: it halves the cache for the same token count (measured
-    // exactly 2x capacity on the 27B) at a few percent of throughput, and the
-    // headroom it returns is what keeps large lane counts off the memory cliff.
-    KvCacheStorage kv_cache            = KvCacheStorage::Fp8E4M3;
+    // Auto: e4m3 where linear-attention layers carry the stack -- it halves the
+    // cache for the same token count (measured exactly 2x capacity on the 27B) at
+    // a few percent of throughput, and the headroom it returns is what keeps large
+    // lane counts off the memory cliff -- and BF16 where every layer is attention,
+    // where e4m3 costs 1.5-2.6 % of perplexity (see KvCacheStorage::Auto).
+    KvCacheStorage kv_cache            = KvCacheStorage::Auto;
     // Full-attention layer indices kept at the model dtype when kv_cache is
     // quantized. Linear-attention layers hold no KV planes, so they are never
     // candidates and need not be listed.

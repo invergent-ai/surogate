@@ -59,15 +59,6 @@ void validate_options(const EngineOptions& options) {
     default:
         throw std::invalid_argument("Engine kv_capacity mode is invalid");
     }
-    if (options.kv_cache == KvCacheStorage::Fp8E4M3 &&
-        options.speculative.backend == SpeculativeBackend::DFlash) {
-        // DFlash commits its draft through kv_cache_append_prefix, which has no
-        // e4m3 path. Refuse the pair at startup: the alternative is an
-        // exception thrown mid-round once a draft first lands.
-        throw std::invalid_argument(
-            "--spec dflash needs a bf16 KV cache (pass --kv-cache-dtype bf16); its draft commit "
-            "has no fp8 path");
-    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1," +
                                     std::to_string(kMaximumConcurrency) + "]");

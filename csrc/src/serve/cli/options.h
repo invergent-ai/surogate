@@ -32,7 +32,7 @@ std::uint32_t prefill_chunk  = 2048;
     int device                   = 0;
     std::vector<int> devices;    // --devices a,b,c
 
-    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache = KvCacheStorage::Auto;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
