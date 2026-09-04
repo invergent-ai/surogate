@@ -49,6 +49,11 @@ enum class QType : std::uint16_t {
     /// split into planes -- so a K_M quant's attention, GDN and shared-expert projections are
     /// served from the file instead of repacked.
     Q8_0                 = 14,
+    /// Also not K-quants: 32 values with a binary16 scale and an additive binary16
+    /// minimum. A quantiser writes these where the reduction axis is not a multiple of
+    /// 256, so no superblock fits a row.
+    Q4_1                 = 15,
+    Q5_1                 = 16,
 };
 
 enum class QuantLayout : std::uint16_t {

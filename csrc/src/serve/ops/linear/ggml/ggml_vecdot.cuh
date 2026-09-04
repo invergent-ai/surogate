@@ -181,12 +181,100 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     return d*sumf;
 }
 
-static /// Q8_0 against the quantised activation: a plain dp4a dot, the two scales multiplied out.
-/// Its `qs` sits at a two-byte offset inside the block, so the reads are the two-byte-aligned
-/// accessor rather than the four-byte one the K-quants use.
-__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
+// Q4_1 / Q5_1 against the int8 activation block. The affine term is what makes these different
+// from every other type here: `w = d*q + m`, so with the activation `y = dy*u` the dot is
+// `d*dy * sum(q*u)  +  m*dy * sum(u)`.
+//
+// The second sum is over the activation *quants*, taken exactly with dp4a against 0x01010101 --
+// the same way the K-quants take theirs. llama.cpp instead reads the sum of the unquantised
+// activations that `quantize_q8_1` parks in the high half of `ds`; that costs nothing extra but
+// sums a different set of numbers than the first term does, and the mismatch shows up as ~4e-4
+// relative error against an oracle that dequantises. Two more dp4a buy exactness.
+template <int vdr>
+__device__ __forceinline__ float vec_dot_q4_1_q8_1_impl(const int* v, const int* u,
+                                                        const __half2& dm4, const __half2& ds8) {
+    int sumi = 0;
+    int sumu = 0;
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        const int vi0 = (v[i] >> 0) & 0x0F0F0F0F;
+        const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
+        sumi          = __dp4a(vi0, u[2 * i + 0], sumi);
+        sumi          = __dp4a(vi1, u[2 * i + 1], sumi);
+        sumu          = __dp4a(0x01010101, u[2 * i + 0], sumu);
+        sumu          = __dp4a(0x01010101, u[2 * i + 1], sumu);
+    }
+    const float2 dm4f = __half22float2(dm4);
+    const float2 ds8f = __half22float2(ds8);
+    return ds8f.x * (dm4f.x * static_cast<float>(sumi) + dm4f.y * static_cast<float>(sumu));
+}
+
+template <int vdr>
+__device__ __forceinline__ float vec_dot_q5_1_q8_1_impl(const int* vl, const int* vh, const int* u,
+                                                        const __half2& dm5, const __half2& ds8) {
+    int sumi = 0;
+    int sumu = 0;
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        int vi0 = (vl[i] >> 0) & 0x0F0F0F0F;   // low nibbles
+        vi0 |= (vh[i] << 4) & 0x00000010;      // qh bit 0 -> byte 0, bit 4
+        vi0 |= (vh[i] << 11) & 0x00001000;     // qh bit 1 -> byte 1, bit 4
+        vi0 |= (vh[i] << 18) & 0x00100000;     // qh bit 2 -> byte 2, bit 4
+        vi0 |= (vh[i] << 25) & 0x10000000;     // qh bit 3 -> byte 3, bit 4
+        sumi = __dp4a(vi0, u[2 * i + 0], sumi);
+
+        int vi1 = (vl[i] >> 4) & 0x0F0F0F0F;   // high nibbles
+        vi1 |= (vh[i] >> 12) & 0x00000010;     // fifth bit of value 16
+        vi1 |= (vh[i] >> 5) & 0x00001000;      // ... of value 17
+        vi1 |= (vh[i] << 2) & 0x00100000;      // ... of value 18
+        vi1 |= (vh[i] << 9) & 0x10000000;      // ... of value 19
+        sumi = __dp4a(vi1, u[2 * i + 1], sumi);
+        sumu = __dp4a(0x01010101, u[2 * i + 0], sumu);
+        sumu = __dp4a(0x01010101, u[2 * i + 1], sumu);
+    }
+    const float2 dm5f = __half22float2(dm5);
+    const float2 ds8f = __half22float2(ds8);
+    return ds8f.x * (dm5f.x * static_cast<float>(sumi) + dm5f.y * static_cast<float>(sumu));
+}
+
+__device__ __forceinline__ float vec_dot_q4_1_q8_1(const void* __restrict__ vbq,
                                                    const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {
+    const block_q4_1* bq4_1 = static_cast<const block_q4_1*>(vbq) + kbx;
+    int v[VDR_Q4_1_Q8_1_MMVQ];
+    int u[2 * VDR_Q4_1_Q8_1_MMVQ];
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_1_Q8_1_MMVQ; ++i) {
+        v[i]             = get_int_b4(bq4_1->qs, iqs + i);
+        u[2 * i + 0]     = get_int_b4(bq8_1->qs, iqs + i);
+        u[2 * i + 1]     = get_int_b4(bq8_1->qs, iqs + i + QI4_1);
+    }
+    return vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMVQ>(v, u, bq4_1->dm, bq8_1->ds);
+}
+
+__device__ __forceinline__ float vec_dot_q5_1_q8_1(const void* __restrict__ vbq,
+                                                   const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q5_1* bq5_1 = static_cast<const block_q5_1*>(vbq) + kbx;
+    int vl[VDR_Q5_1_Q8_1_MMVQ];
+    int vh[VDR_Q5_1_Q8_1_MMVQ];
+    int u[2 * VDR_Q5_1_Q8_1_MMVQ];
+#pragma unroll
+    for (int i = 0; i < VDR_Q5_1_Q8_1_MMVQ; ++i) {
+        vl[i]        = get_int_b4(bq5_1->qs, iqs + i);
+        vh[i]        = get_int_b4(bq5_1->qh, 0) >> (4 * (iqs + i));
+        u[2 * i + 0] = get_int_b4(bq8_1->qs, iqs + i);
+        u[2 * i + 1] = get_int_b4(bq8_1->qs, iqs + i + QI5_1);
+    }
+    return vec_dot_q5_1_q8_1_impl<VDR_Q5_1_Q8_1_MMVQ>(vl, vh, u, bq5_1->dm, bq8_1->ds);
+}
+
+/// Q8_0 against the quantised activation: a plain dp4a dot, the two scales multiplied out.
+/// Its `qs` sits at a two-byte offset inside the block, so the reads are the two-byte-aligned
+/// accessor rather than the four-byte one the K-quants use.
+static __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
+                                                          const block_q8_1* __restrict__ bq8_1,
+                                                          const int& kbx, const int& iqs) {
     const block_q8_0* bq8_0 = static_cast<const block_q8_0*>(vbq) + kbx;
     int sumi                = 0;
 #pragma unroll

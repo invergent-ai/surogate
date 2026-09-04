@@ -125,8 +125,14 @@ def _planes_iq4_nl(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # Bytes per stored block, and how many values that block holds: 256 for every K-quant, 32 for
 # Q8_0, which is not one -- it is the plain 8-bit block a K_M quant leaves the attention, GDN and
 # shared-expert projections in.
-NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210, "Q8_0": 34}
-NATIVE_BLOCK_VALUES = {"Q8_0": 32}
+# Q4_1 and Q5_1 are `code * scale + min` over 32 values. A quantiser reaches for them when the
+# reduction axis is not a multiple of 256, so no K-quant superblock fits a row -- which is why
+# they turn up on the MoE down projections of a model whose expert width is not a multiple of
+# 256. The additive minimum is what keeps them out of REPACKABLE_TYPES: W8 has a scale and
+# nowhere to put a min, so they are served as the file holds them or not at all.
+NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210, "Q8_0": 34,
+                "Q4_1": 20, "Q5_1": 24}
+NATIVE_BLOCK_VALUES = {"Q8_0": 32, "Q4_1": 32, "Q5_1": 32}
 
 
 def native_block_values(gguf_type: str) -> int:

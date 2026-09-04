@@ -37,6 +37,34 @@ struct block_q8_0 {
 };
 static_assert(sizeof(block_q8_0) == sizeof(__half) + QK8_0, "wrong q8_0 block size/padding");
 
+// Q4_1 / Q5_1: 32 values with a scale and an additive minimum, x = d*q + m. Not K-quants and
+// not repackable into W8 either -- W8 carries a scale and has nowhere to put the min. A
+// quantiser writes these where the reduction axis is not a multiple of 256, so no superblock
+// fits a row; a MoE down projection whose expert width is 640 is exactly that case.
+inline constexpr int QK4_1 = 32;
+inline constexpr int QR4_1 = 2;
+inline constexpr int QI4_1 = QK4_1 / (4 * QR4_1);
+inline constexpr int VDR_Q4_1_Q8_1_MMVQ = 2;
+
+inline constexpr int QK5_1 = 32;
+inline constexpr int QR5_1 = 2;
+inline constexpr int QI5_1 = QK5_1 / (4 * QR5_1);
+inline constexpr int VDR_Q5_1_Q8_1_MMVQ = 2;
+
+struct block_q4_1 {
+    __half2 dm;                 // d (scale), m (minimum)
+    uint8_t qs[QK4_1 / 2];      // nibbles
+};
+static_assert(sizeof(block_q4_1) == 2 * sizeof(__half) + QK4_1 / 2, "wrong q4_1 block size/padding");
+
+struct block_q5_1 {
+    __half2 dm;                 // d (scale), m (minimum)
+    uint8_t qh[4];              // fifth bit of each quant
+    uint8_t qs[QK5_1 / 2];      // low nibbles
+};
+static_assert(sizeof(block_q5_1) == 2 * sizeof(__half) + 4 + QK5_1 / 2,
+              "wrong q5_1 block size/padding");
+
 struct block_q8_1 {
     __half2 ds;          // d (scale), s (sum of the 32 unquantised values)
     int8_t  qs[QK8_1];   // quants

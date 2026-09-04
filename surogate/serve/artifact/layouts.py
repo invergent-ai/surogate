@@ -120,7 +120,7 @@ ROW_SCALE_V1 = Layout(
 GGML_BLOCKS_V1 = Layout(
     "ggml-blocks-v1",
     256,
-    frozenset(("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0")),
+    frozenset(("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "Q4_1", "Q5_1")),
 )
 
 LAYOUTS = MappingProxyType(

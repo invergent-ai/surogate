@@ -117,6 +117,8 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "Q5_K") { return NumericFormat::Q5_K; }
     if (name == "Q6_K") { return NumericFormat::Q6_K; }
     if (name == "Q8_0") { return NumericFormat::Q8_0; }
+    if (name == "Q4_1") { return NumericFormat::Q4_1; }
+    if (name == "Q5_1") { return NumericFormat::Q5_1; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 

@@ -60,6 +60,8 @@ void embedding_gather_launch(GgmlType type, const void* table, std::int32_t voca
     case GgmlType::Q5_K: launch<GgmlType::Q5_K>(table, ids, tokens, vocab, hidden, out, stream); return;
     case GgmlType::Q8_0: launch<GgmlType::Q8_0>(table, ids, tokens, vocab, hidden, out, stream); return;
     case GgmlType::Q6_K: launch<GgmlType::Q6_K>(table, ids, tokens, vocab, hidden, out, stream); return;
+    case GgmlType::Q4_1: launch<GgmlType::Q4_1>(table, ids, tokens, vocab, hidden, out, stream); return;
+    case GgmlType::Q5_1: launch<GgmlType::Q5_1>(table, ids, tokens, vocab, hidden, out, stream); return;
     }
     throw std::invalid_argument("ggml embedding: unknown GGML type");
 }

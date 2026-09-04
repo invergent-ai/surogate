@@ -76,8 +76,9 @@ bool load_fixture(const std::string& dir, gg::GgmlType type, const std::string& 
     f.label = label;
     f.dequant.resize(raw.size() / sizeof(float));
     std::memcpy(f.dequant.data(), raw.data(), raw.size());
-    const std::size_t expect_blocks =
-        static_cast<std::size_t>(f.n) * (f.k / gg::QK_K) * gg::block_bytes(type);
+    // Not every GGML type is a superblock: Q8_0, Q4_1 and Q5_1 hold 32 values.
+    const std::size_t expect_blocks = static_cast<std::size_t>(f.n) *
+                                      (f.k / gg::block_values(type)) * gg::block_bytes(type);
     if (f.blocks.size() != expect_blocks || f.dequant.size() != static_cast<std::size_t>(f.n) * f.k) {
         std::fprintf(stderr, "fixture %s: unexpected sizes\n", stem.c_str());
         return false;
@@ -92,6 +93,9 @@ QType qtype_of(gg::GgmlType type) {
     case gg::GgmlType::Q4_K: return QType::Q4_K;
     case gg::GgmlType::Q5_K: return QType::Q5_K;
     case gg::GgmlType::Q6_K: return QType::Q6_K;
+    case gg::GgmlType::Q8_0: return QType::Q8_0;
+    case gg::GgmlType::Q4_1: return QType::Q4_1;
+    case gg::GgmlType::Q5_1: return QType::Q5_1;
     }
     return QType::Q4_K;
 }
@@ -102,12 +106,14 @@ Weight make_weight(const Fixture& f, void* d_blocks) {
     w.payload         = d_blocks;
     w.payload_bytes   = f.blocks.size();
     w.qtype           = qtype_of(f.type);
-    w.group_size      = 256;
+    // The group is the block's value count, which is 256 only for the superblock types.
+    const std::int32_t values = gg::block_values(f.type);
+    w.group_size      = values;
     w.ndim            = 2;
     w.qdata           = d_blocks;
     w.n               = f.n;
     w.k               = f.k;
-    w.group           = 256;
+    w.group           = values;
     w.layout          = QuantLayout::GgmlBlocks;
     w.scale_dtype     = DType::FP16;
     w.shape[0]        = f.n;
@@ -428,7 +434,8 @@ int main() {
     }
     int failures = 0, cases = 0;
     const gg::GgmlType types[] = {gg::GgmlType::Q2_K, gg::GgmlType::Q3_K, gg::GgmlType::Q4_K,
-                                  gg::GgmlType::Q5_K, gg::GgmlType::Q6_K};
+                                  gg::GgmlType::Q5_K, gg::GgmlType::Q6_K, gg::GgmlType::Q8_0,
+                                  gg::GgmlType::Q4_1, gg::GgmlType::Q5_1};
     for (const gg::GgmlType type : types) {
         for (const char* label : {"synthetic", "odd", "real", "big"}) {
             Fixture f;
@@ -469,7 +476,9 @@ int main() {
             failures += run_gather(f, false, d_blocks);
             failures += run_gather(f, true, d_blocks);
             cases += 2;
-            if (!big) {
+            // The MoE seam is superblock-shaped: a warp covers one 256-value block. The plain
+            // 32-value types are served through the dense route until it is de-superblocked.
+            if (!big && gg::block_values(f.type) == gg::QK_K) {
                 failures += run_moe(f, d_blocks, d_scratch, scratch_bytes);
                 failures += run_codec(f, d_blocks);
                 cases += 2;

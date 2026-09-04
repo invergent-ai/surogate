@@ -94,6 +94,10 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "Q6_K";
     case NumericFormat::Q8_0:
         return "Q8_0";
+    case NumericFormat::Q4_1:
+        return "Q4_1";
+    case NumericFormat::Q5_1:
+        return "Q5_1";
     }
     return {};
 }
@@ -124,9 +128,12 @@ std::uint64_t tensor_alignment(StorageLayout) noexcept { return kTensorAlignment
 
 std::uint64_t resource_alignment(ResourceEncoding) noexcept { return 1; }
 
-/// Values per stored block: a K-quant superblock is 256, Q8_0 is 32.
+/// Values per stored block: a K-quant superblock is 256, the plain block types are 32.
 std::uint64_t ggml_block_values(NumericFormat format) {
-    return format == NumericFormat::Q8_0 ? 32 : 256;
+    return (format == NumericFormat::Q8_0 || format == NumericFormat::Q4_1 ||
+            format == NumericFormat::Q5_1)
+               ? 32
+               : 256;
 }
 
 std::uint64_t ggml_block_bytes(NumericFormat format) {
@@ -137,6 +144,8 @@ std::uint64_t ggml_block_bytes(NumericFormat format) {
     case NumericFormat::Q5_K: return 176;
     case NumericFormat::Q6_K: return 210;
     case NumericFormat::Q8_0: return 34;
+    case NumericFormat::Q4_1: return 20;
+    case NumericFormat::Q5_1: return 24;
     default: break;
     }
     throw ArtifactError("format is not a GGML superblock format");
