@@ -379,6 +379,18 @@ def _repack_planner(root: Path, target_key: str):
                     if spelling in candidates:
                         keep.add(spelling)
                         break
+        # A source one covered object reads may feed an uncovered one too -- a fused parent
+        # whose halves land in different types, one the plan can move and one it cannot. Kept
+        # out of the bridge, the uncovered recipe would then find nothing to materialise from
+        # (the converter refuses exactly that), so such a source is bridged after all and the
+        # covered object reads the dequantised copy instead.
+        covered = set(planned) | set(native) | set(halves)
+        for name, tensor_recipe in recipes_by_name.items():
+            if name in covered:
+                continue
+            for src in recipe.expression_sources(tensor_recipe.expression):
+                for spelling in name_spellings(src.name):
+                    keep.discard(spelling)
         return {hf: candidates[hf] for hf in sorted(keep)}
     return plan
 

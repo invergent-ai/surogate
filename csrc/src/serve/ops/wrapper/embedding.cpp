@@ -1,6 +1,7 @@
 // sinfer::ops - embedding wrapper: public api validation and qtype dispatch.
 #include "api/ops/embedding.h"
 #include "ops/linear/ggml/ggml_embedding.h"
+#include "ops/linear/ggml/ggml_mmvq.h"
 
 #include "ops/common/math.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -233,17 +234,9 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_non_empty_tensors(ids, out);
         detail::embed_gather_fp8_launch(ids, table, out, stream);
         break;
-    case QType::Q2_K:
-    case QType::Q3_K:
-    case QType::Q4_K:
-    case QType::Q5_K:
-    case QType::Q6_K:
-    case QType::Q8_0:
-    case QType::Q4_1:
-    case QType::Q5_1:
-    case QType::IQ4_NL:
-    case QType::Q4_0:
-    case QType::Q5_0:
+#define SINFER_GGML_QTYPE_CASE(NAME) case QType::NAME:
+    SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_QTYPE_CASE)
+#undef SINFER_GGML_QTYPE_CASE
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::ggml::ggml_embedding(ids, table, out, stream);

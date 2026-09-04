@@ -38,6 +38,20 @@ StorageLayout storage_layout_for(NumericFormat format) {
     case NumericFormat::IQ4_NL:
     case NumericFormat::Q4_0:
     case NumericFormat::Q5_0:
+    case NumericFormat::IQ2_XXS:
+    case NumericFormat::IQ2_XS:
+    case NumericFormat::IQ2_S:
+    case NumericFormat::IQ3_XXS:
+    case NumericFormat::IQ3_S:
+    case NumericFormat::IQ1_S:
+    case NumericFormat::IQ1_M:
+    case NumericFormat::IQ4_XS:
+    case NumericFormat::TQ1_0:
+    case NumericFormat::TQ2_0:
+    case NumericFormat::MXFP4:
+    case NumericFormat::NVFP4_GGML:
+    case NumericFormat::Q1_0:
+    case NumericFormat::Q2_0:
         return StorageLayout::GgmlBlocksV1;
     case NumericFormat::NVFP4:
         return StorageLayout::BlockScaleK16M128x4V1;
@@ -180,6 +194,34 @@ QType qtype_for(NumericFormat format) {
         return QType::Q4_0;
     case NumericFormat::Q5_0:
         return QType::Q5_0;
+    case NumericFormat::IQ2_XXS:
+        return QType::IQ2_XXS;
+    case NumericFormat::IQ2_XS:
+        return QType::IQ2_XS;
+    case NumericFormat::IQ2_S:
+        return QType::IQ2_S;
+    case NumericFormat::IQ3_XXS:
+        return QType::IQ3_XXS;
+    case NumericFormat::IQ3_S:
+        return QType::IQ3_S;
+    case NumericFormat::IQ1_S:
+        return QType::IQ1_S;
+    case NumericFormat::IQ1_M:
+        return QType::IQ1_M;
+    case NumericFormat::IQ4_XS:
+        return QType::IQ4_XS;
+    case NumericFormat::TQ1_0:
+        return QType::TQ1_0;
+    case NumericFormat::TQ2_0:
+        return QType::TQ2_0;
+    case NumericFormat::MXFP4:
+        return QType::MXFP4;
+    case NumericFormat::NVFP4_GGML:
+        return QType::NVFP4_GGML;
+    case NumericFormat::Q1_0:
+        return QType::Q1_0;
+    case NumericFormat::Q2_0:
+        return QType::Q2_0;
     case NumericFormat::NVFP4:
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
@@ -311,6 +353,20 @@ bool is_linear_format(NumericFormat format) noexcept {
     case NumericFormat::IQ4_NL:
     case NumericFormat::Q4_0:
     case NumericFormat::Q5_0:
+    case NumericFormat::IQ2_XXS:
+    case NumericFormat::IQ2_XS:
+    case NumericFormat::IQ2_S:
+    case NumericFormat::IQ3_XXS:
+    case NumericFormat::IQ3_S:
+    case NumericFormat::IQ1_S:
+    case NumericFormat::IQ1_M:
+    case NumericFormat::IQ4_XS:
+    case NumericFormat::TQ1_0:
+    case NumericFormat::TQ2_0:
+    case NumericFormat::MXFP4:
+    case NumericFormat::NVFP4_GGML:
+    case NumericFormat::Q1_0:
+    case NumericFormat::Q2_0:
         return true;
     case NumericFormat::FP32:
     case NumericFormat::I32:

@@ -539,4 +539,407 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The importance-matrix family. A grid row is eight (IQ2) or four (IQ3) 2- or 3-bit magnitudes
+// packed one per byte; the seven sign bits of an eight-value group expand to an xor mask through
+// `unpack_ksigns`, whose eighth bit is the parity of the other seven.
+
+__device__ __forceinline__ std::uint32_t unpack_ksigns(const std::uint8_t v) {
+    const std::uint32_t p = __popc(v) & 1u;
+    const std::uint32_t s = v ^ (p << 7);
+    return s * 0x01010101u;
+}
+
+/// Sixteen-entry table lookup for eight nibbles at once: the even nibbles' levels in `.x`, the
+/// odd nibbles' in `.y`, as two int8x4 words for dp4a. `__byte_perm` selects with three bits;
+/// the fourth bit picks between the table's two halves.
+__device__ __forceinline__ int2 table16_levels(const int q4, const std::int8_t* table) {
+    const std::uint32_t* table32 = reinterpret_cast<const std::uint32_t*>(table);
+    std::uint32_t tmp[2];
+    const std::uint32_t low_high = (0x32103210u | ((static_cast<std::uint32_t>(q4) & 0x88888888u) >> 1));
+#pragma unroll
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        const std::uint32_t shift = 16 * i;
+        const std::uint32_t low   = __byte_perm(table32[0], table32[1], static_cast<std::uint32_t>(q4) >> shift);
+        const std::uint32_t high  = __byte_perm(table32[2], table32[3], static_cast<std::uint32_t>(q4) >> shift);
+        tmp[i] = __byte_perm(low, high, low_high >> shift);
+    }
+    return make_int2(static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x6420)),
+                     static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x7531)));
+}
+
+__device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq,
+                                                      const block_q8_1* __restrict__ bq8_1,
+                                                      const int& kbx, const int& iqs) {
+    const block_iq2_xxs* bq2 = static_cast<const block_iq2_xxs*>(vbq) + kbx;
+    const int q2                = get_int_b2(bq2->qs, iqs);
+    const std::uint8_t* aux8    = reinterpret_cast<const std::uint8_t*>(&q2);
+    const std::uint32_t aux32   = get_int_b2(bq2->qs, iqs + 1);
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+        const uint2 grid_pos      = reinterpret_cast<const uint2*>(kIq2xxsGrid)[aux8[k0 / 2]];
+        const std::uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
+        const int signs0 = __vcmpne4(signs & 0x08040201u, 0);
+        const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int u0     = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
+        sumi             = __dp4a(grid0, u0, sumi);
+        const int signs1 = __vcmpne4(signs & 0x80402010u, 0);
+        const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u1     = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
+        sumi             = __dp4a(grid1, u1, sumi);
+    }
+    // The block scale is (2*s + 1)/8 with s the four-bit field. llama.cpp evaluates it in
+    // integer arithmetic (`sumi * ls / 8`), which truncates; the exact form costs one multiply
+    // and lands on the dequantised reference.
+    const int ls  = (aux32 >> 27) | 1;
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
+    return d * static_cast<float>(sumi * ls) * 0.125F;
+}
+
+__device__ __forceinline__ float vec_dot_iq2_xs_q8_1(const void* __restrict__ vbq,
+                                                     const block_q8_1* __restrict__ bq8_1,
+                                                     const int& kbx, const int& iqs) {
+    const block_iq2_xs* bq2 = static_cast<const block_iq2_xs*>(vbq) + kbx;
+    const int2 q2_packed      = make_int2(get_int_b2(bq2->qs, iqs + 0), get_int_b2(bq2->qs, iqs + 1));
+    const std::uint16_t* q2   = reinterpret_cast<const std::uint16_t*>(&q2_packed);
+    const int ls0 = bq2->scales[iqs / 2] & 0x0F;
+    const int ls1 = bq2->scales[iqs / 2] >> 4;
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 grid_pos      = reinterpret_cast<const uint2*>(kIq2xsGrid)[q2[l0 / 2] & 0x1FF];
+        const std::uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
+        const int signs0 = __vcmpne4(signs & 0x08040201u, 0);
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int u0     = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int signs1 = __vcmpne4(signs & 0x80402010u, 0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u1     = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+        if (l0 < 4) {
+            sumi0 = __dp4a(grid_l, u0, sumi0);
+            sumi0 = __dp4a(grid_h, u1, sumi0);
+        } else {
+            sumi1 = __dp4a(grid_l, u0, sumi1);
+            sumi1 = __dp4a(grid_h, u1, sumi1);
+        }
+    }
+    // exact (2*ls + 1)/8 per half, rather than llama.cpp's truncating integer form
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
+    return d * static_cast<float>(sumi0 * (2 * ls0 + 1) + sumi1 * (2 * ls1 + 1)) * 0.125F;
+}
+
+__device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq,
+                                                    const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq2_s* bq2 = static_cast<const block_iq2_s*>(vbq) + kbx;
+    const int qs_packed              = get_int_b2(bq2->qs, iqs / 2);
+    const std::uint8_t* qs           = reinterpret_cast<const std::uint8_t*>(&qs_packed);
+    const int qh                     = bq2->qh[iqs / 2];
+    const int signs_packed_32        = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
+    const std::uint8_t* signs_packed = reinterpret_cast<const std::uint8_t*>(&signs_packed_32);
+    const int ls0 = bq2->scales[iqs / 2] & 0x0F;
+    const int ls1 = bq2->scales[iqs / 2] >> 4;
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int* grid_pos = reinterpret_cast<const int*>(kIq2sGrid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+        const int signs0 = __vcmpne4(((signs_packed[l0 / 2] & 0x03) << 7) | ((signs_packed[l0 / 2] & 0x0C) << 21), 0);
+        const int signs1 = __vcmpne4(((signs_packed[l0 / 2] & 0x30) << 3) | ((signs_packed[l0 / 2] & 0xC0) << 17), 0);
+        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+        const int u0     = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int u1     = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+        if (l0 < 4) {
+            sumi0 = __dp4a(grid_l, u0, sumi0);
+            sumi0 = __dp4a(grid_h, u1, sumi0);
+        } else {
+            sumi1 = __dp4a(grid_l, u0, sumi1);
+            sumi1 = __dp4a(grid_h, u1, sumi1);
+        }
+    }
+    // exact (2*ls + 1)/8 per half, rather than llama.cpp's truncating integer form
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
+    return d * static_cast<float>(sumi0 * (2 * ls0 + 1) + sumi1 * (2 * ls1 + 1)) * 0.125F;
+}
+
+__device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(const void* __restrict__ vbq,
+                                                      const block_q8_1* __restrict__ bq8_1,
+                                                      const int& kbx, const int& iqs) {
+    const block_iq3_xxs* bq3 = static_cast<const block_iq3_xxs*>(vbq) + kbx;
+    const int2 q3_packed      = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
+    const std::uint8_t* q3    = reinterpret_cast<const std::uint8_t*>(&q3_packed);
+    const std::uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos       = make_int2(kIq3xxsGrid[q3[l0 + 0]], kIq3xxsGrid[q3[l0 + 1]]);
+        const std::uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
+        const int signs0 = __vcmpne4(signs & 0x08040201u, 0);
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int u0     = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int signs1 = __vcmpne4(signs & 0x80402010u, 0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u1     = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+        sumi             = __dp4a(grid_l, u0, sumi);
+        sumi             = __dp4a(grid_h, u1, sumi);
+    }
+    const int ls  = aux32 >> 28; // the scale is (2*ls + 1)/4, evaluated exactly
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs / 2].ds);
+    return d * static_cast<float>(sumi * (2 * ls + 1)) * 0.25F;
+}
+
+__device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq,
+                                                    const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq3_s* bq3 = static_cast<const block_iq3_s*>(vbq) + kbx;
+    const int2 qs_packed             = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const std::uint8_t* qs           = reinterpret_cast<const std::uint8_t*>(&qs_packed);
+    const int qh                     = bq3->qh[iqs / 2];
+    const int signs_packed_32        = get_int_b2(bq3->signs, iqs / 2);
+    const std::uint8_t* signs_packed = reinterpret_cast<const std::uint8_t*>(&signs_packed_32);
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(kIq3sGrid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+                                        kIq3sGrid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+        const int signs0 = __vcmpne4(((signs_packed[l0 / 2] & 0x03) << 7) | ((signs_packed[l0 / 2] & 0x0C) << 21), 0);
+        const int signs1 = __vcmpne4(((signs_packed[l0 / 2] & 0x30) << 3) | ((signs_packed[l0 / 2] & 0xC0) << 17), 0);
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int u0     = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
+        const int u1     = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
+        sumi             = __dp4a(grid_l, u0, sumi);
+        sumi             = __dp4a(grid_h, u1, sumi);
+    }
+    sumi *= 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs / 2].ds);
+    return d * sumi;
+}
+
+// The 1-bit pair. A grid row is eight values in {-1, 0, 1} plus a per-32 (IQ1_S) or per-16
+// (IQ1_M) offset delta; the dot needs the activation's sum too, which q8_1 carries in ds.y.
+__device__ __forceinline__ float vec_dot_iq1_s_q8_1(const void* __restrict__ vbq,
+                                                    const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq1_s* bq1 = static_cast<const block_iq1_s*>(vbq) + kbx;
+    const int qs_packed    = get_int_b2(bq1->qs, iqs);
+    const std::uint8_t* qs = reinterpret_cast<const std::uint8_t*>(&qs_packed);
+    const int qh           = bq1->qh[iqs];
+    int sumi = 0;
+    int sumy = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid  = kIq1sGridGpu[qs[l0 / 2] | (((qh >> 3 * (l0 / 2)) & 0x07) << 8)];
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+        const int u0    = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1    = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+        sumi            = __dp4a(grid0, u0, sumi);
+        sumi            = __dp4a(grid1, u1, sumi);
+        // the activation's sum from its int8 codes, as IQ1_M does: q8_1's stored sum is of the
+        // unquantised values, and with codes in {0, 1, 2} the delta term is not small next to
+        // the main one, so that rounding showed as 5e-3 against the dequantised reference
+        sumy            = __dp4a(u0, 0x01010101, sumy);
+        sumy            = __dp4a(u1, 0x01010101, sumy);
+    }
+    const float d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+    const float delta = -1.0F + IQ1S_DELTA - (qh & 0x8000) * (2.0F * IQ1S_DELTA / 0x8000);
+    return d1q * __low2float(bq8_1[iqs].ds) * (static_cast<float>(sumi) + delta * static_cast<float>(sumy));
+}
+
+__device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq,
+                                                    const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq1_m* bq1 = static_cast<const block_iq1_m*>(vbq) + kbx;
+    const int qs_packed    = get_int_b4(bq1->qs, iqs);
+    const std::uint8_t* qs = reinterpret_cast<const std::uint8_t*>(&qs_packed);
+    int sumi[2]   = {0, 0};
+    float sumf[2] = {0.0F, 0.0F};
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int qhl   = bq1->qh[2 * iqs + l0 / 4] >> (4 * ((l0 / 2) % 2));
+        const int grid  = kIq1sGridGpu[qs[l0 / 2] | ((qhl & 0x07) << 8)];
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+        const int u0    = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1    = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+        sumi[l0 / 4]    = __dp4a(grid0, u0, sumi[l0 / 4]);
+        sumi[l0 / 4]    = __dp4a(grid1, u1, sumi[l0 / 4]);
+        const float delta = -1.0F + IQ1M_DELTA - (qhl & 0x08) * (2.0F * IQ1M_DELTA / 0x08);
+        int sumy = 0;
+        sumy     = __dp4a(u0, 0x01010101, sumy);
+        sumy     = __dp4a(u1, 0x01010101, sumy);
+        sumf[l0 / 4] += delta * sumy;
+    }
+    const std::uint16_t* sc = reinterpret_cast<const std::uint16_t*>(bq1->scales);
+    const float d = __half2float(iq1m_block_scale(*bq1)) * __low2float(bq8_1[iqs].ds);
+    const int tmp = sc[iqs / 2] >> (6 * (iqs % 2));
+    const int sc0 = 2 * ((tmp >> 0) & 0x07) + 1;
+    const int sc1 = 2 * ((tmp >> 3) & 0x07) + 1;
+    return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
+}
+
+/// IQ4_XS: IQ4_NL's table over a superblock, one 6-bit scale per 32 split across two fields.
+__device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vbq,
+                                                     const block_q8_1* __restrict__ bq8_1,
+                                                     const int& kbx, const int& iqs) {
+    const block_iq4_xs* bq4 = static_cast<const block_iq4_xs*>(vbq) + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int2 v     = iq4_nl_levels(aux_q4);
+        const int u0     = get_int_b4(bq8_1[iqs / 4].qs, j + 0);
+        const int u1     = get_int_b4(bq8_1[iqs / 4].qs, j + 4);
+        sumi             = __dp4a(v.x, u0, sumi);
+        sumi             = __dp4a(v.y, u1, sumi);
+    }
+    const int ls = ((bq4->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs / 2)) & 0x03) << 4);
+    sumi *= ls - 32;
+    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs / 4].ds);
+    return d * sumi;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The microscaling floats: E2M1 nibbles through the doubled table, the shared scale halved.
+__device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq,
+                                                    const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_mxfp4* bq4 = static_cast<const block_mxfp4*>(vbq) + kbx;
+    const int* q8          = reinterpret_cast<const int*>(bq8_1->qs) + iqs;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
+        const int2 v     = table16_levels(aux_q4, kFp4Values);
+        sumi             = __dp4a(v.x, q8[l + 0], sumi);
+        sumi             = __dp4a(v.y, q8[l + 4], sumi);
+    }
+    const float d = e8m0_to_fp32_half(bq4->e) * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
+__device__ __forceinline__ float vec_dot_nvfp4_q8_1(const void* __restrict__ vbq,
+                                                    const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_nvfp4* bq4 = static_cast<const block_nvfp4*>(vbq) + kbx;
+    float sum = 0.0F;
+#pragma unroll
+    for (int i = 0; i < VDR_NVFP4_Q8_1_MMVQ / 2; ++i) {
+        const int iqs0 = iqs + 2 * i;
+        const int iqs1 = iqs0 + 1;
+        const int is   = iqs0 >> 1;
+        const int2 v0  = table16_levels(get_int_b4(bq4->qs, iqs0), kFp4Values);
+        const int2 v1  = table16_levels(get_int_b4(bq4->qs, iqs1), kFp4Values);
+        const block_q8_1* bq8 = bq8_1 + (is >> 1);
+        const int i8          = ((is & 1) << 2);
+        int sumi = __dp4a(v0.x, get_int_b4(bq8->qs, i8 + 0), 0);
+        sumi     = __dp4a(v0.y, get_int_b4(bq8->qs, i8 + 2), sumi);
+        sumi     = __dp4a(v1.x, get_int_b4(bq8->qs, i8 + 1), sumi);
+        sumi     = __dp4a(v1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
+        const float d = ue4m3_to_fp32_half(bq4->d[is]) * __low2float(bq8->ds);
+        sum += d * static_cast<float>(sumi);
+    }
+    return sum;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The plain 1- and 2-bit blocks: `__byte_perm` spreads the packed bits to one int8 per byte.
+__device__ __forceinline__ float vec_dot_q1_0_q8_1(const void* __restrict__ vbq,
+                                                   const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q1_0* bq1_0 = static_cast<const block_q1_0*>(vbq) + kbx;
+    // 128 values under one scale; iqs picks one of four 32-value chunks, each a q8_1 block
+    const float d1            = __half2float(bq1_0->d);
+    const std::int16_t* qs    = reinterpret_cast<const std::int16_t*>(bq1_0->qs) + iqs * 2;
+    const block_q8_1* bq8     = bq8_1 + iqs;
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int q  = qs[j];
+        const int u0 = get_int_b4(bq8->qs, j * 4 + 0);
+        const int u1 = get_int_b4(bq8->qs, j * 4 + 1);
+        const int u2 = get_int_b4(bq8->qs, j * 4 + 2);
+        const int u3 = get_int_b4(bq8->qs, j * 4 + 3);
+        // unpack crumbs into nibble indices, nibbles into bytes, then unshuffle
+        const int n0 = __byte_perm(0x11100100, 0x11100100, q >> 0);
+        const int n1 = __byte_perm(0x11100100, 0x11100100, q >> 2);
+        const int s0 = __byte_perm(0x01FF, 0x01FF, n0 >> 0);
+        const int s1 = __byte_perm(0x01FF, 0x01FF, n1 >> 0);
+        const int s2 = __byte_perm(0x01FF, 0x01FF, n0 >> 16);
+        const int s3 = __byte_perm(0x01FF, 0x01FF, n1 >> 16);
+        const int v0 = __byte_perm(s0, s1, 0x5410);
+        const int v1 = __byte_perm(s0, s1, 0x7632);
+        const int v2 = __byte_perm(s2, s3, 0x5410);
+        const int v3 = __byte_perm(s2, s3, 0x7632);
+        sumi = __dp4a(v0, u0, sumi);
+        sumi = __dp4a(v1, u1, sumi);
+        sumi = __dp4a(v2, u2, sumi);
+        sumi = __dp4a(v3, u3, sumi);
+    }
+    return d1 * __low2float(bq8->ds) * sumi;
+}
+
+__device__ __forceinline__ float vec_dot_q2_0_q8_1(const void* __restrict__ vbq,
+                                                   const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q2_0* bq2_0 = static_cast<const block_q2_0*>(vbq) + kbx;
+    // 64 values under one scale; iqs picks one of two 32-value chunks
+    const float d2         = __half2float(bq2_0->d);
+    const std::int16_t* qs = reinterpret_cast<const std::int16_t*>(bq2_0->qs) + iqs * 4;
+    const block_q8_1* bq8  = bq8_1 + iqs;
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q  = qs[j];
+        const int u  = get_int_b4(bq8->qs, j * 2 + 0);
+        const int v  = get_int_b4(bq8->qs, j * 2 + 1);
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+        sumi = __dp4a(u, qx, sumi);
+        sumi = __dp4a(v, qy, sumi);
+    }
+    return d2 * __low2float(bq8->ds) * sumi;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The ternary pair. llama.cpp serves neither on CUDA, so these are ours: `iqs` picks one of the
+// eight 32-value runs of the superblock, the run is decoded to int8 codes through the shared
+// scalar decoder and dotted against its q8_1 block. Correct rather than fast -- no GGUF on the
+// board carries them.
+__device__ __forceinline__ float vec_dot_tq1_0_q8_1(const void* __restrict__ vbq,
+                                                    const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_tq1_0& x = static_cast<const block_tq1_0*>(vbq)[kbx];
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int v0 = 32 * iqs + 4 * j;
+        const char4 c = make_char4(static_cast<signed char>(tq1_0_trit(x, v0 + 0)), static_cast<signed char>(tq1_0_trit(x, v0 + 1)),
+                                   static_cast<signed char>(tq1_0_trit(x, v0 + 2)), static_cast<signed char>(tq1_0_trit(x, v0 + 3)));
+        sumi = __dp4a(*reinterpret_cast<const int*>(&c), get_int_b4(bq8_1[iqs].qs, j), sumi);
+    }
+    return __half2float(x.d) * __low2float(bq8_1[iqs].ds) * sumi;
+}
+
+__device__ __forceinline__ float vec_dot_tq2_0_q8_1(const void* __restrict__ vbq,
+                                                    const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_tq2_0& x = static_cast<const block_tq2_0*>(vbq)[kbx];
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int v0 = 32 * iqs + 4 * j;
+        const char4 c = make_char4(static_cast<signed char>(tq2_0_code(x, v0 + 0)), static_cast<signed char>(tq2_0_code(x, v0 + 1)),
+                                   static_cast<signed char>(tq2_0_code(x, v0 + 2)), static_cast<signed char>(tq2_0_code(x, v0 + 3)));
+        sumi = __dp4a(*reinterpret_cast<const int*>(&c), get_int_b4(bq8_1[iqs].qs, j), sumi);
+    }
+    return __half2float(x.d) * __low2float(bq8_1[iqs].ds) * sumi;
+}
+
 } // namespace sinfer::ops::detail::ggml

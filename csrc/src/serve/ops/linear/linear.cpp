@@ -108,17 +108,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16S:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
-    case QType::Q2_K:
-    case QType::Q3_K:
-    case QType::Q4_K:
-    case QType::Q5_K:
-    case QType::Q6_K:
-    case QType::Q8_0:
-    case QType::Q4_1:
-    case QType::Q5_1:
-    case QType::IQ4_NL:
-    case QType::Q4_0:
-    case QType::Q5_0:
+#define SINFER_GGML_QTYPE_CASE(NAME) case QType::NAME:
+    SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_QTYPE_CASE)
+#undef SINFER_GGML_QTYPE_CASE
         // The K-quant route quantises its activation to int8 per 32 whatever the policy:
         // that is the format's native compute, not an A8 profile the caller opts into.
         detail::ggml::ggml_linear(x, w, out, workspace, stream);
@@ -171,17 +163,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16S:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
-    case QType::Q2_K:
-    case QType::Q3_K:
-    case QType::Q4_K:
-    case QType::Q5_K:
-    case QType::Q6_K:
-    case QType::Q8_0:
-    case QType::Q4_1:
-    case QType::Q5_1:
-    case QType::IQ4_NL:
-    case QType::Q4_0:
-    case QType::Q5_0:
+#define SINFER_GGML_QTYPE_CASE(NAME) case QType::NAME:
+    SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_QTYPE_CASE)
+#undef SINFER_GGML_QTYPE_CASE
         return detail::ggml::ggml_linear_workspace_capacity_bytes(output_rows, input_rows,
                                                                    max_tokens);
     case QType::FP32_CTRL:

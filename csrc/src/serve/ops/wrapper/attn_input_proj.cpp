@@ -227,12 +227,9 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     }
 
     switch (parent_qtype) {
-    case QType::Q2_K:
-    case QType::Q3_K:
-    case QType::Q4_K:
-    case QType::Q5_K:
-    case QType::Q6_K:
-    case QType::Q8_0:
+#define SINFER_GGML_QTYPE_CASE(NAME) case QType::NAME:
+    SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_QTYPE_CASE)
+#undef SINFER_GGML_QTYPE_CASE
         // the parent is split by row range; the widest range is the parent itself
         return detail::ggml::ggml_linear_workspace_capacity_bytes(parent_rows, input_rows,
                                                                    max_tokens);

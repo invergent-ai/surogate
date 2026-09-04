@@ -59,11 +59,10 @@ template <class Epilogue>
 void launch_typed(gg::GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
                   const gg::block_q8_1* y, const Epilogue& epilogue, cudaStream_t stream) {
     switch (type) {
-    case gg::GgmlType::Q2_K: launch_rows<gg::GgmlType::Q2_K>(blocks, rows, k, y, epilogue, stream); return;
-    case gg::GgmlType::Q3_K: launch_rows<gg::GgmlType::Q3_K>(blocks, rows, k, y, epilogue, stream); return;
-    case gg::GgmlType::Q4_K: launch_rows<gg::GgmlType::Q4_K>(blocks, rows, k, y, epilogue, stream); return;
-    case gg::GgmlType::Q5_K: launch_rows<gg::GgmlType::Q5_K>(blocks, rows, k, y, epilogue, stream); return;
-    case gg::GgmlType::Q6_K: launch_rows<gg::GgmlType::Q6_K>(blocks, rows, k, y, epilogue, stream); return;
+#define SINFER_GDN_CASE(NAME)                                                                      \
+    case gg::GgmlType::NAME: launch_rows<gg::GgmlType::NAME>(blocks, rows, k, y, epilogue, stream); return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_GDN_CASE)
+#undef SINFER_GDN_CASE
     }
     throw std::invalid_argument("ggml gdn_input: unknown GGML type");
 }

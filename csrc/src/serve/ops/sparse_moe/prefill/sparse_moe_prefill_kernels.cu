@@ -5,6 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/ggml/ggml_prefill_codec.cuh"
 #include "ops/linear/ggml/ggml_q8_1.h"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"

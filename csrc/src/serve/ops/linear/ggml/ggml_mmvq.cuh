@@ -62,6 +62,64 @@ template <> struct Traits<GgmlType::Q6_K> {
     static constexpr int qk = QK_K, qi = QI6_K, vdr = VDR_Q6_K_Q8_1_MMVQ;
     static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_q6_K_q8_1;
 };
+// The ternary pair's traits are ours (llama.cpp has no CUDA path for them): eight 32-value
+// runs per superblock, one lane each.
+template <> struct Traits<GgmlType::IQ2_XXS> {
+    static constexpr int qk = QK_K, qi = QI2_XXS, vdr = VDR_IQ2_XXS_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_iq2_xxs_q8_1;
+};
+template <> struct Traits<GgmlType::IQ2_XS> {
+    static constexpr int qk = QK_K, qi = QI2_XS, vdr = VDR_IQ2_XS_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_iq2_xs_q8_1;
+};
+template <> struct Traits<GgmlType::IQ2_S> {
+    static constexpr int qk = QK_K, qi = QI2_S, vdr = VDR_IQ2_S_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_iq2_s_q8_1;
+};
+template <> struct Traits<GgmlType::IQ3_XXS> {
+    static constexpr int qk = QK_K, qi = QI3_XXS, vdr = VDR_IQ3_XXS_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_iq3_xxs_q8_1;
+};
+template <> struct Traits<GgmlType::IQ3_S> {
+    static constexpr int qk = QK_K, qi = QI3_S, vdr = VDR_IQ3_S_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_iq3_s_q8_1;
+};
+template <> struct Traits<GgmlType::IQ1_S> {
+    static constexpr int qk = QK_K, qi = QI1_S, vdr = VDR_IQ1_S_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_iq1_s_q8_1;
+};
+template <> struct Traits<GgmlType::IQ1_M> {
+    static constexpr int qk = QK_K, qi = QI1_M, vdr = VDR_IQ1_M_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_iq1_m_q8_1;
+};
+template <> struct Traits<GgmlType::IQ4_XS> {
+    static constexpr int qk = QK_K, qi = QI4_XS, vdr = VDR_IQ4_XS_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_iq4_xs_q8_1;
+};
+template <> struct Traits<GgmlType::TQ1_0> {
+    static constexpr int qk = QK_K, qi = 8, vdr = 1;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_tq1_0_q8_1;
+};
+template <> struct Traits<GgmlType::TQ2_0> {
+    static constexpr int qk = QK_K, qi = 8, vdr = 1;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_tq2_0_q8_1;
+};
+template <> struct Traits<GgmlType::MXFP4> {
+    static constexpr int qk = QK_MXFP4, qi = QI_MXFP4, vdr = VDR_MXFP4_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_mxfp4_q8_1;
+};
+template <> struct Traits<GgmlType::NVFP4_GGML> {
+    static constexpr int qk = QK_NVFP4, qi = QI_NVFP4, vdr = VDR_NVFP4_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_nvfp4_q8_1;
+};
+template <> struct Traits<GgmlType::Q1_0> {
+    static constexpr int qk = QK1_0, qi = QI1_0, vdr = VDR_Q1_0_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_q1_0_q8_1;
+};
+template <> struct Traits<GgmlType::Q2_0> {
+    static constexpr int qk = QK2_0, qi = QI2_0, vdr = VDR_Q2_0_Q8_1_MMVQ;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_q2_0_q8_1;
+};
 
 // llama.cpp's NVIDIA ("generic") schedule table: warps per CTA and rows per CTA by column count.
 __host__ __device__ constexpr int calc_nwarps(int ncols_dst) { return ncols_dst <= 4 ? 4 : 2; }

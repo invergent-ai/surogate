@@ -16,19 +16,13 @@
 
 namespace sinfer::ops::detail::ggml {
 
+// Both maps are written over the one list, so a format added there is admitted here by
+// construction; the two enums spell every name the same way.
 bool is_ggml_qtype(QType qtype) noexcept {
     switch (qtype) {
-    case QType::Q2_K:
-    case QType::Q3_K:
-    case QType::Q4_K:
-    case QType::Q5_K:
-    case QType::Q6_K:
-    case QType::Q8_0:
-    case QType::Q4_1:
-    case QType::Q5_1:
-    case QType::IQ4_NL:
-    case QType::Q4_0:
-    case QType::Q5_0:
+#define SINFER_GGML_IS_CASE(NAME) case QType::NAME:
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_IS_CASE)
+#undef SINFER_GGML_IS_CASE
         return true;
     default:
         return false;
@@ -37,17 +31,9 @@ bool is_ggml_qtype(QType qtype) noexcept {
 
 GgmlType ggml_type_for(QType qtype) {
     switch (qtype) {
-    case QType::Q2_K: return GgmlType::Q2_K;
-    case QType::Q3_K: return GgmlType::Q3_K;
-    case QType::Q4_K: return GgmlType::Q4_K;
-    case QType::Q5_K: return GgmlType::Q5_K;
-    case QType::Q6_K: return GgmlType::Q6_K;
-    case QType::Q8_0: return GgmlType::Q8_0;
-    case QType::Q4_1: return GgmlType::Q4_1;
-    case QType::Q5_1: return GgmlType::Q5_1;
-    case QType::IQ4_NL: return GgmlType::IQ4_NL;
-    case QType::Q4_0: return GgmlType::Q4_0;
-    case QType::Q5_0: return GgmlType::Q5_0;
+#define SINFER_GGML_MAP_CASE(NAME) case QType::NAME: return GgmlType::NAME;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_MAP_CASE)
+#undef SINFER_GGML_MAP_CASE
     default: break;
     }
     throw std::invalid_argument("ggml: weight qtype is not a GGML block format");

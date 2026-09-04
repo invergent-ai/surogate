@@ -84,6 +84,23 @@ Q5_1 = GgmlBlockFormat("Q5_1", 6.0, 24, 32)
 IQ4_NL = GgmlBlockFormat("IQ4_NL", 4.5, 18, 32)
 Q4_0 = GgmlBlockFormat("Q4_0", 4.5, 18, 32)
 Q5_0 = GgmlBlockFormat("Q5_0", 5.5, 22, 32)
+# The importance-matrix quants (codebook rows plus signs, superblocks of 256), the ternary
+# pair, the two microscaling floats (MXFP4 32 under an E8M0 exponent, NVFP4 64 under four
+# UE4M3 sub-scales) and the plain 1- and 2-bit blocks (128 and 64 values under one scale).
+IQ2_XXS = GgmlBlockFormat("IQ2_XXS", 2.0625, 66)
+IQ2_XS = GgmlBlockFormat("IQ2_XS", 2.3125, 74)
+IQ2_S = GgmlBlockFormat("IQ2_S", 2.5625, 82)
+IQ3_XXS = GgmlBlockFormat("IQ3_XXS", 3.0625, 98)
+IQ3_S = GgmlBlockFormat("IQ3_S", 3.4375, 110)
+IQ1_S = GgmlBlockFormat("IQ1_S", 1.5625, 50)
+IQ1_M = GgmlBlockFormat("IQ1_M", 1.75, 56)
+IQ4_XS = GgmlBlockFormat("IQ4_XS", 4.25, 136)
+TQ1_0 = GgmlBlockFormat("TQ1_0", 1.6875, 54)
+TQ2_0 = GgmlBlockFormat("TQ2_0", 2.0625, 66)
+MXFP4 = GgmlBlockFormat("MXFP4", 4.25, 17, 32)
+NVFP4_GGML = GgmlBlockFormat("NVFP4_GGML", 4.5, 36, 64)
+Q1_0 = GgmlBlockFormat("Q1_0", 1.125, 18, 128)
+Q2_0 = GgmlBlockFormat("Q2_0", 2.25, 18, 64)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -100,7 +117,8 @@ FP8_ROW_FORMATS = MappingProxyType(
     {FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S}
 )
 GGML_BLOCK_FORMATS = MappingProxyType(
-    {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0)}
+    {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0,
+                            IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4_GGML, Q1_0, Q2_0)}
 )
 NUMERIC_FORMATS = MappingProxyType(
     {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **GGML_BLOCK_FORMATS}
@@ -194,6 +212,20 @@ __all__ = [
     "IQ4_NL",
     "Q4_0",
     "Q5_0",
+    "IQ2_XXS",
+    "IQ2_XS",
+    "IQ2_S",
+    "IQ3_XXS",
+    "IQ3_S",
+    "IQ1_S",
+    "IQ1_M",
+    "IQ4_XS",
+    "TQ1_0",
+    "TQ2_0",
+    "MXFP4",
+    "NVFP4_GGML",
+    "Q1_0",
+    "Q2_0",
     "BF16",
     "DIRECT_FORMATS",
     "DirectFormat",

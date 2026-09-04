@@ -321,7 +321,21 @@ int main() {
                  {"Q4_K", QType::Q4_K}, {"Q5_K", QType::Q5_K}, {"Q6_K", QType::Q6_K},
                  {"Q2_K", QType::Q2_K}, {"Q3_K", QType::Q3_K}, {"Q8_0", QType::Q8_0},
                  {"Q4_1", QType::Q4_1}, {"Q5_1", QType::Q5_1}, {"IQ4_NL", QType::IQ4_NL},
-                 {"Q4_0", QType::Q4_0}, {"Q5_0", QType::Q5_0}}) {
+                 {"Q4_0", QType::Q4_0}, {"Q5_0", QType::Q5_0},
+          {"IQ2_XXS", QType::IQ2_XXS},
+          {"IQ2_XS", QType::IQ2_XS},
+          {"IQ2_S", QType::IQ2_S},
+          {"IQ3_XXS", QType::IQ3_XXS},
+          {"IQ3_S", QType::IQ3_S},
+          {"IQ1_S", QType::IQ1_S},
+          {"IQ1_M", QType::IQ1_M},
+          {"IQ4_XS", QType::IQ4_XS},
+          {"TQ1_0", QType::TQ1_0},
+          {"TQ2_0", QType::TQ2_0},
+          {"MXFP4", QType::MXFP4},
+          {"NVFP4_GGML", QType::NVFP4_GGML},
+          {"Q1_0", QType::Q1_0},
+          {"Q2_0", QType::Q2_0}}) {
             const std::int64_t gate_row = ops::ggml_row_bytes(type, H);
             const std::int64_t down_row = ops::ggml_row_bytes(type, I);
             std::vector<std::byte> gate(static_cast<std::size_t>(E) * 2 * I * gate_row);

@@ -122,6 +122,20 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "IQ4_NL") { return NumericFormat::IQ4_NL; }
     if (name == "Q4_0") { return NumericFormat::Q4_0; }
     if (name == "Q5_0") { return NumericFormat::Q5_0; }
+    if (name == "IQ2_XXS") { return NumericFormat::IQ2_XXS; }
+    if (name == "IQ2_XS") { return NumericFormat::IQ2_XS; }
+    if (name == "IQ2_S") { return NumericFormat::IQ2_S; }
+    if (name == "IQ3_XXS") { return NumericFormat::IQ3_XXS; }
+    if (name == "IQ3_S") { return NumericFormat::IQ3_S; }
+    if (name == "IQ1_S") { return NumericFormat::IQ1_S; }
+    if (name == "IQ1_M") { return NumericFormat::IQ1_M; }
+    if (name == "IQ4_XS") { return NumericFormat::IQ4_XS; }
+    if (name == "TQ1_0") { return NumericFormat::TQ1_0; }
+    if (name == "TQ2_0") { return NumericFormat::TQ2_0; }
+    if (name == "MXFP4") { return NumericFormat::MXFP4; }
+    if (name == "NVFP4_GGML") { return NumericFormat::NVFP4_GGML; }
+    if (name == "Q1_0") { return NumericFormat::Q1_0; }
+    if (name == "Q2_0") { return NumericFormat::Q2_0; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 

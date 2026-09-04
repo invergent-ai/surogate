@@ -136,9 +136,22 @@ def _planes_iq4_nl(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # nowhere to put a min, so they are served as the file holds them or not at all.
 NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210, "Q8_0": 34,
                 "Q4_1": 20, "Q5_1": 24, "IQ4_NL": 18,
-                "Q4_0": 18, "Q5_0": 22}
+                "Q4_0": 18, "Q5_0": 22,
+                "IQ2_XXS": 66, "IQ2_XS": 74, "IQ2_S": 82, "IQ3_XXS": 98, "IQ3_S": 110, "IQ1_S": 50, "IQ1_M": 56, "IQ4_XS": 136,
+                "TQ1_0": 54, "TQ2_0": 66, "MXFP4": 17, "NVFP4": 36, "Q1_0": 18, "Q2_0": 18}
 NATIVE_BLOCK_VALUES = {"Q8_0": 32, "Q4_1": 32, "Q5_1": 32, "IQ4_NL": 32, "Q4_0": 32,
-                       "Q5_0": 32}
+                       "Q5_0": 32, "MXFP4": 32, "NVFP4": 64, "Q1_0": 128, "Q2_0": 64}
+# The GGUF spells its microscaling block type "NVFP4", a name the artifact already gives the
+# compressed-tensors block-scaled format; as a stored block type it is "NVFP4_GGML". Both
+# tables answer to both spellings so a lookup by either side's name lands.
+ARTIFACT_FORMAT_FOR_GGML = {"NVFP4": "NVFP4_GGML"}
+NATIVE_TYPES["NVFP4_GGML"] = NATIVE_TYPES["NVFP4"]
+NATIVE_BLOCK_VALUES["NVFP4_GGML"] = NATIVE_BLOCK_VALUES["NVFP4"]
+
+
+def artifact_format_for_ggml(gguf_type: str) -> str:
+    """The artifact format name a GGUF block type is stored under."""
+    return ARTIFACT_FORMAT_FOR_GGML.get(gguf_type, gguf_type)
 
 
 def native_block_values(gguf_type: str) -> int:
@@ -442,7 +455,7 @@ class GgufRepackSource:
             for name, (gguf_type, rows) in zip(names, runs):
                 out.append(
                     replace(spec, name=name, shape=(rows, int(spec.shape[1])),
-                            format=gguf_type, layout=_NATIVE_LAYOUT)
+                            format=artifact_format_for_ggml(gguf_type), layout=_NATIVE_LAYOUT)
                 )
         return tuple(out)
 
@@ -462,7 +475,7 @@ class GgufRepackSource:
                 out.append(spec)
             else:
                 extra = {"runs": runs[name]} if runs is not None and name in runs else {}
-                out.append(replace(spec, format=gguf_type, layout=_NATIVE_LAYOUT, **extra))
+                out.append(replace(spec, format=artifact_format_for_ggml(gguf_type), layout=_NATIVE_LAYOUT, **extra))
         return tuple(out)
 
     def _native_rows(self, hf_name: str) -> np.ndarray:

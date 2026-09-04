@@ -40,6 +40,20 @@ enum class NumericFormat {
     IQ4_NL,
     Q4_0,
     Q5_0,
+    IQ2_XXS,
+    IQ2_XS,
+    IQ2_S,
+    IQ3_XXS,
+    IQ3_S,
+    IQ1_S,
+    IQ1_M,
+    IQ4_XS,
+    TQ1_0,
+    TQ2_0,
+    MXFP4,
+    NVFP4_GGML,
+    Q1_0,
+    Q2_0,
 };
 
 enum class StorageLayout {

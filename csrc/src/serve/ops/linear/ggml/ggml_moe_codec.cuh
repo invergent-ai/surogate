@@ -239,6 +239,205 @@ __host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ4_NL>(const vo
 
 /// The sparse-MoE codec seam: a 256-value group is one superblock, so a warp's 32 lanes cover it
 /// with eight values each. `high` and `scales` are unused -- a superblock carries its own.
+// ---------------------------------------------------------------------------------------------
+// The IQ family: a lane's eight values are exactly one grid row (IQ2, IQ1) or two four-value
+// rows (IQ3), so this is llama.cpp's dequantiser with (il, ib) read off the lane: values
+// 32*ib + 8*il, i.e. ib = lane / 4, il = lane % 4.
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ2_XXS>(const void* blocks, std::int64_t ib,
+                                                                int lane, float (&w)[8]) {
+    const block_iq2_xxs& x = static_cast<const block_iq2_xxs*>(blocks)[ib];
+    const int il = lane % 4, b = lane / 4;
+    const std::uint16_t* q2   = x.qs + 4 * b;
+    const std::uint8_t* aux8  = reinterpret_cast<const std::uint8_t*>(q2);
+    const std::uint8_t* grid  = reinterpret_cast<const std::uint8_t*>(kIq2xxsGrid + aux8[il]);
+    const std::uint32_t aux32 = q2[2] | (static_cast<std::uint32_t>(q2[3]) << 16);
+    const float d             = __half2float(x.d) * (0.5F + (aux32 >> 28)) * 0.25F;
+    const std::uint8_t signs  = kIq2xsSigns[(aux32 >> 7 * il) & 127];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * grid[j] * ((signs & kIq2xsMask[j]) ? -1.0F : 1.0F); }
+}
+
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ2_XS>(const void* blocks, std::int64_t ib,
+                                                               int lane, float (&w)[8]) {
+    const block_iq2_xs& x = static_cast<const block_iq2_xs*>(blocks)[ib];
+    const int il = lane % 4, b = lane / 4;
+    const std::uint16_t* q2  = x.qs + 4 * b;
+    const std::uint8_t* grid = reinterpret_cast<const std::uint8_t*>(kIq2xsGrid + (q2[il] & 511));
+    const float d            = __half2float(x.d) * (0.5F + ((x.scales[b] >> 4 * (il / 2)) & 0xF)) * 0.25F;
+    const std::uint8_t signs = kIq2xsSigns[q2[il] >> 9];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * grid[j] * ((signs & kIq2xsMask[j]) ? -1.0F : 1.0F); }
+}
+
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ2_S>(const void* blocks, std::int64_t ib,
+                                                              int lane, float (&w)[8]) {
+    const block_iq2_s& x = static_cast<const block_iq2_s*>(blocks)[ib];
+    const int il = lane % 4, b = lane / 4;
+    const std::uint8_t* grid = reinterpret_cast<const std::uint8_t*>(
+        kIq2sGrid + (x.qs[4 * b + il] | ((x.qh[b] << (8 - 2 * il)) & 0x300)));
+    const float d            = __half2float(x.d) * (0.5F + ((x.scales[b] >> 4 * (il / 2)) & 0xF)) * 0.25F;
+    const std::uint8_t signs = x.qs[QK_K / 8 + 4 * b + il];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * grid[j] * ((signs & kIq2xsMask[j]) ? -1.0F : 1.0F); }
+}
+
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ3_XXS>(const void* blocks, std::int64_t ib,
+                                                                int lane, float (&w)[8]) {
+    const block_iq3_xxs& x = static_cast<const block_iq3_xxs*>(blocks)[ib];
+    const int il = lane % 4, b = lane / 4;
+    const std::uint8_t* q3    = x.qs + 8 * b;
+    const std::uint16_t* gas  = reinterpret_cast<const std::uint16_t*>(x.qs + QK_K / 4) + 2 * b;
+    const std::uint8_t* grid1 = reinterpret_cast<const std::uint8_t*>(kIq3xxsGrid + q3[2 * il + 0]);
+    const std::uint8_t* grid2 = reinterpret_cast<const std::uint8_t*>(kIq3xxsGrid + q3[2 * il + 1]);
+    const std::uint32_t aux32 = gas[0] | (static_cast<std::uint32_t>(gas[1]) << 16);
+    const float d             = __half2float(x.d) * (0.5F + (aux32 >> 28)) * 0.5F;
+    const std::uint8_t signs  = kIq2xsSigns[(aux32 >> 7 * il) & 127];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        w[j + 0] = d * grid1[j] * ((signs & kIq2xsMask[j + 0]) ? -1.0F : 1.0F);
+        w[j + 4] = d * grid2[j] * ((signs & kIq2xsMask[j + 4]) ? -1.0F : 1.0F);
+    }
+}
+
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ3_S>(const void* blocks, std::int64_t ib,
+                                                              int lane, float (&w)[8]) {
+    const block_iq3_s& x = static_cast<const block_iq3_s*>(blocks)[ib];
+    const int il = lane % 4, b = lane / 4;
+    const std::uint8_t* qs    = x.qs + 8 * b;
+    const std::uint8_t* grid1 = reinterpret_cast<const std::uint8_t*>(kIq3sGrid + (qs[2 * il + 0] | ((x.qh[b] << (8 - 2 * il)) & 256)));
+    const std::uint8_t* grid2 = reinterpret_cast<const std::uint8_t*>(kIq3sGrid + (qs[2 * il + 1] | ((x.qh[b] << (7 - 2 * il)) & 256)));
+    const float d             = __half2float(x.d) * (1 + 2 * ((x.scales[b / 2] >> 4 * (b % 2)) & 0xF));
+    const std::uint8_t signs  = x.signs[4 * b + il];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        w[j + 0] = d * grid1[j] * ((signs & kIq2xsMask[j + 0]) ? -1.0F : 1.0F);
+        w[j + 4] = d * grid2[j] * ((signs & kIq2xsMask[j + 4]) ? -1.0F : 1.0F);
+    }
+}
+
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ1_S>(const void* blocks, std::int64_t ib,
+                                                              int lane, float (&w)[8]) {
+    const block_iq1_s& x = static_cast<const block_iq1_s*>(blocks)[ib];
+    const int il = lane % 4, b = lane / 4;
+    const float delta = (x.qh[b] & 0x8000) ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d     = __half2float(x.d) * (2 * ((x.qh[b] >> 12) & 7) + 1);
+    std::uint32_t grid32[2];
+    const std::int8_t* q = reinterpret_cast<const std::int8_t*>(grid32);
+    grid32[0] = kIq1sGridGpu[x.qs[4 * b + il] | (((x.qh[b] >> 3 * il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0F0F0F0F;
+    grid32[0] &= 0x0F0F0F0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * (q[j] + delta); }
+}
+
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ1_M>(const void* blocks, std::int64_t ib,
+                                                              int lane, float (&w)[8]) {
+    const block_iq1_m& x = static_cast<const block_iq1_m*>(blocks)[ib];
+    const int il = lane % 4, b = lane / 4;
+    const std::uint16_t* sc = reinterpret_cast<const std::uint16_t*>(x.scales);
+    const int ib16          = 2 * b + il / 2;
+    const float d           = __half2float(iq1m_block_scale(x)) * (2 * ((sc[ib16 / 4] >> 3 * (ib16 % 4)) & 0x7) + 1);
+    const float delta       = (x.qh[2 * b + il / 2] & (0x08 << 4 * (il % 2))) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
+    std::uint32_t grid32[2];
+    const std::int8_t* q = reinterpret_cast<const std::int8_t*>(grid32);
+    grid32[0] = kIq1sGridGpu[x.qs[4 * b + il] | (((x.qh[2 * b + il / 2] >> 4 * (il % 2)) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0F0F0F0F;
+    grid32[0] &= 0x0F0F0F0F;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * (q[j] + delta); }
+}
+
+/// IQ4_XS: eight consecutive values are eight low nibbles or eight high nibbles of one 16-byte
+/// run, under that run's 6-bit scale.
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ4_XS>(const void* blocks, std::int64_t ib,
+                                                               int lane, float (&w)[8]) {
+    const block_iq4_xs& x = static_cast<const block_iq4_xs*>(blocks)[ib];
+    const int v0   = lane * 8;
+    const int b    = v0 / 32;          // the 32-value run
+    const int r    = v0 % 32;          // 0, 8 (low nibbles) or 16, 24 (high nibbles)
+    const bool high = r >= 16;
+    const std::uint8_t* q4 = x.qs + 16 * b + (high ? r - 16 : r);
+    const float d = __half2float(x.d) *
+                    ((((x.scales_l[b / 2] >> 4 * (b % 2)) & 0xF) | (((x.scales_h >> 2 * b) & 3) << 4)) - 32);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * kIq4nlValues[high ? (q4[j] >> 4) : (q4[j] & 0xF)]; }
+}
+
+/// The ternary pair, through the scalar decoders.
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::TQ1_0>(const void* blocks, std::int64_t ib,
+                                                              int lane, float (&w)[8]) {
+    const block_tq1_0& x = static_cast<const block_tq1_0*>(blocks)[ib];
+    const float d        = __half2float(x.d);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * static_cast<float>(tq1_0_trit(x, lane * 8 + j)); }
+}
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::TQ2_0>(const void* blocks, std::int64_t ib,
+                                                              int lane, float (&w)[8]) {
+    const block_tq2_0& x = static_cast<const block_tq2_0*>(blocks)[ib];
+    const float d        = __half2float(x.d);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * static_cast<float>(tq2_0_code(x, lane * 8 + j)); }
+}
+
+/// MXFP4: a 32-value block, four lanes; the low nibbles are the first sixteen values.
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::MXFP4>(const void* blocks, std::int64_t ib,
+                                                              int lane, float (&w)[8]) {
+    const block_mxfp4& x = static_cast<const block_mxfp4*>(blocks)[ib];
+    const int base  = lane * 8;
+    const bool high = base >= QK_MXFP4 / 2;
+    const int off   = high ? base - QK_MXFP4 / 2 : base;
+    const float d   = e8m0_to_fp32_half(x.e);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * kFp4Values[high ? (x.qs[off + j] >> 4) : (x.qs[off + j] & 0x0F)]; }
+}
+
+/// NVFP4: a 64-value block, eight lanes, two per 16-value sub-block (low nibbles, then high).
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::NVFP4_GGML>(const void* blocks, std::int64_t ib,
+                                                              int lane, float (&w)[8]) {
+    const block_nvfp4& x = static_cast<const block_nvfp4*>(blocks)[ib];
+    const int sub   = lane / 2;
+    const bool high = (lane % 2) != 0;
+    const std::uint8_t* qs = x.qs + sub * (QK_NVFP4_SUB / 2);
+    const float d          = ue4m3_to_fp32_half(x.d[sub]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = d * kFp4Values[high ? (qs[j] >> 4) : (qs[j] & 0x0F)]; }
+}
+
+/// Q1_0: 128 values, sixteen lanes, one byte of sign bits each. Q2_0: 64 values, eight lanes,
+/// two bytes each.
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q1_0>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    const block_q1_0& x = static_cast<const block_q1_0*>(blocks)[ib];
+    const float d       = __half2float(x.d);
+    const std::uint8_t bits = x.qs[lane];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { w[j] = ((bits >> j) & 1) ? d : -d; }
+}
+template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q2_0>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    const block_q2_0& x = static_cast<const block_q2_0*>(blocks)[ib];
+    const float d       = __half2float(x.d);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int v = lane * 8 + j;
+        w[j] = d * static_cast<float>(((x.qs[v / 4] >> ((v % 4) * 2)) & 0x03) - 1);
+    }
+}
+
 template <GgmlType type>
 struct GgmlMoeCodec {
     static constexpr bool kGateRowsFirst = true;

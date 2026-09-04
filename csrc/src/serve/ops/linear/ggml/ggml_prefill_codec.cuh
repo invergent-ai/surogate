@@ -16,6 +16,7 @@
 
 #include "ops/linear/ggml/ggml_blocks.h"
 #include "ops/linear/ggml/ggml_dequant.cuh"
+#include "ops/linear/ggml/ggml_moe_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cstddef>
@@ -25,6 +26,56 @@ namespace sinfer::ops::detail::ggml {
 
 inline constexpr int kPrefillTileK = 64;
 inline constexpr int kTilesPerBlock = QK_K / kPrefillTileK; // four
+
+/// Every other GGML format, through the eight-value decoder the gather and the CPU expert path
+/// already share. This is the BF16 route only -- the int8 tensor-core route wants an affine
+/// code-times-scale structure per 32 that the codebook and float formats do not have -- and it
+/// is the fallback, not the fast path: a lane decodes eight values to keep two. What it buys is
+/// that a resident-expert MoE in any stored format prefills instead of refusing.
+///
+/// Staging follows the block size. A block of 64 values or fewer is staged per 64-wide tile
+/// (the tile is a whole number of blocks); the 128- and 256-value blocks are staged per
+/// superblock as the "header", the way the K-quant codecs stage their scales. Blocks are
+/// staged whole and exact, in two-byte units, so nothing is read past a row's last block.
+template <GgmlType type>
+struct GgmlBlockPrefill {
+    static constexpr int kValues      = block_values(type);
+    static constexpr int kBytes       = block_bytes(type);
+    static constexpr bool kTileStaged = kValues <= kPrefillTileK;
+    static constexpr int kTileBytes   = kTileStaged ? (kPrefillTileK / kValues) * kBytes : 2;
+    static constexpr int kHeaderBytes = kTileStaged ? 2 : (QK_K / kValues) * kBytes;
+    /// Bytes per 256 values of a row: what the kernels stride rows by.
+    static constexpr int kBlockBytes  = (QK_K / kValues) * kBytes;
+    static constexpr bool kCpAsync    = false;
+    static constexpr int kMinBlocks   = 1;
+    static_assert(kPrefillTileK % kValues == 0 || kValues % kPrefillTileK == 0,
+                  "a tile is a whole number of blocks, or a block a whole number of tiles");
+    static_assert(kTileBytes % 2 == 0 && kHeaderBytes % 2 == 0, "staged in two-byte units");
+
+    __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
+        // the tile's blocks, contiguous: chunk c is bytes 16c.. of that run
+        if constexpr (kTileStaged) {
+            return (tile / kTilesPerBlock) * kBlockBytes + (tile % kTilesPerBlock) * kTileBytes + 16 * chunk;
+        } else {
+            (void)chunk;
+            return (tile / kTilesPerBlock) * kBlockBytes;
+        }
+    }
+    __device__ static __forceinline__ int header_offset(int tile) {
+        return (tile / kTilesPerBlock) * kBlockBytes;
+    }
+
+    __device__ static __forceinline__ __nv_bfloat162 decode(const std::uint8_t* tile,
+                                                            const std::uint8_t* header, int lane,
+                                                            int tile_in_block) {
+        // the lane's two values, as an index into the staged run of blocks
+        const int v0 = kTileStaged ? 2 * lane : tile_in_block * kPrefillTileK + 2 * lane;
+        const std::uint8_t* run = kTileStaged ? tile : header;
+        float w[8];
+        decode_eight<type>(run, v0 / kValues, (v0 % kValues) / 8, w);
+        return __floats2bfloat162_rn(w[v0 % 8], w[v0 % 8 + 1]);
+    }
+};
 
 /// Q4_K. A 64-value tile is exactly the 32 `qs` bytes of quarter `c`: their low nibbles are the
 /// tile's first thirty-two values, their high nibbles the last thirty-two. The pair a lane owns
@@ -281,5 +332,16 @@ struct GgmlQ6KPrefill {
                                      d * static_cast<float>(q1 - 32));
     }
 };
+
+/// The prefill codec of a stored format: the three K-quants with hand codecs (and the int8
+/// tensor-core route), everything else the generic BF16 route.
+template <GgmlType type>
+struct PrefillCodecFor {
+    using Codec = GgmlBlockPrefill<type>;
+    static constexpr bool kInt8Route = false;
+};
+template <> struct PrefillCodecFor<GgmlType::Q4_K> { using Codec = GgmlQ4KPrefill; static constexpr bool kInt8Route = true; };
+template <> struct PrefillCodecFor<GgmlType::Q5_K> { using Codec = GgmlQ5KPrefill; static constexpr bool kInt8Route = true; };
+template <> struct PrefillCodecFor<GgmlType::Q6_K> { using Codec = GgmlQ6KPrefill; static constexpr bool kInt8Route = true; };
 
 } // namespace sinfer::ops::detail::ggml

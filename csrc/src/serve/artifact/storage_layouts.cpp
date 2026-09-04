@@ -104,6 +104,34 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "Q4_0";
     case NumericFormat::Q5_0:
         return "Q5_0";
+    case NumericFormat::IQ2_XXS:
+        return "IQ2_XXS";
+    case NumericFormat::IQ2_XS:
+        return "IQ2_XS";
+    case NumericFormat::IQ2_S:
+        return "IQ2_S";
+    case NumericFormat::IQ3_XXS:
+        return "IQ3_XXS";
+    case NumericFormat::IQ3_S:
+        return "IQ3_S";
+    case NumericFormat::IQ1_S:
+        return "IQ1_S";
+    case NumericFormat::IQ1_M:
+        return "IQ1_M";
+    case NumericFormat::IQ4_XS:
+        return "IQ4_XS";
+    case NumericFormat::TQ1_0:
+        return "TQ1_0";
+    case NumericFormat::TQ2_0:
+        return "TQ2_0";
+    case NumericFormat::MXFP4:
+        return "MXFP4";
+    case NumericFormat::NVFP4_GGML:
+        return "NVFP4_GGML";
+    case NumericFormat::Q1_0:
+        return "Q1_0";
+    case NumericFormat::Q2_0:
+        return "Q2_0";
     }
     return {};
 }
@@ -134,13 +162,22 @@ std::uint64_t tensor_alignment(StorageLayout) noexcept { return kTensorAlignment
 
 std::uint64_t resource_alignment(ResourceEncoding) noexcept { return 1; }
 
-/// Values per stored block: a K-quant superblock is 256, the plain block types are 32.
+/// Values per stored block: a K-quant or IQ superblock is 256, the plain block types are 32 --
+/// except NVFP4 (64 under four sub-scales) and Q1_0 (128 under one scale).
 std::uint64_t ggml_block_values(NumericFormat format) {
-    return (format == NumericFormat::Q8_0 || format == NumericFormat::Q4_1 ||
-            format == NumericFormat::Q5_1 || format == NumericFormat::IQ4_NL ||
-            format == NumericFormat::Q4_0 || format == NumericFormat::Q5_0)
-               ? 32
-               : 256;
+    switch (format) {
+    case NumericFormat::Q8_0:
+    case NumericFormat::Q4_1:
+    case NumericFormat::Q5_1:
+    case NumericFormat::IQ4_NL:
+    case NumericFormat::Q4_0:
+    case NumericFormat::Q5_0:
+    case NumericFormat::MXFP4: return 32;
+    case NumericFormat::NVFP4_GGML: return 64;
+    case NumericFormat::Q1_0: return 128;
+    case NumericFormat::Q2_0: return 64;
+    default: return 256;
+    }
 }
 
 std::uint64_t ggml_block_bytes(NumericFormat format) {
@@ -156,6 +193,20 @@ std::uint64_t ggml_block_bytes(NumericFormat format) {
     case NumericFormat::IQ4_NL: return 18;
     case NumericFormat::Q4_0: return 18;
     case NumericFormat::Q5_0: return 22;
+    case NumericFormat::IQ2_XXS: return 66;
+    case NumericFormat::IQ2_XS: return 74;
+    case NumericFormat::IQ2_S: return 82;
+    case NumericFormat::IQ3_XXS: return 98;
+    case NumericFormat::IQ3_S: return 110;
+    case NumericFormat::IQ1_S: return 50;
+    case NumericFormat::IQ1_M: return 56;
+    case NumericFormat::IQ4_XS: return 136;
+    case NumericFormat::TQ1_0: return 54;
+    case NumericFormat::TQ2_0: return 66;
+    case NumericFormat::MXFP4: return 17;
+    case NumericFormat::NVFP4_GGML: return 36;
+    case NumericFormat::Q1_0: return 18;
+    case NumericFormat::Q2_0: return 18;
     default: break;
     }
     throw ArtifactError("format is not a GGML superblock format");

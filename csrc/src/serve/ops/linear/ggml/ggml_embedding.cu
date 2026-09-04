@@ -54,17 +54,10 @@ void embedding_gather_launch(GgmlType type, const void* table, std::int32_t voca
         throw std::invalid_argument("ggml embedding: table [vocab, hidden] with hidden a multiple of 256");
     }
     switch (type) {
-    case GgmlType::Q2_K: launch<GgmlType::Q2_K>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q3_K: launch<GgmlType::Q3_K>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q4_K: launch<GgmlType::Q4_K>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q5_K: launch<GgmlType::Q5_K>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q8_0: launch<GgmlType::Q8_0>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q6_K: launch<GgmlType::Q6_K>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q4_1: launch<GgmlType::Q4_1>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q5_1: launch<GgmlType::Q5_1>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::IQ4_NL: launch<GgmlType::IQ4_NL>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q4_0: launch<GgmlType::Q4_0>(table, ids, tokens, vocab, hidden, out, stream); return;
-    case GgmlType::Q5_0: launch<GgmlType::Q5_0>(table, ids, tokens, vocab, hidden, out, stream); return;
+#define SINFER_EMBED_CASE(NAME)                                                                    \
+    case GgmlType::NAME: launch<GgmlType::NAME>(table, ids, tokens, vocab, hidden, out, stream); return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_EMBED_CASE)
+#undef SINFER_EMBED_CASE
     }
     throw std::invalid_argument("ggml embedding: unknown GGML type");
 }

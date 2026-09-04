@@ -88,17 +88,9 @@ bool load_fixture(const std::string& dir, gg::GgmlType type, const std::string& 
 
 QType qtype_of(gg::GgmlType type) {
     switch (type) {
-    case gg::GgmlType::Q2_K: return QType::Q2_K;
-    case gg::GgmlType::Q3_K: return QType::Q3_K;
-    case gg::GgmlType::Q4_K: return QType::Q4_K;
-    case gg::GgmlType::Q5_K: return QType::Q5_K;
-    case gg::GgmlType::Q6_K: return QType::Q6_K;
-    case gg::GgmlType::Q8_0: return QType::Q8_0;
-    case gg::GgmlType::Q4_1: return QType::Q4_1;
-    case gg::GgmlType::Q5_1: return QType::Q5_1;
-    case gg::GgmlType::IQ4_NL: return QType::IQ4_NL;
-    case gg::GgmlType::Q4_0: return QType::Q4_0;
-    case gg::GgmlType::Q5_0: return QType::Q5_0;
+#define SINFER_TEST_MAP(NAME) case gg::GgmlType::NAME: return QType::NAME;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_TEST_MAP)
+#undef SINFER_TEST_MAP
     }
     return QType::Q4_K;
 }
@@ -436,11 +428,12 @@ int main() {
         return 77;
     }
     int failures = 0, cases = 0;
-    const gg::GgmlType types[] = {gg::GgmlType::Q2_K, gg::GgmlType::Q3_K, gg::GgmlType::Q4_K,
-                                  gg::GgmlType::Q5_K, gg::GgmlType::Q6_K, gg::GgmlType::Q8_0,
-                                  gg::GgmlType::Q4_1, gg::GgmlType::Q5_1,
-                                  gg::GgmlType::IQ4_NL, gg::GgmlType::Q4_0,
-                                  gg::GgmlType::Q5_0};
+    // every format the list names, so a new one cannot ship untested
+    const gg::GgmlType types[] = {
+#define SINFER_TEST_TYPE(NAME) gg::GgmlType::NAME,
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_TEST_TYPE)
+#undef SINFER_TEST_TYPE
+    };
     for (const gg::GgmlType type : types) {
         for (const char* label : {"synthetic", "odd", "real", "big"}) {
             Fixture f;
@@ -451,10 +444,14 @@ int main() {
             CHECK_CUDA(cudaMemcpy(d_blocks, f.blocks.data(), f.blocks.size(), cudaMemcpyHostToDevice));
             // The GEMV route needs its int8 planes, the wide route its dequantisation tile;
             // one buffer covers whichever the widest case picks.
-            const int widest = big ? 2 : 512;
-            const std::size_t scratch_bytes =
-                std::max(gg::linear_workspace_bytes(f.n, f.k, widest),
-                         gg::linear_workspace_bytes(f.n, f.k, 1));
+            // The routes' workspace is not monotone in the column count -- the wide route's
+            // BF16 tile can be smaller than the GEMV route's int8 planes on a short weight --
+            // so the buffer covers every width this run will ask for.
+            std::size_t scratch_bytes = 0;
+            for (const int tokens : {1, 2, 3, 5, 8, 17, 64, 65, 128, 512}) {
+                if (big && tokens > 2) { continue; }
+                scratch_bytes = std::max(scratch_bytes, gg::linear_workspace_bytes(f.n, f.k, tokens));
+            }
             void* d_scratch = nullptr;
             CHECK_CUDA(cudaMalloc(&d_scratch, scratch_bytes));
             for (const int tokens : {1, 2, 3, 5, 8, 17}) {

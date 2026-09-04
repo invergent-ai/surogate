@@ -739,6 +739,21 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
 
 /// Staging a row's tile: sixteen-byte `cp_async` where the block size allows it, scalar pairs for
 /// Q6_K, whose 210-byte block leaves consecutive blocks only two-byte aligned.
+/// Launch a GGML prefill codec on the route its format has. `Int8` is a template parameter so
+/// the discarded branch is never instantiated: the int8 tensor-core kernels ask a codec for
+/// scale groups and code unpacking that only the three hand codecs have.
+template <class Codec, bool Int8, class I8Launch, class Bf16Launch>
+inline void launch_ggml_prefill_codec(I8Launch& i8, Bf16Launch& bf16, bool int8_route) {
+    if constexpr (Int8) {
+        if (int8_route) { i8.template operator()<Codec>(); }
+        else { bf16.template operator()<Codec>(); }
+    } else {
+        (void)i8;
+        (void)int8_route;
+        bf16.template operator()<Codec>();
+    }
+}
+
 template <class Codec>
 __device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const std::uint8_t* row_base,
                                                 int tile, int unit) {
@@ -2112,9 +2127,7 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                         weights.slot_of_expert, route_job_count, routed_gate_codes,
                         routed_gate_scales, routed_activation);
             }
-        } else if (weights.routed_gate_up.qtype == QType::Q4_K ||
-                   weights.routed_gate_up.qtype == QType::Q5_K ||
-                   weights.routed_gate_up.qtype == QType::Q6_K) {
+        } else if (ggml::is_ggml_qtype(weights.routed_gate_up.qtype)) {
             // A K-quant row is a whole number of 256-value superblocks. Every geometry that
             // serves one satisfies this; the guard keeps the kernel from being instantiated for
             // the others, which share this body.
@@ -2153,19 +2166,19 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                 }
             };
             const bool int8_route = plan.routed_int8;
+            // One case per stored format, from the one list: the codec trait names the hand codec
+            // for the three K-quants (with the int8 route) and the generic BF16 codec for the rest.
             switch (weights.routed_gate_up.qtype) {
-            case QType::Q4_K:
-                if (int8_route) { launch_i8_gate_up.operator()<ggml::GgmlQ4KPrefill>(); }
-                else { launch_ggml_gate_up.operator()<ggml::GgmlQ4KPrefill>(); }
+#define SINFER_GATE_UP_CASE(NAME)                                                                  \
+            case QType::NAME:                                                                      \
+                launch_ggml_prefill_codec<ggml::PrefillCodecFor<ggml::GgmlType::NAME>::Codec,     \
+                                          ggml::PrefillCodecFor<ggml::GgmlType::NAME>::kInt8Route>( \
+                    launch_i8_gate_up, launch_ggml_gate_up, int8_route);                                                       \
                 break;
-            case QType::Q5_K:
-                if (int8_route) { launch_i8_gate_up.operator()<ggml::GgmlQ5KPrefill>(); }
-                else { launch_ggml_gate_up.operator()<ggml::GgmlQ5KPrefill>(); }
-                break;
+            SINFER_GGML_FOR_EACH_TYPE(SINFER_GATE_UP_CASE)
+#undef SINFER_GATE_UP_CASE
             default:
-                if (int8_route) { launch_i8_gate_up.operator()<ggml::GgmlQ6KPrefill>(); }
-                else { launch_ggml_gate_up.operator()<ggml::GgmlQ6KPrefill>(); }
-                break;
+                throw std::invalid_argument("sparse_moe prefill: unsupported gate/up codec");
             }
             }
         } else if (weights.routed_gate_up.qtype == QType::W8G32_F16S) {
@@ -2250,9 +2263,11 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                     routed_activation, offsets, weights.slot_of_expert, routed_down_codes,
                     routed_down_scales, grouped_io, nullptr, nullptr, nullptr, tokens, nullptr);
             break;
-        case QType::Q4_K:
-        case QType::Q5_K:
-        case QType::Q6_K: {
+        // every GGML block format: the three K-quants with hand codecs and the rest generic
+#define SINFER_GGML_DOWN_CASE(NAME) case QType::NAME:
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_DOWN_CASE)
+#undef SINFER_GGML_DOWN_CASE
+        {
             if constexpr (kHidden % ggml::QK_K != 0 || kIntermediate % ggml::QK_K != 0) {
                 throw std::invalid_argument(
                     "sparse_moe prefill: this geometry's rows are not whole superblocks");
@@ -2285,18 +2300,16 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
             };
             const bool int8_route = plan.routed_int8;
             switch (weights.routed_down.qtype) {
-            case QType::Q4_K:
-                if (int8_route) { launch_i8_down.operator()<ggml::GgmlQ4KPrefill>(); }
-                else { launch_ggml_down.operator()<ggml::GgmlQ4KPrefill>(); }
+#define SINFER_DOWN_CASE(NAME)                                                                  \
+            case QType::NAME:                                                                      \
+                launch_ggml_prefill_codec<ggml::PrefillCodecFor<ggml::GgmlType::NAME>::Codec,     \
+                                          ggml::PrefillCodecFor<ggml::GgmlType::NAME>::kInt8Route>( \
+                    launch_i8_down, launch_ggml_down, int8_route);                                                       \
                 break;
-            case QType::Q5_K:
-                if (int8_route) { launch_i8_down.operator()<ggml::GgmlQ5KPrefill>(); }
-                else { launch_ggml_down.operator()<ggml::GgmlQ5KPrefill>(); }
-                break;
+            SINFER_GGML_FOR_EACH_TYPE(SINFER_DOWN_CASE)
+#undef SINFER_DOWN_CASE
             default:
-                if (int8_route) { launch_i8_down.operator()<ggml::GgmlQ6KPrefill>(); }
-                else { launch_ggml_down.operator()<ggml::GgmlQ6KPrefill>(); }
-                break;
+                throw std::invalid_argument("sparse_moe prefill: unsupported down codec");
             }
             }
             break;

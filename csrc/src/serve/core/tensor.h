@@ -59,6 +59,23 @@ enum class QType : std::uint16_t {
     IQ4_NL               = 17,
     Q4_0                 = 18,
     Q5_0                 = 19,
+    /// The importance-matrix quants (codebook rows plus signs), the ternary pair, the two
+    /// microscaling floats and the plain 1- and 2-bit blocks: the rest of what llama.cpp
+    /// stores, each read as the GGUF holds it. Names follow ggml's.
+    IQ2_XXS              = 20,
+    IQ2_XS               = 21,
+    IQ2_S                = 22,
+    IQ3_XXS              = 23,
+    IQ3_S                = 24,
+    IQ1_S                = 25,
+    IQ1_M                = 26,
+    IQ4_XS               = 27,
+    TQ1_0                = 28,
+    TQ2_0                = 29,
+    MXFP4                = 30,
+    NVFP4_GGML           = 31,
+    Q1_0                 = 32,
+    Q2_0                 = 33,
 };
 
 enum class QuantLayout : std::uint16_t {

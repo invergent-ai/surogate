@@ -60,22 +60,12 @@ void mmvq_launch(GgmlType type, const void* blocks, std::int32_t n, std::int32_t
         throw std::invalid_argument("mmvq: W[n, k] with k a whole number of blocks, 1..8 columns");
     }
     switch (type) {
-    case GgmlType::Q2_K: launch_columns<GgmlType::Q2_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
-    case GgmlType::Q3_K: launch_columns<GgmlType::Q3_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
-    case GgmlType::Q4_K: launch_columns<GgmlType::Q4_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
-    case GgmlType::Q5_K: launch_columns<GgmlType::Q5_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
-    case GgmlType::Q6_K: launch_columns<GgmlType::Q6_K, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
-    case GgmlType::Q8_0: launch_columns<GgmlType::Q8_0, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream); return;
-    case GgmlType::Q4_1: launch_columns<GgmlType::Q4_1, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
+#define SINFER_MMVQ_CASE(NAME)                                                                     \
+    case GgmlType::NAME:                                                                           \
+        launch_columns<GgmlType::NAME, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);      \
         return;
-    case GgmlType::Q5_1: launch_columns<GgmlType::Q5_1, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
-        return;
-    case GgmlType::IQ4_NL: launch_columns<GgmlType::IQ4_NL, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
-        return;
-    case GgmlType::Q4_0: launch_columns<GgmlType::Q4_0, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
-        return;
-    case GgmlType::Q5_0: launch_columns<GgmlType::Q5_0, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
-        return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_MMVQ_CASE)
+#undef SINFER_MMVQ_CASE
     }
     throw std::invalid_argument("mmvq: unknown GGML type");
 }
