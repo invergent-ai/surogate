@@ -64,7 +64,13 @@ public:
             throw std::logic_error("target admission capacity does not match the Engine");
         }
         ops_context_ = options.ops_context;
-        worker_      = std::thread([this] { worker_loop(); });
+        // A thread's CUDA device is its own. Everything this engine owns was allocated on the
+        // device the options name, so the thread that launches against it has to be on that
+        // device too -- otherwise the launches go to whatever the process default is, which is
+        // device 0, and only a run that asked for device 0 works by coincidence.
+        device_ = options.devices.empty() ? options.device
+                                          : options.devices.front();
+        worker_ = std::thread([this] { worker_loop(); });
     }
 
     /// Refuse new submissions while asleep. The caller drains in-flight work
@@ -1450,6 +1456,8 @@ private:
     }
 
     void worker_loop() noexcept {
+        // This thread was born with the process default device, not the engine's.
+        if (cudaSetDevice(device_) != cudaSuccess) { return; }
         // Every round this thread runs must resolve op-plane state (Marlin
         // scratch, LoRA banks) in this engine's context -- the same one target
         // construction bound, so captured-graph addresses and eager calls agree.
@@ -1772,6 +1780,7 @@ private:
     bool stopping_ = false;
     bool failed_   = false;
     ops::EngineOpsContext* ops_context_ = nullptr;
+    int device_ = 0;
     std::thread worker_;
 };
 
