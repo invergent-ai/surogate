@@ -57,9 +57,23 @@ compressed-tensors NVFP4 35B from its own directory (M1), BF16 linears at any
 8-aligned shape, text-only GGUF exports of a vision family, and a tied head
 stored once.
 
+**One target per architecture, and it serves every size of its family**
+(2026-09-04). A checkpoint states its own dimensions in the index built beside
+it and the binder validates against those, so `csrc/src/serve/targets/` holds
+seven directories -- gemma3, llama, qwen3, qwen3_5, qwen3_6, qwen3_6_moe,
+qwen4exp -- and none of them names a size. Qwen3-1.7B is served by the code
+compiled for Qwen3-0.6B; Qwen3.5-0.8B and 2B share one directory where three
+stood. Item 6 has what it took.
+
 ---
 
 ## Roadmap
+
+Six of eleven are closed. Two are decisions rather than tasks (2 and 11, both
+waiting on `surogate quantize` as a product). Three are open with what an
+attempt needs written down: FP8 (4), the two smaller NVFP4 sizes (5), the
+trainer/serve mapping duplication (7), and the Q6_K down kernel (10).
+
 
 1. **[x] Close the native prefill gap — the int8 tensor-core route (2026-09-03).**
    The BF16-activation kernel was at its floor (eleven variants); the route
@@ -109,10 +123,8 @@ stored once.
    permutes Q and K for its rotary, and both are silent when missed — TinyLlama
    answered fluently and wrongly, Gemma produced multilingual noise. With them
    inverted, TinyLlama matches llama.cpp word for word on the same file.
-   The deeper limit is item 6: each target is one compiled geometry, so this
-   covers *those* sizes, not those families — Qwen3-8B still has nowhere to go.
-   A GGUF published without a chat template is also refused, which is what the
-   base `google.gemma-3-270m` files are.
+   A GGUF published without a chat template is refused, which is what the base
+   `google.gemma-3-270m` files are.
    **Any size of those three families now serves** (see item 6): the gates ask
    for the architecture, the binders validate against the artifact's declared
    dimensions, and Qwen3-1.7B is served by the target compiled for the 0.6B.
@@ -164,7 +176,7 @@ stored once.
    The engine side is ready for any size: `qwen3_5` compiles both NVFP4 profiles
    and binds NVFP4 parents with both divisors, and every width it uses now comes
    from the artifact.
-6. **[x] M2 — one directory per architecture (2026-09-03).** `qwen3_5_{0_8b,2b,4b}` are
+6. **[x] M2 — one directory per architecture (2026-09-03, completed 2026-09-04).** `qwen3_5_{0_8b,2b,4b}` are
    ~1,750 lines each for seven integers; `variant.h` differs by 2 lines across
    the three. Nothing requires the split: all 52 headers in
    `csrc/src/serve/api/ops/` take runtime shapes, and the attention kernel is
@@ -299,15 +311,10 @@ stored once.
    `__funnelshift_r(w[0], w[1], 8 * ((off + byte) & 3))` over two aligned words
    instead of one unaligned one -- twice the shared traffic to remove seven
    eighths of the global staging. `off` varies per row, so the shift is
-   per-thread and must stay branchless. 688 µs against
-   the row-split kernel's 337, where Q4_K and Q5_K now beat theirs (498/608 and
-   316/335). It is `routed_down` on 3 of 40 layers, so it costs ~1 ms of a
-   35 ms round. The cause is structural: Q6_K's scales cover sixteen values, so
-   its groups run two `m16n8k16` MMAs instead of one `m16n8k32`, and its
-   210-byte block is only two-byte aligned, so the tile stages with scalar
-   loads where the others use `cp_async`. Both are worth one attempt: a
-   sixteen-wide scale table read twice, and a staged copy that realigns the
-   block on the way into shared memory.
+   per-thread and must stay branchless.
+   The earlier layer-level reading stands as the second measurement of the same
+   thing: 688 us against the row-split kernel's 337, where Q4_K and Q5_K beat
+   theirs (498/608 and 316/335). It is `routed_down` on 3 of 40 layers.
 11. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
@@ -405,7 +412,7 @@ What the serve runtime can route today, per stored format.
 | BF16 | **[x]** any 8-aligned shape (cuBLASLt), registered shapes keep the hand kernels |
 | W8G32_F16S | **[x]** the broadest-supported format; what the fused projections consume |
 | NVFP4 (compressed-tensors) | **[x]** generic ingest (M1); TRT-LLM cutlass for routed MoE |
-| NVFP4 (ModelOpt) | **[ ]** roadmap 3 |
+| NVFP4 (ModelOpt) | **[~]** the 4B serves; the 0.8B and 2B need a recipe (roadmap 5) |
 | FP8 | **[~]** only `FP8_E4M3FN_ROW_BF16S`; per-tensor, per-channel and block unsupported |
 | W4A16 / W4A16_ASYM | **[ ]** `Q4G64_F16S` is symmetric with no zero point and no actorder |
 | MXFP4 / MXFP8 | **[ ]** nothing in serve; the trainer decodes MXFP4 |
@@ -590,6 +597,17 @@ Written down so they are not retried.
 
 ## Done
 
+- 2026-09-04 — **one directory per architecture**. The last two size-named
+  targets became `qwen3_6` and `qwen3_6_moe`, and their binders stopped
+  spelling the size out inline (95 occurrences of 5120 in one, 84 of 2048 in
+  the other). Seven directories, none naming a checkpoint.
+- 2026-09-03 — **geometry as data**: the artifact declares its dimensions, the
+  binder validates against them, and one target serves every size of its
+  family (Qwen3-1.7B on the 0.6B's code; three Qwen3.5 directories into one,
+  3,932 lines deleted). A ModelOpt NVFP4 4B serves. A K-quant draft block
+  binds. `--no-cache` rebuilds. The pad-token literal is gone. The converter
+  and the artifact container left `serve/tools/`. The MoE benchmark measures
+  the native K-quant codecs.
 - 2026-09-03 — int8 tensor-core route for K-quant routed experts (gate/up and
   down, Q4_K/Q5_K/Q6_K), on by default; `quantize_q8_1_planes`; the NLL probe
   and `ops::next_token_nll`; `tools/eval/perplexity.py`; accuracy gate passed.
@@ -607,10 +625,7 @@ Written down so they are not retried.
 - **[x] Direct GGUF loading.** 22.30 GB → 70 MB; see *How a GGUF is served*.
 - **[x] BF16 at any 8-aligned shape.**
 
-Commits, most recent first: `6d045ef7` `3becc963` `8374dfc5` `13c05055`
-`996e4166` `4bc55762` `3e94fa60` `0e4a1576` `d52a5e62` `db4cc18e` `7bebf54e`
-`0624d4b6` `300f9d26` `1455c3b0` `700b9a23` `9995f894` `48a25753` `1b33158b`
-(2026-09-03), and `7aea807e` `7de24bab` `2432825e` `478ab1ae` `ca656302`
-(2026-09-02).
+Commits are on `serve-engine`; `git log --oneline c5d327fe..` is the line of
+work this file tracks.
 
 Board rows: `surogate/serve/BENCHMARKS.md`.
