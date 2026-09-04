@@ -204,7 +204,58 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     return tuple(specs)
 
 
+def _build_mtp_specs() -> tuple[TensorSpec, ...]:
+    """The NextN/MTP draft head, `blk.48` of the separate MTP export.
+
+    Structurally an ordinary trunk full-attention block -- two hyper-connection
+    modules, dense attention with the interleaved query/gate, the routed MoE and
+    the shared expert -- with six tensors of its own on either side of it:
+    `embedding_norm`/`hidden_norm`/`input_projection` fold the next token's
+    embedding into the trunk's wide residual on the way in, and `head_hc/`
+    collapses the four streams on the way out, standing in for the output norm
+    qwen4exp does not have. The embedding table and the LM head are the trunk's:
+    the export declares `nextn_shared_target_tensors`, so it carries neither.
+
+    The indexer is bound but unused: the draft attends densely, which is a
+    numerical superset of QSA (the trunk only prunes past a 2,048-token budget)
+    and the target verifies the draft either way.
+    """
+    prefix = "mtp/"
+    layer = prefix + "layer/"
+    specs: list[TensorSpec] = [
+        tensor_spec(prefix + "embedding_norm", (HIDDEN,), FP32),
+        tensor_spec(prefix + "hidden_norm", (HC_WIDTH,), FP32),
+        tensor_spec(prefix + "input_projection", (HIDDEN, 2 * HIDDEN), W8),
+    ]
+    specs.extend(_hyper_connection_specs(layer + "hc_attn/", with_inject=True))
+    specs.extend(
+        (
+            tensor_spec(layer + "attention/query_key_gate_value", (ATTENTION_FUSED_ROWS, HIDDEN), W8),
+            tensor_spec(layer + "attention/query_norm", (HEAD_DIM,), BF16),
+            tensor_spec(layer + "attention/key_norm", (HEAD_DIM,), BF16),
+            tensor_spec(layer + "attention/output", (HIDDEN, QUERY_SIZE), W8),
+            tensor_spec(layer + "attention/indexer/query", (INDEXER_HEADS * INDEXER_DIM, HIDDEN), BF16),
+            tensor_spec(layer + "attention/indexer/key", (INDEXER_DIM, HIDDEN), BF16),
+            tensor_spec(layer + "attention/indexer/query_norm", (INDEXER_DIM,), BF16),
+            tensor_spec(layer + "attention/indexer/key_norm", (INDEXER_DIM,), BF16),
+        )
+    )
+    specs.extend(_hyper_connection_specs(layer + "hc_ffn/", with_inject=True))
+    specs.extend(
+        (
+            tensor_spec(layer + "mlp/router_shared_gate", (ROUTER_ROWS, HIDDEN), BF16),
+            tensor_spec(layer + "mlp/routed_gate_up", (EXPERTS * 2 * EXPERT_FFN, HIDDEN), W8),
+            tensor_spec(layer + "mlp/routed_down", (EXPERTS * HIDDEN, EXPERT_FFN), W8),
+            tensor_spec(layer + "mlp/shared_gate_up", (2 * SHARED_FFN, HIDDEN), W8),
+            tensor_spec(layer + "mlp/shared_down", (HIDDEN, SHARED_FFN), W8),
+        )
+    )
+    specs.extend(_hyper_connection_specs(prefix + "head_hc/", with_inject=False))
+    return tuple(specs)
+
+
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
+MTP_TENSOR_SPECS = _build_mtp_specs()
 
 # Flash-Next's tower is the Qwen3.6 one (27 layers of 1152, head_dim 72), which is
 # exactly what the vision kernels implement. Whether an *artifact* carries it is a
@@ -230,11 +281,20 @@ TEXT_ONLY_OBJECT_SPECS: tuple[StoredObjectSpec, ...] = (
 )
 
 
-def active_specs(*, vision: bool) -> tuple[tuple, tuple]:
-    """The (tensor, object) spec pair matching what the source provides."""
+def active_specs(*, vision: bool, mtp: bool = False) -> tuple[tuple, tuple]:
+    """The (tensor, object) spec pair matching what the source provides.
 
-    return ((TENSOR_SPECS, OBJECT_SPECS) if vision
-            else (TEXT_ONLY_TENSOR_SPECS, TEXT_ONLY_OBJECT_SPECS))
+    Two independent axes, because the two are carried by different files: the
+    vision tower is in the checkpoint or not, and the MTP head arrives as its
+    own GGUF alongside the trunk's shards.
+    """
+
+    tensors = TENSOR_SPECS if vision else TEXT_ONLY_TENSOR_SPECS
+    objects = OBJECT_SPECS if vision else TEXT_ONLY_OBJECT_SPECS
+    if mtp:
+        tensors = tensors + MTP_TENSOR_SPECS
+        objects = objects + MTP_TENSOR_SPECS
+    return tensors, objects
 
 FORMAT_COUNTS = {
     numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)

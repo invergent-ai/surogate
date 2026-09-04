@@ -291,6 +291,35 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
     return tuple(recipes)
 
 
+def _build_mtp_recipes() -> tuple[TensorRecipe, ...]:
+    """The NextN/MTP draft head, `blk.48` of the separate MTP export.
+
+    The block itself is an ordinary trunk full-attention block, so it reuses the
+    trunk's own recipe builders unchanged -- which is the point: the head is one
+    more layer, not a second architecture. Only the six tensors that fold the
+    embedding in and collapse the streams out are its own.
+    """
+    blk = f"blk.{inv.LAYERS}."
+    prefix = "mtp/"
+    layer = prefix + "layer/"
+    recipes: list[TensorRecipe] = [
+        TensorRecipe(prefix + "embedding_norm",
+                     source(blk + "nextn.enorm.weight", (inv.HIDDEN,))),
+        TensorRecipe(prefix + "hidden_norm",
+                     source(blk + "nextn.hnorm.weight", (inv.HC_WIDTH,))),
+        # fc_embedding and fc_hidden fused side by side, so one matmul over
+        # concat(e_norm, h_norm) is fc_embedding@e + fc_hidden@h.
+        TensorRecipe(prefix + "input_projection",
+                     source(blk + "nextn.eh_proj.weight", (inv.HIDDEN, 2 * inv.HIDDEN))),
+    ]
+    recipes.extend(_hyper_connection_recipes(blk + "hc_attn_", layer + "hc_attn/", True))
+    recipes.extend(_attention_recipes(blk, layer + "attention/"))
+    recipes.extend(_hyper_connection_recipes(blk + "hc_ffn_", layer + "hc_ffn/", True))
+    recipes.extend(_mlp_recipes(blk, layer + "mlp/"))
+    recipes.extend(_hyper_connection_recipes(blk + "nextn.hc_head_", prefix + "head_hc/", False))
+    return tuple(recipes)
+
+
 def _materialized_objects() -> frozenset[str]:
     """Objects the expression language cannot say, and why each one resists it."""
     names: set[str] = set()
@@ -298,6 +327,9 @@ def _materialized_objects() -> frozenset[str]:
         # llama.cpp folds the unit offset into the RMSNorm gamma; the runtime re-adds it, so
         # the converter has to unfold it. A subtraction is not a rearrangement of rows.
         names.update(f"text/layers/{layer}/attention/{leaf}_norm" for leaf in ("query", "key"))
+    # The MTP head's attention is a trunk attention block, so its two norms carry the
+    # same folded unit offset and are unfolded the same way.
+    names.update(f"mtp/layer/attention/{leaf}_norm" for leaf in ("query", "key"))
     for layer in inv.GDN_LAYERS:
         # log(-x), and a 48-scalar permutation of a rank-1 tensor: the row algebra needs a
         # trailing K axis to keep untouched, and these have none.
@@ -309,13 +341,14 @@ def _materialized_objects() -> frozenset[str]:
 
 
 TEXT_RECIPE_SPECS = _build_text_recipes()
+MTP_RECIPE_SPECS = _build_mtp_recipes()
 MATERIALIZED_OBJECTS = _materialized_objects()
 PLE_TABLE_RECIPE = TensorRecipe(
     inv.PLE_TABLE_RESOURCE,
     source(PLE_TABLE_SOURCE, (inv.PLE_TABLE_ROWS, inv.PLE_HEAD_DIM)),
 )
 
-RECIPE_SPECS = TEXT_RECIPE_SPECS
+RECIPE_SPECS = TEXT_RECIPE_SPECS + MTP_RECIPE_SPECS
 RECIPES_BY_NAME = {item.object_name: item for item in RECIPE_SPECS}
 
 
@@ -341,7 +374,10 @@ def validate_recipe_coverage() -> None:
     an *artifact* has one is a property of the export; a converter that cannot produce it says
     so rather than advertising it.
     """
-    inventory_names = [spec.name for spec in inv.TEXT_CORE_TENSOR_SPECS]
+    # The MTP head is optional -- it arrives as its own GGUF -- but its recipes are
+    # covered here alongside the trunk's, so a head object that no recipe can build is
+    # caught at import, not when someone first passes --mtp.
+    inventory_names = [spec.name for spec in inv.TEXT_CORE_TENSOR_SPECS + inv.MTP_TENSOR_SPECS]
     covered = [name for name in inventory_names
                if name in RECIPES_BY_NAME or name in MATERIALIZED_OBJECTS]
     if covered != inventory_names:
@@ -357,7 +393,7 @@ def validate_recipe_coverage() -> None:
     recipe_order = [name for name in inventory_names if name in RECIPES_BY_NAME]
     if recipe_order != [item.object_name for item in RECIPE_SPECS]:
         raise ValueError("qwen4exp recipe order does not follow the tensor inventory")
-    by_name = {spec.name: spec for spec in inv.TEXT_CORE_TENSOR_SPECS}
+    by_name = {spec.name: spec for spec in inv.TEXT_CORE_TENSOR_SPECS + inv.MTP_TENSOR_SPECS}
     for item in RECIPE_SPECS:
         actual = expression_shape(item.expression)
         if actual != by_name[item.object_name].shape:

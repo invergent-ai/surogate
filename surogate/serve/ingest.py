@@ -132,10 +132,45 @@ def resolve_hf_repo(repo_id: str) -> Path:
     return Path(path)
 
 
-def _gguf_fingerprint(path: Path) -> str:
-    st = path.stat()
-    h = hashlib.sha256(f"{path.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+def _gguf_fingerprint(path: Path, *extra: Path) -> str:
+    def stamp(p: Path) -> str:
+        st = p.stat()
+        return f"{p.name}:{st.st_size}:{st.st_mtime_ns}"
+
+    h = hashlib.sha256(":".join(stamp(p) for p in (path, *extra)).encode())
     return h.hexdigest()[:24]
+
+
+def _find_mtp_gguf(gguf_path: Path) -> Path | None:
+    """The NextN draft head's GGUF, if one sits with the shards.
+
+    Unsloth publishes it under `MTP/mtp-<model>-shared-<quant>.gguf`, separately from
+    the trunk. Serving it is not the same artifact as serving without it, so whether
+    one is found goes into the cache fingerprint.
+    """
+    stem = gguf_path.name.split("-00001-of-")[0]
+
+    def shared_prefix(candidate: Path) -> int:
+        """How much of the model name the two agree on, counted only to a name boundary.
+
+        `Qwen3-0.6B-Q4_K_M` and `Qwen3.8-Flash-Next-shared-Q8_0` share the five letters
+        of "Qwen3" and are different models; requiring the agreement to end on a `-` is
+        what tells that apart from `Qwen3.8-Flash-Next-UD-Q4_K_XL`, which agrees through
+        `Qwen3.8-Flash-Next-`.
+        """
+        name   = candidate.name.removeprefix("mtp-")
+        prefix = os.path.commonprefix([name, stem])
+        return len(prefix) if len(prefix) > 4 and prefix.endswith("-") else 0
+
+    for directory in (gguf_path.parent, gguf_path.parent / "MTP"):
+        if not directory.is_dir():
+            continue
+        # One head per model, published once and shared by every quant of it -- the head's
+        # name carries the model, not the trunk's quant suffix, so match on what they share.
+        matches = [p for p in sorted(directory.glob("mtp-*.gguf")) if shared_prefix(p) > 0]
+        if matches:
+            return max(matches, key=shared_prefix)
+    return None
 
 
 def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) -> Path:
@@ -155,7 +190,8 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     # Warm start: the cache name embeds the (target-independent) fingerprint,
     # so a hit returns without touching the GGUF — gguf-py's eager KV parse
     # costs ~10s on a 250k-token vocabulary and must stay off this path.
-    fp = _gguf_fingerprint(gguf_path)
+    mtp_path = _find_mtp_gguf(gguf_path)
+    fp = _gguf_fingerprint(gguf_path, *( (mtp_path,) if mtp_path is not None else () ))
     for cached in cache_dir().glob(f"*-gguf-{fp}.sinfer") if reuse_cache else ():
         if cached.is_file() and cached.stat().st_size > 0:
             echo(f"surogate serve: using cached engine weights ({cached.name})")
@@ -177,7 +213,7 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     out = cache_dir() / f"{target_key}-gguf-{fp}.sinfer"
 
     if target_key == "qwen4exp":
-        return _convert_gguf_native(root, gguf_path, out, echo=echo)
+        return _convert_gguf_native(root, gguf_path, out, mtp_path=mtp_path, echo=echo)
 
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate
@@ -209,7 +245,8 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *, echo=print) -> Path:
+def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *,
+                         mtp_path: Path | None = None, echo=print) -> Path:
     """Qwen3.8-Flash-Next: the GGUF is the weight source and the model's own HF frontend
     (tokenizer, chat template, generation and preprocessor configs) is fetched from the Hub.
 
@@ -245,6 +282,9 @@ def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *, echo=print) 
     cmd = [sys.executable, "-m", "surogate.serve.convert.qwen4exp.convert",
            "--gguf", str(gguf_path), "--frontend", str(frontend_dir), "--out", str(tmp),
            "--device", os.environ.get("SUROGATE_CONVERT_DEVICE", "cuda")]
+    if mtp_path is not None:
+        echo(f"surogate serve: NextN draft head found, {mtp_path.name}")
+        cmd += ["--mtp", str(mtp_path)]
     if os.environ.get("SUROGATE_SERVE_DRY"):
         echo("DRY: cwd=" + str(root))
         echo("DRY: " + " ".join(cmd))

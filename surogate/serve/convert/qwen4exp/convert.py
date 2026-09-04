@@ -110,9 +110,13 @@ class GgufSource:
     a 250k-token vocabulary, and this converter reads three key-value arrays and a memmap.
     """
 
-    def __init__(self, first_shard: Path):
+    def __init__(self, first_shard: Path, extra: Sequence[Path] = ()):
         pattern = str(first_shard).replace("-00001-of-", "-*-of-")
         self.shards = [Path(p) for p in sorted(glob.glob(pattern))] or [Path(first_shard)]
+        # Files that are not shards of the split but are still read in place: the MTP head
+        # ships as its own GGUF. They join the shard list, so they take the next external
+        # source numbers and every run points at the file that actually holds the bytes.
+        self.shards += [Path(p) for p in extra]
         self.readers = [LeanGguf(path) for path in self.shards]
         self._maps: dict[int, np.ndarray] = {}
         self.tensors: dict[str, _Tensor] = {}
@@ -334,7 +338,9 @@ def materialize_unspoken(source: GgufSource, name: str) -> bytes:
     leaf = name.rsplit("/", 1)[-1]
     if name.startswith("text/ple/"):
         return _ple_hash_parameters(source, leaf)
-    blk = f"blk.{name.split('/')[2]}."
+    # `text/layers/N/...` names its block; the MTP head is the one past the trunk.
+    blk = (f"blk.{inv.LAYERS}." if name.startswith("mtp/")
+           else f"blk.{name.split('/')[2]}.")
     if name.endswith(("attention/query_norm", "attention/key_norm")):
         # The runtime applies these with a unit offset (HF gamma w, norm = (1+w)*x); the GGUF
         # carries the folded gamma 1+w. Every other norm keeps the folded form.
@@ -403,14 +409,18 @@ def _check_every_quantised_object_is_planned(specs, planned: set[str]) -> None:
 
 
 def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
-            *, device: str = "cuda") -> Path:
+            *, device: str = "cuda", mtp: str | Path | None = None) -> Path:
     """Write the artifact. `device` is accepted so the ingest path can call every converter
-    the same way; nothing here needs a GPU, because nothing here quantises any more."""
+    the same way; nothing here needs a GPU, because nothing here quantises any more.
+
+    `mtp` is the NextN draft head's own GGUF (`mtp-*-shared-*.gguf`). It is read in
+    place like the shards, so passing it costs an index entry, not a copy.
+    """
     started = time.perf_counter()
     del device
     inv.validate_inventory()
     rcp.validate_recipe_coverage()
-    source = GgufSource(Path(gguf))
+    source = GgufSource(Path(gguf), (Path(mtp),) if mtp is not None else ())
     output = Path(out_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -425,7 +435,12 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
         raise NotImplementedError(
             "this GGUF carries a vision tower; the qwen4exp recipes cover the text stack only"
         )
-    tensor_specs, object_specs = inv.active_specs(vision=False)
+    # The head is present when its GGUF was passed; `blk.48` is the proof, since a trunk
+    # shard stops at 47.
+    has_mtp = f"blk.{inv.LAYERS}.nextn.eh_proj.weight" in source.tensors
+    if mtp is not None and not has_mtp:
+        raise ValueError(f"{mtp} carries no blk.{inv.LAYERS} NextN head")
+    tensor_specs, object_specs = inv.active_specs(vision=False, mtp=has_mtp)
 
     recipes = dict(rcp.RECIPES_BY_NAME)
     recipes[inv.PLE_TABLE_RESOURCE] = rcp.PLE_TABLE_RECIPE
@@ -519,10 +534,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--gguf", required=True, help="first shard of the split GGUF")
     parser.add_argument("--frontend", required=True, help="directory with tokenizer/chat template/configs")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--mtp", default=None,
+                        help="the NextN draft head's GGUF (mtp-*-shared-*.gguf), read in place")
     parser.add_argument("--device", default="cuda",
                         help="accepted for a uniform call across the converters; unused")
     args = parser.parse_args(argv)
-    convert(args.gguf, args.frontend, args.out, device=args.device)
+    convert(args.gguf, args.frontend, args.out, device=args.device, mtp=args.mtp)
     return 0
 
 
