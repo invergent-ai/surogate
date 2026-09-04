@@ -34,7 +34,7 @@ _TENSOR_MEMBERS = frozenset(
 #: artifact: the stretches to read, how they become the stored form, and the column
 #: permutation that transform also carries. Written by `TensorObject.to_json` since external
 #: files existed; the reader has to accept what the writer emits.
-_TENSOR_OPTIONAL = frozenset({"runs", "transform", "group_map"})
+_TENSOR_OPTIONAL = frozenset({"runs", "transform", "group_map", "segments"})
 _RESOURCE_MEMBERS = frozenset({"name", "kind", "encoding", "offset", "bytes"})
 
 
@@ -66,6 +66,20 @@ class TensorSpec:
     #: Source group for each destination group, when the transform also carries a column
     #: permutation. Empty when the columns are in order.
     group_map: tuple[int, ...] = ()
+    #: Consecutive typed row runs, (format, rows), when the rows are not all ``format``, which
+    #: then names the first run. ggml-blocks-v1 only.
+    segments: tuple[tuple[str, int], ...] = ()
+
+
+def tensor_payload_bytes(layout: str, format: str, shape, segments=()) -> int:
+    """The stored bytes of a tensor: one encoded size, or the sum over its typed segments."""
+    if not segments:
+        return encoded_size(layout, format, shape)
+    if len(shape) != 2 or sum(int(rows) for _, rows in segments) != int(shape[0]):
+        raise ArtifactError("segments must cover the rows of a rank-two object")
+    if segments[0][0] != format:
+        raise ArtifactError("a segmented object's format must name its first segment's")
+    return sum(encoded_size(layout, fmt, (int(rows), int(shape[1]))) for fmt, rows in segments)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +103,7 @@ class TensorObject:
     runs: tuple[tuple[int, int, int], ...] = ()
     transform: str = ""
     group_map: tuple[int, ...] = ()
+    segments: tuple[tuple[str, int], ...] = ()
 
     @property
     def kind(self) -> str:
@@ -106,7 +121,9 @@ class TensorObject:
         } | ({"runs": [{"source": s, "offset": o, "bytes": b}
                     for s, o, b in self.runs]} if self.runs else {}) | (
             {"transform": self.transform} if self.transform else {}) | (
-            {"group_map": list(self.group_map)} if self.group_map else {})
+            {"group_map": list(self.group_map)} if self.group_map else {}) | (
+            {"segments": [{"format": f, "rows": r} for f, r in self.segments]}
+            if self.segments else {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +201,8 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
         if isinstance(spec, TensorSpec):
             shape = tuple(_require_integer(dim, "shape dimension", positive=True) for dim in spec.shape)
             layout = get_layout(_require_string(spec.layout, "tensor layout"))
-            payload_bytes = encoded_size(layout, spec.format, shape)
+            payload_bytes = tensor_payload_bytes(layout, spec.format, shape,
+                                                 getattr(spec, "segments", ()))
             if spec.runs:
                 covered = sum(int(run_bytes) for _, _, run_bytes in spec.runs)
                 # A transformed object's runs carry its source bytes, a different count from
@@ -204,6 +222,7 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
                         runs=tuple((int(a), int(b), int(c)) for a, b, c in spec.runs),
                         transform=spec.transform,
                         group_map=tuple(int(v) for v in spec.group_map),
+                        segments=tuple((str(f), int(r)) for f, r in getattr(spec, "segments", ())),
                     )
                 )
                 continue
@@ -215,6 +234,7 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
                 layout=layout.name,
                 offset=offset,
                 bytes=payload_bytes,
+                segments=tuple((str(f), int(r)) for f, r in getattr(spec, "segments", ())),
             )
         elif isinstance(spec, ResourceSpec):
             encoding = _require_string(spec.encoding, "resource encoding")
@@ -347,8 +367,14 @@ def _parse_object(value: object) -> ArtifactObject:
         layout_name = _require_string(value["layout"], "tensor layout")
         offset = _require_integer(value["offset"], "tensor offset")
         payload_bytes = _require_integer(value["bytes"], "tensor bytes", positive=True)
+        segments = tuple(
+            (_require_string(entry["format"], "segment format"),
+             _require_integer(entry["rows"], "segment rows", positive=True))
+            for entry in value.get("segments", ()))
+        if "segments" in value and len(segments) < 2:
+            raise ArtifactError(f"tensor {name} lists fewer than two segments")
         try:
-            expected = encoded_size(layout_name, format_name, shape)
+            expected = tensor_payload_bytes(layout_name, format_name, shape, segments)
         except (KeyError, TypeError, ValueError) as exc:
             raise ArtifactError(str(exc)) from exc
         if payload_bytes != expected:
@@ -360,7 +386,8 @@ def _parse_object(value: object) -> ArtifactObject:
                             _require_string(value["transform"], "tensor transform")
                             if "transform" in value else "",
                             tuple(_require_integer(g, "group_map entry")
-                                  for g in value.get("group_map", ())))
+                                  for g in value.get("group_map", ())),
+                            segments)
     if kind == "resource":
         if frozenset(value) != _RESOURCE_MEMBERS:
             raise ArtifactError("resource entry has missing or extra members")

@@ -26,6 +26,7 @@ from surogate.serve.artifact.container import (
     TensorObject,
     TensorSpec as ArtifactTensorSpec,
     plan_objects,
+    tensor_payload_bytes as stored_tensor_bytes,
 )
 from surogate.serve.artifact.layouts import align_up, encode_direct, encoded_size
 from surogate.serve.convert.common.quantize import quantize_and_encode
@@ -155,6 +156,7 @@ def build_object_plan(
                 ArtifactTensorSpec(
                     spec.name, spec.shape, spec.format, spec.layout, getattr(spec, "runs", ()),
                     getattr(spec, "transform", ""), getattr(spec, "group_map", ()),
+                    getattr(spec, "segments", ()),
                 )
             )
         else:
@@ -197,7 +199,8 @@ def object_statistics(objects: Sequence[ArtifactObject]) -> dict[str, object]:
 
 def tensor_payload_bytes(tensor_specs: Sequence[TensorSpec]) -> int:
     return sum(
-        encoded_size(spec.layout, spec.format, spec.shape) for spec in tensor_specs
+        stored_tensor_bytes(spec.layout, spec.format, spec.shape, getattr(spec, "segments", ()))
+        for spec in tensor_specs
     )
 
 
@@ -205,7 +208,8 @@ def device_arena_bytes(tensor_specs: Sequence[TensorSpec], alignment: int = 256)
     cursor = 0
     for spec in tensor_specs:
         cursor = align_up(cursor, alignment)
-        cursor += encoded_size(spec.layout, spec.format, spec.shape)
+        cursor += stored_tensor_bytes(spec.layout, spec.format, spec.shape,
+                                      getattr(spec, "segments", ()))
     return cursor
 
 

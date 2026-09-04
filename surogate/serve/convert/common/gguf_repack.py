@@ -158,6 +158,18 @@ def native_block_values(gguf_type: str) -> int:
     return NATIVE_BLOCK_VALUES.get(gguf_type, 256)
 _NATIVE_LAYOUT = "ggml-blocks-v1"
 
+class NativePlan(dict):
+    """{object: GGML type} of the objects served from the file's own blocks, plus, for a parent
+    whose rows come in more than one type, its consecutive typed runs ((type, rows), ...)."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.segments: dict[str, tuple[tuple[str, int], ...]] = {}
+        #: {object: k/32 entries} for an object read in the file's column order, whose columns
+        #: the runtime rearranges on the activation side.
+        self.group_maps: dict[str, tuple[int, ...]] = {}
+
+
 # What a fused object is called once it is stored as two differently-typed halves. The names
 # match the ones the 35B target already binds, and the public split ops take exactly this pair.
 HALF_NAMES = {"gdn/query_key_value_z": ("gdn/query_key_value", "gdn/z")}
@@ -411,10 +423,14 @@ class GgufRepackSource:
         exclude_suffixes: Sequence[str] = (),
     ) -> dict[str, str]:
         """Objects served as native K-quants: quantized-linear specs whose row program draws
-        every row from mapped sources of one K-quant type at the spec's own k. Returns
-        {object name: GGML type}. A parent that mixes types is not planned here."""
+        every row from mapped native sources at the spec's own k. Returns a NativePlan,
+        {object name: GGML type}; a parent whose components the file quantised to different
+        types -- a UD mixture's q beside its k, gate beside up -- is planned too, as
+        consecutive typed row runs the artifact records as `segments` (NativePlan.segments),
+        with the first run's type as the object's. The fused ops project each component from
+        the segment that holds it, so nothing is requantised."""
         probe = np.zeros(1, dtype=np.int64) if with_token_ids else None
-        planned: dict[str, str] = {}
+        planned: NativePlan = NativePlan()
         for spec in tensor_specs:
             if getattr(spec, "kind", None) != "tensor" or spec.format not in _QUANT_LINEAR_FORMATS:
                 continue
@@ -427,18 +443,27 @@ class GgufRepackSource:
                 program = self._evaluate_rows(recipe.expression, probe)
             if program is None or program.k != int(spec.shape[1]):
                 continue
-            types = {self.native_type_of(name) for name in program.sources}
-            if len(types) != 1 or None in types:
+            types = [self.native_type_of(name) for name in program.sources]
+            if not types or any(t is None for t in types):
                 continue
-            if program.k % native_block_values(next(iter(types))):
+            if any(program.k % native_block_values(t) for t in types):
                 continue
-            # A source whose inverse permutes columns cannot be served from its own bytes: the
-            # native path copies rows, and a column permutation is not a row map. `planes()`
-            # refuses it for the same reason; only the in-place transform carries one. Without
-            # this the object is copied verbatim and the permutation is silently dropped -- the
-            # GDN output projection of a reordered geometry, whose columns follow the V heads.
-            if any(self.column_group_map(name) is not None for name in program.sources):
-                continue
+            # A source whose inverse permutes columns cannot be served from its own bytes as a
+            # row map: the native path copies rows. An object that is one whole such tensor
+            # (the GDN output projection of a reordered geometry, whose columns follow the V
+            # heads) is read as the file holds it and carries the map, which the runtime applies
+            # to the activation's column groups instead; anything else with such a source is
+            # left to the dequantise path, where the in-place transform carries it.
+            column_maps = [self.column_group_map(name) for name in program.sources]
+            group_map = None
+            if any(m is not None for m in column_maps):
+                if len(program.sources) != 1 or len(set(types)) != 1:
+                    continue
+                n_rows, _ = self.source_rows_k(program.sources[0])
+                if n_rows != int(program.rows.shape[0]) or not np.array_equal(
+                        program.rows % _SOURCE_STRIDE, np.arange(n_rows)):
+                    continue
+                group_map = tuple(int(v) for v in column_maps[0])
             # Objects whose op has no kernel for the stored type yet: the caller names them,
             # because which ops a family routes an object through is the family's knowledge.
             if any(spec.name.endswith(suffix) for suffix in exclude_suffixes):
@@ -446,7 +471,20 @@ class GgufRepackSource:
             only = os.environ.get("SUROGATE_GGUF_NATIVE_ONLY")  # bisection aid: name substrings
             if only and not any(part and part in spec.name for part in only.split(",")):
                 continue
-            planned[spec.name] = next(iter(types))
+            per_row = [types[int(index)] for index in (program.rows // _SOURCE_STRIDE)]
+            runs: list[list] = []
+            for gguf_type in per_row:
+                if runs and runs[-1][0] == gguf_type:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([gguf_type, 1])
+            if len(runs) > 1 and os.environ.get("SUROGATE_GGUF_NATIVE_SEGMENTS", "1") == "0":
+                continue
+            planned[spec.name] = str(runs[0][0])
+            if len(runs) > 1:
+                planned.segments[spec.name] = tuple((str(t), int(n)) for t, n in runs)
+            if group_map is not None:
+                planned.group_maps[spec.name] = group_map
         return planned
 
     @staticmethod
@@ -472,8 +510,11 @@ class GgufRepackSource:
         plan: Mapping[str, str],
         runs: Mapping[str, tuple[tuple[int, int, int], ...]] | None = None,
     ) -> tuple:
-        """The specs with each natively planned object's format and layout rewritten, and its
-        runs attached when it is served from the file rather than copied into the artifact."""
+        """The specs with each natively planned object's format and layout rewritten, its
+        runs attached when it is served from the file rather than copied into the artifact,
+        and its typed segments when the plan (a NativePlan) split it by format."""
+        segments = getattr(plan, "segments", {})
+        group_maps = getattr(plan, "group_maps", {})
         out = []
         for spec in tensor_specs:
             name = getattr(spec, "name", None)
@@ -482,6 +523,11 @@ class GgufRepackSource:
                 out.append(spec)
             else:
                 extra = {"runs": runs[name]} if runs is not None and name in runs else {}
+                if name in segments:
+                    extra["segments"] = tuple(
+                        (artifact_format_for_ggml(t), int(n)) for t, n in segments[name])
+                if name in group_maps:
+                    extra["group_map"] = group_maps[name]
                 out.append(replace(spec, format=artifact_format_for_ggml(gguf_type), layout=_NATIVE_LAYOUT, **extra))
         return tuple(out)
 
@@ -499,9 +545,8 @@ class GgufRepackSource:
         data = self._memmap(self.source_index(hf_name))
         if offset < 0 or offset + nbytes > data.shape[0]:
             raise RepackError(f"{hf_name}: quantized payload is outside the GGUF file")
-        if self.column_group_map(hf_name) is not None:
-            raise RepackError(f"{hf_name}: its inverse permutes columns; only the in-place "
-                              "transform carries that")
+        # A column permutation is not applied here: the object that reads these bytes carries
+        # the group map (plan_native) and the runtime rearranges the activation instead.
         rows_out = np.asarray(data[offset : offset + nbytes]).reshape(n, row_bytes)
         row_map = self.row_map(hf_name)
         return rows_out if row_map is None else rows_out[row_map]
@@ -532,20 +577,24 @@ class GgufRepackSource:
             )
         if row_slice is None:
             types = {self.native_type_of(name) for name in program.sources}
-            if types != {spec.format}:
+            if spec.format not in types or (len(types) > 1 and not getattr(spec, "segments", ())):
                 raise RepackError(f"{spec.name}: sources are {types}, spec is {spec.format}")
-        row_bytes = (program.k // native_block_values(spec.format)) * NATIVE_TYPES[spec.format]
         rows = program.rows if row_slice is None else program.rows[row_slice]
-        n = int(rows.shape[0])
-        out = np.empty((n, row_bytes), dtype=np.uint8)
         source_of = rows // _SOURCE_STRIDE
         row_of = rows % _SOURCE_STRIDE
-        for index, source_name in enumerate(program.sources):
-            mask = source_of == index
-            if not mask.any():
-                continue
-            out[mask] = self._native_rows(source_name)[row_of[mask]]
-        return out.tobytes()
+        # Rows are gathered in order; a segmented parent's rows differ in width by source, so
+        # the payload is the concatenation of each maximal same-source stretch.
+        pieces: list[bytes] = []
+        n = int(rows.shape[0])
+        begin = 0
+        while begin < n:
+            index = int(source_of[begin])
+            end = begin
+            while end < n and int(source_of[end]) == index:
+                end += 1
+            pieces.append(self._native_rows(program.sources[index])[row_of[begin:end]].tobytes())
+            begin = end
+        return b"".join(pieces)
 
     def runs_for_native(
         self,
@@ -580,17 +629,18 @@ class GgufRepackSource:
                 f"{spec.name}: native shape {(int(program.rows.shape[0]), program.k)} "
                 f"!= spec {tuple(spec.shape)}"
             )
-        row_bytes = (program.k // native_block_values(spec.format)) * NATIVE_TYPES[spec.format]
         rows = np.asarray(program.rows)
         source_of = rows // _SOURCE_STRIDE
         row_of = rows % _SOURCE_STRIDE
         base = [int(self.sources[name]["offset"]) for name in program.sources]
         shard = [self.source_index(name, source) for name in program.sources]
+        # Bytes per row are the source's: a segmented parent draws rows of different widths
+        # from differently-typed sources.
+        width = []
         for index, name in enumerate(program.sources):
             n_rows, k = self.source_rows_k(name)
             source_type = str(self.sources[name]["type"])
-            if (k // native_block_values(source_type)) * NATIVE_TYPES[source_type] != row_bytes:
-                raise RepackError(f"{spec.name}: {name} has a different row width")
+            width.append((k // native_block_values(source_type)) * NATIVE_TYPES[source_type])
             row_map = self.row_map(name)
             if row_map is not None:
                 mask = source_of == index
@@ -605,8 +655,8 @@ class GgufRepackSource:
         return tuple(
             (
                 shard[int(source_of[begin])],
-                base[int(source_of[begin])] + int(row_of[begin]) * row_bytes,
-                int(end - begin) * row_bytes,
+                base[int(source_of[begin])] + int(row_of[begin]) * width[int(source_of[begin])],
+                int(end - begin) * width[int(source_of[begin])],
             )
             for begin, end in zip(starts, ends)
         )

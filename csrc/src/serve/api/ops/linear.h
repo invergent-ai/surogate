@@ -135,6 +135,16 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
  * @param[in,out] workspace Caller-owned transient arena, or null for the workspace-free routes.
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
+/**
+ * @brief The row range `[row_begin, row_begin + rows)` of `w` as a weight of its own.
+ *
+ * For a format whose rows are independently addressable: the row-split groupwise planes,
+ * contiguous BF16, and GGML blocks -- where a range inside one typed segment of a mixed-format
+ * parent comes back in that segment's format. A range that straddles two segments has no
+ * single format and is refused.
+ */
+[[nodiscard]] Weight weight_rows(const Weight& w, std::int32_t row_begin, std::int32_t rows);
+
 void linear_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                  WorkspaceArena* workspace, cudaStream_t stream);
 

@@ -159,7 +159,8 @@ TensorDescriptor parse_tensor(const Json& value) {
     };
     require_members(value, members, "tensor entry",
                     (value.contains("runs") ? 1 : 0) + (value.contains("transform") ? 1 : 0) +
-                        (value.contains("group_map") ? 1 : 0));
+                        (value.contains("group_map") ? 1 : 0) +
+                        (value.contains("segments") ? 1 : 0));
 
     const auto name        = require_string(value.at("name"), "tensor name");
     const auto format      = parse_format(require_string(value.at("format"), "tensor format"));
@@ -196,13 +197,49 @@ TensorDescriptor parse_tensor(const Json& value) {
         shape.push_back(require_unsigned(dim, "shape dimension", true));
     }
 
-    const auto expected_size = tensor_encoded_size(layout, format, shape);
+    std::vector<TensorSegment> segments;
+    if (value.contains("segments")) {
+        const auto& raw = value.at("segments");
+        if (!raw.is_array() || raw.size() < 2) {
+            throw ArtifactError("tensor " + name + ": segments must list at least two runs");
+        }
+        if (layout != StorageLayout::GgmlBlocksV1 || shape.size() != 2) {
+            throw ArtifactError("tensor " + name + ": only a rank-two ggml-blocks-v1 object has segments");
+        }
+        std::uint64_t rows = 0;
+        for (const auto& entry : raw) {
+            TensorSegment segment{parse_format(require_string(entry.at("format"), "segment format")),
+                                  require_unsigned(entry.at("rows"), "segment rows", true)};
+            rows = checked_add(rows, segment.rows, "segment rows");
+            segments.push_back(segment);
+        }
+        if (rows != shape.at(0)) {
+            throw ArtifactError("tensor " + name + ": segments cover " + std::to_string(rows) +
+                                " rows of " + std::to_string(shape.at(0)));
+        }
+        if (segments.front().format != format) {
+            throw ArtifactError("tensor " + name + ": format must name the first segment's");
+        }
+    }
+    std::uint64_t expected_size = 0;
+    if (segments.empty()) {
+        expected_size = tensor_encoded_size(layout, format, shape);
+    } else {
+        for (const TensorSegment& segment : segments) {
+            const std::array<std::uint64_t, 2> segment_shape = {segment.rows, shape.at(1)};
+            expected_size = checked_add(
+                expected_size, tensor_encoded_size(layout, segment.format, segment_shape),
+                "segment bytes");
+        }
+    }
     if (stored_size != expected_size) {
         throw ArtifactError("tensor " + name + " stores " + std::to_string(stored_size) +
                             " bytes; layout requires " + std::to_string(expected_size));
     }
     if (!group_map.empty()) {
-        if (transform == PayloadTransform::None) {
+        // Without a transform the map is not applied to the bytes: a ggml-blocks object read
+        // as the file holds it, whose columns the runtime rearranges on the activation side.
+        if (transform == PayloadTransform::None && layout != StorageLayout::GgmlBlocksV1) {
             throw ArtifactError("tensor " + name + " has a group_map but no transform to apply it");
         }
         const auto groups = shape.at(1) / 32;
@@ -217,7 +254,7 @@ TensorDescriptor parse_tensor(const Json& value) {
         }
     }
     return {name,   std::move(shape), format,    layout,
-            offset, stored_size,      transform, std::move(group_map)};
+            offset, stored_size,      transform, std::move(group_map), std::move(segments)};
 }
 
 ResourceDescriptor parse_resource(const Json& value) {

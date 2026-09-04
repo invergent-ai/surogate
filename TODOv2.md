@@ -102,9 +102,26 @@ product rather than tasks (1 and 8); the rest are work.
    elsewhere (below). The KV default is now `auto`: BF16 for a pure-attention target, e4m3
    where linear-attention layers carry the stack -- "Decisions that govern". Left:
    **The 27B-class GGUF serves, with MTP (2026-09-04).** `unsloth/Qwen3.8-27B-GGUF`
-   UD-Q4_K_M: 46.5 tok/s decode with `--spec mtp --draft-tokens 1` against llama.cpp's 44.8 on
-   the same file, TTFT 0.23 s against 1.18 s, perplexity 5.1699 +/- 0.134 against 5.0166 +/-
-   0.127. Four things were wrong, none of them the formats: the repack planner was not a fixed
+   UD-Q4_K_M, by the end of the day: **83.3 tok/s** decode with `--spec mtp --draft-tokens 1`
+   against llama.cpp's 44.8 on the same file (46.5 at noon), TTFT 0.24 s against 1.18 s,
+   perplexity **5.0477 +/- 0.129** against 5.0166 +/- 0.127 (5.1699 at noon). What the UD
+   mixture still cost, and what removed it: the file quantises the components of a fused
+   parent to different types (q Q5_K beside k Q4_K, gate IQ4_XS beside up Q4_K, 25 of 48
+   `value_z`), and llama.cpp's V-head reorder puts a *column* permutation on every GDN
+   `out_proj`; both were dequantised and requantised to Q4G64/Q5G64 -- 33 % of the bytes, a
+   second quantisation, and the whole of the 2.6 % gap (the 0.8B, 3 % bridged, matched). Now a
+   native object may carry typed row `segments` (the fused ops already projected row ranges,
+   and a component never straddles a type run: `ggml_weight_rows` resolves the range to its
+   segment; `ops::weight_rows` is public and the qwen3_5 loader's row views use it), and a
+   single-source object whose source has a column map keeps the file's column order and
+   carries `group_map` with no transform -- the runtime permutes the activation's 32-row groups
+   before the launch (`input_for`, one small kernel per GDN layer, measured free). 328 of 330
+   objects, 16.97 GB, read in place; the two left are Q8_0 a/b projections of a few MB.
+   The first segmented board read *35.8*: the decode profile put 70 % of the round in the
+   IQ4_XS GEMV at 232 us/call (Q4_K: 19) -- a per-lane `__constant__` table read, serialised
+   32-way -- which the bridge had hidden on most IQ4_XS tensors. The byte-permute lookup the
+   file already used for MXFP4 fixed it; the old 46.5 had been throttled by the same kernel.
+   Four things were wrong at noon, none of them the formats: the repack planner was not a fixed
    point; a GGUF's `block_count` includes the MTP block; the native path silently dropped the
    column permutation llama.cpp's V-head reorder puts on the GDN `out_proj` (48 objects, and
    the reason the model produced confident noise at 4.6M perplexity); and the 27B-class
@@ -114,13 +131,13 @@ product rather than tasks (1 and 8); the rest are work.
    `K = query_size` where the object is `[hidden, 2*hidden]`; the two coincide at the size this
    target compiles, so every larger model failed at its first draft round.
    **Prefill, measured (2026-09-04).** Through the server we lead: a 2,048-token prompt is
-   812 ms TTFT against llama.cpp's 1,265, and 2,600 tok/s of prompt-eval against its 2,565.
-   `llama-bench pp2048` is the compute bar at 3,190 -- it gets one 2,048-wide batch where the
-   server splits into 512s -- and we are 23 % under it, 142 TFLOP/s effective against 174. An
-   nsys capture (`--cuda-graph-trace=node`, or the graph hides everything) says prefill is
-   GEMM-bound with no scheduling gap: 42 % cutlass BF16 (the dequantise-then-GEMM route),
-   38 % our groupwise kernels on the re-encoded halves, 7.5 % `dequantize_rows` staging, ~4 %
-   GDN and attention. Measured route rates at the dominant MLP shape: BF16 222 TFLOP/s, Q4G64
+   **752 ms** TTFT against llama.cpp's 1,265 (812 at noon), and **2,804 tok/s** of prompt-eval
+   against its 2,565. `llama-bench pp2048` is the compute bar at 3,190 -- it gets one
+   2,048-wide batch where the server splits into 512s -- and we are 14 % under it, 149 TFLOP/s
+   effective against 174. The noon nsys capture (`--cuda-graph-trace=node`, or the graph hides
+   everything) said prefill is GEMM-bound with no scheduling gap: 42 % cutlass BF16 (the
+   dequantise-then-GEMM route), 38 % our groupwise kernels on the re-encoded halves (gone
+   with the native pass), 7.5 % `dequantize_rows` staging, ~4 % GDN and attention. Measured route rates at the dominant MLP shape: BF16 222 TFLOP/s, Q4G64
    187, fused Q4 SwiGLU 183, W8 159, against 838 of int8/fp8 tensor throughput on the card.
    **The int8 dense prefill GEMM on the routed experts' tile was built and measured a loss**
    (881 ms against 812; "Measured and rejected" below has the design and the reason: the

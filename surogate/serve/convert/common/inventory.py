@@ -57,6 +57,10 @@ class TensorSpec:
     #: Source group for each destination group, when the transform also carries a column
     #: permutation. Empty when the columns are in order.
     group_map: tuple[int, ...] = ()
+    #: Consecutive typed row runs, (format, rows), when the object's rows are not all one
+    #: format -- a fused parent whose components the file quantised differently. `format`
+    #: then names the first run. Empty for a homogeneous object.
+    segments: tuple[tuple[str, int], ...] = ()
 
     @property
     def kind(self) -> str:

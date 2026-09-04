@@ -1,7 +1,10 @@
 #include "artifact/materializer.h"
+#include "artifact/typed_binding.h"
+#include "artifact/reader.h"
 
 #include "ops/linear/ggml/ggml_repack.h"
 
+#include <array>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -97,6 +100,21 @@ void* MaterializedArtifact::device_data(ObjectHandle handle) const {
     return objects_[handle.index].device;
 }
 
+std::span<const WeightSegment> MaterializedArtifact::segments(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
+        throw ArtifactError("object handle does not name a materialized tensor");
+    }
+    return objects_[handle.index].segments;
+}
+
+std::span<const std::int32_t> MaterializedArtifact::input_group_map(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
+        throw ArtifactError("object handle does not name a materialized tensor");
+    }
+    const auto& object = objects_[handle.index];
+    return {object.input_group_map, object.input_groups};
+}
+
 std::span<const std::byte> MaterializedArtifact::resource_bytes(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].resource.empty()) {
         throw ArtifactError("object handle does not name a materialized resource");
@@ -169,6 +187,27 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             throw ArtifactError("materialization plan does not match artifact payload");
         }
         out.objects_.at(placement.object.index).device = storage.data;
+        if (tensor != nullptr && !tensor->segments.empty()) {
+            // Typed row runs land back to back; each segment starts where the previous one's
+            // bytes end.
+            auto& segments     = out.objects_.at(placement.object.index).segments;
+            std::uint64_t at   = 0;
+            std::int32_t row   = 0;
+            const auto columns = tensor->shape.at(1);
+            for (const TensorSegment& segment : tensor->segments) {
+                const std::array<std::uint64_t, 2> segment_shape = {segment.rows, columns};
+                const auto bytes = tensor_encoded_size(tensor->layout, segment.format, segment_shape);
+                segments.push_back(WeightSegment{
+                    .row_begin = row,
+                    .rows      = static_cast<std::int32_t>(segment.rows),
+                    .qtype     = qtype_for(segment.format),
+                    .qdata     = static_cast<const std::byte*>(storage.data) + at,
+                    .bytes     = bytes,
+                });
+                at = checked_add(at, bytes, "segment offset");
+                row += static_cast<std::int32_t>(segment.rows);
+            }
+        }
         // A transformed object's runs are its source bytes, which land in scratch and are
         // rearranged into `storage` once every read has finished.
         std::byte* cursor_out = static_cast<std::byte*>(storage.data);
@@ -208,6 +247,33 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                             "artifact tensor byte count overflows u64");
     }
     if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
+    // Column group maps the ops apply to activations: a ggml-blocks object read in the file's
+    // column order carries one without a transform. They live as long as the weights do.
+    {
+        std::vector<std::int32_t> flat;
+        std::vector<std::pair<std::size_t, std::size_t>> spans; // object index, offset
+        for (const DeviceMaterialization& placement : plan.device_objects) {
+            const auto* tensor = std::get_if<TensorDescriptor>(&reader.objects().at(placement.object.index));
+            if (tensor == nullptr || tensor->group_map.empty() || tensor->transform != PayloadTransform::None) {
+                continue;
+            }
+            spans.emplace_back(placement.object.index, flat.size());
+            flat.insert(flat.end(), tensor->group_map.begin(), tensor->group_map.end());
+        }
+        if (!flat.empty()) {
+            out.input_maps_ = std::make_unique<DeviceArena>(flat.size() * sizeof(std::int32_t));
+            auto* maps      = static_cast<std::int32_t*>(
+                out.input_maps_->alloc_bytes(flat.size() * sizeof(std::int32_t), 256).data);
+            CUDA_CHECK(cudaMemcpyAsync(maps, flat.data(), flat.size() * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, device.load_stream));
+            CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
+            for (const auto& [index, offset] : spans) {
+                const auto* tensor = std::get_if<TensorDescriptor>(&reader.objects().at(index));
+                out.objects_.at(index).input_group_map = maps + offset;
+                out.objects_.at(index).input_groups    = tensor->group_map.size();
+            }
+        }
+    }
     // Scratch for the objects that are rearranged rather than copied. It is transient: the reads
     // land here, the rearranging writes their real allocations, and it is freed before serving.
     std::unique_ptr<DeviceArena> staging;

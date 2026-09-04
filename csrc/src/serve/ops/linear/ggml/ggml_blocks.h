@@ -118,7 +118,9 @@ inline constexpr int QI4_NL = QK4_NL / (4 * QR4_NL);
 inline constexpr int VDR_IQ4_NL_Q8_1_MMVQ = 2;
 
 /// ggml-common.h `kvalues_iq4nl`.
-__device__ __constant__ static const int8_t kIq4nlValues[16] = {
+// Global rather than __constant__: read uniformly as four words by the byte-permute lookup
+// and per value by the dequantisers, and a divergent constant read serialises.
+__device__ static const int8_t kIq4nlValues[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 struct block_iq4_nl {

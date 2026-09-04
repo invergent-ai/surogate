@@ -230,6 +230,17 @@ Weight weight_row_view(const Weight& w, std::int32_t row_begin, std::int32_t row
 
 } // namespace
 
+Weight weight_rows(const Weight& w, std::int32_t row_begin, std::int32_t rows) {
+    if (row_begin < 0 || rows <= 0 || row_begin + rows > w.n) {
+        throw std::invalid_argument("weight_rows: row range outside the parent");
+    }
+    if (detail::ggml::is_ggml_qtype(w.qtype)) { return detail::ggml::ggml_weight_rows(w, row_begin, rows); }
+    if (w.layout != QuantLayout::RowSplit && w.layout != QuantLayout::Contiguous) {
+        throw std::invalid_argument("weight_rows: this weight's rows are not independently addressable");
+    }
+    return weight_row_view(w, row_begin, rows);
+}
+
 void linear_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                  WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t rows = out.ne[0];

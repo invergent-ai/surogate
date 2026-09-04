@@ -222,6 +222,17 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
                                        const MtpAttentionProjectionWeights& weights, Tensor& query,
                                        Tensor& gate, Tensor& key, Tensor& value,
                                        WorkspaceArena& workspace, cudaStream_t stream) {
+    // A native GGUF parent is projected per component, from the row views the loader cut:
+    // its rows may come in more than one format (a UD mixture's q beside its k), and each
+    // view is one format the kernel can take. The packed launch and its split stay for the
+    // formats whose fused parent is one plane.
+    if (weights.packed.layout == QuantLayout::GgmlBlocks) {
+        ops::linear(hidden, weights.query, query, stream);
+        ops::linear(hidden, weights.key, key, stream);
+        ops::linear(hidden, weights.output_gate, gate, stream);
+        ops::linear(hidden, weights.value, value, stream);
+        return;
+    }
     auto scope     = workspace.scope();
     const int cols = hidden.ne[1];
     Tensor packed  = workspace.alloc(DType::BF16, {weights.packed.n, cols});

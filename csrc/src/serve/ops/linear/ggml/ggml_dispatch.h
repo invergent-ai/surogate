@@ -32,6 +32,10 @@ void ggml_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena* 
 /// residual += W · x.
 void ggml_linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena* workspace,
                      cudaStream_t stream);
+/// The row range as a GGML weight of its own: its segment's format when the parent mixes
+/// formats, its own otherwise. Refuses a range that straddles two segments.
+Weight ggml_weight_rows(const Weight& w, std::int32_t row_begin, std::int32_t rows);
+
 /// out[rows, T] = W[row_begin : row_begin + rows, :] · x — a row range of the parent, straight
 /// into the caller's tensor. What the fused projections split their parents with.
 void ggml_project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,

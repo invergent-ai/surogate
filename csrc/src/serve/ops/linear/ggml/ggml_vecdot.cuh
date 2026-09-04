@@ -238,20 +238,31 @@ __device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* __restrict__ vbq,
            static_cast<float>(sumi - 16 * sumu);
 }
 
+// A sixteen-entry int8 table looked up for eight nibbles at once with byte permutes, in
+// registers: the table's four words are read uniformly and `__byte_perm` selects with the
+// three low bits of each nibble, the fourth bit choosing between the two halves. The obvious
+// form -- eight per-lane reads of the table -- serialises thirty-two ways on a divergent
+// address and made the IQ4_XS GEMV twelve times slower than Q4_K's (232 us against 19 on the
+// 27B's shapes) until it was measured. llama.cpp's `get_int_from_table_16`.
+__device__ __forceinline__ int2 table16_levels(const int q4, const std::int8_t* table) {
+    const std::uint32_t* table32 = reinterpret_cast<const std::uint32_t*>(table);
+    std::uint32_t tmp[2];
+    const std::uint32_t low_high = (0x32103210u | ((static_cast<std::uint32_t>(q4) & 0x88888888u) >> 1));
+#pragma unroll
+    for (std::uint32_t i = 0; i < 2; ++i) {
+        const std::uint32_t shift = 16 * i;
+        const std::uint32_t low   = __byte_perm(table32[0], table32[1], static_cast<std::uint32_t>(q4) >> shift);
+        const std::uint32_t high  = __byte_perm(table32[2], table32[3], static_cast<std::uint32_t>(q4) >> shift);
+        tmp[i] = __byte_perm(low, high, low_high >> shift);
+    }
+    return make_int2(static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x6420)),
+                     static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x7531)));
+}
+
 // IQ4_NL against the int8 activation block. Four nibbles at a time become four int8 levels
 // through the table, and from there it is the same dp4a dot every other type does; the table
 // lookup is the only thing between this and Q4_0.
-__device__ __forceinline__ int2 iq4_nl_levels(int q4) {
-    const int lo = (q4 >> 0) & 0x0F0F0F0F;
-    const int hi = (q4 >> 4) & 0x0F0F0F0F;
-    const auto* lo8 = reinterpret_cast<const std::int8_t*>(&lo);
-    const auto* hi8 = reinterpret_cast<const std::int8_t*>(&hi);
-    const char4 v0 = make_char4(kIq4nlValues[lo8[0]], kIq4nlValues[lo8[1]], kIq4nlValues[lo8[2]],
-                                kIq4nlValues[lo8[3]]);
-    const char4 v1 = make_char4(kIq4nlValues[hi8[0]], kIq4nlValues[hi8[1]], kIq4nlValues[hi8[2]],
-                                kIq4nlValues[hi8[3]]);
-    return make_int2(*reinterpret_cast<const int*>(&v0), *reinterpret_cast<const int*>(&v1));
-}
+__device__ __forceinline__ int2 iq4_nl_levels(int q4) { return table16_levels(q4, kIq4nlValues); }
 
 __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq,
                                                      const block_q8_1* __restrict__ bq8_1,
@@ -553,20 +564,6 @@ __device__ __forceinline__ std::uint32_t unpack_ksigns(const std::uint8_t v) {
 /// Sixteen-entry table lookup for eight nibbles at once: the even nibbles' levels in `.x`, the
 /// odd nibbles' in `.y`, as two int8x4 words for dp4a. `__byte_perm` selects with three bits;
 /// the fourth bit picks between the table's two halves.
-__device__ __forceinline__ int2 table16_levels(const int q4, const std::int8_t* table) {
-    const std::uint32_t* table32 = reinterpret_cast<const std::uint32_t*>(table);
-    std::uint32_t tmp[2];
-    const std::uint32_t low_high = (0x32103210u | ((static_cast<std::uint32_t>(q4) & 0x88888888u) >> 1));
-#pragma unroll
-    for (std::uint32_t i = 0; i < 2; ++i) {
-        const std::uint32_t shift = 16 * i;
-        const std::uint32_t low   = __byte_perm(table32[0], table32[1], static_cast<std::uint32_t>(q4) >> shift);
-        const std::uint32_t high  = __byte_perm(table32[2], table32[3], static_cast<std::uint32_t>(q4) >> shift);
-        tmp[i] = __byte_perm(low, high, low_high >> shift);
-    }
-    return make_int2(static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x6420)),
-                     static_cast<int>(__byte_perm(tmp[0], tmp[1], 0x7531)));
-}
 
 __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq,
                                                       const block_q8_1* __restrict__ bq8_1,

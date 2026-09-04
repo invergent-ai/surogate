@@ -110,9 +110,12 @@ const gg::block_q8_1* quantise_once(const Tensor& x, std::int32_t k, void* scrat
 
 bool ggml_gdn_input_decode_admits(const Weight& query_key_value, const Weight& z,
                                   std::int32_t batch, std::int32_t width) noexcept {
+    // A parent whose rows mix formats is projected by rows through the generic route; the
+    // fused kernel decodes one format.
     return batch == 1 && width == 1 && ggml::is_ggml_qtype(query_key_value.qtype) &&
            ggml::is_ggml_qtype(z.qtype) && query_key_value.k == z.k &&
-           query_key_value.layout == QuantLayout::GgmlBlocks && z.layout == QuantLayout::GgmlBlocks;
+           query_key_value.layout == QuantLayout::GgmlBlocks && z.layout == QuantLayout::GgmlBlocks &&
+           query_key_value.segment_count == 0 && z.segment_count == 0;
 }
 
 std::size_t ggml_gdn_input_decode_workspace_bytes(std::int32_t input_rows) noexcept {

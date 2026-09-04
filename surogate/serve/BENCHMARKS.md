@@ -166,7 +166,7 @@ gap because llama.cpp's server does not batch these as well as its kernels run.
 | **vLLM** | 1 | 100 | **12,942** | 98.3 | **13,040** | **13.81 s** | prefill-heavy, same card and session; `--max-model-len 4096 --max-num-seqs 128`, and it ran with **less** KV than we did (66,901 tokens against our 104,384), so admission is not what separates them. Replaces a 2026-08-27 pass that read 11,818 |
 | **surogate** | 1 | 1 | **11,200 †** | **70.8** | — | **170 ms** | 2026-08-30 10:21, uncapped GPU 0, fp8 KV, ~1,900-token prompt. Beats the 08-26 pass it replaces (45 tok/s at 352 ms) on both axes |
 | **vLLM** | 1 | 1 | **13,600 †** | **71.7** | — | **140 ms** | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`; 2026-08-30 10:37, uncapped GPU 1. The one shape where vLLM leads us at one user — decode within 1 %, TTFT 20 % better |
-| **surogate** | 1 | 1 | 207 | **46.5** | — | **0.23 s** | 2026-09-04, GPU 0, `unsloth/Qwen3.8-27B-GGUF` UD-Q4_K_M served natively **with MTP** (`--spec mtp --draft-tokens 1`), `--kv-capacity auto`, board harness 512/128. **The first 27B-class GGUF this engine has served**, and it beats llama.cpp on the same file: **+3.8 % decode, 5.1x better TTFT**. Without MTP 44.1 tok/s; draft 2 gives 43.3 and draft 3 38.8, so one draft column is the win here — a verify round costs more than the extra column returns. Perplexity 5.1699 +/- 0.134 against llama.cpp's 5.0166 +/- 0.127 on the same 8 windows. The board's "prefill" is a whole-request share, not a prompt rate: 512 tokens at 0.23 s TTFT is ~2,200 tok/s of prompt, against llama.cpp's own 1,610 |
+| **surogate** | 1 | 1 | 371 | **83.3** | — | **0.24 s** | 2026-09-04 22:03, GPU 0, `unsloth/Qwen3.8-27B-GGUF` UD-Q4_K_M served natively **with MTP** (`--spec mtp --draft-tokens 1`; drafts 2 / 3: 76.9 / 69.9), every object but two Q8_0 projections read from the file: the UD mixture's mixed-type fused parents as typed segments, the V-head-permuted GDN out_proj with the permutation on the activation, and the IQ4_XS GEMV on a byte-permute table lookup (it had been a per-lane constant read: 232 us/call, 12x Q4_K's). The 46.5 row of 22:00 that morning had 33 % of the bytes requantised to Q4G64/Q5G64 and the slow IQ4_XS kernel on the rest; PPL 5.1699 -> 5.0477 against llama.cpp's 5.0166. |
 | llama.cpp | 1 | 1 | **1,610 †** | **44.8** | — | **1.18 s** | 2026-08-30 12:07, uncapped GPU 5, CUDA build, `unsloth/Qwen3.8-27B-GGUF` UD-Q4_K_M (fetched for this row; our side is all-NVFP4). Its own prompt-eval timing is 2,734 tok/s |
 
 ### Qwen3.6-35B-A3B
@@ -223,14 +223,16 @@ Same file, same probe, one card, one user, a 2,048-token prompt:
 
 | | TTFT | the engine's own prompt-eval |
 |---|---:|---:|
-| **surogate** | **812 ms** | **2,600 tok/s** |
+| **surogate** (22:07, everything native) | **752 ms** | **2,804 tok/s** |
+| surogate, 12:00 the same day (33 % of bytes requantised, slow IQ4_XS GEMV) | 812 ms | 2,600 tok/s |
 | llama.cpp `llama-server` | 1,265 ms | 2,565 tok/s |
 | llama.cpp `llama-bench pp2048` | — | **3,190 tok/s** |
 
 Through the server we are ahead on both. `llama-bench` is the compute bar, though: it hands the
 model one 2,048-wide batch where `llama-server` splits into 512-token micro-batches, and that
-number is 23 % above ours. End to end we run 112 TFLOP of prompt at **142 TFLOP/s effective**
-against its 174.
+number is 14 % above ours (23 % before the native pass). End to end we run 112 TFLOP of prompt
+at **149 TFLOP/s effective** against its 174. The profile below is the morning's, before the
+native pass; its "groupwise kernels on the re-encoded halves" no longer run on this file.
 
 An `nsys` capture with `--cuda-graph-trace=node` (the prefill is a captured graph; without that
 flag the profile shows almost nothing) says where a prefill's GPU time goes:
@@ -286,6 +288,7 @@ ours eager with the raw prompt (`surogate/serve/tools/eval/perplexity.py`) again
 | Qwen3-0.6B-Q4_K_M (40 windows, 2026-09-04, **BF16 KV cache** -- the new `auto` default for a pure-attention stack; fp32 reference over the same weights 17.4127) | Q4_K/Q6_K | 17.4315 +/- 0.281 | 17.5103 +/- 0.281 |
 | Qwen3-0.6B-IQ4_XS (40 windows, 2026-09-04, BF16 KV cache; the FP8 row above read 18.330) | IQ4_XS/Q6_K | 17.8580 +/- 0.286 | 17.8659 +/- 0.286 |
 | Qwen3.8-27B-UD-Q4_K_M (8 windows, 2026-09-04, BF16 KV cache; FP8 read 5.1699) | Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_S | 5.1495 +/- 0.133 | 5.0166 +/- 0.127 |
+| Qwen3.8-27B-UD-Q4_K_M (8 windows, 2026-09-04 22:07, **everything native**: typed segments for the mixed-type fused parents, the GDN out_proj permutation on the activation; FP8 KV cache -- BF16 reads 5.0523, inside the bar) | Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_S | **5.0477 +/- 0.129** | 5.0166 +/- 0.127 |
 | Qwen3.5-0.8B-IQ4_XS | IQ4_XS 50 %, Q6_K 43 % | **15.094 +/- 0.225** | 15.151 +/- 0.226 |
 | Qwen3.5-0.8B-UD-Q2_K_XL | Q2_K/Q3_K, IQ3_S/IQ3_XXS/IQ2_S/IQ4_XS | 20.209 +/- 0.305 | 20.016 +/- 0.302 |
 | Qwen3-0.6B-UD-IQ2_M | IQ2_S 34 %, IQ3_S 16 %, IQ3_XXS | **40.128 +/- 0.702** | 42.045 +/- 0.743 |

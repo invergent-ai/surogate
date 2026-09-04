@@ -97,6 +97,18 @@ enum class QuantLayout : std::uint16_t {
     GgmlBlocks          = 5,
 };
 
+/// One typed row run of a GGML-blocks weight whose rows do not all share a format: a fused
+/// parent read from a UD mixture, where the file quantised q and k, or gate and up, to
+/// different K-quants. Segments are consecutive and cover the parent; the ops that split a
+/// parent by rows project each component from the segment that holds it.
+struct WeightSegment {
+    std::int32_t row_begin = 0;
+    std::int32_t rows      = 0;
+    QType qtype            = QType::Q4G64_F16S;
+    const void* qdata      = nullptr;
+    std::uint64_t bytes    = 0;
+};
+
 struct Weight {
     const void* payload            = nullptr;
     std::uint64_t payload_bytes    = 0;
@@ -119,6 +131,15 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+    /// Typed row runs when the rows are not all one format (GgmlBlocks only); `qtype` and
+    /// `qdata` then describe the first run. Null and zero for a homogeneous weight.
+    const WeightSegment* segments = nullptr;
+    std::int32_t segment_count    = 0;
+    /// On the device, k / 32 entries: the stored column group each of the activation's
+    /// 32-row groups belongs at, when the weight was read from a file that keeps its columns
+    /// in another order. The ops permute the activation before the launch. Null when the
+    /// columns are in order.
+    const std::int32_t* input_group_map = nullptr;
 };
 
 } // namespace sinfer

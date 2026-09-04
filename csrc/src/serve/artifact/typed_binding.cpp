@@ -268,11 +268,28 @@ Weight ggml_blocks_weight(const MaterializedArtifact& materialized, ObjectHandle
                           NumericFormat format, std::int32_t rows, std::int32_t columns) {
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
                                                 static_cast<std::uint64_t>(columns)};
-    const std::uint64_t bytes = tensor_encoded_size(StorageLayout::GgmlBlocksV1, format, shape);
+    const auto segments = materialized.segments(handle);
+    std::uint64_t bytes = 0;
+    if (segments.empty()) {
+        bytes = tensor_encoded_size(StorageLayout::GgmlBlocksV1, format, shape);
+    } else {
+        // A parent whose rows come in more than one format: its bytes are the sum of its
+        // typed runs, and `format` names the first of them.
+        for (const WeightSegment& segment : segments) { bytes += segment.bytes; }
+    }
     const auto* data          = static_cast<const std::byte*>(materialized.device_data(handle));
     Weight out{};
     out.payload         = data;
     out.payload_bytes   = bytes;
+    out.segments        = segments.empty() ? nullptr : segments.data();
+    out.segment_count   = static_cast<std::int32_t>(segments.size());
+    const auto map      = materialized.input_group_map(handle);
+    if (!map.empty()) {
+        if (map.size() != static_cast<std::size_t>(columns / 32)) {
+            throw ArtifactError("ggml weight column group map does not match its columns");
+        }
+        out.input_group_map = map.data();
+    }
     const auto values   = static_cast<std::int32_t>(ggml_block_values(format));
     out.qtype           = qtype_for(format);
     out.group_size      = static_cast<std::uint32_t>(values);

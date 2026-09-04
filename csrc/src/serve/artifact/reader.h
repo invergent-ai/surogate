@@ -133,6 +133,12 @@ enum class PayloadTransform : std::uint8_t {
     Q8ToW8RowSplit,
 };
 
+/// A run of rows in one format, for a ggml-blocks object whose rows come in more than one.
+struct TensorSegment {
+    NumericFormat format;
+    std::uint64_t rows;
+};
+
 struct TensorDescriptor {
     std::string name;
     std::vector<std::uint64_t> shape;
@@ -144,6 +150,9 @@ struct TensorDescriptor {
     /// `k / 32` entries naming the source block each destination block takes, when the transform
     /// also carries a column permutation. Empty when the columns are in order.
     std::vector<std::int32_t> group_map;
+    /// Consecutive typed row runs covering the object, when its rows are not all `format`
+    /// (which then names the first run). Empty for a homogeneous object.
+    std::vector<TensorSegment> segments;
 };
 
 struct ResourceDescriptor {

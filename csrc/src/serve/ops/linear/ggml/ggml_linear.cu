@@ -1,5 +1,7 @@
 #include "ops/linear/ggml/ggml_linear.h"
 
+#include "core/device.h"
+
 #include "ops/linear/bf16/bf16_cublaslt.h"
 #include "ops/linear/ggml/ggml_dequant.h"
 #include "ops/linear/ggml/ggml_q8_1.h"
@@ -125,6 +127,35 @@ void linear_launch_f32(GgmlType type, const void* blocks, std::int32_t rows, std
         throw std::invalid_argument("ggml linear: scratch too small or misaligned");
     }
     run_gemv<float, false>(type, blocks, rows, k, x, tokens, out, scratch, stream);
+}
+
+namespace {
+
+__global__ void permute_column_groups_kernel(const __nv_bfloat16* __restrict__ x, int k, int tokens,
+                                             const std::int32_t* __restrict__ group_map,
+                                             __nv_bfloat16* __restrict__ out) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t total = static_cast<std::size_t>(k) * tokens;
+    if (i >= total) { return; }
+    const int t     = static_cast<int>(i / k);
+    const int row   = static_cast<int>(i - static_cast<std::size_t>(t) * k);
+    const int group = row >> 5;
+    const int lane  = row & 31;
+    out[static_cast<std::size_t>(t) * k + group_map[group] * 32 + lane] = x[i];
+}
+
+} // namespace
+
+void permute_column_groups_launch(const __nv_bfloat16* x, std::int32_t k, std::int32_t tokens,
+                                  const std::int32_t* group_map, __nv_bfloat16* out,
+                                  cudaStream_t stream) {
+    if (k <= 0 || tokens <= 0 || (k % 32) != 0 || group_map == nullptr) {
+        throw std::invalid_argument("permute_column_groups: k a multiple of 32 and a map");
+    }
+    const std::size_t total = static_cast<std::size_t>(k) * tokens;
+    const unsigned blocks   = static_cast<unsigned>((total + 255) / 256);
+    permute_column_groups_kernel<<<blocks, 256, 0, stream>>>(x, k, tokens, group_map, out);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace sinfer::ops::detail::ggml

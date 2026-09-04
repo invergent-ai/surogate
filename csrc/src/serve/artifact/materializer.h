@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/binder.h"
+#include "core/tensor.h"
 #include "core/arena.h"
 #include "core/device.h"
 
@@ -39,6 +40,12 @@ public:
     MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
 
     void* device_data(ObjectHandle handle) const;
+    /// The typed row runs of a ggml-blocks tensor whose rows are not all one format, pointing
+    /// into its device bytes; empty for a homogeneous object.
+    std::span<const WeightSegment> segments(ObjectHandle handle) const;
+    /// The device-resident column group map of a ggml-blocks tensor read in the file's column
+    /// order; empty when its columns are in order.
+    std::span<const std::int32_t> input_group_map(ObjectHandle handle) const;
     std::span<const std::byte> resource_bytes(ObjectHandle handle) const;
     std::vector<std::byte> take_resource_bytes(ObjectHandle handle);
 
@@ -53,9 +60,13 @@ private:
     struct ObjectStorage {
         void* device = nullptr;
         std::vector<std::byte> resource;
+        std::vector<WeightSegment> segments;
+        const std::int32_t* input_group_map = nullptr;
+        std::size_t input_groups            = 0;
     };
 
     std::unique_ptr<DeviceArena> device_arena_;
+    std::unique_ptr<DeviceArena> input_maps_; // the column group maps the ops read at every launch
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };
