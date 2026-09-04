@@ -21,7 +21,7 @@ import numpy as np
 from surogate import _surogate
 from surogate.grpo.config import GRPOTrainConfig
 from surogate.grpo.data import GRPODataLoader
-from surogate.grpo.loss import compute_grpo_per_token_grads
+from surogate.grpo.loss import compute_grpo_per_token_grads, shift_to_target, unshift_to_logical
 from surogate.grpo.turn_stats import TurnAccumulator
 from surogate.grpo.weight_broadcast import SurogateWeightBroadcast
 from surogate.train.lr_schedule import LRSchedule
@@ -97,13 +97,34 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
 
     Packed sequences reset position_ids at each sample boundary (e.g.
     [0,1,2,0,1,0,1,2,3]).  Returns (start, end) tuples for each sample.
+
+    A boundary is any position that does not advance its predecessor by exactly
+    one. Every producer writes a sample's positions as ``range(n)``
+    (``batch.py:22``, and ``batch.py:140`` for padding), so within a sample the
+    delta is always 1 and this test is exact rather than heuristic. It is the
+    same rule the engine uses to derive attention documents from the same array
+    (``compute_doc_masking``, ``causal_lm_execution_profile.cpp``), so the two no
+    longer disagree about where a sample ends. They are not identical: ranges are
+    built from the unpadded ``position_ids`` while the engine sees the padded
+    row, whose sequence padding continues monotonically and so joins the last
+    document. Nothing depends on that tail agreeing, but do not read this as a
+    guarantee that it does.
+
+    This replaced ``pos[i] == 0 and pos[i-1] != 0`` plus a ``pos[i+1] == 1``
+    lookahead, which silently dropped the boundary of any 1-token sample: a
+    trailing single pad token merged into the sample before it, and an interior
+    one collapsed both its neighbours into a single range, so the next-token
+    shift ran across the join and one sample's gradient landed on another's
+    token. The delta rule splits those correctly instead of guessing.
+
+    Assumes non-mrope position ids. mrope packs multi-axis positions that do not
+    increment by one, and the engine branches on ``curr < prev`` for that case;
+    GRPO packs text positions only.
     """
     boundaries = [0]
     for i in range(1, len(position_ids_flat)):
-        if position_ids_flat[i] == 0 and position_ids_flat[i - 1] != 0:
-            # Only treat as a new sample if the next position is 1.
-            if i + 1 < len(position_ids_flat) and position_ids_flat[i + 1] == 1:
-                boundaries.append(i)
+        if position_ids_flat[i] - position_ids_flat[i - 1] != 1:
+            boundaries.append(i)
     ranges: list[tuple[int, int]] = []
     for i, start in enumerate(boundaries):
         end = boundaries[i + 1] if i + 1 < len(boundaries) else len(position_ids_flat)
@@ -478,11 +499,9 @@ class GRPOTrainer:
         for i, p in enumerate(prepared):
             # Un-shift from target-slot layout to logical layout (see
             # _diagnostic_micro_step for why this is required).
-            buf = np.asarray(logprob_rows[i, :seq_len], dtype=np.float32)
-            trainer_lp = np.zeros(seq_len, dtype=np.float32)
-            for start, end in p["sample_ranges"]:
-                if end - start > 1:
-                    trainer_lp[start + 1 : end] = buf[start : end - 1]
+            trainer_lp = unshift_to_logical(
+                np.asarray(logprob_rows[i, :seq_len], dtype=np.float32), p["sample_ranges"]
+            )
 
             grads, metrics = compute_grpo_per_token_grads(
                 trainer_logprobs=trainer_lp,
@@ -504,9 +523,7 @@ class GRPOTrainer:
                     sample_ranges=p["sample_ranges"],
                 )
 
-            for start, end in p["sample_ranges"]:
-                if end - start > 1:
-                    custom_dloss[i, start : end - 1] = grads[start + 1 : end]
+            custom_dloss[i] = shift_to_target(grads, p["sample_ranges"])
         custom_dloss /= loss_scale
 
         loss = float(
@@ -547,10 +564,15 @@ class GRPOTrainer:
         """Micro-step that also records turn-resolved statistics.
 
         Decomposes the fused native step into forward -> Python loss -> backward
-        so per-token trainer logprobs become visible. The gradients are identical
-        to ``step_grpo_native`` (same reference implementation, asserted by
-        tests/grpo/test_native_formula.py); the only cost is the Python round
-        trip on the [1, T] logprob buffer.
+        so per-token trainer logprobs become visible. The gradients are intended
+        to be identical to ``step_grpo_native``; the only cost is the Python
+        round trip on the [1, T] logprob buffer.
+
+        Not directly asserted anywhere. The closest evidence is
+        ``tests/grpo/test_native_parity.py::test_the_cuda_kernel_matches_the_python_reference_metrics``
+        (needs a GPU), which compares the kernel's *metrics* against the Python
+        reference on the same batch -- strong evidence the two implementations
+        agree, but not a gradient-level assertion, and not this decomposition.
         """
         logprobs = self.trainer.forward_for_grpo(input_step, targets_step, pos_step, temp_step)
 
@@ -560,11 +582,7 @@ class GRPOTrainer:
         # un-shift within each packed sample. This is the exact inverse of the
         # shift applied to the gradients below, and mirrors how the native kernel
         # reads losses[out_idx] as the logprob of logical token out_idx+1.
-        buf = np.asarray(logprobs[0, :seq_len], dtype=np.float32)
-        trainer_lp = np.zeros(seq_len, dtype=np.float32)
-        for start, end in sample_ranges:
-            if end - start > 1:
-                trainer_lp[start + 1 : end] = buf[start : end - 1]
+        trainer_lp = unshift_to_logical(np.asarray(logprobs[0, :seq_len], dtype=np.float32), sample_ranges)
 
         loss_mask_bool = loss_mask_padded.astype(bool)
         per_token_grads, metrics = compute_grpo_per_token_grads(
@@ -605,10 +623,7 @@ class GRPOTrainer:
 
         # Shift into the target layout the LM-head backward expects: the gradient
         # for logical token t is written at slot t-1 within its own sample.
-        shifted = np.zeros((1, seq_len), dtype=np.float32)
-        for start, end in sample_ranges:
-            if end - start > 1:
-                shifted[0, start : end - 1] = per_token_grads[start + 1 : end]
+        shifted = shift_to_target(per_token_grads, sample_ranges).reshape(1, seq_len)
         shifted /= loss_scale
 
         ngpu = self.config.gpus

@@ -13,6 +13,8 @@
 #include "utilities/dtype.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <mutex>
 #include <string>
 
 namespace dsl {
@@ -155,6 +157,45 @@ CausalLMExecutionProfile::compute_doc_masking(const std::int32_t* position_ids, 
 
     const int num_docs = static_cast<int>(cu_seqlens.size()) - 1;
     const int total_q = cu_seqlens.back();
+
+    // Documents are not free: the flash-varlen backward arena is sized
+    // `total_q + 128 * num_docs`, so each one costs 128 padded tokens however
+    // short it is. num_docs approaching total_q means nearly every document is a
+    // single token, which no real batch produces -- it means position_ids are
+    // not resetting per real document, as when a padded region is counted one
+    // document per pad token. Caught here, where position_ids become documents,
+    // rather than in a backend: every backend sizes something from num_docs, and
+    // this is the one place that can name the cause. Left to run, the flash
+    // backend presents it as a multi-gigabyte std::bad_alloc that mentions
+    // neither documents nor position ids. The token floor keeps small real
+    // batches (and tests) clear of it.
+    // Warn rather than throw: this runs inside the model forward, which is
+    // replayed under an open cudaStreamBeginCapture (py_train.cpp) with no
+    // try/catch before EndCapture. An exception escaping there would leave the
+    // stream in capture mode and turn a clear diagnostic into an opaque CUDA
+    // failure or a hang. Printing costs nothing and still puts the numbers
+    // directly above the std::bad_alloc that follows, which is all the original
+    // diagnosis was missing. Once per process, so a real run is not spammed.
+    // Trigger on the arena, not on document length. `num_docs * 2 > total_q`
+    // needed a mean document under two tokens, but the arena is already 17x
+    // oversized at a mean of eight and 44x at a mean of three -- both of which
+    // die with the same unexplained bad_alloc this exists to prevent. This fires
+    // once the arena exceeds ~5x the real token count, and stays quiet on real
+    // packing (a GRPO row of ~53-token samples sits at 3.4x).
+    if (total_q >= 128 && 128L * num_docs > 4L * total_q) {
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            std::fprintf(stderr,
+                         "[surogate] doc masking: %d documents for %d tokens. Nearly every document is one "
+                         "token long, which means position_ids are not resetting per real document -- check "
+                         "the tokenizer that built them. Attention backward will now try to allocate an "
+                         "arena sized for %d documents.\n",
+                         num_docs,
+                         total_q,
+                         num_docs);
+        });
+    }
+
     return CausalLMDocMaskingInfo{std::move(cu_seqlens), num_docs, max_seqlen, total_q};
 }
 
