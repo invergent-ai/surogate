@@ -66,7 +66,13 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
         throw std::invalid_argument("linear: weight n/k must be positive");
     }
     if (x.ne[0] != w.k || out.ne[0] != w.n || out.ne[1] != x.ne[1]) {
-        throw std::invalid_argument("linear: expected [K,T] x [N,K] -> [N,T]");
+        // Name the shapes: a mismatch here is a caller's geometry against a weight's, and the
+        // numbers say which of the two is wrong far faster than the rule does.
+        throw std::invalid_argument(
+            "linear: expected [K,T] x [N,K] -> [N,T], got x [" + std::to_string(x.ne[0]) + "," +
+            std::to_string(x.ne[1]) + "] weight [" + std::to_string(w.n) + "," +
+            std::to_string(w.k) + "] out [" + std::to_string(out.ne[0]) + "," +
+            std::to_string(out.ne[1]) + "]");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
         throw std::invalid_argument("linear: x/out must be contiguous");
@@ -184,6 +190,67 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+}
+
+namespace {
+
+/// The row range as a weight of its own, for a format whose rows are independently addressable.
+/// Row-split groupwise formats keep their code, high-bit and scale planes separately, each a
+/// whole number of bytes per row, so a row offset is the same offset in each plane; contiguous
+/// BF16 is one plane. GGML blocks are handled by their own route, which knows the block stride.
+Weight weight_row_view(const Weight& w, std::int32_t row_begin, std::int32_t rows) {
+    Weight out = w;
+    out.n = rows;
+    out.shape[0] = rows;
+    out.padded_shape[0] = rows;
+    if (w.layout == QuantLayout::Contiguous) {
+        const std::uint64_t row_bytes = static_cast<std::uint64_t>(w.padded_shape[1]) * sizeof(std::uint16_t);
+        out.payload = static_cast<const std::byte*>(w.payload) + static_cast<std::uint64_t>(row_begin) * row_bytes;
+        out.qdata   = out.payload;
+        out.payload_bytes = static_cast<std::uint64_t>(rows) * row_bytes;
+        return out;
+    }
+    const std::uint64_t groups = static_cast<std::uint64_t>(w.padded_shape[1] / w.group);
+    // Bytes per row in each plane. The low plane carries four bits per value for the groupwise
+    // trio and eight for W8, which at their group sizes is the same 32 bytes per group for all
+    // four -- derived rather than written down, so a format with another pairing still lands right.
+    const std::uint64_t low_bits = w.qtype == QType::W8G32_F16S ? 8 : 4;
+    const std::uint64_t low_row  = groups * (static_cast<std::uint64_t>(w.group) * low_bits / 8);
+    const std::uint64_t high_row = groups * (w.qtype == QType::Q5G64_F16S   ? std::uint64_t{8}
+                                             : w.qtype == QType::Q6G64_F16S ? std::uint64_t{16}
+                                                                            : std::uint64_t{0});
+    const std::uint64_t scale_row = groups * 2;
+    out.qdata  = static_cast<const std::byte*>(w.qdata) + static_cast<std::uint64_t>(row_begin) * low_row;
+    out.qhigh  = high_row == 0 ? nullptr
+                               : static_cast<const std::byte*>(w.qhigh) +
+                                     static_cast<std::uint64_t>(row_begin) * high_row;
+    out.scales = static_cast<const std::byte*>(w.scales) + static_cast<std::uint64_t>(row_begin) * scale_row;
+    return out;
+}
+
+} // namespace
+
+void linear_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
+                 WorkspaceArena* workspace, cudaStream_t stream) {
+    const std::int32_t rows = out.ne[0];
+    if (row_begin < 0 || rows <= 0 || row_begin + rows > w.n) {
+        throw std::invalid_argument("linear_rows: row range outside the parent");
+    }
+    if (detail::ggml::is_ggml_qtype(w.qtype)) {
+        detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
+        return;
+    }
+    if (w.layout != QuantLayout::RowSplit && w.layout != QuantLayout::Contiguous) {
+        throw std::invalid_argument("linear_rows: this weight's rows are not independently "
+                                    "addressable (layout " +
+                                    std::to_string(static_cast<int>(w.layout)) + ")");
+    }
+    const Weight view = weight_row_view(w, row_begin, rows);
+    if (workspace != nullptr) {
+        linear(x, view, out, LinearPolicy::A16Only, *workspace, stream);
+    } else {
+        linear(x, view, out, stream);
+    }
 }
 
 } // namespace sinfer::ops

@@ -94,56 +94,22 @@ product rather than tasks (1 and 10); the rest are work.
    is the `qwen3` target's, not the codec's: something in that family's arithmetic (its Q6_K
    endpoints, attention or rope precision) sits 1-3 % behind llama.cpp where `qwen3_5` matches.
    Its own item below. Left:
-   - **The 27B-class groupwise *runtime* is incomplete, and has been since the three Qwen3.5
-     targets became one (f308f747).** The 27B GGUF now converts (253 of 506 sources native)
-     and loads its 14.9 GiB in 4.9 s, then dies in the plan: the export splits every attention
-     parent into query|key + gate|value and every GDN parent into query|key + value|z, and the
-     runtime serves only the fused parent and the GGUF-native GDN split (qkv | z). The split
-     attention loader was cut in that merge as unreachable and is back (this target's
-     extents); its runtime overload is bound to the safetensors export (Q4G64 + Q5G64 halves,
-     literal 5120/6144/1024) while this artifact's halves are native K-quants or re-encoded
-     Q4/Q5 per layer, mixed. What finishes it: (a) the attention split overload generic per
-     half -- GGML halves through `ggml_project_rows`, other formats through `ops::linear`
-     into a workspace plane and row copies, the fused Q4/Q5 kernel kept as the fast path;
-     (b) the GDN `QkPlusVz` payload in the conv-snapshot/record/decode routes (project each
-     half by rows into the conv plane and z, then the shared projected-conv tail), or the
-     GGUF recipe storing GDN as qkv | z, which the runtime already serves; (c) the workspace
-     terms for the per-half planes. Also found on the way: the GroupwiseInt workspace sizing
-     asked the W8 routes for shapes they never registered at 27B (fixed: those queries answer
-     zero off-table), and MTP on any 27B-class model never bound (below).
-   - **Mixed-type fused parents go through the bridge.** A UD mixture gives one layer's
-     `attn_q` Q5_K and `attn_k` Q4_K; the fused query/key parent cannot be one native
-     format, `SUROGATE_GGUF_SPLIT_HALVES` is off (and two-run only), so the parent is
-     dequantised and re-encoded as Q5G64/Q4G64 -- the home-grown formats item 1 wants gone.
-     On the 27B that is 253 of 506 candidate tensors kept native. The fix is typed runs per
-     source inside one object (the loader binds a run per type), which also retires the
-     halves switch.
-   - **The planner is a fixed point now** (`ingest._repack_planner`): a source read by an
-     uncovered recipe is bridged, and dropping it can un-cover another object whose other
-     sources must follow; `scratchpad/plan_probe.py`'s logic (candidate pre-walk + both
-     sides' coverage, offline in a minute) belongs in `surogate/serve/tools/` so the next
-     RepackError is examined without a bridge run.
-   - **MTP on a 27B-class model has never bound.** The draft block is byte-wide by design
-     (`build_mtp_specs`: W8 "under every export"), and the W8 attention route accepts only
-     K in {1024, 2048, 2560} (`attn_input_proj.cpp` `require_w8_rowsplit`, the workspace
-     switch's registered pairs) -- at K = 5120 the load throws `unsupported W8 profile`
-     before any `--spec` is asked for. The 27B GGUF serves as its no-MTP variant for now.
-     The generic fix is a row-range fallback in that route (split the fused parent by rows
-     and run `ops::linear` per range, as the GGML branch does with `ggml_project_rows`),
-     which also retires the registered-shape list -- a model-agnostic-core item.
-   - **The NLL probe now fits its arena and its model** (`debug_next_token_nll`: slice
-     clamped to the request arena's spare bytes; token domain clamped to the head's vocab).
-     Before, the perplexity gate could not run on the `qwen3` family at all: `{vocab, 256}`
-     BF16 logits are 78 MB against a 59 MB arena, and the family's 248,077-row domain
-     exceeds the 0.6B's 151,936.
-   - **F16 tensors are bridged to BF16**, losing three mantissa bits: UD-Q8_K_XL files are
-     52-67 % F16. A native F16 format is a cuBLASLt path, not a codec.
-   - **`qwen3` eager prefill workspace, pre-existing:** on `Qwen3-0.6B-Q4_K_M` (old types
-     only) a ~2,048-token raw prompt under `SUROGATE_SERVE_PREFILL_GRAPH=0` dies with
-     `workspace arena exhausted: request 77,791,232 bytes ... capacity 58,736,896` in a
-     decode round; the same bytes with an IQ file. Repro: `scratchpad/discrim.sh`. It blocks
-     the perplexity gate on the Qwen3-0.6B family (the gate runs eager); the `qwen3_5`
-     family is unaffected.
+   **The 27B-class GGUF serves, with MTP (2026-09-04).** `unsloth/Qwen3.8-27B-GGUF`
+   UD-Q4_K_M: 46.5 tok/s decode with `--spec mtp --draft-tokens 1` against llama.cpp's 44.8 on
+   the same file, TTFT 0.23 s against 1.18 s, perplexity 5.1699 +/- 0.134 against 5.0166 +/-
+   0.127. Four things were wrong, none of them the formats: the repack planner was not a fixed
+   point; a GGUF's `block_count` includes the MTP block; the native path silently dropped the
+   column permutation llama.cpp's V-head reorder puts on the GDN `out_proj` (48 objects, and
+   the reason the model produced confident noise at 4.6M perplexity); and the 27B-class
+   groupwise runtime had been incomplete since f308f747 -- the split attention loader was cut
+   as unreachable, the GDN `QkPlusVz` payload had no runtime, and the W8 capacity queries
+   refused shapes their routes never registered. `mtp/input_projection` was bound with
+   `K = query_size` where the object is `[hidden, 2*hidden]`; the two coincide at the size this
+   target compiles, so every larger model failed at its first draft round.
+   Left on this model: **prefill**. 512 tokens at 0.23 s is ~2,200 tok/s against llama.cpp's
+   1,610, but only 165 of 506 candidate tensors are native (the re-encode to Q4G64/Q5G64 is
+   what item 1 wants gone), and the 2,048-token prompt llama.cpp measures has not been run.
+
 5. **[ ] The `qwen3` dense target scores 1-3 % behind llama.cpp where `qwen3_5` matches
    (2026-09-04).** Same corpus, same windows, same method: Qwen3-0.6B-Q4_K_M 17.675 vs 17.510,
    IQ4_XS 18.330 vs 17.866; Qwen3.5-0.8B-IQ4_XS 15.094 vs 15.151. The codecs are shared, so

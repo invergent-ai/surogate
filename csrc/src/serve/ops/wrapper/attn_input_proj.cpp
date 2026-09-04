@@ -1,5 +1,7 @@
 #include "api/ops/attn_input_proj.h"
 
+#include "api/ops/linear.h"
+
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
@@ -299,6 +301,45 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         break;
     }
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
+}
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                     Tensor& v, LinearPolicy policy, WorkspaceArena& workspace,
+                     cudaStream_t stream) {
+    validate_policy(policy);
+    const std::int32_t cols      = x.ne[1];
+    const std::int32_t query_rows = q.ne[0];
+    const std::int32_t kv_rows    = k.ne[0];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    // The registered pair keeps its fused kernel, which is why that path is untouched here.
+    if (query_key_weight.qtype == QType::Q4G64_F16S &&
+        gate_value_weight.qtype == QType::Q5G64_F16S &&
+        query_key_weight.layout == QuantLayout::RowSplit &&
+        gate_value_weight.layout == QuantLayout::RowSplit && query_key_weight.k == 5120 &&
+        query_rows == 6144 && kv_rows == 1024) {
+        attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+        return;
+    }
+    if (query_key_weight.k != gate_value_weight.k || query_key_weight.k != x.ne[0]) {
+        throw std::invalid_argument("attn_input_proj: halves disagree on K");
+    }
+    if (query_key_weight.n != query_rows + kv_rows || gate_value_weight.n != gate.ne[0] + v.ne[0] ||
+        gate.ne[0] != query_rows || v.ne[0] != kv_rows) {
+        throw std::invalid_argument(
+            "attn_input_proj: destination rows do not match the halves (each half is query|key "
+            "or gate|value)");
+    }
+    require_matrix(x, query_key_weight.k, cols, "x");
+    require_matrix(q, query_rows, cols, "q");
+    require_matrix(gate, query_rows, cols, "gate");
+    require_matrix(k, kv_rows, cols, "k");
+    require_matrix(v, kv_rows, cols, "v");
+    // Four row ranges, four contiguous destinations: no staging plane is needed.
+    linear_rows(x, query_key_weight, 0, q, &workspace, stream);
+    linear_rows(x, query_key_weight, query_rows, k, &workspace, stream);
+    linear_rows(x, gate_value_weight, 0, gate, &workspace, stream);
+    linear_rows(x, gate_value_weight, query_rows, v, &workspace, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,

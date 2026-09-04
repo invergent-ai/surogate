@@ -811,9 +811,14 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     if (plan.features.mtp() && plan.has_mtp) {
         auto& mtp            = runtime.mtp.emplace();
+        // The draft block projects [embedding ; hidden] -- two hidden widths -- not a query
+        // plane. The binder above already says `mtp_input_rows()`; this said `query_size()`,
+        // and the two are the same number at the size this target compiles (1024 hidden, 8
+        // query heads of 256), so every model where they differ bound the weight with the
+        // wrong K and failed at the first draft round.
         mtp.input_projection = artifact::materialized_weight(
             backing, plan.mtp.input_projection, plan.mtp.input_projection_w.format, g.hidden,
-            g.query_size());
+            g.mtp_input_rows());
         mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
                                                              NumericFormat::BF16, {g.hidden});
         mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,

@@ -158,6 +158,9 @@ FetchContent_Declare(
         GIT_TAG main
         SOURCE_SUBDIR _none
         EXCLUDE_FROM_ALL
+        # minja has Jinja2's `defined` test but not `undefined`, which the Qwen3.5-family chat
+        # templates open with; cmake/patch_minja.sh adds it (idempotent).
+        PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_minja.sh
 )
 
 # Catch2 for tests

@@ -108,6 +108,56 @@ void gdn_input_proj_conv_snapshot_split(
     LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
 
 /** Split qkv|z record: project into the caller's record plane and z, then the convolution. */
+/**
+ * Query|key plus value|z pair, of any row-addressable persistent format.
+ *
+ * The 27B-class groupwise export stores the GDN input projection as two objects: `qk_weight`
+ * holds query and key (`2 * key_dim` rows), `value_z_weight` holds value and z
+ * (`2 * value_dim` rows). The registered Q4/Q5 pair has fused kernels and is delegated to them;
+ * every other pair -- a GGUF whose halves are K-quants, say -- is projected a piece at a time.
+ * A row range of a column-major plane is not contiguous, so the two conv-plane pieces are
+ * projected into scratch and placed with strided copies; z, being the tail of its parent and a
+ * plane of its own, is projected straight into place.
+ *
+ * Shapes are read from the operands: `qkv` is `[qk_rows + value_rows, T]`, `z` is
+ * `[z_rows, T]`, and `value_z_weight.n` must equal `value_rows + z_rows`.
+ */
+void gdn_input_proj_pair(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                         Tensor& qkv, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                         cudaStream_t stream);
+
+[[nodiscard]] std::size_t gdn_input_proj_pair_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, std::int32_t qk_rows, std::int32_t value_rows,
+    std::int32_t z_rows, std::int32_t input_rows, LinearPolicy policy, std::int32_t min_tokens,
+    std::int32_t max_tokens);
+
+/// Snapshot-producing form of gdn_input_proj_pair: the pair fills the convolution plane and z,
+/// then the shared projected-convolution tail writes query, key and value.
+void gdn_input_proj_conv_snapshot_pair(
+    const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+    const Tensor& conv_weight, Tensor& conv_states, const Tensor& valid_columns,
+    const Tensor& initial_state_slots, const Tensor& snapshot_base_slots, Tensor& query,
+    Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+    cudaStream_t stream);
+
+[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_pair_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, std::int32_t qk_rows, std::int32_t value_rows,
+    std::int32_t z_rows, std::int32_t input_rows, LinearPolicy policy, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width);
+
+/// Record-producing form of gdn_input_proj_pair.
+void gdn_input_proj_conv_record_pair(
+    const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+    const Tensor& conv_weight, const Tensor& conv_states, const Tensor& valid_columns,
+    const Tensor& initial_state_slots, Tensor& conv_record, Tensor& query, Tensor& key,
+    Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+    cudaStream_t stream);
+
+[[nodiscard]] std::size_t gdn_input_proj_conv_record_pair_workspace_capacity_bytes(
+    QType qk_qtype, QType value_z_qtype, std::int32_t qk_rows, std::int32_t value_rows,
+    std::int32_t z_rows, std::int32_t input_rows, LinearPolicy policy, std::int32_t batch_size,
+    std::int32_t min_width, std::int32_t max_width);
+
 void gdn_input_proj_conv_record_split(
     const Tensor& x, const Weight& query_key_value_weight, const Weight& z_weight,
     const Tensor& conv_weight, const Tensor& conv_states, const Tensor& valid_columns,

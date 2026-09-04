@@ -5,7 +5,6 @@
 #include "api/ops/gdn_input_proj.h"
 #include "api/ops/linear.h"
 #include "api/ops/linear_add.h"
-#include <cstdio>
 #include <cstdlib>
 
 #include "family/impl/lora_hook.h"
@@ -68,9 +67,17 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
             std::get_if<QkvPlusZGdnInputProjectionPayload>(&weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_split_workspace_capacity_bytes(
-                            split->query_key_value.qtype, g.convolution_dim(),
-                            g.value_dim(), g.hidden,
+                            split->query_key_value.qtype, split->query_key_value.n, split->z.n,
+                            split->query_key_value.k,
                             text_policy(split->query_key_value), batch, width, width));
+    }
+    if (const auto* pair =
+            std::get_if<QkPlusVzGdnInputProjectionPayload>(&weights.input_projection)) {
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_snapshot_pair_workspace_capacity_bytes(
+                            pair->query_key.qtype, pair->value_z.qtype, pair->query_key.n,
+                            pair->value_z.n / 2, pair->value_z.n / 2, pair->query_key.k,
+                            text_policy(pair->value_z), batch, width, width));
     }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
@@ -89,9 +96,17 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
             std::get_if<QkvPlusZGdnInputProjectionPayload>(&weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_split_workspace_capacity_bytes(
-                            split->query_key_value.qtype, g.convolution_dim(),
-                            g.value_dim(), g.hidden,
+                            split->query_key_value.qtype, split->query_key_value.n, split->z.n,
+                            split->query_key_value.k,
                             text_policy(split->query_key_value), batch, width, width));
+    }
+    if (const auto* pair =
+            std::get_if<QkPlusVzGdnInputProjectionPayload>(&weights.input_projection)) {
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_pair_workspace_capacity_bytes(
+                            pair->query_key.qtype, pair->value_z.qtype, pair->query_key.n,
+                            pair->value_z.n / 2, pair->value_z.n / 2, pair->query_key.k,
+                            text_policy(pair->value_z), batch, width, width));
     }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
@@ -187,7 +202,7 @@ void Variant::attention_projection(const Tensor& hidden,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
-                             stream);
+                             text_policy(split->query_key), workspace, stream);
         return;
     }
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
@@ -251,6 +266,13 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
                                   text_policy(split->query_key_value), workspace, stream);
         return;
     }
+    // The 27B-class groupwise export splits one component earlier: query|key, then value|z.
+    if (const auto* pair =
+            std::get_if<QkPlusVzGdnInputProjectionPayload>(&weights.input_projection)) {
+        ops::gdn_input_proj_pair(hidden, pair->query_key, pair->value_z, qkv, output_gate_flat,
+                                 text_policy(pair->value_z), workspace, stream);
+        return;
+    }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj(hidden, fused, qkv, output_gate_flat, text_policy(fused), workspace,
@@ -274,6 +296,14 @@ void Variant::gdn_input_projection_snapshot(
             hidden, split->query_key_value, split->z, conv_weight, conv_states, valid_columns,
             initial_slot, snapshot_base_slot, query, key, value, output_gate_view,
             text_policy(split->query_key_value), leaf_workspace, stream);
+        return;
+    }
+    if (const auto* pair =
+            std::get_if<QkPlusVzGdnInputProjectionPayload>(&weights.input_projection)) {
+        ops::gdn_input_proj_conv_snapshot_pair(
+            hidden, pair->query_key, pair->value_z, conv_weight, conv_states, valid_columns,
+            initial_slot, snapshot_base_slot, query, key, value, output_gate_view,
+            text_policy(pair->value_z), leaf_workspace, stream);
         return;
     }
     const Weight& fused =
@@ -301,6 +331,14 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
             hidden, split->query_key_value, split->z, conv_weight, conv_states, valid_columns,
             initial_slots, conv_record, query, key, value, output_gate_view,
             text_policy(split->query_key_value), leaf_workspace, stream);
+        return;
+    }
+    if (const auto* pair =
+            std::get_if<QkPlusVzGdnInputProjectionPayload>(&weights.input_projection)) {
+        ops::gdn_input_proj_conv_record_pair(
+            hidden, pair->query_key, pair->value_z, conv_weight, conv_states, valid_columns,
+            initial_slots, conv_record, query, key, value, output_gate_view,
+            text_policy(pair->value_z), leaf_workspace, stream);
         return;
     }
     const Weight& fused =
@@ -446,14 +484,23 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(const family:
                                                                    std::int32_t last) {
     family::validate_token_interval(first, last);
     switch (weights_profile) {
-    case WeightsProfile::GroupwiseInt:
+    case WeightsProfile::GroupwiseInt: {
+        const std::int32_t parent_rows = geometry.convolution_dim() + geometry.value_dim();
         // AllowA8 sizes the IMMA path.
-        return std::max(ops::gdn_input_proj_workspace_capacity_bytes(
-                            QType::W8G32_F16S, geometry.convolution_dim() + geometry.value_dim(), geometry.hidden, ops::LinearPolicy::AllowA8,
-                            first, last),
-                        ops::gdn_input_proj_workspace_capacity_bytes(
-                            QType::Q4_K, geometry.convolution_dim() + geometry.value_dim(), geometry.hidden, ops::LinearPolicy::A16Only,
-                            first, last));
+        const std::size_t fused =
+            std::max(ops::gdn_input_proj_workspace_capacity_bytes(
+                         QType::W8G32_F16S, parent_rows, geometry.hidden,
+                         ops::LinearPolicy::AllowA8, first, last),
+                     ops::gdn_input_proj_workspace_capacity_bytes(
+                         QType::Q4_K, parent_rows, geometry.hidden, ops::LinearPolicy::A16Only,
+                         first, last));
+        // A 27B-class export stores the parent as query|key + value|z; the pair projects a
+        // piece at a time and stages the two convolution-plane pieces.
+        const std::size_t pair = ops::gdn_input_proj_pair_workspace_capacity_bytes(
+            QType::Q4_K, QType::Q4_K, 2 * geometry.key_dim(), geometry.value_dim(),
+            geometry.value_dim(), geometry.hidden, ops::LinearPolicy::A16Only, first, last);
+        return std::max(fused, pair);
+    }
     case WeightsProfile::Nvfp4Uniform:
     case WeightsProfile::Nvfp4All:
     case WeightsProfile::Nvfp4MixedBf16:

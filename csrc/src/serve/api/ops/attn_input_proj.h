@@ -29,6 +29,21 @@ namespace sinfer::ops {
  * Current registered routes require no transient allocation. The Op has no persistent state side
  * effect.
  */
+/**
+ * @brief Gated attention input projection from a query|key + gate|value pair, any format.
+ *
+ * @details The 27B-class groupwise export stores this projection as two halves, each
+ * `query_rows + kv_rows` rows: `query_key_weight` is query then key, `gate_value_weight` is gate
+ * then value. The registered Q4/Q5 pair has a fused kernel and is delegated to it; every other
+ * pair -- a GGUF whose halves stayed K-quants, say -- is projected one row range at a time.
+ * Each of the four destinations is a plane of its own, so no staging is needed. Row counts come
+ * from the destinations, so any geometry of the family is served.
+ */
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                     Tensor& v, LinearPolicy policy, WorkspaceArena& workspace,
+                     cudaStream_t stream);
+
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream);

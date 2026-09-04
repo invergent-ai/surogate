@@ -118,4 +118,24 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
+/**
+ * @brief Projects one contiguous row range of a weight, as if that range were a weight of its own.
+ *
+ * @details A fused parent stores several logical projections as one object; a caller that needs
+ * them apart runs this once per range instead of materialising the whole product. The range is
+ * physical rows `[row_begin, row_begin + out.ne[0])` of `w`. Every persistent format whose rows
+ * are independently addressable is admitted -- the GGML block formats (whole blocks per row),
+ * the row-split groupwise ones, and contiguous BF16 -- and a format whose row is not addressable
+ * on its own is refused rather than silently mis-read.
+ *
+ * @param[in] x Contiguous BF16 input matrix `[K,T]`.
+ * @param[in] w Logical weight matrix `[N,K]`; only the named row range is read.
+ * @param[in] row_begin First physical row of `w` to project; `row_begin + out.ne[0] <= w.n`.
+ * @param[out] out Contiguous BF16 output matrix `[rows,T]`.
+ * @param[in,out] workspace Caller-owned transient arena, or null for the workspace-free routes.
+ * @param[in] stream CUDA stream on which execution is enqueued.
+ */
+void linear_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
+                 WorkspaceArena* workspace, cudaStream_t stream);
+
 } // namespace sinfer::ops

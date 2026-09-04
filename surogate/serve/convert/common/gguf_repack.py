@@ -432,6 +432,13 @@ class GgufRepackSource:
                 continue
             if program.k % native_block_values(next(iter(types))):
                 continue
+            # A source whose inverse permutes columns cannot be served from its own bytes: the
+            # native path copies rows, and a column permutation is not a row map. `planes()`
+            # refuses it for the same reason; only the in-place transform carries one. Without
+            # this the object is copied verbatim and the permutation is silently dropped -- the
+            # GDN output projection of a reordered geometry, whose columns follow the V heads.
+            if any(self.column_group_map(name) is not None for name in program.sources):
+                continue
             # Objects whose op has no kernel for the stored type yet: the caller names them,
             # because which ops a family routes an object through is the family's knowledge.
             if any(spec.name.endswith(suffix) for suffix in exclude_suffixes):
@@ -731,6 +738,9 @@ class GgufRepackSource:
                 continue
             types = [self.native_type_of(name) for name in program.sources]
             if any(t is None for t in types) or len(set(types)) < 2:
+                continue
+            # halves are read from the source's bytes too, so the same refusal applies
+            if any(self.column_group_map(name) is not None for name in program.sources):
                 continue
             per_row = [types[int(index)] for index in (program.rows // _SOURCE_STRIDE)]
             runs: list[list] = []
