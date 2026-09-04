@@ -191,13 +191,21 @@ class TestPatchedTargets:
 class TestToolParserConstruction:
     """vLLM builds a fresh parser per request, so a patch that pins the tool
     parser's ``__init__`` signature breaks every chat completion — and nothing
-    else notices, because the tool parser is only reachable with
+    else notices, because the parser is only reachable with
     ``--enable-auto-tool-choice`` on, which no run used until now.
 
     That is what happened: a patch declared ``_patched_init(self, tokenizer)``
     against a wheel whose ``__init__`` had gained a ``tools`` argument, so
     ``Parser.__init__``'s ``tool_parser_cls(tokenizer, tools)`` raised
     ``TypeError`` 10,729 times in one 20-minute run and produced no rollouts.
+
+    That patch also cached encode/decode results to keep the shared HF
+    tokenizer off the per-request path. It was deleted rather than widened
+    because 0.25.1's constructor does no tokenizer work at all — the token
+    ids and both regexes are class attributes — so there is nothing left to
+    cache and nothing left to race. This test constructs with a bare
+    ``object()``, which would raise ``AttributeError`` the moment that stops
+    being true.
     """
 
     def test_hermes_parser_constructs_the_way_vllm_constructs_it(self):
