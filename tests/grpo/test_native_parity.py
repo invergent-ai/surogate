@@ -126,7 +126,8 @@ def test_a_trailing_one_token_range_leaves_the_sample_before_it_alone():
 
 @pytest.mark.gpu
 @pytest.mark.slow
-def test_the_cuda_kernel_matches_the_python_reference_metrics():
+@pytest.mark.parametrize("case", ["ratio", "mask"])
+def test_the_cuda_kernel_matches_the_python_reference_metrics(case):
     """The gap E4 names: nothing has ever run the kernel against the reference.
 
     Both paths see the same weights and the same batch, so the kernel's own
@@ -224,16 +225,24 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
     # trainers doubles peak VRAM on a box that is usually busy.
     del reference_trainer
 
-    # Draw the inference logprobs NEAR the trainer's, not from a fixed range.
-    # A truncated model over random token ids produces logprobs around
-    # -log(vocab) ~ -12, so an independent draw from [-4, -0.1] leaves
-    # importance_ratio = exp(trainer - inference) ~ 5e-5. The kernel's advantage
-    # branch then contributes ~5e-6 of policy_loss, far under the 1e-3 tolerance:
-    # the entire policy-gradient half could be deleted from the kernel and every
-    # assertion here would still pass. Keeping the ratio near 1 puts the policy
-    # term on the same order as the KL term, and makes probs_diff straddle zero
-    # so both sides of the IPO mask are exercised rather than only the low side.
-    inference_logprobs = (trainer_logprobs + rng.normal(0.0, 0.3, size=seq_len)).astype(np.float32)
+    # Two cases, because with this fixture they are mutually exclusive and
+    # neither alone compares the whole kernel. A truncated model over random
+    # token ids gives per-token probabilities around 2e-6:
+    #
+    #   "ratio"  inference drawn NEAR the trainer's, so importance_ratio ~ 1 and
+    #            the advantage branch is the same order as KL. An independent
+    #            draw from [-4, -0.1] instead leaves ratio ~5e-5, so the whole
+    #            policy-gradient half contributes ~5e-6 of policy_loss -- under
+    #            the 1e-3 tolerance. It could be deleted from the kernel and
+    #            every assertion here would still pass.
+    #   "mask"   inference drawn FAR from the trainer's, so probs_diff clears the
+    #            0.2 threshold and the IPO mask actually fires. Unreachable in
+    #            the "ratio" case: both probabilities are ~2e-6 there, so their
+    #            difference cannot exceed 0.2.
+    if case == "ratio":
+        inference_logprobs = (trainer_logprobs + rng.normal(0.0, 0.3, size=seq_len)).astype(np.float32)
+    else:
+        inference_logprobs = rng.uniform(-4.0, -0.1, size=seq_len).astype(np.float32)
 
     expected = compute_native_grpo_metrics_reference(
         trainer_logprobs=trainer_logprobs,
