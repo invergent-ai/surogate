@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The compressed-tensors source for the 35B-A3B converter
-# (surogate/serve/convert/qwen3_6_35b_a3b/compressed_tensors_source.py). One case needs no
+# (surogate/serve/convert/qwen3_5_moe/exports/compressed_tensors_source.py). One case needs no
 # file: the E2M1 nibble table is checked against compressed-tensors' own unpacker
 # over every byte value, because a wrong nibble order would corrupt every NVFP4
 # weight silently. The rest run against RedHatAI's Qwen3.6-35B-A3B NVFP4 export
@@ -21,8 +21,9 @@ torch = pytest.importorskip("torch")
 np = pytest.importorskip("numpy")
 pytest.importorskip("compressed_tensors")
 
-from surogate.serve.convert.qwen3_5_moe import compressed_tensors_source as cts  # noqa: E402
-from surogate.serve.convert.qwen3_5_moe import recipe, routed_nvfp4  # noqa: E402
+from surogate.serve.convert.qwen3_5_moe.exports import compressed_tensors_source as cts  # noqa: E402
+from surogate.serve.convert.qwen3_5_moe import recipe  # noqa: E402
+from surogate.serve.convert.qwen3_5_moe.exports import routed_nvfp4  # noqa: E402
 from surogate.serve.convert.common.safetensors import ShardReader  # noqa: E402
 from surogate.serve.artifact import layouts  # noqa: E402
 
