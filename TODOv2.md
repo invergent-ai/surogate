@@ -216,8 +216,18 @@ stored once.
    where they are: the attention head width (the family's at every size, so the
    head counts come from the tensors' rows) and the GDN output-gate width, which
    has no runtime handle -- the split projection payload would have to carry it.
-   `csrc/src/serve/targets/` now holds one directory per architecture:
-   gemma3, llama, qwen3, qwen3_5, qwen3_6_27b, qwen3_6_35b_a3b, qwen4exp.
+   `csrc/src/serve/targets/` holds one directory per architecture, throughout:
+   **gemma3, llama, qwen3, qwen3_5, qwen3_6, qwen3_6_moe, qwen4exp.** The last
+   two were `qwen3_6_27b` and `qwen3_6_35b_a3b`; they are two architectures
+   rather than two sizes -- one dense hybrid, one routing 256 experts -- so they
+   stay two directories under names that say so. Their binders had spelled the
+   size out as raw numbers (95 occurrences of 5120 in one, 84 of 2048 in the
+   other) and now read the declared geometry, resolved per object because the
+   same number means different dimensions in different places:
+   `attention/output` takes the query width where `gdn/output` takes the value
+   width. What stays compiled is named where it is used -- the draft head's
+   shortlist, the routed block's expert count and shared width, the DFlash
+   tower's config, the vision merger's.
 7. **[ ] M4 — unify weight loading with the trainer, still true but smaller
    than it was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per
    target restate what the trainer's declarations in `surogate/dsl/models/`
@@ -247,6 +257,13 @@ stored once.
    download artifacts from Hugging Face and its links resolve.
    `surogate convert` still does not exist and is not wanted: `surogate serve`
    converts.
+   **One gap found and not closed (2026-09-04):** a text-only GGUF export of the
+   27B vision family is refused, because its converter expects the vision
+   tensors the export drops (`KeyError: model.visual.patch_embed.proj.weight` on
+   unsloth's `Qwen3.8-27B-UD-Q4_K_M.gguf`). It is the same class of thing item 3
+   fixed for the other families, and it predates the renames: the board's
+   Qwen3.8-27B rows are all NVFP4 from safetensors, so a 27B-class GGUF has
+   never been served.
    **The converter is not a tool** (owner, 2026-09-03). `surogate serve` runs it
    on every first load, so `serve/tools/convert/` is now `serve/convert/` and
    `serve/tools/artifact/` is `serve/artifact/`; `serve/tools/` keeps the

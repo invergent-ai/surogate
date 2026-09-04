@@ -109,7 +109,7 @@ Recognised automatically from the checkpoint:
 | Llama | any | dense |
 | Gemma 3 | any | dense; sliding-window attention |
 | Qwen3.5 | any | dense; NVFP4 for the 4B |
-| Qwen3.6 | 27B | dense; BF16 and NVFP4 |
+| Qwen3.6 | 27B | dense hybrid; BF16 and NVFP4 |
 | Qwen3.6 MoE | 35B-A3B | routed experts; optional draft head |
 | Qwen3.8 | 27B | BF16 and NVFP4 |
 | Qwen3.8 Flash-Next | MoE | GGUF source; the CPU-offload tier |
