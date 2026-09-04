@@ -3,6 +3,7 @@
 #include "ops/launcher/next_token_nll.h" // detail::next_token_nll_launch
 
 #include <stdexcept>
+#include <string>
 
 namespace sinfer::ops {
 
@@ -26,7 +27,8 @@ void next_token_nll(const Tensor& logits, const Tensor& targets, Tensor& out, Te
         throw std::invalid_argument("next_token_nll: argmax must be I32 [n]");
     }
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
-        throw std::invalid_argument("next_token_nll: token_domain must be in [1, logits.ne[0]]");
+        throw std::invalid_argument("next_token_nll: token_domain " + std::to_string(token_domain) +
+                                    " must be in [1, " + std::to_string(logits.ne[0]) + "]");
     }
     detail::next_token_nll_launch(logits, targets, out, argmax, token_domain, stream);
 }

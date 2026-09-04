@@ -388,15 +388,21 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
                                                                    std::int32_t last) {
     family::validate_token_interval(first, last);
     switch (weights_profile) {
-    case WeightsProfile::GroupwiseInt:
-        // AllowA8 opts the W8 route into the large-T IMMA workspace.
-        return std::max(ops::attn_input_proj_workspace_capacity_bytes(
-                            QType::W8G32_F16S, geometry.mtp_attention_input_rows(), geometry.hidden, ops::LinearPolicy::AllowA8,
-                            first, last),
-                        // a GGUF served natively: the K-quant route's int8 activation scratch
-                        ops::attn_input_proj_workspace_capacity_bytes(
-                            QType::Q4_K, geometry.mtp_attention_input_rows(), geometry.hidden, ops::LinearPolicy::A16Only,
-                            first, last));
+    case WeightsProfile::GroupwiseInt: {
+        const std::int32_t rows = geometry.mtp_attention_input_rows();
+        // AllowA8 opts the W8 route into the large-T IMMA workspace -- where that route serves
+        // this shape at all: the 27B's parents are groupwise Q4/Q5 or native K-quants, and its
+        // byte-wide draft block is a parent the fused W8 kernels are not registered for.
+        const std::size_t w8 = ops::attn_input_proj_w8_admits(rows, geometry.hidden)
+                                   ? ops::attn_input_proj_workspace_capacity_bytes(
+                                         QType::W8G32_F16S, rows, geometry.hidden,
+                                         ops::LinearPolicy::AllowA8, first, last)
+                                   : 0;
+        // a GGUF served natively: the K-quant route's int8 activation scratch
+        return std::max(w8, ops::attn_input_proj_workspace_capacity_bytes(
+                                QType::Q4_K, rows, geometry.hidden, ops::LinearPolicy::A16Only,
+                                first, last));
+    }
     case WeightsProfile::Nvfp4Uniform:
     case WeightsProfile::Nvfp4All:
     case WeightsProfile::Nvfp4MixedBf16:

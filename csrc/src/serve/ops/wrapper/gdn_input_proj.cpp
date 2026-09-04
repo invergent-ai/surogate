@@ -958,6 +958,15 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     // surogate vendor patches (PATCHES.md #13/#16/#17): W8 fused parents
     // (35B 12288/2048; 0.8b 8192/1024; 2b 8192/2048) at A16 or AllowA8;
     // AllowA8 large-T sizes the quantized-activation workspace.
+    // A parent shape the fused W8 GDN kernels are not registered for takes no workspace from
+    // them: the profile is sized for what it binds (the 27B's parents are groupwise Q4/Q5 or
+    // native K-quants), and a W8 parent of such a shape is refused where it would run.
+    if (parent_qtype == QType::W8G32_F16S &&
+        (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+        !((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
+          (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
+        return 0;
+    }
     if (parent_qtype == QType::W8G32_F16S &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
         ((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||

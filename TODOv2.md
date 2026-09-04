@@ -25,8 +25,8 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Nine open or partly done. Two are decisions waiting on `surogate quantize` as a
-product rather than tasks (1 and 9); the rest are work.
+Ten open or partly done. Two are decisions waiting on `surogate quantize` as a
+product rather than tasks (1 and 10); the rest are work.
 
 1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
@@ -39,7 +39,7 @@ product rather than tasks (1 and 9); the rest are work.
    selects them — the other targets import the names and use `W8G32_F16S` or
    NVFP4. So this is one target's safetensors profile, not five, and it is a
    decision rather than a task: it costs the 27B its groupwise-int route until
-   `surogate quantize` (item 9) is a product.
+   `surogate quantize` (item 10) is a product.
 2. **[ ] FP8, and the two kinds are not the same job (checked 2026-09-03).**
    - *compressed-tensors per-channel/per-tensor* is per-row with an FP32 scale.
      The engine has `FP8_E4M3FN_ROW_BF16S`, so this is either an `_F32S` variant
@@ -70,14 +70,87 @@ product rather than tasks (1 and 9); the rest are work.
      and must check the three share a divisor before it does.
    The engine side is ready for any size: `qwen3_5` compiles both NVFP4 profiles
    and binds NVFP4 parents with both divisors.
-4. **[ ] A 27B-class GGUF has never been served (found 2026-09-04).** A
-   text-only GGUF export of the 27B vision family is refused, because its
-   converter expects the vision tensors the export drops (`KeyError:
-   model.visual.patch_embed.proj.weight` on unsloth's
-   `Qwen3.8-27B-UD-Q4_K_M.gguf`). Same class of thing the GGUF-coverage item
-   fixed for the other families; it predates the target renames, and the board's
-   Qwen3.8-27B rows are all NVFP4 from safetensors, so this path has never run.
-5. **[ ] Unify weight loading with the trainer, still true but smaller than it
+4. **[~] Every GGML weight type is read where it lies (2026-09-04); what the UD mixtures
+   still cost.** The 27B's refusal was never about vision: unsloth's "UD-Q4_K_M" holds 117
+   IQ4_XS and 4 IQ3_S tensors, and the engine read 13 of llama.cpp's 27 storable types. The
+   other fourteen shipped in 6613389f -- the eight IQ formats, TQ1_0/TQ2_0, MXFP4, ggml's
+   NVFP4 (`NVFP4_GGML` here: the name was taken), Q1_0, Q2_0 -- on every route, 1,307
+   fixture cases against gguf-py's dequantiser plus real tensors from the UD files, and
+   every type switch in the tree now expands the one list. Perplexity, wikitext-2 test, 40
+   windows of 2048, ours (eager, raw prompt) against llama-perplexity on the same windows:
+
+   | file | ours | llama.cpp |
+   |---|---:|---:|
+   | Qwen3.5-0.8B-IQ4_XS (50 % IQ4_XS) | 15.094 +/- 0.225 | 15.151 +/- 0.226 |
+   | Qwen3.5-0.8B-UD-Q2_K_XL (Q2_K/Q3_K + IQ3_S/IQ3_XXS/IQ2_S/IQ4_XS) | 20.209 +/- 0.305 | 20.016 +/- 0.302 |
+   | Qwen3-0.6B-UD-IQ2_M (IQ2_S/IQ3_S/IQ3_XXS) | 40.128 +/- 0.702 | 42.045 +/- 0.743 |
+   | Qwen3-0.6B-UD-IQ3_XXS | 29.509 +/- 0.505 | 30.250 +/- 0.522 |
+   | Qwen3-0.6B-IQ4_XS (64 % IQ4_XS, 35 % Q6_K) | 18.330 +/- 0.294 | 17.866 +/- 0.286 |
+
+   The IQ2/IQ3 rows come out ahead because the vec-dots evaluate the block scale exactly
+   where llama.cpp's integer form truncates. The 0.6B IQ4_XS row is 2.6 % behind (1.6
+   sigma) while the 0.8B IQ4_XS row is not. The Q4_K_M control on the same target reads
+   17.675 +/- 0.28 against llama.cpp's 17.510 +/- 0.28 (+0.9 %, old types only), so the offset
+   is the `qwen3` target's, not the codec's: something in that family's arithmetic (its Q6_K
+   endpoints, attention or rope precision) sits 1-3 % behind llama.cpp where `qwen3_5` matches.
+   Its own item below. Left:
+   - **The 27B-class groupwise *runtime* is incomplete, and has been since the three Qwen3.5
+     targets became one (f308f747).** The 27B GGUF now converts (253 of 506 sources native)
+     and loads its 14.9 GiB in 4.9 s, then dies in the plan: the export splits every attention
+     parent into query|key + gate|value and every GDN parent into query|key + value|z, and the
+     runtime serves only the fused parent and the GGUF-native GDN split (qkv | z). The split
+     attention loader was cut in that merge as unreachable and is back (this target's
+     extents); its runtime overload is bound to the safetensors export (Q4G64 + Q5G64 halves,
+     literal 5120/6144/1024) while this artifact's halves are native K-quants or re-encoded
+     Q4/Q5 per layer, mixed. What finishes it: (a) the attention split overload generic per
+     half -- GGML halves through `ggml_project_rows`, other formats through `ops::linear`
+     into a workspace plane and row copies, the fused Q4/Q5 kernel kept as the fast path;
+     (b) the GDN `QkPlusVz` payload in the conv-snapshot/record/decode routes (project each
+     half by rows into the conv plane and z, then the shared projected-conv tail), or the
+     GGUF recipe storing GDN as qkv | z, which the runtime already serves; (c) the workspace
+     terms for the per-half planes. Also found on the way: the GroupwiseInt workspace sizing
+     asked the W8 routes for shapes they never registered at 27B (fixed: those queries answer
+     zero off-table), and MTP on any 27B-class model never bound (below).
+   - **Mixed-type fused parents go through the bridge.** A UD mixture gives one layer's
+     `attn_q` Q5_K and `attn_k` Q4_K; the fused query/key parent cannot be one native
+     format, `SUROGATE_GGUF_SPLIT_HALVES` is off (and two-run only), so the parent is
+     dequantised and re-encoded as Q5G64/Q4G64 -- the home-grown formats item 1 wants gone.
+     On the 27B that is 253 of 506 candidate tensors kept native. The fix is typed runs per
+     source inside one object (the loader binds a run per type), which also retires the
+     halves switch.
+   - **The planner is a fixed point now** (`ingest._repack_planner`): a source read by an
+     uncovered recipe is bridged, and dropping it can un-cover another object whose other
+     sources must follow; `scratchpad/plan_probe.py`'s logic (candidate pre-walk + both
+     sides' coverage, offline in a minute) belongs in `surogate/serve/tools/` so the next
+     RepackError is examined without a bridge run.
+   - **MTP on a 27B-class model has never bound.** The draft block is byte-wide by design
+     (`build_mtp_specs`: W8 "under every export"), and the W8 attention route accepts only
+     K in {1024, 2048, 2560} (`attn_input_proj.cpp` `require_w8_rowsplit`, the workspace
+     switch's registered pairs) -- at K = 5120 the load throws `unsupported W8 profile`
+     before any `--spec` is asked for. The 27B GGUF serves as its no-MTP variant for now.
+     The generic fix is a row-range fallback in that route (split the fused parent by rows
+     and run `ops::linear` per range, as the GGML branch does with `ggml_project_rows`),
+     which also retires the registered-shape list -- a model-agnostic-core item.
+   - **The NLL probe now fits its arena and its model** (`debug_next_token_nll`: slice
+     clamped to the request arena's spare bytes; token domain clamped to the head's vocab).
+     Before, the perplexity gate could not run on the `qwen3` family at all: `{vocab, 256}`
+     BF16 logits are 78 MB against a 59 MB arena, and the family's 248,077-row domain
+     exceeds the 0.6B's 151,936.
+   - **F16 tensors are bridged to BF16**, losing three mantissa bits: UD-Q8_K_XL files are
+     52-67 % F16. A native F16 format is a cuBLASLt path, not a codec.
+   - **`qwen3` eager prefill workspace, pre-existing:** on `Qwen3-0.6B-Q4_K_M` (old types
+     only) a ~2,048-token raw prompt under `SUROGATE_SERVE_PREFILL_GRAPH=0` dies with
+     `workspace arena exhausted: request 77,791,232 bytes ... capacity 58,736,896` in a
+     decode round; the same bytes with an IQ file. Repro: `scratchpad/discrim.sh`. It blocks
+     the perplexity gate on the Qwen3-0.6B family (the gate runs eager); the `qwen3_5`
+     family is unaffected.
+5. **[ ] The `qwen3` dense target scores 1-3 % behind llama.cpp where `qwen3_5` matches
+   (2026-09-04).** Same corpus, same windows, same method: Qwen3-0.6B-Q4_K_M 17.675 vs 17.510,
+   IQ4_XS 18.330 vs 17.866; Qwen3.5-0.8B-IQ4_XS 15.094 vs 15.151. The codecs are shared, so
+   the difference is in what only this target does -- its Q6_K vocabulary endpoints on the
+   GGML route, its attention or rope arithmetic. Bisect by swapping one route at a time
+   against the BF16 reference (`tools/reference/`), as the 27B drift was found.
+6. **[ ] Unify weight loading with the trainer, still true but smaller than it
    was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per target
    restate what the trainer's declarations in `surogate/dsl/models/` already say.
    Both sides describe the same nineteen architectures: the DSL has `qwen3.py`,
@@ -89,7 +162,7 @@ product rather than tasks (1 and 9); the rest are work.
    checkpoint tensor becomes which artifact object, and how fused objects are
    assembled. That is the part worth unifying, and the part `hf_mapping` already
    spells out.
-6. **[ ] Q6_K down. Measured and root-caused 2026-09-03; the fix is written
+7. **[ ] Q6_K down. Measured and root-caused 2026-09-03; the fix is written
    down here and not built.** The op benchmark now carries the native codecs
    (`--codec q4_k-q4_k`, `--codec q4_k-q6_k`). One 5090, 256 unique experts,
    warm, median of three:
@@ -120,7 +193,7 @@ product rather than tasks (1 and 9); the rest are work.
    per-thread and must stay branchless.
    The layer-level reading is the same effect measured the other way: 688 us
    against the row-split kernel's 337, on `routed_down` of 3 of 40 layers.
-7. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
+8. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.
    - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
@@ -139,7 +212,7 @@ product rather than tasks (1 and 9); the rest are work.
      the file's blocks (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`).
    - **The 28k-prompt board row** (long-context ingestion) has not been re-measured
      since the native path landed.
-8. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
+9. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
    (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
    acceptance — which is the evidence the graph is right — but decode moves
    30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
@@ -147,7 +220,7 @@ product rather than tasks (1 and 9); the rest are work.
    more distinct experts than a single token and pays more PCIe gathers with
    3,172 of 5,110 experts resident. The graph and the levers are in memory
    `project_serve_qwen4exp_mtp`.
-9. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+10. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -235,10 +308,13 @@ block. The second is the real fix and belongs to the engine, not to this item.
 
 ## Format coverage
 
-Routed today, everywhere the runtime needs them: **GGML Q2_K–Q6_K and Q8_0**
-(linear, embedding, MoE decode/small-T/prefill, read from the GGUF), **BF16** at
-any 8-aligned shape, **W8G32_F16S**, and **NVFP4 compressed-tensors** (TRT-LLM
-cutlass for routed MoE). What is not:
+Routed today, everywhere the runtime needs them: **every GGML weight type llama.cpp
+stores** -- Q2_K–Q6_K, Q8_0, Q4_0/Q4_1/Q5_0/Q5_1, IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/
+IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS, TQ1_0/TQ2_0, MXFP4, NVFP4_GGML, Q1_0/Q2_0 -- on linear,
+embedding and MoE decode/small-T/prefill (Q4_K/Q5_K/Q6_K on the int8 tensor-core
+route, the rest on the BF16 route), read from the GGUF; **BF16** at any 8-aligned
+shape, **W8G32_F16S**, and **NVFP4 compressed-tensors** (TRT-LLM cutlass for routed
+MoE). What is not:
 
 | Format | Status |
 |---|---|
@@ -248,6 +324,7 @@ cutlass for routed MoE). What is not:
 | MXFP4 / MXFP8 | **[ ]** nothing in serve; the trainer decodes MXFP4 |
 | GPTQ / AWQ | **[ ]** off the roadmap by owner decision |
 | `kv_cache_scheme` | **[ ]** refuse or support — do not ignore silently |
+| F16 (GGUF) | **[ ]** bridged to BF16, three mantissa bits lost; UD-Q8_K_XL is mostly F16 |
 
 Known runtime constraints: NVFP4 needs `n % 128 == 0 && k % 64 == 0` with no
 padding path; `embedding` has no NVFP4 or Q4/Q5; `linear_pair` is W8 only.

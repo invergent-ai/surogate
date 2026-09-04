@@ -181,6 +181,8 @@ def geometry_from_gguf(kv) -> Geometry:
     """
     for arch, model_type in _GGUF_ARCHITECTURES:
         blocks = int(kv(f"{arch}.block_count", 0) or 0)
+        # llama.cpp counts the MTP (nextn) block among the blocks; the text core is the rest.
+        blocks -= int(kv(f"{arch}.nextn_predict_layers", 0) or 0)
         if blocks:
             break
     else:

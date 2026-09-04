@@ -1419,6 +1419,9 @@ void debug_next_token_nll(const Tensor& hidden_all, const Tensor& ids, std::int3
                           Arena& work, cudaStream_t stream) {
     static const char* path = std::getenv("SUROGATE_SERVE_NLL_DUMP");
     if (path == nullptr || columns < 2) { return; }
+    // The token domain is the family's (the rows `ops::sample` scores); a smaller model of the
+    // family has fewer rows than that, and the probe scores what the head actually has.
+    token_domain = std::min(token_domain, vocab);
     cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(stream, &capturing));
     if (capturing != cudaStreamCaptureStatusNone) { return; } // a graph body: nothing to read
@@ -1429,11 +1432,18 @@ void debug_next_token_nll(const Tensor& hidden_all, const Tensor& ids, std::int3
         return value > 0 ? value : 256;
     }();
     auto scope    = work.scope();
-    Tensor logits = work.alloc(DType::BF16, {vocab, kSlice});
+    // The slice is bounded by what the request's arena has left: a 152k vocabulary at 256
+    // columns is 78 MB of logits, more than a small dense target's whole arena, and the probe
+    // is a diagnostic that must fit whatever the plan budgeted, not size the plan.
+    const std::size_t spare = work.capacity() > work.used() ? work.capacity() - work.used() : 0;
+    const std::size_t fixed = static_cast<std::size_t>(columns) * (sizeof(float) + sizeof(std::int32_t)) + 4096;
+    const std::size_t fits  = spare > fixed ? (spare - fixed) / (static_cast<std::size_t>(vocab) * sizeof(std::uint16_t)) : 0;
+    const std::int32_t slice = std::max<std::int32_t>(1, std::min<std::int32_t>(kSlice, static_cast<std::int32_t>(fits) & ~7));
+    Tensor logits = work.alloc(DType::BF16, {vocab, slice});
     Tensor nll    = work.alloc(DType::FP32, {columns});
     Tensor best   = work.alloc(DType::I32, {columns});
-    for (std::int32_t c0 = 0; c0 < columns - 1; c0 += kSlice) {
-        const std::int32_t n = std::min(kSlice, columns - 1 - c0);
+    for (std::int32_t c0 = 0; c0 < columns - 1; c0 += slice) {
+        const std::int32_t n = std::min(slice, columns - 1 - c0);
         Tensor hidden        = hidden_all.slice(1, c0, n);
         Tensor slice         = logits.slice(1, 0, n);
         ops::linear(hidden, head, slice, stream);

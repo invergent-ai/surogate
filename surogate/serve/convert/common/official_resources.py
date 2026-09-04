@@ -91,7 +91,10 @@ def validate_official_resource_hashes(
                     file=sys.stderr,
                 )
                 continue
-            if derived_ok and name in _DERIVABLE_RESOURCES:
+            # A GGUF-sourced conversion carries no official file at all: its tokenizer is
+            # reconstructed from the file's metadata and the rest is vendored from one size of
+            # the family, so every resource is a recorded warning there, not a refusal.
+            if derived_ok:
                 import sys
 
                 print(

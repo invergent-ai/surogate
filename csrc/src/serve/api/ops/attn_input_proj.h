@@ -33,6 +33,12 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream);
 
+/// Whether the fused W8 query/key/gate/value route serves a parent of this shape. The route is a
+/// set of tuned kernels per registered (parent rows, hidden) pair; a target asks before sizing
+/// a workspace for it, so a profile whose W8 parent this route does not serve -- the 27B's
+/// byte-wide draft block -- is not refused at plan time on behalf of a route it never binds.
+[[nodiscard]] bool attn_input_proj_w8_admits(std::int32_t parent_rows, std::int32_t input_rows) noexcept;
+
 /**
  * Computes the single-parent Q/K/output-gate/V projection.
  *

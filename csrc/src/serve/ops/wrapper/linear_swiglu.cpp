@@ -57,10 +57,12 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("linear_swiglu workspace: W8 admits A16 or A8");
         }
-        (void)detail::w8_linear_swiglu_resolve_plan(
-            {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens});
-        (void)detail::w8_linear_swiglu_resolve_plan(
-            {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, max_tokens});
+        // A shape the W8 route's table does not serve takes no workspace from it: the profile
+        // is sized for what it binds, and a W8 weight of such a shape is refused where it runs.
+        if (!detail::w8_linear_swiglu_admits({gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens}) ||
+            !detail::w8_linear_swiglu_admits({gate_up_rows, gate_up_rows / 2, input_rows, input_rows, max_tokens})) {
+            return 0;
+        }
         // surogate vendor patch (PATCHES.md #17): under AllowA8 the large-T
         // band runs the W8A8-int IMMA path (per-token int8 activations),
         // which needs quantized-activation and gemm-buffer workspace.

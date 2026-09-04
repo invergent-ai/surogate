@@ -207,6 +207,27 @@ without batch flags understated it 3.9× and are gone.
 | llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
 | llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s |  |
 
+## Accuracy gates (2026-09-04)
+
+Perplexity on wikitext-2 test, llama-perplexity's own 2048-token windows (the first 40),
+ours eager with the raw prompt (`surogate/serve/tools/eval/perplexity.py`) against
+`llama-perplexity` on the same file and windows. The bar is "no worse than llama.cpp".
+
+| file | stored types by weight | surogate | llama.cpp |
+|---|---|---:|---:|
+| Qwen3.6-35B-A3B-UD-Q4_K_M (145 windows, 2026-09-03) | Q4_K/Q5_K/Q6_K | 6.2370 +/- 0.040 | 6.2311 +/- 0.040 |
+| Qwen3.5-0.8B-IQ4_XS | IQ4_XS 50 %, Q6_K 43 % | **15.094 +/- 0.225** | 15.151 +/- 0.226 |
+| Qwen3.5-0.8B-UD-Q2_K_XL | Q2_K/Q3_K, IQ3_S/IQ3_XXS/IQ2_S/IQ4_XS | 20.209 +/- 0.305 | 20.016 +/- 0.302 |
+| Qwen3-0.6B-UD-IQ2_M | IQ2_S 34 %, IQ3_S 16 %, IQ3_XXS | **40.128 +/- 0.702** | 42.045 +/- 0.743 |
+| Qwen3-0.6B-UD-IQ3_XXS | IQ3_XXS 39 %, IQ3_S, IQ2_S | **29.509 +/- 0.505** | 30.250 +/- 0.522 |
+| Qwen3-0.6B-IQ4_XS | IQ4_XS 64 %, Q6_K 35 % | 18.330 +/- 0.294 | 17.866 +/- 0.286 |
+| Qwen3-0.6B-Q4_K_M (control) | Q4_K 54 %, Q6_K 44 % | 17.675 +/- 0.28 | 17.510 +/- 0.28 |
+
+The IQ2/IQ3 rows come out ahead of the reference because our vec-dots evaluate the block
+scale exactly where llama.cpp's integer form truncates. The two Qwen3-0.6B rows behind the
+reference are the `qwen3` target, not the formats: its Q4_K_M control shows the same offset on
+old types only, and the same IQ4_XS codec matches on the 0.8B (TODOv2 item 5).
+
 ## Reading the table
 
 - **Weight format beats every scheduling lever on this hardware**: NVFP4 gave

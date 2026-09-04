@@ -217,6 +217,13 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
 
 } // namespace
 
+bool attn_input_proj_w8_admits(std::int32_t parent_rows, std::int32_t input_rows) noexcept {
+    // the registered (parent rows, hidden) pairs of the fused W8 kernels: 0.8B/2B, 4B (#18)
+    return (parent_rows == 9216 && input_rows == 2048) ||
+           (parent_rows == 5120 && (input_rows == 1024 || input_rows == 2048)) ||
+           (parent_rows == 10240 && input_rows == 2560);
+}
+
 std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
                                                      std::int32_t input_rows, LinearPolicy policy,
                                                      std::int32_t min_tokens,
@@ -256,10 +263,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
-        if (!((parent_rows == 9216 && input_rows == 2048) ||
-              (parent_rows == 5120 &&
-               (input_rows == 1024 || input_rows == 2048)) ||
-              (parent_rows == 10240 && input_rows == 2560)) ||
+        if (!attn_input_proj_w8_admits(parent_rows, input_rows) ||
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
         }

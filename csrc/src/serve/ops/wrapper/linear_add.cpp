@@ -107,8 +107,14 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("linear_add workspace: W8 admits A16 or A8");
         }
-        (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
-        (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
+        // The W8 route is a table of registered exact problems. A shape it does not serve
+        // takes no workspace from it -- a profile whose W8 export this route never binds (the
+        // 27B's, whose trunk is groupwise Q4/Q5) is sized for what it does bind, and a W8
+        // weight of such a shape is refused where it would run, with the route's own message.
+        if (!detail::w8_linear_add_admits({output_rows, input_rows, input_rows, min_tokens}) ||
+            !detail::w8_linear_add_admits({output_rows, input_rows, input_rows, max_tokens})) {
+            return 0;
+        }
         // surogate vendor patch (PATCHES.md #17): AllowA8 large-T runs the
         // W8A8-int IMMA residual path.
         if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {

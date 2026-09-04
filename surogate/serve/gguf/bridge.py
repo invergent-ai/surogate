@@ -322,7 +322,8 @@ def _apply_gguf_dimensions(config: dict, reader, arch: str) -> bool:
     state = kv("ssm.state_size")
     moved = False
     updates = {
-        "num_hidden_layers": kv("block_count"),
+        # the text core: llama.cpp counts the MTP (nextn) block among the blocks
+        "num_hidden_layers": (kv("block_count") or 0) - (kv("nextn_predict_layers") or 0),
         "hidden_size": kv("embedding_length"),
         "intermediate_size": kv("feed_forward_length"),
         "num_attention_heads": heads,

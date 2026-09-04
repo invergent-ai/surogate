@@ -242,7 +242,9 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
             no_mtp=no_mtp,
         )
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        # A failed conversion is examined from its bridge; keeping it costs the disk it took.
+        if os.environ.get("SUROGATE_GGUF_KEEP_BRIDGE", "0") != "1":
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *,
@@ -356,42 +358,56 @@ def _repack_planner(root: Path, target_key: str):
             if entry["type"] in REPACKABLE_TYPES
             or (entry["type"] in NATIVE_TYPES and os.environ.get("SUROGATE_GGUF_NATIVE", "1") != "0")
         }
-        source = GgufRepackSource.from_sources(gguf_path, candidates)
-        planned = source.plan(recipes_by_name, tensor_specs)
-        native = source.plan_native(
-            recipes_by_name,
-            tensor_specs,
-            exclude_suffixes=getattr(recipe, "NATIVE_EXCLUDE_SUFFIXES", ()),
-        )
-
-        # A fused parent stored as two typed halves keeps its sources too, or the bridge
-        # dequantises them and the converter can no longer see the types it split on.
-        halves = source.plan_native_halves(recipes_by_name, tensor_specs)
-        # Recipes and the bridge may spell one tensor differently; resolve each wanted source to
-        # the candidate that actually holds it before intersecting, or nothing matches and the
-        # bridge dequantises weights the converter was going to read straight from the file.
         from surogate.serve.convert.common.safetensors import name_spellings
 
-        keep: set[str] = set()
-        for name in (*planned, *native, *halves):
-            for src in recipe.expression_sources(recipes_by_name[name].expression):
-                for spelling in name_spellings(src.name):
-                    if spelling in candidates:
-                        keep.add(spelling)
-                        break
-        # A source one covered object reads may feed an uncovered one too -- a fused parent
-        # whose halves land in different types, one the plan can move and one it cannot. Kept
-        # out of the bridge, the uncovered recipe would then find nothing to materialise from
-        # (the converter refuses exactly that), so such a source is bridged after all and the
-        # covered object reads the dequantised copy instead.
-        covered = set(planned) | set(native) | set(halves)
-        for name, tensor_recipe in recipes_by_name.items():
-            if name in covered:
-                continue
-            for src in recipe.expression_sources(tensor_recipe.expression):
-                for spelling in name_spellings(src.name):
-                    keep.discard(spelling)
-        return {hf: candidates[hf] for hf in sorted(keep)}
+        def spelled(name: str, pool: Mapping[str, object]) -> str | None:
+            for spelling in name_spellings(name):
+                if spelling in pool:
+                    return spelling
+            return None
+
+        # The plan is a fixed point over the sources kept out of the bridge. A source one covered
+        # object reads may feed an uncovered one too -- a fused parent whose halves land in
+        # different types, one the plan can move and one it cannot -- and kept out of the bridge
+        # the uncovered recipe finds nothing to materialise from (the converter refuses exactly
+        # that). So such a source is bridged after all; and dropping it can un-cover another
+        # object that read it natively, whose remaining sources must then be bridged too. The
+        # loop re-plans against what is still kept until nothing more drops; it only ever
+        # shrinks, so it ends.
+        kept = dict(candidates)
+        while True:
+            source = GgufRepackSource.from_sources(gguf_path, kept)
+            planned = source.plan(recipes_by_name, tensor_specs)
+            native = source.plan_native(
+                recipes_by_name,
+                tensor_specs,
+                exclude_suffixes=getattr(recipe, "NATIVE_EXCLUDE_SUFFIXES", ()),
+            )
+            # A fused parent stored as two typed halves keeps its sources too, or the bridge
+            # dequantises them and the converter can no longer see the types it split on.
+            halves = source.plan_native_halves(recipes_by_name, tensor_specs)
+            covered = set(planned) | set(native) | set(halves)
+            # Recipes and the bridge may spell one tensor differently; resolve each wanted
+            # source to the candidate that actually holds it before intersecting, or nothing
+            # matches and the bridge dequantises weights the converter was going to read
+            # straight from the file.
+            keep: set[str] = set()
+            for name in covered:
+                for src in recipe.expression_sources(recipes_by_name[name].expression):
+                    found = spelled(src.name, kept)
+                    if found is not None:
+                        keep.add(found)
+            for name, tensor_recipe in recipes_by_name.items():
+                if name in covered:
+                    continue
+                for src in recipe.expression_sources(tensor_recipe.expression):
+                    found = spelled(src.name, kept)
+                    if found is not None:
+                        keep.discard(found)
+            if keep == set(kept):
+                break
+            kept = {hf: kept[hf] for hf in sorted(keep)}
+        return kept
     return plan
 
 

@@ -182,14 +182,18 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
 FullAttentionProjectionPayload
 load_attention_projection(const FullAttentionPlan& plan,
                           const artifact::MaterializedArtifact& materialized, const family::TextGeometry& g) {
-    // The split attention plan is never constructed for this target — only the
-    // 27B produces one. The branch that used to live here carried shape
-    // constants copied from a sibling target (a hidden size that was not this
-    // target's), which nothing caught because the code was unreachable. If a
-    // split plan ever does appear here, that is a binding bug and it should
-    // stop the load rather than silently materialise wrong extents.
-    if (std::holds_alternative<SplitAttentionProjectionPlan>(plan.projection)) {
-        throw std::invalid_argument("attention projection: split plans are not produced for this target");
+    // The 27B-class groupwise export stores the parent as two halves, query|key and
+    // gate|value, each (query_size + kv_size) rows: the query and gate halves are one head
+    // width each, the key and value halves one KV width each. The extents come from this
+    // target's geometry -- the branch that once lived here carried a sibling target's
+    // constants, which is why it was cut, and why the 27B could not load until it was put
+    // back in its own terms.
+    if (const auto* split = std::get_if<SplitAttentionProjectionPlan>(&plan.projection)) {
+        const std::int32_t half_rows = g.query_size() + g.kv_size();
+        return SplitAttentionProjectionPayload{
+            .query_key  = materialized_weight(materialized, split->query_key, half_rows, g.hidden),
+            .gate_value = materialized_weight(materialized, split->gate_value, half_rows, g.hidden),
+        };
     }
     const auto& fused = std::get<FusedAttentionProjectionPlan>(plan.projection);
     return FusedAttentionProjectionPayload{
