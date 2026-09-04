@@ -115,11 +115,15 @@ product rather than tasks (1 and 10); the rest are work.
    38 % our groupwise kernels on the re-encoded halves, 7.5 % `dequantize_rows` staging, ~4 %
    GDN and attention. Measured route rates at the dominant MLP shape: BF16 222 TFLOP/s, Q4G64
    187, fused Q4 SwiGLU 183, W8 159, against 838 of int8/fp8 tensor throughput on the card.
-   **The lever is an int8 dense prefill GEMM**, the one already built for routed experts
-   (`sparse_moe_prefill_ggml_i8_*`, 498 us against 758 there): it deletes the 60 ms of BF16
-   staging and lifts ~80 % of prefill off a 222 TFLOP/s route; at 350 it lands near 545 ms,
-   ~3,760 tok/s. Re-routing the groupwise weights through the BF16 path instead is measured
-   and *not* worth it -- the staging pass moves the crossover to T ~= 1,500 for a ~5 % win.
+   **The int8 dense prefill GEMM on the routed experts' tile was built and measured a loss**
+   (881 ms against 812; "Measured and rejected" below has the design and the reason: the
+   per-32 scale-apply is the instruction stream, not the MMA). Re-routing the groupwise
+   weights through the BF16 path is measured and *not* worth it either -- the staging pass
+   moves the crossover to T ~= 1,500 for a ~5 % win. What is left on prefill is the 38 % in
+   the groupwise kernels on re-encoded halves, which a native mixed-type fused parent would
+   put on the BF16 route (222 against 183-187 TFLOP/s, ~5 % whole-model), and the numerics
+   of the int8 tile itself, fixed here: its activation planes carried the raw Σx and now
+   carry d·Σq, matching the GEMV route (real-tensor error 1.25e-2 -> 1.77e-3 relative).
 
 5. **[ ] The `qwen3` dense target scores 1-3 % behind llama.cpp where `qwen3_5` matches
    (2026-09-04).** Same corpus, same windows, same method: Qwen3-0.6B-Q4_K_M 17.675 vs 17.510,
@@ -458,6 +462,24 @@ Written down so they are not retried.
   tensor cores instead: ~200 lines against ~6,000, more accurate, and our MoE
   prefill kernel already beats llama.cpp's MMQ by 1.65×. Worth revisiting only
   where the dequantisation tile is the constraint.
+- **An int8 dense prefill linear on the routed experts' tile (2026-09-04).**
+  The MoE int8 tile (`ggml_i8_tile.cuh`) run over the dense K-quant linears with
+  `row_base` the row's first superblock and `act_row` the identity, a persistent
+  grid of 64-row × 64-token items, activations quantised once per prefill. It
+  passes the fixture suite and **loses**: 27B 2,048-token prefill 881 ms / 2,390
+  tok/s against 812 / 2,600 on the BF16 wide route, 512 tokens 269 against 257
+  ms. The kernels took ~262 ms per prefill where cuBLASLt plus its staging took
+  ~225 on the same weights. The instruction stream is the per-32 affine
+  scale-apply — per MMA (16×8×32, 8,192 ops, ~4 SM-cycles) each thread converts
+  four accumulators and applies two FMAs to each, ~3 SM-cycles of FP32 issue —
+  so the tile tops out near the BF16 rate whatever the tensor cores can do,
+  and widening BN or amortising the unpack moves it 10–15 %, not the 2× it
+  needs. That is also why llama.cpp's MMQ, the same structure, sits at 172
+  TFLOP/s effective in `llama-bench`. What would change it: accumulate a whole
+  superblock in int32 with the 6-bit sub-block scales applied as integer
+  multiplies and the (d, dmin) pair once per 256 — which needs one activation
+  scale per 256, not per 32, i.e. a numerics change against llama.cpp that the
+  perplexity gate would have to judge. Not retried without that design.
 - **Q8_0 codecs in the fused-projection kernels.** They cp_async 16-byte chunks
   out of separate code/scale planes, so Q8_0's 34-byte blocks mean six kernel
   rewrites. The load transform gets the same result and touches no kernel.

@@ -24,7 +24,8 @@ void quantize_q8_1_launch(const __nv_bfloat16* x, std::int32_t k, std::int32_t t
 
 
 /// The same numbers as `quantize_q8_1_launch`, written as two planes instead of interleaved
-/// blocks: `codes` is [tokens][k] int8 and `ds` is [tokens][k/32] half2 of (d, sum). A tiled
+/// blocks: `codes` is [tokens][k] int8 and `ds` is [tokens][k/32] half2 of (d, d * sum of the
+/// codes). A tiled
 /// GEMM stages its activation operand with sixteen-byte asynchronous copies, which a 36-byte
 /// block cannot be the source of; a codes plane whose rows are whole multiples of sixteen can.
 void quantize_q8_1_planes_launch(const __nv_bfloat16* x, std::int32_t k, std::int32_t tokens,

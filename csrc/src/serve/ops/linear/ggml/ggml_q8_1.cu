@@ -43,12 +43,16 @@ __global__ void quantize_q8_1_planes_kernel(const __nv_bfloat16* __restrict__ x,
     if (i0 >= k) { return; }
     const float xi = __bfloat162float(x[static_cast<std::size_t>(t) * k + i0]);
     float amax = fabsf(xi);
-    float sum  = xi;
     amax = warp_max(amax);
-    sum  = warp_sum(sum);
     const float d  = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : static_cast<int8_t>(roundf(xi / d));
     codes[static_cast<std::size_t>(t) * k + i0] = q;
+    // The sum is of the codes, not of x: the affine min term then sees the same activation
+    // the dot product saw, as in the GEMV route, and the two terms' quantisation errors
+    // cancel instead of adding. With the raw sum (llama.cpp's q8_1) a real K-quant tensor,
+    // whose weights are small differences of the scale and min terms, lands 2.5x further
+    // from the exact product.
+    const float sum = d * static_cast<float>(warp_sum(static_cast<int>(q)));
     if ((i0 % QK8_1) == 0) {
         ds[static_cast<std::size_t>(t) * (k / QK8_1) + i0 / QK8_1] = __floats2half2_rn(d, sum);
     }

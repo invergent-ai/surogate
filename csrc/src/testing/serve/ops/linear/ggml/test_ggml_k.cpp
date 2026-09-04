@@ -233,6 +233,17 @@ int run_case(const Fixture& f, int tokens, bool bf16_out, void* d_blocks, void* 
         CHECK_CUDA(cudaDeviceSynchronize());
         CHECK_CUDA(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost));
     }
+    if (const char* dump = std::getenv("SINFER_GGML_DUMP_DIR"); dump != nullptr && bf16_out) {
+        // got / ref as f64, x as f32, for offline analysis of a route's error structure
+        const std::string stem = std::string(dump) + "/" + gg::type_name(f.type) + "_" + f.label +
+                                 "_T" + std::to_string(tokens);
+        std::vector<double> g64(got.begin(), got.end());
+        std::vector<float> x32(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i) { x32[i] = __bfloat162float(x[i]); }
+        std::ofstream(stem + ".got", std::ios::binary).write(reinterpret_cast<const char*>(g64.data()), g64.size() * 8);
+        std::ofstream(stem + ".ref", std::ios::binary).write(reinterpret_cast<const char*>(ref.data()), ref.size() * 8);
+        std::ofstream(stem + ".x", std::ios::binary).write(reinterpret_cast<const char*>(x32.data()), x32.size() * 4);
+    }
     CHECK_CUDA(cudaFree(d_x));
     CHECK_CUDA(cudaFree(d_out));
     return report(f, wide ? "launch bf16 (wide)" : (bf16_out ? "launch bf16" : "launch f32"), tokens,

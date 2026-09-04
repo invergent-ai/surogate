@@ -242,10 +242,20 @@ llama.cpp's MMQ computes on. Two consequences worth writing down:
 - **Re-routing the groupwise weights through the BF16 path is not worth it.** It buys 222 over
   187, but the dequantise pass costs ~0.4 ms on a ~3.9 ms weight, so the crossover sits near
   T = 1,500 and the whole-model win is ~5 %.
-- **The lever is an int8 dense prefill GEMM** -- the one already built for routed experts
-  (`sparse_moe_prefill_ggml_i8_*`, measured 498 us against 758 there). It would delete the 60 ms
-  of BF16 staging outright and lift ~80 % of prefill off a 222 TFLOP/s route. At 350 TFLOP/s a
-  2,048-token prefill lands near 545 ms, i.e. ~3,760 tok/s, ahead of llama.cpp's 3,190.
+- **The int8 dense prefill GEMM was built and measured a loss.** The routed experts' int8 tile
+  (`sparse_moe_prefill_ggml_i8_*`, 498 us against 758 there) run over the dense K-quant
+  linears: 2,048 tokens **881 ms / 2,390 tok/s** against 812 / 2,600 on the BF16 route, 512
+  tokens 269 ms / 2,120 against 257 / 2,232. The profile says why: the int8 kernels took ~262
+  ms per prefill where cuBLASLt plus staging took ~225 on the same weights, because the tile's
+  instruction stream is the per-32 affine scale-apply (a convert and two FMAs per accumulator
+  per MMA), not the MMA -- the same structure as llama.cpp's MMQ, which is why `llama-bench`
+  is at 172 TFLOP/s effective and not 800. The experts win with that tile only because their
+  alternative, a per-expert dequantisation at small M, is worse. Removed; the design lives in
+  `TODOv2.md`, "Measured and rejected". What it left behind is a numerics fix: the tile's
+  activation planes carried llama.cpp's raw Σx in the (scale, sum) pair while the GEMV route
+  sums the codes, and on a real K-quant tensor -- whose weights are small differences of the
+  scale and min terms -- the raw sum lands 2.5x further from the exact product (1.3e-2 against
+  5.3e-3 relative). The planes now carry d·Σq; the routed-expert prefill inherits it.
 
 ## Accuracy gates (2026-09-04)
 
@@ -256,6 +266,7 @@ ours eager with the raw prompt (`surogate/serve/tools/eval/perplexity.py`) again
 | file | stored types by weight | surogate | llama.cpp |
 |---|---|---:|---:|
 | Qwen3.6-35B-A3B-UD-Q4_K_M (145 windows, 2026-09-03) | Q4_K/Q5_K/Q6_K | 6.2370 +/- 0.040 | 6.2311 +/- 0.040 |
+| Qwen3.6-35B-A3B-UD-Q4_K_M (145 windows, 2026-09-04, int8 planes carry d·Σq; the windows differ from the row above, so compare gaps: 0.054 % against 0.095 %) | Q4_K/Q5_K/Q6_K | 5.9118 +/- 0.037 | 5.9086 +/- 0.037 |
 | Qwen3.5-0.8B-IQ4_XS | IQ4_XS 50 %, Q6_K 43 % | **15.094 +/- 0.225** | 15.151 +/- 0.226 |
 | Qwen3.5-0.8B-UD-Q2_K_XL | Q2_K/Q3_K, IQ3_S/IQ3_XXS/IQ2_S/IQ4_XS | 20.209 +/- 0.305 | 20.016 +/- 0.302 |
 | Qwen3-0.6B-UD-IQ2_M | IQ2_S 34 %, IQ3_S 16 %, IQ3_XXS | **40.128 +/- 0.702** | 42.045 +/- 0.743 |
