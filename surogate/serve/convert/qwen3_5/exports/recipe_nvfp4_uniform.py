@@ -1,11 +1,13 @@
-"""Single-source recipe for the Qwen3.5-4B NVFP4 artifact.
+"""Single-source recipe for a ModelOpt NVFP4 export of this family, at any size.
 
-``AxionML/Qwen3.5-4B-NVFP4`` is a ModelOpt export: every linear weight ships as
-packed E2M1 codes with per-16 E4M3 block scales, a global weight divisor and a
-calibrated activation divisor, while the norms, the convolution and the tied
-embedding stay BF16 in the same file. So one checkpoint supplies the whole
-artifact - the NVFP4 blocks pass through untouched, and only the embedding is
-re-encoded (FP8 row-scaled, as the byte-wide head this target expects).
+``AxionML/Qwen3.5-4B-NVFP4`` was the first: every linear weight ships as packed E2M1 codes
+with per-16 E4M3 block scales, a global weight divisor and a calibrated activation divisor,
+while the norms, the convolution and the tied embedding stay BF16 in the same file. So one
+checkpoint supplies the whole artifact - the NVFP4 blocks pass through untouched, and only
+the embedding is re-encoded (FP8 row-scaled, as the byte-wide head this target expects).
+The 0.8B and 2B releases are the same export at other dimensions and under the VL-style
+``model.language_model.`` root, so the recipes are built from the checkpoint's own
+`config.json` and tensor names rather than restated per size.
 
 ModelOpt spells its fields ``weight`` / ``weight_scale`` / ``weight_scale_2``
 where compressed-tensors exports use ``weight_packed`` / ``weight_scale`` /
@@ -24,32 +26,16 @@ from surogate.serve.convert.common.safetensors import ShardReader
 from .. import inventory as family_inventory
 
 
-#: The one checkpoint published under this export; the tables below are its size.
-GEOMETRY = family_inventory.Geometry(
-    layers=32, hidden=2560, intermediate=9216, query_heads=16, kv_heads=4,
-    gdn_value_heads=32,
-)
-EXPORT = family_inventory.export_inventory(
-    family_inventory.NVFP4_UNIFORM, GEOMETRY)
-
-
-
-QUANTIZED_REPOSITORY = "AxionML/Qwen3.5-4B-NVFP4"
-QUANTIZED_REVISION = "main"
-BASE_REPOSITORY = QUANTIZED_REPOSITORY
-BASE_REVISION = QUANTIZED_REVISION
-
-HIDDEN = 2560
-LAYERS = 32
-ATTENTION_HEADS = 16
-HEAD_DIM = 256
+QUANTIZED_REPOSITORY = "AxionML/Qwen3.5-4B-NVFP4" # the export this recipe was written against
 
 WEIGHT_FIELD = "weight"
 SCALE_FIELD = "weight_scale"
 GLOBAL_SCALE_FIELD = "weight_scale_2"
 INPUT_SCALE_FIELD = "input_scale"
 
-EMBEDDING_SOURCE = "model.embed_tokens.weight"
+#: Where a checkpoint keeps its decoder: the 4B under ``model.``, the VL-style 0.8B and 2B
+#: under ``model.language_model.``. Read off the tensor names, never off the size.
+SOURCE_ROOTS = ("model.language_model.", "model.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,239 +102,159 @@ def _all(source: MatrixSource) -> MatrixPart:
     return MatrixPart(source, (RowRange(0, source.shape[0]),))
 
 
-def _q_part(source: MatrixSource, gate: bool) -> MatrixPart:
+def _q_part(source: MatrixSource, gate: bool, geometry: family_inventory.Geometry) -> MatrixPart:
     """Query rows interleave query and gate per head; split them apart."""
 
-    begin = HEAD_DIM if gate else 0
-    stride = 2 * HEAD_DIM
+    head_dim = geometry.head_dim
+    begin = head_dim if gate else 0
+    stride = 2 * head_dim
     return MatrixPart(
         source,
         tuple(
-            RowRange(head * stride + begin, head * stride + begin + HEAD_DIM)
-            for head in range(ATTENTION_HEADS)
+            RowRange(head * stride + begin, head * stride + begin + head_dim)
+            for head in range(geometry.query_heads)
         ),
     )
 
 
-def _build_matrix_recipes() -> tuple[
-    tuple[Nvfp4WeightRecipe, ...],
-    tuple[InputDivisorRecipe, ...],
-]:
+@dataclass(frozen=True, slots=True)
+class UniformRecipes:
+    """Every recipe of one checkpoint: its NVFP4 matrices, their activation divisors, and
+    the objects copied dense, all at the checkpoint's own dimensions."""
+
+    geometry: family_inventory.Geometry
+    source_root: str
+    nvfp4_weights: tuple[Nvfp4WeightRecipe, ...]
+    input_divisors: tuple[InputDivisorRecipe, ...]
+    direct: tuple[DirectRecipe, ...]
+
+    @property
+    def embedding_source(self) -> str:
+        return self.source_root + "embed_tokens.weight"
+
+    @property
+    def nvfp4_weights_by_name(self) -> dict[str, Nvfp4WeightRecipe]:
+        return {item.object_name: item for item in self.nvfp4_weights}
+
+    @property
+    def input_divisors_by_name(self) -> dict[str, InputDivisorRecipe]:
+        return {item.object_name: item for item in self.input_divisors}
+
+    @property
+    def direct_by_name(self) -> dict[str, DirectRecipe]:
+        return {item.object_name: item for item in self.direct}
+
+    @property
+    def nvfp4_sources(self) -> tuple[MatrixSource, ...]:
+        return tuple(dict.fromkeys(part.source for r in self.nvfp4_weights for part in r.parts))
+
+
+def source_root_of(names) -> str:
+    """The decoder's tensor-name root, from the names the checkpoint holds."""
+    names = list(names)
+    for root in SOURCE_ROOTS:
+        if any(name.startswith(root + "layers.") for name in names):
+            return root
+    raise ValueError("no decoder layers under any known root: " + ", ".join(SOURCE_ROOTS))
+
+
+def build(geometry: family_inventory.Geometry, source_root: str) -> UniformRecipes:
+    """The recipes at these dimensions. Row counts follow the geometry: the query projection
+    interleaves query and gate per head (2 x query_size rows), the GDN input projection is
+    [q | k | v] over the convolution width with z beside it, and every other matrix is the
+    shape its object declares."""
+    g = geometry
+    hidden = g.hidden
     weights: list[Nvfp4WeightRecipe] = []
     divisors: list[InputDivisorRecipe] = []
+    direct: list[DirectRecipe] = []
+    attention_layers = set(g.full_attention_layers)
 
-    for layer in range(LAYERS):
-        source_prefix = f"model.layers.{layer}."
+    for layer in range(g.layers):
+        source_prefix = f"{source_root}layers.{layer}."
         object_prefix = f"text/layers/{layer}/"
-
-        if layer in EXPORT.FULL_ATTENTION_LAYERS:
-            query = _source(source_prefix + "self_attn.q_proj", 8192, HIDDEN)
-            key = _source(source_prefix + "self_attn.k_proj", 1024, HIDDEN)
-            value = _source(source_prefix + "self_attn.v_proj", 1024, HIDDEN)
-            output = _source(source_prefix + "self_attn.o_proj", HIDDEN, 4096)
+        direct.append(DirectRecipe(object_prefix + "input_norm",
+                                   source_prefix + "input_layernorm.weight", (hidden,)))
+        if layer in attention_layers:
+            query = _source(source_prefix + "self_attn.q_proj", 2 * g.query_size, hidden)
+            key = _source(source_prefix + "self_attn.k_proj", g.kv_size, hidden)
+            value = _source(source_prefix + "self_attn.v_proj", g.kv_size, hidden)
+            output = _source(source_prefix + "self_attn.o_proj", hidden, g.query_size)
             fused_sources = (query, key, value)
-            weights.extend(
-                (
-                    Nvfp4WeightRecipe(
-                        object_prefix + "attention/query_key_gate_value",
-                        (10240, HIDDEN),
-                        (
-                            _q_part(query, False),
-                            _all(key),
-                            _q_part(query, True),
-                            _all(value),
-                        ),
-                        fused_sources,
-                    ),
-                    Nvfp4WeightRecipe(
-                        object_prefix + "attention/output",
-                        output.shape,
-                        (_all(output),),
-                        (output,),
-                    ),
-                )
-            )
-            divisors.extend(
-                (
-                    InputDivisorRecipe(
-                        object_prefix
-                        + "attention/input_projection/input_scale_divisor",
-                        fused_sources,
-                        (object_prefix + "attention/query_key_gate_value",),
-                    ),
-                    InputDivisorRecipe(
-                        object_prefix + "attention/output_projection/input_scale_divisor",
-                        (output,),
-                        (object_prefix + "attention/output",),
-                    ),
-                )
-            )
+            weights.extend((
+                Nvfp4WeightRecipe(
+                    object_prefix + "attention/query_key_gate_value",
+                    (2 * g.query_size + 2 * g.kv_size, hidden),
+                    (_q_part(query, False, g), _all(key), _q_part(query, True, g), _all(value)),
+                    fused_sources,
+                ),
+                Nvfp4WeightRecipe(object_prefix + "attention/output", output.shape,
+                                  (_all(output),), (output,)),
+            ))
+            divisors.extend((
+                InputDivisorRecipe(object_prefix + "attention/input_projection/input_scale_divisor",
+                                   fused_sources, (object_prefix + "attention/query_key_gate_value",)),
+                InputDivisorRecipe(object_prefix + "attention/output_projection/input_scale_divisor",
+                                   (output,), (object_prefix + "attention/output",)),
+            ))
+            direct.extend((
+                DirectRecipe(object_prefix + "attention/query_norm",
+                             source_prefix + "self_attn.q_norm.weight", (g.head_dim,)),
+                DirectRecipe(object_prefix + "attention/key_norm",
+                             source_prefix + "self_attn.k_norm.weight", (g.head_dim,)),
+            ))
         else:
-            query_key_value = _source(
-                source_prefix + "linear_attn.in_proj_qkv", 8192, HIDDEN
-            )
-            z = _source(source_prefix + "linear_attn.in_proj_z", 4096, HIDDEN)
-            output = _source(source_prefix + "linear_attn.out_proj", HIDDEN, 4096)
+            query_key_value = _source(source_prefix + "linear_attn.in_proj_qkv", g.convolution_dim, hidden)
+            z = _source(source_prefix + "linear_attn.in_proj_z", g.value_dim, hidden)
+            output = _source(source_prefix + "linear_attn.out_proj", hidden, g.value_dim)
             fused_sources = (query_key_value, z)
-            weights.extend(
-                (
-                    Nvfp4WeightRecipe(
-                        object_prefix + "gdn/query_key_value_z",
-                        (12288, HIDDEN),
-                        (_all(query_key_value), _all(z)),
-                        fused_sources,
-                    ),
-                    Nvfp4WeightRecipe(
-                        object_prefix + "gdn/output",
-                        output.shape,
-                        (_all(output),),
-                        (output,),
-                    ),
-                )
-            )
-            divisors.extend(
-                (
-                    InputDivisorRecipe(
-                        object_prefix + "gdn/input_projection/input_scale_divisor",
-                        fused_sources,
-                        (object_prefix + "gdn/query_key_value_z",),
-                    ),
-                    InputDivisorRecipe(
-                        object_prefix + "gdn/output_projection/input_scale_divisor",
-                        (output,),
-                        (object_prefix + "gdn/output",),
-                    ),
-                )
-            )
-
-        gate = _source(source_prefix + "mlp.gate_proj", 9216, HIDDEN)
-        up = _source(source_prefix + "mlp.up_proj", 9216, HIDDEN)
-        down = _source(source_prefix + "mlp.down_proj", HIDDEN, 9216)
-        weights.extend(
-            (
-                Nvfp4WeightRecipe(
-                    object_prefix + "mlp/gate_up",
-                    (18432, HIDDEN),
-                    (_all(gate), _all(up)),
-                    (gate, up),
-                ),
-                Nvfp4WeightRecipe(
-                    object_prefix + "mlp/down", down.shape, (_all(down),), (down,)
-                ),
-            )
-        )
-        divisors.extend(
-            (
-                InputDivisorRecipe(
-                    object_prefix + "mlp/gate_up_projection/input_scale_divisor",
-                    (gate, up),
-                    (object_prefix + "mlp/gate_up",),
-                ),
-                InputDivisorRecipe(
-                    object_prefix + "mlp/down_projection/input_scale_divisor",
-                    (down,),
-                    (object_prefix + "mlp/down",),
-                ),
-            )
-        )
-
-    return tuple(weights), tuple(divisors)
-
-
-def _build_direct_recipes() -> tuple[DirectRecipe, ...]:
-    items: list[DirectRecipe] = []
-    for layer in range(LAYERS):
-        source_prefix = f"model.layers.{layer}."
-        object_prefix = f"text/layers/{layer}/"
-        items.append(
-            DirectRecipe(
-                object_prefix + "input_norm",
-                source_prefix + "input_layernorm.weight",
-                (HIDDEN,),
-            )
-        )
-        if layer in EXPORT.FULL_ATTENTION_LAYERS:
-            items.extend(
-                (
-                    DirectRecipe(
-                        object_prefix + "attention/query_norm",
-                        source_prefix + "self_attn.q_norm.weight",
-                        (HEAD_DIM,),
-                    ),
-                    DirectRecipe(
-                        object_prefix + "attention/key_norm",
-                        source_prefix + "self_attn.k_norm.weight",
-                        (HEAD_DIM,),
-                    ),
-                )
-            )
-        else:
-            items.extend(
-                (
-                    DirectRecipe(
-                        object_prefix + "gdn/a_log",
-                        source_prefix + "linear_attn.A_log",
-                        (32,),
-                    ),
-                    DirectRecipe(
-                        object_prefix + "gdn/dt_bias",
-                        source_prefix + "linear_attn.dt_bias",
-                        (32,),
-                    ),
-                    DirectRecipe(
-                        object_prefix + "gdn/convolution",
-                        source_prefix + "linear_attn.conv1d.weight",
-                        (4, 8192),
-                        source_shape=(8192, 4),
-                        transpose=True,
-                    ),
-                    # in_proj_a and in_proj_b ship as NVFP4 blocks; the artifact wants
-                    # them dense, so they are decoded back to BF16 on the way in.
-                    DirectRecipe(
-                        object_prefix + "gdn/a_projection",
-                        source_prefix + "linear_attn.in_proj_a",
-                        (32, HIDDEN),
-                        dequantize=True,
-                    ),
-                    DirectRecipe(
-                        object_prefix + "gdn/b_projection",
-                        source_prefix + "linear_attn.in_proj_b",
-                        (32, HIDDEN),
-                        dequantize=True,
-                    ),
-                    DirectRecipe(
-                        object_prefix + "gdn/norm",
-                        source_prefix + "linear_attn.norm.weight",
-                        (128,),
-                    ),
-                )
-            )
-        items.append(
-            DirectRecipe(
-                object_prefix + "post_attention_norm",
-                source_prefix + "post_attention_layernorm.weight",
-                (HIDDEN,),
-            )
-        )
-    items.append(
-        DirectRecipe(
-            "text/final_norm", "model.norm.weight", (HIDDEN,)
-        )
-    )
-    return tuple(items)
-
-
-NVFP4_WEIGHT_RECIPES, INPUT_DIVISOR_RECIPES = _build_matrix_recipes()
-NVFP4_WEIGHTS_BY_NAME = {item.object_name: item for item in NVFP4_WEIGHT_RECIPES}
-INPUT_DIVISORS_BY_NAME = {item.object_name: item for item in INPUT_DIVISOR_RECIPES}
-DIRECT_RECIPES = _build_direct_recipes()
-DIRECT_BY_NAME = {item.object_name: item for item in DIRECT_RECIPES}
-NVFP4_SOURCES = tuple(
-    dict.fromkeys(
-        part.source for recipe in NVFP4_WEIGHT_RECIPES for part in recipe.parts
-    )
-)
-EXPECTED_FIELDS = (WEIGHT_FIELD, SCALE_FIELD, GLOBAL_SCALE_FIELD, INPUT_SCALE_FIELD)
+            weights.extend((
+                Nvfp4WeightRecipe(object_prefix + "gdn/query_key_value_z",
+                                  (g.convolution_dim + g.value_dim, hidden),
+                                  (_all(query_key_value), _all(z)), fused_sources),
+                Nvfp4WeightRecipe(object_prefix + "gdn/output", output.shape, (_all(output),), (output,)),
+            ))
+            divisors.extend((
+                InputDivisorRecipe(object_prefix + "gdn/input_projection/input_scale_divisor",
+                                   fused_sources, (object_prefix + "gdn/query_key_value_z",)),
+                InputDivisorRecipe(object_prefix + "gdn/output_projection/input_scale_divisor",
+                                   (output,), (object_prefix + "gdn/output",)),
+            ))
+            direct.extend((
+                DirectRecipe(object_prefix + "gdn/a_log", source_prefix + "linear_attn.A_log",
+                             (g.gdn_value_heads,)),
+                DirectRecipe(object_prefix + "gdn/dt_bias", source_prefix + "linear_attn.dt_bias",
+                             (g.gdn_value_heads,)),
+                DirectRecipe(object_prefix + "gdn/convolution", source_prefix + "linear_attn.conv1d.weight",
+                             (g.gdn_conv_kernel, g.convolution_dim),
+                             source_shape=(g.convolution_dim, g.gdn_conv_kernel), transpose=True),
+                # in_proj_a and in_proj_b ship as NVFP4 blocks; the artifact wants them
+                # dense, so they are decoded back to BF16 on the way in.
+                DirectRecipe(object_prefix + "gdn/a_projection", source_prefix + "linear_attn.in_proj_a",
+                             (g.gdn_value_heads, hidden), dequantize=True),
+                DirectRecipe(object_prefix + "gdn/b_projection", source_prefix + "linear_attn.in_proj_b",
+                             (g.gdn_value_heads, hidden), dequantize=True),
+                DirectRecipe(object_prefix + "gdn/norm", source_prefix + "linear_attn.norm.weight",
+                             (g.gdn_value_head_dim,)),
+            ))
+        gate = _source(source_prefix + "mlp.gate_proj", g.intermediate, hidden)
+        up = _source(source_prefix + "mlp.up_proj", g.intermediate, hidden)
+        down = _source(source_prefix + "mlp.down_proj", hidden, g.intermediate)
+        weights.extend((
+            Nvfp4WeightRecipe(object_prefix + "mlp/gate_up", (2 * g.intermediate, hidden),
+                              (_all(gate), _all(up)), (gate, up)),
+            Nvfp4WeightRecipe(object_prefix + "mlp/down", down.shape, (_all(down),), (down,)),
+        ))
+        divisors.extend((
+            InputDivisorRecipe(object_prefix + "mlp/gate_up_projection/input_scale_divisor",
+                               (gate, up), (object_prefix + "mlp/gate_up",)),
+            InputDivisorRecipe(object_prefix + "mlp/down_projection/input_scale_divisor",
+                               (down,), (object_prefix + "mlp/down",)),
+        ))
+        direct.append(DirectRecipe(object_prefix + "post_attention_norm",
+                                   source_prefix + "post_attention_layernorm.weight", (hidden,)))
+    direct.append(DirectRecipe("text/final_norm", source_root + "norm.weight", (hidden,)))
+    return UniformRecipes(g, source_root, tuple(weights), tuple(divisors), tuple(direct))
 
 
 def _select_rows(tensor: torch.Tensor, part: MatrixPart) -> torch.Tensor:
@@ -434,22 +340,19 @@ def materialize_input_divisor(recipe: InputDivisorRecipe, reader: ShardReader) -
     )
 
 
-def validate_recipe() -> None:
+def validate(recipes: UniformRecipes, export) -> None:
     """Every NVFP4 object in the inventory must have exactly one recipe."""
-
     expected = {
-        spec.name
-        for spec in EXPORT.TEXT_CORE_TENSOR_SPECS
-        if spec.format == EXPORT.NVFP4
+        spec.name for spec in export.TEXT_CORE_TENSOR_SPECS if spec.format == export.NVFP4
     }
-    produced = set(NVFP4_WEIGHTS_BY_NAME)
+    produced = set(recipes.nvfp4_weights_by_name)
     if expected != produced:
         missing = sorted(expected - produced)[:4]
         extra = sorted(produced - expected)[:4]
         raise ValueError(
             f"NVFP4 recipe coverage mismatch; missing={missing} extra={extra}"
         )
-    for recipe in NVFP4_WEIGHT_RECIPES:
+    for recipe in recipes.nvfp4_weights:
         rows = sum(part.output_rows for part in recipe.parts)
         if rows != recipe.shape[0]:
             raise ValueError(f"{recipe.object_name}: fused rows {rows} != {recipe.shape[0]}")

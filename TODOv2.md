@@ -25,8 +25,8 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Eight open or partly done. Two are decisions waiting on `surogate quantize` as a
-product rather than tasks (1 and 8); the rest are work.
+Seven open or partly done. Two are decisions waiting on `surogate quantize` as a
+product rather than tasks (1 and 7); the rest are work.
 
 1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
@@ -39,7 +39,7 @@ product rather than tasks (1 and 8); the rest are work.
    selects them — the other targets import the names and use `W8G32_F16S` or
    NVFP4. So this is one target's safetensors profile, not five, and it is a
    decision rather than a task: it costs the 27B its groupwise-int route until
-   `surogate quantize` (item 8) is a product.
+   `surogate quantize` (item 7) is a product.
 2. **[ ] FP8, and the two kinds are not the same job (checked 2026-09-03).**
    - *compressed-tensors per-channel/per-tensor* is per-row with an FP32 scale.
      The engine has `FP8_E4M3FN_ROW_BF16S`, so this is either an `_F32S` variant
@@ -51,26 +51,7 @@ product rather than tasks (1 and 8); the rest are work.
      `weight_scale_inv` as a 2-D F32 grid (e.g. `[48, 8]` for a `[6144, 1024]`
      projection). No runtime format holds a 2-D block scale, so this is a new
      weight format and GEMM support, not an ingest change.
-3. **[~] NVFP4 ModelOpt ingest: the 4B serves (2026-09-03).**
-   `surogate serve <Qwen3.5-4B-NVFP4>` works end to end. **Left: the 0.8B and
-   the 2B have no NVFP4 recipe** — their checkpoints are on this machine and are
-   refused by name until one exists.
-   What such a recipe reads: `weight` `[n, k/2]` U8, `weight_scale` `[n, k/16]`
-   E4M3, `weight_scale_2` a scalar F32, `input_scale` a scalar F32, per
-   component. Two differences from the compressed-tensors path the 27B converter
-   already handles:
-   - **The global scale is a multiplier, not a divisor.** The engine binds
-     `weight_scale_divisor` / `input_scale_divisor` and validates them positive
-     and finite, so ingest inverts: `divisor = 1 / weight_scale_2`. Measured on
-     layer 11: `weight_scale_2 = 7.30242e-05`, `input_scale = 8.97507e-03`, and
-     q/k/v share both while `o_proj` has its own — so the divisor groups the
-     recipe already models are the right shape, they are just per component.
-   - **Parents are split per component.** ModelOpt writes `q_proj`, `k_proj`,
-     `v_proj` separately where the artifact fuses them, so the converter fuses
-     and must check the three share a divisor before it does.
-   The engine side is ready for any size: `qwen3_5` compiles both NVFP4 profiles
-   and binds NVFP4 parents with both divisors.
-4. **[~] Every GGML weight type is read where it lies (2026-09-04); what the UD mixtures
+3. **[~] Every GGML weight type is read where it lies (2026-09-04); what the UD mixtures
    still cost.** The 27B's refusal was never about vision: unsloth's "UD-Q4_K_M" holds 117
    IQ4_XS and 4 IQ3_S tensors, and the engine read 13 of llama.cpp's 27 storable types. The
    other fourteen shipped in 6613389f -- the eight IQ formats, TQ1_0/TQ2_0, MXFP4, ggml's
@@ -149,7 +130,7 @@ product rather than tasks (1 and 8); the rest are work.
    of the int8 tile itself, fixed here: its activation planes carried the raw Σx and now
    carry d·Σq, matching the GEMV route (real-tensor error 1.25e-2 -> 1.77e-3 relative).
 
-5. **[ ] Unify weight loading with the trainer, still true but smaller than it
+4. **[ ] Unify weight loading with the trainer, still true but smaller than it
    was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per target
    restate what the trainer's declarations in `surogate/dsl/models/` already say.
    Both sides describe the same nineteen architectures: the DSL has `qwen3.py`,
@@ -161,7 +142,7 @@ product rather than tasks (1 and 8); the rest are work.
    checkpoint tensor becomes which artifact object, and how fused objects are
    assembled. That is the part worth unifying, and the part `hf_mapping` already
    spells out.
-6. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
+5. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.
    - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
@@ -180,7 +161,7 @@ product rather than tasks (1 and 8); the rest are work.
      the file's blocks (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`).
    - **The 28k-prompt board row** (long-context ingestion) has not been re-measured
      since the native path landed.
-7. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
+6. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
    (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
    acceptance — which is the evidence the graph is right — but decode moves
    30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
@@ -188,7 +169,7 @@ product rather than tasks (1 and 8); the rest are work.
    more distinct experts than a single token and pays more PCIe gathers with
    3,172 of 5,110 experts resident. The graph and the levers are in memory
    `project_serve_qwen4exp_mtp`.
-8. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+7. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -360,6 +341,23 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
   the cache and costs a 3:1 GDN stack 0-0.4 % of perplexity; it costs a
   pure-attention model 1.5-2.6 %, which is the whole of the `qwen3` target's
   offset against llama.cpp's f16 cache. `--kv-cache-dtype bf16|fp8` pins either.
+
+- **NVFP4 ModelOpt exports of every size serve (2026-09-04), and the small ones
+  are worth what their checkpoints are worth.** The uniform export builds its
+  recipes from the checkpoint's `config.json` and tensor-name root (the 4B under
+  `model.`, the VL-style 0.8B/2B under `model.language_model.`), and the NVFP4
+  generic route admits every K its activation quantiser is built for -- one list
+  (`SINFER_NVFP4_FOR_EACH_ACTIVATION_K`) that the predicate and the launch switch
+  both expand -- so a new width is one entry. The export writers had also been
+  unreachable since the recipes moved into `exports/` (a stale import), which
+  had broken the 4B's conversion too. Perplexity against llama.cpp's 4-bit
+  GGUFs on the same windows: 0.8B **17.57 vs 15.15**, 2B **11.64 vs 10.29**, 4B
+  **8.97 vs 8.24**. That is the checkpoints, not the engine: the 0.8B's NVFP4
+  weights dequantised exactly inside the BF16 transformers model score 17.33
+  with exact activations. ModelOpt's per-16 E2M1 with a calibrated static
+  activation scale is simply a worse 4-bit quantisation of these models than a
+  K-quant; the engine is faithful to it. Decode on one 5090: 0.8B 481, 2B 380,
+  4B 354 tok/s.
 
 ## Traps
 

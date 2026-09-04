@@ -1,15 +1,18 @@
-"""Single-source conversion of the Qwen3.5-4B NVFP4 export into an artifact.
+"""Single-source conversion of a ModelOpt NVFP4 export of this family into an artifact.
 
 Everything comes from one ModelOpt checkpoint: the NVFP4 blocks pass through
 untouched with their calibrated activation divisors, the norms and the
 convolution are copied dense, and the tied embedding is re-encoded FP8
-row-scaled for both the embedding table and the output head.
+row-scaled for both the embedding table and the output head. The dimensions
+and the tensor-name root are the checkpoint's own, so the 4B, 2B and 0.8B
+releases convert through the same program.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import time
 from typing import Iterable, Mapping, Sequence
@@ -24,27 +27,11 @@ from surogate.serve.convert.common import conversion as family_conversion
 
 from .. import draft_head
 from . import recipe_nvfp4_uniform as recipe
-
 from .. import inventory as family_inventory
 from .. import recipe as family_recipe
 
-
-#: The one checkpoint published under this export; the tables below are its size.
-GEOMETRY = family_inventory.Geometry(
-    layers=32, hidden=2560, intermediate=9216, query_heads=16, kv_heads=4,
-    gdn_value_heads=32,
-)
-EXPORT = family_inventory.export_inventory(
-    family_inventory.NVFP4_UNIFORM, GEOMETRY)
-#: The BF16 checkpoint's recipes at this size, for the objects this export
-#: does not quantise.
-BASE_RECIPES = {item.object_name: item
-                for item in family_recipe.build_recipes(GEOMETRY)}
-
-
 RECIPE_ID = "qwen3_5-nvfp4-modelopt-v1"
 OUTPUT_BASENAME = "qwen3_5_nvfp4.sinfer"
-
 
 
 def geometry_block(model_dir) -> dict[str, float]:
@@ -80,7 +67,13 @@ class ConversionPreflight:
     model_dir: Path
     object_plan: family_conversion.ObjectPlan
     resources: tuple
-    draft: "draft_head.DraftHeadContext" 
+    draft: "draft_head.DraftHeadContext"
+    geometry: family_inventory.Geometry
+    export: family_inventory.ExportInventory
+    recipes: recipe.UniformRecipes
+    #: The BF16 checkpoint's recipes at this size, for the objects this export does not
+    #: quantise (the draft head).
+    base_recipes: Mapping[str, object]
 
 
 # E2M1 code -> value, the 4-bit float NVFP4 stores (sign in the high bit).
@@ -114,22 +107,36 @@ def _decode_nvfp4_dense(
     return dense.to(torch.bfloat16)
 
 
+def _reader_factory(model_dir: Path):
+    single = model_dir / "model.safetensors"
+    if single.is_file() and not (model_dir / "model.safetensors.index.json").is_file():
+        return lambda: ShardReader.from_file(single)
+    return lambda: ShardReader(model_dir)
+
+
 def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
     source = Path(model_dir)
     if not source.is_dir():
         raise FileNotFoundError(f"NVFP4 source directory not found: {source}")
-    recipe.validate_recipe()
-    resources = family_conversion.load_resources(source, EXPORT.RESOURCE_SPECS)
+    config = json.loads((source / "config.json").read_text(encoding="utf-8"))
+    geometry = family_inventory.geometry_from_config(config)
+    export = family_inventory.export_inventory(family_inventory.NVFP4_UNIFORM, geometry)
+    with _reader_factory(source)() as reader:
+        root = recipe.source_root_of(reader.names)
+    recipes = recipe.build(geometry, root)
+    recipe.validate(recipes, export)
+    resources = family_conversion.load_resources(source, export.RESOURCE_SPECS)
     plan = family_conversion.build_object_plan(
-        EXPORT.OBJECT_SPECS, {item.name: item.data for item in resources}
+        export.OBJECT_SPECS, {item.name: item.data for item in resources}
     )
-    ranking = Path(__file__).resolve().parents[2] / "tools" / draft_head.DEFAULT_RANKING
-    draft = draft_head.compute_shortlist(ranking, source)
-    return ConversionPreflight(source, plan, resources, draft)
+    from ..convert import _tools_root  # the ranking the draft head's shortlist is cut from
+    draft = draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, source)
+    base_recipes = {item.object_name: item for item in family_recipe.build_recipes(geometry)}
+    return ConversionPreflight(source, plan, resources, draft, geometry, export, recipes,
+                               base_recipes)
 
 
-def _encode_nvfp4_object(spec, reader: ShardReader) -> bytes:
-    entry = recipe.NVFP4_WEIGHTS_BY_NAME[spec.name]
+def _encode_nvfp4_object(spec, entry: recipe.Nvfp4WeightRecipe, reader: ShardReader) -> bytes:
     packed, scales, divisor = recipe.materialize_nvfp4_weight(entry, reader)
     return encode_nvfp4(packed, scales, divisor, spec.shape)
 
@@ -144,46 +151,44 @@ def convert(
     output = Path(out_path)
     resolved_device = pick_device(device)
     preflight = preflight_conversion(model_dir)
+    export, recipes = preflight.export, preflight.recipes
+    nvfp4_by_name = recipes.nvfp4_weights_by_name
+    divisors_by_name = recipes.input_divisors_by_name
+    direct_by_name = recipes.direct_by_name
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
-        f"{len(recipe.NVFP4_SOURCES)} NVFP4 source matrices, device={resolved_device}",
+        f"{len(recipes.nvfp4_sources)} NVFP4 source matrices, "
+        f"hidden={preflight.geometry.hidden} layers={preflight.geometry.layers} "
+        f"root={recipes.source_root!r}, device={resolved_device}",
         flush=True,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
-    total = len(EXPORT.OBJECT_SPECS)
-    single = preflight.model_dir / "model.safetensors"
-    reader_factory = (
-        (lambda: ShardReader.from_file(single))
-        if single.is_file() and not (preflight.model_dir / "model.safetensors.index.json").is_file()
-        else (lambda: ShardReader(preflight.model_dir))
-    )
-    with reader_factory() as reader:
+    total = len(export.OBJECT_SPECS)
+    with _reader_factory(preflight.model_dir)() as reader:
         with ArtifactWriter(
             output,
-            ArtifactIdentity(EXPORT.MODEL_ID, EXPORT.WEIGHTS_ID),
+            ArtifactIdentity(export.MODEL_ID, export.WEIGHTS_ID),
             preflight.object_plan.specs,
             geometry=geometry_block(model_dir),
         ) as writer:
-            for index, spec in enumerate(EXPORT.OBJECT_SPECS, start=1):
+            for index, spec in enumerate(export.OBJECT_SPECS, start=1):
                 payload: bytes | Iterable[bytes]
-                if isinstance(spec, EXPORT.ResourceSpec):
+                if isinstance(spec, export.ResourceSpec):
                     payload = resources[spec.name]
                 elif spec.name in ("text/token_embedding", "text/output_head"):
                     # The embedding is tied, so the head reads the same source.
-                    tensor = reader.get(recipe.EMBEDDING_SOURCE)
+                    tensor = reader.get(recipes.embedding_source)
                     payload = family_conversion.encode_tensor_payload(
                         tensor.reshape(spec.shape), spec, resolved_device
                     )
                     del tensor
-                elif spec.name in recipe.NVFP4_WEIGHTS_BY_NAME:
-                    payload = _encode_nvfp4_object(spec, reader)
-                elif spec.name in recipe.INPUT_DIVISORS_BY_NAME:
-                    payload = recipe.materialize_input_divisor(
-                        recipe.INPUT_DIVISORS_BY_NAME[spec.name], reader
-                    )
-                elif spec.name in recipe.DIRECT_BY_NAME:
-                    entry = recipe.DIRECT_BY_NAME[spec.name]
+                elif spec.name in nvfp4_by_name:
+                    payload = _encode_nvfp4_object(spec, nvfp4_by_name[spec.name], reader)
+                elif spec.name in divisors_by_name:
+                    payload = recipe.materialize_input_divisor(divisors_by_name[spec.name], reader)
+                elif spec.name in direct_by_name:
+                    entry = direct_by_name[spec.name]
                     tensor = (
                         _decode_nvfp4_dense(entry.source_name, entry.shape, reader)
                         if entry.dequantize
@@ -191,9 +196,9 @@ def convert(
                     )
                     # The export stores some scalars in bf16 where the artifact wants fp32.
                     dtype = {
-                        EXPORT.FP32: torch.float32,
-                        EXPORT.BF16: torch.bfloat16,
-                        EXPORT.I32: torch.int32,
+                        export.FP32: torch.float32,
+                        export.BF16: torch.bfloat16,
+                        export.I32: torch.int32,
                     }.get(spec.format)
                     if dtype is not None and tensor.dtype != dtype:
                         tensor = tensor.to(dtype)
@@ -215,7 +220,7 @@ def convert(
                         )
                     }
                     tensor = family_recipe.materialize_recipe(
-                        BASE_RECIPES[spec.name], reader, derived
+                        preflight.base_recipes[spec.name], reader, derived
                     )
                     payload = family_conversion.encode_tensor_payload(
                         tensor.reshape(spec.shape), spec, resolved_device

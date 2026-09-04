@@ -116,30 +116,12 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
         throw std::invalid_argument("nvfp4 W4A4 requires caller workspace");
     }
     switch (weight.k) {
-    case Nvfp4Activation5120Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation5120Geometry>(x, weight, workspace, stream, layout);
+#define SINFER_NVFP4_K_CASE(K)                                                                    \
+    case K:                                                                                       \
+        launch_quantize_exact<Nvfp4ActivationGeometry<K>>(x, weight, workspace, stream, layout);  \
         return;
-    case Nvfp4Activation6144Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation6144Geometry>(x, weight, workspace, stream, layout);
-        return;
-    case Nvfp4Activation17408Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, stream, layout);
-        return;
-    case Nvfp4Activation512Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation512Geometry>(x, weight, workspace, stream, layout);
-        return;
-    case Nvfp4Activation2048Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation2048Geometry>(x, weight, workspace, stream, layout);
-        return;
-    case Nvfp4Activation2560Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation2560Geometry>(x, weight, workspace, stream, layout);
-        return;
-    case Nvfp4Activation4096Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation4096Geometry>(x, weight, workspace, stream, layout);
-        return;
-    case Nvfp4Activation9216Geometry::kInputRows:
-        launch_quantize_exact<Nvfp4Activation9216Geometry>(x, weight, workspace, stream, layout);
-        return;
+        SINFER_NVFP4_FOR_EACH_ACTIVATION_K(SINFER_NVFP4_K_CASE)
+#undef SINFER_NVFP4_K_CASE
     default:
         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
     }

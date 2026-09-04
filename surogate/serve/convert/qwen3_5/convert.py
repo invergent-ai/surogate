@@ -756,8 +756,8 @@ DUAL_SOURCE_PROFILES = (inventory.NVFP4_MIXED_BF16, inventory.NVFP4_MLP_ONLY)
 def _export_writer(profile: str):
     """The module that writes one export's artifact. Imported on use: each pulls in its own
     source-format machinery, and a group-wise conversion needs none of it."""
-    from . import convert_nvfp4_all, convert_nvfp4_mixed_bf16
-    from . import convert_nvfp4_mlp_only, convert_nvfp4_uniform
+    from .exports import convert_nvfp4_all, convert_nvfp4_mixed_bf16
+    from .exports import convert_nvfp4_mlp_only, convert_nvfp4_uniform
 
     return {
         inventory.NVFP4_UNIFORM: convert_nvfp4_uniform,

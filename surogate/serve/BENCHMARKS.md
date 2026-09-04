@@ -231,8 +231,11 @@ Same file, same probe, one card, one user, a 2,048-token prompt:
 Through the server we are ahead on both. `llama-bench` is the compute bar, though: it hands the
 model one 2,048-wide batch where `llama-server` splits into 512-token micro-batches, and that
 number is 14 % above ours (23 % before the native pass). End to end we run 112 TFLOP of prompt
-at **149 TFLOP/s effective** against its 174. The profile below is the morning's, before the
-native pass; its "groupwise kernels on the re-encoded halves" no longer run on this file.
+at **149 TFLOP/s effective** against its 174. Re-profiled after the native pass (22:09): the
+whole prefill is the BF16 wide route -- cutlass BF16 GEMMs **75 %**, `dequantize_rows` staging
+**14.5 %**, GDN core and attention ~3 % -- so the dequantise-once-then-GEMM route is the entire
+compute story and the two levers left are its staging pass and cuBLASLt's own rate. The table
+below is the morning's, before the native pass, kept for the route rates it measured.
 
 An `nsys` capture with `--cuda-graph-trace=node` (the prefill is a captured graph; without that
 flag the profile shows almost nothing) says where a prefill's GPU time goes:
@@ -289,6 +292,9 @@ ours eager with the raw prompt (`surogate/serve/tools/eval/perplexity.py`) again
 | Qwen3-0.6B-IQ4_XS (40 windows, 2026-09-04, BF16 KV cache; the FP8 row above read 18.330) | IQ4_XS/Q6_K | 17.8580 +/- 0.286 | 17.8659 +/- 0.286 |
 | Qwen3.8-27B-UD-Q4_K_M (8 windows, 2026-09-04, BF16 KV cache; FP8 read 5.1699) | Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_S | 5.1495 +/- 0.133 | 5.0166 +/- 0.127 |
 | Qwen3.8-27B-UD-Q4_K_M (8 windows, 2026-09-04 22:07, **everything native**: typed segments for the mixed-type fused parents, the GDN out_proj permutation on the activation; FP8 KV cache -- BF16 reads 5.0523, inside the bar) | Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_S | **5.0477 +/- 0.129** | 5.0166 +/- 0.127 |
+| Qwen3.5-0.8B **NVFP4** (`surogate/Qwen3.5-0.8B-NVFP4`, ModelOpt; 40 windows, 2026-09-04) against llama.cpp on the IQ4_XS GGUF. The same NVFP4 weights dequantised exactly inside the BF16 transformers model score 17.33 with exact activations: the checkpoint, not the engine | NVFP4 W4A4 | 17.5679 +/- 0.267 | 15.1511 +/- 0.226 (IQ4_XS) |
+| Qwen3.5-2B **NVFP4** (`surogate/Qwen3.5-2B-NVFP4`; 40 windows) against llama.cpp on Q4_K_M | NVFP4 W4A4 | 11.6437 +/- 0.162 | 10.2912 +/- 0.140 (Q4_K_M) |
+| Qwen3.5-4B **NVFP4** (`surogate/Qwen3.5-4B-NVFP4`; 40 windows) against llama.cpp on Q4_K_M | NVFP4 W4A4 | 8.9714 +/- 0.121 | 8.2445 +/- 0.108 (Q4_K_M) |
 | Qwen3.5-0.8B-IQ4_XS | IQ4_XS 50 %, Q6_K 43 % | **15.094 +/- 0.225** | 15.151 +/- 0.226 |
 | Qwen3.5-0.8B-UD-Q2_K_XL | Q2_K/Q3_K, IQ3_S/IQ3_XXS/IQ2_S/IQ4_XS | 20.209 +/- 0.305 | 20.016 +/- 0.302 |
 | Qwen3-0.6B-UD-IQ2_M | IQ2_S 34 %, IQ3_S 16 %, IQ3_XXS | **40.128 +/- 0.702** | 42.045 +/- 0.743 |

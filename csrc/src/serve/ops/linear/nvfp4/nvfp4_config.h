@@ -167,15 +167,30 @@ inline constexpr bool is_nvfp4_gemv_only_problem(std::int32_t output_rows, std::
 }
 
 // Shapes outside the five registered geometries run on the cuBLASLt route alone (#82): it is
-// shape-generic, so only the activation quantizer needs an instantiation per K.
+// shape-generic, so only the activation quantizer needs an instantiation per K. The one list
+// below is every K the quantizer is built for -- the family's hidden, query, value and
+// intermediate widths at every published size (0.8B 1024/2048/3584, 2B 2048/6144, 4B
+// 2560/4096/9216, 27B 5120/6144/17408) -- and both the admission predicate and the launch
+// switch expand it, so a new width is one entry here.
+#define SINFER_NVFP4_FOR_EACH_ACTIVATION_K(X) \
+    X(512) X(1024) X(2048) X(2560) X(3584) X(4096) X(5120) X(6144) X(9216) X(17408)
 using Nvfp4Activation512Geometry   = Nvfp4ActivationGeometry<512>;
+using Nvfp4Activation1024Geometry  = Nvfp4ActivationGeometry<1024>;
 using Nvfp4Activation2048Geometry  = Nvfp4ActivationGeometry<2048>;
 using Nvfp4Activation2560Geometry  = Nvfp4ActivationGeometry<2560>;
+using Nvfp4Activation3584Geometry  = Nvfp4ActivationGeometry<3584>;
 using Nvfp4Activation4096Geometry  = Nvfp4ActivationGeometry<4096>;
 using Nvfp4Activation9216Geometry  = Nvfp4ActivationGeometry<9216>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+
+inline constexpr bool nvfp4_activation_k_instantiated(std::int32_t input_rows) {
+#define SINFER_NVFP4_K_CASE(K) if (input_rows == (K)) { return true; }
+    SINFER_NVFP4_FOR_EACH_ACTIVATION_K(SINFER_NVFP4_K_CASE)
+#undef SINFER_NVFP4_K_CASE
+    return false;
+}
 
 // Byte offset of the UE4M3 scale for (row, 16-wide group) in the 128x4 tiled layout shared by
 // the stored weight scales, the mma/TMA schedules and cuBLASLt's VEC16 block scaling.
@@ -219,8 +234,7 @@ inline constexpr bool is_nvfp4_generic_problem(std::int32_t output_rows, std::in
         return false;
     }
     if (is_nvfp4_registered_problem(output_rows, input_rows)) { return false; }
-    return input_rows == 512 || input_rows == 2048 || input_rows == 2560 || input_rows == 4096 ||
-           input_rows == 5120 || input_rows == 9216;
+    return nvfp4_activation_k_instantiated(input_rows);
 }
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
