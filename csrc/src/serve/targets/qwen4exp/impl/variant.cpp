@@ -933,8 +933,26 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                raw != nullptr && *raw != '\0') {
         requested = std::strtol(raw, nullptr, 10);
     }
-    if (requested <= 0) { return cache; }
     const auto geometry = ops::kSparseMoeFlashNextGeometry;
+    if (requested <= 0) {
+        // No slot count asked for. One layer's experts is the floor the resolve needs, and it
+        // is also what the pool used to settle on -- which left most of a card idle and cost
+        // more than half the decode rate, because every other expert then crossed PCIe on the
+        // token that wanted it. Take what is free instead, keeping a margin for the KV cache
+        // and the round's workspaces, and stop at the whole model.
+        // Half of what is free, not all of it: this runs before the KV cache and the round's
+        // workspaces are allocated, so the reading is an overstatement of what the pool may
+        // take. Half leaves those their room and still lands near the slot count the
+        // single-card measurements use.
+        const std::size_t per_slot = ops::expert_slot_pool_bytes(geometry, 1);
+        const std::size_t free     = device_free_bytes(device);
+        const std::size_t budget   = free / 2;
+        const auto whole_model =
+            static_cast<long>(TextConfig::layers) * static_cast<long>(geometry.experts);
+        requested = per_slot == 0 ? 0 : static_cast<long>(budget / per_slot);
+        requested = std::min(requested, whole_model);
+        if (requested < geometry.experts) { return cache; }
+    }
     // A round can touch every expert of a layer, and resolve must never leave a routed expert
     // unmapped, so the pool holds at least one layer's worth of experts.
     cache.slots         = std::max(static_cast<std::int32_t>(requested), geometry.experts);
