@@ -211,8 +211,13 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
 
 def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *, echo=print) -> Path:
     """Qwen3.8-Flash-Next: the GGUF is the weight source and the model's own HF frontend
-    (tokenizer, chat template, generation and preprocessor configs) is fetched from the Hub;
-    the converter repacks the GGUF tensors directly (no bridged BF16 shards)."""
+    (tokenizer, chat template, generation and preprocessor configs) is fetched from the Hub.
+
+    No bridge: the base model is 131 safetensors shards on the Hub, so the converter reads
+    the GGUF directly and builds its own repack candidate map. What it writes is ~1.5 GB of
+    index -- the weights themselves stay in the GGUF shards, which the artifact names by
+    absolute path, so the cached `.sinfer` is only good while they stay put.
+    """
     from surogate.serve.convert.qwen4exp import inventory as inv
     frontend_files = [spec.name.removeprefix("frontend/") for spec in inv.RESOURCE_SPECS]
     frontend_dir = cache_dir() / "frontends" / "Qwen3.8-Flash-Next"

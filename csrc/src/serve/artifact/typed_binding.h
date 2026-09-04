@@ -46,6 +46,9 @@ struct LinearBinding {
     std::uint32_t input_scale_divisor_bits  = 0;
 };
 
+/// The runtime quantisation type a stored format is read as.
+[[nodiscard]] QType qtype_for(NumericFormat format);
+
 [[nodiscard]] LinearBinding bind_linear(Binder& binder, std::string_view name, std::int32_t rows,
                                         std::int32_t columns,
                                         TensorPlacement placement = TensorPlacement::Device);

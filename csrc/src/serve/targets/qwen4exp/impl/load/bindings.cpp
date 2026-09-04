@@ -51,12 +51,38 @@ artifact::ObjectHandle host_q4(artifact::Binder& binder, HostBankPlan& bank,
     return handle;
 }
 
+// How the bank will find an object's bytes. One run is a span; several are the stretches of a
+// GGUF a fused parent is assembled from, and the bank concatenates them into pinned memory.
+HostObjectPlan host_plan(artifact::Binder& binder, artifact::ObjectHandle handle,
+                         const std::string& name) {
+    const auto runs = binder.runs(handle);
+    HostObjectPlan plan{handle, {}, name};
+    if (runs.size() == 1) {
+        plan.payload = binder.payload(handle).data;
+        return plan;
+    }
+    plan.parts.reserve(runs.size());
+    for (const artifact::PayloadRun& run : runs) { plan.parts.push_back(binder.run_span(run)); }
+    return plan;
+}
+
+// As `host`, but the format is read from the artifact rather than asserted. A GGUF-native
+// artifact stores the routed experts as the file's own blocks and never rewrites them.
+artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank,
+                                    const std::string& name, std::int32_t rows,
+                                    std::int32_t columns) {
+    const artifact::LinearBinding binding =
+        artifact::bind_linear(binder, name, rows, columns, TensorPlacement::ValidateOnly);
+    bank.objects.push_back(host_plan(binder, binding.object, name));
+    return binding;
+}
+
 // Validates the object and records its mapping for the pinned host bank.
 artifact::ObjectHandle host(artifact::Binder& binder, HostBankPlan& bank, const std::string& name,
                             NumericFormat format, std::initializer_list<std::uint64_t> shape) {
     const artifact::ObjectHandle handle =
         artifact::bind_tensor(binder, name, format, shape, TensorPlacement::ValidateOnly);
-    bank.objects.push_back({handle, binder.payload(handle).data, name});
+    bank.objects.push_back(host_plan(binder, handle, name));
     return handle;
 }
 
@@ -74,15 +100,28 @@ HyperConnectionPlan bind_hc(artifact::Binder& binder, const std::string& prefix,
 
 MoePlan bind_moe(artifact::Binder& binder, HostBankPlan& bank, const std::string& prefix,
                  bool q4) {
-    const auto routed = [&](const std::string& name, std::initializer_list<std::uint64_t> shape) {
-        return q4 ? host_q4(binder, bank, name, NumericFormat::W8G32_F16S, shape)
-                  : host(binder, bank, name, NumericFormat::W8G32_F16S, shape);
+    // The Q4 bank still asks for W8 planes, because its requantiser reads them. Otherwise the
+    // format is the artifact's: a GGUF-native one names the file's blocks.
+    NumericFormat gate_up_format = NumericFormat::W8G32_F16S;
+    NumericFormat down_format    = NumericFormat::W8G32_F16S;
+    const auto routed = [&](const std::string& name, std::initializer_list<std::uint64_t> shape,
+                            NumericFormat& format) {
+        if (q4) { return host_q4(binder, bank, name, NumericFormat::W8G32_F16S, shape); }
+        const artifact::LinearBinding binding =
+            host_linear(binder, bank, name, static_cast<std::int32_t>(*shape.begin()),
+                        static_cast<std::int32_t>(*(shape.begin() + 1)));
+        format = binding.format;
+        return binding.object;
     };
     return MoePlan{
         .router_shared_gate = device(binder, prefix + "router_shared_gate", NumericFormat::BF16,
                                      {kExperts + 1, kHidden}),
-        .routed_gate_up = routed(prefix + "routed_gate_up", {kExperts * 2 * kFfn, kHidden}),
-        .routed_down    = routed(prefix + "routed_down", {kExperts * kHidden, kFfn}),
+        .routed_gate_up = routed(prefix + "routed_gate_up", {kExperts * 2 * kFfn, kHidden},
+                                 gate_up_format),
+        .routed_down    = routed(prefix + "routed_down", {kExperts * kHidden, kFfn},
+                                 down_format),
+        .routed_gate_up_format = gate_up_format,
+        .routed_down_format    = down_format,
         .shared_gate_up = device(binder, prefix + "shared_gate_up", NumericFormat::W8G32_F16S,
                                  {2 * kFfn, kHidden}),
         .shared_down =
@@ -124,6 +163,40 @@ ops::HyperConnectionWeights load_hc(const artifact::MaterializedArtifact& backin
 
 // A row-split W8 weight whose planes live in the pinned host bank, addressed through the
 // mapped device pointer (the same layout the device materializer produces).
+Weight host_ggml_weight(const HostObject& object, NumericFormat format, std::int32_t rows,
+                        std::int32_t columns) {
+    const auto values = static_cast<std::int32_t>(artifact::ggml_block_values(format));
+    if (columns % values != 0) {
+        throw std::logic_error("host bank object " + object.name +
+                               " has a width that is not a whole number of blocks");
+    }
+    const auto* bytes = static_cast<const std::byte*>(object.device);
+    Weight out{};
+    out.payload       = bytes;
+    out.payload_bytes = object.bytes;
+    out.qtype         = artifact::qtype_for(format);
+    out.layout        = QuantLayout::GgmlBlocks;
+    out.qdata         = bytes;
+    // A GGML block carries its own scale, so there is no separate plane and no padding: the
+    // stored width is the logical width.
+    out.scales          = nullptr;
+    out.group_size      = static_cast<std::uint32_t>(values);
+    out.group           = values;
+    out.scale_dtype     = DType::FP16;
+    out.ndim            = 2;
+    out.n               = rows;
+    out.k               = columns;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.shape[2]        = 1;
+    out.shape[3]        = 1;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
+    out.padded_shape[2] = 1;
+    out.padded_shape[3] = 1;
+    return out;
+}
+
 Weight host_w8_weight(const HostObject& object, std::int32_t rows, std::int32_t columns) {
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
                                                 static_cast<std::uint64_t>(columns)};
@@ -197,6 +270,18 @@ SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const H
         out.op.routed_down    = host_q4_weight(bank.object(plan.routed_down),
                                                static_cast<std::int32_t>(kExperts * kHidden),
                                                static_cast<std::int32_t>(kFfn));
+    } else if (plan.routed_gate_up_format != NumericFormat::W8G32_F16S ||
+               plan.routed_down_format != NumericFormat::W8G32_F16S) {
+        // A GGUF-native artifact: the experts are the file's own blocks, so the bank holds them
+        // as they lie and the slot cache decodes each group on its way into the pool.
+        out.op.routed_gate_up = host_ggml_weight(bank.object(plan.routed_gate_up),
+                                                 plan.routed_gate_up_format,
+                                                 static_cast<std::int32_t>(kExperts * 2 * kFfn),
+                                                 static_cast<std::int32_t>(kHidden));
+        out.op.routed_down    = host_ggml_weight(bank.object(plan.routed_down),
+                                                 plan.routed_down_format,
+                                                 static_cast<std::int32_t>(kExperts * kHidden),
+                                                 static_cast<std::int32_t>(kFfn));
     } else {
         out.op.routed_gate_up = host_w8_weight(bank.object(plan.routed_gate_up),
                                                static_cast<std::int32_t>(kExperts * 2 * kFfn),
@@ -333,9 +418,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     read_i32_array(binder, offsets, out.ple_head_offsets);
     read_i32_array(binder, vocab_sizes, out.ple_head_vocab_sizes);
 
-    out.ple_table = binder.require_resource("text/ple/table.iq4nl",
-                                            artifact::ResourceEncoding::RawBytesV1);
-    binder.validate_only(out.ple_table);
+    // A tensor rather than a raw resource: as IQ4_NL blocks it is describable, so the artifact
+    // points at the GGUF's 28.8 GB instead of copying them.
+    out.ple_table = artifact::bind_tensor(
+        binder, "text/ple/table.iq4nl", NumericFormat::IQ4_NL,
+        {static_cast<std::uint64_t>(TextConfig::ple_table_rows), 160},
+        TensorPlacement::ValidateOnly);
     {
         const auto payload = binder.payload(out.ple_table).data;
         const std::uint64_t expected = static_cast<std::uint64_t>(TextConfig::ple_table_rows) *

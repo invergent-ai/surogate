@@ -29,7 +29,10 @@ namespace sinfer::ops {
 /// - Q4G32AM: unsigned 4-bit codes packed two per byte (low nibble = even element), one FP16
 ///   scale AND one FP16 min per 32-group (`w = scale * q + min`). Requantised from W8 at load;
 ///   the affine form reproduces the Q4_K-derived weights almost exactly at 59 % of the bytes.
-enum class ExpertBankFormat : std::uint8_t { W8G32 = 0, Q4G32AM = 1 };
+/// How an expert bank holds its weights on the host. W8G32 is the pool's own layout; Q4G32AM
+/// halves it during the copy into pinned memory; GgmlBlocks is the GGUF's own bytes, so the
+/// artifact stores no requantised copy of the experts at all and the gather decodes them.
+enum class ExpertBankFormat : std::uint8_t { W8G32 = 0, Q4G32AM = 1, GgmlBlocks = 2 };
 
 struct CpuExpertBank {
     ExpertBankFormat format         = ExpertBankFormat::W8G32;

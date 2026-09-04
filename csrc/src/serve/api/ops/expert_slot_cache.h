@@ -38,6 +38,14 @@ struct ExpertHostBank {
     std::uint64_t gate_up_scales_bytes_per_expert = 0; // also the mins stride
     std::uint64_t down_codes_bytes_per_expert     = 0;
     std::uint64_t down_scales_bytes_per_expert    = 0;
+    /// GgmlBlocks only: which block format each half holds. The codes pointer addresses the
+    /// blocks and the scales pointer is unused, because a GGML block carries its own.
+    ///
+    /// Deliberately left without a default. A value-initialised `ExpertHostBank` lands on
+    /// QType(0), which is not a GGML format, so a caller that forgets to set these is refused
+    /// by the gather rather than quietly decoding one block format as another.
+    QType gate_up_ggml;
+    QType down_ggml;
 };
 
 /// Plane layout of one Q4G32AM host object holding `rows_total x k` weights (all experts of

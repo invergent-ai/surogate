@@ -47,51 +47,6 @@ StorageLayout storage_layout_for(NumericFormat format) {
     throw std::logic_error("unhandled numeric format");
 }
 
-QType qtype_for(NumericFormat format) {
-    switch (format) {
-    case NumericFormat::BF16:
-        return QType::BF16_CTRL;
-    case NumericFormat::FP32:
-        return QType::FP32_CTRL;
-    case NumericFormat::I32:
-        return QType::I32_CTRL;
-    case NumericFormat::Q4G64_F16S:
-        return QType::Q4G64_F16S;
-    case NumericFormat::Q5G64_F16S:
-        return QType::Q5G64_F16S;
-    case NumericFormat::Q6G64_F16S:
-        return QType::Q6G64_F16S;
-    case NumericFormat::W8G32_F16S:
-        return QType::W8G32_F16S;
-    case NumericFormat::Q2_K:
-        return QType::Q2_K;
-    case NumericFormat::Q3_K:
-        return QType::Q3_K;
-    case NumericFormat::Q4_K:
-        return QType::Q4_K;
-    case NumericFormat::Q5_K:
-        return QType::Q5_K;
-    case NumericFormat::Q6_K:
-        return QType::Q6_K;
-    case NumericFormat::Q8_0:
-        return QType::Q8_0;
-    case NumericFormat::Q4_1:
-        return QType::Q4_1;
-    case NumericFormat::Q5_1:
-        return QType::Q5_1;
-    case NumericFormat::IQ4_NL:
-        return QType::IQ4_NL;
-    case NumericFormat::Q4_0:
-        return QType::Q4_0;
-    case NumericFormat::Q5_0:
-        return QType::Q5_0;
-    case NumericFormat::NVFP4:
-        return QType::NVFP4;
-    case NumericFormat::FP8_E4M3FN_ROW_BF16S:
-        return QType::FP8_E4M3FN_ROW_BF16S;
-    }
-    throw std::logic_error("unhandled numeric format");
-}
 
 DType dtype_for(NumericFormat format) {
     switch (format) {
@@ -186,6 +141,52 @@ Weight row_scale_weight(const MaterializedArtifact& materialized, ObjectHandle h
 }
 
 } // namespace
+
+QType qtype_for(NumericFormat format) {
+    switch (format) {
+    case NumericFormat::BF16:
+        return QType::BF16_CTRL;
+    case NumericFormat::FP32:
+        return QType::FP32_CTRL;
+    case NumericFormat::I32:
+        return QType::I32_CTRL;
+    case NumericFormat::Q4G64_F16S:
+        return QType::Q4G64_F16S;
+    case NumericFormat::Q5G64_F16S:
+        return QType::Q5G64_F16S;
+    case NumericFormat::Q6G64_F16S:
+        return QType::Q6G64_F16S;
+    case NumericFormat::W8G32_F16S:
+        return QType::W8G32_F16S;
+    case NumericFormat::Q2_K:
+        return QType::Q2_K;
+    case NumericFormat::Q3_K:
+        return QType::Q3_K;
+    case NumericFormat::Q4_K:
+        return QType::Q4_K;
+    case NumericFormat::Q5_K:
+        return QType::Q5_K;
+    case NumericFormat::Q6_K:
+        return QType::Q6_K;
+    case NumericFormat::Q8_0:
+        return QType::Q8_0;
+    case NumericFormat::Q4_1:
+        return QType::Q4_1;
+    case NumericFormat::Q5_1:
+        return QType::Q5_1;
+    case NumericFormat::IQ4_NL:
+        return QType::IQ4_NL;
+    case NumericFormat::Q4_0:
+        return QType::Q4_0;
+    case NumericFormat::Q5_0:
+        return QType::Q5_0;
+    case NumericFormat::NVFP4:
+        return QType::NVFP4;
+    case NumericFormat::FP8_E4M3FN_ROW_BF16S:
+        return QType::FP8_E4M3FN_ROW_BF16S;
+    }
+    throw std::logic_error("unhandled numeric format");
+}
 
 ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
                          std::initializer_list<std::uint64_t> shape, TensorPlacement placement) {

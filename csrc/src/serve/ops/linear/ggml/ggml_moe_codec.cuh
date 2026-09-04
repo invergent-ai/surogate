@@ -22,6 +22,56 @@ template <GgmlType type>
 __device__ __forceinline__ void decode_eight(const void* blocks, std::int64_t ib, int lane,
                                              float (&w)[8]);
 
+/// Q2_K: sixteen sub-blocks of sixteen, `x = d*sc*q - dmin*m` with sc and m four bits each.
+/// Eight consecutive values share one sub-block, because eight divides sixteen.
+template <>
+__device__ __forceinline__ void decode_eight<GgmlType::Q2_K>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    const block_q2_K* x = static_cast<const block_q2_K*>(blocks) + ib;
+    const int v0 = lane * 8;
+    const int n  = v0 >> 7;          // which 128-value half
+    const int r  = v0 & 127;
+    const int j  = r >> 5;           // which of the four 32-value stripes
+    const int l0 = r & 31;
+    const int is = 8 * n + (l0 >> 4) + 2 * j;
+    const float d  = __low2float(x->dm) * static_cast<float>(x->scales[is] & 0xF);
+    const float mo = __high2float(x->dm) * static_cast<float>(x->scales[is] >> 4);
+    const std::uint8_t* q = x->qs + 32 * n + l0;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        w[l] = d * static_cast<float>((q[l] >> (2 * j)) & 3) - mo;
+    }
+}
+
+/// Q3_K: the same stripe geometry with a 6-bit scale split across two bytes and the third bit
+/// of each quant living inverted in `hmask`.
+template <>
+__device__ __forceinline__ void decode_eight<GgmlType::Q3_K>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    const block_q3_K* x = static_cast<const block_q3_K*>(blocks) + ib;
+    const int v0  = lane * 8;
+    const int n   = v0 >> 7;
+    const int r   = v0 & 127;
+    const int j   = r >> 5;
+    const int l0  = r & 31;
+    const int is0 = l0 >> 4;
+    const int is  = 8 * n + 2 * j + is0;
+    const std::int8_t us =
+        is < 4    ? static_cast<std::int8_t>((x->scales[is] & 0xF) | (((x->scales[is + 8] >> 0) & 3) << 4))
+        : is < 8  ? static_cast<std::int8_t>((x->scales[is] & 0xF) | (((x->scales[is + 4] >> 2) & 3) << 4))
+        : is < 12 ? static_cast<std::int8_t>((x->scales[is - 8] >> 4) | (((x->scales[is] >> 4) & 3) << 4))
+                  : static_cast<std::int8_t>((x->scales[is - 8] >> 4) | (((x->scales[is - 4] >> 6) & 3) << 4));
+    const float dl        = __half2float(x->d) * static_cast<float>(us - 32);
+    const std::uint8_t m  = static_cast<std::uint8_t>(1 << (4 * n + j));
+    const std::uint8_t* q = x->qs + 32 * n;
+    const std::uint8_t* hm = x->hmask;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int code = static_cast<int>((q[l0 + l] >> (2 * j)) & 3) - ((hm[l0 + l] & m) ? 0 : 4);
+        w[l]           = dl * static_cast<float>(code);
+    }
+}
+
 template <>
 __device__ __forceinline__ void decode_eight<GgmlType::Q4_K>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
@@ -204,5 +254,23 @@ struct GgmlMoeCodec {
         decode_eight<type>(codes, group_index, lane_in_group, weights);
     }
 };
+
+/// Thirty-two consecutive values starting at `group * 32`, for a caller that owns a whole
+/// group rather than eight of them. A 32-value block is one group; a superblock is eight.
+template <GgmlType type>
+__device__ __forceinline__ void decode_group_32(const void* blocks, std::int64_t group,
+                                                float (&v)[32]) {
+    constexpr int kValues = block_values(type);
+    const std::int64_t base = group * 32;
+    const std::int64_t ib   = base / kValues;
+    const int lane0         = static_cast<int>((base % kValues) / 8);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float w[8];
+        decode_eight<type>(blocks, ib, lane0 + j, w);
+#pragma unroll
+        for (int l = 0; l < 8; ++l) { v[j * 8 + l] = w[l]; }
+    }
+}
 
 } // namespace sinfer::ops::detail::ggml

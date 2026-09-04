@@ -19,8 +19,13 @@ namespace sinfer::targets::qwen4exp::detail {
 
 struct HostObjectPlan {
     artifact::ObjectHandle handle;
-    std::span<const std::byte> payload; ///< the artifact mapping; valid while the reader lives
+    /// The artifact mapping, valid while the reader lives. An object read in place from a GGUF
+    /// is assembled from several runs -- a fused expert parent is one per source tensor per row
+    /// block -- so the bank concatenates `parts` into pinned memory. `payload` is the single
+    /// span an object stored in the artifact itself has, and is empty when `parts` is used.
+    std::span<const std::byte> payload;
     std::string name;
+    std::vector<std::span<const std::byte>> parts;
     // Non-zero: requantise this W8 row-split object to Q4G32AM while it is copied into pinned
     // memory (`q4_rows x q4_k` weights; `q4_w8_scale_offset` locates the source scales plane).
     std::int64_t q4_rows           = 0;

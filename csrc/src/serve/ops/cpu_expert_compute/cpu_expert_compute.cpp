@@ -701,6 +701,13 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
     for (int i = 0; i < hidden; ++i) { s.x_float[i] = bf16_to_float(x_column[i]); }
     quantise_groups(s.x_float, hidden, s.xq, s.xs);
 
+    if (bank.format == ExpertBankFormat::GgmlBlocks) {
+        // No GGML decoder on this path yet. Reading the blocks as W8 planes would answer with
+        // nonsense rather than fail, so it fails.
+        throw std::invalid_argument(
+            "cpu_expert_compute: a GGML-block expert bank has no CPU path; run the experts on "
+            "the device, or convert with --host-expert-bank w8");
+    }
     if (bank.format == ExpertBankFormat::Q4G32AM) {
         // Reference path for the Q4 bank: the scalar Q4 dot is the oracle the SIMD kernels are
         // tested against, so this stays scalar on purpose.

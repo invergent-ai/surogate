@@ -101,16 +101,10 @@ void launch_codec(const void* blocks, std::int64_t superblocks, float* out, cuda
 void moe_codec_decode_launch(GgmlType type, const void* blocks, std::int64_t superblocks,
                              float* out, cudaStream_t stream) {
     switch (type) {
-    case GgmlType::Q4_K: launch_codec<GgmlType::Q4_K>(blocks, superblocks, out, stream); return;
-    case GgmlType::Q5_K: launch_codec<GgmlType::Q5_K>(blocks, superblocks, out, stream); return;
-    case GgmlType::Q6_K: launch_codec<GgmlType::Q6_K>(blocks, superblocks, out, stream); return;
-    case GgmlType::Q8_0: launch_codec<GgmlType::Q8_0>(blocks, superblocks, out, stream); return;
-    case GgmlType::Q4_0: launch_codec<GgmlType::Q4_0>(blocks, superblocks, out, stream); return;
-    case GgmlType::Q4_1: launch_codec<GgmlType::Q4_1>(blocks, superblocks, out, stream); return;
-    case GgmlType::Q5_0: launch_codec<GgmlType::Q5_0>(blocks, superblocks, out, stream); return;
-    case GgmlType::Q5_1: launch_codec<GgmlType::Q5_1>(blocks, superblocks, out, stream); return;
-    case GgmlType::IQ4_NL: launch_codec<GgmlType::IQ4_NL>(blocks, superblocks, out, stream); return;
-    default: break;
+#define SINFER_CODEC_CASE(NAME)                                                                    \
+    case GgmlType::NAME: launch_codec<GgmlType::NAME>(blocks, superblocks, out, stream); return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_CODEC_CASE)
+#undef SINFER_CODEC_CASE
     }
     throw std::invalid_argument("ggml moe codec: unknown GGML type");
 }
@@ -124,17 +118,12 @@ void moe_gemv_launch(GgmlType type, const void* blocks, std::int32_t rows, std::
                                     "blocks and at most 32 tokens");
     }
     switch (type) {
-    case GgmlType::Q2_K: launch<GgmlType::Q2_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q3_K: launch<GgmlType::Q3_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q4_K: launch<GgmlType::Q4_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q5_K: launch<GgmlType::Q5_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q6_K: launch<GgmlType::Q6_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q8_0: launch<GgmlType::Q8_0>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q4_0: launch<GgmlType::Q4_0>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q4_1: launch<GgmlType::Q4_1>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q5_0: launch<GgmlType::Q5_0>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::Q5_1: launch<GgmlType::Q5_1>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
-    case GgmlType::IQ4_NL: launch<GgmlType::IQ4_NL>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
+#define SINFER_MOE_GEMV_CASE(NAME)                                                                 \
+    case GgmlType::NAME:                                                                           \
+        launch<GgmlType::NAME>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream);    \
+        return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_MOE_GEMV_CASE)
+#undef SINFER_MOE_GEMV_CASE
     }
     throw std::invalid_argument("ggml moe_gemv: unknown GGML type");
 }

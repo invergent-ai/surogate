@@ -28,6 +28,7 @@ from surogate.serve.convert.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
     FP32,
+    GGML_BLOCKS_LAYOUT,
     I32,
     RESOURCE_SPECS,
     ROW_SPLIT_LAYOUT,
@@ -42,10 +43,14 @@ MODEL_ID = "qwen3.8-flash-next"
 WEIGHTS_ID = "w8-hc-v1"
 TARGET_KEY = "qwen4exp"
 
-# The PLE table travels as a raw resource: the GGUF's IQ4_NL rows verbatim (18 bytes per 32
-# values: fp16 scale + 16 codebook nibbles), 90 bytes per 160-wide row, host-resident and
-# decoded by the gather kernel. Its hash parameters are ordinary I32 tensors.
+# The PLE table is the GGUF's IQ4_NL rows verbatim (18 bytes per 32 values: fp16 scale + 16
+# codebook nibbles), 90 bytes per 160-wide row, host-resident and decoded by the gather kernel.
+# It is a tensor rather than a resource because only a tensor can carry `runs`, and 28.8 GB
+# that already exist byte-identically in the GGUF are not worth copying into the artifact. It
+# stays outside `TENSOR_SPECS`: the engine binds it as one flat table, not as part of a layer.
+# Its hash parameters are ordinary I32 tensors.
 PLE_TABLE_RESOURCE = "text/ple/table.iq4nl"
+PLE_TABLE_FORMAT = "IQ4_NL"
 PLE_TABLE_ROW_BYTES = 90
 
 FORMAT_NAMES = (BF16, FP32, I32, W8)
@@ -212,11 +217,17 @@ VISION_TENSOR_SPECS = build_vision_specs(HIDDEN)
 
 TEXT_ONLY_TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS
 TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS + VISION_TENSOR_SPECS
-PLE_TABLE_SPEC = ResourceSpec(PLE_TABLE_RESOURCE)
-ALL_RESOURCE_SPECS = RESOURCE_SPECS + (PLE_TABLE_SPEC,)
-OBJECT_SPECS: tuple[StoredObjectSpec, ...] = ALL_RESOURCE_SPECS + TENSOR_SPECS
+PLE_TABLE_SPEC = TensorSpec(
+    PLE_TABLE_RESOURCE, (PLE_TABLE_ROWS, PLE_HEAD_DIM), PLE_TABLE_FORMAT, GGML_BLOCKS_LAYOUT
+)
+#: The objects that precede the layer stack, in artifact order: the frontend files, then the
+#: PLE table.
+LEADING_OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + (PLE_TABLE_SPEC,)
+OBJECT_SPECS: tuple[StoredObjectSpec, ...] = LEADING_OBJECT_SPECS + TENSOR_SPECS
 #: For sources that carry no vision tower — the community GGUF exports drop it.
-TEXT_ONLY_OBJECT_SPECS: tuple[StoredObjectSpec, ...] = ALL_RESOURCE_SPECS + TEXT_ONLY_TENSOR_SPECS
+TEXT_ONLY_OBJECT_SPECS: tuple[StoredObjectSpec, ...] = (
+    LEADING_OBJECT_SPECS + TEXT_ONLY_TENSOR_SPECS
+)
 
 
 def active_specs(*, vision: bool) -> tuple[tuple, tuple]:
@@ -279,7 +290,7 @@ __all__ = [
     "I32",
     "INDEXER_DIM",
     "INDEXER_HEADS",
-    "ALL_RESOURCE_SPECS",
+    "LEADING_OBJECT_SPECS",
     "KV_HEADS",
     "KV_SIZE",
     "LAYERS",
@@ -292,6 +303,7 @@ __all__ = [
     "PLE_HEAD_DIM",
     "PLE_LAYER",
     "PLE_NGRAM",
+    "PLE_TABLE_FORMAT",
     "PLE_TABLE_RESOURCE",
     "PLE_TABLE_ROWS",
     "PLE_TABLE_ROW_BYTES",

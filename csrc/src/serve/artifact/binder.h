@@ -59,6 +59,9 @@ public:
 
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
+    /// The runs an object is assembled from, and the bytes of one of them.
+    std::span<const PayloadRun> runs(ObjectHandle handle) const;
+    std::span<const std::byte> run_span(const PayloadRun& run) const;
     void materialize_on_device(ObjectHandle handle);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);

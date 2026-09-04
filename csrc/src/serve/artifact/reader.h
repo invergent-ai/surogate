@@ -200,6 +200,9 @@ public:
     PayloadSpan payload(std::string_view name) const;
     /// The runs an object's bytes are assembled from, in order.
     std::span<const PayloadRun> runs(const ObjectDescriptor& object) const;
+    /// The bytes one run names, in whichever file holds them. An object assembled from several
+    /// runs has no single payload span, but each of its runs does.
+    std::span<const std::byte> run_span(const PayloadRun& run) const;
     const std::vector<ExternalFile>& external_files() const noexcept;
     /// The artifact's declared dimensions, keyed as `family::TextGeometry` names them; empty
     /// for an artifact written without a `geometry` member.

@@ -41,6 +41,10 @@ struct MoePlan {
     artifact::ObjectHandle router_shared_gate;
     artifact::ObjectHandle routed_gate_up; ///< host resident
     artifact::ObjectHandle routed_down;    ///< host resident
+    /// What the artifact says those two hold. A GGUF-native artifact stores the file's own
+    /// GGML blocks; a converted one stores W8 row-split planes.
+    artifact::NumericFormat routed_gate_up_format = artifact::NumericFormat::W8G32_F16S;
+    artifact::NumericFormat routed_down_format    = artifact::NumericFormat::W8G32_F16S;
     artifact::ObjectHandle shared_gate_up;
     artifact::ObjectHandle shared_down;
 };

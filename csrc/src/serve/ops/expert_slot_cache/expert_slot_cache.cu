@@ -7,6 +7,8 @@
 // (gate/up codes + scales, down codes + scales), from pinned host memory into the pool, the row
 // count read from a device word so the launch captures into a graph.
 
+#include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/ggml/ggml_moe_codec.cuh"
 #include "api/ops/expert_slot_cache.h"
 #include "core/device.h"
 
@@ -367,11 +369,97 @@ __global__ void __launch_bounds__(kGatherThreads)
     }
 }
 
+// One GGML-block matrix of the bank: the GGUF's own bytes on the host, the pool's W8 codes and
+// scales on the device. Same shape as the Q4G32AM gather above -- one thread owns one 32-value
+// group, decodes it and requantises to the pool's symmetric int8 -- so the kernels reading the
+// pool never learn what the bank holds. What differs is only the decode, which is the same one
+// the sparse-MoE codec uses, so a block format the codec can read is a bank format too.
+struct GatherGgmlBank {
+    const std::uint8_t* src_blocks  = nullptr;
+    std::byte* dst_codes            = nullptr;
+    std::byte* dst_scales           = nullptr;
+    std::uint64_t groups_per_expert = 0;
+    std::uint64_t src_bytes_per_expert = 0;
+    std::uint64_t dst_codes_bytes   = 0;
+    std::uint64_t dst_scales_bytes  = 0;
+};
+
+struct GatherGgmlIds {
+    const int* miss_slots;
+    const int* miss_experts;
+    const long long* miss_count;
+};
+
+template <detail::ggml::GgmlType type>
+__global__ void __launch_bounds__(kGatherThreads)
+    gather_unpack_ggml_kernel(const __grid_constant__ GatherGgmlBank b,
+                              const __grid_constant__ GatherGgmlIds ids) {
+    const long long n         = *ids.miss_count;
+    const std::uint64_t total = static_cast<std::uint64_t>(n) * b.groups_per_expert;
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(kGatherBlocksPerBank) * kGatherThreads;
+    for (std::uint64_t u = static_cast<std::uint64_t>(blockIdx.x) * kGatherThreads + threadIdx.x;
+         u < total; u += stride) {
+        const std::uint64_t row     = u / b.groups_per_expert;
+        const std::uint64_t group   = u - row * b.groups_per_expert;
+        const std::uint64_t src_row = static_cast<std::uint64_t>(ids.miss_experts[row]);
+        const std::uint64_t dst_row = static_cast<std::uint64_t>(ids.miss_slots[row]);
+        const std::uint8_t* blocks  = b.src_blocks + src_row * b.src_bytes_per_expert;
+        float value[32];
+        detail::ggml::decode_group_32<type>(blocks, static_cast<std::int64_t>(group), value);
+        float amax = 0.0F;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) { amax = fmaxf(amax, fabsf(value[i])); }
+        const float scale = amax / 127.0F;
+        const float inv   = scale > 0.0F ? 1.0F / scale : 0.0F;
+        std::uint32_t out[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            std::uint32_t packed_out = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int c = __float2int_rn(value[w * 4 + i] * inv);
+                packed_out |= (static_cast<std::uint32_t>(c) & 0xFFU) << (8 * i);
+            }
+            out[w] = packed_out;
+        }
+        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + group * 32;
+        __stcs(reinterpret_cast<uint4*>(dst), make_uint4(out[0], out[1], out[2], out[3]));
+        __stcs(reinterpret_cast<uint4*>(dst + 16), make_uint4(out[4], out[5], out[6], out[7]));
+        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + group * 2) =
+            __float2half_rn(scale);
+    }
+}
+
 __global__ void partial_add_kernel(const float* __restrict__ partial, __nv_bfloat16* __restrict__ destination,
                                    long long count) {
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
     destination[i] = __float2bfloat16_rn(__bfloat162float(destination[i]) + partial[i]);
+}
+
+/// One launch per routed half, each resolved over the whole block vocabulary. Splitting the
+/// two halves is what keeps this linear: the gate/up and down projections of a K_XL mix are
+/// routinely different formats, and enumerating pairs would be quadratic and would silently
+/// refuse whichever combination nobody thought to list.
+void launch_ggml_gather(QType type, const GatherGgmlBank& bank, const GatherGgmlIds& ids,
+                        cudaStream_t stream) {
+    using T = detail::ggml::GgmlType;
+    switch (type) {
+#define SINFER_GATHER_CASE(NAME)                                                                   \
+    case QType::NAME:                                                                              \
+        gather_unpack_ggml_kernel<T::NAME>                                                         \
+            <<<kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(bank, ids);                       \
+        CUDA_CHECK(cudaGetLastError());                                                            \
+        return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_GATHER_CASE)
+#undef SINFER_GATHER_CASE
+    default:
+        break;
+    }
+    throw std::invalid_argument(
+        "expert_slot_cache: routed experts are not a GGML block format (QType " +
+        std::to_string(static_cast<int>(type)) + ")");
 }
 
 } // namespace
@@ -537,14 +625,48 @@ void expert_slot_directory_reset(ExpertSlotDirectory& directory, cudaStream_t st
 ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry, const Weight& routed_gate_up,
                                 const Weight& routed_down) {
     require_geometry(geometry);
-    if (routed_gate_up.qtype != QType::W8G32_F16S || routed_down.qtype != QType::W8G32_F16S ||
-        routed_gate_up.layout != QuantLayout::RowSplit ||
-        routed_down.layout != QuantLayout::RowSplit) {
-        throw std::invalid_argument("expert_slot_cache: the host bank must hold W8 row-split experts");
+    // Two shapes of bank. W8 row-split is the pool's own layout, copied straight through. GGML
+    // blocks are the GGUF's bytes, so the artifact stores no requantised copy of the experts at
+    // all and the gather decodes each 32-value group on its way into the pool.
+    const bool ggml_bank = detail::ggml::is_ggml_qtype(routed_gate_up.qtype) &&
+                           detail::ggml::is_ggml_qtype(routed_down.qtype) &&
+                           routed_gate_up.layout == QuantLayout::GgmlBlocks &&
+                           routed_down.layout == QuantLayout::GgmlBlocks;
+    const bool w8_bank = routed_gate_up.qtype == QType::W8G32_F16S &&
+                         routed_down.qtype == QType::W8G32_F16S &&
+                         routed_gate_up.layout == QuantLayout::RowSplit &&
+                         routed_down.layout == QuantLayout::RowSplit;
+    if (!ggml_bank && !w8_bank) {
+        throw std::invalid_argument(
+            "expert_slot_cache: the host bank holds W8 row-split experts or GGML blocks, and "
+            "both routed halves must agree");
     }
     if (routed_gate_up.n != geometry.routed_gate_rows() || routed_gate_up.k != geometry.hidden ||
         routed_down.n != geometry.routed_down_rows() || routed_down.k != geometry.intermediate) {
         throw std::invalid_argument("expert_slot_cache: host bank shapes do not match the geometry");
+    }
+    if (ggml_bank) {
+        // A GGML block carries its own scale, so there is no scales plane: the per-expert
+        // stride is the block bytes of one expert's rows, and the "scales bytes" the gather
+        // reads is only how it derives the group count.
+        const auto blocks_bytes = [](const Weight& w, std::int64_t rows) {
+            const auto values = detail::ggml::block_values(detail::ggml::ggml_type_for(w.qtype));
+            const auto bytes  = detail::ggml::block_bytes(detail::ggml::ggml_type_for(w.qtype));
+            return static_cast<std::uint64_t>(rows) * (w.k / values) * bytes;
+        };
+        ExpertHostBank bank;
+        bank.format         = ExpertBankFormat::GgmlBlocks;
+        bank.gate_up_ggml   = routed_gate_up.qtype;
+        bank.down_ggml      = routed_down.qtype;
+        bank.gate_up_codes  = static_cast<const std::byte*>(routed_gate_up.qdata);
+        bank.down_codes     = static_cast<const std::byte*>(routed_down.qdata);
+        bank.gate_up_codes_bytes_per_expert = blocks_bytes(routed_gate_up, geometry.expert_rows());
+        bank.down_codes_bytes_per_expert    = blocks_bytes(routed_down, geometry.hidden);
+        bank.gate_up_scales_bytes_per_expert =
+            static_cast<std::uint64_t>(geometry.expert_rows()) * (geometry.hidden / 32) * 2;
+        bank.down_scales_bytes_per_expert =
+            static_cast<std::uint64_t>(geometry.hidden) * (geometry.intermediate / 32) * 2;
+        return bank;
     }
     const W8Planes gate = w8_planes(geometry.expert_rows(), geometry.hidden);
     const W8Planes down = w8_planes(geometry.hidden, geometry.intermediate);
@@ -667,6 +789,28 @@ void expert_slot_gather(const ExpertHostBank& bank, const ExpertMissList& misses
                         ExpertSlotPool& pool, cudaStream_t stream) {
     if (bank.gate_up_codes == nullptr || pool.gate_up_codes == nullptr) {
         throw std::invalid_argument("expert_slot_cache: gather needs a bank and a pool");
+    }
+    if (bank.format == ExpertBankFormat::GgmlBlocks) {
+        const GatherGgmlIds ids{static_cast<const int*>(misses.slots.data),
+                                static_cast<const int*>(misses.experts.data),
+                                static_cast<const long long*>(misses.count.data)};
+        const GatherGgmlBank gate{reinterpret_cast<const std::uint8_t*>(bank.gate_up_codes),
+                                  pool.gate_up_codes,
+                                  pool.gate_up_scales,
+                                  bank.gate_up_scales_bytes_per_expert / 2,
+                                  bank.gate_up_codes_bytes_per_expert,
+                                  bank.gate_up_codes_bytes_per_expert * 2,
+                                  bank.gate_up_scales_bytes_per_expert};
+        const GatherGgmlBank down{reinterpret_cast<const std::uint8_t*>(bank.down_codes),
+                                  pool.down_codes,
+                                  pool.down_scales,
+                                  bank.down_scales_bytes_per_expert / 2,
+                                  bank.down_codes_bytes_per_expert,
+                                  bank.down_codes_bytes_per_expert * 2,
+                                  bank.down_scales_bytes_per_expert};
+        launch_ggml_gather(bank.gate_up_ggml, gate, ids, stream);
+        launch_ggml_gather(bank.down_ggml, down, ids, stream);
+        return;
     }
     if (bank.format == ExpertBankFormat::Q4G32AM) {
         if (bank.gate_up_mins == nullptr || bank.down_mins == nullptr) {

@@ -588,6 +588,13 @@ PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
     };
 }
 
+std::span<const std::byte> Reader::run_span(const PayloadRun& run) const {
+    const MappedFile& file = impl_->file_for(run.source);
+    const auto end         = checked_add(run.offset, run.bytes, "absolute payload range");
+    if (end > file.size()) { throw ArtifactError("run extends beyond its file"); }
+    return {file.data() + run.offset, static_cast<std::size_t>(run.bytes)};
+}
+
 std::span<const PayloadRun> Reader::runs(const ObjectDescriptor& object) const {
     const auto index = static_cast<std::size_t>(&object - impl_->entries.data());
     if (index >= impl_->runs.size()) {

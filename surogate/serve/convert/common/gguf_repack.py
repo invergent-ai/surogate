@@ -26,6 +26,10 @@ checkpoint dir::
                  {"name": "blk.0.ffn_gate.weight",
                   "rows": 3584, "k": 1024, "offset": 123456}, ...}}
 
+``gguf_path`` may instead be the ordered shards of a split GGUF, in which
+case an entry adds ``"source": n`` -- 1-based, the same numbering the
+artifact's external file table uses -- to say which shard holds it.
+
 listing exactly the HF-name sources whose GGUF tensor is Q8_0 *and* whose
 bridge-side inverse transform is a row identity, with each tensor's logical
 shape and absolute payload offset.  Sources in the map are not materialized
@@ -172,29 +176,42 @@ class RepackError(ValueError):
 
 
 class GgufRepackSource:
-    """Q8_0 plane provider + recipe row-algebra evaluator over one GGUF."""
+    """Q8_0 plane provider + recipe row-algebra evaluator over one GGUF, split or not."""
 
     def __init__(self, map_path: str | Path):
         raw = json.loads(Path(map_path).read_text())
-        self._init(Path(raw["gguf_path"]), dict(raw["sources"]))
+        self._init(raw["gguf_path"], dict(raw["sources"]))
 
     @classmethod
-    def from_sources(cls, gguf_path: str | Path, sources: Mapping[str, str]):
-        """Planner entry: candidate map held in memory (bridge pre-walk)."""
+    def from_sources(cls, gguf_path: str | Path | Sequence[str | Path],
+                     sources: Mapping[str, str]):
+        """Planner entry: candidate map held in memory (bridge pre-walk).
+
+        `gguf_path` may name one file or the ordered shards of a split one; an entry's
+        `source` field, 1-based, says which shard holds it and defaults to the first.
+        """
         self = cls.__new__(cls)
-        self._init(Path(gguf_path), dict(sources))
+        self._init(gguf_path, dict(sources))
         return self
 
-    def _init(self, gguf_path: Path, sources: dict[str, dict]) -> None:
-        self.gguf_path = gguf_path
+    def _init(self, gguf_path, sources: dict[str, dict]) -> None:
+        paths = ([gguf_path] if isinstance(gguf_path, (str, Path))
+                 else [item for item in gguf_path])
+        self.gguf_paths = tuple(Path(item) for item in paths)
+        if not self.gguf_paths:
+            raise RepackError("a repack source needs at least one GGUF")
+        #: The first shard, which is the whole file for every unsplit GGUF. Kept because a
+        #: caller that knows its source is one file names it this way.
+        self.gguf_path = self.gguf_paths[0]
         # The recipes and the bridge may spell one tensor differently (a `.weight` suffix, the
         # VL nesting, a router alias); index every spelling so a lookup finds the entry.
         self.sources = dict(sources)
         for stored, entry in list(sources.items()):
             for spelling in name_spellings(stored):
                 self.sources.setdefault(spelling, entry)
-        if not self.gguf_path.is_file():
-            raise RepackError(f"repack map points at a missing GGUF: {self.gguf_path}")
+        for path in self.gguf_paths:
+            if not path.is_file():
+                raise RepackError(f"repack map points at a missing GGUF: {path}")
         for hf_name, entry in sources.items():
             if not {"name", "rows", "k", "offset", "type"} <= set(entry):
                 raise RepackError(f"{hf_name}: repack map entry is missing fields")
@@ -203,15 +220,28 @@ class GgufRepackSource:
                     f"{hf_name}: GGUF type {entry['type']!r} is neither exactly repackable "
                     "nor a native K-quant"
                 )
-        self._file = None
+            shard = int(entry.get("source", 1))
+            if not 1 <= shard <= len(self.gguf_paths):
+                raise RepackError(
+                    f"{hf_name}: source {shard} is not one of the {len(self.gguf_paths)} "
+                    "declared GGUF shards"
+                )
+        self._files: dict[int, np.ndarray] = {}
         self._planes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
     # -- GGUF payload access (memmap; no metadata parse) --------------------
 
-    def _memmap(self) -> np.ndarray:
-        if self._file is None:
-            self._file = np.memmap(self.gguf_path, dtype=np.uint8, mode="r")
-        return self._file
+    def source_index(self, hf_name: str, default: int = 1) -> int:
+        """Which shard holds this source, 1-based, as the artifact's external table numbers
+        them. A single-file GGUF leaves the field out and every run reads source 1."""
+        return int(self.sources[hf_name].get("source", default))
+
+    def _memmap(self, source: int = 1) -> np.ndarray:
+        mapped = self._files.get(source)
+        if mapped is None:
+            mapped = np.memmap(self.gguf_paths[source - 1], dtype=np.uint8, mode="r")
+            self._files[source] = mapped
+        return mapped
 
     def source_shape(self, hf_name: str) -> tuple[int, ...]:
         """The source's stored shape, whatever its rank (the last axis is K)."""
@@ -273,7 +303,7 @@ class GgufRepackSource:
         block_bytes, decoder = REPACKABLE_TYPES[entry["type"]]
         offset = int(entry["offset"])
         nbytes = n * (k // _GROUP) * block_bytes
-        data = self._memmap()
+        data = self._memmap(self.source_index(hf_name))
         if offset < 0 or offset + nbytes > data.shape[0]:
             raise RepackError(f"{hf_name}: quantized payload is outside the GGUF file")
         raw = np.asarray(data[offset : offset + nbytes]).reshape(
@@ -446,7 +476,7 @@ class GgufRepackSource:
         row_bytes = (k // values) * block_bytes
         offset = int(entry["offset"])
         nbytes = n * row_bytes
-        data = self._memmap()
+        data = self._memmap(self.source_index(hf_name))
         if offset < 0 or offset + nbytes > data.shape[0]:
             raise RepackError(f"{hf_name}: quantized payload is outside the GGUF file")
         if self.column_group_map(hf_name) is not None:
@@ -511,6 +541,9 @@ class GgufRepackSource:
         which is where the file already holds them side by side. A tensor copied whole is one
         run; a fused routed gate/up is one run per expert per half, because the file keeps gate
         and up as separate tensors and the object interleaves them.
+
+        Each run names the shard its tensor lives in, so a fused object may draw from more than
+        one file of a split GGUF; `source` is the fallback for a map that does not say.
         """
         ids = None
         if token_ids is not None:
@@ -532,6 +565,7 @@ class GgufRepackSource:
         source_of = rows // _SOURCE_STRIDE
         row_of = rows % _SOURCE_STRIDE
         base = [int(self.sources[name]["offset"]) for name in program.sources]
+        shard = [self.source_index(name, source) for name in program.sources]
         for index, name in enumerate(program.sources):
             n_rows, k = self.source_rows_k(name)
             source_type = str(self.sources[name]["type"])
@@ -550,7 +584,7 @@ class GgufRepackSource:
         ends = np.append(starts[1:], rows.shape[0])
         return tuple(
             (
-                int(source),
+                shard[int(source_of[begin])],
                 base[int(source_of[begin])] + int(row_of[begin]) * row_bytes,
                 int(end - begin) * row_bytes,
             )
@@ -604,6 +638,7 @@ class GgufRepackSource:
             source_of = rows // _SOURCE_STRIDE
             row_of = rows % _SOURCE_STRIDE
             base = [int(self.sources[source]["offset"]) for source in program.sources]
+            shard = [self.source_index(source) for source in program.sources]
             for index, source in enumerate(program.sources):
                 row_map = self.row_map(source)
                 if row_map is not None:
@@ -619,7 +654,7 @@ class GgufRepackSource:
             planned[str(name)] = (
                 tuple(
                     (
-                        1,
+                        shard[int(source_of[begin])],
                         base[int(source_of[begin])] + int(row_of[begin]) * row_bytes,
                         int(end - begin) * row_bytes,
                     )

@@ -355,6 +355,10 @@ struct ExpertSlotCache {
             }
             entry.bank  = ops::expert_host_bank(geometry, weights.op.routed_gate_up,
                                                 weights.op.routed_down);
+            // A GGML-block bank has no host planes for the CPU path to read, so the CPU split
+            // is simply not offered for it; `cpu_expert_compute` refuses one by name if it
+            // ever arrives anyway.
+            if (entry.bank.format == ops::ExpertBankFormat::GgmlBlocks) { return entry; }
             if (weights.host_gate_up != nullptr && weights.host_down != nullptr) {
                 // Plane offsets are the same in the host and device views of the object.
                 const auto gate_scale_offset = static_cast<const std::byte*>(weights.op.routed_gate_up.scales) -

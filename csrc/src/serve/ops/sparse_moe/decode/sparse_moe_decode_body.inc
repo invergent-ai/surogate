@@ -440,6 +440,10 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
         const int lane_in_group = lane % kLanesPerGroup;
         for (int group_base = first_group; group_base < last_group; group_base += kGroupsPerWarp) {
             const int group = group_base + lane_group;
+            // The last step is short whenever the group count is not a whole number of warp
+            // steps -- 20 groups of 32 against a step of 8, which is what a 640-wide expert
+            // gives. Lanes past the end contribute nothing rather than the codec refusing.
+            if (group >= last_group) { continue; }
             const float4 x0 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8);
             const float4 x1 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8 + 4);
             const float values[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
@@ -714,22 +718,13 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
     case QType::NVFP4:
         launch_d3_dependent_codec<Nvfp4CodecFor<kHidden / 16>>(x, weights, workspace, stream);
         break;
-    case QType::Q4_K:
-        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q4_K>>(x, weights, workspace,
-                                                                            stream);
+#define SINFER_D3_DEP(NAME)                                                                        \
+    case QType::NAME:                                                                              \
+        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>>(x, weights, workspace,  \
+                                                                            stream);                \
         break;
-    case QType::Q5_K:
-        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q5_K>>(x, weights, workspace,
-                                                                            stream);
-        break;
-    case QType::Q6_K:
-        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>>(x, weights, workspace,
-                                                                            stream);
-        break;
-    case QType::Q8_0:
-        launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q8_0>>(x, weights, workspace,
-                                                                            stream);
-        break;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_D3_DEP)
+#undef SINFER_D3_DEP
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
     }
@@ -738,17 +733,7 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
 
 template <class Codec>
 void require_d4_codec_geometry() {
-    if constexpr (Codec::kPackedWord8) {
-        // The packed D4 loop walks 32/(kGroupK/8) groups per warp step and does not bound the
-        // last one, so the group count must divide by that step -- four for the 64-wide codecs
-        // (which is where the constant four came from) but one for a 256-wide superblock, where
-        // a whole warp covers a single group and every step is exact.
-        constexpr int kD4GroupsPerWarp = 32 / (Codec::kGroupK / 8);
-        if constexpr ((kIntermediate / Codec::kGroupK) % kD4GroupsPerWarp != 0) {
-            throw std::invalid_argument(
-                "sparse_moe: routed down codec needs intermediate divisible by its warp step");
-        }
-    }
+    // The packed D4 loop bounds its last warp step, so any group count works.
 }
 
 template <class Codec>
@@ -781,22 +766,13 @@ void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
     case QType::Q6G64_F16S:
         launch_d4_dependent_codec<Q6Codec>(weights, destination, workspace, stream);
         return;
-    case QType::Q4_K:
-        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q4_K>>(weights, destination,
-                                                                            workspace, stream);
+#define SINFER_D4_DEP(NAME)                                                                        \
+    case QType::NAME:                                                                              \
+        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>>(weights, destination,   \
+                                                                            workspace, stream);     \
         return;
-    case QType::Q5_K:
-        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q5_K>>(weights, destination,
-                                                                            workspace, stream);
-        return;
-    case QType::Q6_K:
-        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>>(weights, destination,
-                                                                            workspace, stream);
-        return;
-    case QType::Q8_0:
-        launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q8_0>>(weights, destination,
-                                                                            workspace, stream);
-        return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_D4_DEP)
+#undef SINFER_D4_DEP
     case QType::W8G32_F16S:
         launch_d4_dependent_codec<W8Codec>(weights, destination, workspace, stream);
         return;
@@ -934,22 +910,13 @@ void decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
         launch_d3_small_t_codec<W8Codec, false>(x, weights, token_ids, token_activations, tokens,
                                                 schedule, stream, nullptr);
         return;
-    case QType::Q4_K:
-        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q4_K>, false>(
-            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
+#define SINFER_D3_SMALL(NAME)                                                                      \
+    case QType::NAME:                                                                              \
+        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>, false>(                  \
+            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);           \
         return;
-    case QType::Q5_K:
-        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q5_K>, false>(
-            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
-        return;
-    case QType::Q6_K:
-        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>, false>(
-            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
-        return;
-    case QType::Q8_0:
-        launch_d3_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q8_0>, false>(
-            x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
-        return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_D3_SMALL)
+#undef SINFER_D3_SMALL
     case QType::NVFP4:
         if (adaptive_route_jobs == nullptr) {
             launch_d3_small_t_codec<Nvfp4CodecFor<kHidden / 16>, false>(
@@ -998,37 +965,14 @@ void decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destinati
                                                 shared_scale, token_activations, tokens, schedule,
                                                 stream, nullptr);
         return;
-    case QType::Q4_K:
-        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q4_K>, false>(
-            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
-            schedule, stream, nullptr);
+#define SINFER_D4_SMALL(NAME)                                                                      \
+    case QType::NAME:                                                                              \
+        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>, false>(                  \
+            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,  \
+            schedule, stream, nullptr);                                                             \
         return;
-    case QType::Q5_K:
-        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q5_K>, false>(
-            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
-            schedule, stream, nullptr);
-        return;
-    case QType::Q6_K:
-        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q6_K>, false>(
-            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
-            schedule, stream, nullptr);
-        return;
-    case QType::Q8_0:
-        launch_d4_small_t_codec<ggml::GgmlMoeCodec<ggml::GgmlType::Q8_0>, false>(
-            weights, destination, token_ids, token_alpha, shared_scale, token_activations, tokens,
-            schedule, stream, nullptr);
-        return;
-    case QType::NVFP4:
-        if (adaptive_route_jobs == nullptr) {
-            launch_d4_small_t_codec<Nvfp4CodecFor<kIntermediate / 16>, false>(
-                weights, destination, token_ids, token_alpha, shared_scale, token_activations,
-                tokens, schedule, stream, nullptr);
-        } else {
-            launch_d4_small_t_codec<Nvfp4CodecFor<kIntermediate / 16>, true>(
-                weights, destination, token_ids, token_alpha, shared_scale, token_activations,
-                tokens, schedule, stream, adaptive_route_jobs);
-        }
-        return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_D4_SMALL)
+#undef SINFER_D4_SMALL
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D4 codec");
     }

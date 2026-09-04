@@ -25,7 +25,7 @@ for n in range(2, ngram + 1):
 print("rows", rows)
 name = "per_layer_token_embd.weight"
 t = src.tensor(name); raw = src.raw(name); print("table raw", raw.shape, raw.dtype, t.type_name)
-emb = np.concatenate([np.asarray(dequantize(raw[r:r + 1], t.reader_tensor.tensor_type), dtype=np.float32).reshape(-1) for r in rows])
+emb = np.concatenate([np.asarray(dequantize(raw[r:r + 1], t.tensor_type), dtype=np.float32).reshape(-1) for r in rows])
 print("ple_embd", f(emb[:3]), f(emb[-3:]), "| llama [0.0126 -0.0064 0.0024 ... -0.0054 0.0038 -0.0075]")
 b = "blk.1."
 key = src.float32(b + "ple_key.weight") @ emb          # (10240,)

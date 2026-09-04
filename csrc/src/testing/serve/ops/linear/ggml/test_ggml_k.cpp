@@ -402,7 +402,7 @@ int run_moe(const Fixture& f, void* d_blocks, void* d_scratch, std::size_t scrat
 // CTA; it must agree exactly with the reference dequantisation, or a routed expert would be
 // read differently from every other weight of the same type.
 int run_codec(const Fixture& f, void* d_blocks) {
-    if (f.type == gg::GgmlType::Q2_K || f.type == gg::GgmlType::Q3_K) { return 0; }
+
     const std::int64_t superblocks = static_cast<std::int64_t>(f.n) * (f.k / gg::QK_K);
     float* d_out = nullptr;
     CHECK_CUDA(cudaMalloc(&d_out, superblocks * gg::QK_K * sizeof(float)));

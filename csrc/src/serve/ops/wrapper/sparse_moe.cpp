@@ -105,17 +105,18 @@ QuantGeometry quant_geometry(QType qtype) {
         // Sixteen values per group, two per code byte, one e4m3 scale byte, and the dense
         // block-scale tiling rather than row-split.
         return {16, 8, 0, 1, QuantLayout::BlockScaleK16M128x4, DType::FP8_E4M3FN};
-    // A GGML K-quant carries its scales inside each 256-value superblock, so there is one plane
-    // and its "code bytes" are the whole block: 144 for Q4_K, 176 for Q5_K, 210 for Q6_K.
-    case QType::Q4_K:
-        return {256, 144, 0, 0, QuantLayout::GgmlBlocks, DType::FP16};
-    case QType::Q5_K:
-        return {256, 176, 0, 0, QuantLayout::GgmlBlocks, DType::FP16};
-    case QType::Q6_K:
-        return {256, 210, 0, 0, QuantLayout::GgmlBlocks, DType::FP16};
     default:
-        throw std::invalid_argument("sparse_moe: unsupported quantized weight format");
+        break;
     }
+    // A GGML block carries its scales inside itself, so there is one plane and its "code bytes"
+    // are the whole block. Both numbers come from the block vocabulary rather than a second
+    // table here, so a format the kernels read is a format this accepts.
+    if (detail::ggml::is_ggml_qtype(qtype)) {
+        const auto type = detail::ggml::ggml_type_for(qtype);
+        return {detail::ggml::block_values(type), detail::ggml::block_bytes(type), 0, 0,
+                QuantLayout::GgmlBlocks, DType::FP16};
+    }
+    throw std::invalid_argument("sparse_moe: unsupported quantized weight format");
 }
 
 void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, const char* name,

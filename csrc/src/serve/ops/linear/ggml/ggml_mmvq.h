@@ -11,6 +11,21 @@ namespace sinfer::ops::detail::ggml {
 
 enum class GgmlType : std::uint8_t { Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0 };
 
+/// Every stored block format, in one place. A dispatch written over this covers the whole
+/// vocabulary by construction, so adding a format cannot leave one switch behind.
+#define SINFER_GGML_FOR_EACH_TYPE(X)                                                               \
+    X(Q2_K)                                                                                        \
+    X(Q3_K)                                                                                        \
+    X(Q4_K)                                                                                        \
+    X(Q5_K)                                                                                        \
+    X(Q6_K)                                                                                        \
+    X(Q8_0)                                                                                        \
+    X(Q4_1)                                                                                        \
+    X(Q5_1)                                                                                        \
+    X(IQ4_NL)                                                                                      \
+    X(Q4_0)                                                                                        \
+    X(Q5_0)
+
 /// Values per stored block: 256 for every K-quant, 32 for Q8_0, which has no superblock.
 __host__ __device__ constexpr std::int32_t block_values(GgmlType type) noexcept {
     return (type == GgmlType::Q8_0 || type == GgmlType::Q4_1 || type == GgmlType::Q5_1 ||

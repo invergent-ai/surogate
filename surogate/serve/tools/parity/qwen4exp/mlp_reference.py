@@ -32,7 +32,7 @@ print("top10 experts", top.tolist(), "weights", f(w))
 def expert(name, e):
     t = src.tensor(name); raw = src.raw(name)
     if raw.ndim == 3:
-        return np.asarray(dequantize(raw[e], t.reader_tensor.tensor_type), dtype=np.float32).reshape(t.shape[1:])
+        return np.asarray(dequantize(raw[e], t.tensor_type), dtype=np.float32).reshape(t.shape[1:])
     return src.float32(name)[e]
 moe = np.zeros(H, np.float32)
 for e, we in zip(top, w):

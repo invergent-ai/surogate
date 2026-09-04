@@ -100,6 +100,14 @@ PayloadSpan Binder::payload(ObjectHandle handle) const {
     return reader_.payload(descriptor(handle));
 }
 
+std::span<const PayloadRun> Binder::runs(ObjectHandle handle) const {
+    return reader_.runs(descriptor(handle));
+}
+
+std::span<const std::byte> Binder::run_span(const PayloadRun& run) const {
+    return reader_.run_span(run);
+}
+
 void Binder::materialize_on_device(ObjectHandle handle) {
     const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr) {

@@ -30,6 +30,11 @@ _IDENTITY_MEMBERS = frozenset({"model_id", "weights_id"})
 _TENSOR_MEMBERS = frozenset(
     {"name", "kind", "shape", "format", "layout", "offset", "bytes"}
 )
+#: What a tensor entry adds when its bytes live in an external file rather than in the
+#: artifact: the stretches to read, how they become the stored form, and the column
+#: permutation that transform also carries. Written by `TensorObject.to_json` since external
+#: files existed; the reader has to accept what the writer emits.
+_TENSOR_OPTIONAL = frozenset({"runs", "transform", "group_map"})
 _RESOURCE_MEMBERS = frozenset({"name", "kind", "encoding", "offset", "bytes"})
 
 
@@ -286,6 +291,21 @@ def _parse_geometry_member(directory: bytes, member: str) -> dict[str, float]:
     return {str(k): _require_number(v, f"{member}.{k}") for k, v in raw.items()}
 
 
+def parse_external(directory: bytes) -> tuple[tuple[str, int], ...]:
+    """The files this artifact serves weights from, in the order its runs number them."""
+    value = json.loads(directory.decode("utf-8"))
+    raw = value.get("external") if isinstance(value, dict) else None
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ArtifactError("external must be an array")
+    return tuple(
+        (_require_string(entry["path"], "external path"),
+         _require_integer(entry["bytes"], "external bytes", positive=True))
+        for entry in raw
+    )
+
+
 def parse_geometry(directory: bytes) -> dict[str, float]:
     """The `geometry` member of an encoded directory, or an empty mapping."""
     return _parse_geometry_member(directory, "geometry")
@@ -296,12 +316,30 @@ def parse_vision_geometry(directory: bytes) -> dict[str, float]:
     return _parse_geometry_member(directory, "vision_geometry")
 
 
+def _parse_runs(raw: object) -> tuple[tuple[int, int, int], ...]:
+    if raw == ():
+        return ()
+    if not isinstance(raw, list):
+        raise ArtifactError("tensor runs must be an array")
+    runs = []
+    for entry in raw:
+        if not isinstance(entry, dict) or frozenset(entry) != frozenset({"source", "offset", "bytes"}):
+            raise ArtifactError("each run must name exactly a source, an offset and a length")
+        runs.append((
+            _require_integer(entry["source"], "run source", positive=True),
+            _require_integer(entry["offset"], "run offset"),
+            _require_integer(entry["bytes"], "run bytes", positive=True),
+        ))
+    return tuple(runs)
+
+
 def _parse_object(value: object) -> ArtifactObject:
     if not isinstance(value, dict):
         raise ArtifactError("each object entry must be a JSON object")
     kind = value.get("kind")
     if kind == "tensor":
-        if frozenset(value) != _TENSOR_MEMBERS:
+        members = frozenset(value)
+        if not _TENSOR_MEMBERS <= members or not members <= _TENSOR_MEMBERS | _TENSOR_OPTIONAL:
             raise ArtifactError("tensor entry has missing or extra members")
         name = _require_string(value["name"], "tensor name")
         shape = _require_shape(value["shape"])
@@ -317,7 +355,12 @@ def _parse_object(value: object) -> ArtifactObject:
             raise ArtifactError(
                 f"tensor {name} stores {payload_bytes} bytes; layout requires {expected}"
             )
-        return TensorObject(name, shape, format_name, layout_name, offset, payload_bytes)
+        return TensorObject(name, shape, format_name, layout_name, offset, payload_bytes,
+                            _parse_runs(value.get("runs", ())),
+                            _require_string(value["transform"], "tensor transform")
+                            if "transform" in value else "",
+                            tuple(_require_integer(g, "group_map entry")
+                                  for g in value.get("group_map", ())))
     if kind == "resource":
         if frozenset(value) != _RESOURCE_MEMBERS:
             raise ArtifactError("resource entry has missing or extra members")
@@ -373,6 +416,11 @@ def _validate_ranges(
     cursor = 0
     index: dict[str, ArtifactObject] = {}
     for obj in objects:
+        if getattr(obj, "runs", ()):
+            # Nothing of it is in this file: its offset is meaningless and its length is the
+            # external file's, not the payload's.
+            index[obj.name] = obj
+            continue
         alignment = object_alignment(obj)
         if obj.offset < cursor:
             raise ArtifactError(f"object {obj.name} overlaps or is out of order")
@@ -418,6 +466,7 @@ class Artifact:
             if len(directory) != json_bytes:
                 raise ArtifactError("artifact JSON is truncated")
             self.identity, self.objects = parse_directory(directory)
+            self.external = parse_external(directory)
             self.geometry = parse_geometry(directory)
             self.vision_geometry = parse_vision_geometry(directory)
             payload_bytes = self.file_bytes - self.payload_offset
@@ -441,6 +490,10 @@ class Artifact:
             obj = self.find(obj)
         if self._mapping is None:
             raise RuntimeError("artifact is closed")
+        if getattr(obj, "runs", ()):
+            raise ArtifactError(
+                f"{obj.name} is served from an external file; read its runs, not this payload"
+            )
         begin = self.payload_offset + obj.offset
         return memoryview(self._mapping)[begin : begin + obj.bytes]
 

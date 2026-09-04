@@ -28,9 +28,24 @@
 
 namespace sinfer::targets::qwen4exp::detail {
 
+namespace {
+
+/// Bytes an object occupies once assembled, however it is stored.
+std::size_t object_bytes(const HostObjectPlan& plan) {
+    if (!plan.parts.empty()) {
+        std::size_t total = 0;
+        for (const auto& part : plan.parts) { total += part.size(); }
+        return total;
+    }
+    return plan.payload.size();
+}
+
+} // namespace
+
+
 std::size_t HostBankPlan::total_bytes() const noexcept {
     std::size_t total = 0;
-    for (const auto& object : objects) { total += object.payload.size(); }
+    for (const auto& object : objects) { total += object_bytes(object); }
     return total;
 }
 
@@ -41,9 +56,9 @@ HostBank::HostBank(const HostBankPlan& plan) {
         const ops::Q4BankPlanes q4_planes =
             q4 ? ops::q4_bank_planes(source.q4_rows, source.q4_k) : ops::Q4BankPlanes{};
         HostObject object;
-        object.bytes = q4 ? q4_planes.total_bytes : source.payload.size();
+        object.bytes = q4 ? q4_planes.total_bytes : object_bytes(source);
         object.name  = source.name;
-        if (object.bytes == 0 || source.payload.empty()) {
+        if (object.bytes == 0 || (source.payload.empty() && source.parts.empty())) {
             throw std::invalid_argument("host bank object " + source.name + " is empty");
         }
         // Every host expert thread reads every expert, so the bank belongs across the nodes
@@ -142,6 +157,21 @@ HostBank::HostBank(const HostBankPlan& plan) {
                         src_codes + begin * 32, src_scales + begin, count, dst_codes + begin * 16,
                         dst_scales + begin, dst_mins + begin);
                 });
+            }
+        } else if (!source.parts.empty()) {
+            // Read in place: the bytes are stretches of the GGUF, so the copy walks them in
+            // order. One worker per part keeps the same threaded fill; the parts of a fused
+            // expert are large and few, not scattered singletons.
+            std::size_t offset = 0;
+            for (const std::span<const std::byte>& part : source.parts) {
+                threads.emplace_back([dst = static_cast<std::byte*>(object.host) + offset, part] {
+                    std::memcpy(dst, part.data(), part.size());
+                });
+                offset += part.size();
+                if (threads.size() >= 32) {
+                    for (auto& thread : threads) { thread.join(); }
+                    threads.clear();
+                }
             }
         } else {
             const std::size_t workers = 16;
