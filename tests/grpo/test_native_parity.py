@@ -31,6 +31,13 @@ from surogate.grpo.loss import compute_native_shifted_grpo_dloss_reference
 # in test_native_formula.py, which writes out the same expression by hand.
 KL_ONLY = GRPOLossConfig(ipo_mask_low=1.0, ipo_mask_high=1.0, adv_tau=1.0, teacher_tau=0.0, kl_tau=0.1)
 
+# The GPU test uses production thresholds instead. With the 1.0 bounds above,
+# |probs_diff| < 1 always holds, so nothing is ever masked and `is_masked`,
+# `is_masked_low`, `is_masked_high` and `masked_mismatch_kl` compare 0 to 0 --
+# four of the nine shared metrics proving nothing. 0.2 is the shipped default
+# (`grpo/config.py`), and makes the kernel's masking arithmetic actually run.
+PRODUCTION_LIKE = GRPOLossConfig(ipo_mask_low=0.2, ipo_mask_high=0.2, adv_tau=1.0, teacher_tau=0.0, kl_tau=0.1)
+
 TRAINER_LP = np.array([-7.0, -1.2, -0.8, -3.1, -2.0, -0.4, -5.0], dtype=np.float32)
 INFERENCE_LP = np.array([-7.0, -1.4, -0.7, -2.8, -1.1, -0.5, -4.6], dtype=np.float32)
 # Sample 2 starts at index 4 and its first token is unmasked on purpose: a global
@@ -150,7 +157,9 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
     inputs = rng.integers(0, vocab_size, size=(1, seq_len), dtype=np.int32)
     targets = np.roll(inputs, -1, axis=1).astype(np.int32)
     position_ids = np.arange(seq_len, dtype=np.int32).reshape(1, seq_len)
-    sample_ranges = [(0, seq_len)]
+    # Two packed samples, not one: a single unpacked range never exercises the
+    # per-sample shift, and this branch rewrote how those ranges are derived.
+    sample_ranges = [(0, 8), (8, seq_len)]
 
     # Prompt tokens masked out, completion tokens live, matching a real pack.
     loss_mask = np.zeros(seq_len, dtype=bool)
@@ -208,7 +217,7 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
         inference_logprobs=inference_logprobs,
         advantages=advantages,
         loss_mask=loss_mask,
-        loss_config=KL_ONLY,
+        loss_config=PRODUCTION_LIKE,
         sample_ranges=sample_ranges,
         teacher_logprobs=None,
     )
@@ -226,12 +235,12 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
         temperatures=None,
         teacher_logprobs=None,
         loss_scale=loss_scale,
-        ipo_mask_low=float(KL_ONLY.ipo_mask_low),
-        ipo_mask_high=float(KL_ONLY.ipo_mask_high),
-        adv_tau=float(KL_ONLY.adv_tau),
-        teacher_tau=float(KL_ONLY.teacher_tau),
-        kl_tau=float(KL_ONLY.kl_tau),
-        ratio_clip=float(KL_ONLY.ratio_clip),
+        ipo_mask_low=float(PRODUCTION_LIKE.ipo_mask_low),
+        ipo_mask_high=float(PRODUCTION_LIKE.ipo_mask_high),
+        adv_tau=float(PRODUCTION_LIKE.adv_tau),
+        teacher_tau=float(PRODUCTION_LIKE.teacher_tau),
+        kl_tau=float(PRODUCTION_LIKE.kl_tau),
+        ratio_clip=float(PRODUCTION_LIKE.ratio_clip),
     )
     actual = native_trainer.get_grpo_native_metrics()
 
@@ -252,4 +261,4 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
         # the tolerance is on the arithmetic agreeing, not on bit equality.
         assert actual_value == pytest.approx(expected[key], rel=1e-3, abs=1e-4), key
         compared += 1
-    assert compared >= len(core), f"only {compared} metrics were actually compared"
+    assert compared >= 9, f"only {compared} metrics were compared; 9 are shared"

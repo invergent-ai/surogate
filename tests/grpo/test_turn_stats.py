@@ -337,11 +337,12 @@ class TestDiagnosticLayoutRoundTrip:
             if end - start > 1:
                 buf[start : end - 1] = logical_lp[start + 1 : end]
 
-        # The un-shift performed in GRPOTrainer._diagnostic_micro_step.
-        recovered = np.zeros(seq_len, dtype=np.float32)
-        for start, end in sample_ranges:
-            if end - start > 1:
-                recovered[start + 1 : end] = buf[start : end - 1]
+        # Call the un-shift the trainer actually uses, rather than a copy of it.
+        # This class exists to pin that transform, and a private re-implementation
+        # pins nothing: inverting the real one used to leave every test green.
+        from surogate.grpo.loss import unshift_to_logical
+
+        recovered = unshift_to_logical(buf, sample_ranges)
 
         from surogate.grpo.loss import compute_grpo_per_token_grads
 

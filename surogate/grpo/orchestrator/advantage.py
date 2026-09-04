@@ -88,7 +88,12 @@ def compute_advantages(
         rewards: Flattened list of rewards where first `samples_per_problem` rewards are for the first problem
         completion_lengths: List of completion lengths for each reward
         samples_per_problem: Number of samples (and thus, rewards) per problem
-        advantage_config: Configuration for advantage computation (AdvantageConfig or CustomAdvantageConfig)
+        advantage_config: Configuration for advantage computation (AdvantageConfig or
+            CustomAdvantageConfig). Required: a falsy value raises, because
+            centering is not optional.
+
+    Raises:
+        ValueError: if *advantage_config* is falsy.
     """
     if not advantage_config:
         # Returning the rewards here made them advantages with no baseline

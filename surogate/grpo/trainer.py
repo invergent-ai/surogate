@@ -570,8 +570,11 @@ class GRPOTrainer:
         to be identical to ``step_grpo_native``; the only cost is the Python
         round trip on the [1, T] logprob buffer.
 
-        Asserted by ``tests/grpo/test_native_parity.py::
-        test_the_cuda_kernel_matches_the_python_reference_metrics`` (needs a GPU).
+        Not directly asserted anywhere. The closest evidence is
+        ``tests/grpo/test_native_parity.py::test_the_cuda_kernel_matches_the_python_reference_metrics``
+        (needs a GPU), which compares the kernel's *metrics* against the Python
+        reference on the same batch -- strong evidence the two implementations
+        agree, but not a gradient-level assertion, and not this decomposition.
         """
         logprobs = self.trainer.forward_for_grpo(input_step, targets_step, pos_step, temp_step)
 

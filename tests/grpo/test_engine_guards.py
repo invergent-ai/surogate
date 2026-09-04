@@ -1,8 +1,10 @@
 """Guards for two latent GRPO defects (E1, E2 in the RL end-to-end findings).
 
-Neither is reachable from a config, a YAML or Studio today. Both are silent if
-they ever do fire, which is why they are worth closing rather than leaving to be
-discovered from a training curve that merely looks disappointing.
+Neither *harmful* case is reachable from a config, a YAML or Studio today, and
+both are silent if they ever do fire -- which is why they are worth closing
+rather than leaving to be found in a training curve that merely looks
+disappointing. The trailing single pad token below is reachable; it is benign,
+and pinned so it stays that way.
 """
 
 import numpy as np
@@ -71,28 +73,6 @@ def test_an_interior_one_token_sample_splits_instead_of_contaminating():
     a 2-token sample.
     """
     assert _find_sample_boundaries(np.array([0, 1, 2, 0, 0, 1])) == [(0, 3), (3, 4), (4, 6)]
-
-
-@pytest.mark.parametrize(
-    "packed,expected",
-    [
-        ([0, 1, 2, 0, 1, 0, 1, 2, 3], [(0, 3), (3, 5), (5, 9)]),
-        ([0, 1, 2, 0], [(0, 3), (3, 4)]),
-        ([0, 1, 2, 0, 0, 1], [(0, 3), (3, 4), (4, 6)]),
-    ],
-)
-def test_the_split_matches_what_the_engine_masks_attention_with(packed, expected):
-    """`compute_doc_masking` (causal_lm_execution_profile.cpp:135) derives
-    attention documents from the same array with `curr - prev != 1`, and the loss
-    used a weaker rule, so the two could disagree about where a sample ended --
-    silently, since nothing compares them.
-
-    These expectations are worked out by hand from the C++ rule rather than by
-    re-implementing it here: a test running its own copy of the rule would agree
-    with itself even if the C++ changed. Genuinely pinning the two languages
-    together needs the built extension.
-    """
-    assert _find_sample_boundaries(np.array(packed)) == expected
 
 
 def test_an_empty_sequence_is_not_an_error():
