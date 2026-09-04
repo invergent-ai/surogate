@@ -182,7 +182,6 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     ops::detail::bf16_cublaslt_prewarm();
     detail::Variant::prewarm_device_scratch();
     detail::Variant::prepare_expert_split(model.impl_->data.runtime);
-    detail::Variant::prepare_expert_prefetch(model.impl_->data.runtime);
     return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }

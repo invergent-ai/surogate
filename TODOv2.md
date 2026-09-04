@@ -5,64 +5,30 @@ K-quants first, then compressed-tensors NVFP4, FP8 and the rest — without a
 per-model converter or a per-export profile. `TODO.md` remains the tracker for
 pre-existing review items; nothing moves between the two.
 
-Legend: `[x]` done · `[~]` partly done · `[ ]` open
+Legend: `[~]` partly done · `[ ]` open. Completed items are not kept here —
+what shipped is in `git log --oneline c5d327fe..` and `design/INFERENCE.md`.
 
 ---
 
 ## Status
 
-**A GGUF is served where it lies.** `surogate serve model.gguf` reads the file's
-own bytes: no dequantise-and-requantise on the text path and no copy of the
-weights. What lands beside it is a small index.
+**A GGUF is served where it lies**, at any size of a supported family, ahead of
+llama.cpp on the formats the board covers. `csrc/src/serve/targets/` holds six
+architectures — gemma3, llama, qwen3, qwen3_5, qwen3_5_moe, qwen4exp — and none
+names a size: the artifact declares its dimensions and the binder validates
+against them.
 
-**One target per architecture, serving every size of its family.**
-`csrc/src/serve/targets/` holds gemma3, llama, qwen3, qwen3_5, qwen3_5_moe and
-qwen4exp. Qwen3, Llama, Gemma 3 and Qwen3.5 take any size of their family; the
-rest are the sizes their loaders are still written around. Qwen3.5, 3.6 and 3.8
-are one architecture and share one target, which is what their own checkpoints
-say: every one declares `model_type: qwen3_5`.
-
-`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22.13 GB, 34.66 B parameters, 256 experts of
-which 8 route — on one 5090, single stream, ~700-token prompt, 128 generated,
-warm, greedy (2026-09-03, both native rows the same session):
-
-| | prefill tok/s | decode tok/s |
-|---|---:|---:|
-| **surogate, native K-quant** | **13,195** | **315** |
-| llama.cpp, same file | 8,408 | 278 |
-| surogate, dequantised to Q4G64 | 13,700 | 346 |
-
-Ahead of llama.cpp on both, at the accuracy llama-perplexity measures:
-
-| wikitext-2 test, 145 windows of 2048, second halves scored | PPL |
-|---|---:|
-| llama.cpp, same file | 6.2311 ± 0.040 |
-| **surogate** | **6.2370 ± 0.040** |
-
-| | |
-|---|---:|
-| the GGUF | 22.13 GB |
-| artifact beside it, before this line of work | 22.30 GB (a full copy) |
-| **artifact today** | **70 MB** |
-| one-time step | 18 s |
-
-The harness is `surogate/serve/tools/eval/perplexity.py`.
+What is left is in this file. Board rows are `surogate/serve/BENCHMARKS.md`;
+the history of what was tried is `design/INFERENCE.md`.
 
 ---
 
 ## Roadmap
 
-Six of eleven are closed (1, 3, 6, 8, 9, and 5's first size). Two are decisions
-waiting on `surogate quantize` as a product rather than tasks (2 and 11). The
-rest are open, each with what an attempt needs written down: FP8 (4), the two
-smaller NVFP4 sizes (5), the trainer/serve mapping duplication (7), and the
-Q6_K down kernel (10).
+Nine open or partly done. Two are decisions waiting on `surogate quantize` as a
+product rather than tasks (1 and 9); the rest are work.
 
-1. **[x] Native K-quant prefill (2026-09-03).** 13,195 tok/s against the
-   BF16-activation path's 10,299 on a ~700-token prompt, 17,300 against 14,300
-   at 8k. Perplexity 6.2370 against llama.cpp's 6.2311 (± 0.040), which was the
-   gate. Decode unchanged. `SUROGATE_SERVE_MOE_INT8=0` reverts.
-2. **[~] K6 — retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
+1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
    The old argument against it is stale: with the int8 route the K-quant path
    measures 13,195 tok/s against the row-split path's 13,700, and decode is
@@ -73,16 +39,8 @@ Q6_K down kernel (10).
    selects them — the other targets import the names and use `W8G32_F16S` or
    NVFP4. So this is one target's safetensors profile, not five, and it is a
    decision rather than a task: it costs the 27B its groupwise-int route until
-   `surogate quantize` (item 11) is a product.
-3. **[x] GGUF coverage beyond the Qwen3.5/3.6 families (2026-09-03).** Qwen3,
-   Llama and Gemma 3 serve from a GGUF at any size of the family, on the file's
-   own metadata: no vendored config, nothing to register per size. TinyLlama
-   matches llama.cpp word for word on the same file, and both families encode
-   3,104 corpus strings identically to their official tokenizers. SentencePiece
-   vocabularies reconstruct.
-   A GGUF published without a chat template is refused, which is what the base
-   `google.gemma-3-270m` files are.
-4. **[ ] F — FP8, and the two kinds are not the same job (checked 2026-09-03).**
+   `surogate quantize` (item 9) is a product.
+2. **[ ] FP8, and the two kinds are not the same job (checked 2026-09-03).**
    - *compressed-tensors per-channel/per-tensor* is per-row with an FP32 scale.
      The engine has `FP8_E4M3FN_ROW_BF16S`, so this is either an `_F32S` variant
      or a documented BF16 cast of the row scales. Small — but **no checkpoint of
@@ -93,7 +51,7 @@ Q6_K down kernel (10).
      `weight_scale_inv` as a 2-D F32 grid (e.g. `[48, 8]` for a `[6144, 1024]`
      projection). No runtime format holds a 2-D block scale, so this is a new
      weight format and GEMM support, not an ingest change.
-5. **[~] N — NVFP4 ModelOpt ingest: the 4B serves (2026-09-03).**
+3. **[~] NVFP4 ModelOpt ingest: the 4B serves (2026-09-03).**
    `surogate serve <Qwen3.5-4B-NVFP4>` works end to end. **Left: the 0.8B and
    the 2B have no NVFP4 recipe** — their checkpoints are on this machine and are
    refused by name until one exists.
@@ -112,47 +70,26 @@ Q6_K down kernel (10).
      and must check the three share a divisor before it does.
    The engine side is ready for any size: `qwen3_5` compiles both NVFP4 profiles
    and binds NVFP4 parents with both divisors.
-6. **[x] M2 — one directory per architecture (2026-09-04).**
-   `csrc/src/serve/targets/` holds six directories — gemma3, llama, qwen3,
-   qwen3_5, qwen3_5_moe, qwen4exp — and none names a size or a generation. A
-   checkpoint states its dimensions in the index built beside it and the engine
-   binds against those, so a target serves every size and generation of its
-   family: Qwen3-1.7B runs on the code compiled for Qwen3-0.6B, and Qwen3.5,
-   Qwen3.6 and Qwen3.8 share one target where five directories stood. The
-   converter, the reference implementation and the vendored resources are keyed
-   the same way. Two dimensions stay compiled in the hybrid forward interface,
-   marked where they are: the attention head width and the GDN output-gate
-   width.
-7. **[ ] M4 — unify weight loading with the trainer, still true but smaller
-   than it was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per
-   target restate what the trainer's declarations in `surogate/dsl/models/`
-   already say. Both sides describe the same nineteen architectures: the DSL has
-   `qwen3.py`, `qwen3_5.py`, `llama.py`, `gemma3.py` and fifteen more, and serve
-   has a recipe per converter — 4,468 lines of them.
+4. **[ ] A 27B-class GGUF has never been served (found 2026-09-04).** A
+   text-only GGUF export of the 27B vision family is refused, because its
+   converter expects the vision tensors the export drops (`KeyError:
+   model.visual.patch_embed.proj.weight` on unsloth's
+   `Qwen3.8-27B-UD-Q4_K_M.gguf`). Same class of thing the GGUF-coverage item
+   fixed for the other families; it predates the target renames, and the board's
+   Qwen3.8-27B rows are all NVFP4 from safetensors, so this path has never run.
+5. **[ ] Unify weight loading with the trainer, still true but smaller than it
+   was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per target
+   restate what the trainer's declarations in `surogate/dsl/models/` already say.
+   Both sides describe the same nineteen architectures: the DSL has `qwen3.py`,
+   `qwen3_5.py`, `llama.py`, `gemma3.py` and fifteen more, and serve has a recipe
+   per converter — 4,468 lines of them.
    The remaining duplication is smaller than it was. The recipes no longer
    restate *dimensions*, because the artifact carries them and the binder
    validates against them; what they still restate is the *mapping* — which
    checkpoint tensor becomes which artifact object, and how fused objects are
    assembled. That is the part worth unifying, and the part `hf_mapping` already
    spells out.
-8. **[x] K5c — fused K-quant GDN projection-and-convolution: closed, negative
-   (2026-09-03).** Measured slower; not in the tree. Reopening it needs a reason
-   the measurement did not have.
-9. **[x] Drift to fix (2026-09-03).** A K-quant draft block binds and serves,
-   proved on our own export of Qwen3.5-0.8B carrying 12 MTP objects across BF16,
-   Q4_K, Q6_K and W8G32_F16S. `--no-cache` rebuilds the index instead of reusing
-   one. The converter and the artifact container live in the serving path
-   (`serve/convert/`, `serve/artifact/`) rather than in `serve/tools/`, whose
-   README is accurate again. `surogate convert` does not exist and is not
-   wanted: `surogate serve` converts.
-   **One gap found and not closed (2026-09-04):** a text-only GGUF export of the
-   27B vision family is refused, because its converter expects the vision
-   tensors the export drops (`KeyError: model.visual.patch_embed.proj.weight` on
-   unsloth's `Qwen3.8-27B-UD-Q4_K_M.gguf`). Same class of thing item 3 fixed for
-   the other families, and it predates the target renames: the board's
-   Qwen3.8-27B rows are all NVFP4 from safetensors, so a 27B-class GGUF has
-   never been served.
-10. **[ ] Q6_K down. Measured and root-caused 2026-09-03; the fix is written
+6. **[ ] Q6_K down. Measured and root-caused 2026-09-03; the fix is written
    down here and not built.** The op benchmark now carries the native codecs
    (`--codec q4_k-q4_k`, `--codec q4_k-q6_k`). One 5090, 256 unique experts,
    warm, median of three:
@@ -183,7 +120,34 @@ Q6_K down kernel (10).
    per-thread and must stay branchless.
    The layer-level reading is the same effect measured the other way: 688 us
    against the row-split kernel's 337, on `routed_down` of 3 of 40 layers.
-11. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+7. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
+   board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
+   users); what is left is above them.
+   - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
+     while it waits on PCIe. That is why the next-layer prefetch was built,
+     measured a loss (TTFT 1.37 s against 0.84) and discarded: overlapping a
+     kernel gather with the next layer's compute starves that compute rather
+     than hiding the transfer. `cudaMemcpyBatchAsync` off the SMs would change
+     that, but it needs the miss list on the host, and a host node inside a
+     captured prefill graph cannot issue copies — so it is an eager-prefill
+     path first, if at all. Design and measurements: memory
+     `reference_freetoken`.
+   - **The CPU expert path decodes GGML blocks scalar.** `--cpu-moe-share` works
+     on a GGML-block bank, but auto measures the host at ~1 GB/s against a
+     24 GB/s PCIe gather and takes 30 % of misses, which is not yet a win. The
+     bank is decoded to Q4G32AM at load now, so this only bites a run that keeps
+     the file's blocks (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`).
+   - **The 28k-prompt board row** (long-context ingestion) has not been re-measured
+     since the native path landed.
+8. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
+   (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
+   acceptance — which is the evidence the graph is right — but decode moves
+   30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
+   being high, the cost is the round, not the drafts: a 4-6 column verify touches
+   more distinct experts than a single token and pays more PCIe gathers with
+   3,172 of 5,110 experts resident. The graph and the levers are in memory
+   `project_serve_qwen4exp_mtp`.
+9. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -271,17 +235,15 @@ block. The second is the real fix and belongs to the engine, not to this item.
 
 ## Format coverage
 
-What the serve runtime can route today, per stored format.
+Routed today, everywhere the runtime needs them: **GGML Q2_K–Q6_K and Q8_0**
+(linear, embedding, MoE decode/small-T/prefill, read from the GGUF), **BF16** at
+any 8-aligned shape, **W8G32_F16S**, and **NVFP4 compressed-tensors** (TRT-LLM
+cutlass for routed MoE). What is not:
 
 | Format | Status |
 |---|---|
-| GGML Q2_K–Q6_K | **[x]** linear, embedding, MoE (decode, small-T, prefill), read from the GGUF |
-| GGML Q8_0 | **[x]** linear, embedding, MoE; the fused projections read it and rearrange at load |
-| BF16 | **[x]** any 8-aligned shape (cuBLASLt), registered shapes keep the hand kernels |
-| W8G32_F16S | **[x]** the broadest-supported format; what the fused projections consume |
-| NVFP4 (compressed-tensors) | **[x]** generic ingest (M1); TRT-LLM cutlass for routed MoE |
-| NVFP4 (ModelOpt) | **[~]** the 4B serves; the 0.8B and 2B need a recipe (roadmap 5) |
-| FP8 | **[~]** only `FP8_E4M3FN_ROW_BF16S`; per-tensor, per-channel and block unsupported |
+| NVFP4 (ModelOpt) | **[~]** the 4B serves; the 0.8B and 2B need a recipe (roadmap 3) |
+| FP8 | **[~]** only `FP8_E4M3FN_ROW_BF16S`; per-tensor, per-channel and block unsupported (roadmap 2) |
 | W4A16 / W4A16_ASYM | **[ ]** `Q4G64_F16S` is symmetric with no zero point and no actorder |
 | MXFP4 / MXFP8 | **[ ]** nothing in serve; the trainer decodes MXFP4 |
 | GPTQ / AWQ | **[ ]** off the roadmap by owner decision |
@@ -447,44 +409,6 @@ Written down so they are not retried.
   rewrites. The load transform gets the same result and touches no kernel.
 
 ---
-
-## Done
-
-- 2026-09-04 — **the engine binds on the device it was asked for**. The
-  executor's worker thread never called `cudaSetDevice`, so every kernel
-  launched on device 0 while the weights sat on the requested one. `--device 0`
-  worked by coincidence and every other device failed in warmup.
-- 2026-09-04 — **one directory per architecture, end to end**. Qwen3.5, 3.6 and
-  3.8 are one architecture, so they are one target, one converter, one Python
-  reference and one vendored config; the MoE sibling keeps its own. Five
-  directories became two on each of those four axes. Quantisation is a
-  parameter, not a directory: one object contract with a table of five export
-  profiles, named as the engine names them. The 27B-class binder stopped
-  spelling its size out inline (95 occurrences of 5120 in one, 84 of 2048 in
-  the other).
-- 2026-09-03 — **geometry as data**: the artifact declares its dimensions, the
-  binder validates against them, and one target serves every size of its
-  family (Qwen3-1.7B on the 0.6B's code; three Qwen3.5 directories into one,
-  3,932 lines deleted). A ModelOpt NVFP4 4B serves. A K-quant draft block
-  binds. `--no-cache` rebuilds. The pad-token literal is gone. The converter
-  and the artifact container left `serve/tools/`. The MoE benchmark measures
-  the native K-quant codecs.
-- 2026-09-03 — int8 tensor-core route for K-quant routed experts (gate/up and
-  down, Q4_K/Q5_K/Q6_K), on by default; `quantize_q8_1_planes`; the NLL probe
-  and `ops::next_token_nll`; `tools/eval/perplexity.py`; accuracy gate passed.
-
-- **[x] M1 — generic compressed-tensors NVFP4.** RedHatAI's 35B-A3B converts from
-  its own directory; the config is the authority, resolved with the library's own
-  matcher.
-- **[x] M3 — generic GGUF.** Per-tensor GGML type → runtime format, from the
-  header, never a file-level "quant type".
-- **[x] K0–K5 — the K-quant line.** The bar, the native read path, Q8_0 (served,
-  not merely decided), the wide-batch route, the routed MoE decode *and* prefill,
-  and the three `QType` switches. K5's fused projections never needed a codec:
-  their weights are read from the GGUF and rearranged at load. Six tuned kernels
-  not written.
-- **[x] Direct GGUF loading.** 22.30 GB → 70 MB; see *How a GGUF is served*.
-- **[x] BF16 at any 8-aligned shape.**
 
 Commits are on `serve-engine`; `git log --oneline c5d327fe..` is the line of
 work this file tracks.

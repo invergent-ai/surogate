@@ -306,11 +306,6 @@ struct ExpertSlotCache {
         std::int32_t round_offset = 0;
         std::int32_t round_slice  = 0; // ordinal of the next slice within the round
         bool round_split          = false;
-        // Columns the round hook has seen so far this round, every slice counted: the
-        // next-layer prefetch may only be issued once the layer's last slice has resolved,
-        // because the prefetch's resolve and a later slice's resolve would otherwise run
-        // concurrently on one directory.
-        std::int32_t round_resolved = 0;
     };
     // Pinned mirrors of the device job list, one per slice ordinal: the copies run on the
     // main stream, so slice k+1's copy may land while slice k's host function still reads
@@ -360,28 +355,6 @@ struct ExpertSlotCache {
     ops::ExpertSlotDirectory directory;
     ops::ExpertMissList misses;
     std::vector<Layer> layers;
-
-    // --- next-layer prefetch for wide rounds (FreeToken's prefill double buffer, our shape) ---
-    //
-    // A prompt chunk of a few hundred tokens touches nearly every expert of every layer, so
-    // the set layer L+1 will miss is known before its routing is: everything not resident.
-    // Layer L's round hook resolves that set and gathers it on a side stream while L's expert
-    // kernels run, and L+1's hook waits on it and finds hits. The scan ring is two expert sets
-    // wide for this: L's slots and L+1's never overlap, and L+2's prefetch (issued from L+1's
-    // hook, after L's kernels are behind it on the stream) may wrap onto L's. A narrow round
-    // is left alone; so is a pool too small for the double ring.
-    bool prefetch_enabled           = false;
-    cudaStream_t prefetch_stream    = nullptr;
-    cudaEvent_t prefetch_fork       = nullptr;
-    cudaEvent_t prefetch_ready[2]   = {nullptr, nullptr};
-    bool prefetch_ready_valid[2]    = {false, false};
-    void* prefetch_miss_memory      = nullptr;
-    void* prefetch_ids_memory       = nullptr;
-    ops::ExpertMissList prefetch_misses;
-    Tensor prefetch_ids;               // I32 [experts]: 0..experts-1, one layer's whole set
-    std::int32_t prefetch_layer     = -1; // layer whose prefetch is in flight, -1 for none
-    std::int64_t prefetch_rounds    = 0;
-    static constexpr std::int32_t kPrefetchMinTokens = 256;
 
     Layer& layer(const SparseMoePayload& weights) {
         if (weights.layer < 0 || weights.layer >= static_cast<std::int32_t>(layers.size())) {
@@ -529,56 +502,11 @@ struct ExpertSlotCache {
     }
     // Called by post_mixer before the MoE op: fixes the round's split decision and share.
     void begin_round(Layer& entry, std::int32_t tokens) {
-        entry.round_total    = tokens;
-        entry.round_offset   = 0;
-        entry.round_slice    = 0;
-        entry.round_resolved = 0;
+        entry.round_total  = tokens;
+        entry.round_offset = 0;
+        entry.round_slice  = 0;
         entry.round_split  = cpu_split_enabled() && share_for(tokens) > 0 && tokens >= cpu_min_tokens &&
                              entry.cpu_bank.gate_up_codes != nullptr;
-    }
-
-    /// Before this layer resolves: if its experts were prefetched, the directory and the pool
-    /// must show them first.
-    void await_prefetch(const Layer& entry, cudaStream_t stream) {
-        if (!prefetch_enabled || prefetch_layer != entry.index) { return; }
-        const int parity = entry.index & 1;
-        if (prefetch_ready_valid[parity]) {
-            CUDA_CHECK(cudaStreamWaitEvent(stream, prefetch_ready[parity], 0));
-        }
-    }
-
-    /// After this layer's misses are on their way: on a wide round, bring in everything the
-    /// next layer does not have yet, on the side stream, behind this layer's expert kernels.
-    void prefetch_next_layer(const Layer& entry, cudaStream_t stream) {
-        if (!prefetch_enabled) { return; }
-        const std::int32_t next = entry.index + 1;
-        if (prefetch_layer == next) { return; } // already in flight
-        // Every hook either issues the next layer's prefetch or clears the record of one. A
-        // pass may hold a narrow round (a small prefill-graph bucket) between two wide ones;
-        // if it left `prefetch_layer` standing, the next layer would wait on an event from an
-        // earlier pass -- from outside the capture, when captured.
-        prefetch_layer = -1;
-        if (entry.round_total < kPrefetchMinTokens) { return; }
-        if (next >= static_cast<std::int32_t>(TextConfig::layers)) { return; } // the head keeps its own rounds
-        if (next >= static_cast<std::int32_t>(layers.size()) || layers[static_cast<std::size_t>(next)].owner == nullptr) {
-            return; // the next layer's bank is not bound (a pipeline stage boundary)
-        }
-        const Layer& target = layers[static_cast<std::size_t>(next)];
-        // The resolve stays on the compute stream: it is the directory's only writer there,
-        // ordered with this layer's later slices and with the next layer's own resolve. What
-        // forks is the gather -- the PCIe traffic -- which runs under this layer's expert
-        // kernels from its first slice on, while the resolve itself is a short single-block
-        // kernel.
-        ops::expert_slot_resolve(prefetch_ids, next, directory, prefetch_misses, stream,
-                                 /*scan=*/true);
-        CUDA_CHECK(cudaEventRecord(prefetch_fork, stream));
-        CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream, prefetch_fork, 0));
-        ops::expert_slot_gather(target.bank, prefetch_misses, pool, prefetch_stream);
-        const int parity = next & 1;
-        CUDA_CHECK(cudaEventRecord(prefetch_ready[parity], prefetch_stream));
-        prefetch_ready_valid[parity] = true;
-        prefetch_layer               = next;
-        ++prefetch_rounds;
     }
 
     /// Brings up the memop handshake if the driver has the operations and they survive a
@@ -924,7 +852,6 @@ struct ExpertSlotCache {
         ExpertSlotCache& cache = *entry->owner;
         const std::int32_t tokens =
             static_cast<std::int32_t>(x.numel() / ops::kSparseMoeFlashNextGeometry.hidden);
-        cache.await_prefetch(*entry, stream);
         // The split decision is per round (begin_round); every slice of the round follows it.
         const bool split          = entry->round_split && x.data != nullptr && destination.data != nullptr;
         const std::uint32_t share = split ? cache.share_for(entry->round_total) : 0U;
@@ -945,8 +872,6 @@ struct ExpertSlotCache {
         gather_probe().end(stream);
         gather_probe().tick_gather();
         if (split) { cache.cpu_round(*entry, x, destination, stream); }
-        entry->round_resolved += tokens;
-        cache.prefetch_next_layer(*entry, stream);
         // SUROGATE_SERVE_CPU_MOE_FAKE_WAIT=<ms>: with the split off, still fork a host function
         // that sleeps for <ms> and make the combine wait for it — the host split's stream
         // timing without its data. Tells a data fault in the host path from a latent race
@@ -1258,36 +1183,13 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                        std::getenv("SUROGATE_SERVE_NO_SCAN_RING") == nullptr)
                           ? geometry.experts
                           : 0;
-    // The next-layer prefetch needs a ring of two expert sets, which the directory allows
-    // only up to half the pool: four expert sets of slots, then. Opt-in
-    // (SUROGATE_SERVE_PREFETCH=1): measured on 2026-09-04 it *loses* at one user -- TTFT 1.37 s
-    // against 0.84 -- because the gather is a kernel that holds SMs while it waits on PCIe, so
-    // running it under the next layer's compute starves that compute rather than hiding the
-    // transfer. It earns its keep only with a copy-engine gather, which the captured prefill
-    // graphs cannot host today (a host node cannot issue copies). Kept as that path's scaffold.
-    cache.prefetch_enabled = cache.scan_ring > 0 && cache.slots >= geometry.experts * 4 &&
-                             std::getenv("SUROGATE_SERVE_PREFETCH") != nullptr;
-    if (cache.prefetch_enabled) { cache.scan_ring = geometry.experts * 2; }
+
     cache.directory = ops::create_expert_slot_directory(TextConfig::expert_layers, geometry.experts,
                                                         cache.slots, cache.scan_ring,
                                                         cache.directory_memory,
                                                         nullptr);
     cache.misses    = ops::create_expert_miss_list(geometry.experts, cache.miss_memory);
-    if (cache.prefetch_enabled) {
-        CUDA_CHECK(cudaMalloc(&cache.prefetch_miss_memory, miss_bytes));
-        cache.prefetch_misses = ops::create_expert_miss_list(geometry.experts, cache.prefetch_miss_memory);
-        std::vector<std::int32_t> every(static_cast<std::size_t>(geometry.experts));
-        for (std::int32_t e = 0; e < geometry.experts; ++e) { every[static_cast<std::size_t>(e)] = e; }
-        CUDA_CHECK(cudaMalloc(&cache.prefetch_ids_memory, every.size() * sizeof(std::int32_t)));
-        CUDA_CHECK(cudaMemcpy(cache.prefetch_ids_memory, every.data(),
-                              every.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
-        cache.prefetch_ids = Tensor(cache.prefetch_ids_memory, DType::I32, {geometry.experts});
-        CUDA_CHECK(cudaStreamCreateWithFlags(&cache.prefetch_stream, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaEventCreateWithFlags(&cache.prefetch_fork, cudaEventDisableTiming));
-        for (cudaEvent_t& ready : cache.prefetch_ready) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
-        }
-    }
+
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     cache.layers.resize(static_cast<std::size_t>(TextConfig::expert_layers));
     cache.enabled = true;
@@ -1451,10 +1353,9 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         }
     }
     std::fprintf(stderr,
-                 "qwen4exp: expert slot cache ready: %d slots (%.1f GiB pool), scan ring %d%s\n",
+                 "qwen4exp: expert slot cache ready: %d slots (%.1f GiB pool), scan ring %d\n",
                  cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0),
-                 cache.scan_ring,
-                 cache.prefetch_enabled ? ", next-layer prefetch on wide rounds" : "");
+                 cache.scan_ring);
     if (const std::string numa = numa_policy_description(); !numa.empty()) {
         std::fprintf(stderr, "qwen4exp: %s\n", numa.c_str());
     }
@@ -1700,19 +1601,6 @@ void Variant::configure_expert_slots(std::uint32_t slots, std::size_t runtime_fl
     std::lock_guard<std::mutex> lock(expert_slot_mutex());
     configured_expert_slots()[device]        = slots;
     configured_runtime_floor()[device]       = runtime_floor_bytes;
-}
-
-void Variant::prepare_expert_prefetch(const ModelView& model) {
-    // The prefetch for layer L+1 is issued from layer L's hook, before L+1's payload has ever
-    // reached the cache -- so every layer's bank is bound here, once, up front.
-    ExpertSlotCache& cache = expert_slot_cache_for_current_device();
-    if (!cache.enabled || !cache.prefetch_enabled) { return; }
-    for (const auto& gdn : model.gdn_layers) {
-        if (gdn.post_mixer.layer >= 0) { (void)cache.layer(gdn.post_mixer); }
-    }
-    for (const auto& full : model.full_layers) {
-        if (full.post_mixer.layer >= 0) { (void)cache.layer(full.post_mixer); }
-    }
 }
 
 void Variant::prepare_expert_split(const ModelView& model) {
