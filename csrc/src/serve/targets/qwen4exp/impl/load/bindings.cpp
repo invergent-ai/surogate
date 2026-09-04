@@ -317,7 +317,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     out.geometry        = family::TextGeometry::declared<TextConfig>(binder.reader().geometry());
     out.frontend        = family::bind_frontend_resources(binder);
     out.features        = features;
-    out.host_bank_q4    = host_bank_q4;
+    // The Q4 bank requantises W8 planes while copying them into pinned memory, so it has
+    // nothing to do with an artifact that stores the GGUF's own blocks: those are already
+    // narrower than Q4G32AM and the slot cache decodes them on the way to the device.
+    const auto* routed0 = binder.reader().find("text/layers/0/mlp/routed_gate_up");
+    const auto* routed0_tensor =
+        routed0 != nullptr ? std::get_if<artifact::TensorDescriptor>(routed0) : nullptr;
+    const bool routed_is_ggml =
+        routed0_tensor != nullptr && routed0_tensor->layout == artifact::StorageLayout::GgmlBlocksV1;
+    out.host_bank_q4    = host_bank_q4 && !routed_is_ggml;
     out.token_embedding = device(binder, "text/token_embedding", NumericFormat::W8G32_F16S,
                                  {kVocab, kHidden});
 
@@ -392,7 +400,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
             target.ple.convolution = device(binder, prefix + "ple/convolution", NumericFormat::BF16,
                                             {TextConfig::ple_conv_kernel, kHcWidth});
         }
-        target.moe = bind_moe(binder, out.host_bank, prefix + "mlp/", host_bank_q4);
+        target.moe = bind_moe(binder, out.host_bank, prefix + "mlp/", out.host_bank_q4);
     }
     g_layer_placement = TensorPlacement::Device;
 

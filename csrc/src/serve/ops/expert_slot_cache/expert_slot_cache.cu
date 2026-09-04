@@ -794,20 +794,24 @@ void expert_slot_gather(const ExpertHostBank& bank, const ExpertMissList& misses
         const GatherGgmlIds ids{static_cast<const int*>(misses.slots.data),
                                 static_cast<const int*>(misses.experts.data),
                                 static_cast<const long long*>(misses.count.data)};
+        // The destination strides are the pool's, not the bank's: the pool always holds W8, so
+        // one group is 32 code bytes and one f16 scale however many bytes the block took.
+        const std::uint64_t gate_groups = bank.gate_up_scales_bytes_per_expert / 2;
+        const std::uint64_t down_groups = bank.down_scales_bytes_per_expert / 2;
         const GatherGgmlBank gate{reinterpret_cast<const std::uint8_t*>(bank.gate_up_codes),
                                   pool.gate_up_codes,
                                   pool.gate_up_scales,
-                                  bank.gate_up_scales_bytes_per_expert / 2,
+                                  gate_groups,
                                   bank.gate_up_codes_bytes_per_expert,
-                                  bank.gate_up_codes_bytes_per_expert * 2,
-                                  bank.gate_up_scales_bytes_per_expert};
+                                  gate_groups * 32,
+                                  gate_groups * 2};
         const GatherGgmlBank down{reinterpret_cast<const std::uint8_t*>(bank.down_codes),
                                   pool.down_codes,
                                   pool.down_scales,
-                                  bank.down_scales_bytes_per_expert / 2,
+                                  down_groups,
                                   bank.down_codes_bytes_per_expert,
-                                  bank.down_codes_bytes_per_expert * 2,
-                                  bank.down_scales_bytes_per_expert};
+                                  down_groups * 32,
+                                  down_groups * 2};
         launch_ggml_gather(bank.gate_up_ggml, gate, ids, stream);
         launch_ggml_gather(bank.down_ggml, down, ids, stream);
         return;
