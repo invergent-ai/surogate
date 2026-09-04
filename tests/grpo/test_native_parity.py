@@ -35,7 +35,10 @@ KL_ONLY = GRPOLossConfig(ipo_mask_low=1.0, ipo_mask_high=1.0, adv_tau=1.0, teach
 # |probs_diff| < 1 always holds, so nothing is ever masked and `is_masked`,
 # `is_masked_low`, `is_masked_high` and `masked_mismatch_kl` compare 0 to 0 --
 # four of the nine shared metrics proving nothing. 0.2 is the shipped default
-# (`grpo/config.py`), and makes the kernel's masking arithmetic actually run.
+# (`grpo/config.py`). That alone only fixes three of the four: the high side
+# additionally needs probs_diff to go positive, which is why the GPU fixture
+# derives its inference logprobs from the trainer's rather than from a fixed
+# range that is always larger.
 PRODUCTION_LIKE = GRPOLossConfig(ipo_mask_low=0.2, ipo_mask_high=0.2, adv_tau=1.0, teacher_tau=0.0, kl_tau=0.1)
 
 TRAINER_LP = np.array([-7.0, -1.2, -0.8, -3.1, -2.0, -0.4, -5.0], dtype=np.float32)
@@ -174,8 +177,8 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
     for start, end in sample_ranges:
         loss_mask[start + 4 : end] = True
     advantages = rng.normal(0.0, 1.0, size=seq_len).astype(np.float32) * loss_mask
-    inference_logprobs = rng.uniform(-4.0, -0.1, size=seq_len).astype(np.float32)
     loss_scale = float(loss_mask.sum())
+    # inference_logprobs is derived from the trainer's below, deliberately.
 
     config = _surogate.PretrainedConfig.from_pretrained(str(model_dir), "bf16")
     options = _surogate.RuntimeOptions(
@@ -220,6 +223,17 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
     # Nothing reads the reference trainer after this, and holding two full
     # trainers doubles peak VRAM on a box that is usually busy.
     del reference_trainer
+
+    # Draw the inference logprobs NEAR the trainer's, not from a fixed range.
+    # A truncated model over random token ids produces logprobs around
+    # -log(vocab) ~ -12, so an independent draw from [-4, -0.1] leaves
+    # importance_ratio = exp(trainer - inference) ~ 5e-5. The kernel's advantage
+    # branch then contributes ~5e-6 of policy_loss, far under the 1e-3 tolerance:
+    # the entire policy-gradient half could be deleted from the kernel and every
+    # assertion here would still pass. Keeping the ratio near 1 puts the policy
+    # term on the same order as the KL term, and makes probs_diff straddle zero
+    # so both sides of the IPO mask are exercised rather than only the low side.
+    inference_logprobs = (trainer_logprobs + rng.normal(0.0, 0.3, size=seq_len)).astype(np.float32)
 
     expected = compute_native_grpo_metrics_reference(
         trainer_logprobs=trainer_logprobs,

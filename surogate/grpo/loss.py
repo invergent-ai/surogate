@@ -325,6 +325,27 @@ def compute_grpo_per_token_grads(
     return per_token_grads, agg_metrics
 
 
+def shift_to_target(per_token_grads: np.ndarray, sample_ranges: list[tuple[int, int]]) -> np.ndarray:
+    """Logical layout -> target-slot layout, per packed sample.
+
+    The exact inverse of :func:`unshift_to_logical`. The LM-head backward expects
+    the gradient for logical token ``t`` at slot ``t - 1`` **within its own
+    sample**, which is also how the native kernel reads it. Shifting across the
+    whole packed row instead of per sample lands one sample's gradient on its
+    neighbour's last token -- silent, and wrong on every micro-batch.
+
+    A sample shorter than two tokens has no shiftable window and stays zero.
+
+    Returned unscaled: callers divide by ``loss_scale`` themselves, because the
+    dispatch-PP path accumulates several rows before dividing.
+    """
+    shifted = np.zeros_like(per_token_grads)
+    for start, end in sample_ranges:
+        if end - start > 1:
+            shifted[start : end - 1] = per_token_grads[start + 1 : end]
+    return shifted
+
+
 def unshift_to_logical(buf: np.ndarray, sample_ranges: list[tuple[int, int]]) -> np.ndarray:
     """Target-slot layout -> logical layout, per packed sample.
 
@@ -381,10 +402,7 @@ def compute_native_shifted_grpo_dloss_reference(
         replay_mask=replay_mask,
         replay_weights=replay_weights,
     )
-    shifted = np.zeros_like(per_token_grads)
-    for start, end in sample_ranges:
-        if end - start > 1:
-            shifted[start : end - 1] = per_token_grads[start + 1 : end]
+    shifted = shift_to_target(per_token_grads, sample_ranges)
     if loss_scale != 1.0:
         shifted = shifted / float(loss_scale)
     return shifted

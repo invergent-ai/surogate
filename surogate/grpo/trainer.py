@@ -21,7 +21,7 @@ import numpy as np
 from surogate import _surogate
 from surogate.grpo.config import GRPOTrainConfig
 from surogate.grpo.data import GRPODataLoader
-from surogate.grpo.loss import compute_grpo_per_token_grads, unshift_to_logical
+from surogate.grpo.loss import compute_grpo_per_token_grads, shift_to_target, unshift_to_logical
 from surogate.grpo.turn_stats import TurnAccumulator
 from surogate.grpo.weight_broadcast import SurogateWeightBroadcast
 from surogate.train.lr_schedule import LRSchedule
@@ -523,9 +523,7 @@ class GRPOTrainer:
                     sample_ranges=p["sample_ranges"],
                 )
 
-            for start, end in p["sample_ranges"]:
-                if end - start > 1:
-                    custom_dloss[i, start : end - 1] = grads[start + 1 : end]
+            custom_dloss[i] = shift_to_target(grads, p["sample_ranges"])
         custom_dloss /= loss_scale
 
         loss = float(
@@ -625,10 +623,7 @@ class GRPOTrainer:
 
         # Shift into the target layout the LM-head backward expects: the gradient
         # for logical token t is written at slot t-1 within its own sample.
-        shifted = np.zeros((1, seq_len), dtype=np.float32)
-        for start, end in sample_ranges:
-            if end - start > 1:
-                shifted[0, start : end - 1] = per_token_grads[start + 1 : end]
+        shifted = shift_to_target(per_token_grads, sample_ranges).reshape(1, seq_len)
         shifted /= loss_scale
 
         ngpu = self.config.gpus

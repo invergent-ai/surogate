@@ -176,7 +176,13 @@ CausalLMExecutionProfile::compute_doc_masking(const std::int32_t* position_ids, 
     // failure or a hang. Printing costs nothing and still puts the numbers
     // directly above the std::bad_alloc that follows, which is all the original
     // diagnosis was missing. Once per process, so a real run is not spammed.
-    if (total_q >= 128 && num_docs * 2 > total_q) {
+    // Trigger on the arena, not on document length. `num_docs * 2 > total_q`
+    // needed a mean document under two tokens, but the arena is already 17x
+    // oversized at a mean of eight and 44x at a mean of three -- both of which
+    // die with the same unexplained bad_alloc this exists to prevent. This fires
+    // once the arena exceeds ~5x the real token count, and stays quiet on real
+    // packing (a GRPO row of ~53-token samples sits at 3.4x).
+    if (total_q >= 128 && 128L * num_docs > 4L * total_q) {
         static std::once_flag warned;
         std::call_once(warned, [&] {
             std::fprintf(stderr,
