@@ -1,13 +1,13 @@
 #pragma once
 
-#include <api/targets/qwen3_6_35b_a3b/package.h>
+#include <api/targets/qwen3_6_moe/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
 #include <api/family/model_view.h>
 #include <api/family/startup_features.h>
 #include <api/family/vision.h>
 
-#include "targets/qwen3_6_35b_a3b/impl/config.h"
+#include "targets/qwen3_6_moe/impl/config.h"
 #include "artifact/binder.h"
 #include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
@@ -19,7 +19,7 @@
 #include <optional>
 #include <utility>
 
-namespace sinfer::targets::qwen3_6_35b_a3b::detail {
+namespace sinfer::targets::qwen3_6_moe::detail {
 
 inline constexpr std::size_t kTextLayers          = 40;
 inline constexpr std::size_t kFullAttentionLayers = 10;
@@ -215,4 +215,4 @@ public:
 
 SINFER_TARGET_LOADED_MODEL_IMPL();
 
-} // namespace sinfer::targets::qwen3_6_35b_a3b::detail
+} // namespace sinfer::targets::qwen3_6_moe::detail

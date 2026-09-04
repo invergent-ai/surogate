@@ -1,7 +1,7 @@
 #pragma once
 
-#include "targets/qwen3_6_27b/impl/config.h"
-#include "targets/qwen3_6_27b/impl/load/bindings.h"
+#include "targets/qwen3_6_moe/impl/config.h"
+#include "targets/qwen3_6_moe/impl/load/bindings.h"
 #include <api/family/runtime.h>
 #include <api/family/text_geometry.h>
 
@@ -9,23 +9,21 @@
 #include <cstdint>
 #include <vector>
 
-namespace sinfer::targets::qwen3_6_27b::detail {
+namespace sinfer::targets::qwen3_6_moe::detail {
 
 using GraphExecutionProfile = family::GraphExecutionProfile;
 
-// Compile-time data and the three closed execution leaves supplied to the Qwen3.6 family runtime.
-// It owns no request state, execution phase, graph object, or schedule callback.
 struct Variant {
     using WeightsProfile                 = detail::WeightsProfile;
     using TextConfig                     = detail::TextConfig;
     using VisionConfig                   = detail::VisionConfig;
     using DFlashConfig                   = detail::DFlashConfig;
     using ModelView                      = detail::RuntimeModelView;
-    using FullAttentionProjectionWeights = detail::FullAttentionProjectionPayload;
+    using FullAttentionProjectionWeights = detail::AttentionProjectionPayload;
     using GdnProjectionWeights           = detail::GdnProjectionPayload;
-    using PostMixerWeights               = detail::DensePostMixerPayload;
-    using MtpAttentionProjectionWeights  = detail::MtpAttentionPayload;
-    using MtpPostMixerWeights            = detail::DensePostMixerPayload;
+    using PostMixerWeights               = detail::SparseMoePayload;
+    using MtpAttentionProjectionWeights  = detail::AttentionProjectionPayload;
+    using MtpPostMixerWeights            = detail::SparseMoePayload;
     using VisionWeights                  = family::VisionWeights;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
@@ -37,6 +35,14 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
+
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    ordinary_graph_profiles(std::uint32_t capacity);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
+                          std::uint32_t batch_size);
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
@@ -74,10 +80,6 @@ struct Variant {
     static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                       family::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream);
-    /// Parity probe: under SUROGATE_SERVE_DUMP_RESIDUAL the family loop's tagged
-    /// intermediates are written out, numbered by the order the layers run in. A no-op
-    /// unless the variable is set.
-    static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,
@@ -87,6 +89,7 @@ struct Variant {
                            cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
+
     [[nodiscard]] static std::size_t
     mtp_attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
@@ -120,14 +123,6 @@ struct Variant {
                                         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                              std::int32_t last);
-
-    [[nodiscard]] static std::vector<GraphExecutionProfile>
-    ordinary_graph_profiles(std::uint32_t capacity);
-    [[nodiscard]] static std::vector<GraphExecutionProfile>
-    mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
-    [[nodiscard]] static std::vector<GraphExecutionProfile>
-    dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
-                          std::uint32_t batch_size);
 };
 
-} // namespace sinfer::targets::qwen3_6_27b::detail
+} // namespace sinfer::targets::qwen3_6_moe::detail

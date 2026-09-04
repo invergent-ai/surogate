@@ -7,8 +7,8 @@
 #include <api/targets/llama/package.h>
 #include <api/targets/qwen3/package.h>
 #include <api/targets/qwen3_5/package.h>
-#include <api/targets/qwen3_6_27b/package.h>
-#include <api/targets/qwen3_6_35b_a3b/package.h>
+#include <api/targets/qwen3_6/package.h>
+#include <api/targets/qwen3_6_moe/package.h>
 #include <api/targets/qwen4exp/package.h>
 
 #include <memory>
@@ -24,8 +24,8 @@ using Gemma3          = gemma3_270m::Package;
 using Llama           = llama::Package;
 using Qwen3Dense      = qwen3::Package;
 using Qwen3_5    = qwen3_5::Package;
-using Qwen3_6_27B    = qwen3_6_27b::Package;
-using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
+using Qwen3_6    = qwen3_6::Package;
+using Qwen3_6_35BA3B = qwen3_6_moe::Package;
 using Qwen38FlashNext = qwen4exp::Package;
 
 // One loaded model and one live instance, per target.
@@ -81,8 +81,8 @@ using LoadedQwen3Dense = LoadedTarget<Qwen3Dense>;
 using Qwen3DenseInstance = TargetInstance<Qwen3Dense>;
 using LoadedQwen3_5 = LoadedTarget<Qwen3_5>;
 using Qwen3_5Instance = TargetInstance<Qwen3_5>;
-using LoadedQwen3_6_27B = LoadedTarget<Qwen3_6_27B>;
-using Qwen3_6_27BInstance = TargetInstance<Qwen3_6_27B>;
+using LoadedQwen3_6 = LoadedTarget<Qwen3_6>;
+using Qwen3_6Instance = TargetInstance<Qwen3_6>;
 using LoadedQwen3_6_35BA3B = LoadedTarget<Qwen3_6_35BA3B>;
 using Qwen3_6_35BA3BInstance = TargetInstance<Qwen3_6_35BA3B>;
 using LoadedQwen38FlashNext = LoadedTarget<Qwen38FlashNext>;
@@ -90,16 +90,16 @@ using Qwen38FlashNextInstance = TargetInstance<Qwen38FlashNext>;
 
 
 using Qwen38FlashNextPipeline = runtime::PipelineInstance<Qwen38FlashNextInstance>;
-using Qwen3_6_27BPipeline     = runtime::PipelineInstance<Qwen3_6_27BInstance>;
+using Qwen3_6Pipeline     = runtime::PipelineInstance<Qwen3_6Instance>;
 using Qwen3_6_35BA3BPipeline  = runtime::PipelineInstance<Qwen3_6_35BA3BInstance>;
 
 using ActiveTarget =
     std::variant<std::unique_ptr<Gemma3Instance>, std::unique_ptr<LlamaInstance>, std::unique_ptr<Qwen3DenseInstance>,
                  std::unique_ptr<Qwen3_5Instance>,
-                 std::unique_ptr<Qwen3_6_27BInstance>,
+                 std::unique_ptr<Qwen3_6Instance>,
                  std::unique_ptr<Qwen3_6_35BA3BInstance>,
                  std::unique_ptr<Qwen38FlashNextInstance>,
-                 std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_6_27BPipeline>,
+                 std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_6Pipeline>,
                  std::unique_ptr<Qwen3_6_35BA3BPipeline>>;
 
 struct ConstructedTarget {

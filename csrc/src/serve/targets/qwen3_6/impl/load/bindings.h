@@ -1,13 +1,13 @@
 #pragma once
 
-#include <api/targets/qwen3_6_27b/package.h>
+#include <api/targets/qwen3_6/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
 #include <api/family/model_view.h>
 #include <api/family/startup_features.h>
 #include <api/family/vision.h>
 
-#include "targets/qwen3_6_27b/impl/config.h"
+#include "targets/qwen3_6/impl/config.h"
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
@@ -18,7 +18,7 @@
 #include <utility>
 #include <variant>
 
-namespace sinfer::targets::qwen3_6_27b::detail {
+namespace sinfer::targets::qwen3_6::detail {
 
 inline constexpr std::size_t kTextLayers          = 64;
 inline constexpr std::size_t kFullAttentionLayers = 16;
@@ -231,4 +231,4 @@ public:
 
 SINFER_TARGET_LOADED_MODEL_IMPL();
 
-} // namespace sinfer::targets::qwen3_6_27b::detail
+} // namespace sinfer::targets::qwen3_6::detail

@@ -1,4 +1,4 @@
-#include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
+#include "targets/qwen3_6_moe/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
 
@@ -14,7 +14,7 @@
 #include <string_view>
 #include <vector>
 
-namespace sinfer::targets::qwen3_6_35b_a3b::detail {
+namespace sinfer::targets::qwen3_6_moe::detail {
 namespace {
 
 using artifact::NumericFormat;
@@ -626,4 +626,4 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 }
 
-} // namespace sinfer::targets::qwen3_6_35b_a3b::detail
+} // namespace sinfer::targets::qwen3_6_moe::detail

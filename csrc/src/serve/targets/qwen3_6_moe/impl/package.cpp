@@ -1,22 +1,22 @@
-#include <api/targets/qwen3_6_35b_a3b/package.h>
+#include <api/targets/qwen3_6_moe/package.h>
 #include "family/impl/lora_bind.h"
 #include <api/family/frontend_resources.h>
 #include <api/family/prepared_prompt.h>
 
 #include "artifact/reader.h"
-#include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
-#include "targets/qwen3_6_35b_a3b/impl/variant.h"
+#include "targets/qwen3_6_moe/impl/load/bindings.h"
+#include "targets/qwen3_6_moe/impl/variant.h"
 
 #include <stdexcept>
 #include <utility>
 
-namespace sinfer::targets::qwen3_6_35b_a3b::detail {
+namespace sinfer::targets::qwen3_6_moe::detail {
 
 SINFER_TARGET_LOAD_PIMPL();
 
-} // namespace sinfer::targets::qwen3_6_35b_a3b::detail
+} // namespace sinfer::targets::qwen3_6_moe::detail
 
-namespace sinfer::targets::qwen3_6_35b_a3b {
+namespace sinfer::targets::qwen3_6_moe {
 namespace {
 
 constexpr ModelSamplingDefaults kQwen3_6_35BA3BDefaults{
@@ -118,4 +118,4 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 
-} // namespace sinfer::targets::qwen3_6_35b_a3b
+} // namespace sinfer::targets::qwen3_6_moe

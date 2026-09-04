@@ -1376,8 +1376,8 @@ add_subdirectory(${SERVE_ROOT}/targets/qwen3 serve_t_qwen3 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/llama serve_t_llama EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/gemma3 serve_t_gemma3 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5 serve_t_qwen3_5 EXCLUDE_FROM_ALL)
-add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_27b serve_t_qwen3_6_27b EXCLUDE_FROM_ALL)
-add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_35b_a3b serve_t_qwen3_6_35b_a3b EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_6 serve_t_qwen3_6 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_moe serve_t_qwen3_6_moe EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen4exp serve_t_qwen4exp EXCLUDE_FROM_ALL)
 
 target_link_libraries(sinfer_engine

@@ -1,4 +1,4 @@
-#include "targets/qwen3_6_35b_a3b/impl/variant.h"
+#include "targets/qwen3_6_moe/impl/variant.h"
 
 #include "family/impl/lora_hook.h"
 #include "api/ops/attn_input_proj.h"
@@ -10,12 +10,12 @@
 #include <algorithm>
 #include <stdexcept>
 
-#define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_6_35b_a3b::detail::Variant
-#define SINFER_FAMILY_RUNTIME_NS qwen3_6_35b_a3b_runtime
+#define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_6_moe::detail::Variant
+#define SINFER_FAMILY_RUNTIME_NS qwen3_6_moe_runtime
 #include "family/impl/runtime/instantiate.h"
 #include "family/impl/runtime/target_support.h"
 
-namespace sinfer::targets::qwen3_6_35b_a3b::detail {
+namespace sinfer::targets::qwen3_6_moe::detail {
 namespace {
 
 
@@ -400,4 +400,4 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextG
                                                     last);
 }
 
-} // namespace sinfer::targets::qwen3_6_35b_a3b::detail
+} // namespace sinfer::targets::qwen3_6_moe::detail

@@ -12,8 +12,8 @@
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/kv_capacity.h"
 #include "targets/qwen4exp/impl/config.h"
-#include "targets/qwen3_6_27b/impl/config.h"
-#include "targets/qwen3_6_35b_a3b/impl/config.h"
+#include "targets/qwen3_6/impl/config.h"
+#include "targets/qwen3_6_moe/impl/config.h"
 
 #include <chrono>
 #include <cstdio>
@@ -316,13 +316,13 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
         return construct_registered<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(
             options, device, reader, load_start, Qwen3_5::target_key);
     }
-    if (identity.model_id == Qwen3_6_27B::model_id) {
-        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::target_key);
+    if (identity.model_id == Qwen3_6::model_id) {
+        return construct_registered<Qwen3_6, LoadedQwen3_6, Qwen3_6Instance>(
+            options, device, reader, load_start, Qwen3_6::target_key);
     }
-    if (identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
-        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key);
+    if (identity.model_id == Qwen3_6::qwen3_8_model_id) {
+        return construct_registered<Qwen3_6, LoadedQwen3_6, Qwen3_6Instance>(
+            options, device, reader, load_start, Qwen3_6::qwen3_8_target_key);
     }
     if (identity.model_id == Qwen38FlashNext::model_id) {
         return construct_registered<Qwen38FlashNext, LoadedQwen38FlashNext,
@@ -476,15 +476,15 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
                                   qwen4exp::detail::TextConfig::layers>(options, reader, load_start,
                                                                         Qwen38FlashNext::target_key);
     }
-    if (identity.model_id == Qwen3_6_27B::model_id || identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
-        return construct_pipeline<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance,
-                                  qwen3_6_27b::detail::TextConfig::layers>(
+    if (identity.model_id == Qwen3_6::model_id || identity.model_id == Qwen3_6::qwen3_8_model_id) {
+        return construct_pipeline<Qwen3_6, LoadedQwen3_6, Qwen3_6Instance,
+                                  qwen3_6::detail::TextConfig::layers>(
             options, reader, load_start,
-            identity.model_id == Qwen3_6_27B::model_id ? Qwen3_6_27B::target_key : Qwen3_6_27B::qwen3_8_target_key);
+            identity.model_id == Qwen3_6::model_id ? Qwen3_6::target_key : Qwen3_6::qwen3_8_target_key);
     }
     if (identity.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_pipeline<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance,
-                                  qwen3_6_35b_a3b::detail::TextConfig::layers>(options, reader, load_start,
+                                  qwen3_6_moe::detail::TextConfig::layers>(options, reader, load_start,
                                                                                Qwen3_6_35BA3B::target_key);
     }
     throw std::runtime_error("pipeline parallelism is not wired for artifact '" + identity.model_id + "'");

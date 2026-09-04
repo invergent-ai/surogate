@@ -24,7 +24,7 @@ struct ArtifactIdentity;
 struct MaterializationPlan;
 } // namespace artifact
 
-namespace targets::qwen3_6_27b {
+namespace targets::qwen3_6 {
 
 struct Package;
 
@@ -46,19 +46,19 @@ using Frontend       = family::Frontend;
 using PreparedPrompt = family::PreparedPrompt;
 using OutputSession  = family::OutputSession;
 
-SINFER_TARGET_LOAD_TYPES(qwen3_6_27b::Package);
+SINFER_TARGET_LOAD_TYPES(qwen3_6::Package);
 
 } // namespace detail
 
 struct Package {
     static constexpr std::string_view model_id           = "qwen3.6-27b";
-    static constexpr std::string_view target_key         = "qwen3_6_27b";
+    static constexpr std::string_view target_key         = "qwen3_6";
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a
     /// constant: `detail::Variant` is only forward-declared here.
     [[nodiscard]] static std::uint32_t maximum_context() noexcept;
     static constexpr std::string_view qwen3_8_model_id   = "qwen3.8-27b";
-    static constexpr std::string_view qwen3_8_target_key = "qwen3_8_27b";
+    static constexpr std::string_view qwen3_8_target_key = "qwen3_8";
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;
@@ -90,5 +90,5 @@ struct Package {
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
 };
 
-} // namespace targets::qwen3_6_27b
+} // namespace targets::qwen3_6
 } // namespace sinfer

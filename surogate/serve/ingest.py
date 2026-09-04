@@ -87,14 +87,14 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
                                "Qwen3.5", gguf_repack=True)
     if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:
         if nvfp4:
-            return ConverterTarget("qwen3_6_27b_nvfp4", "surogate.serve.convert.qwen3_6_27b.convert_nvfp4",
+            return ConverterTarget("qwen3_6_nvfp4", "surogate.serve.convert.qwen3_6_27b.convert_nvfp4",
                                    "Qwen3.6-27B (NVFP4)")
-        return ConverterTarget("qwen3_6_27b", "surogate.serve.convert.qwen3_6_27b.convert", "Qwen3.6-27B")
+        return ConverterTarget("qwen3_6", "surogate.serve.convert.qwen3_6_27b.convert", "Qwen3.6")
     if model_type == "qwen3_8" and hidden == 5120:
         if nvfp4:
-            return ConverterTarget("qwen3_8_27b_nvfp4", "surogate.serve.convert.qwen3_8_27b.convert_nvfp4",
+            return ConverterTarget("qwen3_8_nvfp4", "surogate.serve.convert.qwen3_8_27b.convert_nvfp4",
                                    "Qwen3.8-27B (NVFP4)")
-        return ConverterTarget("qwen3_8_27b", "surogate.serve.convert.qwen3_8_27b.convert", "Qwen3.8-27B")
+        return ConverterTarget("qwen3_8", "surogate.serve.convert.qwen3_8_27b.convert", "Qwen3.8")
     # Any size of the plain dense Qwen3: the artifact states its dimensions and the engine
     # binds against those, so the architecture is the gate.
     if model_type == "qwen3" and hidden > 0 and layers > 0:
@@ -104,7 +104,7 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     if model_type in ("gemma3", "gemma3_text") and hidden > 0 and layers > 0:
         return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma 3")
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
-        return ConverterTarget("qwen3_6_35b_a3b", "surogate.serve.convert.qwen3_6_35b_a3b.convert",
+        return ConverterTarget("qwen3_6_moe", "surogate.serve.convert.qwen3_6_35b_a3b.convert",
                                "Qwen3.6-35B-A3B", gguf_repack=True)
     return None
 
@@ -200,7 +200,7 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
-    repack_targets = {"qwen3_5", "qwen3_6_35b_a3b"}
+    repack_targets = {"qwen3_5", "qwen3_6_moe"}
     converter_key = serve_gguf.gguf_converter_key(gguf_path, reader)
     planner = _repack_planner(root, converter_key) if target_key in repack_targets else None
     # No-MTP variant (PATCHES.md #15): community exports may strip nextn.

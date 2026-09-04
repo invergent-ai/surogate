@@ -1,4 +1,4 @@
-#include "targets/qwen3_6_27b/impl/load/bindings.h"
+#include "targets/qwen3_6/impl/load/bindings.h"
 
 #include "artifact/typed_binding.h"
 
@@ -17,7 +17,7 @@
 #include <variant>
 #include <vector>
 
-namespace sinfer::targets::qwen3_6_27b::detail {
+namespace sinfer::targets::qwen3_6::detail {
 namespace {
 
 using artifact::NumericFormat;
@@ -48,7 +48,7 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     case WeightsProfile::Qwen38Nvfp4:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
     }
-    throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+    throw std::invalid_argument("qwen3_6: invalid weights profile");
 }
 
 std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
@@ -517,7 +517,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_qwen38_nvfp4_all_text_layers(binder, out);
         break;
     default:
-        throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+        throw std::invalid_argument("qwen3_6: invalid weights profile");
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {g.hidden});
@@ -689,4 +689,4 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 }
 
-} // namespace sinfer::targets::qwen3_6_27b::detail
+} // namespace sinfer::targets::qwen3_6::detail

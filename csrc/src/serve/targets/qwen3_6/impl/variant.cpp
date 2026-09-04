@@ -1,4 +1,4 @@
-#include "targets/qwen3_6_27b/impl/variant.h"
+#include "targets/qwen3_6/impl/variant.h"
 
 #include "core/device.h"
 #include "family/impl/lora_hook.h"
@@ -21,12 +21,12 @@
 #include <string>
 #include <vector>
 
-#define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_6_27b::detail::Variant
-#define SINFER_FAMILY_RUNTIME_NS qwen3_6_27b_runtime
+#define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_6::detail::Variant
+#define SINFER_FAMILY_RUNTIME_NS qwen3_6_runtime
 #include "family/impl/runtime/instantiate.h"
 #include "family/impl/runtime/target_support.h"
 
-namespace sinfer::targets::qwen3_6_27b::detail {
+namespace sinfer::targets::qwen3_6::detail {
 namespace {
 
 /// This family's attention head width, the same at every size it ships; how many heads there
@@ -551,7 +551,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
         return std::max(nvfp4, fp8);
     }
     }
-    throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+    throw std::invalid_argument("qwen3_6: invalid weights profile");
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
@@ -618,4 +618,4 @@ void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t st
     std::fclose(file);
 }
 
-} // namespace sinfer::targets::qwen3_6_27b::detail
+} // namespace sinfer::targets::qwen3_6::detail

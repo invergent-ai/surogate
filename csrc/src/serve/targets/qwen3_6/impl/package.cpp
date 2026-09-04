@@ -1,22 +1,22 @@
-#include <api/targets/qwen3_6_27b/package.h>
+#include <api/targets/qwen3_6/package.h>
 #include "family/impl/lora_bind.h"
 #include <api/family/frontend_resources.h>
 #include <api/family/prepared_prompt.h>
 
 #include "artifact/reader.h"
-#include "targets/qwen3_6_27b/impl/load/bindings.h"
-#include "targets/qwen3_6_27b/impl/variant.h"
+#include "targets/qwen3_6/impl/load/bindings.h"
+#include "targets/qwen3_6/impl/variant.h"
 
 #include <stdexcept>
 #include <utility>
 
-namespace sinfer::targets::qwen3_6_27b::detail {
+namespace sinfer::targets::qwen3_6::detail {
 
 SINFER_TARGET_LOAD_PIMPL();
 
-} // namespace sinfer::targets::qwen3_6_27b::detail
+} // namespace sinfer::targets::qwen3_6::detail
 
-namespace sinfer::targets::qwen3_6_27b {
+namespace sinfer::targets::qwen3_6 {
 namespace {
 
 // General-task presets published with each exact model. Keep the registrations separate even
@@ -134,4 +134,4 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 
-} // namespace sinfer::targets::qwen3_6_27b
+} // namespace sinfer::targets::qwen3_6

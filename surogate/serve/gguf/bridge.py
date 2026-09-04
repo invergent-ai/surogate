@@ -521,6 +521,11 @@ def gguf_converter_key(gguf_path: Path, reader=None):
     the module. The vendored `resources/<key>/` directories are keyed the same way.
     """
     target = gguf_target_key(gguf_path, reader)
+    #: The engine target a converter and its vendored resources belong to, where the two names
+    #: differ: one target per architecture, one converter per size it was written for.
+    per_size = {"qwen3_6": "qwen3_6_27b", "qwen3_8": "qwen3_8_27b", "qwen3_6_moe": "qwen3_6_35b_a3b"}
+    if target in per_size:
+        return per_size[target]
     if target != "qwen3_5":
         return target
     summary = read_gguf_summary(gguf_path, reader)
@@ -541,15 +546,15 @@ def gguf_target_key(gguf_path: Path, reader=None):
     hidden = int(s["hidden_size"] or 0)
     layers = int(s["num_hidden_layers"] or 0)
     if arch in ("qwen35", "qwen3_6", "qwen3_5") and hidden == 5120 and layers >= 60:
-        return "qwen3_6_27b"
+        return "qwen3_6"
     # Every size of the dense Qwen3.5 family is one target: it binds against the dimensions
     # the artifact declares.
     if arch in ("qwen35", "qwen3_5") and hidden > 0 and layers > 0:
         return "qwen3_5"
     if arch in ("qwen38", "qwen3_8") and hidden == 5120:
-        return "qwen3_8_27b"
+        return "qwen3_8"
     if arch in ("qwen35moe", "qwen3moe", "qwen3_6_moe", "qwen3_5_moe") and hidden > 0:
-        return "qwen3_6_35b_a3b"
+        return "qwen3_6_moe"
     # Dense decoders whose engine target is one compiled geometry. The gates below are that
     # geometry: a differently sized Qwen3 or Llama has no target to be served by yet, and is
     # refused with the summary rather than converted against the wrong config.
