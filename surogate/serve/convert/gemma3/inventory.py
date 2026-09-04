@@ -34,7 +34,7 @@ every one of them comes from the declaration rather than from a family habit:
   the one itself, so the artifact must hold the *unfolded* `w` — which is what
   a safetensors checkpoint already stores, so these objects pass through
   untouched.  Only a GGUF source, which stores the folded `1 + w`, has to
-  subtract; see `convert/gemma_embedding/sources.py`.
+  subtract; see `convert/gemma_embedding/recipe.py`.
 
 * **The tied head is not stored.**  Gemma 3 ties `lm_head` to the embedding and
   ships no `lm_head.weight`, so `text/output_head` is a logical role served by

@@ -475,7 +475,20 @@ BASE_RECIPE_SPECS = (
     + build_vision_recipes(2048)
 )
 DFLASH_RECIPE_SPECS = _build_dflash_recipes()
-RECIPE_SPECS = BASE_RECIPE_SPECS + DFLASH_RECIPE_SPECS
+
+
+def build_recipes(geometry=None) -> tuple[TensorRecipe, ...]:
+    """Where every artifact object comes from, for a checkpoint of this size.
+
+    The dense family reads its dimensions off the checkpoint because one target serves
+    every published size of it. This target serves 35B-A3B and nothing else -- every width
+    in this module is that checkpoint's, written out -- so the geometry is accepted for a
+    uniform call across the families and has nothing here to vary.
+    """
+    return BASE_RECIPE_SPECS + DFLASH_RECIPE_SPECS
+
+
+RECIPE_SPECS = build_recipes()
 BASE_RECIPES_BY_NAME = {item.object_name: item for item in BASE_RECIPE_SPECS}
 DFLASH_RECIPES_BY_NAME = {
     item.object_name: item for item in DFLASH_RECIPE_SPECS

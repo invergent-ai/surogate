@@ -289,13 +289,8 @@ def _repack_planner(root: Path, target_key: str):
             GgufRepackSource,
         )
         inventory = importlib.import_module(f"surogate.serve.convert.{target_key}.inventory")
-        # A converter keeps its recipes either in `recipe.py` or in `convert.py`; the
-        # dense families build both recipes and specs from the checkpoint's geometry
-        # rather than declaring one module-level set.
-        try:
-            recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.recipe")
-        except ModuleNotFoundError:
-            recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.convert")
+        # Every converter keeps its recipes in `recipe.py`, so there is one place to look.
+        recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.recipe")
         # The plan must describe *this* checkpoint, not the size the converter registers, so
         # a converter that can build from a geometry is asked to.
         geometry = _gguf_geometry(recipe, inventory, gguf_path)

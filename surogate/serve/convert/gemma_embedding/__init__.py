@@ -1,17 +1,14 @@
 """EmbeddingGemma artifact conversion target.
 
-The inventory is derived from the DSL declaration rather than restated here;
-this package supplies only the source mapping and the conversion driver.
+An encoder: one forward, no KV cache, no sampler. So the contract has no output head,
+no draft head and no MTP -- there is nothing to predict a next token with -- and the
+declaration ends at a pooled embedding instead. What the artifact does hold is in
+:mod:`inventory`, where each object comes from is in :mod:`recipe`, and
+:mod:`convert` is the driver that puts the two together.
 """
 
-from .sources import LAYER_SOURCES, MODEL_SOURCES, Source, gguf_names, source_for
-
-MODEL_ID = "embeddinggemma-300m"
-TARGET_KEY = "gemma_embedding"
-#: Every quantised object comes from Q8_0, which is W8G32_F16S bit for bit.
-WEIGHTS_ID = "w8"
-#: What the target's C++ binder must consume for the artifact to load.
-CAPABILITIES = frozenset({"text", "embedding"})
+from .inventory import CAPABILITIES, MODEL_ID, TARGET_KEY, WEIGHTS_ID
+from .recipe import LAYER_SOURCES, MODEL_SOURCES, Source, gguf_names, source_for
 
 __all__ = [
     "CAPABILITIES",

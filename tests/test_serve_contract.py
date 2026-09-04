@@ -252,6 +252,10 @@ def test_fused_serve_objects_name_their_components(emitters, target, model_dir):
 #: the inventory exactly — an inventory that grows without its recipe produces a
 #: converter that cannot build the artifact it promises.
 RECIPE_TARGETS = (
+    "qwen3",
+    "llama",
+    "gemma3",
+    "gemma_embedding",
     "qwen3_5",
     "qwen3_5_moe",
 )

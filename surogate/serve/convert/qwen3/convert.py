@@ -46,19 +46,16 @@ from surogate.serve.convert.common.gguf_repack import (
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common.recipe import (
-    Concat,
     SourcePreflight,
     TensorRecipe,
     expression_sources,
     materialize_recipe,
-    preflight_source_reader,
-    source,
 )
 from surogate.serve.convert.common.recipe import (
     validate_recipe_coverage as _validate_recipe_coverage,
 )
 
-from . import inventory
+from . import inventory, recipe
 
 RECIPE_ID = "qwen3-v1"
 
@@ -85,28 +82,11 @@ _REQUIRED_CONFIG = {
 # ---------------------------------------------------------------------------
 
 
-def geometry_from_config(config: Mapping[str, object]) -> inventory.Geometry:
-    """Read the artifact-shaping dimensions straight off `config.json`."""
-
-    hidden = int(config["hidden_size"])
-    heads = int(config["num_attention_heads"])
-    head_dim = int(config.get("head_dim") or hidden // heads)
-    return inventory.Geometry(
-        layers=int(config["num_hidden_layers"]),
-        hidden=hidden,
-        intermediate=int(config["intermediate_size"]),
-        vocab=int(config["vocab_size"]),
-        query_heads=heads,
-        kv_heads=int(config["num_key_value_heads"]),
-        head_dim=head_dim,
-    )
-
-
 def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, dict]:
     """Validate the checkpoint and summarize it for the conversion report."""
 
     family_conversion.check_members("config", config, _REQUIRED_CONFIG)
-    geometry = geometry_from_config(config)
+    geometry = recipe.geometry_from_config(config)
     # Any size of the family converts. The artifact states its own dimensions in the
     # `geometry` member and the engine binds against those, so what has to hold is that
     # the checkpoint is self-consistent -- not that it is one particular checkpoint.
@@ -148,151 +128,6 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
         "mtp_num_hidden_layers": 0,
     }
     return geometry, summary
-
-
-# ---------------------------------------------------------------------------
-# source recipe
-# ---------------------------------------------------------------------------
-
-
-def build_recipes(
-    geometry: inventory.Geometry = inventory.GEOMETRY,
-    *,
-    tied_output_head: bool = True,
-) -> tuple[TensorRecipe, ...]:
-    """Where every artifact object comes from in the checkpoint, in object order."""
-
-    hidden = geometry.hidden
-    query, kv = geometry.query_size, geometry.kv_size
-    embedding = source("model.embed_tokens.weight", (geometry.vocab, hidden))
-
-    recipes: list[TensorRecipe] = [TensorRecipe("text/token_embedding", embedding)]
-
-    for layer in range(geometry.layers):
-        src = f"model.layers.{layer}."
-        obj = f"text/layers/{layer}/"
-        recipes.extend(
-            (
-                TensorRecipe(
-                    obj + "input_norm",
-                    source(src + "input_layernorm.weight", (hidden,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/query_key_value",
-                    # Ungated attention: q | k | v, with no gate block between
-                    # k and v. The row order is the one the fused decode kernel
-                    # reads and the one `LOGICAL_ROW_VIEW_SPECS` publishes.
-                    Concat(
-                        (
-                            source(src + "self_attn.q_proj.weight", (query, hidden)),
-                            source(src + "self_attn.k_proj.weight", (kv, hidden)),
-                            source(src + "self_attn.v_proj.weight", (kv, hidden)),
-                        ),
-                        0,
-                    ),
-                ),
-                TensorRecipe(
-                    obj + "attention/query_norm",
-                    source(src + "self_attn.q_norm.weight", (geometry.head_dim,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/key_norm",
-                    source(src + "self_attn.k_norm.weight", (geometry.head_dim,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/output",
-                    source(src + "self_attn.o_proj.weight", (hidden, query)),
-                ),
-                TensorRecipe(
-                    obj + "post_attention_norm",
-                    source(src + "post_attention_layernorm.weight", (hidden,)),
-                ),
-                TensorRecipe(
-                    obj + "mlp/gate_up",
-                    Concat(
-                        (
-                            source(src + "mlp.gate_proj.weight",
-                                   (geometry.intermediate, hidden)),
-                            source(src + "mlp.up_proj.weight",
-                                   (geometry.intermediate, hidden)),
-                        ),
-                        0,
-                    ),
-                ),
-                TensorRecipe(
-                    obj + "mlp/down",
-                    source(src + "mlp.down_proj.weight", (hidden, geometry.intermediate)),
-                ),
-            )
-        )
-
-    recipes.extend(
-        (
-            TensorRecipe("text/final_norm", source("model.norm.weight", (hidden,))),
-            TensorRecipe(
-                "text/output_head",
-                # tie_word_embeddings=True: Qwen3-0.6B still ships an
-                # `lm_head.weight`, bit-identical to the embedding, but not every
-                # tied export does, so the tied path reads the embedding.
-                embedding
-                if tied_output_head
-                else source("lm_head.weight", (geometry.vocab, hidden)),
-            ),
-        )
-    )
-    return tuple(recipes)
-
-
-RECIPE_SPECS = build_recipes()
-RECIPES_BY_NAME = {recipe.object_name: recipe for recipe in RECIPE_SPECS}
-
-
-def validate_recipe_coverage() -> None:
-    _validate_recipe_coverage(RECIPE_SPECS, inventory.TENSOR_SPECS)
-
-
-def source_requirements(recipes: Sequence[TensorRecipe] = RECIPE_SPECS) -> dict:
-    requirements: dict = {}
-    for recipe in recipes:
-        for requirement in expression_sources(recipe.expression):
-            requirements.setdefault(requirement.name, requirement)
-    return requirements
-
-
-validate_recipe_coverage()
-
-
-# ---------------------------------------------------------------------------
-# checkpoint access
-# ---------------------------------------------------------------------------
-
-
-def open_reader(model_dir: str | Path) -> ShardReader:
-    """Open a sharded or single-file safetensors checkpoint.
-
-    The hybrid targets in this package are all multi-shard, so their converters
-    open by index. Qwen3-0.6B is one 1.4 GB `model.safetensors` with no index at
-    all, and a converter that only knew how to follow an index could not read it.
-    """
-
-    root = Path(model_dir)
-    index = root / "model.safetensors.index.json"
-    if index.exists():
-        return ShardReader(root)
-    single = root / "model.safetensors"
-    if single.exists():
-        return ShardReader.from_file(single)
-    raise FileNotFoundError(
-        f"{root} holds neither model.safetensors.index.json nor model.safetensors"
-    )
-
-
-def preflight_sources(
-    model_dir: str | Path,
-    recipes: Sequence[TensorRecipe] = RECIPE_SPECS,
-) -> SourcePreflight:
-    with open_reader(model_dir) as reader:
-        return preflight_source_reader(reader, recipes)
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +225,7 @@ class ConversionPreflight:
 
     @property
     def recipes_by_name(self) -> dict[str, TensorRecipe]:
-        return {recipe.object_name: recipe for recipe in self.recipes}
+        return {tensor_recipe.object_name: tensor_recipe for tensor_recipe in self.recipes}
 
 
 def preflight_inventory() -> None:
@@ -411,7 +246,7 @@ def preflight_inventory() -> None:
         raise ValueError("registered inventory does not hold the four text resources")
     if len(inventory.OBJECT_SPECS) != expected_tensors + 4:
         raise ValueError("registered object inventory is incomplete")
-    validate_recipe_coverage()
+    recipe.validate_recipe_coverage()
 
 
 def build_object_plan(
@@ -469,11 +304,11 @@ def preflight_conversion(
     # Which tensor the output head reads is a property of the checkpoint, not of
     # the target, so the recipe is rebuilt for the checkpoint in hand rather than
     # the module-level one being used blind.
-    recipes = build_recipes(geometry, tied_output_head=tied)
+    recipes = recipe.build_recipes(geometry, tied_output_head=tied)
     _validate_recipe_coverage(recipes, inventory.build_tensor_specs(geometry))
     # Repacked objects read the GGUF directly; only what remains needs a bridged source.
     remaining = tuple(r for r in recipes if r.object_name not in planned) if planned else recipes
-    source_preflight = preflight_sources(model, remaining)
+    source_preflight = recipe.preflight_sources(model, remaining)
     resources = load_resources(model)
     plan = build_object_plan({item.name: item.data for item in resources}, geometry,
                              native=native, object_specs=object_specs)
@@ -573,8 +408,8 @@ def convert(
     geometry, _ = validate_config(config)
     recipes = {
         r.object_name: r
-        for r in build_recipes(geometry,
-                               tied_output_head=bool(config.get("tie_word_embeddings", False)))
+        for r in recipe.build_recipes(
+            geometry, tied_output_head=bool(config.get("tie_word_embeddings", False)))
     }
     tensor_specs = inventory.build_tensor_specs(geometry)
     object_specs = inventory.build_object_specs(geometry)
@@ -628,7 +463,7 @@ def convert(
             first += rows
     resources = {item.name: item.data for item in preflight.resources}
     recipes = preflight.recipes_by_name
-    with open_reader(model) as reader:
+    with recipe.open_reader(model) as reader:
         with ArtifactWriter(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),

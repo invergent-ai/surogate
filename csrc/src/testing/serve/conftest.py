@@ -9,6 +9,8 @@ does not have it.
 import pathlib
 import sys
 
+# Appended, not prepended: this directory holds `convert`, `artifact`, `gguf` and other
+# names a test may legitimately import from elsewhere, and putting it first would shadow them.
 _SERVE = pathlib.Path(__file__).resolve().parents[4] / "surogate" / "serve"
 if str(_SERVE) not in sys.path:
-    sys.path.insert(0, str(_SERVE))
+    sys.path.append(str(_SERVE))
