@@ -378,13 +378,17 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 
     try {
         const auto acquisition_started = Clock::now();
-        std::size_t remaining_media_bytes =
-            std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
-        sinfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+        // A raw prompt carries no content parts, so there is nothing to acquire and no
+        // template to render: the text is tokenized as written.
+        std::optional<sinfer::PromptInput> input;
+        if (!request.raw_prompt.has_value()) {
+            std::size_t remaining_media_bytes =
+                std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
+            input = to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
             });
+        }
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
@@ -392,7 +396,9 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
         };
-        sinfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
+        sinfer::PreparedPrompt prompt = request.raw_prompt.has_value()
+                                            ? engine_->prepare_text(*request.raw_prompt)
+                                            : engine_->prepare(std::move(*input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();

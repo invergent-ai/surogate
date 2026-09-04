@@ -76,6 +76,14 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
 
+    /// A prompt served exactly as written, with no chat template: what `/v1/completions` sends,
+    /// and the only shape a base model can be asked anything in.
+    [[nodiscard]] PreparedPrompt prepare_text(std::string_view text,
+                                              bool allow_prefix_identity = true) const;
+    /// Whether the loaded artifact carries a chat template. False for a base model, and the
+    /// chat-shaped endpoints refuse rather than render nothing.
+    [[nodiscard]] bool supports_chat() const;
+
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;

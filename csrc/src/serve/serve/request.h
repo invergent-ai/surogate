@@ -166,6 +166,10 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 
 struct GenerationRequest {
     std::string model;
+    /// A `/v1/completions` prompt, served exactly as written with no chat template. Set for a
+    /// completion request and empty for a chat one; the two are the same request otherwise, so
+    /// everything below -- sampling, stops, streaming, adapters, limits -- is shared.
+    std::optional<std::string> raw_prompt;
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;

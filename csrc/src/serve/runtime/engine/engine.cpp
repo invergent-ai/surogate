@@ -258,6 +258,37 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
         impl_->active);
 }
 
+PreparedPrompt Engine::prepare_text(std::string_view text, bool allow_prefix_identity) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& target_ptr) -> PreparedPrompt {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            auto prepared =
+                target_ptr->loaded->frontend.prepare_text(text, allow_prefix_identity);
+            PromptSummary info = prepared.summary();
+            if (info.prompt_tokens > target_ptr->capacity) {
+                throw RequestError(
+                    RequestErrorKind::ContextLengthExceeded,
+                    context_capacity_error(info.prompt_tokens, target_ptr->capacity));
+            }
+            const PromptPreparationStats preparation = prepared.preparation_stats();
+            // A raw prompt has no reasoning turn to resume, so the session starts outside one.
+            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+                info, preparation, SamplingMode::NonThinking, std::move(prepared)));
+        },
+        impl_->active);
+}
+
+bool Engine::supports_chat() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& target_ptr) -> bool {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.supports_chat();
+        },
+        impl_->active);
+}
+
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                                       bool allow_prefix_identity) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }

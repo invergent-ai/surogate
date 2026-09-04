@@ -45,6 +45,7 @@ public:
 private:
     void register_routes();
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
+    void handle_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_responses(const httplib::Request& req, httplib::Response& res);

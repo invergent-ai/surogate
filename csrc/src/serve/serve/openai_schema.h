@@ -26,6 +26,27 @@ GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
 
 std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
 
+// Parse a /v1/completions body. The prompt is carried verbatim in
+// `GenerationRequest::raw_prompt`; everything else -- sampling, stops, streaming, the token
+// budget -- is the same request a chat call makes, so the two share one type.
+GenerationRequest parse_completion_request(const nlohmann::json& body,
+                                           const RequestLimits& limits);
+
+// Non-streaming /v1/completions body, and its streaming chunks. The shape differs from chat
+// in more than a name: a choice carries `text` rather than a message, and there is no role.
+std::string make_completion_response(const std::string& id, const std::string& model,
+                                     std::int64_t created, const std::string& text,
+                                     const char* finish_reason, const CompletionUsage& usage);
+std::string make_completion_chunk_text(const std::string& id, const std::string& model,
+                                       std::int64_t created, const std::string& delta_text,
+                                       bool include_usage);
+std::string make_completion_chunk_final(const std::string& id, const std::string& model,
+                                        std::int64_t created, const char* finish_reason,
+                                        bool include_usage);
+std::string make_completion_chunk_usage(const std::string& id, const std::string& model,
+                                        std::int64_t created, const CompletionUsage& usage);
+std::string new_completion_id();
+
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style
 // convention consumed by Chatbox, Open WebUI, etc.), leaving `content` = answer.

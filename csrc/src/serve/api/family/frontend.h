@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <memory>
 #include <span>
 #include <vector>
@@ -137,6 +138,18 @@ public:
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
+    /// A prompt served exactly as written, with no chat template applied.
+    ///
+    /// This is what `/v1/completions` sends and what a base model needs: a checkpoint that was
+    /// never taught a turn structure has no template to render, and one that has a template
+    /// still answers a raw continuation when asked for one. Tokenization is the tokenizer's
+    /// own, so a SentencePiece checkpoint gets the leading BOS its encoder adds and a BPE one
+    /// does not, matching what each produces on the chat path.
+    [[nodiscard]] PreparedPrompt prepare_text(std::string_view text,
+                                              bool allow_prefix_identity = true) const;
+    /// Whether this artifact carries a chat template, and so whether the chat-shaped
+    /// endpoints have anything to render with.
+    [[nodiscard]] bool supports_chat() const noexcept;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,

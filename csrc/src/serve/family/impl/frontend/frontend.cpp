@@ -732,7 +732,9 @@ public:
                                              // build it exactly when this frontend has no hand-written
                                              // reproduction of the template to fall back on.
                                              .render_chat_template = chat_template.rendered_by_tokenizer()})),
-          processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
+          processor(processor_options(resources)), vision_enabled(options.vision_enabled),
+          has_chat_template(!resources.chat_template_jinja.empty() ||
+                            !options.chat_template_override.empty()) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
@@ -769,6 +771,9 @@ public:
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     bool vision_enabled = true;
+    /// Whether anything was compiled above. A checkpoint with no template is a base model, and
+    /// only the raw-prompt path can serve it.
+    bool has_chat_template = true;
 };
 
 class OutputSession::Impl {
@@ -1167,6 +1172,21 @@ MediaCacheSummary Frontend::media_cache_summary() const {
         .evictions           = stats.evictions,
         .oversize_bypasses   = stats.oversize_bypasses,
     };
+}
+
+bool Frontend::supports_chat() const noexcept { return impl_->has_chat_template; }
+
+PreparedPrompt Frontend::prepare_text(std::string_view text, bool allow_prefix_identity) const {
+    const auto start = Clock::now();
+    std::vector<int> encoded = impl_->tokenizer->encode(text);
+    (void)checked_token_count(encoded.size());
+    auto prepared              = std::make_unique<PreparedPromptData>();
+    PreparedPromptData& result = *prepared;
+    result.token_ids.assign(encoded.begin(), encoded.end());
+    assign_text_positions(result);
+    result.identity.reusable = allow_prefix_identity;
+    result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
+    return PreparedPrompt(std::move(prepared));
 }
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
