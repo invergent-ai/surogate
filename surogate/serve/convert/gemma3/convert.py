@@ -79,6 +79,7 @@ from surogate.serve.convert.common.gguf_repack import (
 )
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
+from surogate.serve.convert.common import official_resources
 from surogate.serve.convert.common.recipe import (
     SourcePreflight,
     TensorRecipe,
@@ -384,7 +385,7 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     """
 
     root = Path(model_dir)
-    template = _chat_template(root)
+    template = official_resources.chat_template_bytes(root)
     payloads: list[ResourcePayload] = []
     for spec in inventory.RESOURCE_SPECS:
         filename = spec.name.removeprefix("frontend/")
@@ -411,24 +412,6 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     return tuple(payloads)
 
 
-def _chat_template(root: Path) -> bytes:
-    """The template the artifact serves, from whichever place the release states it.
-
-    Written out verbatim, with no added trailing newline: the engine compares it
-    byte for byte against the copy in `tokenizer_config.json`.
-    """
-
-    path = root / "chat_template.jinja"
-    if path.exists():
-        return path.read_bytes()
-    config = json.loads((root / "tokenizer_config.json").read_text(encoding="utf-8"))
-    template = config.get("chat_template")
-    if not isinstance(template, str) or not template:
-        raise ValueError(
-            "checkpoint publishes neither chat_template.jinja nor "
-            "tokenizer_config.json.chat_template; the engine needs one"
-        )
-    return template.encode("utf-8")
 
 
 def _tokenizer_config_with_template(raw: bytes, template: bytes) -> bytes:

@@ -44,7 +44,7 @@ from surogate.serve.convert.common.gguf_repack import (
     half_names,
 )
 from surogate.serve.convert.common.safetensors import ShardReader
-from surogate.serve.convert.common import conversion as family_conversion
+from surogate.serve.convert.common import official_resources, conversion as family_conversion
 from surogate.serve.convert.common.recipe import (
     SourcePreflight,
     TensorRecipe,
@@ -152,7 +152,7 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
         if path.exists():
             data = path.read_bytes()
         elif filename == "chat_template.jinja":
-            data = _chat_template_from_tokenizer_config(root)
+            data = official_resources.chat_template_bytes(root)
         elif filename == "generation_config.json":
             data = family_conversion._synthesize_generation_config(root)  # noqa: SLF001
         else:
@@ -197,15 +197,6 @@ def geometry_block(preflight: "ConversionPreflight", root: Path) -> dict[str, fl
     }
 
 
-def _chat_template_from_tokenizer_config(root: Path) -> bytes:
-    config = json.loads((root / "tokenizer_config.json").read_text(encoding="utf-8"))
-    template = config.get("chat_template")
-    if not isinstance(template, str) or not template:
-        raise ValueError(
-            "checkpoint publishes neither chat_template.jinja nor "
-            "tokenizer_config.json.chat_template; the engine needs one"
-        )
-    return template.encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +251,6 @@ def build_object_plan(
     if native:
         object_specs = GgufRepackSource.native_specs(object_specs, native)
     return family_conversion.build_object_plan(object_specs, resources)
-
 
 
 def plan_repack(repack, recipes_by_name, tensor_specs, native=None) -> tuple[str, ...]:
