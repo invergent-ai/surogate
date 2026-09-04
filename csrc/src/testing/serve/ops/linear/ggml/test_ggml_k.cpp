@@ -96,6 +96,9 @@ QType qtype_of(gg::GgmlType type) {
     case gg::GgmlType::Q8_0: return QType::Q8_0;
     case gg::GgmlType::Q4_1: return QType::Q4_1;
     case gg::GgmlType::Q5_1: return QType::Q5_1;
+    case gg::GgmlType::IQ4_NL: return QType::IQ4_NL;
+    case gg::GgmlType::Q4_0: return QType::Q4_0;
+    case gg::GgmlType::Q5_0: return QType::Q5_0;
     }
     return QType::Q4_K;
 }
@@ -435,7 +438,9 @@ int main() {
     int failures = 0, cases = 0;
     const gg::GgmlType types[] = {gg::GgmlType::Q2_K, gg::GgmlType::Q3_K, gg::GgmlType::Q4_K,
                                   gg::GgmlType::Q5_K, gg::GgmlType::Q6_K, gg::GgmlType::Q8_0,
-                                  gg::GgmlType::Q4_1, gg::GgmlType::Q5_1};
+                                  gg::GgmlType::Q4_1, gg::GgmlType::Q5_1,
+                                  gg::GgmlType::IQ4_NL, gg::GgmlType::Q4_0,
+                                  gg::GgmlType::Q5_0};
     for (const gg::GgmlType type : types) {
         for (const char* label : {"synthetic", "odd", "real", "big"}) {
             Fixture f;

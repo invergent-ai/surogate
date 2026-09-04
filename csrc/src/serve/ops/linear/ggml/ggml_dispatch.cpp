@@ -26,6 +26,9 @@ bool is_ggml_qtype(QType qtype) noexcept {
     case QType::Q8_0:
     case QType::Q4_1:
     case QType::Q5_1:
+    case QType::IQ4_NL:
+    case QType::Q4_0:
+    case QType::Q5_0:
         return true;
     default:
         return false;
@@ -42,6 +45,9 @@ GgmlType ggml_type_for(QType qtype) {
     case QType::Q8_0: return GgmlType::Q8_0;
     case QType::Q4_1: return GgmlType::Q4_1;
     case QType::Q5_1: return GgmlType::Q5_1;
+    case QType::IQ4_NL: return GgmlType::IQ4_NL;
+    case QType::Q4_0: return GgmlType::Q4_0;
+    case QType::Q5_0: return GgmlType::Q5_0;
     default: break;
     }
     throw std::invalid_argument("ggml: weight qtype is not a GGML block format");

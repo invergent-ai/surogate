@@ -37,6 +37,9 @@ enum class NumericFormat {
     Q8_0,
     Q4_1,
     Q5_1,
+    IQ4_NL,
+    Q4_0,
+    Q5_0,
 };
 
 enum class StorageLayout {

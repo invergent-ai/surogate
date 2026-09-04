@@ -16,11 +16,11 @@ REAL = pathlib.Path(os.environ.get("SINFER_GGML_FIXTURE_GGUF", "models/Qwen3.5-0
 HALF_FIELDS = {  # byte offsets of the fp16 super-scales inside each block
     T.Q2_K: (80, 82), T.Q3_K: (108,), T.Q4_K: (0, 2), T.Q5_K: (0, 2), T.Q6_K: (208,),
     # Q4_1/Q5_1 are 32-value blocks, not superblocks: (d, m) sit at the front of each.
-    T.Q4_1: (0, 2), T.Q5_1: (0, 2), T.Q8_0: (0,),
+    T.Q4_1: (0, 2), T.Q5_1: (0, 2), T.Q8_0: (0,), T.IQ4_NL: (0,), T.Q4_0: (0,), T.Q5_0: (0,),
 }
 
 #: Values a block of each type holds. Only the K-quants are superblocks.
-BLOCK_VALUES = {T.Q4_1: 32, T.Q5_1: 32, T.Q8_0: 32}
+BLOCK_VALUES = {T.Q4_1: 32, T.Q5_1: 32, T.Q8_0: 32, T.IQ4_NL: 32, T.Q4_0: 32, T.Q5_0: 32}
 
 def synthetic(t: T, n: int, k: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
@@ -39,7 +39,7 @@ def write(t: T, blocks: np.ndarray, n: int, k: int, label: str) -> None:
     blocks.tofile(stem.with_suffix(".blocks")); f32.tofile(stem.with_suffix(".f32"))
     print(f"  {stem.name:<22} [{n},{k}]  {blocks.nbytes/1e6:6.2f} MB blocks")
 
-for i, t in enumerate((T.Q2_K, T.Q3_K, T.Q4_K, T.Q5_K, T.Q6_K, T.Q8_0, T.Q4_1, T.Q5_1)):
+for i, t in enumerate((T.Q2_K, T.Q3_K, T.Q4_K, T.Q5_K, T.Q6_K, T.Q8_0, T.Q4_1, T.Q5_1, T.IQ4_NL, T.Q4_0, T.Q5_0)):
     write(t, synthetic(t, 256, 2048, 100 + i), 256, 2048, "synthetic")
     write(t, synthetic(t, 63, 512, 200 + i), 63, 512, "odd")   # odd row count: the 2-row CTA's guard
 if REAL.exists():
@@ -47,7 +47,7 @@ if REAL.exists():
     seen = set()
     for tensor in r.tensors:
         t = tensor.tensor_type
-        if t.name in ("Q4_K", "Q5_K", "Q6_K", "Q8_0", "Q4_1", "Q5_1") and t not in seen and len(tensor.shape) == 2:
+        if t.name in ("Q4_K", "Q5_K", "Q6_K", "Q8_0", "Q4_1", "Q5_1", "IQ4_NL", "Q4_0", "Q5_0") and t not in seen and len(tensor.shape) == 2:
             k, n = int(tensor.shape[0]), int(tensor.shape[1])
             rows = min(n, 512)
             data = np.asarray(tensor.data).reshape(n, -1)[:rows]

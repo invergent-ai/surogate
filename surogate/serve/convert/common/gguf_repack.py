@@ -131,8 +131,10 @@ def _planes_iq4_nl(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 # 256. The additive minimum is what keeps them out of REPACKABLE_TYPES: W8 has a scale and
 # nowhere to put a min, so they are served as the file holds them or not at all.
 NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210, "Q8_0": 34,
-                "Q4_1": 20, "Q5_1": 24}
-NATIVE_BLOCK_VALUES = {"Q8_0": 32, "Q4_1": 32, "Q5_1": 32}
+                "Q4_1": 20, "Q5_1": 24, "IQ4_NL": 18,
+                "Q4_0": 18, "Q5_0": 22}
+NATIVE_BLOCK_VALUES = {"Q8_0": 32, "Q4_1": 32, "Q5_1": 32, "IQ4_NL": 32, "Q4_0": 32,
+                       "Q5_0": 32}
 
 
 def native_block_values(gguf_type: str) -> int:

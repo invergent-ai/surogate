@@ -181,6 +181,93 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     return d*sumf;
 }
 
+// Q4_0 / Q5_0 against the int8 activation block. The bias is the affine term again in disguise:
+// `w = d*(q - c)` gives `d*dy*(sum(q*u) - c*sum(u))`, and the activation-quant sum is taken
+// exactly with dp4a rather than read from the fp16 sum, for the reason given below.
+__device__ __forceinline__ float vec_dot_q4_0_q8_1(const void* __restrict__ vbq,
+                                                   const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q4_0* bq = static_cast<const block_q4_0*>(vbq) + kbx;
+    int sumi             = 0;
+    int sumu             = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_Q4_0_Q8_1_MMVQ; ++i) {
+        const int v   = get_int_b2(bq->qs, iqs + i);
+        const int u0  = get_int_b4(bq8_1->qs, iqs + i);
+        const int u1  = get_int_b4(bq8_1->qs, iqs + i + QI4_0);
+        sumi          = __dp4a((v >> 0) & 0x0F0F0F0F, u0, sumi);
+        sumi          = __dp4a((v >> 4) & 0x0F0F0F0F, u1, sumi);
+        sumu          = __dp4a(0x01010101, u0, sumu);
+        sumu          = __dp4a(0x01010101, u1, sumu);
+    }
+    return __half2float(bq->d) * __half2float(__low2half(bq8_1->ds)) *
+           static_cast<float>(sumi - 8 * sumu);
+}
+
+__device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* __restrict__ vbq,
+                                                   const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q5_0* bq = static_cast<const block_q5_0*>(vbq) + kbx;
+    int sumi             = 0;
+    int sumu             = 0;
+#pragma unroll
+    for (int i = 0; i < VDR_Q5_0_Q8_1_MMVQ; ++i) {
+        const int vl = get_int_b2(bq->qs, iqs + i);
+        const int vh = get_int_b2(bq->qh, 0) >> (4 * (iqs + i));
+        const int u0 = get_int_b4(bq8_1->qs, iqs + i);
+        const int u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_0);
+
+        int vi0 = (vl >> 0) & 0x0F0F0F0F;
+        vi0 |= (vh << 4) & 0x00000010;
+        vi0 |= (vh << 11) & 0x00001000;
+        vi0 |= (vh << 18) & 0x00100000;
+        vi0 |= (vh << 25) & 0x10000000;
+        sumi = __dp4a(vi0, u0, sumi);
+
+        int vi1 = (vl >> 4) & 0x0F0F0F0F;
+        vi1 |= (vh >> 12) & 0x00000010;
+        vi1 |= (vh >> 5) & 0x00001000;
+        vi1 |= (vh << 2) & 0x00100000;
+        vi1 |= (vh << 9) & 0x10000000;
+        sumi = __dp4a(vi1, u1, sumi);
+
+        sumu = __dp4a(0x01010101, u0, sumu);
+        sumu = __dp4a(0x01010101, u1, sumu);
+    }
+    return __half2float(bq->d) * __half2float(__low2half(bq8_1->ds)) *
+           static_cast<float>(sumi - 16 * sumu);
+}
+
+// IQ4_NL against the int8 activation block. Four nibbles at a time become four int8 levels
+// through the table, and from there it is the same dp4a dot every other type does; the table
+// lookup is the only thing between this and Q4_0.
+__device__ __forceinline__ int2 iq4_nl_levels(int q4) {
+    const int lo = (q4 >> 0) & 0x0F0F0F0F;
+    const int hi = (q4 >> 4) & 0x0F0F0F0F;
+    const auto* lo8 = reinterpret_cast<const std::int8_t*>(&lo);
+    const auto* hi8 = reinterpret_cast<const std::int8_t*>(&hi);
+    const char4 v0 = make_char4(kIq4nlValues[lo8[0]], kIq4nlValues[lo8[1]], kIq4nlValues[lo8[2]],
+                                kIq4nlValues[lo8[3]]);
+    const char4 v1 = make_char4(kIq4nlValues[hi8[0]], kIq4nlValues[hi8[1]], kIq4nlValues[hi8[2]],
+                                kIq4nlValues[hi8[3]]);
+    return make_int2(*reinterpret_cast<const int*>(&v0), *reinterpret_cast<const int*>(&v1));
+}
+
+__device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vbq,
+                                                     const block_q8_1* __restrict__ bq8_1,
+                                                     const int& kbx, const int& iqs) {
+    const block_iq4_nl* bq = static_cast<const block_iq4_nl*>(vbq) + kbx;
+    int sumi               = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_IQ4_NL_Q8_1_MMVQ; ++l) {
+        // `qs` sits at a two-byte offset behind the scale, so the reads are two-byte aligned.
+        const int2 v = iq4_nl_levels(get_int_b2(bq->qs, iqs + l));
+        sumi         = __dp4a(v.x, get_int_b4(bq8_1->qs, iqs + l), sumi);
+        sumi         = __dp4a(v.y, get_int_b4(bq8_1->qs, iqs + l + QI4_NL), sumi);
+    }
+    return __half2float(bq->d) * __half2float(__low2half(bq8_1->ds)) * static_cast<float>(sumi);
+}
+
 // Q4_1 / Q5_1 against the int8 activation block. The affine term is what makes these different
 // from every other type here: `w = d*q + m`, so with the activation `y = dy*u` the dot is
 // `d*dy * sum(q*u)  +  m*dy * sum(u)`.

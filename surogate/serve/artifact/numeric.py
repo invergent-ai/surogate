@@ -62,8 +62,10 @@ class GgmlBlockFormat:
     """A GGML block format kept as the GGUF stores it.
 
     Every K-quant is a 256-value superblock. The rest are plain 32-value blocks: Q8_0 with one
-    scale, and Q4_1/Q5_1 with a scale and an additive minimum, which is the shape a quantiser
-    reaches for when the reduction axis is not a multiple of 256 and no superblock fits.
+    scale, Q4_1/Q5_1 with a scale and an additive minimum, and IQ4_NL whose four-bit codes index
+    a sixteen-entry table of int8 levels rather than standing for themselves. A quantiser
+    reaches for a 32-value block when the reduction axis is not a multiple of 256 and no
+    superblock fits.
     """
 
     name: str
@@ -79,6 +81,9 @@ Q6_K = GgmlBlockFormat("Q6_K", 6.5625, 210)
 Q8_0 = GgmlBlockFormat("Q8_0", 8.5, 34, 32)
 Q4_1 = GgmlBlockFormat("Q4_1", 5.0, 20, 32)
 Q5_1 = GgmlBlockFormat("Q5_1", 6.0, 24, 32)
+IQ4_NL = GgmlBlockFormat("IQ4_NL", 4.5, 18, 32)
+Q4_0 = GgmlBlockFormat("Q4_0", 4.5, 18, 32)
+Q5_0 = GgmlBlockFormat("Q5_0", 5.5, 22, 32)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -95,7 +100,7 @@ FP8_ROW_FORMATS = MappingProxyType(
     {FP8_E4M3FN_ROW_BF16S.name: FP8_E4M3FN_ROW_BF16S}
 )
 GGML_BLOCK_FORMATS = MappingProxyType(
-    {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1)}
+    {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0)}
 )
 NUMERIC_FORMATS = MappingProxyType(
     {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **GGML_BLOCK_FORMATS}
@@ -186,6 +191,9 @@ __all__ = [
     "Q8_0",
     "Q4_1",
     "Q5_1",
+    "IQ4_NL",
+    "Q4_0",
+    "Q5_0",
     "BF16",
     "DIRECT_FORMATS",
     "DirectFormat",

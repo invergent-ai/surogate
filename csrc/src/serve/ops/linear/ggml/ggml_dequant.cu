@@ -47,6 +47,9 @@ void dequantize_rows_launch(GgmlType type, const void* blocks, std::int32_t rows
     case GgmlType::Q8_0: launch<GgmlType::Q8_0>(blocks, rows, k, out, stream); return;
     case GgmlType::Q4_1: launch<GgmlType::Q4_1>(blocks, rows, k, out, stream); return;
     case GgmlType::Q5_1: launch<GgmlType::Q5_1>(blocks, rows, k, out, stream); return;
+    case GgmlType::IQ4_NL: launch<GgmlType::IQ4_NL>(blocks, rows, k, out, stream); return;
+    case GgmlType::Q4_0: launch<GgmlType::Q4_0>(blocks, rows, k, out, stream); return;
+    case GgmlType::Q5_0: launch<GgmlType::Q5_0>(blocks, rows, k, out, stream); return;
     }
     throw std::invalid_argument("ggml dequantize_rows: unknown GGML type");
 }

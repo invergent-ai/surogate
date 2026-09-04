@@ -70,6 +70,12 @@ void mmvq_launch(GgmlType type, const void* blocks, std::int32_t n, std::int32_t
         return;
     case GgmlType::Q5_1: launch_columns<GgmlType::Q5_1, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
         return;
+    case GgmlType::IQ4_NL: launch_columns<GgmlType::IQ4_NL, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
+        return;
+    case GgmlType::Q4_0: launch_columns<GgmlType::Q4_0, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
+        return;
+    case GgmlType::Q5_0: launch_columns<GgmlType::Q5_0, DstT, Accumulate>(blocks, n, k, y, tokens, out, stream);
+        return;
     }
     throw std::invalid_argument("mmvq: unknown GGML type");
 }

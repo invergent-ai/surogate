@@ -54,6 +54,11 @@ enum class QType : std::uint16_t {
     /// 256, so no superblock fits a row.
     Q4_1                 = 15,
     Q5_1                 = 16,
+    /// Four-bit codes indexing a sixteen-entry table of int8 levels, one scale per 32. The
+    /// codes do not stand for themselves, which is the whole of what separates it from Q4_0.
+    IQ4_NL               = 17,
+    Q4_0                 = 18,
+    Q5_0                 = 19,
 };
 
 enum class QuantLayout : std::uint16_t {

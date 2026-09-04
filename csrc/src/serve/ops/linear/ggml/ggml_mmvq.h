@@ -9,11 +9,12 @@
 
 namespace sinfer::ops::detail::ggml {
 
-enum class GgmlType : std::uint8_t { Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1 };
+enum class GgmlType : std::uint8_t { Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0 };
 
 /// Values per stored block: 256 for every K-quant, 32 for Q8_0, which has no superblock.
 __host__ __device__ constexpr std::int32_t block_values(GgmlType type) noexcept {
-    return (type == GgmlType::Q8_0 || type == GgmlType::Q4_1 || type == GgmlType::Q5_1)
+    return (type == GgmlType::Q8_0 || type == GgmlType::Q4_1 || type == GgmlType::Q5_1 ||
+            type == GgmlType::IQ4_NL || type == GgmlType::Q4_0 || type == GgmlType::Q5_0)
                ? QK8_0
                : QK_K;
 }
@@ -28,6 +29,9 @@ __host__ __device__ constexpr std::int32_t block_bytes(GgmlType type) noexcept {
     case GgmlType::Q8_0: return sizeof(block_q8_0);
     case GgmlType::Q4_1: return sizeof(block_q4_1);
     case GgmlType::Q5_1: return sizeof(block_q5_1);
+    case GgmlType::IQ4_NL: return sizeof(block_iq4_nl);
+    case GgmlType::Q4_0: return sizeof(block_q4_0);
+    case GgmlType::Q5_0: return sizeof(block_q5_0);
     }
     return 0;
 }
@@ -41,6 +45,9 @@ constexpr const char* type_name(GgmlType type) noexcept {
     case GgmlType::Q8_0: return "Q8_0";
     case GgmlType::Q4_1: return "Q4_1";
     case GgmlType::Q5_1: return "Q5_1";
+    case GgmlType::IQ4_NL: return "IQ4_NL";
+    case GgmlType::Q4_0: return "Q4_0";
+    case GgmlType::Q5_0: return "Q5_0";
     }
     return "?";
 }

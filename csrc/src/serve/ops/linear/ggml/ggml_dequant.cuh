@@ -23,6 +23,9 @@ __host__ __device__ constexpr int dequant_threads() {
     if constexpr (type == GgmlType::Q8_0) { return QK8_0; }
     if constexpr (type == GgmlType::Q4_1) { return QK4_1; }
     if constexpr (type == GgmlType::Q5_1) { return QK5_1; }
+    if constexpr (type == GgmlType::IQ4_NL) { return QK4_NL; }
+    if constexpr (type == GgmlType::Q4_0) { return QK4_0; }
+    if constexpr (type == GgmlType::Q5_0) { return QK5_0; }
     return type == GgmlType::Q4_K ? 32 : 64;
 }
 
@@ -212,6 +215,41 @@ __device__ __forceinline__ void dequantize_q5_1(const void* blocks, std::int64_t
     }
 }
 
+/// One value per lane: Q4_0 and Q5_0, whose codes are biased by half their range.
+template <typename dst_t>
+__device__ __forceinline__ void dequantize_q4_0(const void* blocks, std::int64_t ib, dst_t* out,
+                                                int tid) {
+    const block_q4_0* x = static_cast<const block_q4_0*>(blocks) + ib;
+    if (tid < QK4_0) {
+        const int q = (tid < QK4_0 / 2) ? (x->qs[tid] & 0x0F) : (x->qs[tid - QK4_0 / 2] >> 4);
+        out[tid]    = cast_to<dst_t>(__half2float(x->d) * static_cast<float>(q - 8));
+    }
+}
+
+template <typename dst_t>
+__device__ __forceinline__ void dequantize_q5_0(const void* blocks, std::int64_t ib, dst_t* out,
+                                                int tid) {
+    const block_q5_0* x = static_cast<const block_q5_0*>(blocks) + ib;
+    if (tid < QK5_0) {
+        std::uint32_t qh;
+        memcpy(&qh, x->qh, sizeof(qh));
+        const int low  = (tid < QK5_0 / 2) ? (x->qs[tid] & 0x0F) : (x->qs[tid - QK5_0 / 2] >> 4);
+        const int high = static_cast<int>((qh >> tid) & 1u) << 4;
+        out[tid]       = cast_to<dst_t>(__half2float(x->d) * static_cast<float>((low | high) - 16));
+    }
+}
+
+/// One value per lane: an IQ4_NL block, each nibble a table index rather than a magnitude.
+template <typename dst_t>
+__device__ __forceinline__ void dequantize_iq4_nl(const void* blocks, std::int64_t ib, dst_t* out,
+                                                  int tid) {
+    const block_iq4_nl* x = static_cast<const block_iq4_nl*>(blocks) + ib;
+    if (tid < QK4_NL) {
+        const int code = (tid < QK4_NL / 2) ? (x->qs[tid] & 0x0F) : (x->qs[tid - QK4_NL / 2] >> 4);
+        out[tid] = cast_to<dst_t>(__half2float(x->d) * static_cast<float>(kIq4nlValues[code]));
+    }
+}
+
 /// One 256-value superblock `ib` of a K-quant array into `out`, by the calling CTA's threads.
 template <GgmlType type, typename dst_t>
 __device__ __forceinline__ void dequantize_superblock(const void* blocks, std::int64_t ib,
@@ -224,6 +262,9 @@ __device__ __forceinline__ void dequantize_superblock(const void* blocks, std::i
     if constexpr (type == GgmlType::Q8_0) { dequantize_q8_0(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q4_1) { dequantize_q4_1(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q5_1) { dequantize_q5_1(blocks, ib, out, tid); }
+    if constexpr (type == GgmlType::IQ4_NL) { dequantize_iq4_nl(blocks, ib, out, tid); }
+    if constexpr (type == GgmlType::Q4_0) { dequantize_q4_0(blocks, ib, out, tid); }
+    if constexpr (type == GgmlType::Q5_0) { dequantize_q5_0(blocks, ib, out, tid); }
 }
 
 } // namespace sinfer::ops::detail::ggml

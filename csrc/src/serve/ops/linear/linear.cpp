@@ -116,6 +116,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::Q8_0:
     case QType::Q4_1:
     case QType::Q5_1:
+    case QType::IQ4_NL:
+    case QType::Q4_0:
+    case QType::Q5_0:
         // The K-quant route quantises its activation to int8 per 32 whatever the policy:
         // that is the format's native compute, not an A8 profile the caller opts into.
         detail::ggml::ggml_linear(x, w, out, workspace, stream);
@@ -176,6 +179,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q8_0:
     case QType::Q4_1:
     case QType::Q5_1:
+    case QType::IQ4_NL:
+    case QType::Q4_0:
+    case QType::Q5_0:
         return detail::ggml::ggml_linear_workspace_capacity_bytes(output_rows, input_rows,
                                                                    max_tokens);
     case QType::FP32_CTRL:

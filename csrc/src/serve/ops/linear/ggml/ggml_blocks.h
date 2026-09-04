@@ -65,6 +65,52 @@ struct block_q5_1 {
 static_assert(sizeof(block_q5_1) == 2 * sizeof(__half) + 4 + QK5_1 / 2,
               "wrong q5_1 block size/padding");
 
+// Q4_0 / Q5_0: 32 values, one scale, and codes biased by half their range -- `w = d*(q - 8)`
+// for four bits, `d*(q - 16)` for five. No minimum and no table; the plainest of the family.
+inline constexpr int QK4_0 = 32;
+inline constexpr int QR4_0 = 2;
+inline constexpr int QI4_0 = QK4_0 / (4 * QR4_0);
+inline constexpr int VDR_Q4_0_Q8_1_MMVQ = 2;
+
+inline constexpr int QK5_0 = 32;
+inline constexpr int QR5_0 = 2;
+inline constexpr int QI5_0 = QK5_0 / (4 * QR5_0);
+inline constexpr int VDR_Q5_0_Q8_1_MMVQ = 2;
+
+struct block_q4_0 {
+    __half d;
+    uint8_t qs[QK4_0 / 2];
+};
+static_assert(sizeof(block_q4_0) == sizeof(__half) + QK4_0 / 2, "wrong q4_0 block size/padding");
+
+struct block_q5_0 {
+    __half d;
+    uint8_t qh[4];
+    uint8_t qs[QK5_0 / 2];
+};
+static_assert(sizeof(block_q5_0) == sizeof(__half) + 4 + QK5_0 / 2,
+              "wrong q5_0 block size/padding");
+
+// IQ4_NL: 32 values, one scale, four-bit codes that index a sixteen-entry table of int8 levels
+// rather than standing for their own magnitude. The levels are spaced non-linearly -- closer
+// together near zero, where weights actually live -- which is what buys the accuracy over Q4_0
+// at the same width.
+inline constexpr int QK4_NL = 32;
+inline constexpr int QR4_NL = 2;
+inline constexpr int QI4_NL = QK4_NL / (4 * QR4_NL);
+inline constexpr int VDR_IQ4_NL_Q8_1_MMVQ = 2;
+
+/// ggml-common.h `kvalues_iq4nl`.
+__device__ __constant__ static const int8_t kIq4nlValues[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+struct block_iq4_nl {
+    __half d;                   // scale
+    uint8_t qs[QK4_NL / 2];     // four-bit table indices
+};
+static_assert(sizeof(block_iq4_nl) == sizeof(__half) + QK4_NL / 2,
+              "wrong iq4_nl block size/padding");
+
 struct block_q8_1 {
     __half2 ds;          // d (scale), s (sum of the 32 unquantised values)
     int8_t  qs[QK8_1];   // quants
