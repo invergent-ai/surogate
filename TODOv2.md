@@ -40,17 +40,28 @@ product rather than tasks (1 and 7); the rest are work.
    NVFP4. So this is one target's safetensors profile, not five, and it is a
    decision rather than a task: it costs the 27B its groupwise-int route until
    `surogate quantize` (item 7) is a product.
-2. **[ ] FP8, and the two kinds are not the same job (checked 2026-09-03).**
-   - *compressed-tensors per-channel/per-tensor* is per-row with an FP32 scale.
-     The engine has `FP8_E4M3FN_ROW_BF16S`, so this is either an `_F32S` variant
-     or a documented BF16 cast of the row scales. Small — but **no checkpoint of
-     this kind is on this machine**, so it cannot be written against anything.
-   - *HF fine-grained FP8* is block-scaled, and that is what the three local FP8
-     checkpoints are: `models--surogate--Qwen3.5-{0.8B,2B,4B}-FP8` declare
-     `quant_method: fp8`, `weight_block_size: [128, 128]`, and carry
-     `weight_scale_inv` as a 2-D F32 grid (e.g. `[48, 8]` for a `[6144, 1024]`
-     projection). No runtime format holds a 2-D block scale, so this is a new
-     weight format and GEMM support, not an ingest change.
+2. **[~] FP8: the block-scaled kind serves (2026-09-04); the per-channel kind waits on
+   a runtime-shaped row route.**
+   - *HF fine-grained FP8* (`quant_method: fp8`, `weight_block_size: [128, 128]`,
+     `weight_scale_inv` an F32 grid) is a new format, `FP8_E4M3FN_BLK128_F32S` in layout
+     `block-scale-128-fp8-v1`: the checkpoint's E4M3 codes and its scale grid, untouched.
+     This cuBLASLt admits only scalar FP8 scales on sm_120 (probed: `VEC128`, `BLK128x128`
+     and `OUTER_VEC` all `NOT_SUPPORTED`), so the routes are the engine's own and
+     runtime-shaped: a 64x64 e4m3 tensor-core tile that applies the block scale once per
+     128 of K (activations quantised per token per 128, the recipe's convention), and a
+     decode GEMV on exact BF16 activations. The fused ops project it by rows through the
+     same branch the K-quants take, so no size registers a shape. Export profile
+     `fp8-block` (`--profile` auto-detected from `quantization_config`), the uniform
+     recipe's object graph at any geometry. Qwen3.5-0.8B-FP8: **14.7418** against the
+     BF16 torch reference's 14.60 on the same 40 windows (+1 %, the recipe's cost) and
+     llama.cpp's IQ4_XS 15.15; 833 tok/s decode on one 5090.
+   - *compressed-tensors per-channel/per-tensor* (a per-row F32 scale). The engine's
+     `FP8_E4M3FN_ROW_BF16S` route holds the numbers but is compile-time geometry -- the
+     27B's shapes only -- so a small checkpoint of this kind would be refused before its
+     scale precision mattered. A checkpoint is now obtainable
+     (`RedHatAI/Qwen3-0.6B-FP8-dynamic`); the work is a runtime-shaped row-scaled route
+     (or reading per-row scales into the block route with a 1-row block), then the
+     `_F32S` variant or a documented BF16 cast of the scales.
 3. **[~] Every GGML weight type is read where it lies (2026-09-04); what the UD mixtures
    still cost.** The 27B's refusal was never about vision: unsloth's "UD-Q4_K_M" holds 117
    IQ4_XS and 4 IQ3_S tensors, and the engine read 13 of llama.cpp's 27 storable types. The

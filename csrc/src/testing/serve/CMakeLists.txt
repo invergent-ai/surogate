@@ -351,6 +351,9 @@ sinfer_add_op_test(sinfer_linear_add_nvfp4_test
 sinfer_add_op_test(sinfer_linear_add_fp8_test
   SOURCES ops/linear_add/test_fp8.cpp
   LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_linear_fp8_block_test
+  SOURCES ops/linear/fp8_block/test_fp8_block.cpp
+  LIBRARIES sinfer_ops)
 sinfer_add_fused_linear_test(
   sinfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp

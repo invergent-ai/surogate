@@ -1,6 +1,7 @@
 #include "api/ops/linear_swiglu.h"
 #include "api/ops/silu_mul.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 
 #include "api/ops/linear.h"
 #include "api/ops/silu_mul.h"
@@ -20,6 +21,28 @@
 #include <stdexcept>
 
 namespace sinfer::ops {
+
+namespace {
+// A parent split by row range straight into its outputs: the K-quants and block-scaled FP8
+// both project any range, so the fused ops need no registered shape for either.
+bool row_projectable(QType qtype) {
+    return detail::ggml::is_ggml_qtype(qtype) || detail::fp8_block::is_fp8_block_qtype(qtype);
+}
+void project_rows_any(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
+                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
+        detail::fp8_block::project_rows(x, w, row_begin, out, workspace, stream);
+    } else {
+        detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
+    }
+}
+std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
+                                                     std::int32_t max_tokens) {
+    return detail::fp8_block::is_fp8_block_qtype(qtype)
+               ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
+               : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);
+}
+} // namespace
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -46,12 +69,11 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
-    if (detail::ggml::is_ggml_qtype(qtype)) {
+    if (row_projectable(qtype)) {
         // gate and up projected into two [M, T] BF16 planes, then silu_mul.
         const std::size_t half = static_cast<std::size_t>(gate_up_rows / 2) * max_tokens * sizeof(std::uint16_t);
         return 2 * (half + 256) +
-               detail::ggml::ggml_linear_workspace_capacity_bytes(gate_up_rows / 2, input_rows,
-                                                                  max_tokens);
+               row_projectable_workspace_capacity_bytes(qtype, gate_up_rows / 2, input_rows, max_tokens);
     }
     if (qtype == QType::W8G32_F16S) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
@@ -113,17 +135,17 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream) {
     validate_policy(policy);
-    if (detail::ggml::is_ggml_qtype(gate_up_weight.qtype)) {
+    if (row_projectable(gate_up_weight.qtype)) {
         const std::int32_t rows = gate_up_weight.n / 2;
         const std::int32_t t    = x.ne[1];
         if ((gate_up_weight.n % 2) != 0 || out.ne[0] != rows || out.ne[1] != t) {
-            throw std::invalid_argument("linear_swiglu: K-quant gate_up parent must be [2M, k] with out [M, T]");
+            throw std::invalid_argument("linear_swiglu: a row-projected gate_up parent must be [2M, k] with out [M, T]");
         }
         auto scope  = ws.scope();
         Tensor gate = ws.alloc(DType::BF16, {rows, t});
         Tensor up   = ws.alloc(DType::BF16, {rows, t});
-        detail::ggml::ggml_project_rows(x, gate_up_weight, 0, gate, &ws, stream);
-        detail::ggml::ggml_project_rows(x, gate_up_weight, rows, up, &ws, stream);
+        project_rows_any(x, gate_up_weight, 0, gate, &ws, stream);
+        project_rows_any(x, gate_up_weight, rows, up, &ws, stream);
         silu_mul(gate, up, out, stream);
         return;
     }

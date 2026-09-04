@@ -111,6 +111,7 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    if (name == "FP8_E4M3FN_BLK128_F32S") { return NumericFormat::FP8_E4M3FN_BLK128_F32S; }
     if (name == "Q2_K") { return NumericFormat::Q2_K; }
     if (name == "Q3_K") { return NumericFormat::Q3_K; }
     if (name == "Q4_K") { return NumericFormat::Q4_K; }
@@ -145,6 +146,7 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
     if (name == "ggml-blocks-v1") { return StorageLayout::GgmlBlocksV1; }
+    if (name == "block-scale-128-fp8-v1") { return StorageLayout::BlockScale128Fp8V1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 

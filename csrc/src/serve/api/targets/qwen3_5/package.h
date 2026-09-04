@@ -41,6 +41,9 @@ enum class WeightsProfile : std::uint8_t {
     Nvfp4MixedBf16,
     /// Every projection NVFP4, no BF16 exceptions: what a ModelOpt export of this family is.
     Nvfp4Uniform,
+    /// Every projection block-scaled FP8 (E4M3 with an FP32 scale per 128x128): Hugging
+    /// Face's fine-grained FP8 export of this family, fused parents, byte-wide endpoints.
+    Fp8Block,
     /// Only the MLP is NVFP4; the attention and GDN projections stay FP8, because that is
     /// what the export quantised.
     Nvfp4MlpOnly,

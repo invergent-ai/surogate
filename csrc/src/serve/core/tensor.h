@@ -37,6 +37,9 @@ enum class QType : std::uint16_t {
     I32_CTRL             = 6,
     NVFP4                = 7,
     FP8_E4M3FN_ROW_BF16S = 8,
+    /// E4M3FN codes with one FP32 scale per 128x128 block (HF fine-grained FP8, DeepSeek's
+    /// recipe): [rows, k] codes and a [rows/128][k/128] scale grid, QuantLayout::Fp8Block128.
+    FP8_E4M3FN_BLK128_F32S = 64,
     // GGML K-quants in their own superblock layout (QuantLayout::GgmlBlocks), bytes as the
     // GGUF stores them: 256 values per block, affine sub-scales, k a multiple of 256.
     Q2_K                 = 9,
@@ -95,6 +98,8 @@ enum class QuantLayout : std::uint16_t {
     MarlinTiles         = 4,
     // qdata is an [n][k/256] array of GGML superblocks; qhigh and scales are null.
     GgmlBlocks          = 5,
+    /// E4M3 codes [rows, k] followed by an FP32 scale grid [rows/128][k/128].
+    Fp8Block128         = 6,
 };
 
 /// One typed row run of a GGML-blocks weight whose rows do not all share a format: a fused

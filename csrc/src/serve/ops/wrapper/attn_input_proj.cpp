@@ -3,6 +3,7 @@
 #include "api/ops/linear.h"
 
 #include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
@@ -26,6 +27,28 @@
 #include <string>
 
 namespace sinfer::ops {
+
+namespace {
+// A parent split by row range straight into its outputs: the K-quants and block-scaled FP8
+// both project any range, so the fused ops need no registered shape for either.
+bool row_projectable(QType qtype) {
+    return detail::ggml::is_ggml_qtype(qtype) || detail::fp8_block::is_fp8_block_qtype(qtype);
+}
+void project_rows_any(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
+                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
+        detail::fp8_block::project_rows(x, w, row_begin, out, workspace, stream);
+    } else {
+        detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
+    }
+}
+std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
+                                                     std::int32_t max_tokens) {
+    return detail::fp8_block::is_fp8_block_qtype(qtype)
+               ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
+               : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);
+}
+} // namespace
 namespace {
 
 
@@ -99,17 +122,17 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
     validate_policy(policy);
-    if (detail::ggml::is_ggml_qtype(weight.qtype)) {
-        // A K-quant parent is split by row range straight into the four outputs: physical row
-        // order query, key, output gate, value. Any width; k a multiple of 256.
+    if (row_projectable(weight.qtype)) {
+        // A K-quant or block-FP8 parent is split by row range straight into the four outputs:
+        // physical row order query, key, output gate, value. Any width.
         const std::int32_t rows_q = q.ne[0], rows_k = k.ne[0], rows_gate = gate.ne[0], rows_v = v.ne[0];
         if (rows_q + rows_k + rows_gate + rows_v != weight.n) {
-            throw std::invalid_argument("attn_input_proj: K-quant parent rows must equal q+k+gate+v");
+            throw std::invalid_argument("attn_input_proj: row-projected parent rows must equal q+k+gate+v");
         }
-        detail::ggml::ggml_project_rows(x, weight, 0, q, workspace, stream);
-        detail::ggml::ggml_project_rows(x, weight, rows_q, k, workspace, stream);
-        detail::ggml::ggml_project_rows(x, weight, rows_q + rows_k, gate, workspace, stream);
-        detail::ggml::ggml_project_rows(x, weight, rows_q + rows_k + rows_gate, v, workspace, stream);
+        project_rows_any(x, weight, 0, q, workspace, stream);
+        project_rows_any(x, weight, rows_q, k, workspace, stream);
+        project_rows_any(x, weight, rows_q + rows_k, gate, workspace, stream);
+        project_rows_any(x, weight, rows_q + rows_k + rows_gate, v, workspace, stream);
         return;
     }
     if (weight.qtype == QType::BF16_CTRL) {
@@ -242,6 +265,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         // the parent is split by row range; the widest range is the parent itself
         return detail::ggml::ggml_linear_workspace_capacity_bytes(parent_rows, input_rows,
                                                                    max_tokens);
+    case QType::FP8_E4M3FN_BLK128_F32S:
+        return detail::fp8_block::linear_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
     case QType::BF16_CTRL:
         if (parent_rows != 14336 || input_rows != 5120 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");
@@ -380,19 +405,18 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     // dispatch above is: 6144 = q4096 | k1024 | v1024 over hidden 2048 (the
     // Qwen3.6 companion), and 4096 = q2048 | k1024 | v1024 over hidden 1024
     // (Qwen3-0.6B, 16 query heads and 8 KV heads at head dim 128).
-    if (detail::ggml::is_ggml_qtype(query_key_value_weight.qtype)) {
-        // A K-quant parent splits by row range straight into the three outputs, in physical
-        // row order query, key, value. Any width, k a multiple of 256 -- the same generic
-        // route the gated parent above takes, and the reason a GGUF of any size of a family
-        // needs no registered attention shape here.
+    if (row_projectable(query_key_value_weight.qtype)) {
+        // A K-quant or block-FP8 parent splits by row range straight into the three outputs,
+        // in physical row order query, key, value. Any width -- the same generic route the
+        // gated parent above takes, and the reason a checkpoint of any size of a family needs
+        // no registered attention shape here.
         const std::int32_t rows_q = q.ne[0], rows_k = k.ne[0], rows_v = v.ne[0];
         if (rows_q + rows_k + rows_v != query_key_value_weight.n) {
-            throw std::invalid_argument("attn_input_proj: K-quant parent rows must equal q+k+v");
+            throw std::invalid_argument("attn_input_proj: row-projected parent rows must equal q+k+v");
         }
-        detail::ggml::ggml_project_rows(x, query_key_value_weight, 0, q, nullptr, stream);
-        detail::ggml::ggml_project_rows(x, query_key_value_weight, rows_q, k, nullptr, stream);
-        detail::ggml::ggml_project_rows(x, query_key_value_weight, rows_q + rows_k, v, nullptr,
-                                        stream);
+        project_rows_any(x, query_key_value_weight, 0, q, nullptr, stream);
+        project_rows_any(x, query_key_value_weight, rows_q, k, nullptr, stream);
+        project_rows_any(x, query_key_value_weight, rows_q + rows_k, v, nullptr, stream);
         return;
     }
     const std::int32_t kRows   = query_key_value_weight.n;

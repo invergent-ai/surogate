@@ -15,6 +15,7 @@ ROW_SPLIT_LAYOUT = "row-split-k128-v1"
 BLOCK_SCALE_LAYOUT = "blockscale-k16-m128x4-v1"
 ROW_SCALE_LAYOUT = "row-scale-v1"
 GGML_BLOCKS_LAYOUT = "ggml-blocks-v1"
+BLOCK128_LAYOUT = "block-scale-128-fp8-v1"
 RESOURCE_ENCODING = "raw-bytes-v1"
 
 BF16 = "BF16"
@@ -26,6 +27,7 @@ Q6 = "Q6G64_F16S"
 W8 = "W8G32_F16S"
 NVFP4 = "NVFP4"
 FP8 = "FP8_E4M3FN_ROW_BF16S"
+FP8_BLOCK = "FP8_E4M3FN_BLK128_F32S"
 Q2_K = "Q2_K"
 Q3_K = "Q3_K"
 Q4_K = "Q4_K"
@@ -38,8 +40,9 @@ DIRECT_FORMATS = frozenset((BF16, FP32, I32))
 # The engine's nine formats and four layouts (csrc/src/serve/artifact/reader.h). Every
 # target used to re-declare the NVFP4 pair beside its own inventory; they are named
 # once here so a converter that reads formats off a checkpoint has one vocabulary.
-FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8, NVFP4, FP8, *GGML_BLOCK_FORMAT_NAMES)
-LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT, BLOCK_SCALE_LAYOUT, ROW_SCALE_LAYOUT, GGML_BLOCKS_LAYOUT)
+FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8, NVFP4, FP8, FP8_BLOCK, *GGML_BLOCK_FORMAT_NAMES)
+LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT, BLOCK_SCALE_LAYOUT, ROW_SCALE_LAYOUT, GGML_BLOCKS_LAYOUT,
+                BLOCK128_LAYOUT)
 
 VISION_LAYERS = tuple(range(27))
 

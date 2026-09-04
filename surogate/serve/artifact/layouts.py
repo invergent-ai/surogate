@@ -18,6 +18,8 @@ from typing import Sequence, TypeAlias
 
 import torch
 
+from surogate.serve.artifact.numeric import Fp8BlockFormat
+
 from .numeric import (
     GgmlBlockFormat,
     DirectFormat,
@@ -85,6 +87,19 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class BlockScale128Geometry:
+    """block-scale-128-fp8-v1: E4M3 codes [n][k], then, 256-aligned, FP32 scales
+    [n/128][k/128] row-major."""
+
+    n: int
+    k: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
 Plane: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 Payload: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 
@@ -117,6 +132,11 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("FP8_E4M3FN_ROW_BF16S",)),
 )
+BLOCK_SCALE128_FP8_V1 = Layout(
+    "block-scale-128-fp8-v1",
+    256,
+    frozenset(("FP8_E4M3FN_BLK128_F32S",)),
+)
 GGML_BLOCKS_V1 = Layout(
     "ggml-blocks-v1",
     256,
@@ -133,6 +153,7 @@ LAYOUTS = MappingProxyType(
             BLOCKSCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
             GGML_BLOCKS_V1,
+            BLOCK_SCALE128_FP8_V1,
         )
     }
 )
@@ -277,6 +298,42 @@ def row_scale_geometry(
     )
 
 
+def block_scale128_geometry(
+    format: str | Fp8BlockFormat, shape: Sequence[int]
+) -> BlockScale128Geometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8BlockFormat):
+        raise ValueError("block-scale-128-fp8-v1 requires a block-scaled FP8 format")
+    n, k = _shape(shape, rank=2)
+    if n % spec.block or k % spec.block:
+        raise ValueError("block-scale-128-fp8-v1 requires n and k to be whole 128-blocks")
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = (n // spec.block) * (k // spec.block) * 4
+    return BlockScale128Geometry(
+        n=n, k=k, code_plane_bytes=code_plane_bytes, scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes, payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
+def encode_fp8_block_scaled(
+    code_words: torch.Tensor, block_scales: torch.Tensor, shape: Sequence[int]
+) -> bytes:
+    """Encode exact E4M3FN code words [n, k] and FP32 block multipliers [n/128, k/128]."""
+    geometry = block_scale128_geometry("FP8_E4M3FN_BLK128_F32S", shape)
+    codes = _exact_uint8_matrix(code_words, (geometry.n, geometry.k), "block-scaled FP8 codes")
+    scales = block_scales.detach().cpu()
+    if scales.dtype != torch.float32 or tuple(scales.shape) != (geometry.n // 128, geometry.k // 128):
+        raise ValueError("block-scaled FP8 scales must be FP32 [n/128, k/128]")
+    if not bool(torch.isfinite(scales).all()) or bool((scales <= 0).any()):
+        raise ValueError("block-scaled FP8 scales must be finite and positive")
+    payload = bytearray(geometry.payload_bytes)
+    payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
+    begin = geometry.scale_plane_offset
+    payload[begin : begin + geometry.scale_plane_bytes] = scales.contiguous().numpy().tobytes()
+    return bytes(payload)
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -307,6 +364,10 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is BLOCK_SCALE128_FP8_V1:
+        if not isinstance(numeric_spec, Fp8BlockFormat):
+            raise ValueError("block-scale-128-fp8-v1 requires a block-scaled FP8 format")
+        return block_scale128_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_BLOCKS_V1:
         if not isinstance(numeric_spec, GgmlBlockFormat):
             raise ValueError("ggml-blocks-v1 requires a GGML block format")
@@ -1095,6 +1156,10 @@ __all__ = [
     "PLANE_ALIGNMENT",
     "ROW_SPLIT_K128_V1",
     "ROW_SCALE_V1",
+    "BLOCK_SCALE128_FP8_V1",
+    "BlockScale128Geometry",
+    "block_scale128_geometry",
+    "encode_fp8_block_scaled",
     "RowPlanes",
     "RowScaleGeometry",
     "RowSplitGeometry",

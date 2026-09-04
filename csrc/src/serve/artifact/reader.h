@@ -29,6 +29,7 @@ enum class NumericFormat {
     W8G32_F16S,
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
+    FP8_E4M3FN_BLK128_F32S,
     Q2_K,
     Q3_K,
     Q4_K,
@@ -62,6 +63,7 @@ enum class StorageLayout {
     BlockScaleK16M128x4V1,
     RowScaleV1,
     GgmlBlocksV1,
+    BlockScale128Fp8V1,
 };
 
 enum class ResourceEncoding {
@@ -123,6 +125,18 @@ struct RowScaleGeometry {
 };
 
 RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+
+/// block-scale-128-fp8-v1: the E4M3 code plane [rows][columns], then, 256-aligned, an FP32
+/// scale grid [rows/128][columns/128]. Both dimensions are whole 128-blocks.
+struct BlockScale128Geometry {
+    std::uint64_t rows               = 0;
+    std::uint64_t columns            = 0;
+    std::uint64_t code_plane_bytes   = 0;
+    std::uint64_t scale_plane_offset = 0;
+    std::uint64_t scale_plane_bytes  = 0;
+    std::uint64_t encoded_bytes      = 0;
+};
+BlockScale128Geometry block_scale128_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
 /// How an object's runs become its stored form. `None` is a copy, which is what every object
 /// written into the artifact's own payload is. `Q8ToW8RowSplit` rearranges Q8_0 blocks into the

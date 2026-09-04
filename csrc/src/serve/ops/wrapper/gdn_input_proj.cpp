@@ -12,6 +12,7 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/gdn_input_proj/ggml/ggml_gdn_input.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
@@ -31,6 +32,28 @@
 #include <string>
 
 namespace sinfer::ops {
+
+namespace {
+// A parent split by row range straight into its outputs: the K-quants and block-scaled FP8
+// both project any range, so the fused ops need no registered shape for either.
+bool row_projectable(QType qtype) {
+    return detail::ggml::is_ggml_qtype(qtype) || detail::fp8_block::is_fp8_block_qtype(qtype);
+}
+void project_rows_any(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
+                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
+        detail::fp8_block::project_rows(x, w, row_begin, out, workspace, stream);
+    } else {
+        detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
+    }
+}
+std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
+                                                     std::int32_t max_tokens) {
+    return detail::fp8_block::is_fp8_block_qtype(qtype)
+               ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
+               : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);
+}
+} // namespace
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -305,14 +328,14 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
 
-    if (detail::ggml::is_ggml_qtype(weight.qtype)) {
-        // A K-quant parent splits by row range straight into the two outputs: qkv rows first,
-        // z rows after, the split read off the output views.
+    if (row_projectable(weight.qtype)) {
+        // A K-quant or block-FP8 parent splits by row range straight into the two outputs:
+        // qkv rows first, z rows after, the split read off the output views.
         if (qkv.ne[0] + z.ne[0] != weight.n) {
-            throw std::invalid_argument("gdn_input_proj: K-quant parent rows must equal qkv + z rows");
+            throw std::invalid_argument("gdn_input_proj: row-projected parent rows must equal qkv + z rows");
         }
-        detail::ggml::ggml_project_rows(x, weight, 0, qkv, workspace, stream);
-        detail::ggml::ggml_project_rows(x, weight, qkv.ne[0], z, workspace, stream);
+        project_rows_any(x, weight, 0, qkv, workspace, stream);
+        project_rows_any(x, weight, qkv.ne[0], z, workspace, stream);
         return;
     }
 
@@ -483,8 +506,8 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
     validate_policy(policy);
 
-    if (detail::ggml::is_ggml_qtype(weight.qtype)) {
-        // K-quant parent: the row split comes from the output views, the projection is the
+    if (row_projectable(weight.qtype)) {
+        // K-quant or block-FP8 parent: the row split comes from the output views, the projection is the
         // plain single-parent form, and the conv is the shared projected-conv tail.
         const std::int32_t kQueryRows = query.ne[0];
         const std::int32_t kKeyRows   = key.ne[0];
@@ -712,7 +735,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    cudaStream_t stream) {
     validate_policy(policy);
 
-    if (detail::ggml::is_ggml_qtype(weight.qtype)) {
+    if (row_projectable(weight.qtype)) {
         const std::int32_t kQueryRows = query.ne[0];
         const std::int32_t kKeyRows   = key.ne[0];
         const std::int32_t kValueRows = value.ne[0];
@@ -934,9 +957,8 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
-    if (detail::ggml::is_ggml_qtype(parent_qtype)) {
-        return detail::ggml::ggml_linear_workspace_capacity_bytes(parent_rows, input_rows,
-                                                                   max_tokens);
+    if (row_projectable(parent_qtype)) {
+        return row_projectable_workspace_capacity_bytes(parent_qtype, parent_rows, input_rows, max_tokens);
     }
     if (parent_qtype == QType::NVFP4) {
         const bool registered = parent_rows == detail::Nvfp4GdnInputGeometry::kOutputRows &&
@@ -1461,7 +1483,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
-    if (detail::ggml::is_ggml_qtype(parent_qtype)) {
+    if (row_projectable(parent_qtype)) {
         // The split is read off the output views at run time; here only the parent is known,
         // so the projected plane is sized for every parent row (z included) -- sufficient,
         // and a few MiB over at most -- plus the int8 activation scratch.
@@ -1554,7 +1576,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
-    if (detail::ggml::is_ggml_qtype(parent_qtype)) {
+    if (row_projectable(parent_qtype)) {
         return detail::ggml::ggml_linear_workspace_capacity_bytes(parent_rows, input_rows,
                                                                    batch_size * max_width);
     }

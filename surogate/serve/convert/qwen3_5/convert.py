@@ -756,10 +756,11 @@ DUAL_SOURCE_PROFILES = (inventory.NVFP4_MIXED_BF16, inventory.NVFP4_MLP_ONLY)
 def _export_writer(profile: str):
     """The module that writes one export's artifact. Imported on use: each pulls in its own
     source-format machinery, and a group-wise conversion needs none of it."""
-    from .exports import convert_nvfp4_all, convert_nvfp4_mixed_bf16
+    from .exports import convert_fp8_block, convert_nvfp4_all, convert_nvfp4_mixed_bf16
     from .exports import convert_nvfp4_mlp_only, convert_nvfp4_uniform
 
     return {
+        inventory.FP8_BLOCK: convert_fp8_block,
         inventory.NVFP4_UNIFORM: convert_nvfp4_uniform,
         inventory.NVFP4_MIXED_BF16: convert_nvfp4_mixed_bf16,
         inventory.NVFP4_MLP_ONLY: convert_nvfp4_mlp_only,
@@ -776,9 +777,13 @@ def profile_for_checkpoint(config: Mapping[str, object]) -> str:
     """
     quantization = config.get("quantization_config") or {}
     text = json.dumps(quantization)[:2000] if isinstance(quantization, Mapping) else ""
-    if "NVFP4" not in text and "nvfp4" not in str(
-        quantization.get("quant_method", "") if isinstance(quantization, Mapping) else ""
-    ):
+    method = str(quantization.get("quant_method", "")) if isinstance(quantization, Mapping) else ""
+    if method == "fp8" and isinstance(quantization, Mapping) and quantization.get("weight_block_size"):
+        # Hugging Face fine-grained FP8: a [128, 128] block scale grid per weight.
+        if list(quantization["weight_block_size"]) != [128, 128]:
+            raise ValueError(f"fp8 weight_block_size {quantization['weight_block_size']} is not [128, 128]")
+        return inventory.FP8_BLOCK
+    if "NVFP4" not in text and "nvfp4" not in method:
         return inventory.GROUPWISE_INT
     geometry = inventory.geometry_from_config(config)
     if not inventory.is_27b(geometry):

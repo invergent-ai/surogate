@@ -43,7 +43,16 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class Fp8BlockFormat:
+    """E4M3FN weights with one FP32 multiplier per 128x128 block: Hugging Face's fine-grained
+    FP8 (`weight_scale_inv` over `weight_block_size = [128, 128]`)."""
+
+    name: str
+    block: int = 128
+
+
+NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Fp8BlockFormat
 
 
 BF16 = DirectFormat("BF16", 2)
@@ -56,6 +65,7 @@ Q6G64_F16S = QuantFormat("Q6G64_F16S", 6, 64, -32, 31)
 W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("NVFP4", 16)
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
+FP8_E4M3FN_BLK128_F32S = Fp8BlockFormat("FP8_E4M3FN_BLK128_F32S")
 
 @dataclass(frozen=True, slots=True)
 class GgmlBlockFormat:
@@ -120,8 +130,11 @@ GGML_BLOCK_FORMATS = MappingProxyType(
     {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0,
                             IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4_GGML, Q1_0, Q2_0)}
 )
+FP8_BLOCK_FORMATS = {FP8_E4M3FN_BLK128_F32S.name: FP8_E4M3FN_BLK128_F32S}
+
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **GGML_BLOCK_FORMATS}
+    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **FP8_BLOCK_FORMATS,
+     **GGML_BLOCK_FORMATS}
 )
 
 
@@ -233,6 +246,8 @@ __all__ = [
     "FP8_ROW_FORMATS",
     "FP32",
     "Fp8RowFormat",
+    "Fp8BlockFormat",
+    "FP8_E4M3FN_BLK128_F32S",
     "I32",
     "NUMERIC_FORMATS",
     "NVFP4",

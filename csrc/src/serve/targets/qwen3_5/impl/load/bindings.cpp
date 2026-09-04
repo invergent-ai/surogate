@@ -623,6 +623,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_linear_weight(binder, "text/token_embedding", {g.output_rows, g.hidden});
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
+    case WeightsProfile::Fp8Block:
+        // Both bind whatever formats the artifact declares for the same object graph; the
+        // block-FP8 export stores the fused parents and byte-wide endpoints.
         bind_groupwise_text_layers(binder, out);
         break;
     case WeightsProfile::Nvfp4MixedBf16:

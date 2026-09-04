@@ -57,6 +57,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::BlockScaleK16M128x4V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
+    case NumericFormat::FP8_E4M3FN_BLK128_F32S:
+        return StorageLayout::BlockScale128Fp8V1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -119,6 +121,35 @@ Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle h
     out.shape[1]    = columns;
     out.padded_shape[0] = rows;
     out.padded_shape[1] = static_cast<std::int32_t>(geometry.padded_columns);
+    return out;
+}
+
+// Block-scaled FP8: E4M3 codes [rows][k] and an FP32 scale per 128x128 block, both as the
+// checkpoint holds them; nothing is derived at load.
+Weight fp8_block_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                        NumericFormat format, std::int32_t rows, std::int32_t columns) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const BlockScale128Geometry geometry = block_scale128_geometry(format, shape);
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
+    Weight out{};
+    out.payload         = bytes;
+    out.payload_bytes   = geometry.encoded_bytes;
+    out.qtype           = qtype_for(format);
+    out.layout          = QuantLayout::Fp8Block128;
+    out.group_size      = 128;
+    out.qdata           = bytes;
+    out.qhigh           = nullptr;
+    out.scales          = bytes + geometry.scale_plane_offset;
+    out.n               = rows;
+    out.k               = columns;
+    out.group           = 128;
+    out.scale_dtype     = DType::FP32;
+    out.ndim            = 2;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
     return out;
 }
 
@@ -226,6 +257,8 @@ QType qtype_for(NumericFormat format) {
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
+    case NumericFormat::FP8_E4M3FN_BLK128_F32S:
+        return QType::FP8_E4M3FN_BLK128_F32S;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -323,6 +356,9 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
     if (storage_layout_for(format) == StorageLayout::RowScaleV1) {
         return row_scale_weight(materialized, handle, format, rows, columns);
     }
+    if (storage_layout_for(format) == StorageLayout::BlockScale128Fp8V1) {
+        return fp8_block_weight(materialized, handle, format, rows, columns);
+    }
     if (storage_layout_for(format) == StorageLayout::GgmlBlocksV1) {
         return ggml_blocks_weight(materialized, handle, format, rows, columns);
     }
@@ -359,6 +395,7 @@ bool is_linear_format(NumericFormat format) noexcept {
     case NumericFormat::W8G32_F16S:
     case NumericFormat::NVFP4:
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
+    case NumericFormat::FP8_E4M3FN_BLK128_F32S:
     case NumericFormat::Q2_K:
     case NumericFormat::Q3_K:
     case NumericFormat::Q4_K:

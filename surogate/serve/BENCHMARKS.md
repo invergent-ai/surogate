@@ -295,6 +295,7 @@ ours eager with the raw prompt (`surogate/serve/tools/eval/perplexity.py`) again
 | Qwen3.5-0.8B **NVFP4** (`surogate/Qwen3.5-0.8B-NVFP4`, ModelOpt; 40 windows, 2026-09-04) against llama.cpp on the IQ4_XS GGUF. The same NVFP4 weights dequantised exactly inside the BF16 transformers model score 17.33 with exact activations: the checkpoint, not the engine | NVFP4 W4A4 | 17.5679 +/- 0.267 | 15.1511 +/- 0.226 (IQ4_XS) |
 | Qwen3.5-2B **NVFP4** (`surogate/Qwen3.5-2B-NVFP4`; 40 windows) against llama.cpp on Q4_K_M | NVFP4 W4A4 | 11.6437 +/- 0.162 | 10.2912 +/- 0.140 (Q4_K_M) |
 | Qwen3.5-4B **NVFP4** (`surogate/Qwen3.5-4B-NVFP4`; 40 windows) against llama.cpp on Q4_K_M | NVFP4 W4A4 | 8.9714 +/- 0.121 | 8.2445 +/- 0.108 (Q4_K_M) |
+| Qwen3.5-0.8B **block-scaled FP8** (`surogate/Qwen3.5-0.8B-FP8`, HF fine-grained [128,128]; 40 windows, 2026-09-04) -- the BF16 model itself scores **14.60** on these windows (torch), so the recipe costs 1 % | FP8 E4M3 blk128, A8 per token per 128 | **14.7418 +/- 0.220** | 15.1511 +/- 0.226 (IQ4_XS) |
 | Qwen3.5-0.8B-IQ4_XS | IQ4_XS 50 %, Q6_K 43 % | **15.094 +/- 0.225** | 15.151 +/- 0.226 |
 | Qwen3.5-0.8B-UD-Q2_K_XL | Q2_K/Q3_K, IQ3_S/IQ3_XXS/IQ2_S/IQ4_XS | 20.209 +/- 0.305 | 20.016 +/- 0.302 |
 | Qwen3-0.6B-UD-IQ2_M | IQ2_S 34 %, IQ3_S 16 %, IQ3_XXS | **40.128 +/- 0.702** | 42.045 +/- 0.743 |

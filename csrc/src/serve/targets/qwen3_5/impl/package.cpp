@@ -63,6 +63,7 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.weights_id == "groupwise-int") { return WeightsProfile::GroupwiseInt; }
     if (identity.weights_id == "nvfp4-mixed") { return WeightsProfile::Nvfp4Uniform; }
     if (identity.weights_id == "nvfp4-all") { return WeightsProfile::Nvfp4All; }
+    if (identity.weights_id == "fp8-block") { return WeightsProfile::Fp8Block; }
     if (identity.weights_id == "nvfp4") {
         // Asked before the family-wide rule: the 3.8 export leaves attention and GDN in FP8
         // and only the MLP in NVFP4, which is a different set of objects to bind.

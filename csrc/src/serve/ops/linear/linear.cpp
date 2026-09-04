@@ -5,6 +5,7 @@
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
@@ -114,6 +115,11 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16S:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::FP8_E4M3FN_BLK128_F32S:
+        // Block-scaled FP8 quantises its activation per token per 128 whatever the policy:
+        // that is the recipe's own compute, not a profile the caller opts into.
+        detail::fp8_block::linear(x, w, out, workspace, stream);
+        return;
 #define SINFER_GGML_QTYPE_CASE(NAME) case QType::NAME:
     SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_QTYPE_CASE)
 #undef SINFER_GGML_QTYPE_CASE
@@ -169,6 +175,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16S:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::FP8_E4M3FN_BLK128_F32S:
+        return detail::fp8_block::linear_workspace_capacity_bytes(output_rows, input_rows, max_tokens);
 #define SINFER_GGML_QTYPE_CASE(NAME) case QType::NAME:
     SINFER_GGML_FOR_EACH_TYPE(SINFER_GGML_QTYPE_CASE)
 #undef SINFER_GGML_QTYPE_CASE
@@ -235,6 +243,7 @@ Weight weight_rows(const Weight& w, std::int32_t row_begin, std::int32_t rows) {
         throw std::invalid_argument("weight_rows: row range outside the parent");
     }
     if (detail::ggml::is_ggml_qtype(w.qtype)) { return detail::ggml::ggml_weight_rows(w, row_begin, rows); }
+    if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) { return detail::fp8_block::weight_rows(w, row_begin, rows); }
     if (w.layout != QuantLayout::RowSplit && w.layout != QuantLayout::Contiguous) {
         throw std::invalid_argument("weight_rows: this weight's rows are not independently addressable");
     }
@@ -249,6 +258,10 @@ void linear_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tenso
     }
     if (detail::ggml::is_ggml_qtype(w.qtype)) {
         detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
+        return;
+    }
+    if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
+        detail::fp8_block::project_rows(x, w, row_begin, out, workspace, stream);
         return;
     }
     if (w.layout != QuantLayout::RowSplit && w.layout != QuantLayout::Contiguous) {
