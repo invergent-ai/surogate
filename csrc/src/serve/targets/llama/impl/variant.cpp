@@ -157,7 +157,10 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
     const QType qtype = profile_qtype(weights_profile);
-    return post_mixer_workspace_bytes(geometry, qtype, qtype, kTextPolicy, first, last);
+    return std::max(
+        post_mixer_workspace_bytes(geometry, qtype, qtype, kTextPolicy, first, last),
+        post_mixer_workspace_bytes(geometry, QType::Q4_K, QType::Q4_K,
+                                   ops::LinearPolicy::A16Only, first, last));
 }
 
 // ---- Leaves this target cannot run -----------------------------------------

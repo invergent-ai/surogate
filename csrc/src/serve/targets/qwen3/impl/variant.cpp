@@ -131,8 +131,15 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    return ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile), geometry.hidden,
-                                                   geometry.query_size(), kTextPolicy, first, last);
+    // The larger of the two routes this artifact may carry: the profile's row-split format,
+    // or the K-quants a GGUF served natively keeps. The layout is planned before the weights
+    // are read, so it must hold either.
+    return std::max(
+        ops::linear_add_workspace_capacity_bytes(profile_qtype(weights_profile), geometry.hidden,
+                                                 geometry.query_size(), kTextPolicy, first, last),
+        ops::linear_add_workspace_capacity_bytes(QType::Q4_K, geometry.hidden,
+                                                 geometry.query_size(), ops::LinearPolicy::A16Only,
+                                                 first, last));
 }
 
 // ---- Post-mixer (SwiGLU MLP) ----------------------------------------------
@@ -155,7 +162,10 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
     const QType qtype = profile_qtype(weights_profile);
-    return post_mixer_workspace_bytes(geometry, qtype, qtype, kTextPolicy, first, last);
+    return std::max(
+        post_mixer_workspace_bytes(geometry, qtype, qtype, kTextPolicy, first, last),
+        post_mixer_workspace_bytes(geometry, QType::Q4_K, QType::Q4_K,
+                                   ops::LinearPolicy::A16Only, first, last));
 }
 
 // ---- Leaves this target cannot run -----------------------------------------

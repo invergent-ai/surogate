@@ -135,6 +135,20 @@ TENSOR_SPECS = (
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
+
+def active_specs(*, vision: bool = True) -> tuple[tuple, tuple]:
+    """(tensor_specs, object_specs) for the variant being written.
+
+    A text-only export of this family carries no `model.visual.*` weights -- every
+    community GGUF of it, so far -- and the artifact then omits `vision/*` entirely. The
+    engine already probes for the tower rather than assuming it, so such an artifact loads
+    and only `--vision` is refused against it.
+    """
+    tensors = TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS + MTP_TENSOR_SPECS
+    if vision:
+        tensors += VISION_TENSOR_SPECS
+    return tensors, RESOURCE_SPECS + tensors
+
 FORMAT_COUNTS = {
     numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)
     for numeric_format in FORMAT_NAMES

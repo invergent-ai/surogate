@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,11 @@ from surogate.serve.artifact.container import (
     ArtifactWriter,
 )
 from surogate.serve.convert.common.quantize import pick_device
+from surogate.serve.convert.common.gguf_repack import (
+    GgufRepackSource,
+    RepackError,
+    half_names,
+)
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common.recipe import (
@@ -409,14 +415,52 @@ def preflight_inventory() -> None:
 
 
 def build_object_plan(
-    resources: Mapping[str, bytes], geometry: inventory.Geometry = inventory.GEOMETRY
+    resources: Mapping[str, bytes], geometry: inventory.Geometry = inventory.GEOMETRY,
+    *, native=None, object_specs=None
 ) -> ObjectPlan:
-    return family_conversion.build_object_plan(
-        inventory.build_object_specs(geometry), resources
-    )
+    """`native` names the objects a GGUF serves as it stores them, with their format
+    rewritten to the stored one."""
+    if object_specs is None:
+        object_specs = inventory.build_object_specs(geometry)
+    if native:
+        object_specs = GgufRepackSource.native_specs(object_specs, native)
+    return family_conversion.build_object_plan(object_specs, resources)
 
 
-def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
+
+def plan_repack(repack, recipes_by_name, tensor_specs, native=None) -> tuple[str, ...]:
+    """Objects the repack source covers; verifies the map is not over-broad.
+
+    Every recipe left on the materialize path must find its sources in the bridged
+    checkpoint, so a mapped source consumed by an un-planned recipe is a hard error.
+    """
+    if repack is None:
+        return ()
+    planned = repack.plan(recipes_by_name, tensor_specs)
+    covered = set(planned) | set(native or ())
+    stray = {
+        source.name
+        for name, tensor_recipe in recipes_by_name.items()
+        if name not in covered
+        for source in expression_sources(tensor_recipe.expression)
+        if source.name in repack.sources
+    }
+    if stray:
+        raise RepackError(
+            "repack map names sources still needed by materialized recipes: "
+            + ", ".join(sorted(stray))
+        )
+    return planned
+
+
+def preflight_conversion(
+    model_dir: str | Path,
+    repack=None,
+    planned: tuple[str, ...] = (),
+    *,
+    native=None,
+    object_specs=None,
+) -> ConversionPreflight:
     model = Path(model_dir)
     config = family_conversion.load_json(model / "config.json")
     geometry, summary = validate_config(config)
@@ -427,9 +471,12 @@ def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
     # the module-level one being used blind.
     recipes = build_recipes(geometry, tied_output_head=tied)
     _validate_recipe_coverage(recipes, inventory.build_tensor_specs(geometry))
-    source_preflight = preflight_sources(model, recipes)
+    # Repacked objects read the GGUF directly; only what remains needs a bridged source.
+    remaining = tuple(r for r in recipes if r.object_name not in planned) if planned else recipes
+    source_preflight = preflight_sources(model, remaining)
     resources = load_resources(model)
-    plan = build_object_plan({item.name: item.data for item in resources}, geometry)
+    plan = build_object_plan({item.name: item.data for item in resources}, geometry,
+                             native=native, object_specs=object_specs)
     return ConversionPreflight(
         model_dir=model,
         geometry=geometry,
@@ -508,6 +555,7 @@ def convert(
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
+    gguf_repack: str | Path | None = None,
 ) -> Path:
     """Run the complete conversion and return the conversion-report path."""
 
@@ -516,8 +564,53 @@ def convert(
     output = Path(out_path)
     requested_device = str(device)
     resolved_device = pick_device(device)
+    repack = GgufRepackSource(gguf_repack) if gguf_repack else None
 
-    preflight = preflight_conversion(model)
+    # What the GGUF can serve as it stores it. `native` is a whole object read verbatim,
+    # `halves` a fused parent whose two halves carry different K-quant types, `planned` the
+    # objects a bit-exact plane repack covers. Everything else is materialised.
+    config = family_conversion.load_json(model / "config.json")
+    geometry, _ = validate_config(config)
+    recipes = {
+        r.object_name: r
+        for r in build_recipes(geometry,
+                               tied_output_head=bool(config.get("tie_word_embeddings", False)))
+    }
+    tensor_specs = inventory.build_tensor_specs(geometry)
+    object_specs = inventory.build_object_specs(geometry)
+    native = repack.plan_native(recipes, tensor_specs) if repack is not None else {}
+    halves = repack.plan_native_halves(recipes, tensor_specs) if repack is not None else {}
+    planned = plan_repack(repack, recipes, tensor_specs, set(native) | set(halves))
+    repacked_names = frozenset(planned)
+    if halves:
+        tensor_specs = GgufRepackSource.native_half_specs(tensor_specs, halves)
+        object_specs = GgufRepackSource.native_half_specs(object_specs, halves)
+        print(f"native K-quant halves: {len(halves)} fused parents stored as typed pairs",
+              flush=True)
+    external = ()
+    native_runs: dict = {}
+    if native and repack is not None and os.environ.get("SUROGATE_GGUF_COPY", "0") == "0":
+        native_runs = {
+            spec.name: repack.runs_for_native(spec, recipes[spec.name], None)
+            for spec in GgufRepackSource.native_specs(tensor_specs, native)
+            if spec.name in native
+        }
+        external = ((str(Path(repack.gguf_path).resolve()),
+                     Path(repack.gguf_path).stat().st_size),)
+        not_copied = sum(sum(r[2] for r in runs) for runs in native_runs.values())
+        print(f"native K-quants: {len(native_runs)} objects read from the GGUF in place "
+              f"({not_copied / 1e9:.2f} GB not copied)", flush=True)
+    if native:
+        tensor_specs = GgufRepackSource.native_specs(tensor_specs, native, native_runs)
+        object_specs = GgufRepackSource.native_specs(object_specs, native, native_runs)
+        if not native_runs:
+            print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
+                  flush=True)
+
+    preflight = preflight_conversion(
+        model, repack, planned + tuple(native) + tuple(halves),
+        native=native, object_specs=object_specs,
+    )
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
         f"{preflight.source.source_tensor_count} source tensors, "
@@ -526,6 +619,13 @@ def convert(
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
+    # object name -> (fused parent recipe, the rows of that parent it holds)
+    half_lookup: dict[str, tuple[str, slice]] = {}
+    for parent, runs in halves.items():
+        first = 0
+        for name, (_, rows) in zip(half_names(parent), runs):
+            half_lookup[name] = (parent, slice(first, first + rows))
+            first += rows
     resources = {item.name: item.data for item in preflight.resources}
     recipes = preflight.recipes_by_name
     with open_reader(model) as reader:
@@ -534,21 +634,42 @@ def convert(
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
             geometry=geometry_block(preflight, model),
+            external=external,
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError("writer object plan differs from completed preflight")
-            checkpoint_specs = inventory.build_object_specs(preflight.geometry)
+            checkpoint_specs = object_specs
             total = len(checkpoint_specs)
             for index, spec in enumerate(checkpoint_specs, start=1):
+                repacked = False
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
+                elif repack is not None and spec.name in half_lookup:
+                    parent, row_slice = half_lookup[spec.name]
+                    payload = repack.payload_for_native(spec, recipes[parent], None,
+                                                        row_slice=row_slice)
+                    repacked = True
+                elif repack is not None and spec.name in native_runs:
+                    # Read from the GGUF where it lies: the index names the runs and the
+                    # artifact carries no bytes for it, so there is nothing to write.
+                    print(f"[{index}/{total}] {spec.name} (in place)", flush=True)
+                    continue
+                elif repack is not None and spec.name in native:
+                    # A K-quant served as the GGUF stores it: rows gathered verbatim.
+                    payload = repack.payload_for_native(spec, recipes[spec.name], None)
+                    repacked = True
+                elif repack is not None and spec.name in repacked_names:
+                    # Bit-exact plane repack; no dequantization or requantization.
+                    payload = repack.payload_for(spec, recipes[spec.name], None)
+                    repacked = True
                 else:
                     tensor = materialize_tensor(spec, reader, recipes)
                     payload = encode_tensor_payload(tensor, spec, resolved_device)
                     del tensor
                 writer.write(spec.name, payload)
                 del payload
-                print(f"[{index}/{total}] {spec.name}", flush=True)
+                print(f"[{index}/{total}] {spec.name}" + (" (repacked)" if repacked else ""),
+                      flush=True)
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
@@ -583,8 +704,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--gguf-repack", type=Path, default=None,
+                        help="repack map: objects this GGUF serves as it stores them")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device)
+    convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack)
 
 
 if __name__ == "__main__":

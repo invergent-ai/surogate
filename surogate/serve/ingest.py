@@ -89,7 +89,8 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
         if nvfp4:
             return ConverterTarget("qwen3_6_nvfp4", "surogate.serve.convert.qwen3_6_27b.convert_nvfp4",
                                    "Qwen3.6-27B (NVFP4)")
-        return ConverterTarget("qwen3_6", "surogate.serve.convert.qwen3_6_27b.convert", "Qwen3.6")
+        return ConverterTarget("qwen3_6", "surogate.serve.convert.qwen3_6_27b.convert", "Qwen3.6",
+                               gguf_repack=True)
     if model_type == "qwen3_8" and hidden == 5120:
         if nvfp4:
             return ConverterTarget("qwen3_8_nvfp4", "surogate.serve.convert.qwen3_8_27b.convert_nvfp4",
@@ -98,11 +99,14 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     # Any size of the plain dense Qwen3: the artifact states its dimensions and the engine
     # binds against those, so the architecture is the gate.
     if model_type == "qwen3" and hidden > 0 and layers > 0:
-        return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3")
+        return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3",
+                               gguf_repack=True)
     if model_type == "llama" and hidden > 0 and layers > 0:
-        return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "Llama")
+        return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "Llama",
+                               gguf_repack=True)
     if model_type in ("gemma3", "gemma3_text") and hidden > 0 and layers > 0:
-        return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma 3")
+        return ConverterTarget("gemma3", "surogate.serve.convert.gemma3.convert", "Gemma 3",
+                               gguf_repack=True)
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
         return ConverterTarget("qwen3_6_moe", "surogate.serve.convert.qwen3_6_35b_a3b.convert",
                                "Qwen3.6-35B-A3B", gguf_repack=True)
@@ -200,7 +204,9 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
-    repack_targets = {"qwen3_5", "qwen3_6_moe"}
+    # Every target reads its GGUF where it lies: the bridge dequantises only what a value
+    # transform forces, not the whole checkpoint.
+    repack_targets = {"qwen3", "llama", "gemma3", "qwen3_5", "qwen3_6", "qwen3_6_moe"}
     converter_key = serve_gguf.gguf_converter_key(gguf_path, reader)
     planner = _repack_planner(root, converter_key) if target_key in repack_targets else None
     # No-MTP variant (PATCHES.md #15): community exports may strip nextn.
@@ -269,6 +275,21 @@ def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *, echo=print) 
     return out
 
 
+def _gguf_geometry(recipe_module, inventory_module, gguf_path: Path):
+    """The checkpoint's dimensions, for a converter that builds its recipes from them.
+
+    The bridged `config.json` does not exist yet when the repack is planned, so this reads
+    the same numbers from the GGUF that the bridge will synthesise it from.
+    """
+    from surogate.serve.gguf import bridge as serve_gguf
+    from surogate.serve.gguf.lean import LeanGguf
+
+    with LeanGguf(gguf_path) as reader:
+        arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
+        config = serve_gguf.synthesised_config(reader, arch)
+    return recipe_module.geometry_from_config(config)
+
+
 def _repack_planner(root: Path, target_key: str):
     """Repack plan via the named vendored converter's registered recipes."""
     def plan(gguf_path: Path, candidates: dict[str, str]) -> dict[str, str]:
@@ -282,7 +303,19 @@ def _repack_planner(root: Path, target_key: str):
             GgufRepackSource,
         )
         inventory = importlib.import_module(f"surogate.serve.convert.{target_key}.inventory")
-        recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.recipe")
+        # A converter keeps its recipes either in `recipe.py` or in `convert.py`; the
+        # dense families build both recipes and specs from the checkpoint's geometry
+        # rather than declaring one module-level set.
+        try:
+            recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.recipe")
+        except ModuleNotFoundError:
+            recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.convert")
+        recipes_by_name = getattr(recipe, "RECIPES_BY_NAME", None)
+        tensor_specs = getattr(inventory, "TENSOR_SPECS", None)
+        if recipes_by_name is None or tensor_specs is None:
+            geometry = _gguf_geometry(recipe, inventory, gguf_path)
+            recipes_by_name = {r.object_name: r for r in recipe.build_recipes(geometry)}
+            tensor_specs = inventory.build_tensor_specs(geometry)
 
         candidates = {
             hf: entry
@@ -291,16 +324,16 @@ def _repack_planner(root: Path, target_key: str):
             or (entry["type"] in NATIVE_TYPES and os.environ.get("SUROGATE_GGUF_NATIVE", "1") != "0")
         }
         source = GgufRepackSource.from_sources(gguf_path, candidates)
-        planned = source.plan(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
+        planned = source.plan(recipes_by_name, tensor_specs)
         native = source.plan_native(
-            recipe.RECIPES_BY_NAME,
-            inventory.TENSOR_SPECS,
+            recipes_by_name,
+            tensor_specs,
             exclude_suffixes=getattr(recipe, "NATIVE_EXCLUDE_SUFFIXES", ()),
         )
 
         # A fused parent stored as two typed halves keeps its sources too, or the bridge
         # dequantises them and the converter can no longer see the types it split on.
-        halves = source.plan_native_halves(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
+        halves = source.plan_native_halves(recipes_by_name, tensor_specs)
         # Recipes and the bridge may spell one tensor differently; resolve each wanted source to
         # the candidate that actually holds it before intersecting, or nothing matches and the
         # bridge dequantises weights the converter was going to read straight from the file.
@@ -308,7 +341,7 @@ def _repack_planner(root: Path, target_key: str):
 
         keep: set[str] = set()
         for name in (*planned, *native, *halves):
-            for src in recipe.expression_sources(recipe.RECIPES_BY_NAME[name].expression):
+            for src in recipe.expression_sources(recipes_by_name[name].expression):
                 for spelling in name_spellings(src.name):
                     if spelling in candidates:
                         keep.add(spelling)
@@ -365,7 +398,9 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
                 "without --gguf-repack support."
             )
         cmd += ["--gguf-repack", str(gguf_repack)]
-    if no_mtp:
+    # Only some converters have an MTP block to omit, and passing the flag to one that has
+    # none is an argparse error rather than a no-op. Ask the converter, as `--no-vision` does.
+    if no_mtp and "--no-mtp" in _converter_options(root, target.module):
         cmd += ["--no-mtp"]
     # A text-only export of a vision family (every community GGUF of these, so far) carries no
     # visual.* tensors; the artifact then omits vision/* entirely and the loader, which already

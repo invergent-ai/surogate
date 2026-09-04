@@ -314,8 +314,11 @@ def source_requirements() -> dict[str, SourceTensor]:
     return _recipe_source_requirements(RECIPE_SPECS)
 
 
-def preflight_sources(model_dir: str | Path) -> SourcePreflight:
-    return _preflight_recipe_sources(model_dir, RECIPE_SPECS)
+def preflight_sources(model_dir: str | Path, recipes=None) -> SourcePreflight:
+    """Check the sources the given recipes need; the full set unless one is passed."""
+    if recipes is None:
+        return _preflight_recipe_sources(model_dir, RECIPE_SPECS)
+    return _preflight_recipe_sources(model_dir, tuple(recipes.values()))
 
 
 validate_recipe_coverage()

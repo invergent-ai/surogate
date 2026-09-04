@@ -321,6 +321,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 ++next_range;
             }
             std::size_t range_index = next_range;
+            std::size_t resume       = ranges.size();
             while (range_index < ranges.size() && ranges[range_index].source == span.source &&
                    ranges[range_index].source_begin < chunk_end) {
                 const CopyRange& range         = ranges[range_index];
@@ -337,13 +338,19 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                     copied =
                         checked_add(copied, amount, "artifact copied byte count overflows u64");
                 }
-                if (range.source_end <= chunk_end) {
-                    ++range_index;
-                } else {
-                    break;
+                // Every range overlapping this chunk takes its slice, including ones that
+                // reach past it: two objects may read the same source bytes -- a tied
+                // embedding and output head do -- and stopping at the first unfinished range
+                // would leave the second one's earlier chunks uncopied.
+                if (range.source_end > chunk_end && resume == ranges.size()) {
+                    resume = range_index;
                 }
+                ++range_index;
             }
-            next_range = range_index;
+            // Resume at the first range this chunk did not finish. Ranges after it that the
+            // chunk did complete are skipped by the guard above on the next pass, because
+            // their source_end is behind the next chunk's start.
+            next_range = std::min(resume, range_index);
             CUDA_CHECK(cudaEventRecord(slot.event, device.load_stream));
             slot.pending = true;
 
@@ -357,7 +364,10 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (const auto& slot : slots) { slot->wait(); }
     CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
     if (copied != total || next_range != ranges.size()) {
-        throw ArtifactError("direct materialization did not cover every tensor byte");
+        throw ArtifactError("direct materialization did not cover every tensor byte (copied " +
+                            std::to_string(copied) + " of " + std::to_string(total) +
+                            ", consumed " + std::to_string(next_range) + " of " +
+                            std::to_string(ranges.size()) + " ranges)");
     }
     for (const PendingTransform& pending : transforms) {
         switch (pending.transform) {

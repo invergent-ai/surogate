@@ -9,6 +9,7 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <string_view>
 
 namespace sinfer::targets::gemma3_270m::detail {
@@ -43,10 +44,17 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
     throw std::invalid_argument("gemma3: invalid weights profile");
 }
 
-WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericFormat format,
+/// A matrix at whatever format the artifact declares. The profile's format is what a
+/// converted checkpoint stores, but a GGUF served natively keeps its own K-quants, and the
+/// kernels dispatch on the weight's qtype either way.
+WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericFormat,
                        std::initializer_list<std::uint64_t> shape) {
-    return WeightPlan{.object = artifact::bind_device_tensor(binder, name, format, shape),
-                      .format = format};
+    if (shape.size() != 2) { throw std::logic_error("bind_weight: rank-two shape"); }
+    const auto dims = std::vector<std::uint64_t>(shape);
+    const artifact::LinearBinding binding =
+        artifact::bind_linear(binder, name, static_cast<std::int32_t>(dims[0]),
+                              static_cast<std::int32_t>(dims[1]));
+    return WeightPlan{.object = binding.object, .format = binding.format};
 }
 
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
