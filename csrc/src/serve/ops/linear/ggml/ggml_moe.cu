@@ -74,9 +74,18 @@ void launch(const void* blocks, std::int32_t rows, std::int32_t k, const block_q
 template <GgmlType type>
 __global__ void codec_decode_kernel(const std::uint8_t* __restrict__ blocks,
                                     float* __restrict__ out) {
+    // One CTA per 256 values, whatever the block size: a superblock is exactly that, and the
+    // plain 32-value types put eight blocks under one CTA with four lanes each. The codec's
+    // `load_eight` addresses a block and a lane within it, so the split happens here.
+    constexpr int kValues        = block_values(type);
+    constexpr int kBlocksPerCta  = QK_K / kValues;
+    constexpr int kLanesPerBlock = kValues / 8;
+    const int lane               = static_cast<int>(threadIdx.x);
+    const std::int64_t block =
+        static_cast<std::int64_t>(blockIdx.x) * kBlocksPerCta + lane / kLanesPerBlock;
     float w[8];
-    GgmlMoeCodec<type>::load_eight(blocks, nullptr, nullptr, blockIdx.x, threadIdx.x, w);
-    float* dst = out + static_cast<std::int64_t>(blockIdx.x) * QK_K + threadIdx.x * 8;
+    GgmlMoeCodec<type>::load_eight(blocks, nullptr, nullptr, block, lane % kLanesPerBlock, w);
+    float* dst = out + static_cast<std::int64_t>(blockIdx.x) * QK_K + lane * 8;
 #pragma unroll
     for (int l = 0; l < 8; ++l) { dst[l] = w[l]; }
 }
@@ -95,19 +104,24 @@ void moe_codec_decode_launch(GgmlType type, const void* blocks, std::int64_t sup
     case GgmlType::Q4_K: launch_codec<GgmlType::Q4_K>(blocks, superblocks, out, stream); return;
     case GgmlType::Q5_K: launch_codec<GgmlType::Q5_K>(blocks, superblocks, out, stream); return;
     case GgmlType::Q6_K: launch_codec<GgmlType::Q6_K>(blocks, superblocks, out, stream); return;
+    case GgmlType::Q8_0: launch_codec<GgmlType::Q8_0>(blocks, superblocks, out, stream); return;
+    case GgmlType::Q4_0: launch_codec<GgmlType::Q4_0>(blocks, superblocks, out, stream); return;
+    case GgmlType::Q4_1: launch_codec<GgmlType::Q4_1>(blocks, superblocks, out, stream); return;
+    case GgmlType::Q5_0: launch_codec<GgmlType::Q5_0>(blocks, superblocks, out, stream); return;
+    case GgmlType::Q5_1: launch_codec<GgmlType::Q5_1>(blocks, superblocks, out, stream); return;
+    case GgmlType::IQ4_NL: launch_codec<GgmlType::IQ4_NL>(blocks, superblocks, out, stream); return;
     default: break;
     }
-    throw std::invalid_argument(
-        "ggml moe codec: only Q4_K, Q5_K and Q6_K decode through the MoE seam today");
+    throw std::invalid_argument("ggml moe codec: unknown GGML type");
 }
 
 void moe_gemv_launch(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
                      const block_q8_1* y, const std::int32_t* ids, std::int32_t tokens,
                      std::int32_t slots, std::int32_t ids_stride, float* out, cudaStream_t stream) {
     if (blocks == nullptr || y == nullptr || ids == nullptr || out == nullptr || rows <= 0 ||
-        k <= 0 || (k % QK_K) != 0 || tokens <= 0 || slots <= 0 || tokens > 32) {
-        throw std::invalid_argument(
-            "ggml moe_gemv: [experts, rows, k] with k a multiple of 256 and at most 32 tokens");
+        k <= 0 || (k % block_values(type)) != 0 || tokens <= 0 || slots <= 0 || tokens > 32) {
+        throw std::invalid_argument("ggml moe_gemv: [experts, rows, k] with k a whole number of "
+                                    "blocks and at most 32 tokens");
     }
     switch (type) {
     case GgmlType::Q2_K: launch<GgmlType::Q2_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
@@ -115,6 +129,12 @@ void moe_gemv_launch(GgmlType type, const void* blocks, std::int32_t rows, std::
     case GgmlType::Q4_K: launch<GgmlType::Q4_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
     case GgmlType::Q5_K: launch<GgmlType::Q5_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
     case GgmlType::Q6_K: launch<GgmlType::Q6_K>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
+    case GgmlType::Q8_0: launch<GgmlType::Q8_0>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
+    case GgmlType::Q4_0: launch<GgmlType::Q4_0>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
+    case GgmlType::Q4_1: launch<GgmlType::Q4_1>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
+    case GgmlType::Q5_0: launch<GgmlType::Q5_0>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
+    case GgmlType::Q5_1: launch<GgmlType::Q5_1>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
+    case GgmlType::IQ4_NL: launch<GgmlType::IQ4_NL>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream); return;
     }
     throw std::invalid_argument("ggml moe_gemv: unknown GGML type");
 }

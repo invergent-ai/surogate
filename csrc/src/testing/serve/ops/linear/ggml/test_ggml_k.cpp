@@ -481,9 +481,7 @@ int main() {
             failures += run_gather(f, false, d_blocks);
             failures += run_gather(f, true, d_blocks);
             cases += 2;
-            // The MoE seam is superblock-shaped: a warp covers one 256-value block. The plain
-            // 32-value types are served through the dense route until it is de-superblocked.
-            if (!big && gg::block_values(f.type) == gg::QK_K) {
+            if (!big) {
                 failures += run_moe(f, d_blocks, d_scratch, scratch_bytes);
                 failures += run_codec(f, d_blocks);
                 cases += 2;

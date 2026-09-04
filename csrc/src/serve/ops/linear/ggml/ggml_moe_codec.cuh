@@ -100,6 +100,89 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q8_0>(const void* blocks,
     for (int l = 0; l < 8; ++l) { w[l] = d * static_cast<float>(x->qs[lane * 8 + l]); }
 }
 
+/// The plain 32-value blocks. Four lanes cover one, and eight consecutive values never
+/// straddle the block's single scale, so each lane reads one nibble half of eight bytes.
+template <>
+__device__ __forceinline__ void decode_eight<GgmlType::Q4_0>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    const block_q4_0* x = static_cast<const block_q4_0*>(blocks) + ib;
+    const int base      = lane * 8;
+    const bool high     = base >= QK4_0 / 2;
+    const int off       = high ? base - QK4_0 / 2 : base;
+    const float d       = __half2float(x->d);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int q = high ? (x->qs[off + l] >> 4) : (x->qs[off + l] & 0x0F);
+        w[l]        = d * static_cast<float>(q - 8);
+    }
+}
+
+template <>
+__device__ __forceinline__ void decode_eight<GgmlType::Q4_1>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    const block_q4_1* x = static_cast<const block_q4_1*>(blocks) + ib;
+    const int base      = lane * 8;
+    const bool high     = base >= QK4_1 / 2;
+    const int off       = high ? base - QK4_1 / 2 : base;
+    const float2 dm     = __half22float2(x->dm);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int q = high ? (x->qs[off + l] >> 4) : (x->qs[off + l] & 0x0F);
+        w[l]        = dm.x * static_cast<float>(q) + dm.y;
+    }
+}
+
+template <>
+__device__ __forceinline__ void decode_eight<GgmlType::Q5_0>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    const block_q5_0* x = static_cast<const block_q5_0*>(blocks) + ib;
+    const int base      = lane * 8;
+    const bool high     = base >= QK5_0 / 2;
+    const int off       = high ? base - QK5_0 / 2 : base;
+    const float d       = __half2float(x->d);
+    std::uint32_t qh;
+    memcpy(&qh, x->qh, sizeof(qh));
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int low  = high ? (x->qs[off + l] >> 4) : (x->qs[off + l] & 0x0F);
+        const int bit  = static_cast<int>((qh >> (base + l)) & 1u) << 4;
+        w[l]           = d * static_cast<float>((low | bit) - 16);
+    }
+}
+
+template <>
+__device__ __forceinline__ void decode_eight<GgmlType::Q5_1>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    const block_q5_1* x = static_cast<const block_q5_1*>(blocks) + ib;
+    const int base      = lane * 8;
+    const bool high     = base >= QK5_1 / 2;
+    const int off       = high ? base - QK5_1 / 2 : base;
+    const float2 dm     = __half22float2(x->dm);
+    std::uint32_t qh;
+    memcpy(&qh, x->qh, sizeof(qh));
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int low = high ? (x->qs[off + l] >> 4) : (x->qs[off + l] & 0x0F);
+        const int bit = static_cast<int>((qh >> (base + l)) & 1u) << 4;
+        w[l]          = dm.x * static_cast<float>(low | bit) + dm.y;
+    }
+}
+
+template <>
+__device__ __forceinline__ void decode_eight<GgmlType::IQ4_NL>(const void* blocks, std::int64_t ib,
+                                                               int lane, float (&w)[8]) {
+    const block_iq4_nl* x = static_cast<const block_iq4_nl*>(blocks) + ib;
+    const int base        = lane * 8;
+    const bool high       = base >= QK4_NL / 2;
+    const int off         = high ? base - QK4_NL / 2 : base;
+    const float d         = __half2float(x->d);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int code = high ? (x->qs[off + l] >> 4) : (x->qs[off + l] & 0x0F);
+        w[l]           = d * static_cast<float>(kIq4nlValues[code]);
+    }
+}
+
 /// The sparse-MoE codec seam: a 256-value group is one superblock, so a warp's 32 lanes cover it
 /// with eight values each. `high` and `scales` are unused -- a superblock carries its own.
 template <GgmlType type>

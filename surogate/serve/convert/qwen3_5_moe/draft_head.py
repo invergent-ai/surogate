@@ -24,7 +24,7 @@ DRAFT_HEAD_N = 131072
 DRAFT_HEAD_OBJECT = "text/draft_head"
 DRAFT_HEAD_TOKEN_IDS_OBJECT = "text/draft_head_token_ids"
 DEFAULT_RANKING = Path(
-    "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64"
+    "freq_corpus/fixtures/ranking/ranking.train.counts.i64"
 )
 RANKING_SOURCE_TARGET = "qwen3_5"
 
