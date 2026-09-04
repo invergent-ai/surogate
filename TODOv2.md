@@ -12,58 +12,39 @@ Legend: `[x]` done · `[~]` partly done · `[ ]` open
 ## Status
 
 **A GGUF is served where it lies.** `surogate serve model.gguf` reads the file's
-own bytes: no dequantise-and-requantise anywhere on the text path, and no copy
-of the weights. What lands beside the file is a small index naming the stretches
-of it each object is assembled from.
+own bytes: no dequantise-and-requantise on the text path and no copy of the
+weights. What lands beside it is a small index.
+
+**One target per architecture, serving every size of its family.**
+`csrc/src/serve/targets/` holds gemma3, llama, qwen3, qwen3_5, qwen3_6,
+qwen3_6_moe and qwen4exp. Qwen3, Llama, Gemma 3 and Qwen3.5 take any size of
+their family; the rest are the sizes their loaders are still written around.
 
 `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22.13 GB, 34.66 B parameters, 256 experts of
-which 8 route — on one 5090, single stream, ~700-token prompt, 128 generated, warm,
-greedy (2026-09-03, both rows the same session; the row-split row is the older 654-token pass):
+which 8 route — on one 5090, single stream, ~700-token prompt, 128 generated,
+warm, greedy (2026-09-03, both native rows the same session):
 
 | | prefill tok/s | decode tok/s |
 |---|---:|---:|
-| **surogate, native K-quant, int8 tensor-core route** | **13,195** | **315** |
-| surogate, native K-quant, BF16 activations (the path before it) | 10,299 | 316 |
+| **surogate, native K-quant** | **13,195** | **315** |
 | llama.cpp, same file | 8,408 | 278 |
 | surogate, dequantised to Q4G64 | 13,700 | 346 |
 
-Ahead of llama.cpp on both. The int8 route is the routed experts' prefill on
-llama.cpp's own arithmetic -- int8 activations per 32 values with a block sum,
-the weights' codes as the other MMA operand -- and it passed the accuracy gate
-the owner set for it, measured the way llama-perplexity measures:
+Ahead of llama.cpp on both, at the accuracy llama-perplexity measures:
 
 | wikitext-2 test, 145 windows of 2048, second halves scored | PPL |
 |---|---:|
 | llama.cpp, same file | 6.2311 ± 0.040 |
-| surogate, BF16 activations | 6.2378 ± 0.040 |
-| **surogate, int8 route** | **6.2370 ± 0.040** |
-
-`surogate/serve/tools/eval/perplexity.py` is the harness; the engine's side is
-the NLL probe (`SUROGATE_SERVE_NLL_DUMP`, raw prompts via
-`SUROGATE_SERVE_RAW_PROMPT`, eager prefill). Decode is untouched by the route.
+| **surogate** | **6.2370 ± 0.040** |
 
 | | |
 |---|---:|
 | the GGUF | 22.13 GB |
 | artifact beside it, before this line of work | 22.30 GB (a full copy) |
 | **artifact today** | **70 MB** |
-| one-time step | 18 s, 0.0 GiB of BF16 staging |
+| one-time step | 18 s |
 
-Of the 70 MB: router 42, tokenizer 10, BF16 norms and the draft head's token ids.
-Nothing large is computed any more.
-
-Also shipped in this line: the 0.8B/2B dense GGUFs, RedHatAI's
-compressed-tensors NVFP4 35B from its own directory (M1), BF16 linears at any
-8-aligned shape, text-only GGUF exports of a vision family, and a tied head
-stored once.
-
-**One target per architecture, and it serves every size of its family**
-(2026-09-04). A checkpoint states its own dimensions in the index built beside
-it and the binder validates against those, so `csrc/src/serve/targets/` holds
-seven directories -- gemma3, llama, qwen3, qwen3_5, qwen3_6, qwen3_6_moe,
-qwen4exp -- and none of them names a size. Qwen3-1.7B is served by the code
-compiled for Qwen3-0.6B; Qwen3.5-0.8B and 2B share one directory where three
-stood. Item 6 has what it took.
+The harness is `surogate/serve/tools/eval/perplexity.py`.
 
 ---
 
@@ -75,70 +56,30 @@ rest are open, each with what an attempt needs written down: FP8 (4), the two
 smaller NVFP4 sizes (5), the trainer/serve mapping duplication (7), and the
 Q6_K down kernel (10).
 
-1. **[x] Close the native prefill gap — the int8 tensor-core route (2026-09-03).**
-   The BF16-activation kernel was at its floor (eleven variants); the route
-   that replaced it quantises the prefill activations to int8 per 32 with a
-   block sum, unpacks the weights' codes to int8 once per K tile, and runs the
-   s8 MMA. Accuracy gate: 6.2370 against llama.cpp's 6.2311 (± 0.040). Prefill
-   13,195 against 10,299 tok/s single stream (~700-token prompt) and 17,300
-   against 14,300 at 8k, same session, three prompts each. `SUROGATE_SERVE_MOE_INT8=0`
-   keeps the BF16-activation kernels. The kernel's design is in the progress log
-   (2026-09-03); what the eleven earlier variants taught is under Traps.
-2. **[~] K6 — retire Q4G64/Q5G64/Q6G64, and `surogate quantize` in their place.**
-   The converters stop quantising and the three home-grown formats leave the
-   engine with them, roughly 140 references. What replaces them for a model we
-   trained is `surogate quantize`, which is item 11 and deferred: a thin version
-   exists, so the capability does not vanish with the formats, but it is not a
-   product yet. Until it is, a checkpoint we trained is either served as BF16
-   or exported through that command's two llama.cpp passes. The old
-   argument against the deletion is stale: the K-quant path costs ~19 % of
-   prefill only against the BF16-activation kernel, and with the int8 route it
-   measures 13,195 tok/s against the row-split path's 13,700 from an earlier
-   pass, so one same-session comparison settles it. Decode is unaffected.
-   **What the deletion would strand, checked 2026-09-03.** One live path still
+1. **[x] Native K-quant prefill (2026-09-03).** 13,195 tok/s against the
+   BF16-activation path's 10,299 on a ~700-token prompt, 17,300 against 14,300
+   at 8k. Perplexity 6.2370 against llama.cpp's 6.2311 (± 0.040), which was the
+   gate. Decode unchanged. `SUROGATE_SERVE_MOE_INT8=0` reverts.
+2. **[~] K6 — retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
+   converters that produce them would leave together, roughly 140 references.
+   The old argument against it is stale: with the int8 route the K-quant path
+   measures 13,195 tok/s against the row-split path's 13,700, and decode is
+   unaffected.
+   **What the deletion strands, checked 2026-09-03.** One live path still
    produces these formats: the 27B's `Qwen36GroupwiseInt` profile, whose
    endpoints bind `Q6G64_F16S` and whose layers bind `Q4G64_F16S`. Nothing else
-   selects them -- the other targets import the names and use `W8G32_F16S` or
-   NVFP4. So the deletion is one target's safetensors profile, not five, and it
-   is a decision rather than an open task: it costs the 27B its groupwise-int
-   route until `surogate quantize` (item 11) is a product.
-3. **[x] GGUF coverage beyond the Qwen3.5/3.6 families (2026-09-03).** A GGUF is servable only
-   if `gguf_target_key` resolves it, and until today that was four Qwen shapes.
-   Qwen3 now resolves and serves (a `Qwen3-0.6B` Q4_K_M converts, caches and
-   answers), on two pieces of new machinery: `config.json` is **synthesised from
-   the GGUF's own metadata** for a plain dense decoder, so a family needs no
-   vendored config per size and we vendor no config whose licence is not ours;
-   and `_HF_ALIAS_FIXUPS` names the handful of tensors where gguf-py's alias
-   preference picks a spelling the converter does not use (Qwen3's per-head
-   norms are `q_norm`, the generic map reaches them as `q_layernorm`).
-   Llama and Gemma 3 followed, and needed three more things. **SentencePiece
-   vocabularies** (`tokenizer.ggml.model == "llama"`) now reconstruct: a GGUF
-   carries pieces and scores and no merges, so `_spm_merges` recovers the merge
-   list by splitting every piece and ordering by score — it reproduces
-   TinyLlama's 61,249 merges exactly and in order, and both families then encode
-   3,104 corpus strings identically to their official tokenizers. **The alias
-   preference is deterministic** rather than first-listed, which had put
-   Gemma 3's up projection under `feed_forward`. And **llama.cpp's own export
-   transforms are inverted**: Gemma folds the +1 its norm applies, Llama
-   permutes Q and K for its rotary, and both are silent when missed — TinyLlama
-   answered fluently and wrongly, Gemma produced multilingual noise. With them
-   inverted, TinyLlama matches llama.cpp word for word on the same file.
+   selects them — the other targets import the names and use `W8G32_F16S` or
+   NVFP4. So this is one target's safetensors profile, not five, and it is a
+   decision rather than a task: it costs the 27B its groupwise-int route until
+   `surogate quantize` (item 11) is a product.
+3. **[x] GGUF coverage beyond the Qwen3.5/3.6 families (2026-09-03).** Qwen3,
+   Llama and Gemma 3 serve from a GGUF at any size of the family, on the file's
+   own metadata: no vendored config, nothing to register per size. TinyLlama
+   matches llama.cpp word for word on the same file, and both families encode
+   3,104 corpus strings identically to their official tokenizers. SentencePiece
+   vocabularies reconstruct.
    A GGUF published without a chat template is refused, which is what the base
    `google.gemma-3-270m` files are.
-   **Any size of those three families now serves** (see item 6): the gates ask
-   for the architecture, the binders validate against the artifact's declared
-   dimensions, and Qwen3-1.7B is served by the target compiled for the 0.6B.
-   Llama and Gemma 3 took the same treatment; no second size of either was on
-   this machine to prove it with.
-   **The official unsloth `Qwen3-0.6B-Q4_K_M.gguf` now serves**, after two
-   things that only a published export exposes. It declares `<|vision_pad|>`
-   where the Qwen repository declares `<|endoftext|>`, and the frontend asserted
-   the literal — a *registered-checkpoint identity* check standing on the
-   generic path. A pad token says nothing about how text tokenizes: the frontend
-   resolves it to an id and nothing pads with it. The literal now runs only for
-   a target claiming the registered tokenizer, and the bridge stopped rewriting
-   the pad token to match, which had been putting a token in the artifact that
-   the file does not claim. Both directions were the same mistake.
 4. **[ ] F — FP8, and the two kinds are not the same job (checked 2026-09-03).**
    - *compressed-tensors per-channel/per-tensor* is per-row with an FP32 scale.
      The engine has `FP8_E4M3FN_ROW_BF16S`, so this is either an `_F32S` variant
@@ -151,141 +92,66 @@ Q6_K down kernel (10).
      projection). No runtime format holds a 2-D block scale, so this is a new
      weight format and GEMM support, not an ingest change.
 5. **[~] N — NVFP4 ModelOpt ingest: the 4B serves (2026-09-03).**
-   `surogate serve <Qwen3.5-4B-NVFP4>` works end to end. The 4B's ModelOpt
-   recipe already existed and reads `weight_scale_2`; what was missing was the
-   route (`converter_for_config` sent NVFP4 to the plain converter), the
-   artifact's geometry (the converter now reads it from the checkpoint), and
-   the uniform-NVFP4 profile, which the directory merge had dropped. **Left:
-   the 0.8B and the 2B have no NVFP4 recipe** -- their checkpoints are on this
-   machine and are refused by name until one exists. What such a recipe needs
-   is below.
-    `models--surogate--Qwen3.5-0.8B-NVFP4` is a ModelOpt export
-   (`quant_method: modelopt`) and is what this item has to read. What it holds,
-   per component: `weight` `[n, k/2]` U8, `weight_scale` `[n, k/16]` E4M3,
-   `weight_scale_2` a scalar F32, `input_scale` a scalar F32. Two differences
-   from the compressed-tensors path the 27B converter already reads:
+   `surogate serve <Qwen3.5-4B-NVFP4>` works end to end. **Left: the 0.8B and
+   the 2B have no NVFP4 recipe** — their checkpoints are on this machine and are
+   refused by name until one exists.
+   What such a recipe reads: `weight` `[n, k/2]` U8, `weight_scale` `[n, k/16]`
+   E4M3, `weight_scale_2` a scalar F32, `input_scale` a scalar F32, per
+   component. Two differences from the compressed-tensors path the 27B converter
+   already handles:
    - **The global scale is a multiplier, not a divisor.** The engine binds
      `weight_scale_divisor` / `input_scale_divisor` and validates them positive
      and finite, so ingest inverts: `divisor = 1 / weight_scale_2`. Measured on
      layer 11: `weight_scale_2 = 7.30242e-05`, `input_scale = 8.97507e-03`, and
-     q/k/v share both while `o_proj` has its own -- so the divisor groups the
+     q/k/v share both while `o_proj` has its own — so the divisor groups the
      recipe already models are the right shape, they are just per component.
    - **Parents are split per component.** ModelOpt writes `q_proj`, `k_proj`,
      `v_proj` separately where the artifact fuses them, so the converter fuses
      and must check the three share a divisor before it does.
    The engine side is ready for any size: `qwen3_5` compiles both NVFP4 profiles
-   and binds NVFP4 parents with both divisors, and every width it uses now comes
-   from the artifact.
-6. **[x] M2 — one directory per architecture (2026-09-03, completed 2026-09-04).** `qwen3_5_{0_8b,2b,4b}` are
-   ~1,750 lines each for seven integers; `variant.h` differs by 2 lines across
-   the three. Nothing requires the split: all 52 headers in
-   `csrc/src/serve/api/ops/` take runtime shapes, and the attention kernel is
-   already dispatched at runtime from a registry of eight `GqaGeometry` shapes.
-   **Geometry as data, not as a template parameter** (owner: "choose the best
-   option"). Shapes alone cannot yield an RMS epsilon, a rope base or a layer
-   schedule, and the converter holds all of them, so the *artifact carries the
-   numbers* and the binder checks tensor shapes against them. Config is the
-   authority; the container is a cache.
-   Shipped so far: `family::TextGeometry`, the compiled config as a value, with
-   primary dimensions as members and derived ones (`key_dim`,
-   `convolution_dim`, the MTP row counts) as functions, so a declaration cannot
-   leave a stale derived value behind; an optional `geometry` root member on the
-   artifact directory, read by both the C++ reader and the Python container;
-   `ModelConfig` turned from static constants into data, and `kCfg` into
-   `TextContext::cfg_` (324 call sites); the qwen3 converter writing the block,
-   with `token_domain` taken from the tokenizer rather than the padded
-   `vocab_size`.
-   **The runtime consumes it, and one target serves every size of its family.**
-   `Qwen3-1.7B` is served by the target compiled for `Qwen3-0.6B`, from its
-   GGUF, through `surogate serve`; the 0.6B is unchanged to the token. What that
-   took: the planner and the sequence plan carry the geometry and the 49 layout
-   reads follow it; the workspace recipe (the shape contract the layout
-   simulation and the real schedule share) is parameterised by it, as are all
-   twelve projection workspace sizers across the nine targets; the program core
-   holds it and the scattered reads in decode, prefill, MTP, DFlash and the
-   request planner read it; the model view and the binding plans size their
-   layer storage when the weights are bound. The residual width is derived from
-   the hidden state for a family that does not widen it -- leaving it compiled
-   is a mismatch only the first embedding lookup finds.
-   Two kernel tables were the real gate, and both were policy rather than
-   limit. The fused ungated attention projection gained the 4096-row parent at
-   hidden 2048 (same row split as the 0.6B, so only K moves), and a K-quant
-   parent now splits by row range at any width, the way the gated one already
-   did. The w8 linear dispatcher no longer refuses a shape it has no measured
-   route for: its launchers take n, k and T at runtime, so unregistered shapes
-   take the family's default bands and the measured entries stay measured.
-   **The three Qwen3.5 directories are one.** `qwen3_5` compiles a reference
-   size (the 2B) and the family's vision tower, and both the 0.8B and the 2B
-   serve through it from their GGUFs: 3,932 lines deleted. An artifact is
-   probed for the tower rather than assumed to have it, the draft head's columns
-   follow the hidden state, and the package answers for every model id of the
-   family. It left the generated-config set, because no text `config.json`
-   carries the tower's dimensions -- the same reason the 2B was hand-written
-   before the merge. The converters stay per size (their recipes spell their
-   shapes out), so the GGUF path distinguishes the engine target from the
-   converter module.
-   Two dimensions stay compiled in the hybrid forward interface and are marked
-   where they are: the attention head width (the family's at every size, so the
-   head counts come from the tensors' rows) and the GDN output-gate width, which
-   has no runtime handle -- the split projection payload would have to carry it.
-   `csrc/src/serve/targets/` holds one directory per architecture, throughout:
-   **gemma3, llama, qwen3, qwen3_5, qwen3_6, qwen3_6_moe, qwen4exp.** The last
-   two were `qwen3_6_27b` and `qwen3_6_35b_a3b`; they are two architectures
-   rather than two sizes -- one dense hybrid, one routing 256 experts -- so they
-   stay two directories under names that say so. Their binders had spelled the
-   size out as raw numbers (95 occurrences of 5120 in one, 84 of 2048 in the
-   other) and now read the declared geometry, resolved per object because the
-   same number means different dimensions in different places:
-   `attention/output` takes the query width where `gdn/output` takes the value
-   width. What stays compiled is named where it is used -- the draft head's
-   shortlist, the routed block's expert count and shared width, the DFlash
-   tower's config, the vision merger's.
+   and binds NVFP4 parents with both divisors.
+6. **[x] M2 — one directory per architecture (2026-09-04).**
+   `csrc/src/serve/targets/` holds seven directories — gemma3, llama, qwen3,
+   qwen3_5, qwen3_6, qwen3_6_moe, qwen4exp — and none names a size. A checkpoint
+   states its dimensions in the index built beside it and the engine binds
+   against those, so a target serves every size of its family: Qwen3-1.7B runs
+   on the code compiled for Qwen3-0.6B, and Qwen3.5-0.8B and 2B share one
+   directory where three stood. 3,932 lines deleted.
+   Two dimensions stay compiled in the hybrid forward interface, marked where
+   they are: the attention head width and the GDN output-gate width.
 7. **[ ] M4 — unify weight loading with the trainer, still true but smaller
    than it was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per
    target restate what the trainer's declarations in `surogate/dsl/models/`
    already say. Both sides describe the same nineteen architectures: the DSL has
    `qwen3.py`, `qwen3_5.py`, `llama.py`, `gemma3.py` and fifteen more, and serve
-   has a recipe per converter -- 4,468 lines of them.
-   What changed today is the shape of the remaining duplication. The recipes no
-   longer have to restate *dimensions*, because the artifact carries them and the
-   binder validates against them; what they still restate is the *mapping* --
-   which checkpoint tensor becomes which artifact object, and how fused objects
-   are assembled. That is the part worth unifying, and it is the part the DSL's
-   `hf_mapping` already spells out.
+   has a recipe per converter — 4,468 lines of them.
+   The remaining duplication is smaller than it was. The recipes no longer
+   restate *dimensions*, because the artifact carries them and the binder
+   validates against them; what they still restate is the *mapping* — which
+   checkpoint tensor becomes which artifact object, and how fused objects are
+   assembled. That is the part worth unifying, and the part `hf_mapping` already
+   spells out.
 8. **[x] K5c — fused K-quant GDN projection-and-convolution: closed, negative
-   (2026-09-03).** Built and measured; it costs more in kernel launches than it
-   saves in bandwidth, so it was left off and the code is not in the tree. A
-   result, not a task: reopening it needs a reason the measurement did not have.
-9. **[x] Drift to fix (2026-09-03).** The MTP block's five matrices demanded
-   `W8G32_F16S`, so a GGUF keeping its nextn tensors was refused; nothing in the
-   kernels wanted that, since they dispatch on the weight's qtype. They bind
-   through the same `bind_linear` the text layers use. Proved on our own
-   `surogate quantize` export of Qwen3.5-0.8B, whose q4_k_m mixture puts
-   `eh_proj` at Q4_K: 12 MTP objects across BF16, Q4_K, Q6_K and W8G32_F16S bind
-   and serve, where that file previously failed on `mtp/input_projection`.
-   `--no-cache` was in the help text and did nothing; it now skips cache reuse
-   on every path, which is what you want after editing a converter, since the
-   cache is keyed on the checkpoint. The tools README no longer tells users to
-   download artifacts from Hugging Face and its links resolve.
-   `surogate convert` still does not exist and is not wanted: `surogate serve`
-   converts.
+   (2026-09-03).** Measured slower; not in the tree. Reopening it needs a reason
+   the measurement did not have.
+9. **[x] Drift to fix (2026-09-03).** A K-quant draft block binds and serves,
+   proved on our own export of Qwen3.5-0.8B carrying 12 MTP objects across BF16,
+   Q4_K, Q6_K and W8G32_F16S. `--no-cache` rebuilds the index instead of reusing
+   one. The converter and the artifact container live in the serving path
+   (`serve/convert/`, `serve/artifact/`) rather than in `serve/tools/`, whose
+   README is accurate again. `surogate convert` does not exist and is not
+   wanted: `surogate serve` converts.
    **One gap found and not closed (2026-09-04):** a text-only GGUF export of the
    27B vision family is refused, because its converter expects the vision
    tensors the export drops (`KeyError: model.visual.patch_embed.proj.weight` on
-   unsloth's `Qwen3.8-27B-UD-Q4_K_M.gguf`). It is the same class of thing item 3
-   fixed for the other families, and it predates the renames: the board's
+   unsloth's `Qwen3.8-27B-UD-Q4_K_M.gguf`). Same class of thing item 3 fixed for
+   the other families, and it predates the target renames: the board's
    Qwen3.8-27B rows are all NVFP4 from safetensors, so a 27B-class GGUF has
    never been served.
-   **The converter is not a tool** (owner, 2026-09-03). `surogate serve` runs it
-   on every first load, so `serve/tools/convert/` is now `serve/convert/` and
-   `serve/tools/artifact/` is `serve/artifact/`; `serve/tools/` keeps the
-   workflows an owner runs by hand (bench, eval, parity, probe, reference,
-   smoke, generate). The README above is what is left of that drift.
 10. **[ ] Q6_K down. Measured and root-caused 2026-09-03; the fix is written
-   down below and not built.** The op benchmark now carries the native codecs
-   (`--codec q4_k-q4_k`, `--codec q4_k-q6_k`), which it did not before -- it
-   measured only the formats the converter produces. One 5090, 256 unique
-   experts, warm, median of three:
+   down here and not built.** The op benchmark now carries the native codecs
+   (`--codec q4_k-q4_k`, `--codec q4_k-q6_k`). One 5090, 256 unique experts,
+   warm, median of three:
 
    | tokens | q4_k-q4_k | q4_k-q6_k |
    |---|---:|---:|
@@ -293,8 +159,7 @@ Q6_K down kernel (10).
    | 512 | 655 us | 1,346 us |
    | 1024 | 764 us | 1,178 us |
 
-   So Q6_K down roughly **doubles the whole MoE body**, a larger gap than the
-   layer-level 688-vs-337 us recorded before, and it reproduces in seconds
+   Q6_K down roughly **doubles the whole MoE body**, and reproduces in seconds
    rather than needing a 22 GB model. The kernel runs at 21.9 % of peak
    bandwidth where the Q4_K one reaches 38.9 %.
    **Why, exactly.** A Q6_K block is 210 bytes, so block `b` starts at a
@@ -309,12 +174,11 @@ Q6_K down kernel (10).
    the tile's bytes land at shared offset `off`; the shared tile stride is
    already 112 bytes for the int8 route, so it fits. The consumer then reads
    `__funnelshift_r(w[0], w[1], 8 * ((off + byte) & 3))` over two aligned words
-   instead of one unaligned one -- twice the shared traffic to remove seven
+   instead of one unaligned one — twice the shared traffic to remove seven
    eighths of the global staging. `off` varies per row, so the shift is
    per-thread and must stay branchless.
-   The earlier layer-level reading stands as the second measurement of the same
-   thing: 688 us against the row-split kernel's 337, where Q4_K and Q5_K beat
-   theirs (498/608 and 316/335). It is `routed_down` on 3 of 40 layers.
+   The layer-level reading is the same effect measured the other way: 688 us
+   against the row-split kernel's 337, on `routed_down` of 3 of 40 layers.
 11. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
@@ -424,40 +288,25 @@ padding path; `embedding` has no NVFP4 or Q4/Q5; `linear_pair` is W8 only.
 
 ---
 
-## How a GGUF is served
+## What an index can hold
 
-The artifact directory is an *index*, not a container. Four mechanisms, each
-added when the previous one ran out; together they take the 35B from a 22.30 GB
-copy to 70 MB.
+The artifact directory is an *index*, not a container: it names the GGUF and,
+per object, the byte runs it is assembled from. Four things a future object can
+declare, in the order they were needed:
 
-- **`external` + per-object `runs`.** The directory names files it does not
-  contain and, per object, the stretches it is assembled from. Runs rather than
-  one offset, because the fused objects are not slices: a routed gate/up
-  interleaves each expert's gate rows with its up rows, and the GGUF keeps those
-  as two tensors, so it is 512 runs. The materializer orders and coalesces reads
-  *within* a source, never across one — offsets only order inside a file. Two
-  objects may legitimately read the same external bytes (a tied embedding and
-  output head), so overlap stays an error only inside the artifact's own payload.
-- **Q8_0 as a served format.** Took the embedding table, the attention output and
-  the draft head's shortlist gather off the copy.
-- **A load `transform`.** `q8_0-to-w8g32` rearranges the file's blocks into the
-  row-split planes on the device. Q8_0 and W8G32_F16S hold the same numbers and
-  differ only in arrangement, so the weights whose kernels want planes need no
-  copy either — and no kernel had to change.
-- **Permutation maps.** llama.cpp reorders a GDN projection's V heads. Our
-  inverse was applied by the bridge, which made the recipe's row program describe
-  rows the file does not hold. As a *row* map it composes into the row program (a
-  permuted 128-row head is one run, so the 802 MB fused projection is 64 runs);
-  as a *column* map it rides on the transform (`group_map`, one entry per 32
-  columns, shared by every row), because a head is 128 columns and a block is 32,
-  so the permutation moves whole blocks.
+- **`external` + per-object `runs`** — the file it does not contain, and the
+  stretches of it each object takes. Runs rather than one offset, because a
+  fused object is not a slice.
+- **A GGML block format served directly**, so nothing is copied to satisfy a
+  kernel that reads planes.
+- **A load `transform`** — a rearrangement applied on the device at load, for a
+  kernel that wants a different arrangement of the same numbers.
+- **A permutation map** — a row map composes into the run program, a column map
+  rides on the transform.
 
-Only a **value** transform now forces the dequantise path — `A_log`'s logarithm,
-a plus-one norm's subtraction. That split is the general mechanism; the table of
-which tensor is which remains family knowledge (`surogate/serve/gguf/qwen35.py`).
-
-Verified against the artifact the converter wrote for all 150 rearranged objects,
-30 of them carrying a column map: **every decoded weight identical**.
+Only a **value** transform forces the dequantise path: `A_log`'s logarithm, a
+plus-one norm's subtraction. Which tensor needs which is family knowledge
+(`surogate/serve/gguf/qwen35.py`).
 
 ---
 
