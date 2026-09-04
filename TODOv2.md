@@ -161,6 +161,12 @@ product rather than tasks (1 and 6); the rest are work.
    more distinct experts than a single token and pays more PCIe gathers with
    3,172 of 5,110 experts resident. The graph and the levers are in memory
    `project_serve_qwen4exp_mtp`.
+   **Draft-length sweep (2026-09-04 23:40, one 5090, board 512/128, defaults):** off
+   32.6 tok/s; draft 1 **35.2** (71.6 % accepted); draft 2 34.6 (55 %); draft 3 32.6
+   (45 %). The shortest draft wins, as on the 27B (83.3 at draft 1): every extra
+   column costs a wider expert gather and the acceptance falls off fast. `--spec mtp
+   --draft-tokens 1` is the setting to serve with; the +8 % is what the head is worth
+   on an offloaded MoE until the verify round's gather is cheaper.
 6. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
