@@ -54,7 +54,8 @@ product rather than tasks (1 and 7); the rest are work.
      `fp8-block` (`--profile` auto-detected from `quantization_config`), the uniform
      recipe's object graph at any geometry. Qwen3.5-0.8B-FP8: **14.7418** against the
      BF16 torch reference's 14.60 on the same 40 windows (+1 %, the recipe's cost) and
-     llama.cpp's IQ4_XS 15.15; 833 tok/s decode on one 5090.
+     llama.cpp's IQ4_XS 15.15; 833 tok/s decode on one 5090. 2B **10.118** vs Q4_K_M 10.291
+     (518 tok/s), 4B **8.148** vs 8.245 (261): block FP8 beats the 4-bit GGUFs at every size.
    - *compressed-tensors per-channel/per-tensor* (a per-row F32 scale). The engine's
      `FP8_E4M3FN_ROW_BF16S` route holds the numbers but is compile-time geometry -- the
      27B's shapes only -- so a small checkpoint of this kind would be refused before its
