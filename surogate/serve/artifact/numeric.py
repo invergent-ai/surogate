@@ -66,6 +66,9 @@ W8G32_F16S = QuantFormat("W8G32_F16S", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("NVFP4", 16)
 FP8_E4M3FN_ROW_BF16S = Fp8RowFormat("FP8_E4M3FN_ROW_BF16S")
 FP8_E4M3FN_BLK128_F32S = Fp8BlockFormat("FP8_E4M3FN_BLK128_F32S")
+#: E4M3FN weights with one FP32 multiplier per row (compressed-tensors per-channel FP8; the
+#: checkpoint's BF16 scales widen exactly). Served by the block route as a [n][1] grid.
+FP8_E4M3FN_ROW_F32S = Fp8BlockFormat("FP8_E4M3FN_ROW_F32S", block=0)
 
 @dataclass(frozen=True, slots=True)
 class GgmlBlockFormat:
@@ -130,7 +133,8 @@ GGML_BLOCK_FORMATS = MappingProxyType(
     {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0,
                             IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4_GGML, Q1_0, Q2_0)}
 )
-FP8_BLOCK_FORMATS = {FP8_E4M3FN_BLK128_F32S.name: FP8_E4M3FN_BLK128_F32S}
+FP8_BLOCK_FORMATS = {FP8_E4M3FN_BLK128_F32S.name: FP8_E4M3FN_BLK128_F32S,
+                     FP8_E4M3FN_ROW_F32S.name: FP8_E4M3FN_ROW_F32S}
 
 NUMERIC_FORMATS = MappingProxyType(
     {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS, **FP8_BLOCK_FORMATS,

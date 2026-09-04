@@ -43,6 +43,7 @@ from surogate.serve.convert.common.inventory import (
     tensor_spec as _family_tensor_spec,
 )
 from surogate.serve.convert.common.inventory import FP8_BLOCK as FP8_BLOCK_FORMAT, BLOCK128_LAYOUT
+from surogate.serve.convert.common.inventory import FP8_ROW_F32 as FP8_ROW_F32_FORMAT, ROW_SCALE_F32_LAYOUT
 
 
 #: The identity of the checkpoint being converted. One converter serves the family, so this
@@ -243,7 +244,10 @@ NVFP4_ALL = "nvfp4-all"
 #: Hugging Face fine-grained FP8: every projection E4M3 with an FP32 scale per 128x128
 #: block (`weight_scale_inv`), fused parents, byte-wide endpoints. Any size of the family.
 FP8_BLOCK = "fp8-block"
-PROFILES = (GROUPWISE_INT, NVFP4_MIXED_BF16, NVFP4_UNIFORM, NVFP4_MLP_ONLY, NVFP4_ALL, FP8_BLOCK)
+#: compressed-tensors per-channel FP8 (one scale per row, dynamic per-token activations):
+#: the same object graph, stored row-scaled and served by the same route.
+FP8_CHANNEL = "fp8-channel"
+PROFILES = (GROUPWISE_INT, NVFP4_MIXED_BF16, NVFP4_UNIFORM, NVFP4_MLP_ONLY, NVFP4_ALL, FP8_BLOCK, FP8_CHANNEL)
 
 #: The `weights_id` half of the artifact identity each profile writes. The engine resolves
 #: the profile back from (model_id, weights_id), so these strings are the contract: `nvfp4`
@@ -256,6 +260,7 @@ WEIGHTS_IDS = {
     NVFP4_MLP_ONLY: "nvfp4",
     NVFP4_ALL: "nvfp4-all",
     FP8_BLOCK: "fp8-block",
+    FP8_CHANNEL: "fp8-channel",
 }
 
 
@@ -376,6 +381,15 @@ def export_for(profile: str, geometry: Geometry = GEOMETRY) -> Export:
             gdn_input=(FP8,), gdn_output=FP8, mlp=(NVFP4, NVFP4),
             exceptions={"mlp": (FP8, _FP8_MLP_LAYERS)},
         )
+    if profile == FP8_CHANNEL:
+        return Export(
+            attention_storage=FUSED, gdn_storage=FUSED, control_storage=SPLIT_A_B,
+            vocabulary=W8, draft_head=W8,
+            attention_input=(FP8_ROW_F32_FORMAT,), attention_output=FP8_ROW_F32_FORMAT,
+            gdn_input=(FP8_ROW_F32_FORMAT,), gdn_output=FP8_ROW_F32_FORMAT,
+            mlp=(FP8_ROW_F32_FORMAT, FP8_ROW_F32_FORMAT),
+            mtp=False, vision=False,
+        )
     if profile == FP8_BLOCK:
         return Export(
             attention_storage=FUSED, gdn_storage=FUSED, control_storage=SPLIT_A_B,
@@ -410,6 +424,8 @@ def tensor_spec(name: str, shape: tuple[int, ...], numeric_format: str) -> Tenso
         return TensorSpec(name, shape, numeric_format, ROW_SCALE_LAYOUT)
     if numeric_format == FP8_BLOCK_FORMAT:
         return TensorSpec(name, shape, numeric_format, BLOCK128_LAYOUT)
+    if numeric_format == FP8_ROW_F32_FORMAT:
+        return TensorSpec(name, shape, numeric_format, ROW_SCALE_F32_LAYOUT)
     return _family_tensor_spec(name, shape, numeric_format)
 
 

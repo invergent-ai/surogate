@@ -137,6 +137,11 @@ BLOCK_SCALE128_FP8_V1 = Layout(
     256,
     frozenset(("FP8_E4M3FN_BLK128_F32S",)),
 )
+ROW_SCALE_F32_V1 = Layout(
+    "row-scale-f32-v1",
+    256,
+    frozenset(("FP8_E4M3FN_ROW_F32S",)),
+)
 GGML_BLOCKS_V1 = Layout(
     "ggml-blocks-v1",
     256,
@@ -154,6 +159,7 @@ LAYOUTS = MappingProxyType(
             ROW_SCALE_V1,
             GGML_BLOCKS_V1,
             BLOCK_SCALE128_FP8_V1,
+            ROW_SCALE_F32_V1,
         )
     }
 )
@@ -302,7 +308,7 @@ def block_scale128_geometry(
     format: str | Fp8BlockFormat, shape: Sequence[int]
 ) -> BlockScale128Geometry:
     spec = _format(format)
-    if not isinstance(spec, Fp8BlockFormat):
+    if not isinstance(spec, Fp8BlockFormat) or spec.block == 0:
         raise ValueError("block-scale-128-fp8-v1 requires a block-scaled FP8 format")
     n, k = _shape(shape, rank=2)
     if n % spec.block or k % spec.block:
@@ -314,6 +320,43 @@ def block_scale128_geometry(
         n=n, k=k, code_plane_bytes=code_plane_bytes, scale_plane_offset=scale_plane_offset,
         scale_plane_bytes=scale_plane_bytes, payload_bytes=scale_plane_offset + scale_plane_bytes,
     )
+
+
+def row_scale_f32_geometry(
+    format: str | Fp8BlockFormat, shape: Sequence[int]
+) -> BlockScale128Geometry:
+    """row-scale-f32-v1: E4M3 codes [n][k], then, 256-aligned, one FP32 scale per row."""
+    spec = _format(format)
+    if not isinstance(spec, Fp8BlockFormat) or spec.block != 0:
+        raise ValueError("row-scale-f32-v1 requires the row-scaled FP8 format")
+    n, k = _shape(shape, rank=2)
+    if k % 128:
+        raise ValueError("row-scale-f32-v1 requires k to be a whole number of 128s")
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = n * 4
+    return BlockScale128Geometry(
+        n=n, k=k, code_plane_bytes=code_plane_bytes, scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes, payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
+def encode_fp8_row_f32(
+    code_words: torch.Tensor, row_scales: torch.Tensor, shape: Sequence[int]
+) -> bytes:
+    """Encode exact E4M3FN code words [n, k] and FP32 row multipliers [n]."""
+    geometry = row_scale_f32_geometry("FP8_E4M3FN_ROW_F32S", shape)
+    codes = _exact_uint8_matrix(code_words, (geometry.n, geometry.k), "row-scaled FP8 codes")
+    scales = row_scales.detach().cpu().reshape(-1).to(torch.float32)
+    if scales.numel() != geometry.n:
+        raise ValueError("row-scaled FP8 scales must hold one value per row")
+    if not bool(torch.isfinite(scales).all()) or bool((scales <= 0).any()):
+        raise ValueError("row-scaled FP8 scales must be finite and positive")
+    payload = bytearray(geometry.payload_bytes)
+    payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
+    begin = geometry.scale_plane_offset
+    payload[begin : begin + geometry.scale_plane_bytes] = scales.contiguous().numpy().tobytes()
+    return bytes(payload)
 
 
 def encode_fp8_block_scaled(
@@ -368,6 +411,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8BlockFormat):
             raise ValueError("block-scale-128-fp8-v1 requires a block-scaled FP8 format")
         return block_scale128_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is ROW_SCALE_F32_V1:
+        return row_scale_f32_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGML_BLOCKS_V1:
         if not isinstance(numeric_spec, GgmlBlockFormat):
             raise ValueError("ggml-blocks-v1 requires a GGML block format")
@@ -1160,6 +1205,9 @@ __all__ = [
     "BlockScale128Geometry",
     "block_scale128_geometry",
     "encode_fp8_block_scaled",
+    "ROW_SCALE_F32_V1",
+    "row_scale_f32_geometry",
+    "encode_fp8_row_f32",
     "RowPlanes",
     "RowScaleGeometry",
     "RowSplitGeometry",

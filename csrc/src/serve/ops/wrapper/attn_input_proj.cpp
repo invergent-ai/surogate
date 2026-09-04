@@ -266,6 +266,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         return detail::ggml::ggml_linear_workspace_capacity_bytes(parent_rows, input_rows,
                                                                    max_tokens);
     case QType::FP8_E4M3FN_BLK128_F32S:
+    case QType::FP8_E4M3FN_ROW_F32S:
         return detail::fp8_block::linear_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
     case QType::BF16_CTRL:
         if (parent_rows != 14336 || input_rows != 5120 || policy != LinearPolicy::A16Only) {

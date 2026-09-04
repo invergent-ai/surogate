@@ -22,6 +22,10 @@ struct FrontendResourcePlan {
     artifact::ObjectHandle generation_config_json;
     artifact::ObjectHandle preprocessor_config_json;
     artifact::ObjectHandle video_preprocessor_config_json;
+    /// Whether the artifact carried the pixel processor configs. A text-only release of a
+    /// vision family does not; the frontend reads the empty strings as "never asked for a
+    /// pixel" and refuses --vision at load.
+    bool has_preprocessor_configs = true;
 };
 
 struct FrontendResources {

@@ -40,6 +40,9 @@ enum class QType : std::uint16_t {
     /// E4M3FN codes with one FP32 scale per 128x128 block (HF fine-grained FP8, DeepSeek's
     /// recipe): [rows, k] codes and a [rows/128][k/128] scale grid, QuantLayout::Fp8Block128.
     FP8_E4M3FN_BLK128_F32S = 64,
+    /// E4M3FN codes with one FP32 scale per row (compressed-tensors per-channel FP8); served
+    /// by the block route with a [rows][1] scale grid. QuantLayout::Fp8Block128 as well.
+    FP8_E4M3FN_ROW_F32S    = 65,
     // GGML K-quants in their own superblock layout (QuantLayout::GgmlBlocks), bytes as the
     // GGUF stores them: 256 values per block, affine sub-scales, k a multiple of 256.
     Q2_K                 = 9,

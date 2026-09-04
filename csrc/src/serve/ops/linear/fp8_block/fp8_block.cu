@@ -54,9 +54,16 @@ __device__ __forceinline__ float2 e4m3x2_to_float2(std::uint16_t bits) {
     return static_cast<float2>(v);
 }
 
+/// The scale grid's cell, [k per scale, rows per scale]: 128 x 128 for the block export, k x 1
+/// for a per-channel one. A scale index is (row / rows_per) * (k / k_per) + kofs / k_per.
+struct ScaleCell {
+    int k_per;
+    int rows_per;
+};
+
 template <int Tokens>
 __global__ __launch_bounds__(128) void gemv_kernel(const std::uint8_t* __restrict__ codes,
-                                                   const float* __restrict__ scales,
+                                                   const float* __restrict__ scales, ScaleCell cell,
                                                    const __nv_bfloat16* __restrict__ x, int rows,
                                                    int k, int tokens,
                                                    __nv_bfloat16* __restrict__ out,
@@ -65,16 +72,16 @@ __global__ __launch_bounds__(128) void gemv_kernel(const std::uint8_t* __restric
     const int lane = static_cast<int>(threadIdx.x & 31);
     const int row  = static_cast<int>(blockIdx.x) * 4 + warp;
     if (row >= rows) { return; }
-    const int kblocks = k / kBlock;
+    const int kcells = k / cell.k_per;
     const std::uint8_t* wrow = codes + static_cast<std::size_t>(row) * k;
-    const float* srow        = scales + static_cast<std::size_t>(row / kBlock) * kblocks; // one scale row per 128 weight rows
+    const float* srow        = scales + static_cast<std::size_t>(row / cell.rows_per) * kcells;
     float acc[Tokens];
 #pragma unroll
     for (int t = 0; t < Tokens; ++t) { acc[t] = 0.0f; }
     // 32 lanes x 16 codes = 512 values a step; a lane's 16 sit inside one 128-block
     for (int base = lane * 16; base < k; base += 512) {
         const uint4 packed = *reinterpret_cast<const uint4*>(wrow + base);
-        const float s      = srow[base / kBlock];
+        const float s      = srow[base / cell.k_per];
         const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
         float part[Tokens];
 #pragma unroll
@@ -121,7 +128,7 @@ struct TileSmem {
 
 template <bool Accumulate>
 __global__ __launch_bounds__(kTileWarps * 32, kBlocksPerSm) void tile_kernel(
-    const std::uint8_t* __restrict__ w_codes, const float* __restrict__ w_scales,
+    const std::uint8_t* __restrict__ w_codes, const float* __restrict__ w_scales, ScaleCell cell,
     const std::uint8_t* __restrict__ x_codes, const float* __restrict__ x_scales, int rows, int k,
     int tokens, __nv_bfloat16* __restrict__ out) {
     __shared__ TileSmem sm;
@@ -131,6 +138,7 @@ __global__ __launch_bounds__(kTileWarps * 32, kBlocksPerSm) void tile_kernel(
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
     const int kblocks    = k / kBlock;
+    const int kcells     = k / cell.k_per;
     const int row_blocks = rows / kTileRows;
     const int col_blocks = (tokens + kTileCols - 1) / kTileCols;
     const int total_work = row_blocks * col_blocks;
@@ -157,7 +165,7 @@ __global__ __launch_bounds__(kTileWarps * 32, kBlocksPerSm) void tile_kernel(
                                               valid ? 16 : 0);
             }
             if (tid < kTileRows) {
-                sm.Sw[slot][tid] = w_scales[static_cast<std::size_t>((row0 + tid) / kBlock) * kblocks + kb];
+                sm.Sw[slot][tid] = w_scales[static_cast<std::size_t>((row0 + tid) / cell.rows_per) * kcells + (kb * kBlock) / cell.k_per];
             } else if (tid < kTileRows + kTileCols) {
                 const int t = tid - kTileRows;
                 sm.Sx[slot][t] = t < cols ? x_scales[static_cast<std::size_t>(col0 + t) * kblocks + kb] : 0.0f;
@@ -267,23 +275,25 @@ void require_x_out(const Tensor& x, std::int32_t k, const Tensor& out, std::int3
 void run(const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t rows, Tensor& out,
          bool accumulate, WorkspaceArena* workspace, cudaStream_t stream, const char* op) {
     require_fp8_block_weight(w, op);
-    if (row_begin < 0 || rows <= 0 || row_begin + rows > w.n || (row_begin % kBlock) != 0 ||
-        (rows % kTileRows) != 0) {
-        throw std::invalid_argument(std::string(op) + ": row range must start on a 128-block and be whole 64-row tiles");
+    if (row_begin < 0 || rows <= 0 || row_begin + rows > w.n || (row_begin % w.scale_ne[1]) != 0 ||
+        (row_begin % kTileRows) != 0 || (rows % kTileRows) != 0) {
+        throw std::invalid_argument(std::string(op) + ": row range must start on a scale row and be whole 64-row tiles");
     }
     require_x_out(x, w.k, out, rows, op);
     const std::int32_t k = w.k, tokens = x.ne[1], kblocks = k / kBlock;
+    const ScaleCell cell{w.scale_ne[0], w.scale_ne[1]};
     const auto* codes  = static_cast<const std::uint8_t*>(w.qdata) + static_cast<std::size_t>(row_begin) * k;
-    const auto* scales = static_cast<const float*>(w.scales) + static_cast<std::size_t>(row_begin / kBlock) * kblocks;
+    const auto* scales = static_cast<const float*>(w.scales) +
+                         static_cast<std::size_t>(row_begin / cell.rows_per) * (k / cell.k_per);
     auto* o = static_cast<__nv_bfloat16*>(out.data);
     if (tokens <= kGemvMaxTokens) {
         const dim3 grid(static_cast<unsigned>((rows + 3) / 4));
         const auto* xin = static_cast<const __nv_bfloat16*>(x.data);
         switch (tokens) {
-        case 1: gemv_kernel<1><<<grid, 128, 0, stream>>>(codes, scales, xin, rows, k, tokens, o, accumulate); break;
-        case 2: gemv_kernel<2><<<grid, 128, 0, stream>>>(codes, scales, xin, rows, k, tokens, o, accumulate); break;
-        case 3: gemv_kernel<3><<<grid, 128, 0, stream>>>(codes, scales, xin, rows, k, tokens, o, accumulate); break;
-        default: gemv_kernel<4><<<grid, 128, 0, stream>>>(codes, scales, xin, rows, k, tokens, o, accumulate); break;
+        case 1: gemv_kernel<1><<<grid, 128, 0, stream>>>(codes, scales, cell, xin, rows, k, tokens, o, accumulate); break;
+        case 2: gemv_kernel<2><<<grid, 128, 0, stream>>>(codes, scales, cell, xin, rows, k, tokens, o, accumulate); break;
+        case 3: gemv_kernel<3><<<grid, 128, 0, stream>>>(codes, scales, cell, xin, rows, k, tokens, o, accumulate); break;
+        default: gemv_kernel<4><<<grid, 128, 0, stream>>>(codes, scales, cell, xin, rows, k, tokens, o, accumulate); break;
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -301,23 +311,27 @@ void run(const Tensor& x, const Weight& w, std::int32_t row_begin, std::int32_t 
     const int work = (rows / kTileRows) * ((tokens + kTileCols - 1) / kTileCols);
     const int grid = std::min(work, persistent_blocks());
     if (accumulate) {
-        tile_kernel<true><<<grid, kTileWarps * 32, 0, stream>>>(codes, scales, x_codes, x_scales, rows, k, tokens, o);
+        tile_kernel<true><<<grid, kTileWarps * 32, 0, stream>>>(codes, scales, cell, x_codes, x_scales, rows, k, tokens, o);
     } else {
-        tile_kernel<false><<<grid, kTileWarps * 32, 0, stream>>>(codes, scales, x_codes, x_scales, rows, k, tokens, o);
+        tile_kernel<false><<<grid, kTileWarps * 32, 0, stream>>>(codes, scales, cell, x_codes, x_scales, rows, k, tokens, o);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
-bool is_fp8_block_qtype(QType qtype) noexcept { return qtype == QType::FP8_E4M3FN_BLK128_F32S; }
+bool is_fp8_block_qtype(QType qtype) noexcept {
+    return qtype == QType::FP8_E4M3FN_BLK128_F32S || qtype == QType::FP8_E4M3FN_ROW_F32S;
+}
 
 void require_fp8_block_weight(const Weight& w, const char* op) {
+    const bool per_row = w.qtype == QType::FP8_E4M3FN_ROW_F32S;
     if (!is_fp8_block_qtype(w.qtype) || w.layout != QuantLayout::Fp8Block128 || w.qdata == nullptr ||
-        w.scales == nullptr || w.ndim != 2 || w.n <= 0 || w.k <= 0 || (w.n % kBlock) != 0 ||
+        w.scales == nullptr || w.ndim != 2 || w.n <= 0 || w.k <= 0 || (w.n % kTileRows) != 0 ||
         (w.k % kBlock) != 0 || w.scale_dtype != DType::FP32 || w.padded_shape[0] != w.n ||
-        w.padded_shape[1] != w.k) {
-        throw std::invalid_argument(std::string(op) + ": weight must be block-scaled FP8, [n, k] whole 128-blocks with an FP32 scale grid");
+        w.padded_shape[1] != w.k || (!per_row && (w.n % kBlock) != 0) ||
+        w.scale_ne[0] != (per_row ? w.k : kBlock) || w.scale_ne[1] != (per_row ? 1 : kBlock)) {
+        throw std::invalid_argument(std::string(op) + ": weight must be block- or row-scaled FP8, [n, k] with k whole 128-blocks and an FP32 scale grid");
     }
 }
 
@@ -336,14 +350,15 @@ std::size_t linear_workspace_capacity_bytes(std::int32_t output_rows, std::int32
 
 Weight weight_rows(const Weight& w, std::int32_t row_begin, std::int32_t rows) {
     require_fp8_block_weight(w, "fp8 block weight_rows");
-    if (row_begin < 0 || rows <= 0 || row_begin + rows > w.n || (row_begin % kBlock) != 0 || (rows % kBlock) != 0) {
-        throw std::invalid_argument("fp8 block weight_rows: the range must be whole 128-blocks of rows");
+    const std::int32_t rows_per = w.scale_ne[1], kcells = w.k / w.scale_ne[0];
+    if (row_begin < 0 || rows <= 0 || row_begin + rows > w.n || (row_begin % rows_per) != 0 ||
+        (row_begin % kTileRows) != 0 || (rows % kTileRows) != 0) {
+        throw std::invalid_argument("fp8 block weight_rows: the range must be whole scale rows and whole 64-row tiles");
     }
-    const std::int32_t kblocks = w.k / kBlock;
     Weight out          = w;
     out.qdata           = static_cast<const std::byte*>(w.qdata) + static_cast<std::size_t>(row_begin) * w.k;
     out.payload         = out.qdata;
-    out.scales          = static_cast<const float*>(w.scales) + static_cast<std::size_t>(row_begin / kBlock) * kblocks;
+    out.scales          = static_cast<const float*>(w.scales) + static_cast<std::size_t>(row_begin / rows_per) * kcells;
     out.payload_bytes   = static_cast<std::uint64_t>(rows) * w.k; // the codes; the scales follow elsewhere
     out.n               = rows;
     out.shape[0]        = rows;

@@ -48,6 +48,7 @@ ops::LinearPolicy text_policy(const Weight& weight) {
     case QType::FP8_E4M3FN_ROW_BF16S:
         return kFp8TextPolicy;
     case QType::FP8_E4M3FN_BLK128_F32S:
+    case QType::FP8_E4M3FN_ROW_F32S:
         return kFp8TextPolicy; // informational: the route quantises per token per 128 regardless
     // W8 opts into A8: the wrappers run the W8A8-int IMMA path at
     // T >= kW8A8MinTokens and A16 below it.

@@ -25,8 +25,8 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Seven open or partly done. Two are decisions waiting on `surogate quantize` as a
-product rather than tasks (1 and 7); the rest are work.
+Six open or partly done. Two are decisions waiting on `surogate quantize` as a
+product rather than tasks (1 and 6); the rest are work.
 
 1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
@@ -39,31 +39,8 @@ product rather than tasks (1 and 7); the rest are work.
    selects them — the other targets import the names and use `W8G32_F16S` or
    NVFP4. So this is one target's safetensors profile, not five, and it is a
    decision rather than a task: it costs the 27B its groupwise-int route until
-   `surogate quantize` (item 7) is a product.
-2. **[~] FP8: the block-scaled kind serves (2026-09-04); the per-channel kind waits on
-   a runtime-shaped row route.**
-   - *HF fine-grained FP8* (`quant_method: fp8`, `weight_block_size: [128, 128]`,
-     `weight_scale_inv` an F32 grid) is a new format, `FP8_E4M3FN_BLK128_F32S` in layout
-     `block-scale-128-fp8-v1`: the checkpoint's E4M3 codes and its scale grid, untouched.
-     This cuBLASLt admits only scalar FP8 scales on sm_120 (probed: `VEC128`, `BLK128x128`
-     and `OUTER_VEC` all `NOT_SUPPORTED`), so the routes are the engine's own and
-     runtime-shaped: a 64x64 e4m3 tensor-core tile that applies the block scale once per
-     128 of K (activations quantised per token per 128, the recipe's convention), and a
-     decode GEMV on exact BF16 activations. The fused ops project it by rows through the
-     same branch the K-quants take, so no size registers a shape. Export profile
-     `fp8-block` (`--profile` auto-detected from `quantization_config`), the uniform
-     recipe's object graph at any geometry. Qwen3.5-0.8B-FP8: **14.7418** against the
-     BF16 torch reference's 14.60 on the same 40 windows (+1 %, the recipe's cost) and
-     llama.cpp's IQ4_XS 15.15; 833 tok/s decode on one 5090. 2B **10.118** vs Q4_K_M 10.291
-     (518 tok/s), 4B **8.148** vs 8.245 (261): block FP8 beats the 4-bit GGUFs at every size.
-   - *compressed-tensors per-channel/per-tensor* (a per-row F32 scale). The engine's
-     `FP8_E4M3FN_ROW_BF16S` route holds the numbers but is compile-time geometry -- the
-     27B's shapes only -- so a small checkpoint of this kind would be refused before its
-     scale precision mattered. A checkpoint is now obtainable
-     (`RedHatAI/Qwen3-0.6B-FP8-dynamic`); the work is a runtime-shaped row-scaled route
-     (or reading per-row scales into the block route with a 1-row block), then the
-     `_F32S` variant or a documented BF16 cast of the scales.
-3. **[~] Every GGML weight type is read where it lies (2026-09-04); what the UD mixtures
+   `surogate quantize` (item 6) is a product.
+2. **[~] Every GGML weight type is read where it lies (2026-09-04); what the UD mixtures
    still cost.** The 27B's refusal was never about vision: unsloth's "UD-Q4_K_M" holds 117
    IQ4_XS and 4 IQ3_S tensors, and the engine read 13 of llama.cpp's 27 storable types. The
    other fourteen shipped in 6613389f -- the eight IQ formats, TQ1_0/TQ2_0, MXFP4, ggml's
@@ -142,7 +119,7 @@ product rather than tasks (1 and 7); the rest are work.
    of the int8 tile itself, fixed here: its activation planes carried the raw Σx and now
    carry d·Σq, matching the GEMV route (real-tensor error 1.25e-2 -> 1.77e-3 relative).
 
-4. **[ ] Unify weight loading with the trainer, still true but smaller than it
+3. **[ ] Unify weight loading with the trainer, still true but smaller than it
    was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per target
    restate what the trainer's declarations in `surogate/dsl/models/` already say.
    Both sides describe the same nineteen architectures: the DSL has `qwen3.py`,
@@ -154,7 +131,7 @@ product rather than tasks (1 and 7); the rest are work.
    checkpoint tensor becomes which artifact object, and how fused objects are
    assembled. That is the part worth unifying, and the part `hf_mapping` already
    spells out.
-5. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
+4. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.
    - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
@@ -173,7 +150,7 @@ product rather than tasks (1 and 7); the rest are work.
      the file's blocks (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`).
    - **The 28k-prompt board row** (long-context ingestion) has not been re-measured
      since the native path landed.
-6. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
+5. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
    (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
    acceptance — which is the evidence the graph is right — but decode moves
    30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
@@ -181,7 +158,7 @@ product rather than tasks (1 and 7); the rest are work.
    more distinct experts than a single token and pays more PCIe gathers with
    3,172 of 5,110 experts resident. The graph and the levers are in memory
    `project_serve_qwen4exp_mtp`.
-7. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+6. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -370,6 +347,21 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
   activation scale is simply a worse 4-bit quantisation of these models than a
   K-quant; the engine is faithful to it. Decode on one 5090: 0.8B 481, 2B 380,
   4B 354 tok/s.
+
+- **FP8 checkpoints of both kinds serve natively (2026-09-04).** Hugging Face
+  fine-grained FP8 (`weight_scale_inv` over [128,128] blocks) is
+  `FP8_E4M3FN_BLK128_F32S`; compressed-tensors per-channel FP8 (`weight_scale`
+  per row, dynamic per-token activations) is `FP8_E4M3FN_ROW_F32S`. One route
+  serves both -- the scale grid's cell, [k per scale, rows per scale], is a
+  runtime parameter of the same e4m3 tile and GEMV -- because this cuBLASLt
+  admits only scalar FP8 scales on sm_120 and a K-varying scale cannot be
+  applied after a GEMM. Activations are quantised per token per 128 for both.
+  Export profiles `fp8-block` / `fp8-channel`, detected from
+  `quantization_config`; a text-only release's missing pixel-processor configs
+  are optional resources now, on both sides. Qwen3.5-0.8B: block **14.74**,
+  per-channel **15.11** (`mahadev9/Qwen3.5-0.8B-fp8`, torch reference over the
+  same weights 15.01), against the BF16 model's 14.60 and llama.cpp's IQ4_XS
+  15.15; 2B block 10.12 vs Q4_K_M 10.29, 4B block 8.15 vs 8.24.
 
 ## Traps
 

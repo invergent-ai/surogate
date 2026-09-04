@@ -175,6 +175,8 @@ def convert(
             for index, spec in enumerate(export.OBJECT_SPECS, start=1):
                 payload: bytes | Iterable[bytes]
                 if isinstance(spec, export.ResourceSpec):
+                    if spec.name not in resources:
+                        continue # an optional resource the checkpoint does not carry; not in the plan either
                     payload = resources[spec.name]
                 elif spec.name in ("text/token_embedding", "text/output_head"):
                     # The embedding is tied, so the head reads the same source.

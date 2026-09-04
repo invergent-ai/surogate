@@ -84,6 +84,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "FP8_E4M3FN_ROW_BF16S";
     case NumericFormat::FP8_E4M3FN_BLK128_F32S:
         return "FP8_E4M3FN_BLK128_F32S";
+    case NumericFormat::FP8_E4M3FN_ROW_F32S:
+        return "FP8_E4M3FN_ROW_F32S";
     case NumericFormat::Q2_K:
         return "Q2_K";
     case NumericFormat::Q3_K:
@@ -243,6 +245,9 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     if (layout == StorageLayout::BlockScale128Fp8V1) {
         return block_scale128_geometry(format, shape).encoded_bytes;
     }
+    if (layout == StorageLayout::RowScaleF32V1) {
+        return row_scale_f32_geometry(format, shape).encoded_bytes;
+    }
     if (layout == StorageLayout::GgmlBlocksV1) {
         const auto values = ggml_block_values(format);
         if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || (shape[1] % values) != 0) {
@@ -329,6 +334,24 @@ BlockScale128Geometry block_scale128_geometry(NumericFormat format,
                                         4, "FP8 block scale plane bytes");
     out.encoded_bytes =
         checked_add(out.scale_plane_offset, out.scale_plane_bytes, "FP8 block tensor encoded size");
+    return out;
+}
+
+BlockScale128Geometry row_scale_f32_geometry(NumericFormat format,
+                                             std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::FP8_E4M3FN_ROW_F32S) {
+        throw ArtifactError("row-scale-f32-v1 requires FP8_E4M3FN_ROW_F32S");
+    }
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 || (shape[1] % 128) != 0) {
+        throw ArtifactError("row-scale-f32-v1 requires a rank-two shape with k a whole number of 128s");
+    }
+    BlockScale128Geometry out;
+    out.rows             = shape[0];
+    out.columns          = shape[1];
+    out.code_plane_bytes = checked_mul(out.rows, out.columns, "FP8 element count");
+    out.scale_plane_offset = align_up(out.code_plane_bytes, kTensorAlignment, "FP8 row scale plane offset");
+    out.scale_plane_bytes = checked_mul(out.rows, 4, "FP8 row scale plane bytes");
+    out.encoded_bytes = checked_add(out.scale_plane_offset, out.scale_plane_bytes, "FP8 row tensor encoded size");
     return out;
 }
 

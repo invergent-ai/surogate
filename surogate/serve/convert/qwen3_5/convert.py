@@ -761,6 +761,7 @@ def _export_writer(profile: str):
 
     return {
         inventory.FP8_BLOCK: convert_fp8_block,
+        inventory.FP8_CHANNEL: convert_fp8_block,
         inventory.NVFP4_UNIFORM: convert_nvfp4_uniform,
         inventory.NVFP4_MIXED_BF16: convert_nvfp4_mixed_bf16,
         inventory.NVFP4_MLP_ONLY: convert_nvfp4_mlp_only,
@@ -783,6 +784,12 @@ def profile_for_checkpoint(config: Mapping[str, object]) -> str:
         if list(quantization["weight_block_size"]) != [128, 128]:
             raise ValueError(f"fp8 weight_block_size {quantization['weight_block_size']} is not [128, 128]")
         return inventory.FP8_BLOCK
+    if method == "compressed-tensors" and isinstance(quantization, Mapping):
+        groups = quantization.get("config_groups") or {}
+        weights = next(iter(groups.values()), {}).get("weights") or {} if groups else {}
+        if (str(weights.get("type", "")).lower() == "float" and int(weights.get("num_bits", 0) or 0) == 8
+                and str(weights.get("strategy", "")) == "channel"):
+            return inventory.FP8_CHANNEL
     if "NVFP4" not in text and "nvfp4" not in method:
         return inventory.GROUPWISE_INT
     geometry = inventory.geometry_from_config(config)

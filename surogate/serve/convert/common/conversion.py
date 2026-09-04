@@ -86,6 +86,11 @@ def load_resources(
         path = root / filename
         if not path.exists() and filename == "generation_config.json":
             data = _synthesize_generation_config(root)
+        elif not path.exists() and filename.endswith("preprocessor_config.json"):
+            # A text-only release of a vision family ships no image processor. The artifact
+            # then carries no such resource, and the engine's frontend reads its absence as
+            # "this target never asked for a pixel" and refuses --vision at load.
+            continue
         else:
             data = path.read_bytes()
         if not data:
@@ -122,7 +127,10 @@ def _synthesize_generation_config(root: Path) -> bytes:
 
 #: The artifact objects a checkpoint may legitimately not carry.
 _CHAT_TEMPLATE = "frontend/chat_template.jinja"
-OPTIONAL_RESOURCES = (_CHAT_TEMPLATE,)
+#: The image and video processor configs: a text-only release of a vision family ships
+#: neither, and the engine reads their absence as "never asked for a pixel".
+_PREPROCESSOR_CONFIGS = ("frontend/preprocessor_config.json", "frontend/video_preprocessor_config.json")
+OPTIONAL_RESOURCES = (_CHAT_TEMPLATE, *_PREPROCESSOR_CONFIGS)
 
 
 def build_object_plan(
@@ -132,13 +140,15 @@ def build_object_plan(
     expected_resources = tuple(
         spec.name for spec in object_specs if isinstance(spec, ResourceSpec)
     )
-    # The chat template is the one resource a checkpoint may legitimately not have: a base
-    # model publishes none. Its absence drops the object from the artifact, and the engine
-    # reads that absence as "no chat endpoints for this one". Every other resource missing is
-    # still a converter that lost track of its own contract.
-    if OPTIONAL_RESOURCES and _CHAT_TEMPLATE not in resources:
+    # The chat template and the pixel processor configs are the resources a checkpoint may
+    # legitimately not have: a base model publishes no template, a text-only release no
+    # processor. An absence drops the object from the artifact, and the engine reads it as
+    # "no chat endpoints" or "never asked for a pixel". Every other resource missing is still
+    # a converter that lost track of its own contract.
+    missing_optional = {name for name in OPTIONAL_RESOURCES if name not in resources}
+    if missing_optional:
         expected_resources = tuple(
-            name for name in expected_resources if name != _CHAT_TEMPLATE
+            name for name in expected_resources if name not in missing_optional
         )
     if tuple(resources) != expected_resources:
         raise ValueError("resource mapping does not match canonical inventory order")

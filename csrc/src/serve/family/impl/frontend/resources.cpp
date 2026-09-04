@@ -54,6 +54,10 @@ FrontendResources take_text_only_frontend_resources(artifact::MaterializedArtifa
 }
 
 FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder) {
+    // A text-only release of a vision family carries no pixel processor configs; the
+    // handles are then left naming nothing and the frontend sees empty strings.
+    const bool pixels = binder.has("frontend/preprocessor_config.json") &&
+                        binder.has("frontend/video_preprocessor_config.json");
     return FrontendResourcePlan{
         .tokenizer_json = artifact::bind_raw_resource(binder, "frontend/tokenizer.json"),
         .tokenizer_config_json =
@@ -63,9 +67,12 @@ FrontendResourcePlan bind_frontend_resources(artifact::Binder& binder) {
         .generation_config_json =
             artifact::bind_raw_resource(binder, "frontend/generation_config.json"),
         .preprocessor_config_json =
-            artifact::bind_raw_resource(binder, "frontend/preprocessor_config.json"),
+            pixels ? artifact::bind_raw_resource(binder, "frontend/preprocessor_config.json")
+                   : artifact::ObjectHandle{},
         .video_preprocessor_config_json =
-            artifact::bind_raw_resource(binder, "frontend/video_preprocessor_config.json"),
+            pixels ? artifact::bind_raw_resource(binder, "frontend/video_preprocessor_config.json")
+                   : artifact::ObjectHandle{},
+        .has_preprocessor_configs = pixels,
     };
 }
 
@@ -76,9 +83,13 @@ FrontendResources take_frontend_resources(artifact::MaterializedArtifact& materi
         .tokenizer_config_json    = take_string(materialized, plan.tokenizer_config_json),
         .chat_template_jinja      = take_chat_template(materialized, plan),
         .generation_config_json   = take_string(materialized, plan.generation_config_json),
-        .preprocessor_config_json = take_string(materialized, plan.preprocessor_config_json),
+        .preprocessor_config_json = plan.has_preprocessor_configs
+                                        ? take_string(materialized, plan.preprocessor_config_json)
+                                        : std::string{},
         .video_preprocessor_config_json =
-            take_string(materialized, plan.video_preprocessor_config_json),
+            plan.has_preprocessor_configs
+                ? take_string(materialized, plan.video_preprocessor_config_json)
+                : std::string{},
     };
 }
 

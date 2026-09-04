@@ -59,6 +59,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::RowScaleV1;
     case NumericFormat::FP8_E4M3FN_BLK128_F32S:
         return StorageLayout::BlockScale128Fp8V1;
+    case NumericFormat::FP8_E4M3FN_ROW_F32S:
+        return StorageLayout::RowScaleF32V1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -130,13 +132,19 @@ Weight fp8_block_weight(const MaterializedArtifact& materialized, ObjectHandle h
                         NumericFormat format, std::int32_t rows, std::int32_t columns) {
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
                                                 static_cast<std::uint64_t>(columns)};
-    const BlockScale128Geometry geometry = block_scale128_geometry(format, shape);
+    const bool per_row = format == NumericFormat::FP8_E4M3FN_ROW_F32S;
+    const BlockScale128Geometry geometry =
+        per_row ? row_scale_f32_geometry(format, shape) : block_scale128_geometry(format, shape);
     const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
     Weight out{};
     out.payload         = bytes;
     out.payload_bytes   = geometry.encoded_bytes;
     out.qtype           = qtype_for(format);
     out.layout          = QuantLayout::Fp8Block128;
+    // The scale grid's cell: [k per scale, rows per scale] -- 128 x 128 for the block export,
+    // k x 1 for a per-channel one. The kernels index the grid through these.
+    out.scale_ne[0]     = per_row ? columns : 128;
+    out.scale_ne[1]     = per_row ? 1 : 128;
     out.group_size      = 128;
     out.qdata           = bytes;
     out.qhigh           = nullptr;
@@ -259,6 +267,8 @@ QType qtype_for(NumericFormat format) {
         return QType::FP8_E4M3FN_ROW_BF16S;
     case NumericFormat::FP8_E4M3FN_BLK128_F32S:
         return QType::FP8_E4M3FN_BLK128_F32S;
+    case NumericFormat::FP8_E4M3FN_ROW_F32S:
+        return QType::FP8_E4M3FN_ROW_F32S;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -356,7 +366,8 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
     if (storage_layout_for(format) == StorageLayout::RowScaleV1) {
         return row_scale_weight(materialized, handle, format, rows, columns);
     }
-    if (storage_layout_for(format) == StorageLayout::BlockScale128Fp8V1) {
+    if (storage_layout_for(format) == StorageLayout::BlockScale128Fp8V1 ||
+        storage_layout_for(format) == StorageLayout::RowScaleF32V1) {
         return fp8_block_weight(materialized, handle, format, rows, columns);
     }
     if (storage_layout_for(format) == StorageLayout::GgmlBlocksV1) {
@@ -396,6 +407,7 @@ bool is_linear_format(NumericFormat format) noexcept {
     case NumericFormat::NVFP4:
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
     case NumericFormat::FP8_E4M3FN_BLK128_F32S:
+    case NumericFormat::FP8_E4M3FN_ROW_F32S:
     case NumericFormat::Q2_K:
     case NumericFormat::Q3_K:
     case NumericFormat::Q4_K:
