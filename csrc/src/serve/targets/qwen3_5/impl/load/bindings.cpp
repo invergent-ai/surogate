@@ -34,20 +34,6 @@ bool is_bf16_attention_output(std::size_t layer) { return layer == 3 || layer ==
 
 bool is_bf16_gdn_output(std::size_t layer) { return layer == 4; }
 
-NumericFormat endpoint_format(WeightsProfile weights_profile) {
-    switch (weights_profile) {
-    case WeightsProfile::Qwen36GroupwiseInt:
-        return NumericFormat::W8G32_F16S;  // W8 profile (Q8_0-faithful)
-    case WeightsProfile::Qwen38GroupwiseInt:
-    case WeightsProfile::Qwen36Nvfp4:
-    case WeightsProfile::Qwen35Nvfp4Mixed:
-        return NumericFormat::W8G32_F16S;
-    case WeightsProfile::Qwen38Nvfp4:
-        return NumericFormat::FP8_E4M3FN_ROW_BF16S;
-    }
-    throw std::invalid_argument("qwen3_5: invalid weights profile");
-}
-
 std::uint32_t read_u32_le(std::span<const std::byte> bytes, std::uint64_t offset,
                           std::string_view label) {
     if (offset > bytes.size() || bytes.size() - static_cast<std::size_t>(offset) < 4) {
@@ -215,12 +201,21 @@ load_attention_projection(const FullAttentionPlan& plan,
 GdnInputProjectionPayload
 load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtifact& materialized, const family::TextGeometry& g) {
     // A GGUF whose qkv and z halves carry different K-quant types is stored as two objects.
-    if (const auto* split = std::get_if<SplitGdnInputProjectionPlan>(&plan.input_projection)) {
-        return SplitGdnInputProjectionPayload{
+    if (const auto* split = std::get_if<QkvPlusZGdnInputProjectionPlan>(&plan.input_projection)) {
+        return QkvPlusZGdnInputProjectionPayload{
             .query_key_value = materialized_weight(materialized, split->query_key_value,
                                                    g.convolution_dim(), g.hidden),
             .z = materialized_weight(materialized, split->z, g.value_dim(),
                                      g.hidden),
+        };
+    }
+    // The 27B-class groupwise export splits one component earlier: query|key, then value|z.
+    if (const auto* split = std::get_if<QkPlusVzGdnInputProjectionPlan>(&plan.input_projection)) {
+        return QkPlusVzGdnInputProjectionPayload{
+            .query_key =
+                materialized_weight(materialized, split->query_key, 2 * g.key_dim(), g.hidden),
+            .value_z =
+                materialized_weight(materialized, split->value_z, 2 * g.value_dim(), g.hidden),
         };
     }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
@@ -255,10 +250,23 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                                                 NumericFormat::BF16, {g.hidden});
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
-            target.attention.projection = FusedAttentionProjectionPlan{
-                .query_key_gate_value =
-                    bind_linear_weight(binder, prefix + "attention/query_key_gate_value", {g.mtp_attention_input_rows(), g.hidden}),
-            };
+            // Which objects exist decides the shape of the plan: the 27B-class export stores
+            // query|key and gate|value as two objects so each can carry its own group-wise
+            // type, and every other export stores the one fused parent.
+            if (binder.has(prefix + "attention/query_key")) {
+                target.attention.projection = SplitAttentionProjectionPlan{
+                    .query_key = bind_linear_weight(binder, prefix + "attention/query_key",
+                                                    {g.query_size() + g.kv_size(), g.hidden}),
+                    .gate_value = bind_linear_weight(binder, prefix + "attention/gate_value",
+                                                     {g.query_size() + g.kv_size(), g.hidden}),
+                };
+            } else {
+                target.attention.projection = FusedAttentionProjectionPlan{
+                    .query_key_gate_value = bind_linear_weight(
+                        binder, prefix + "attention/query_key_gate_value",
+                        {g.mtp_attention_input_rows(), g.hidden}),
+                };
+            }
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {g.head_dim});
             target.attention.key_norm = artifact::bind_device_tensor(
@@ -277,8 +285,15 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
                                             NumericFormat::BF16, {g.gdn_value_heads, g.hidden}),
             };
-            if (binder.has(prefix + "gdn/query_key_value")) {
-                target.gdn.input_projection = SplitGdnInputProjectionPlan{
+            if (binder.has(prefix + "gdn/query_key")) {
+                target.gdn.input_projection = QkPlusVzGdnInputProjectionPlan{
+                    .query_key = bind_linear_weight(binder, prefix + "gdn/query_key",
+                                                    {2 * g.key_dim(), g.hidden}),
+                    .value_z   = bind_linear_weight(binder, prefix + "gdn/value_z",
+                                                    {2 * g.value_dim(), g.hidden}),
+                };
+            } else if (binder.has(prefix + "gdn/query_key_value")) {
+                target.gdn.input_projection = QkvPlusZGdnInputProjectionPlan{
                     .query_key_value = bind_linear_weight(
                         binder, prefix + "gdn/query_key_value",
                         {g.convolution_dim(), g.hidden}),
@@ -438,7 +453,7 @@ void bind_nvfp4_uniform_text_layers(artifact::Binder& binder, BindingPlan& out) 
     }
 }
 
-void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
+void bind_nvfp4_mlp_only_text_layers(artifact::Binder& binder, BindingPlan& out) {
     const family::TextGeometry& g = out.geometry;
     out.text_layers.resize(static_cast<std::size_t>(g.layers));
     constexpr NumericFormat kFp8 = NumericFormat::FP8_E4M3FN_ROW_BF16S;
@@ -493,6 +508,73 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
     }
 }
 
+void bind_nvfp4_all_text_layers(artifact::Binder& binder, BindingPlan& out) {
+    const family::TextGeometry& g = out.geometry;
+    out.text_layers.resize(static_cast<std::size_t>(g.layers));
+    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
+        TextLayerPlan& target    = out.text_layers[layer];
+        const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+        target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
+                                                                NumericFormat::BF16, {g.hidden});
+        target.is_full_attention = is_full_layer(layer);
+        if (target.is_full_attention) {
+            target.attention.projection = FusedAttentionProjectionPlan{
+                .query_key_gate_value = bind_nvfp4_weight(
+                    binder, prefix + "attention/query_key_gate_value",
+                    g.mtp_attention_input_rows(), g.hidden,
+                    prefix + "attention/input_projection/input_scale_divisor"),
+            };
+            target.attention.query_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/query_norm", NumericFormat::BF16, {g.head_dim});
+            target.attention.key_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/key_norm", NumericFormat::BF16, {g.head_dim});
+            target.attention.output =
+                bind_nvfp4_weight(binder, prefix + "attention/output", g.hidden, g.query_size(),
+                                  prefix + "attention/output_projection/input_scale_divisor");
+        } else {
+            target.gdn.a_log   = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
+                                                              NumericFormat::FP32,
+                                                              {g.gdn_value_heads});
+            target.gdn.dt_bias = artifact::bind_device_tensor(binder, prefix + "gdn/dt_bias",
+                                                              NumericFormat::FP32,
+                                                              {g.gdn_value_heads});
+            target.gdn.convolution =
+                artifact::bind_device_tensor(binder, prefix + "gdn/convolution",
+                                             NumericFormat::BF16,
+                                             {g.gdn_conv_kernel, g.convolution_dim()});
+            target.gdn.control_projection = FusedGdnControlProjectionPlan{
+                .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
+                                              NumericFormat::BF16,
+                                              {2 * g.gdn_value_heads, g.hidden}),
+            };
+            // An NVFP4 object carries one weight divisor, so an export that gives qkv and z
+            // their own divisors must store them apart.
+            target.gdn.input_projection = QkvPlusZGdnInputProjectionPlan{
+                .query_key_value =
+                    bind_nvfp4_weight(binder, prefix + "gdn/query_key_value",
+                                      g.convolution_dim(), g.hidden,
+                                      prefix + "gdn/input_projection/input_scale_divisor"),
+                .z = bind_nvfp4_weight(binder, prefix + "gdn/z", g.value_dim(), g.hidden,
+                                       prefix + "gdn/z_projection/input_scale_divisor"),
+            };
+            target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
+                                                             NumericFormat::BF16,
+                                                             {g.gdn_key_head_dim});
+            target.gdn.output =
+                bind_nvfp4_weight(binder, prefix + "gdn/output", g.hidden, g.value_dim(),
+                                  prefix + "gdn/output_projection/input_scale_divisor");
+        }
+        target.post_attention_norm = artifact::bind_device_tensor(
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
+        target.mlp.gate_up =
+            bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 2 * g.intermediate, g.hidden,
+                              prefix + "mlp/gate_up_projection/input_scale_divisor");
+        target.mlp.down =
+            bind_nvfp4_weight(binder, prefix + "mlp/down", g.hidden, g.intermediate,
+                              prefix + "mlp/down_projection/input_scale_divisor");
+    }
+}
+
 void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle) {
     constexpr std::size_t kDraftVocab     = 131072;
     constexpr std::size_t kTokenizerVocab = 248077;
@@ -526,22 +608,23 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.frontend     = family::bind_frontend_resources(binder);
     out.features     = features;
 
-    const NumericFormat vocabulary_format = endpoint_format(weights_profile);
     out.token_embedding =
         bind_linear_weight(binder, "text/token_embedding", {g.output_rows, g.hidden});
     switch (weights_profile) {
-    case WeightsProfile::Qwen36GroupwiseInt:
-    case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::GroupwiseInt:
         bind_groupwise_text_layers(binder, out);
         break;
-    case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Nvfp4MixedBf16:
         bind_nvfp4_text_layers(binder, out);
         break;
-    case WeightsProfile::Qwen35Nvfp4Mixed:
+    case WeightsProfile::Nvfp4Uniform:
         bind_nvfp4_uniform_text_layers(binder, out);
         break;
-    case WeightsProfile::Qwen38Nvfp4:
-        bind_qwen38_nvfp4_text_layers(binder, out);
+    case WeightsProfile::Nvfp4MlpOnly:
+        bind_nvfp4_mlp_only_text_layers(binder, out);
+        break;
+    case WeightsProfile::Nvfp4All:
+        bind_nvfp4_all_text_layers(binder, out);
         break;
     default:
         throw std::invalid_argument("qwen3_5: invalid weights profile");
@@ -563,16 +646,13 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
-    // surogate vendor patch (PATCHES.md #15): community GGUF exports often
-    // strip the MTP (nextn) block; such artifacts omit the mtp/* objects
-    // entirely. The runtime is already optional (materialization and the
-    // speculative executor key off features.mtp()); binding follows the
-    // artifact, and requesting MTP speculation without the block is a clear
-    // startup error instead of a missing-object failure.
+    // Community GGUF exports often strip the MTP (nextn) block, so those artifacts carry no
+    // mtp/* objects at all. Binding follows the artifact: the runtime is already optional, and
+    // asking for MTP speculation without the block is reported rather than guessed at.
     out.has_mtp = binder.has("mtp/input_projection");
     if (!out.has_mtp && features.mtp()) {
         throw std::runtime_error(
-            "qwen3.5-0.8b artifact has no MTP block (the source checkpoint was "
+            "artifact has no MTP block (the source checkpoint was "
             "exported without nextn); run without --spec mtp");
     }
     const artifact::TensorPlacement mtp_placement = features.mtp()
@@ -587,7 +667,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // export. `bind_linear` is the same call the text layers use, so a K-quant draft block
     // binds exactly like a K-quant layer.
     out.mtp.input_projection_w =
-        bind_linear_weight_at(binder, "mtp/input_projection", g.hidden, g.query_size(),
+        bind_linear_weight_at(binder, "mtp/input_projection", g.hidden,
+                              g.mtp_input_rows(),
                               mtp_placement);
     out.mtp.input_projection = out.mtp.input_projection_w.object;
     out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {g.hidden});
@@ -734,8 +815,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         mtp.attention.packed = artifact::materialized_weight(
             backing, plan.mtp.query_key_gate_value, plan.mtp.query_key_gate_value_w.format,
             g.mtp_attention_input_rows(), g.hidden);
-        // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv rows
-        // (q 2048 | k 512 | gate 2048 | v 512), not the 27B extents.
+        // The fused qkgv parent is q | k | gate | v in that order, so each component's rows
+        // are found by walking those extents rather than by any one model's numbers.
         mtp.attention.query       = row_view(mtp.attention.packed, 0, g.query_size());
         mtp.attention.key         = row_view(mtp.attention.packed, g.query_size(), g.kv_size());
         mtp.attention.output_gate = row_view(mtp.attention.packed, g.query_size() + g.kv_size(), g.query_size());
