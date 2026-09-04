@@ -148,8 +148,11 @@ product rather than tasks (1 and 6); the rest are work.
      24 GB/s PCIe gather and takes 30 % of misses, which is not yet a win. The
      bank is decoded to Q4G32AM at load now, so this only bites a run that keeps
      the file's blocks (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`).
-   - **The 28k-prompt board row** (long-context ingestion) has not been re-measured
-     since the native path landed.
+   - **The 28k-prompt board row re-measured (2026-09-04): it holds.** 7.07 s TTFT,
+     3,989 tok/s prompt processing, 39.1 tok/s after the prompt with
+     `--max-num-batched-tokens 8192` (row: 7.06 / 3,966 / 40.8). The defaults carry
+     prefill chunk 2,048 now -- the 8-card pipeline's compromise -- which reads 11.6 s /
+     2,434 tok/s on the same request, so a one-card long-prompt serve passes the flag.
 5. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
    (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
    acceptance — which is the evidence the graph is right — but decode moves
