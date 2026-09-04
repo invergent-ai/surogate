@@ -9,6 +9,9 @@ namespace sinfer::ops::detail {
 void mtp_pack_fc_input_launch(const Tensor& embedding_norm, const Tensor& hidden_norm, Tensor& out,
                               cudaStream_t stream);
 
+void mtp_pack_fc_input_streams_launch(const Tensor& embedding_norm, const Tensor& hidden_norm,
+                                      std::int32_t streams, Tensor& out, cudaStream_t stream);
+
 void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
                               cudaStream_t stream);
 

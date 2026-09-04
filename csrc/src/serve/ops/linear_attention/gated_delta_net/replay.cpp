@@ -161,7 +161,10 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
     // qwen3.5-0.8b and 2b share this one: 18 GDN layers, 16 symmetric heads.
     const bool geometry_18 = spec.layers == 18 && spec.qk_heads == 16 && spec.value_heads == 16 &&
                              spec.conv_channels == 6144;
-    return geometry_48 || geometry_30 || geometry_18;
+    // Qwen3.8-Flash-Next: 36 of its 48 layers are GDN, the head shape of the 48-layer entry.
+    const bool geometry_36 = spec.layers == 36 && spec.qk_heads == 16 && spec.value_heads == 48 &&
+                             spec.conv_channels == 10240;
+    return geometry_48 || geometry_36 || geometry_30 || geometry_18;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

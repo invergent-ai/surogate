@@ -27,6 +27,20 @@ void mtp_pack_fc_input_launch(const Tensor& embedding_norm, const Tensor& hidden
     });
 }
 
+void mtp_pack_fc_input_streams_launch(const Tensor& embedding_norm, const Tensor& hidden_norm,
+                                      std::int32_t streams, Tensor& out, cudaStream_t stream) {
+    constexpr int kBlock       = 256;
+    const std::int32_t rows    = embedding_norm.ne[0];
+    const std::int32_t columns = embedding_norm.ne[1] * streams;
+    const dim3 grid(static_cast<unsigned int>(div_up(rows, kBlock)),
+                    static_cast<unsigned int>(columns));
+    mtp_pack_fc_input_streams_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(embedding_norm.data),
+        static_cast<const __nv_bfloat16*>(hidden_norm.data),
+        static_cast<__nv_bfloat16*>(out.data), rows, streams);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
                               cudaStream_t stream) {
     constexpr int kBlock = 256;

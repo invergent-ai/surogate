@@ -30,6 +30,25 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
                        cudaStream_t stream);
 
 /**
+ * Op: mtp_pack_fc_input_streams
+ *
+ * The same pack for a residual carried as `streams` copies of the model width (a
+ * hyper-connection stack). The embedding is shared across the streams and broadcast; each
+ * stream takes its own slice of the hidden:
+ *
+ *   out[0:D,   t*streams + s] = embedding_norm[:, t]
+ *   out[D:2D,  t*streams + s] = hidden_norm[s*D : (s+1)*D, t]
+ *
+ * Logical shapes: embedding_norm [D,T], hidden_norm [streams*D, T], out [2D, streams*T], all
+ * contiguous BF16. The column order puts the stream fastest, which is what lets one matmul
+ * over the result write a stream-major residual straight back.
+ *
+ * Numeric: exact BF16 element copies. Inputs and output must not alias.
+ */
+void mtp_pack_fc_input_streams(const Tensor& embedding_norm, const Tensor& hidden_norm,
+                               std::int32_t streams, Tensor& out, cudaStream_t stream);
+
+/**
  * Op: mtp_split_attn_in
  *
  * Math / indexing:

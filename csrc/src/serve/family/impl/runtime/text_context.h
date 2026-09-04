@@ -392,6 +392,17 @@ public:
 private:
     void bind();
 
+    /// The width of the hidden that crosses a round boundary: the wide residual when a
+    /// trunk-block draft head is running, the model width otherwise.
+    [[nodiscard]] std::int32_t round_hidden_width() const noexcept {
+        // The model's frozen features, not this card's KV binding: the buffers were sized once
+        // at startup, and a card that never binds MTP KV still writes into them.
+        if constexpr (mtp_block_is_trunk_layer<Variant>()) {
+            if (weights_.features.mtp()) { return weights_.geometry.residual; }
+        }
+        return cfg_.hidden;
+    }
+
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
@@ -400,7 +411,12 @@ private:
     // `index` selects this layer's KV plane (the full-attention index); `layer` is
     // the absolute layer index, which is what the per-layer rope base and sliding
     // window are declared over. They coincide only in a stack that is all attention.
-    void attn_mix(const FullLayerW& weights, Tensor& x, int index, int layer, Phase phase);
+    /// Which KV plane a mixer writes into. The draft head keeps its own, one plane deep, and
+    /// attends densely -- the trunk's QSA only prunes past a 2,048-token budget, so dense is a
+    /// numerical superset and the target verifies the draft either way.
+    enum class KvPlane { Text, Mtp };
+    void attn_mix(const FullLayerW& weights, Tensor& x, int index, int layer, Phase phase,
+                  KvPlane plane = KvPlane::Text);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
@@ -413,11 +429,29 @@ private:
                                   ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
+    /// Fills `wide` -- the hidden that crosses the round boundary -- and returns the tensor
+    /// the LM head reads. The same tensor unless a trunk-block draft head widened the
+    /// boundary, in which case `wide` takes the residual and the collapse goes to a scratch.
+    template <class V = Variant>
+    Tensor finish_prefill(Tensor& wide, const Tensor& x, cudaStream_t stream);
+    /// The LM head's view of a stored boundary hidden. Identity unless a trunk-block
+    /// draft head widened it, in which case the trunk's output mixer collapses it.
+    template <class V = Variant>
+    Tensor lm_head_view(const Tensor& stored, cudaStream_t stream);
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
     void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                           const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                           Tensor& mtp_hidden);
+    /// A draft head whose block is a trunk block: fold, then the trunk's own mixer and
+    /// post-mixer over the wide residual, which is what the next draft step reads back.
+    /// Templated on the Variant so the body is discarded for the targets that keep the fixed
+    /// draft tail: their Variants have none of the hooks it names.
+    template <class V = Variant>
+    void mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidden,
+                                 const Tensor* input_embeddings, const Tensor& positions,
+                                 const Tensor& rope_positions,
+                                 ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                           const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                           Tensor& mtp_hidden, const Tensor* input_embeddings);
@@ -425,6 +459,9 @@ private:
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::GqaExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
+    /// `hidden` is the residual the draft head produced: the model width for a fixed-tail
+    /// head, the wide stream for a trunk-block one, which this collapses.
+    template <class V = Variant>
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
 
     struct MultimodalPrefill {

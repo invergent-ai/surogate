@@ -45,6 +45,24 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
     detail::mtp_pack_fc_input_launch(embedding_norm, hidden_norm, out, stream);
 }
 
+void mtp_pack_fc_input_streams(const Tensor& embedding_norm, const Tensor& hidden_norm,
+                               std::int32_t streams, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "mtp_pack_fc_input_streams";
+    require_bf16_contiguous_nonnull(embedding_norm, op, "embedding_norm");
+    require_bf16_contiguous_nonnull(hidden_norm, op, "hidden_norm");
+    require_bf16_contiguous_nonnull(out, op, "out");
+    const std::int32_t rows   = embedding_norm.ne[0];
+    const std::int32_t tokens = embedding_norm.ne[1];
+    if (rows <= 0 || tokens <= 0 || streams <= 0) {
+        throw std::invalid_argument("mtp_pack_fc_input_streams: D, T and streams must be positive");
+    }
+    require_shape(embedding_norm, rows, tokens, op, "embedding_norm");
+    require_shape(hidden_norm, streams * rows, tokens, op, "hidden_norm");
+    require_shape(out, 2 * rows, streams * tokens, op, "out");
+
+    detail::mtp_pack_fc_input_streams_launch(embedding_norm, hidden_norm, streams, out, stream);
+}
+
 void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
                        cudaStream_t stream) {
     constexpr const char* op = "mtp_split_attn_in";

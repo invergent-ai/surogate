@@ -223,7 +223,9 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
     prefix = "mtp/"
     layer = prefix + "layer/"
     specs: list[TensorSpec] = [
-        tensor_spec(prefix + "embedding_norm", (HIDDEN,), FP32),
+        # BF16 because the plain RMSNorm reads BF16 gammas; the stream-wise norm the wide
+        # residual takes reads FP32, as every hyper-connection norm does.
+        tensor_spec(prefix + "embedding_norm", (HIDDEN,), BF16),
         tensor_spec(prefix + "hidden_norm", (HC_WIDTH,), FP32),
         tensor_spec(prefix + "input_projection", (HIDDEN, 2 * HIDDEN), W8),
     ]

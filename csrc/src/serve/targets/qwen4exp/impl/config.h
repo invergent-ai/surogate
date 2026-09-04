@@ -76,9 +76,14 @@ struct TextConfig {
 
     static constexpr int full_attention_interval = 4;
 
-    // No MTP block is served (the GGUF carries none); the family's MTP planes are sized by
-    // these but never materialised, so they mirror the text block's shapes.
+    // The NextN draft head is one more block past the trunk, with the same shapes -- it is a
+    // trunk full-attention block. It arrives in its own GGUF, so an artifact may or may not
+    // carry it; what is compiled in is where it would sit.
     static constexpr int mtp_layers               = 1;
+    /// Layers with routed experts, the draft head's included: what the expert slot cache is
+    /// sized and keyed over. Always includes the head's block, so a run that turns the head
+    /// on does not resize the cache -- one layer of directory entries is a rounding error.
+    static constexpr int expert_layers            = layers + mtp_layers;
     static constexpr int mtp_input_rows           = 2 * hidden;
     static constexpr int mtp_attention_input_rows = 2 * (query_heads * head_dim) + 2 * (kv_heads * head_dim);
     static constexpr int mtp_mlp_gate_up_rows     = 2 * intermediate;

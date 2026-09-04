@@ -196,6 +196,26 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(std::int32_t streams,
            round(width * tokens * 2) + 3 * 256;
 }
 
+void hyper_connection_norm(const Tensor& residual, const Tensor& norm, std::int32_t streams,
+                           float eps, Tensor& normalized, cudaStream_t stream) {
+    const std::int32_t width  = residual.ne[0];
+    const std::int32_t tokens = residual.ne[1];
+    if (streams < 1 || (width % streams) != 0) {
+        throw std::invalid_argument("hyper_connection: residual width is not a stream multiple");
+    }
+    if (!(eps > 0.0F)) { throw std::invalid_argument("hyper_connection: eps must be positive"); }
+    require_contiguous(residual, DType::BF16, width, tokens, "residual");
+    require_contiguous(normalized, DType::BF16, width, tokens, "normalized");
+    if (norm.dtype != DType::FP32 || norm.ne[0] != width || norm.numel() != width ||
+        norm.data == nullptr) {
+        throw std::invalid_argument("hyper_connection: norm must be FP32 [streams*hidden]");
+    }
+    stream_norm_kernel<<<static_cast<unsigned>(tokens) * streams, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(norm.data),
+        width / streams, streams, eps, static_cast<__nv_bfloat16*>(normalized.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& weights,
                           std::int32_t streams, float eps, Tensor& mixed, Tensor* inject,
                           WorkspaceArena& workspace, cudaStream_t stream) {

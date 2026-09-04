@@ -522,6 +522,10 @@ struct FoldGeometry {
 };
 
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
+// Qwen3.8-Flash-Next: 36 of its 48 layers are GDN, in the 48x48 head shape. Only the layer
+// tag differs from the pair above -- the kernel body never reads it, and the grid comes from
+// kValueHeads -- so this is the same instantiation under another name.
+using FoldGeometry36x48 = FoldGeometry<36, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
 // The symmetric small targets (qwen3.5-0.8b and 2b both carry 18 GDN layers of
 // 16 key and 16 value heads, so 2*2048 + 2048 conv channels). Only the strides

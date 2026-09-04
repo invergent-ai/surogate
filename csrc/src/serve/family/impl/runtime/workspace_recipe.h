@@ -168,6 +168,25 @@ MtpStemRoots mtp_stem(Allocator& allocator, const family::TextGeometry& geometry
     return out;
 }
 
+/// A trunk-block draft head needs only the embedding and the wide residual it folds into: the
+/// block that follows allocates through the trunk's own recipes, and the fold's own scratch is
+/// the target's business.
+struct MtpTrunkRoots {
+    Tensor embedding;
+    Tensor residual;
+};
+
+template <class Allocator>
+MtpTrunkRoots mtp_trunk_stem(Allocator& allocator, const family::TextGeometry& geometry,
+                             std::int32_t tokens, bool allocate_embedding) {
+    MtpTrunkRoots out;
+    if (allocate_embedding) {
+        out.embedding = matrix(allocator, DType::BF16, geometry.hidden, tokens);
+    }
+    out.residual = matrix(allocator, DType::BF16, geometry.residual, tokens);
+    return out;
+}
+
 struct MtpAttentionProjectionRoots {
     Tensor query;
     Tensor key;

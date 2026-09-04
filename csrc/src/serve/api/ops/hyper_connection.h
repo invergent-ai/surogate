@@ -38,6 +38,18 @@ struct HyperConnectionWeights {
                                                                         std::int32_t max_tokens);
 
 /**
+ * The stream-wise RMSNorm alone, which is the mix's first line:
+ *
+ *   normalized[i,t] = residual[i,t] * rsqrt(mean_{d in stream(i)} residual^2 + eps) * norm[i]
+ *
+ * A NextN draft head normalises the wide residual on its own, before any mixing, so it needs
+ * this step without the projections that follow it. Both tensors are contiguous BF16
+ * [streams*hidden, T]; in-place is allowed.
+ */
+void hyper_connection_norm(const Tensor& residual, const Tensor& norm, std::int32_t streams,
+                           float eps, Tensor& normalized, cudaStream_t stream);
+
+/**
  * Mixes the residual streams into one block input.
  *
  *   n[i,t]      = residual[i,t] * rsqrt(mean_{d in stream(i)} residual^2 + eps) * norm[i]

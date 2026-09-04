@@ -303,6 +303,35 @@ unsigned grid_for(std::int64_t count) {
 
 } // namespace
 
+__global__ void expand_columns_kernel(const int* __restrict__ slots_in, int width, int columns,
+                                      int* __restrict__ slots_out, int* __restrict__ begin,
+                                      int* __restrict__ last) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= columns) { return; }
+    const int lane   = i / width;
+    const int offset = i - lane * width;
+    slots_out[i]     = slots_in[lane];
+    begin[i]         = offset;
+    last[i]          = offset == width - 1 ? 1 : 0;
+}
+
+void ngram_ple_expand_columns(const Tensor& slots_in, std::int32_t width, Tensor& slots_out,
+                              Tensor& segment_begin, Tensor& segment_last, cudaStream_t stream) {
+    const std::int32_t columns = static_cast<std::int32_t>(slots_out.numel());
+    if (width <= 0 || columns <= 0 || slots_in.dtype != DType::I32 ||
+        slots_out.dtype != DType::I32 || segment_begin.dtype != DType::I32 ||
+        segment_last.dtype != DType::I32 || columns != slots_in.numel() * width ||
+        segment_begin.numel() != columns || segment_last.numel() != columns) {
+        throw std::invalid_argument("ngram_ple_expand_columns: invalid operands");
+    }
+    constexpr int kBlock = 128;
+    expand_columns_kernel<<<(columns + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
+        static_cast<const int*>(slots_in.data), width, columns,
+        static_cast<int*>(slots_out.data), static_cast<int*>(segment_begin.data),
+        static_cast<int*>(segment_last.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ngram_ple_mark_segment_last(Tensor& flags, const Tensor& count_scalar, std::int32_t base,
                                  cudaStream_t stream) {
     if (flags.dtype != DType::I32 || flags.numel() <= 0 || flags.data == nullptr ||

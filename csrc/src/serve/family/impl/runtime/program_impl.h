@@ -307,7 +307,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // come back byte-identical, and backing it up also keeps the prefix cache
     // warm across a sleep.
     sleep_tag_region(workspace_storage.base(), SleepTag::Discard);
-    if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
+    // A trunk-block draft head is not in `model.mtp`: its block is bound where the trunk's
+    // layers are, and the target answers for it. `Variant::mtp_block` refuses if the run asked
+    // for a head the artifact did not carry.
+    const bool mtp_view_matches = mtp_block_is_trunk_layer<Variant>()
+                                      ? true
+                                      : model.mtp.has_value() == plan.features.mtp();
+    if (model.features != plan.features || !mtp_view_matches ||
         model.dflash.has_value() != plan.features.dflash() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
         model.vision.has_value() != plan.features.vision) {
@@ -1812,7 +1818,10 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
 }
 
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
-    if (source.dtype != DType::BF16 || source.ne[0] != cfg.hidden || source.ne[1] != 1) {
+    // The lane's stored hidden is as wide as the round's, which a trunk-block draft head widens
+    // to the residual: this is exactly the tensor it reads back as `h`.
+    if (source.dtype != DType::BF16 || source.ne[0] != tail_hidden_store.ne[0] ||
+        source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
     }
     CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),

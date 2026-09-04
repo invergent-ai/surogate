@@ -206,10 +206,29 @@ using FamilyModelView =
                        AttentionProjectionPayload, SparseMoePayload,
                        family::DFlashWeights<1>>;
 
-/// The family view plus what the residual hooks need: the output mixer and the PLE layer.
+/// The NextN draft head, as the runtime sees it. The block is a trunk full-attention layer --
+/// the same type, run by the same code -- and the four tensors around it are the head's own:
+/// `embedding_norm`/`hidden_norm`/`input_projection` fold the next token's embedding into the
+/// wide residual, and `head_mix` collapses the four streams afterwards, standing in for the
+/// output norm this architecture does not have. The embedding table and the LM head are the
+/// trunk's.
+struct MtpHeadWeights {
+    bool present = false;
+    Tensor embedding_norm;
+    Tensor hidden_norm;
+    Weight input_projection;
+    ops::HyperConnectionWeights head_mix;
+};
+
+/// The family view plus what the residual hooks need: the output mixer, the PLE layer and the
+/// draft head.
 struct RuntimeModelView : FamilyModelView {
     ops::HyperConnectionWeights output_mix;
     PleWeights ple;
+    MtpHeadWeights mtp_head;
+    /// The draft head's block. Held beside `full_layers` rather than in it so the trunk's
+    /// layer count stays the trunk's.
+    typename FamilyModelView::FullLayer mtp_block;
 };
 
 using FullAttentionWeights = RuntimeModelView::FullLayer;

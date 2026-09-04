@@ -154,6 +154,34 @@ struct Variant {
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
+    // --- NextN draft head ---
+    //
+    // The head's block is a trunk full-attention block, so the family runs it with the trunk's
+    // own mixer rather than a second program. What is the head's own is the fold on the way in
+    // and the collapse on the way out, and those are these two.
+    //
+    // Declaring this tells the family to take that route: the fixed Qwen3.5-shaped draft tail
+    // does not describe this architecture, whose residual is four streams wide.
+    static constexpr bool mtp_block_is_trunk_layer = true;
+
+    /// residual = eh_proj( concat( embedding_norm(embedding), hidden_norm(hidden) ) ), per
+    /// stream. `embedding` is [hidden, T]; `hidden` and `residual` are the wide residual
+    /// [residual, T]. eh_proj holds the checkpoint's fc_embedding and fc_hidden side by side,
+    /// so one matmul over the pair is fc_embedding@e + fc_hidden@h. The streams stay distinct
+    /// through it -- pooling them first is exactly what the residual exists to avoid.
+    static void mtp_fold(const ModelView& model, const Tensor& embedding,
+                         const Tensor& hidden, Tensor& residual, WorkspaceArena& workspace,
+                         cudaStream_t stream);
+    /// The head's own mixer collapses the streams into the width the LM head reads. It stands
+    /// in for the output norm this architecture does not have.
+    static void mtp_collapse(const ModelView& model, const Tensor& residual, Tensor& hidden,
+                             WorkspaceArena& workspace, cudaStream_t stream);
+    /// The head's block, for the family to run.
+    [[nodiscard]] static const detail::FullAttentionWeights& mtp_block(const ModelView& model);
+    [[nodiscard]] static std::size_t
+    mtp_fold_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
+                                      std::int32_t last);
+
     // --- workspace capacities ---
     [[nodiscard]] static std::size_t
     mtp_attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first, std::int32_t last);

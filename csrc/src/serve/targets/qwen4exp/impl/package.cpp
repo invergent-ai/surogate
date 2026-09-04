@@ -63,9 +63,14 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     if (features.vision) {
         throw std::runtime_error("qwen3.8-flash-next: vision is not served by this target");
     }
-    if (features.speculative_enabled()) {
+    if (features.dflash()) {
+        throw std::runtime_error("qwen3.8-flash-next: DFlash is not served by this target");
+    }
+    if (features.mtp() && !binder.has("mtp/input_projection")) {
         throw std::runtime_error(
-            "qwen3.8-flash-next: speculative decoding (MTP/DFlash) is not served by this target");
+            "qwen3.8-flash-next: --spec mtp needs the NextN draft head, which this artifact does "
+            "not carry; put the model's mtp-*.gguf beside the shards (or under MTP/) and convert "
+            "again");
     }
     if (options.host_expert_bank == EngineOptions::HostExpertBank::Q4 &&
         options.expert_slots == 0) {

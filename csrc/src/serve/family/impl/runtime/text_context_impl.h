@@ -292,7 +292,9 @@ void TextContext::bind() {
                           proposal.head.n);
     }
 
-    if (mtp_enabled()) {
+    // A trunk-block draft head carries no fixed-tail weights: its block is an ordinary layer,
+    // bound where the trunk's are, and the family reads it through the target's hooks.
+    if (mtp_enabled() && !mtp_block_is_trunk_layer<Variant>()) {
         if (!weights_.mtp) {
             throw std::invalid_argument("MTP state was enabled without materialized MTP weights");
         }
@@ -442,7 +444,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s);
     }
 
-    Tensor flat_mtp_hidden = mtp_hidden.view({cfg_.hidden, T});
+    Tensor flat_mtp_hidden = mtp_hidden.view({cfg_.hidden, T}); // fixed tail only
     ops::rmsnorm(x, *mtp_.norm, cfg_.rms_eps, true, flat_mtp_hidden, s);
 }
 
@@ -451,10 +453,74 @@ void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
                                    Tensor& mtp_hidden, const Tensor* input_embeddings) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     auto scratch_scope = work_.scope();
-    Tensor x;
-    Tensor ah;
-    mtp_forward_stem(ids, hidden, input_embeddings, x, ah);
-    mtp_forward_tail(x, ah, positions, rope_positions, envelope, mtp_hidden);
+    if constexpr (mtp_block_is_trunk_layer<Variant>()) {
+        mtp_forward_trunk_block(ids, hidden, input_embeddings, positions, rope_positions, envelope,
+                                mtp_hidden);
+    } else {
+        Tensor x;
+        Tensor ah;
+        mtp_forward_stem(ids, hidden, input_embeddings, x, ah);
+        mtp_forward_tail(x, ah, positions, rope_positions, envelope, mtp_hidden);
+    }
+}
+
+template <class V>
+void TextContext::mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidden,
+                                          const Tensor* input_embeddings, const Tensor& positions,
+                                          const Tensor& rope_positions,
+                                          ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden) {
+    // Only instantiated for a target that says its head is a trunk block; the others never
+    // reach here, and their Variants have none of the hooks below.
+    if constexpr (!mtp_block_is_trunk_layer<V>()) {
+        throw std::logic_error("this target's draft head is not a trunk block");
+    } else {
+    cudaStream_t s          = ctx_.stream;
+    const int T             = ids.ne[0] * ids.ne[1];
+    const std::int32_t wide = weights_.geometry.residual;
+
+    auto roots = workspace_recipe::mtp_trunk_stem(work_, cfg_geometry(), T,
+                                                  input_embeddings == nullptr);
+    Tensor emb;
+    if (input_embeddings != nullptr) {
+        emb = input_embeddings->view({cfg_.hidden, T});
+    } else {
+        emb = roots.embedding;
+        ops::embedding(ids.view({T}), *embed_, emb, s);
+    }
+
+    // The residual the block runs on, seeded from the next token's embedding and the trunk's
+    // own wide residual at the previous position.
+    Tensor x = roots.residual;
+    V::mtp_fold(weights_, emb, hidden.view({wide, T}), x, work_, s);
+
+    // One trunk block. The head keeps its own KV plane, one layer deep.
+    ScopedValue<const Tensor*> position_binding(active_cache_positions_, &positions);
+    ScopedValue<const Tensor*> rope_binding(active_rope_positions_, &rope_positions);
+    ScopedValue<const ops::GqaExecutionEnvelope*> envelope_binding(active_gqa_envelope_, &envelope);
+    // The same pointer view `bind()` builds for a trunk layer, over the head's weights.
+    const auto& source = V::mtp_block(weights_);
+    FullLayerW block;
+    block.input_norm     = &source.input_norm;
+    block.projection     = &source.projection;
+    block.o_proj         = &source.output;
+    block.q_norm         = &source.query_norm;
+    block.k_norm         = &source.key_norm;
+    block.post_attn_norm = &source.post_attention_norm;
+    block.mlp            = MlpW{&source.post_mixer};
+    {
+        auto mixer_scope = work_.scope();
+        attn_mix(block, x, 0, TextConfig::layers, Phase::Verify, KvPlane::Mtp);
+    }
+    {
+        auto post_mixer_scope = work_.scope();
+        mlp_tail(block.post_attn_norm, block.mlp, x, Phase::Verify);
+    }
+
+    // The wide residual is the head's output: the next draft step folds into it again. The
+    // collapse to the LM head's width happens at proposal time, not here.
+    Tensor out = mtp_hidden.view({wide, T});
+    CUDA_CHECK(cudaMemcpyAsync(out.data, x.data, out.bytes(), cudaMemcpyDeviceToDevice, s));
+    }
 }
 
 void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
@@ -470,7 +536,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     nvtx::ScopedRange mtp_prefill_range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
                                         static_cast<std::uint64_t>(T));
     require_tensor_shape(ids, DType::I32, {T}, "MTP prefill ids");
-    require_tensor_shape(hidden, DType::BF16, {cfg_.hidden, T}, "MTP prefill hidden");
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), T}, "MTP prefill hidden");
     require_tensor_shape(positions, DType::I32, {T}, "MTP prefill positions");
     if (rope_positions.dtype != DType::I32 || rope_positions.ne[0] != T ||
         (rope_positions.ne[1] != 1 && rope_positions.ne[1] != 3) || rope_positions.ne[2] != 1 ||
@@ -482,7 +548,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         if (final_hidden == nullptr || logits == nullptr || draft_token == nullptr) {
             throw std::invalid_argument("MTP final prefill outputs are required");
         }
-        require_tensor_shape(*final_hidden, DType::BF16, {cfg_.hidden, 1},
+        require_tensor_shape(*final_hidden, DType::BF16, {round_hidden_width(), 1},
                              "MTP final prefill hidden");
         require_tensor_shape(*logits, DType::BF16, {cfg_.vocab, 1}, "MTP final prefill logits");
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP final prefill draft token");
@@ -490,6 +556,20 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
     cudaStream_t s     = ctx_.stream;
     auto scratch_scope = work_.scope();
+    if constexpr (mtp_block_is_trunk_layer<Variant>()) {
+        // The head's block is a trunk block, so the chunk runs through the same forward the
+        // decode rounds use. The bulk columns exist to fill the head's KV; the last one also
+        // carries the proposal.
+        Tensor chunk_hidden = work_.alloc(DType::BF16, {round_hidden_width(), T});
+        mtp_forward_core(ids, hidden, positions, rope_positions, envelope, chunk_hidden,
+                         input_embeddings);
+        if (!final_chunk) { return; }
+        Tensor last = chunk_hidden.slice(1, T - 1, 1);
+        CUDA_CHECK(cudaMemcpyAsync(final_hidden->data, last.data, final_hidden->bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+        proposal_argmax(*final_hidden, *logits, *draft_token);
+        return;
+    }
     Tensor x_last;
     Tensor ah_last;
     if (final_chunk) {
@@ -572,8 +652,19 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     }
 }
 
-void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
-    const int T = hidden.ne[1];
+template <class V>
+void TextContext::proposal_argmax(const Tensor& wide, Tensor& logits, Tensor& proposal_tokens) {
+    const int T = wide.ne[1];
+    // A trunk-block draft head hands back the wide residual, because that is what the next
+    // draft step folds into. Its own mixer collapses the streams to the LM head's width here,
+    // standing in for the output norm the architecture does not have.
+    auto collapse_scope = work_.scope();
+    Tensor hidden       = wide;
+    if constexpr (mtp_block_is_trunk_layer<V>()) {
+        require_tensor_shape(wide, DType::BF16, {weights_.geometry.residual, T}, "proposal hidden");
+        hidden = work_.alloc(DType::BF16, {cfg_.hidden, T});
+        V::mtp_collapse(weights_, wide, hidden, work_, ctx_.stream);
+    }
     require_tensor_shape(hidden, DType::BF16, {cfg_.hidden, T}, "proposal hidden");
     require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
     require_tensor_window(logits, DType::BF16, cfg_.vocab, T, "proposal logits");
@@ -602,8 +693,9 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     }
     require_tensor_shape(ids, DType::I32, {T}, "MTP ids");
     require_tensor_shape(positions, DType::I32, {T}, "MTP positions");
-    require_tensor_shape(hidden, DType::BF16, {cfg_.hidden, T}, "MTP hidden");
-    require_tensor_shape(mtp_hidden, DType::BF16, {cfg_.hidden, T}, "MTP output hidden");
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), T}, "MTP hidden");
+    require_tensor_shape(mtp_hidden, DType::BF16, {round_hidden_width(), T},
+                         "MTP output hidden");
     if (logits_column >= T) { throw std::invalid_argument("MTP logits column out of range"); }
     if (logits_column >= 0) {
         if (logits == nullptr || draft_token == nullptr) {
@@ -642,8 +734,10 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
-    require_tensor_shape(previous_hidden, DType::BF16, {cfg_.hidden, 1}, "MTP AR previous hidden");
-    require_tensor_shape(mtp_hidden, DType::BF16, {cfg_.hidden, 1}, "MTP AR output hidden");
+    require_tensor_shape(previous_hidden, DType::BF16, {round_hidden_width(), 1},
+                         "MTP AR previous hidden");
+    require_tensor_shape(mtp_hidden, DType::BF16, {round_hidden_width(), 1},
+                         "MTP AR output hidden");
     require_tensor_shape(logits, DType::BF16, {cfg_.vocab, 1}, "MTP AR logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
 
@@ -684,6 +778,21 @@ inline PrologueColumns decode_columns(WorkspaceArena& work, const Tensor& ids, c
     return out;
 }
 
+// A speculative round: each lane owns `width` consecutive columns, which are one segment.
+inline PrologueColumns verify_columns(WorkspaceArena& work, const Tensor& ids, const Tensor& slots,
+                                      std::int32_t width, std::int32_t batch,
+                                      cudaStream_t stream) {
+    PrologueColumns out;
+    const std::int32_t columns = width * batch;
+    out.ids                    = ids;
+    out.slots                  = work.alloc(DType::I32, {columns});
+    out.segment_begin          = work.alloc(DType::I32, {columns});
+    out.segment_last           = work.alloc(DType::I32, {columns});
+    ops::ngram_ple_expand_columns(slots, width, out.slots, out.segment_begin, out.segment_last,
+                                  stream);
+    return out;
+}
+
 // One prompt segment on one slot, `valid` columns long: a host count, or a device scalar for
 // the bucket-padded graph bodies where the count is an ingress value.
 inline PrologueColumns single_segment_columns(WorkspaceArena& work, const Tensor& ids,
@@ -709,6 +818,59 @@ inline PrologueColumns single_segment_columns(WorkspaceArena& work, const Tensor
 
 } // namespace prologue_staging
 
+template <class V>
+Tensor TextContext::finish_prefill(Tensor& wide, const Tensor& x, cudaStream_t stream) {
+    if constexpr (mtp_block_is_trunk_layer<V>()) {
+        if (wide.ne[0] == weights_.geometry.residual && weights_.geometry.residual != cfg_.hidden) {
+            Tensor collapsed = work_.alloc(DType::BF16, {cfg_.hidden, wide.ne[1]});
+            Hooks::finish(weights_, x, cfg_.rms_eps, collapsed, work_, stream);
+            CUDA_CHECK(cudaMemcpyAsync(wide.data, x.data, wide.bytes(), cudaMemcpyDeviceToDevice,
+                                       stream));
+            return collapsed;
+        }
+    }
+    Hooks::finish(weights_, x, cfg_.rms_eps, wide, work_, stream);
+    return wide;
+}
+
+template <class V>
+Tensor TextContext::lm_head_view(const Tensor& stored, cudaStream_t stream) {
+    if constexpr (mtp_block_is_trunk_layer<V>()) {
+        if (stored.ne[0] == weights_.geometry.residual &&
+            weights_.geometry.residual != cfg_.hidden) {
+            Tensor collapsed = work_.alloc(DType::BF16, {cfg_.hidden, stored.ne[1]});
+            Hooks::finish(weights_, stored, cfg_.rms_eps, collapsed, work_, stream);
+            return collapsed;
+        }
+    }
+    return stored;
+}
+
+/// Writes the round's hidden output and the logits that follow it.
+///
+/// With a trunk-block draft head the buffer that crosses the round boundary is the wide
+/// residual, because that is what the head folds into next; the LM head still reads the
+/// collapsed width, from a scratch. Without one the two are the same tensor, as they always
+/// were.
+template <class Variant, class Hooks, class Model, class Cfg>
+void finish_round_hidden(const Model& weights, const Tensor& x, float eps, Tensor& hidden,
+                         Tensor& logits, const Weight& lm_head, const Cfg& cfg,
+                         WorkspaceArena& work, cudaStream_t stream) {
+    if constexpr (mtp_block_is_trunk_layer<Variant>()) {
+        if (hidden.ne[0] == weights.geometry.residual && weights.geometry.residual != cfg.hidden) {
+            auto scope       = work.scope();
+            Tensor collapsed = work.alloc(DType::BF16, {cfg.hidden, hidden.ne[1]});
+            Hooks::finish(weights, x, eps, collapsed, work, stream);
+            ops::linear(collapsed, lm_head, logits, stream);
+            CUDA_CHECK(cudaMemcpyAsync(hidden.data, x.data, hidden.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+            return;
+        }
+    }
+    Hooks::finish(weights, x, eps, hidden, work, stream);
+    ops::linear(hidden, lm_head, logits, stream);
+}
+
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                         const Tensor& rope_positions, const Tensor& kv_table_rows,
                                         const Tensor& linear_state_slots,
@@ -724,7 +886,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "ordinary decode KV rows");
     require_tensor_shape(linear_state_slots, DType::I32, {batch},
                          "ordinary decode Linear Attention slots");
-    require_tensor_shape(hidden, DType::BF16, {cfg_.hidden, batch}, "ordinary decode hidden");
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), batch},
+                         "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {cfg_.vocab, batch}, "ordinary decode logits");
 
     cudaStream_t stream = ctx_.stream;
@@ -747,8 +910,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         if (stage_finishes()) {
-            Hooks::finish(weights_, x, cfg_.rms_eps, hidden, work_, stream);
-            ops::linear(hidden, *lm_head_, logits, stream);
+            finish_round_hidden<Variant, Hooks>(weights_, x, cfg_.rms_eps, hidden, logits,
+                                                *lm_head_, cfg_, work_, stream);
         } else {
             stage_export(x, stream);
         }
@@ -779,7 +942,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "target verify batch KV rows");
     require_tensor_shape(linear_state_slots, DType::I32, {batch},
                          "target verify batch Linear Attention slots");
-    require_tensor_shape(hidden, DType::BF16, {cfg_.hidden, width, batch},
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), width, batch},
                          "target verify batch hidden");
     require_tensor_shape(logits, DType::BF16, {cfg_.vocab, width, batch},
                          "target verify batch logits");
@@ -800,11 +963,13 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor x        = work_.alloc(DType::BF16, {cfg_.residual, columns});
         Tensor flat_ids = ids.view({columns});
         if constexpr (Hooks::prologue) {
-            if (width != 1) {
-                throw std::invalid_argument("layer prologue targets serve one column per lane");
-            }
-            prologue_ = prologue_staging::decode_columns(work_, flat_ids, linear_state_slots,
-                                                         columns, stream);
+            // A speculative verify gives each lane several consecutive columns, and they are
+            // one segment of that lane's history; an ordinary round's columns are one each.
+            prologue_ = width != 1
+                            ? prologue_staging::verify_columns(work_, flat_ids, linear_state_slots,
+                                                               width, batch, stream)
+                            : prologue_staging::decode_columns(work_, flat_ids, linear_state_slots,
+                                                               columns, stream);
         }
         if (stage_embeds()) { Hooks::embed(weights_, flat_ids, x, work_, stream); } else { stage_import(x, stream); }
         if constexpr (Tap::enabled) { tap.begin(x); }
@@ -812,12 +977,12 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
             tap.capture_positions(cache_positions, stream);
         }
-        Tensor flat_hidden = hidden.view({cfg_.hidden, columns});
+        Tensor flat_hidden = hidden.view({round_hidden_width(), columns});
         Tensor flat_logits = logits.view({cfg_.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
         if (stage_finishes()) {
-            Hooks::finish(weights_, x, cfg_.rms_eps, flat_hidden, work_, stream);
-            ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+            finish_round_hidden<Variant, Hooks>(weights_, x, cfg_.rms_eps, flat_hidden, flat_logits,
+                                                *lm_head_, cfg_, work_, stream);
             ops::argmax(flat_logits, flat_tokens, cfg_.token_domain, stream);
         } else {
             stage_export(x, stream);
@@ -859,7 +1024,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
-    require_tensor_shape(hidden, DType::BF16, {cfg_.hidden, width, batch},
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), width, batch},
                          "MTP decode batch target hidden");
     require_tensor_shape(cache_positions, DType::I32, {width, batch},
                          "MTP decode batch cache positions");
@@ -867,7 +1032,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                          "MTP decode batch RoPE positions");
     require_tensor_shape(valid_columns, DType::I32, {batch}, "MTP decode batch valid columns");
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "MTP decode batch KV rows");
-    require_tensor_shape(mtp_hidden, DType::BF16, {cfg_.hidden, width, batch},
+    require_tensor_shape(mtp_hidden, DType::BF16, {round_hidden_width(), width, batch},
                          "MTP decode batch hidden");
 
     ScopedValue<const Tensor*> backend_binding(active_backend_kv_table_rows_, &kv_table_rows);
@@ -879,13 +1044,16 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
 
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
     const std::int32_t batch = hidden.ne[1];
-    require_tensor_shape(hidden, DType::BF16, {cfg_.hidden, batch}, "MTP proposal batch hidden");
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), batch},
+                         "MTP proposal batch hidden");
     require_tensor_shape(logits, DType::BF16, {cfg_.vocab, batch}, "MTP proposal batch logits");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, Phase ph) {
+void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, Phase ph,
+                           KvPlane plane) {
+    const bool mtp = plane == KvPlane::Mtp;
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     if (active_gqa_envelope_ == nullptr) {
@@ -938,20 +1106,30 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
 
     Tensor a = results.attention.view({cfg_.head_dim, cfg_.n_q, T});
     const Tensor& kv_table_rows =
-        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+        mtp ? (active_backend_kv_table_rows_ != nullptr ? *active_backend_kv_table_rows_
+                                                        : io_.backend_kv_table_row)
+            : (active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row);
+    const auto kv_view =
+        mtp ? batch_mtp_kv_->batch_layer_view(0) : batch_text_kv_->batch_layer_view(fidx);
     // QSA indexer: cache this chunk's indexer keys and, past the budget, select the blocks each
-    // column may attend to. Empty below the budget, so the dense path is untouched.
+    // column may attend to. Empty below the budget, so the dense path is untouched. The draft
+    // head skips it and attends densely -- see KvPlane.
     const std::int32_t indexer_columns_per_row =
         active_sequence_batch_ != 0 ? active_sequence_width_ : T;
-    const ops::GqaBlockMask selection = text_indexer_selection(
-        w, h, T, cache_positions, rope_positions, kv_table_rows, indexer_columns_per_row,
-        static_cast<std::int32_t>(active_gqa_envelope_->max_visible_keys),
-        batch_text_kv_->batch_layer_view(fidx));
+    const ops::GqaBlockMask selection =
+        mtp ? ops::GqaBlockMask{}
+            : text_indexer_selection(
+                  w, h, T, cache_positions, rope_positions, kv_table_rows, indexer_columns_per_row,
+                  static_cast<std::int32_t>(active_gqa_envelope_->max_visible_keys),
+                  batch_text_kv_->batch_layer_view(fidx));
     // The round binding says how many keys the launch must be sized for; the window
     // says how many of them this layer may look at. Stamp the layer's window onto a
     // copy -- widening the round binding could not express an alternating stack.
     ops::GqaExecutionEnvelope layer_envelope = *active_gqa_envelope_;
-    layer_envelope.sliding_window            = layer_sliding_window<TextConfig>(layer, weights_.geometry);
+    // The draft head is not a stack layer, so it has no layer index to key a window on; no
+    // target with a draft head declares one, and one that grows both must decide it here.
+    layer_envelope.sliding_window =
+        mtp ? 0 : layer_sliding_window<TextConfig>(layer, weights_.geometry);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -964,12 +1142,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                           kAttnScale, batch_text_kv_->batch_layer_view(fidx), layer_envelope,
-                           work_, a_batch, s, selection);
+                           kAttnScale, kv_view, layer_envelope, work_, a_batch, s, selection);
     } else {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
-                           batch_text_kv_->batch_layer_view(fidx), layer_envelope, work_, a, s,
-                           selection);
+                           kv_view, layer_envelope, work_, a, s, selection);
     }
     // A dense stack writes no gate rows; see attention_output_gate<Variant>().
     if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
@@ -1913,18 +2089,19 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     if (!stage_finishes()) {
         stage_export(x, s);
     } else {
-    Hooks::finish(weights_, x, cfg_.rms_eps, xf, work_, s);
+    Tensor xl = finish_prefill(xf, x, s);
     if (prefill_cols > 0) {
-        debug_next_token_nll(xf, ids_device, prefill_cols, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
+        debug_next_token_nll(xl, ids_device, prefill_cols, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
     }
 
     if (batch > 0) {
         Tensor xf_decode = xf.slice(1, prefill_cols, batch);
+        Tensor xl_decode = xl.slice(1, prefill_cols, batch);
         CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data,
                                    static_cast<std::size_t>(cfg_.hidden) * batch * 2,
                                    cudaMemcpyDeviceToDevice, s));
         Tensor logits_decode = decode.logits;
-        ops::linear(xf_decode, *lm_head_, logits_decode, s);
+        ops::linear(xl_decode, *lm_head_, logits_decode, s);
     }
 
     // Every segment that finishes samples in this round. Their last hidden columns are
@@ -1938,8 +2115,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             Tensor last_xf = xf.slice(1, segment_begin[sg] + len - 1, 1);
             CUDA_CHECK(cudaMemcpyAsync(
                 static_cast<char*>(finalize.hidden.data) +
-                    static_cast<std::size_t>(slot) * cfg_.hidden * 2,
-                last_xf.data, static_cast<std::size_t>(cfg_.hidden) * 2,
+                    static_cast<std::size_t>(slot) * round_hidden_width() * 2,
+                last_xf.data, static_cast<std::size_t>(round_hidden_width()) * 2,
                 cudaMemcpyDeviceToDevice, s));
             const std::int32_t position = segments[sg].kv_base + len;
             Tensor position_slot        = finalize.positions.slice(0, slot, 1);
@@ -1956,7 +2133,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                 static_cast<int>(segments.back().ids.size()) - 1,
                                          1);
         Tensor logits   = finalize.logits.slice(1, 0, finalizers);
-        ops::linear(gathered, *lm_head_, logits, s);
+        ops::linear(lm_head_view(gathered, s), *lm_head_, logits, s);
         Tensor sampled   = finalize.tokens.slice(0, 0, finalizers);
         Tensor positions_out = finalize.positions.slice(0, 0, finalizers);
         ops::sample(logits, sampled, cfg_.token_domain, finalize.sampling, positions_out,
@@ -2024,8 +2201,8 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
     }
     Tensor xf = matrix_window(prefill_hidden_, bucket);
     if (stage_finishes()) {
-        Hooks::finish(weights_, x, cfg_.rms_eps, xf, work_, s);
-        debug_next_token_nll(xf, ids_device, bucket, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
+        Tensor xl = finish_prefill(xf, x, s);
+        debug_next_token_nll(xl, ids_device, bucket, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
     } else {
         stage_export(x, s);
     }
@@ -2316,16 +2493,17 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         stage_export(x, s);
         return;
     }
-    Hooks::finish(weights_, x, cfg_.rms_eps, xf, work_, s);
-    debug_next_token_nll(xf, ids_device, prefill_cols, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
+    Tensor xl = finish_prefill(xf, x, s);
+    debug_next_token_nll(xl, ids_device, prefill_cols, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
 
     if (batch == 0) { return; }
     Tensor xf_decode = xf.slice(1, prefill_cols, batch);
+        Tensor xl_decode = xl.slice(1, prefill_cols, batch);
     CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data,
                                static_cast<std::size_t>(cfg_.hidden) * batch * 2,
                                cudaMemcpyDeviceToDevice, s));
     Tensor logits_decode = decode.logits;
-    ops::linear(xf_decode, *lm_head_, logits_decode, s);
+    ops::linear(xl_decode, *lm_head_, logits_decode, s);
 }
 
 // Stages one mixed round into the family, captures the (chunk bucket, batch
@@ -2434,7 +2612,7 @@ bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int 
         Tensor xf      = matrix_window(prefill_hidden_, len);
         Tensor last_xf = xf.slice(1, len - 1, 1);
         Tensor logits  = matrix_window(io_.logits, 1);
-        ops::linear(last_xf, *lm_head_, logits, s);
+        ops::linear(lm_head_view(last_xf, s), *lm_head_, logits, s);
         ops::set_i32_scalar(io_.pos, base_i + T, s);
         ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
         work_.reset();
@@ -2623,8 +2801,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {cfg_.hidden, len});
             if (stage_finishes()) {
-                Hooks::finish(weights_, x, cfg_.rms_eps, xf, work_, s);
-                debug_next_token_nll(xf, ids_device, len, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
+                Tensor xl = finish_prefill(xf, x, s);
+                debug_next_token_nll(xl, ids_device, len, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
             } else {
                 stage_export(x, s);
             }
@@ -2632,7 +2810,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (is_last && stage_finishes()) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
-                ops::linear(last_xf, *lm_head_, logits, s);
+                ops::linear(lm_head_view(last_xf, s), *lm_head_, logits, s);
                 // Set io_.pos to the bonus token's absolute position (base + T) before picking so
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
@@ -2710,7 +2888,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
                         Tensor prev_token     = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                         Tensor next_token     = io_.mtp->draft_tokens.slice(0, i, 1);
-                        Tensor next_hidden    = work_.alloc(DType::BF16, {cfg_.hidden, 1});
+                        Tensor next_hidden    = work_.alloc(DType::BF16, {round_hidden_width(), 1});
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
                         const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,

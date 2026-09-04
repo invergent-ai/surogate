@@ -417,7 +417,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
         MtpPlan& mtp      = out.mtp;
         mtp.resident      = features.mtp();
         g_layer_placement = mtp.resident ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
-        mtp.embedding_norm = device(binder, "mtp/embedding_norm", NumericFormat::FP32, {kHidden});
+        mtp.embedding_norm = device(binder, "mtp/embedding_norm", NumericFormat::BF16, {kHidden});
         mtp.hidden_norm    = device(binder, "mtp/hidden_norm", NumericFormat::FP32, {kHcWidth});
         // fc_embedding and fc_hidden fused side by side, so one matmul over
         // concat(embedding_norm(e), hidden_norm(h)) is fc_embedding@e + fc_hidden@h.
@@ -504,6 +504,36 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     return load_plan;
 }
 
+/// One full-attention block's weights, out of the artifact and into the runtime view. The
+/// NextN draft head loads through here too: its block is a trunk block, so it is the same
+/// statements over the same objects.
+void load_full_attention(artifact::MaterializedArtifact& backing, const FullAttentionPlan& attention,
+                         ops::HyperConnectionWeights mix_attn, FullAttentionWeights& target) {
+    target.projection.mix                  = std::move(mix_attn);
+    target.projection.query_key_gate_value = artifact::materialized_weight(
+        backing, attention.query_key_gate_value, NumericFormat::W8G32_F16S,
+        TextConfig::query_projection_rows, static_cast<std::int32_t>(kHidden));
+    target.query_norm = artifact::materialized_tensor(backing, attention.query_norm,
+                                                      NumericFormat::BF16, {TextConfig::head_dim});
+    target.key_norm   = artifact::materialized_tensor(backing, attention.key_norm,
+                                                      NumericFormat::BF16, {TextConfig::head_dim});
+    target.projection.indexer.query = artifact::materialized_weight(
+        backing, attention.indexer.query, NumericFormat::BF16,
+        static_cast<std::int32_t>(TextConfig::indexer_heads) * TextConfig::indexer_head_dim,
+        static_cast<std::int32_t>(kHidden));
+    target.projection.indexer.key = artifact::materialized_weight(
+        backing, attention.indexer.key, NumericFormat::BF16, TextConfig::indexer_head_dim,
+        static_cast<std::int32_t>(kHidden));
+    target.projection.indexer.query_norm = artifact::materialized_tensor(
+        backing, attention.indexer.query_norm, NumericFormat::BF16, {TextConfig::indexer_head_dim});
+    target.projection.indexer.key_norm = artifact::materialized_tensor(
+        backing, attention.indexer.key_norm, NumericFormat::BF16, {TextConfig::indexer_head_dim});
+    target.output = artifact::materialized_weight(backing, attention.output,
+                                                  NumericFormat::W8G32_F16S,
+                                                  static_cast<std::int32_t>(kHidden),
+                                                  TextConfig::query_size);
+}
+
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)), host_bank(HostBank::shared(plan.host_bank)) {
     // The layer storage is sized here, not by the type: the counts come from the
@@ -531,30 +561,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         ops::HyperConnectionWeights mix_mlp  = load_hc(backing, source.hc_mlp, true);
         if (source.is_full_attention) {
             FullAttentionWeights& target = runtime.full_layers.at(full_index++);
-            target.projection.query_key_gate_value = artifact::materialized_weight(
-                backing, source.attention.query_key_gate_value, NumericFormat::W8G32_F16S,
-                TextConfig::query_projection_rows, static_cast<std::int32_t>(kHidden));
-            target.projection.mix = std::move(mix_attn);
-            target.query_norm     = artifact::materialized_tensor(
-                backing, source.attention.query_norm, NumericFormat::BF16, {TextConfig::head_dim});
-            target.key_norm = artifact::materialized_tensor(
-                backing, source.attention.key_norm, NumericFormat::BF16, {TextConfig::head_dim});
-            target.projection.indexer.query = artifact::materialized_weight(
-                backing, source.attention.indexer.query, NumericFormat::BF16,
-                static_cast<std::int32_t>(TextConfig::indexer_heads) * TextConfig::indexer_head_dim,
-                static_cast<std::int32_t>(kHidden));
-            target.projection.indexer.key = artifact::materialized_weight(
-                backing, source.attention.indexer.key, NumericFormat::BF16,
-                TextConfig::indexer_head_dim, static_cast<std::int32_t>(kHidden));
-            target.projection.indexer.query_norm =
-                artifact::materialized_tensor(backing, source.attention.indexer.query_norm,
-                                              NumericFormat::BF16, {TextConfig::indexer_head_dim});
-            target.projection.indexer.key_norm =
-                artifact::materialized_tensor(backing, source.attention.indexer.key_norm,
-                                              NumericFormat::BF16, {TextConfig::indexer_head_dim});
-            target.output = artifact::materialized_weight(
-                backing, source.attention.output, NumericFormat::W8G32_F16S,
-                static_cast<std::int32_t>(kHidden), TextConfig::query_size);
+            load_full_attention(backing, source.attention, std::move(mix_attn), target);
             target.post_mixer = load_moe(backing, *host_bank, source.moe, std::move(mix_mlp),
                                          plan.host_bank_q4);
             target.post_mixer.layer = static_cast<std::int32_t>(layer);
@@ -612,6 +619,31 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
     if (full_index != runtime.full_layers.size() || gdn_index != runtime.gdn_layers.size()) {
         throw std::logic_error("qwen4exp text topology binding is incomplete");
+    }
+
+    // The NextN draft head. Its block loads through the trunk's own loader, because it is a
+    // trunk block; only the fold on the way in and the mixer on the way out are its own.
+    runtime.mtp_head.present = plan.mtp.present && plan.mtp.resident;
+    if (runtime.mtp_head.present) {
+        MtpHeadWeights& head = runtime.mtp_head;
+        head.embedding_norm  = artifact::materialized_tensor(
+            backing, plan.mtp.embedding_norm, NumericFormat::BF16,
+            {static_cast<std::int32_t>(kHidden)});
+        head.hidden_norm = artifact::materialized_tensor(
+            backing, plan.mtp.hidden_norm, NumericFormat::FP32,
+            {static_cast<std::int32_t>(kHcWidth)});
+        head.input_projection = artifact::materialized_weight(
+            backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S,
+            static_cast<std::int32_t>(kHidden), static_cast<std::int32_t>(2 * kHidden));
+        head.head_mix = load_hc(backing, plan.mtp.head_mix, false);
+        load_full_attention(backing, plan.mtp.layer.attention,
+                            load_hc(backing, plan.mtp.layer.hc_attention, true),
+                            runtime.mtp_block);
+        runtime.mtp_block.post_mixer =
+            load_moe(backing, *host_bank, plan.mtp.layer.moe,
+                     load_hc(backing, plan.mtp.layer.hc_mlp, true), plan.host_bank_q4);
+        // The head's own expert bank, past the trunk's layers: the slot cache keys on this.
+        runtime.mtp_block.post_mixer.layer = static_cast<std::int32_t>(kTextLayers);
     }
 
     runtime.output_mix  = load_hc(backing, plan.output_mix, false);

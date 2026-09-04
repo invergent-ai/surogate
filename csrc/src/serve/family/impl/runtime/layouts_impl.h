@@ -275,15 +275,22 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
 
+    // A trunk-block draft head folds into the wide residual and hands it back, so the hidden
+    // that crosses a round boundary -- into the head, into the continuation store, out of the
+    // verify -- is the residual, not the model width. Identical for every other family, whose
+    // residual is its hidden.
+    const std::int32_t round_hidden =
+        plan.features.mtp() && mtp_block_is_trunk_layer<Variant>() ? plan.geometry.residual
+                                                                   : plan.geometry.hidden;
     out.round = family::begin_round_state_layout(
-        builder, family::RoundStateSpec{.hidden         = plan.geometry.hidden,
+        builder, family::RoundStateSpec{.hidden         = round_hidden,
                                          .output_rows    = plan.geometry.output_rows,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .enable_mtp     = plan.features.mtp(),
                                          .enable_dflash  = plan.features.dflash()});
     out.prefill_hidden = add_tensor(
-        builder, DType::BF16, {plan.geometry.hidden, effective_prefill_chunk}, "step prefill hidden");
+        builder, DType::BF16, {round_hidden, effective_prefill_chunk}, "step prefill hidden");
     family::complete_round_state_layout(builder, out.round);
     const auto i32 = [&](std::size_t n, const char* label) {
         return add_tensor(builder, DType::I32, {static_cast<std::int32_t>(n)}, label);
@@ -297,11 +304,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
+    // These carry a lane's hidden from one round to the next, which is where a trunk-block
+    // draft head reads its `h` from -- so they widen with the round's hidden.
+    const std::int32_t persistent_hidden =
+        plan.features.mtp() && mtp_block_is_trunk_layer<Variant>() ? plan.geometry.residual
+                                                                   : plan.geometry.hidden;
     out.tail_hidden = add_tensor(
-        builder, DType::BF16, {plan.geometry.hidden, static_cast<std::int32_t>(plan.max_concurrency)},
+        builder, DType::BF16, {persistent_hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "tail hidden");
     out.rewrite_checkpoint_hidden = add_tensor(
-        builder, DType::BF16, {plan.geometry.hidden, static_cast<std::int32_t>(plan.max_concurrency)},
+        builder, DType::BF16, {persistent_hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "rewrite checkpoint hidden");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =

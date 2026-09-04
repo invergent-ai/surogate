@@ -58,6 +58,21 @@ template <class Variant>
     }
 }
 
+/// Whether the target's NextN draft head is a trunk block.
+///
+/// A head whose block is an ordinary layer is run by the trunk's own mixer -- one program, not
+/// two that drift -- and the target supplies only the fold that seeds the residual and the
+/// collapse that reads it back. A target that says nothing keeps the fixed draft tail, which
+/// is what every family with a Qwen3.5-shaped head uses.
+template <class Variant>
+[[nodiscard]] constexpr bool mtp_block_is_trunk_layer() {
+    if constexpr (requires { Variant::mtp_block_is_trunk_layer; }) {
+        return Variant::mtp_block_is_trunk_layer;
+    } else {
+        return false;
+    }
+}
+
 /// The value a bf16 buffer would hold for `x`, round-to-nearest-even.
 constexpr float as_bf16(float x) {
     const std::uint32_t bits    = std::bit_cast<std::uint32_t>(x);

@@ -117,6 +117,20 @@ struct NgramPleState {
 void ngram_ple_mark_segment_last(Tensor& flags, const Tensor& count_scalar, std::int32_t base,
                                  cudaStream_t stream);
 
+/**
+ * Column staging for a round that gives each lane `width` consecutive columns -- a speculative
+ * verify or draft round. The columns of one lane are one segment: the lane's slot repeats
+ * across them, the segment offset ramps 0..width-1, and only the last column closes it.
+ *
+ *   slots_out[b*width + j]     = slots_in[b]
+ *   segment_begin[b*width + j] = j
+ *   segment_last[b*width + j]  = (j == width - 1)
+ *
+ * `slots_in` is I32 [batch]; the three outputs are I32 [width*batch].
+ */
+void ngram_ple_expand_columns(const Tensor& slots_in, std::int32_t width, Tensor& slots_out,
+                              Tensor& segment_begin, Tensor& segment_last, cudaStream_t stream);
+
 void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const NgramPleHash& hash,
                        const NgramPleTable& table, const NgramPleWeights& weights,
                        NgramPleState& state, std::int32_t streams, std::int32_t conv_kernel,

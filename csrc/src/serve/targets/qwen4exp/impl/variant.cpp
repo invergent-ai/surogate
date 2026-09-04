@@ -8,6 +8,7 @@
 #include "api/ops/expert_slot_cache.h"
 #include "api/ops/cpu_expert_compute.h"
 #include "api/ops/hyper_connection.h"
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "api/ops/linear.h"
 #include "api/ops/ngram_ple.h"
 #include "api/ops/scatter.h"
@@ -959,7 +960,7 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         const std::size_t free     = device_free_bytes(device);
         const std::size_t budget   = free / 2;
         const auto whole_model =
-            static_cast<long>(TextConfig::layers) * static_cast<long>(geometry.experts);
+            static_cast<long>(TextConfig::expert_layers) * static_cast<long>(geometry.experts);
         requested = per_slot == 0 ? 0 : static_cast<long>(budget / per_slot);
         requested = std::min(requested, whole_model);
         if (requested < geometry.experts) { return cache; }
@@ -969,7 +970,7 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
     cache.slots         = std::max(static_cast<std::int32_t>(requested), geometry.experts);
     const std::size_t pool_bytes = ops::expert_slot_pool_bytes(geometry, cache.slots);
     const std::size_t dir_bytes =
-        ops::expert_slot_directory_bytes(TextConfig::layers, geometry.experts, cache.slots);
+        ops::expert_slot_directory_bytes(TextConfig::expert_layers, geometry.experts, cache.slots);
     // A round can miss at most one whole layer's expert set.
     const std::size_t miss_bytes = ops::expert_miss_list_bytes(geometry.experts);
     CUDA_CHECK(cudaMalloc(&cache.pool_memory, pool_bytes));
@@ -980,19 +981,22 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
     // pool cannot hold every expert of its layers but is comfortably bigger than one scan.
     // Below that, plain LRU (a ring would eat half a tiny pool for no stable set to protect).
     const auto stage_experts =
-        static_cast<std::int64_t>(TextConfig::layers) * geometry.experts; // whole-model bound
+        static_cast<std::int64_t>(TextConfig::expert_layers) * geometry.experts; // whole-model bound
+    // The ring must be at least one expert set and at most half the pool, so it needs a pool
+    // of two expert sets before it fits at all -- a pool between 1.5 and 2 sets would ask for
+    // a ring wider than half of it, which the directory refuses.
     cache.scan_ring = (static_cast<std::int64_t>(cache.slots) < stage_experts &&
-                       cache.slots >= geometry.experts * 3 / 2 &&
+                       cache.slots >= geometry.experts * 2 &&
                        std::getenv("SUROGATE_SERVE_NO_SCAN_RING") == nullptr)
                           ? geometry.experts
                           : 0;
-    cache.directory = ops::create_expert_slot_directory(TextConfig::layers, geometry.experts,
+    cache.directory = ops::create_expert_slot_directory(TextConfig::expert_layers, geometry.experts,
                                                         cache.slots, cache.scan_ring,
                                                         cache.directory_memory,
                                                         nullptr);
     cache.misses    = ops::create_expert_miss_list(geometry.experts, cache.miss_memory);
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
-    cache.layers.resize(static_cast<std::size_t>(TextConfig::layers));
+    cache.layers.resize(static_cast<std::size_t>(TextConfig::expert_layers));
     cache.enabled = true;
     if (const char* stats = std::getenv("SUROGATE_SERVE_EXPERT_STATS"); stats != nullptr && *stats != '\0') {
         cache.stats_every = std::strtol(stats, nullptr, 10);
@@ -1339,8 +1343,19 @@ std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_
     return graph_profiles_through(capacity - 1, {127, 511, 2047});
 }
 
-std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t, std::uint32_t) {
-    return {};
+std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
+                                                               std::uint32_t draft_window) {
+    // The draft head's rounds are captured over the same visible-key bands the trunk uses,
+    // shifted by the draft window: a verify round writes the window's keys before the head
+    // reads them, so the head's envelope trails the trunk's by that much.
+    if (draft_window == 0 || capacity == 0) { return {}; }
+    std::vector<std::uint32_t> ends;
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
+        if (visible_end >= 2 * draft_window) { ends.push_back(visible_end - 2 * draft_window); }
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return graph_profiles_through(capacity - 1, ends);
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
@@ -1584,10 +1599,71 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     combine_into(output, residual, stream);
 }
 
+// ---------------------------------------------------------------------------------------------
+// NextN draft head
+//
+// The head folds the next token's embedding into the trunk's wide residual, runs one trunk
+// block over it, and collapses the result with its own mixer before reusing the trunk's LM
+// head. The block is the family's business -- it is an ordinary layer and the family runs it
+// with the trunk's own mixer. These two are what is the head's own.
+// ---------------------------------------------------------------------------------------------
+
+const FullAttentionWeights& Variant::mtp_block(const ModelView& model) {
+    if (!model.mtp_head.present) {
+        throw std::logic_error("qwen4exp: the draft head's block is not resident");
+    }
+    return model.mtp_block;
+}
+
+void Variant::mtp_fold(const ModelView& model, const Tensor& embedding, const Tensor& hidden,
+                       Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
+    const MtpHeadWeights& head = model.mtp_head;
+    if (!head.present) { throw std::logic_error("qwen4exp: the draft head is not resident"); }
+    const std::int32_t tokens = embedding.ne[1];
+    auto scope = workspace.scope();
+
+    // The two inputs, each under its own norm. `hidden` is the wide residual, so its norm is
+    // per stream -- the same first line the layer mixers run.
+    Tensor e = workspace.alloc(DType::BF16, {kHidden, tokens});
+    Tensor h = workspace.alloc(DType::BF16, {kResidual, tokens});
+    ops::rmsnorm(embedding, head.embedding_norm, kEps, false, e, stream);
+    ops::hyper_connection_norm(hidden, head.hidden_norm, kStreams, kEps, h, stream);
+
+    // One matmul over [e; h_s] per stream. The pack puts the stream fastest, so the result
+    // read as [kHcWidth, tokens] is already stream-major within each column.
+    Tensor packed = workspace.alloc(DType::BF16, {2 * kHidden, kStreams * tokens});
+    ops::mtp_pack_fc_input_streams(e, h, kStreams, packed, stream);
+    Tensor folded = residual.view({kHidden, kStreams * tokens});
+    ops::linear(packed, head.input_projection, folded, kPolicy, workspace, stream);
+}
+
+void Variant::mtp_collapse(const ModelView& model, const Tensor& residual, Tensor& hidden,
+                           WorkspaceArena& workspace, cudaStream_t stream) {
+    const MtpHeadWeights& head = model.mtp_head;
+    if (!head.present) { throw std::logic_error("qwen4exp: the draft head is not resident"); }
+    ops::hyper_connection_mix(residual, head.head_mix, kStreams, kEps, hidden, nullptr, workspace,
+                              stream);
+}
+
+std::size_t Variant::mtp_fold_workspace_capacity_bytes(const family::TextGeometry& geometry,
+                                                       std::int32_t first, std::int32_t last) {
+    if (first <= 0 || last < first) {
+        throw std::invalid_argument("qwen4exp: draft-head token interval is empty");
+    }
+    const auto plane = [&](std::int32_t rows, std::int32_t columns) {
+        return plane_bytes(rows, columns, DType::BF16);
+    };
+    return plane(kHidden, last) + plane(kResidual, last) + plane(2 * kHidden, kStreams * last) +
+           w8_capacity(kHidden, kStreams * last, kStreams * first, kStreams * last) +
+           mix_capacity(first, last);
+}
+
 void Variant::mtp_attention_projection(const Tensor&, const MtpAttentionProjectionWeights&,
                                        Tensor&, Tensor&, Tensor&, Tensor&, WorkspaceArena&,
                                        cudaStream_t) {
-    throw std::logic_error("qwen4exp: MTP is not served");
+    // The head's block is a trunk block; the family runs it through the trunk's own mixer, so
+    // the fixed draft-tail projections are never reached. See `mtp_block_is_trunk_layer`.
+    throw std::logic_error("qwen4exp: the draft head runs the trunk's block, not this path");
 }
 
 void Variant::mtp_kv_projection(const Tensor&, const MtpAttentionProjectionWeights&, Tensor&,
@@ -1640,12 +1716,22 @@ void Variant::gdn_input_projection_snapshot(
     ops::extract_bf16_columns(convolved_flat, 2 * TextConfig::key_dim, value_flat, stream);
 }
 
-void Variant::gdn_input_projection_record(const Tensor&, const GdnProjectionWeights&,
-                                          const Tensor&, const Tensor&, const Tensor&,
-                                          const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                                          Tensor&, family::TextPhase, WorkspaceArena&,
-                                          cudaStream_t) {
-    throw std::logic_error("qwen4exp: speculative replay records are not served");
+void Variant::gdn_input_projection_record(const Tensor& hidden,
+                                          const GdnProjectionWeights& weights,
+                                          const Tensor& conv_weight, const Tensor& conv_states,
+                                          const Tensor& valid_columns, const Tensor& initial_slots,
+                                          Tensor& conv_record, Tensor& query, Tensor& key,
+                                          Tensor& value, Tensor& output_gate,
+                                          family::TextPhase phase, WorkspaceArena& workspace,
+                                          cudaStream_t stream) {
+    // A speculative round records the pre-convolution projection instead of advancing the
+    // convolution state: a rejected draft replays the scan from the record, so the recurrent
+    // state is never rolled back, only re-derived. The projection is the layer's own; the
+    // convolution tail is the family's, the same one the fused profiles compose with.
+    gdn_input_projection(hidden, weights, conv_record, output_gate, phase, workspace, stream);
+    ops::detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states,
+                                                  valid_columns, initial_slots, query, key, value,
+                                                  stream);
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
