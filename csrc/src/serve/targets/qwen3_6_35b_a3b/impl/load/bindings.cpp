@@ -19,6 +19,13 @@ namespace {
 
 using artifact::NumericFormat;
 
+/// The routed block's counts. `intermediate` in this target's config is one expert's, so the
+/// stored parents multiply by the expert count; the shared expert has its own width.
+constexpr std::int32_t kExperts           = 256;
+constexpr std::int32_t kSharedIntermediate = 512;
+/// The draft head's shortlist: a fixed count of frequent tokens, not a model dimension.
+constexpr std::int32_t kDraftVocab        = 131072;
+
 bool is_full_layer(std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; }
 
 /// Routed experts per MoE layer; the second-level NVFP4 scales are one array of this length.
@@ -130,7 +137,7 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
 }
 
 MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFormat routed_gate_up,
-                 NumericFormat routed_down, artifact::TensorPlacement placement) {
+                 NumericFormat routed_down, artifact::TensorPlacement placement, const family::TextGeometry& g) {
     const auto bind = [&](std::string_view name, NumericFormat format,
                           std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, placement);
@@ -139,15 +146,18 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
         return artifact::bind_linear(binder, name, rows, columns, placement);
     };
     MoePlan plan{
-        .router_shared_gate = bind(prefix + "router_shared_gate", NumericFormat::BF16, {257, 2048}),
+        .router_shared_gate = bind(prefix + "router_shared_gate", NumericFormat::BF16,
+                                  {kExperts + 1, g.hidden}),
         // The routed experts' format comes from the artifact: a GGUF serves them as its own
         // K-quant superblocks, a converted checkpoint as the groupwise-int or NVFP4 profile.
         // `routed_gate_up`/`routed_down` remain the profile's expectation for the NVFP4 extras
         // below, which only that profile carries.
-        .routed_gate_up     = bind_stored(prefix + "routed_gate_up", 262144, 2048),
-        .routed_down        = bind_stored(prefix + "routed_down", 524288, 512),
-        .shared_gate_up = bind(prefix + "shared_gate_up", NumericFormat::W8G32_F16S, {1024, 2048}),
-        .shared_down    = bind(prefix + "shared_down", NumericFormat::W8G32_F16S, {2048, 512}),
+        .routed_gate_up     = bind_stored(prefix + "routed_gate_up", kExperts * 2 * g.intermediate, g.hidden),
+        .routed_down        = bind_stored(prefix + "routed_down", kExperts * g.hidden, g.intermediate),
+        .shared_gate_up = bind(prefix + "shared_gate_up", NumericFormat::W8G32_F16S,
+                              {2 * kSharedIntermediate, g.hidden}),
+        .shared_down    = bind(prefix + "shared_down", NumericFormat::W8G32_F16S,
+                              {g.hidden, kSharedIntermediate}),
     };
     // NVFP4 carries a second-level scale per expert per projection; the row block holds gate and
     // up stacked, so gate/up needs two entries per expert and down one.
@@ -159,7 +169,7 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
         plan.routed_gate_up_alpha =
             bind(prefix + "routed_gate_up_alpha", NumericFormat::FP32, {kRoutedExperts});
         require_identity_divisor(binder, plan.routed_gate_up.object,
-                                 prefix + "routed_gate_up", 262144, 2048);
+                                 prefix + "routed_gate_up", kExperts * 2 * g.intermediate, g.hidden);
     }
     if (plan.routed_down.format == NumericFormat::NVFP4) {
         plan.routed_down_scale =
@@ -175,7 +185,7 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
 }
 
 SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtifact& materialized,
-                          NumericFormat routed_gate_up, NumericFormat routed_down) {
+                          NumericFormat routed_gate_up, NumericFormat routed_down, const family::TextGeometry& g) {
     SparseMoePayload payload{
         .op = {
             .router_shared_gate = artifact::materialized_weight(
@@ -186,16 +196,20 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
             // expert silently wrong.
             .routed_gate_up =
                 plan.routed_gate_up.format == NumericFormat::NVFP4
-                    ? routed_nvfp4_weight(materialized, plan.routed_gate_up.object, 262144, 2048)
-                    : artifact::materialized_linear(materialized, plan.routed_gate_up, 262144, 2048),
+                    ? routed_nvfp4_weight(materialized, plan.routed_gate_up.object,
+                                            kExperts * 2 * g.intermediate, g.hidden)
+                    : artifact::materialized_linear(materialized, plan.routed_gate_up,
+                                                        kExperts * 2 * g.intermediate, g.hidden),
             .routed_down =
                 plan.routed_down.format == NumericFormat::NVFP4
-                    ? routed_nvfp4_weight(materialized, plan.routed_down.object, 524288, 512)
-                    : artifact::materialized_linear(materialized, plan.routed_down, 524288, 512),
+                    ? routed_nvfp4_weight(materialized, plan.routed_down.object,
+                                            kExperts * g.hidden, g.intermediate)
+                    : artifact::materialized_linear(materialized, plan.routed_down,
+                                                        kExperts * g.hidden, g.intermediate),
             .shared_gate_up = artifact::materialized_weight(materialized, plan.shared_gate_up,
-                                                            NumericFormat::W8G32_F16S, 1024, 2048),
+                                                            NumericFormat::W8G32_F16S, 2 * kSharedIntermediate, g.hidden),
             .shared_down    = artifact::materialized_weight(materialized, plan.shared_down,
-                                                            NumericFormat::W8G32_F16S, 2048, 512),
+                                                            NumericFormat::W8G32_F16S, g.hidden, kSharedIntermediate),
             .experts_per_token = ops::kSparseMoeQwen36Geometry.experts_per_token,
         }};
     if (plan.routed_gate_up_scale.has_value()) {
@@ -255,16 +269,17 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.
     out.geometry = family::TextGeometry::declared<TextConfig>(binder.reader().geometry());
+    const family::TextGeometry& g = out.geometry;
     out.frontend        = family::bind_frontend_resources(binder);
     out.features        = features;
     out.weights         = weights;
-    out.token_embedding = artifact::bind_linear(binder, "text/token_embedding", 248320, 2048);
+    out.token_embedding = artifact::bind_linear(binder, "text/token_embedding", g.output_rows, g.hidden);
 
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
         target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
-                                                                NumericFormat::BF16, {2048});
+                                                                NumericFormat::BF16, {g.hidden});
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             // One object per HF Linear when the artifact stores them so (a quantized export,
@@ -272,54 +287,56 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
             // format of each is read from the artifact, not asserted.
             if (binder.has(prefix + "attention/query")) {
                 target.attention.split = SplitAttentionPlan{
-                    .query = artifact::bind_linear(binder, prefix + "attention/query", 4096, 2048),
+                    .query = artifact::bind_linear(binder, prefix + "attention/query", g.query_size(), g.hidden),
                     .key   = artifact::bind_linear(binder, prefix + "attention/key", 512, 2048),
-                    .gate  = artifact::bind_linear(binder, prefix + "attention/gate", 4096, 2048),
+                    .gate  = artifact::bind_linear(binder, prefix + "attention/gate", g.query_size(), g.hidden),
                     .value = artifact::bind_linear(binder, prefix + "attention/value", 512, 2048),
                 };
             } else {
                 target.attention.query_key_gate_value = artifact::bind_linear(
-                    binder, prefix + "attention/query_key_gate_value", 9216, 2048);
+                    binder, prefix + "attention/query_key_gate_value",
+                                              2 * g.query_size() + 2 * g.kv_size(), g.hidden);
             }
             target.attention.query_norm = artifact::bind_device_tensor(
-                binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
+                binder, prefix + "attention/query_norm", NumericFormat::BF16, {g.head_dim});
             target.attention.key_norm = artifact::bind_device_tensor(
-                binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
+                binder, prefix + "attention/key_norm", NumericFormat::BF16, {g.head_dim});
             target.attention.output =
-                artifact::bind_linear(binder, prefix + "attention/output", 2048, 4096);
+                artifact::bind_linear(binder, prefix + "attention/output", g.hidden, g.query_size());
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
-                                                                  NumericFormat::FP32, {32});
+                                                                  NumericFormat::FP32, {g.gdn_value_heads});
             target.gdn.dt_bias     = artifact::bind_device_tensor(binder, prefix + "gdn/dt_bias",
-                                                                  NumericFormat::FP32, {32});
+                                                                  NumericFormat::FP32, {g.gdn_value_heads});
             target.gdn.convolution = artifact::bind_device_tensor(
-                binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 8192});
+                binder, prefix + "gdn/convolution", NumericFormat::BF16, {g.gdn_conv_kernel, g.convolution_dim()});
             target.gdn.a_b_projection = artifact::bind_device_tensor(
-                binder, prefix + "gdn/a_b_projection", NumericFormat::BF16, {64, 2048});
+                binder, prefix + "gdn/a_b_projection", NumericFormat::BF16, {2 * g.gdn_value_heads, g.hidden});
             if (binder.has(prefix + "gdn/query_key_value")) {
                 target.gdn.split = SplitGdnInputPlan{
                     .query_key_value =
-                        artifact::bind_linear(binder, prefix + "gdn/query_key_value", 8192, 2048),
-                    .z = artifact::bind_linear(binder, prefix + "gdn/z", 4096, 2048),
+                        artifact::bind_linear(binder, prefix + "gdn/query_key_value", g.convolution_dim(), g.hidden),
+                    .z = artifact::bind_linear(binder, prefix + "gdn/z", g.value_dim(), g.hidden),
                 };
             } else {
                 target.gdn.query_key_value_z =
-                    artifact::bind_linear(binder, prefix + "gdn/query_key_value_z", 12288, 2048);
+                    artifact::bind_linear(binder, prefix + "gdn/query_key_value_z",
+                                              g.convolution_dim() + g.value_dim(), g.hidden);
             }
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
-                                                             NumericFormat::BF16, {128});
-            target.gdn.output = artifact::bind_linear(binder, prefix + "gdn/output", 2048, 4096);
+                                                             NumericFormat::BF16, {g.gdn_key_head_dim});
+            target.gdn.output = artifact::bind_linear(binder, prefix + "gdn/output", g.hidden, g.value_dim());
         }
         target.post_attention_norm = artifact::bind_device_tensor(
-            binder, prefix + "post_attention_norm", NumericFormat::BF16, {2048});
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
         const RoutedFormats routed = routed_formats(weights, layer);
         target.moe = bind_moe(binder, prefix + "moe/", routed.gate_up, routed.down,
-                              artifact::TensorPlacement::Device);
+                              artifact::TensorPlacement::Device, g);
     }
 
     out.final_norm =
-        artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {2048});
-    out.output_head = artifact::bind_linear(binder, "text/output_head", 248320, 2048);
+        artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {g.hidden});
+    out.output_head = artifact::bind_linear(binder, "text/output_head", g.output_rows, g.hidden);
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
@@ -327,7 +344,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     out.draft_head = artifact::bind_linear(binder, "text/draft_head", 131072, 2048,
                                            proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
-        binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
+        binder, "text/draft_head_token_ids", NumericFormat::I32, {kDraftVocab},
+        proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
     // A community GGUF export usually strips the nextn block; the artifact then omits mtp/*
@@ -346,23 +364,23 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     };
     if (out.has_mtp) {
         out.mtp.input_projection =
-            bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {2048, 4096});
-        out.mtp.embedding_norm = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {2048});
-        out.mtp.hidden_norm    = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {2048});
-        out.mtp.input_norm     = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {2048});
+            bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {g.hidden, g.mtp_input_rows()});
+        out.mtp.embedding_norm = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {g.hidden});
+        out.mtp.hidden_norm    = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {g.hidden});
+        out.mtp.input_norm     = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {g.hidden});
         out.mtp.attention.query_key_gate_value = artifact::bind_linear(
             binder, "mtp/layer/attention/query_key_gate_value", 9216, 2048, mtp_placement);
         out.mtp.attention.query_norm =
-            bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
+            bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {g.head_dim});
         out.mtp.attention.key_norm =
-            bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
+            bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {g.head_dim});
         out.mtp.attention.output =
             artifact::bind_linear(binder, "mtp/layer/attention/output", 2048, 4096, mtp_placement);
         out.mtp.post_attention_norm =
-            bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {2048});
+            bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {g.hidden});
         out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
-                                      NumericFormat::W8G32_F16S, mtp_placement);
-        out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
+                                      NumericFormat::W8G32_F16S, mtp_placement, g);
+        out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {g.hidden});
     }
     // Community GGUF exports of this family are text-only; the artifact then omits vision/*
     // and only `--vision` against such a model is the error.
@@ -378,9 +396,11 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     out.vision_backbone     = family::bind_vision_backbone<family::VisionBackboneConfig>(binder, vision_placement);
     out.vision_merger_input = family::bind_vision_merger_input<family::VisionBackboneConfig>(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(
-        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {2048, 4608}, vision_placement);
+        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S,
+            {VisionConfig::output_hidden, VisionConfig::merger_hidden}, vision_placement);
     out.vision_merger_fc2_bias = artifact::bind_tensor(
-        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {2048}, vision_placement);
+        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {VisionConfig::output_hidden},
+            vision_placement);
     out.vision_merger_norm = family::bind_vision_merger_norm<family::VisionBackboneConfig>(binder, vision_placement);
     }
 
@@ -403,26 +423,31 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     };
     if (out.has_dflash) {
     out.dflash.feature_projection =
-        bind_dflash("dflash/feature_projection", NumericFormat::W8G32_F16S, {2048, 16384});
-    out.dflash.context_norm = bind_dflash("dflash/context_norm", NumericFormat::BF16, {2048});
+        bind_dflash("dflash/feature_projection", NumericFormat::W8G32_F16S,
+                    {DFlashConfig::hidden, DFlashConfig::feature_rows});
+    out.dflash.context_norm = bind_dflash("dflash/context_norm", NumericFormat::BF16, {g.hidden});
     for (std::size_t layer = 0; layer < kDFlashLayers; ++layer) {
         DFlashLayerPlan& target  = out.dflash.layers[layer];
         const std::string prefix = "dflash/layers/" + std::to_string(layer) + "/";
-        target.input_norm        = bind_dflash(prefix + "input_norm", NumericFormat::BF16, {2048});
+        target.input_norm        = bind_dflash(prefix + "input_norm", NumericFormat::BF16, {g.hidden});
         target.query_key_value   = bind_dflash(prefix + "attention/query_key_value",
-                                               NumericFormat::W8G32_F16S, {6144, 2048});
+                                               NumericFormat::W8G32_F16S, {g.query_size() + 2 * g.kv_size(), g.hidden});
         target.query_norm =
-            bind_dflash(prefix + "attention/query_norm", NumericFormat::BF16, {128});
-        target.key_norm = bind_dflash(prefix + "attention/key_norm", NumericFormat::BF16, {128});
+            bind_dflash(prefix + "attention/query_norm", NumericFormat::BF16,
+                        {DFlashConfig::head_dim});
+        target.key_norm = bind_dflash(prefix + "attention/key_norm", NumericFormat::BF16,
+                                      {DFlashConfig::head_dim});
         target.attention_output =
-            bind_dflash(prefix + "attention/output", NumericFormat::W8G32_F16S, {2048, 4096});
+            bind_dflash(prefix + "attention/output", NumericFormat::W8G32_F16S, {g.hidden, g.query_size()});
         target.post_attention_norm =
-            bind_dflash(prefix + "post_attention_norm", NumericFormat::BF16, {2048});
+            bind_dflash(prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
         target.gate_up =
-            bind_dflash(prefix + "mlp/gate_up", NumericFormat::W8G32_F16S, {12288, 2048});
-        target.down = bind_dflash(prefix + "mlp/down", NumericFormat::W8G32_F16S, {2048, 6144});
+            bind_dflash(prefix + "mlp/gate_up", NumericFormat::W8G32_F16S,
+                        {2 * DFlashConfig::intermediate, DFlashConfig::hidden});
+        target.down = bind_dflash(prefix + "mlp/down", NumericFormat::W8G32_F16S,
+                                  {DFlashConfig::hidden, DFlashConfig::intermediate});
     }
-    out.dflash.final_norm = bind_dflash("dflash/final_norm", NumericFormat::BF16, {2048});
+    out.dflash.final_norm = bind_dflash("dflash/final_norm", NumericFormat::BF16, {DFlashConfig::hidden});
     }
 
     load_plan.materialization = binder.finish();
@@ -433,7 +458,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     // The layer storage is sized here, not by the type: the counts come from the
     // geometry these weights were bound against.
-    runtime.geometry = plan.geometry;
+    runtime.geometry              = plan.geometry;
+    const family::TextGeometry& g = runtime.geometry;
     runtime.full_layers.resize(kFullAttentionLayers);
     runtime.gdn_layers.resize(kGdnLayers);
     frontend = family::take_frontend_resources(backing, plan.frontend);
@@ -446,7 +472,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     auto& final_norm      = runtime.final_norm;
     auto& output_head     = runtime.output_head;
 
-    token_embedding = artifact::materialized_linear(backing, plan.token_embedding, 248320, 2048);
+    token_embedding = artifact::materialized_linear(backing, plan.token_embedding, g.output_rows, g.hidden);
 
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
@@ -455,58 +481,59 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         if (source.is_full_attention) {
             FullAttentionWeights& target = full_layers.at(full_index++);
             target.input_norm            = artifact::materialized_tensor(backing, source.input_norm,
-                                                                         NumericFormat::BF16, {2048});
+                                                                         NumericFormat::BF16, {g.hidden});
             if (source.attention.split) {
                 const SplitAttentionPlan& split = *source.attention.split;
                 target.projection.split         = SplitAttentionWeights{
-                            .query = artifact::materialized_linear(backing, split.query, 4096, 2048),
+                            .query = artifact::materialized_linear(backing, split.query, g.query_size(), g.hidden),
                             .key   = artifact::materialized_linear(backing, split.key, 512, 2048),
-                            .gate  = artifact::materialized_linear(backing, split.gate, 4096, 2048),
+                            .gate  = artifact::materialized_linear(backing, split.gate, g.query_size(), g.hidden),
                             .value = artifact::materialized_linear(backing, split.value, 512, 2048),
                 };
             } else {
                 target.projection.query_key_gate_value = artifact::materialized_linear(
-                    backing, *source.attention.query_key_gate_value, 9216, 2048);
+                    backing, *source.attention.query_key_gate_value,
+            2 * g.query_size() + 2 * g.kv_size(), g.hidden);
             }
             target.query_norm = artifact::materialized_tensor(backing, source.attention.query_norm,
-                                                              NumericFormat::BF16, {256});
+                                                              NumericFormat::BF16, {g.head_dim});
             target.key_norm   = artifact::materialized_tensor(backing, source.attention.key_norm,
-                                                              NumericFormat::BF16, {256});
-            target.output     = artifact::materialized_linear(backing, source.attention.output, 2048, 4096);
+                                                              NumericFormat::BF16, {g.head_dim});
+            target.output     = artifact::materialized_linear(backing, source.attention.output, g.hidden, g.query_size());
             target.post_attention_norm = artifact::materialized_tensor(
-                backing, source.post_attention_norm, NumericFormat::BF16, {2048});
+                backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             const RoutedFormats routed = routed_formats(plan.weights, layer);
-            target.post_mixer = load_moe(source.moe, backing, routed.gate_up, routed.down);
+            target.post_mixer = load_moe(source.moe, backing, routed.gate_up, routed.down, g);
         } else {
             GdnWeights& target = gdn_layers.at(gdn_index++);
             target.input_norm  = artifact::materialized_tensor(backing, source.input_norm,
-                                                               NumericFormat::BF16, {2048});
+                                                               NumericFormat::BF16, {g.hidden});
             target.projection.a_log =
-                artifact::materialized_tensor(backing, source.gdn.a_log, NumericFormat::FP32, {32});
+                artifact::materialized_tensor(backing, source.gdn.a_log, NumericFormat::FP32, {g.gdn_value_heads});
             target.projection.dt_bias = artifact::materialized_tensor(backing, source.gdn.dt_bias,
-                                                                      NumericFormat::FP32, {32});
+                                                                      NumericFormat::FP32, {g.gdn_value_heads});
             target.convolution = artifact::materialized_tensor(backing, source.gdn.convolution,
-                                                               NumericFormat::BF16, {8192, 4});
+                                                               NumericFormat::BF16, {g.convolution_dim(), g.gdn_conv_kernel});
             target.projection.a_b_projection = artifact::materialized_weight(
                 backing, source.gdn.a_b_projection, NumericFormat::BF16, 64, 2048);
             if (source.gdn.split) {
                 const SplitGdnInputPlan& split = *source.gdn.split;
                 target.projection.split        = SplitGdnInputWeights{
                            .query_key_value =
-                               artifact::materialized_linear(backing, split.query_key_value, 8192, 2048),
-                           .z = artifact::materialized_linear(backing, split.z, 4096, 2048),
+                               artifact::materialized_linear(backing, split.query_key_value, g.convolution_dim(), g.hidden),
+                           .z = artifact::materialized_linear(backing, split.z, g.value_dim(), g.hidden),
                 };
             } else {
                 target.projection.query_key_value_z = artifact::materialized_linear(
-                    backing, *source.gdn.query_key_value_z, 12288, 2048);
+                    backing, *source.gdn.query_key_value_z, g.convolution_dim() + g.value_dim(), g.hidden);
             }
             target.norm =
-                artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16, {128});
-            target.output              = artifact::materialized_linear(backing, source.gdn.output, 2048, 4096);
+                artifact::materialized_tensor(backing, source.gdn.norm, NumericFormat::BF16, {g.gdn_key_head_dim});
+            target.output              = artifact::materialized_linear(backing, source.gdn.output, g.hidden, g.value_dim());
             target.post_attention_norm = artifact::materialized_tensor(
-                backing, source.post_attention_norm, NumericFormat::BF16, {2048});
+                backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             const RoutedFormats routed = routed_formats(plan.weights, layer);
-            target.post_mixer = load_moe(source.moe, backing, routed.gate_up, routed.down);
+            target.post_mixer = load_moe(source.moe, backing, routed.gate_up, routed.down, g);
         }
     }
     if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {
@@ -514,38 +541,39 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 
     final_norm =
-        artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {2048});
-    output_head = artifact::materialized_linear(backing, plan.output_head, 248320, 2048);
+        artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {g.hidden});
+    output_head = artifact::materialized_linear(backing, plan.output_head, g.output_rows, g.hidden);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
-        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, 131072, 2048);
+        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, kDraftVocab, g.hidden);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
-                                                           NumericFormat::I32, {131072});
+                                                           NumericFormat::I32, {kDraftVocab});
     }
 
     if (plan.features.mtp()) {
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(backing, plan.mtp.input_projection,
-                                                             NumericFormat::W8G32_F16S, 2048, 4096);
+                                                             NumericFormat::W8G32_F16S, g.hidden, g.query_size());
         mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
-                                                             NumericFormat::BF16, {2048});
+                                                             NumericFormat::BF16, {g.hidden});
         mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,
-                                                             NumericFormat::BF16, {2048});
+                                                             NumericFormat::BF16, {g.hidden});
         mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
-                                                             NumericFormat::BF16, {2048});
+                                                             NumericFormat::BF16, {g.hidden});
         mtp.attention.query_key_gate_value = artifact::materialized_linear(
-            backing, *plan.mtp.attention.query_key_gate_value, 9216, 2048);
+            backing, *plan.mtp.attention.query_key_gate_value,
+            2 * g.query_size() + 2 * g.kv_size(), g.hidden);
         mtp.query_norm = artifact::materialized_tensor(backing, plan.mtp.attention.query_norm,
-                                                       NumericFormat::BF16, {256});
+                                                       NumericFormat::BF16, {g.head_dim});
         mtp.key_norm   = artifact::materialized_tensor(backing, plan.mtp.attention.key_norm,
-                                                       NumericFormat::BF16, {256});
-        mtp.output     = artifact::materialized_linear(backing, plan.mtp.attention.output, 2048, 4096);
+                                                       NumericFormat::BF16, {g.head_dim});
+        mtp.output     = artifact::materialized_linear(backing, plan.mtp.attention.output, g.hidden, g.query_size());
         mtp.post_attention_norm = artifact::materialized_tensor(
-            backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {2048});
+            backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {g.hidden});
         mtp.post_mixer =
-            load_moe(plan.mtp.moe, backing, NumericFormat::W8G32_F16S, NumericFormat::W8G32_F16S);
+            load_moe(plan.mtp.moe, backing, NumericFormat::W8G32_F16S, NumericFormat::W8G32_F16S, g);
         mtp.final_norm = artifact::materialized_tensor(backing, plan.mtp.final_norm,
-                                                       NumericFormat::BF16, {2048});
+                                                       NumericFormat::BF16, {g.hidden});
     }
 
     if (plan.features.vision) {
@@ -553,41 +581,48 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         vision.common = family::materialize_vision_common<family::VisionBackboneConfig>(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
         vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                               NumericFormat::W8G32_F16S, 2048, 4608);
+                                                               NumericFormat::W8G32_F16S, VisionConfig::output_hidden,
+            VisionConfig::merger_hidden);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                               NumericFormat::BF16, {2048});
+                                                               NumericFormat::BF16, {g.hidden});
     }
 
     if (plan.features.dflash()) {
         DFlashWeights& target     = runtime.dflash.emplace();
         target.feature_projection = artifact::materialized_weight(
-            backing, plan.dflash.feature_projection, NumericFormat::W8G32_F16S, 2048, 16384);
+            backing, plan.dflash.feature_projection, NumericFormat::W8G32_F16S, DFlashConfig::hidden,
+        DFlashConfig::feature_rows);
         target.context_norm = artifact::materialized_tensor(backing, plan.dflash.context_norm,
-                                                            NumericFormat::BF16, {2048});
+                                                            NumericFormat::BF16, {g.hidden});
         for (std::size_t layer = 0; layer < kDFlashLayers; ++layer) {
             const DFlashLayerPlan& source = plan.dflash.layers[layer];
             DFlashLayerWeights& weights   = target.layers[layer];
             weights.input_norm      = artifact::materialized_tensor(backing, source.input_norm,
-                                                                    NumericFormat::BF16, {2048});
+                                                                    NumericFormat::BF16, {g.hidden});
             weights.query_key_value = artifact::materialized_weight(
-                backing, source.query_key_value, NumericFormat::W8G32_F16S, 6144, 2048);
-            weights.context_key   = row_view(weights.query_key_value, 4096, 1024);
-            weights.context_value = row_view(weights.query_key_value, 5120, 1024);
+                backing, source.query_key_value, NumericFormat::W8G32_F16S,
+            DFlashConfig::query_size + 2 * DFlashConfig::kv_size, DFlashConfig::hidden);
+            weights.context_key   = row_view(weights.query_key_value, DFlashConfig::query_size, DFlashConfig::kv_size);
+            weights.context_value = row_view(weights.query_key_value, DFlashConfig::query_size + DFlashConfig::kv_size,
+                     DFlashConfig::kv_size);
             weights.query_norm    = artifact::materialized_tensor(backing, source.query_norm,
-                                                                  NumericFormat::BF16, {128});
+                                                                  NumericFormat::BF16, {g.gdn_key_head_dim});
             weights.key_norm =
-                artifact::materialized_tensor(backing, source.key_norm, NumericFormat::BF16, {128});
+                artifact::materialized_tensor(backing, source.key_norm, NumericFormat::BF16, {g.gdn_key_head_dim});
             weights.attention_output = artifact::materialized_weight(
-                backing, source.attention_output, NumericFormat::W8G32_F16S, 2048, 4096);
+                backing, source.attention_output, NumericFormat::W8G32_F16S, DFlashConfig::hidden,
+            DFlashConfig::query_size);
             weights.post_attention_norm = artifact::materialized_tensor(
-                backing, source.post_attention_norm, NumericFormat::BF16, {2048});
+                backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             weights.gate_up = artifact::materialized_weight(backing, source.gate_up,
-                                                            NumericFormat::W8G32_F16S, 12288, 2048);
+                                                            NumericFormat::W8G32_F16S, 2 * DFlashConfig::intermediate,
+                                                        DFlashConfig::hidden);
             weights.down    = artifact::materialized_weight(backing, source.down,
-                                                            NumericFormat::W8G32_F16S, 2048, 6144);
+                                                            NumericFormat::W8G32_F16S, DFlashConfig::hidden,
+                                                     DFlashConfig::intermediate);
         }
         target.final_norm = artifact::materialized_tensor(backing, plan.dflash.final_norm,
-                                                          NumericFormat::BF16, {2048});
+                                                          NumericFormat::BF16, {g.hidden});
     }
 }
 
