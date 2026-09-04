@@ -36,7 +36,8 @@ from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common import official_resources
 from surogate.serve.convert.common import recipe as family_recipe
 
-from . import compressed_tensors_source, draft_head, inventory, recipe, routed_nvfp4
+from . import draft_head, inventory, recipe
+from .exports import compressed_tensors_source, routed_nvfp4
 
 
 RECIPE_ID = "qwen3_6_35b_a3b-v2"

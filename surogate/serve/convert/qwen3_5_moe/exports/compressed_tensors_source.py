@@ -52,7 +52,7 @@ from surogate.serve.convert.common.recipe import TensorRecipe
 from surogate.serve.convert.common.row_algebra import evaluate_rows
 from surogate.serve.convert.common.safetensors import ShardReader
 
-from . import inventory
+from .. import inventory
 
 WEIGHTS_ID = "compressed-tensors"
 

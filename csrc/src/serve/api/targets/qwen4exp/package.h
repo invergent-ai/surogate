@@ -8,6 +8,7 @@
 #include <api/family/target_package.h>
 #include <api/family/runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -47,7 +48,10 @@ SINFER_TARGET_LOAD_TYPES(qwen4exp::Package);
 /// Qwen3.8-Flash-Next: 48 hybrid layers with four residual streams, 512 routed experts held in
 /// pinned host memory, and an n-gram memory at layer 1.
 struct Package {
-    static constexpr std::string_view model_id   = "qwen3.8-flash-next";
+    /// The checkpoints this target serves. One entry here, because this architecture
+    /// ships as one model; the registry asks every package the same question.
+    static constexpr std::array<std::string_view, 1> model_ids{"qwen3.8-flash-next"};
+    static constexpr std::string_view model_id = model_ids[0];
     static constexpr std::string_view target_key = "qwen4exp";
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a

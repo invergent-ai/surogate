@@ -8,6 +8,7 @@
 #include <api/family/target_package.h>
 #include <api/family/runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -57,7 +58,10 @@ struct Package {
     /// `surogate/serve/convert/gemma3/inventory.py` declares `MODEL_ID`
     /// and `TARGET_KEY`, and the engine matches an artifact to a package by
     /// comparing them character for character.
-    static constexpr std::string_view model_id   = "gemma3-270m";
+    /// The checkpoints this target serves. One entry here, because this architecture
+    /// ships as one model; the registry asks every package the same question.
+    static constexpr std::array<std::string_view, 1> model_ids{"gemma3-270m"};
+    static constexpr std::string_view model_id = model_ids[0];
     static constexpr std::string_view target_key = "gemma3";
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a

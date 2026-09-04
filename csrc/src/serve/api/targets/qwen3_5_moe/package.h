@@ -8,6 +8,7 @@
 #include <api/family/target_package.h>
 #include <api/family/runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -55,7 +56,10 @@ SINFER_TARGET_LOAD_TYPES(qwen3_5_moe::Package);
 } // namespace detail
 
 struct Package {
-    static constexpr std::string_view model_id   = "qwen3.6-35b-a3b";
+    /// The checkpoints this target serves. One entry here, because this architecture
+    /// ships as one model; the registry asks every package the same question.
+    static constexpr std::array<std::string_view, 1> model_ids{"qwen3.6-35b-a3b"};
+    static constexpr std::string_view model_id = model_ids[0];
     static constexpr std::string_view target_key = "qwen3_6_moe";
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a

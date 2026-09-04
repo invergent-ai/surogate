@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <optional>
 #include <api/family/text_geometry.h>
 
 #include "targets/registry.h"
@@ -296,33 +297,24 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
-    if (identity.model_id == Gemma3::model_id) {
-        return construct_registered<Gemma3, LoadedGemma3, Gemma3Instance>(
-            options, device, reader, load_start, Gemma3::target_key);
-    }
-    if (identity.model_id == Llama::model_id) {
-        return construct_registered<Llama, LoadedLlama, LlamaInstance>(
-            options, device, reader, load_start, Llama::target_key);
-    }
-
-    if (identity.model_id == Qwen3Dense::model_id) {
-        return construct_registered<Qwen3Dense, LoadedQwen3Dense, Qwen3DenseInstance>(
-            options, device, reader, load_start, Qwen3Dense::target_key);
-    }
-    if (std::find(Qwen3_5::model_ids.begin(), Qwen3_5::model_ids.end(),
-                  identity.model_id) != Qwen3_5::model_ids.end()) {
-        return construct_registered<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(
-            options, device, reader, load_start, Qwen3_5::target_key_for(identity.model_id));
-    }
-    if (identity.model_id == Qwen38FlashNext::model_id) {
-        return construct_registered<Qwen38FlashNext, LoadedQwen38FlashNext,
-                                    Qwen38FlashNextInstance>(options, device, reader, load_start,
-                                                             Qwen38FlashNext::target_key);
-    }
-    if (identity.model_id == Qwen3_5Moe::model_id) {
-        return construct_registered<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(
-            options, device, reader, load_start, Qwen3_5Moe::target_key);
-    }
+    // Every package answers the same two questions -- do you serve this checkpoint, and what
+    // do you call yourself when you do -- so adding a target is one line here.
+    const auto dispatch = [&]<class Target, class Loaded, class Instance>(
+                              std::optional<ConstructedTarget>& out) {
+        if (out.has_value() || !family::package_serves<Target>(identity.model_id)) { return; }
+        out = construct_registered<Target, Loaded, Instance>(
+            options, device, reader, load_start,
+            family::package_target_key_for<Target>(identity.model_id));
+    };
+    std::optional<ConstructedTarget> constructed;
+    dispatch.template operator()<Gemma3, LoadedGemma3, Gemma3Instance>(constructed);
+    dispatch.template operator()<Llama, LoadedLlama, LlamaInstance>(constructed);
+    dispatch.template operator()<Qwen3Dense, LoadedQwen3Dense, Qwen3DenseInstance>(constructed);
+    dispatch.template operator()<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(constructed);
+    dispatch.template operator()<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(constructed);
+    dispatch.template operator()<Qwen38FlashNext, LoadedQwen38FlashNext,
+                                 Qwen38FlashNextInstance>(constructed);
+    if (constructed.has_value()) { return std::move(*constructed); }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");
 }
@@ -461,22 +453,20 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
     const auto load_start = Clock::now();
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
-    if (identity.model_id == Qwen38FlashNext::model_id) {
-        return construct_pipeline<Qwen38FlashNext, LoadedQwen38FlashNext, Qwen38FlashNextInstance>(
-            options, reader, load_start, Qwen38FlashNext::target_key,
-            Qwen38FlashNext::declared_geometry(reader).layers);
-    }
-    if (std::find(Qwen3_5::model_ids.begin(), Qwen3_5::model_ids.end(),
-                  identity.model_id) != Qwen3_5::model_ids.end()) {
-        return construct_pipeline<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(
-            options, reader, load_start, Qwen3_5::target_key_for(identity.model_id),
-            Qwen3_5::declared_geometry(reader).layers);
-    }
-    if (identity.model_id == Qwen3_5Moe::model_id) {
-        return construct_pipeline<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(
-            options, reader, load_start, Qwen3_5Moe::target_key,
-            Qwen3_5Moe::declared_geometry(reader).layers);
-    }
+    const auto dispatch = [&]<class Target, class Loaded, class Instance>(
+                              std::optional<ConstructedTarget>& out) {
+        if (out.has_value() || !family::package_serves<Target>(identity.model_id)) { return; }
+        out = construct_pipeline<Target, Loaded, Instance>(
+            options, reader, load_start,
+            family::package_target_key_for<Target>(identity.model_id),
+            Target::declared_geometry(reader).layers);
+    };
+    std::optional<ConstructedTarget> constructed;
+    dispatch.template operator()<Qwen38FlashNext, LoadedQwen38FlashNext,
+                                 Qwen38FlashNextInstance>(constructed);
+    dispatch.template operator()<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(constructed);
+    dispatch.template operator()<Qwen3_5Moe, LoadedQwen3_5Moe, Qwen3_5MoeInstance>(constructed);
+    if (constructed.has_value()) { return std::move(*constructed); }
     throw std::runtime_error("pipeline parallelism is not wired for artifact '" + identity.model_id + "'");
 }
 

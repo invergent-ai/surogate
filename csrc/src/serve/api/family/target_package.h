@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <string_view>
+
 // The pimpl a target package needs and no target chooses.
 //
 // Every target hands the engine a LoadPlan (what to materialize) and a
@@ -128,3 +131,29 @@
     static_assert(true, "consume the trailing semicolon")
 
 // clang-format on
+
+namespace sinfer::family {
+
+/// Whether this package serves the checkpoint with that identity.
+///
+/// Every package states its checkpoints as `model_ids`, one entry or several, so the registry
+/// asks all of them the same question. A family whose sizes and generations share one graph
+/// lists them together and is one target.
+template <class Package>
+[[nodiscard]] inline bool package_serves(std::string_view model) noexcept {
+    return std::find(Package::model_ids.begin(), Package::model_ids.end(), model) !=
+           Package::model_ids.end();
+}
+
+/// The key a run reports itself as. A package that serves one checkpoint has one; a package
+/// serving several says which, so a summary still names the model rather than the folder.
+template <class Package>
+[[nodiscard]] inline std::string_view package_target_key_for(std::string_view model) noexcept {
+    if constexpr (requires { Package::target_key_for(model); }) {
+        return Package::target_key_for(model);
+    } else {
+        return Package::target_key;
+    }
+}
+
+} // namespace sinfer::family

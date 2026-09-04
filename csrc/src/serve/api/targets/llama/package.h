@@ -8,6 +8,7 @@
 #include <api/family/target_package.h>
 #include <api/family/runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -49,7 +50,10 @@ SINFER_TARGET_LOAD_TYPES(llama::Package);
 } // namespace detail
 
 struct Package {
-    static constexpr std::string_view model_id   = "tinyllama-1.1b";
+    /// The checkpoints this target serves. One entry here, because this architecture
+    /// ships as one model; the registry asks every package the same question.
+    static constexpr std::array<std::string_view, 1> model_ids{"tinyllama-1.1b"};
+    static constexpr std::string_view model_id = model_ids[0];
     static constexpr std::string_view target_key = "llama";
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a

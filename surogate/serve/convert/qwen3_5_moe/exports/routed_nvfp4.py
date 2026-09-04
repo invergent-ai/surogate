@@ -61,7 +61,7 @@ from surogate.serve.artifact.layouts import encode_nvfp4
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common.inventory import TensorSpec, tensor_spec
 
-from . import inventory
+from .. import inventory
 
 
 NVFP4 = "NVFP4"
