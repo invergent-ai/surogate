@@ -87,7 +87,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     }
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile, detail::bind_artifact(binder, features, options.pipeline_stage_first,
-                                               options.pipeline_stage_last, bank_q4)));
+                                               options.pipeline_stage_last, bank_q4,
+                                               options.load_progress)));
 }
 
 SINFER_TARGET_CONSTRUCT_LOADED_MODEL();

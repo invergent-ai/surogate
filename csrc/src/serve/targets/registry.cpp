@@ -257,10 +257,23 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
+    // The runtime reservation -- KV cache pages, round state, the workspaces -- is one large
+    // allocation and the graphs are planned against it, so this is the last quiet stretch of a
+    // load. Say what it is before it happens, for the same reason the expert pool does.
+    const std::uint64_t reserved = sequence_plan.device_reservation_bytes();
+    if (options.load_progress.callback) {
+        options.load_progress.callback("runtime reservation", 0, reserved);
+    }
     auto loaded   = std::make_unique<Loaded>(std::move(model), effective);
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
+    // Closed after the synchronise, not before it: the barrier drains the uploads and the
+    // bank's page registration, which is several more seconds that belong to this phase
+    // rather than to the silence after it.
     device.synchronize();
+    if (options.load_progress.callback) {
+        options.load_progress.callback("runtime reservation", reserved, reserved);
+    }
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
 
     LoadSummary summary;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "api/types.h"
+
 // Pinned, device-mapped host memory for the objects that never become device resident: the
 // routed expert banks of every layer and the n-gram embedding table. Kernels read them
 // zero-copy over PCIe through the mapped device pointer (phase 1); later phases add a device
@@ -35,6 +37,10 @@ struct HostObjectPlan {
 
 struct HostBankPlan {
     std::vector<HostObjectPlan> objects;
+    /// Reported against while the bank is filled. Building it reads every routed expert out of
+    /// the mapped checkpoint and into pinned memory -- tens of seconds for a model of this size
+    /// -- and without this the engine says nothing for all of it.
+    LoadProgress progress;
     [[nodiscard]] std::size_t total_bytes() const noexcept;
 };
 

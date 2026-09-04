@@ -51,6 +51,14 @@ std::size_t HostBankPlan::total_bytes() const noexcept {
 
 HostBank::HostBank(const HostBankPlan& plan) {
     objects_.reserve(plan.objects.size());
+    // The bank is filled object by object, and each one is a whole layer's routed experts, so
+    // the byte count moves in steps a reader can see. Reported before the first copy as well,
+    // so the phase appears the moment it starts rather than when its first layer lands.
+    const std::uint64_t planned = plan.total_bytes();
+    const auto report = [&](std::uint64_t done) {
+        if (plan.progress.callback) { plan.progress.callback("expert bank", done, planned); }
+    };
+    report(0);
     for (const auto& source : plan.objects) {
         const bool q4 = source.q4_rows > 0;
         const ops::Q4BankPlanes q4_planes =
@@ -189,7 +197,9 @@ HostBank::HostBank(const HostBankPlan& plan) {
         for (auto& thread : threads) { thread.join(); }
         total_bytes_ += object.bytes;
         objects_.emplace_back(source.handle.index, object);
+        report(total_bytes_);
     }
+    report(planned);
 }
 
 HostBank::~HostBank() {

@@ -973,6 +973,10 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         ops::expert_slot_directory_bytes(TextConfig::expert_layers, geometry.experts, cache.slots);
     // A round can miss at most one whole layer's expert set.
     const std::size_t miss_bytes = ops::expert_miss_list_bytes(geometry.experts);
+    // Said before the allocation, not after: reserving this much is seconds of silence, and a
+    // reader watching a stalled console should know what the engine is waiting on.
+    std::fprintf(stderr, "qwen4exp: reserving a %.1f GiB expert slot pool (%d slots)...\n",
+                 static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0), cache.slots);
     CUDA_CHECK(cudaMalloc(&cache.pool_memory, pool_bytes));
     CUDA_CHECK(cudaMalloc(&cache.directory_memory, dir_bytes));
     CUDA_CHECK(cudaMalloc(&cache.miss_memory, miss_bytes));
@@ -1157,7 +1161,7 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         }
     }
     std::fprintf(stderr,
-                 "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool), scan ring %d\n",
+                 "qwen4exp: expert slot cache ready: %d slots (%.1f GiB pool), scan ring %d\n",
                  cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0),
                  cache.scan_ring);
     if (const std::string numa = numa_policy_description(); !numa.empty()) {

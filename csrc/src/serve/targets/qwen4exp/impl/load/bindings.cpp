@@ -334,10 +334,12 @@ SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const H
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
-                               int stage_first, int stage_last, bool host_bank_q4) {
+                               int stage_first, int stage_last, bool host_bank_q4,
+                               LoadProgress progress) {
     const bool staged = stage_last > 0;
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
+    out.host_bank.progress = std::move(progress);
     // The checkpoint's own dimensions, where it states them: absent members keep the
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.

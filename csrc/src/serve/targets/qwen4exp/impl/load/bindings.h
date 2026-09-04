@@ -155,7 +155,7 @@ struct ArtifactLoadPlan {
 /// pipeline stage.
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
                                int stage_first = 0, int stage_last = 0,
-                               bool host_bank_q4 = false);
+                               bool host_bank_q4 = false, LoadProgress progress = {});
 
 /// Per-block hyper-connection weights ride on the projection payloads the family hands to the
 /// Variant at the norm hooks, so the Variant can mix before its projection.
