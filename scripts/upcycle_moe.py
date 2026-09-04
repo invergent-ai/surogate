@@ -108,7 +108,7 @@ def _set_config_dtype_bf16(model: nn.Module) -> None:
         return
     # Transformers convention
     try:
-        model.config.torch_dtype = "bfloat16"
+        model.config.dtype = "bfloat16"
     except Exception:
         pass
     # Some configs (e.g. Qwen3) also serialize a plain `dtype` field.
@@ -564,7 +564,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
     model = model.to(dtype=torch.bfloat16)
     _set_config_dtype_bf16(model)
