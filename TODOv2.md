@@ -106,9 +106,20 @@ product rather than tasks (1 and 10); the rest are work.
    refused shapes their routes never registered. `mtp/input_projection` was bound with
    `K = query_size` where the object is `[hidden, 2*hidden]`; the two coincide at the size this
    target compiles, so every larger model failed at its first draft round.
-   Left on this model: **prefill**. 512 tokens at 0.23 s is ~2,200 tok/s against llama.cpp's
-   1,610, but only 165 of 506 candidate tensors are native (the re-encode to Q4G64/Q5G64 is
-   what item 1 wants gone), and the 2,048-token prompt llama.cpp measures has not been run.
+   **Prefill, measured (2026-09-04).** Through the server we lead: a 2,048-token prompt is
+   812 ms TTFT against llama.cpp's 1,265, and 2,600 tok/s of prompt-eval against its 2,565.
+   `llama-bench pp2048` is the compute bar at 3,190 -- it gets one 2,048-wide batch where the
+   server splits into 512s -- and we are 23 % under it, 142 TFLOP/s effective against 174. An
+   nsys capture (`--cuda-graph-trace=node`, or the graph hides everything) says prefill is
+   GEMM-bound with no scheduling gap: 42 % cutlass BF16 (the dequantise-then-GEMM route),
+   38 % our groupwise kernels on the re-encoded halves, 7.5 % `dequantize_rows` staging, ~4 %
+   GDN and attention. Measured route rates at the dominant MLP shape: BF16 222 TFLOP/s, Q4G64
+   187, fused Q4 SwiGLU 183, W8 159, against 838 of int8/fp8 tensor throughput on the card.
+   **The lever is an int8 dense prefill GEMM**, the one already built for routed experts
+   (`sparse_moe_prefill_ggml_i8_*`, 498 us against 758 there): it deletes the 60 ms of BF16
+   staging and lifts ~80 % of prefill off a 222 TFLOP/s route; at 350 it lands near 545 ms,
+   ~3,760 tok/s. Re-routing the groupwise weights through the BF16 path instead is measured
+   and *not* worth it -- the staging pass moves the crossover to T ~= 1,500 for a ~5 % win.
 
 5. **[ ] The `qwen3` dense target scores 1-3 % behind llama.cpp where `qwen3_5` matches
    (2026-09-04).** Same corpus, same windows, same method: Qwen3-0.6B-Q4_K_M 17.675 vs 17.510,

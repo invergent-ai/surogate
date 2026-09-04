@@ -208,6 +208,45 @@ without batch flags understated it 3.9× and are gone.
 | llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
 | llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s |  |
 
+## Prefill on the 27B GGUF, and where it goes (2026-09-04)
+
+Same file, same probe, one card, one user, a 2,048-token prompt:
+
+| | TTFT | the engine's own prompt-eval |
+|---|---:|---:|
+| **surogate** | **812 ms** | **2,600 tok/s** |
+| llama.cpp `llama-server` | 1,265 ms | 2,565 tok/s |
+| llama.cpp `llama-bench pp2048` | — | **3,190 tok/s** |
+
+Through the server we are ahead on both. `llama-bench` is the compute bar, though: it hands the
+model one 2,048-wide batch where `llama-server` splits into 512-token micro-batches, and that
+number is 23 % above ours. End to end we run 112 TFLOP of prompt at **142 TFLOP/s effective**
+against its 174.
+
+An `nsys` capture with `--cuda-graph-trace=node` (the prefill is a captured graph; without that
+flag the profile shows almost nothing) says where a prefill's GPU time goes:
+
+| | share | per prefill |
+|---|---:|---:|
+| cutlass BF16 GEMMs (the dequantise-then-GEMM route the native K-quants take) | 42 % | ~340 ms |
+| our groupwise kernels on the re-encoded Q4G64/Q5G64 halves | 38 % | ~300 ms |
+| `dequantize_rows` staging for the BF16 route | 7.5 % | ~60 ms |
+| GDN core, attention, norms | ~4 % | ~30 ms |
+
+So prefill is GEMM-bound and the GPU is busy; there is no scheduling gap to reclaim. The routes
+themselves are the ceiling: BF16 cuBLASLt measures **222 TFLOP/s** at the dominant MLP shape
+(n=34,816, k=5,120, T=2,048), our Q4G64 kernel **187**, W8 **159**, and the fused Q4 SwiGLU
+**183** -- all far below the card's 838 TFLOP/s of int8/fp8 tensor throughput, which is what
+llama.cpp's MMQ computes on. Two consequences worth writing down:
+
+- **Re-routing the groupwise weights through the BF16 path is not worth it.** It buys 222 over
+  187, but the dequantise pass costs ~0.4 ms on a ~3.9 ms weight, so the crossover sits near
+  T = 1,500 and the whole-model win is ~5 %.
+- **The lever is an int8 dense prefill GEMM** -- the one already built for routed experts
+  (`sparse_moe_prefill_ggml_i8_*`, measured 498 us against 758 there). It would delete the 60 ms
+  of BF16 staging outright and lift ~80 % of prefill off a 222 TFLOP/s route. At 350 TFLOP/s a
+  2,048-token prefill lands near 545 ms, i.e. ~3,760 tok/s, ahead of llama.cpp's 3,190.
+
 ## Accuracy gates (2026-09-04)
 
 Perplexity on wikitext-2 test, llama-perplexity's own 2048-token windows (the first 40),
