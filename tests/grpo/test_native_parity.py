@@ -126,6 +126,10 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
     Metrics rather than gradients on purpose: they are the kernel's arithmetic
     made observable without reading device memory, and they cover all the loss
     terms (policy loss, mismatch KL, keep/clip counts and their denominators).
+
+    First run 2026-09-04 against the published cu128 image: all 9 shared metrics
+    agreed, policy_loss 17.431433 vs 17.431432. So the hand-verified claim that
+    the two implementations match is now actually checked.
     """
     _surogate = pytest.importorskip("surogate._surogate", reason="needs the built extension")
 
@@ -231,9 +235,11 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
     )
     actual = native_trainer.get_grpo_native_metrics()
 
-    # The reference also reports terms the kernel has no counterpart for (OPD,
-    # replay, ratio_clipped, policy_sample_count), so compare what the kernel
-    # actually emits rather than demanding it produce all 18 keys.
+    # Measured on a real run (Qwen3-0.6B, one batch, 2026-09-04): the kernel
+    # reports 10 metrics, the reference 18, and 9 are shared. Each side has
+    # terms the other lacks -- the reference computes OPD, replay,
+    # ratio_clipped and policy_sample_count; the kernel reports teacher_kl --
+    # so compare the intersection rather than demanding either be complete.
     assert actual, "the kernel must report metrics to compare against"
     core = {"policy_loss", "mismatch_kl", "keep_tokens", "total_tokens"}
     assert core <= set(actual), f"kernel metrics missing the core terms: {core - set(actual)}"
