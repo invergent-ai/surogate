@@ -98,6 +98,8 @@ struct Variant {
     /// (outside graph capture) and sets the share to host/(host+pcie). Called by
     /// create_program before the graphs are captured; a no-op otherwise.
     static void prepare_expert_split(const ModelView& model);
+    /// Binds every layer's expert bank up front, so the next-layer prefetch has them.
+    static void prepare_expert_prefetch(const ModelView& model);
     static constexpr bool has_layer_prologue = true;
     // 48 layers, a four-stream residual, the PLE nodes and (with the CPU split) the host-round
     // nodes per layer: the decode graphs measure 15.7-21.4 MiB per lane at 16 lanes and 31.4 MiB

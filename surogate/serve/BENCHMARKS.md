@@ -188,15 +188,15 @@ without batch flags understated it 3.9× and are gone.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 1 | **145** | **32.6** | **178** | **0.84 s** | defaults: pool 3,004 slots (14.6 GiB, sized to leave the runtime its floor), 22 unpinned host workers (8 cpus busy with other jobs), host 136 GB/s vs PCIe 46 → 75 % of misses on the host, min-tokens 1 so the split fires on one-token rounds |
-| llama.cpp | 1 | 1 | 93 | 20.8 | 114 | 2.95 s | the same GGUF, served by both engines as the file's own blocks now. surogate **+57 % decode, 3.5× the prompt rate** |
+| **surogate** | 1 | 1 | **150** | **33.6** | **183** | **0.84 s** | defaults: pool 3,004 slots (14.6 GiB, sized to leave the runtime its floor), unpinned host workers sized to the cores other jobs leave free, host round started and joined through stream memory operations (no host-function dispatch: +6 % decode over the event path), the CPU/PCIe split measured with both sides running against each other (135 vs 46 GB/s → 75 % of misses on the host), min-tokens 1 so the split fires on one-token rounds |
+| llama.cpp | 1 | 1 | 93 | 20.8 | 114 | 2.95 s | the same GGUF, served by both engines as the file's own blocks now. surogate **+62 % decode, 3.5× the prompt rate** |
 | **surogate** | 1 | 1 | — | **40.8** | — | **7.06 s** | 28k prompt into 131k context (23.1 GiB VRAM): **3,966 tok/s prompt processing**; decode is the post-28k stream rate |
 | llama.cpp | 1 | 1 | — | 27.3 | — | 23.02 s | 28k prompt, 80k context: 1,216 tok/s prompt processing. surogate **3.3× ingestion, +49 % decode** |
 | cafe-llama.cpp `-hmoe` | 1 | 1 | — | 18.8 / 4.3 | — | 3.55 s / 25.46 s | 512 and 28k prompts. Experts pinned in host memory, computed on the GPU over PCIe — **our architecture in their engine** (935-1,100 tok/s at 28k); kept as the like-for-like reference |
-| **surogate** | 1 | 16 | **374** | **83.9** | **457** | **1.74 s** | defaults, `--max-num-seqs 16`: KV auto 65,536 tokens; 20 unpinned host workers. Run-to-run spread at 16 users is ~±8 % (86.8 on the same day with the board's explicit flags) |
-| llama.cpp | 1 | 16 | 253 | 56.8 | 310 | 16.17 s | `-np 16`. surogate **+48 % decode at 9× lower TTFT** |
-| **surogate** | 1 | 64 | **464** | **104.1** | **568** | **5.14 s** | defaults, `--max-num-seqs 64 --max-pending-requests 512`: the pool sized itself to 1,985 slots so 64 lanes' KV fits (74,240 tokens) — the 2,000 the old row set by hand, derived |
-| llama.cpp | 1 | 64 | 46 | 10.4 | 56 | 655 s | `-np 64`: CPU expert compute serialises across 64 decodes and the queue is the run — every request ~13 min. surogate **10.0×** |
+| **surogate** | 1 | 16 | **381** | **85.7** | **467** | **1.74 s** | defaults, `--max-num-seqs 16`: KV auto 65,536 tokens. Run-to-run spread at 16 users is ~±8 % (83.9 and 86.8 on the same day) |
+| llama.cpp | 1 | 16 | 253 | 56.8 | 310 | 16.17 s | `-np 16`. surogate **+51 % decode at 9× lower TTFT** |
+| **surogate** | 1 | 64 | **518** | **116.4** | **635** | **4.73 s** | defaults, `--max-num-seqs 64 --max-pending-requests 512`: the pool sized itself to 1,985 slots so 64 lanes' KV fits (74,240 tokens) — the 2,000 the old row set by hand, derived. Above the 08-30 row (110.1) for the first time |
+| llama.cpp | 1 | 64 | 46 | 10.4 | 56 | 655 s | `-np 64`: CPU expert compute serialises across 64 decodes and the queue is the run — every request ~13 min. surogate **11.2×** |
 | ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels, `-ot exps=CPU` |
 | ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s |  |
 | ik_llama.cpp | 1 | 1 | 1,068 | 40.4 | — | — | **reported, not measured here** (2026-08-30): same commit 7cff686d on an **RTX 3090 24 GB + Ryzen 9 9950X**, AD-4.27bpw Q4_K_M, 3-run average at temperature 0, single slot, 10,006-token prompt without cache reuse, 128 generated; KV Q8_0/Q8_0 (their setting — no board row of ours quantises the KV), 22.1 GB VRAM |

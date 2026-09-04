@@ -16,6 +16,8 @@
 #include "core/device.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
+#include <atomic>
+#include <cuda.h>
 #include <algorithm>
 #include <thread>
 #include <cctype>
@@ -54,10 +56,39 @@ constexpr auto kPolicy           = ops::LinearPolicy::A16Only;
 constexpr std::size_t kInjectScratchBytes = 1u << 20; // [4 streams, T] FP32 up to T = 65536
 thread_local Tensor t_inject;
 // A host-computed partial of the block being executed: consumed by the next combine.
+// The two stream memory operations, resolved from the driver at runtime: the runtime header
+// does not declare them, and a driver without them just leaves the host-function path on.
+using StreamWriteValue64Fn = CUresult (*)(CUstream, CUdeviceptr, cuuint64_t, unsigned int);
+using StreamWaitValue64Fn  = CUresult (*)(CUstream, CUdeviceptr, cuuint64_t, unsigned int);
+StreamWriteValue64Fn stream_write_value64() {
+    static StreamWriteValue64Fn fn = [] {
+        void* p = nullptr;
+        cudaDriverEntryPointQueryResult status{};
+        if (cudaGetDriverEntryPointByVersion("cuStreamWriteValue64", &p, 12000, cudaEnableDefault, &status) != cudaSuccess ||
+            status != cudaDriverEntryPointSuccess) { return StreamWriteValue64Fn{nullptr}; }
+        return reinterpret_cast<StreamWriteValue64Fn>(p);
+    }();
+    return fn;
+}
+StreamWaitValue64Fn stream_wait_value64() {
+    static StreamWaitValue64Fn fn = [] {
+        void* p = nullptr;
+        cudaDriverEntryPointQueryResult status{};
+        if (cudaGetDriverEntryPointByVersion("cuStreamWaitValue64", &p, 12000, cudaEnableDefault, &status) != cudaSuccess ||
+            status != cudaDriverEntryPointSuccess) { return StreamWaitValue64Fn{nullptr}; }
+        return reinterpret_cast<StreamWaitValue64Fn>(p);
+    }();
+    return fn;
+}
+constexpr unsigned int kStreamWaitValueGeq = 0x0; // CU_STREAM_WAIT_VALUE_GEQ
+
 struct PendingPartial {
     const float* device_alias = nullptr;
     cudaEvent_t join          = nullptr;
     int device                = -1; // the device whose buffers this partial points at
+    // Memop handshake: the combine waits for the slice's `done` flag and clears it, instead of
+    // waiting on the join event, when the handshake carried the round.
+    CUdeviceptr done_device = 0;
 };
 thread_local PendingPartial t_partial;
 // The inject gates and the partial are handed from the mixer to the combine through this
@@ -275,6 +306,11 @@ struct ExpertSlotCache {
         std::int32_t round_offset = 0;
         std::int32_t round_slice  = 0; // ordinal of the next slice within the round
         bool round_split          = false;
+        // Columns the round hook has seen so far this round, every slice counted: the
+        // next-layer prefetch may only be issued once the layer's last slice has resolved,
+        // because the prefetch's resolve and a later slice's resolve would otherwise run
+        // concurrently on one directory.
+        std::int32_t round_resolved = 0;
     };
     // Pinned mirrors of the device job list, one per slice ordinal: the copies run on the
     // main stream, so slice k+1's copy may land while slice k's host function still reads
@@ -324,6 +360,28 @@ struct ExpertSlotCache {
     ops::ExpertSlotDirectory directory;
     ops::ExpertMissList misses;
     std::vector<Layer> layers;
+
+    // --- next-layer prefetch for wide rounds (FreeToken's prefill double buffer, our shape) ---
+    //
+    // A prompt chunk of a few hundred tokens touches nearly every expert of every layer, so
+    // the set layer L+1 will miss is known before its routing is: everything not resident.
+    // Layer L's round hook resolves that set and gathers it on a side stream while L's expert
+    // kernels run, and L+1's hook waits on it and finds hits. The scan ring is two expert sets
+    // wide for this: L's slots and L+1's never overlap, and L+2's prefetch (issued from L+1's
+    // hook, after L's kernels are behind it on the stream) may wrap onto L's. A narrow round
+    // is left alone; so is a pool too small for the double ring.
+    bool prefetch_enabled           = false;
+    cudaStream_t prefetch_stream    = nullptr;
+    cudaEvent_t prefetch_fork       = nullptr;
+    cudaEvent_t prefetch_ready[2]   = {nullptr, nullptr};
+    bool prefetch_ready_valid[2]    = {false, false};
+    void* prefetch_miss_memory      = nullptr;
+    void* prefetch_ids_memory       = nullptr;
+    ops::ExpertMissList prefetch_misses;
+    Tensor prefetch_ids;               // I32 [experts]: 0..experts-1, one layer's whole set
+    std::int32_t prefetch_layer     = -1; // layer whose prefetch is in flight, -1 for none
+    std::int64_t prefetch_rounds    = 0;
+    static constexpr std::int32_t kPrefetchMinTokens = 256;
 
     Layer& layer(const SparseMoePayload& weights) {
         if (weights.layer < 0 || weights.layer >= static_cast<std::int32_t>(layers.size())) {
@@ -397,6 +455,45 @@ struct ExpertSlotCache {
     bool prefill_share_default  = false; // prefill share not given: follows the measured decode share
     std::shared_ptr<ops::CpuExpertPool> cpu_pool; // one per process: pipeline stages share the host cores
     cudaStream_t cpu_stream = nullptr; // side stream: the host round overlaps the GPU experts
+
+    // --- GPU<->host handshake through stream memory operations ---
+    //
+    // The host round used to be a host function on a side stream: cudaLaunchHostFunc to
+    // start it, an event for the combine to wait on. Each is a callback dispatch of some tens
+    // of microseconds with the GPU front end idle, twice per MoE layer -- milliseconds per
+    // token at 48 layers. Instead the stream itself raises a flag in mapped pinned memory
+    // (cuStreamWriteValue64) once the slice's activations and jobs have landed, a persistent
+    // coordinator thread sees it, runs the round, and stores a done flag the combine waits on
+    // (cuStreamWaitValue64) -- no callback in either direction. Both are front-end operations,
+    // so no SM is held while the host computes. Probed at startup, in a capture as well as
+    // eagerly; the host-function path stays as the fallback (SUROGATE_SERVE_NO_MEMOP_HANDSHAKE=1
+    // forces it).
+    // One flag pair per (layer, slice ordinal). The values are 1 and 0, not a counter: a
+    // captured graph replays the write with the value it was captured with, so the protocol
+    // is raise-and-clear -- the stream raises `ready`, the coordinator clears it, runs the
+    // round and raises `done`; the stream waits on `done` and clears it again itself, so the
+    // next replay of the same graph waits properly. Ordering across layers needs nothing more:
+    // the stream raises L+1's flag only after it has passed L's wait.
+    static constexpr int kHandshakeSlots = (TextConfig::expert_layers) * kJobMirrors;
+    struct Handshake {
+        bool enabled                = false;
+        unsigned long long* ready   = nullptr; // pinned, mapped: [kHandshakeSlots], the stream writes
+        unsigned long long* done    = nullptr; // pinned, mapped: [kHandshakeSlots], the host writes
+        CUdeviceptr ready_device    = 0;
+        CUdeviceptr done_device     = 0;
+        std::vector<std::atomic<SliceContext*>> slice; // [kHandshakeSlots], set at issue time
+        std::thread coordinator;
+        std::atomic<bool> stop{false};
+    } handshake;
+    static std::size_t handshake_slot(const Layer& entry, std::int32_t ordinal) {
+        return static_cast<std::size_t>(entry.index) * kJobMirrors + static_cast<std::size_t>(ordinal);
+    }
+    ~ExpertSlotCache() {
+        // The coordinator spins on flags this object owns; stop it before they go.
+        handshake.stop.store(true, std::memory_order_relaxed);
+        if (handshake.coordinator.joinable()) { handshake.coordinator.join(); }
+        if (handshake.ready != nullptr) { (void)cudaFreeHost(handshake.ready); }
+    }
     cudaStream_t fake_stream = nullptr; // SUROGATE_SERVE_CPU_MOE_FAKE_WAIT: timing-only fork/join
     cudaEvent_t fake_fork = nullptr, fake_join = nullptr;
     cudaEvent_t fork_event   = nullptr;
@@ -432,11 +529,136 @@ struct ExpertSlotCache {
     }
     // Called by post_mixer before the MoE op: fixes the round's split decision and share.
     void begin_round(Layer& entry, std::int32_t tokens) {
-        entry.round_total  = tokens;
-        entry.round_offset = 0;
-        entry.round_slice  = 0;
+        entry.round_total    = tokens;
+        entry.round_offset   = 0;
+        entry.round_slice    = 0;
+        entry.round_resolved = 0;
         entry.round_split  = cpu_split_enabled() && share_for(tokens) > 0 && tokens >= cpu_min_tokens &&
                              entry.cpu_bank.gate_up_codes != nullptr;
+    }
+
+    /// Before this layer resolves: if its experts were prefetched, the directory and the pool
+    /// must show them first.
+    void await_prefetch(const Layer& entry, cudaStream_t stream) {
+        if (!prefetch_enabled || prefetch_layer != entry.index) { return; }
+        const int parity = entry.index & 1;
+        if (prefetch_ready_valid[parity]) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, prefetch_ready[parity], 0));
+        }
+    }
+
+    /// After this layer's misses are on their way: on a wide round, bring in everything the
+    /// next layer does not have yet, on the side stream, behind this layer's expert kernels.
+    void prefetch_next_layer(const Layer& entry, cudaStream_t stream) {
+        if (!prefetch_enabled) { return; }
+        const std::int32_t next = entry.index + 1;
+        if (prefetch_layer == next) { return; } // already in flight
+        // Every hook either issues the next layer's prefetch or clears the record of one. A
+        // pass may hold a narrow round (a small prefill-graph bucket) between two wide ones;
+        // if it left `prefetch_layer` standing, the next layer would wait on an event from an
+        // earlier pass -- from outside the capture, when captured.
+        prefetch_layer = -1;
+        if (entry.round_total < kPrefetchMinTokens) { return; }
+        if (next >= static_cast<std::int32_t>(TextConfig::layers)) { return; } // the head keeps its own rounds
+        if (next >= static_cast<std::int32_t>(layers.size()) || layers[static_cast<std::size_t>(next)].owner == nullptr) {
+            return; // the next layer's bank is not bound (a pipeline stage boundary)
+        }
+        const Layer& target = layers[static_cast<std::size_t>(next)];
+        // The resolve stays on the compute stream: it is the directory's only writer there,
+        // ordered with this layer's later slices and with the next layer's own resolve. What
+        // forks is the gather -- the PCIe traffic -- which runs under this layer's expert
+        // kernels from its first slice on, while the resolve itself is a short single-block
+        // kernel.
+        ops::expert_slot_resolve(prefetch_ids, next, directory, prefetch_misses, stream,
+                                 /*scan=*/true);
+        CUDA_CHECK(cudaEventRecord(prefetch_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(prefetch_stream, prefetch_fork, 0));
+        ops::expert_slot_gather(target.bank, prefetch_misses, pool, prefetch_stream);
+        const int parity = next & 1;
+        CUDA_CHECK(cudaEventRecord(prefetch_ready[parity], prefetch_stream));
+        prefetch_ready_valid[parity] = true;
+        prefetch_layer               = next;
+        ++prefetch_rounds;
+    }
+
+    /// Brings up the memop handshake if the driver has the operations and they survive a
+    /// capture; otherwise the host-function path stays.
+    void start_handshake() {
+        if (std::getenv("SUROGATE_SERVE_NO_MEMOP_HANDSHAKE") != nullptr) { return; }
+        if (stream_write_value64() == nullptr || stream_wait_value64() == nullptr) {
+            std::fprintf(stderr, "qwen4exp: memop handshake unavailable (driver has no stream memops); host functions stay\n");
+            return;
+        }
+        void* flags = nullptr;
+        const std::size_t bytes = 2 * static_cast<std::size_t>(kHandshakeSlots) * sizeof(unsigned long long);
+        if (cudaHostAlloc(&flags, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) { return; }
+        std::memset(flags, 0, bytes);
+        void* device = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&device, flags, 0));
+        handshake.ready        = static_cast<unsigned long long*>(flags);
+        handshake.done         = handshake.ready + kHandshakeSlots;
+        handshake.ready_device = reinterpret_cast<CUdeviceptr>(device);
+        handshake.done_device  = handshake.ready_device + static_cast<std::size_t>(kHandshakeSlots) * sizeof(unsigned long long);
+        handshake.slice        = std::vector<std::atomic<SliceContext*>>(static_cast<std::size_t>(kHandshakeSlots));
+        // Probe: write then wait on the last slot, eagerly and inside a capture, and see the
+        // value arrive. A driver that refuses the memop in a capture would break every decode
+        // graph, so it is tried here rather than discovered at the first prefill.
+        const auto probe = [&](bool captured) {
+            cudaStream_t s = nullptr;
+            CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+            const CUdeviceptr slot = handshake.ready_device + static_cast<std::size_t>(kHandshakeSlots - 1) * sizeof(unsigned long long);
+            bool ok = true;
+            cudaGraph_t graph = nullptr;
+            if (captured) { ok = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) == cudaSuccess; }
+            if (ok) { ok = stream_write_value64()(s, slot, 7ULL, 0U) == CUDA_SUCCESS; }
+            if (ok) { ok = stream_wait_value64()(s, slot, 7ULL, kStreamWaitValueGeq) == CUDA_SUCCESS; }
+            if (captured) {
+                if (cudaStreamEndCapture(s, &graph) != cudaSuccess) { ok = false; }
+                if (ok) {
+                    cudaGraphExec_t exec = nullptr;
+                    ok = cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess &&
+                         cudaGraphLaunch(exec, s) == cudaSuccess;
+                    if (exec != nullptr) { (void)cudaGraphExecDestroy(exec); }
+                }
+                if (graph != nullptr) { (void)cudaGraphDestroy(graph); }
+            }
+            if (ok) { ok = cudaStreamSynchronize(s) == cudaSuccess; }
+            (void)cudaGetLastError();
+            (void)cudaStreamDestroy(s);
+            return ok && handshake.ready[kHandshakeSlots - 1] == 7ULL;
+        };
+        const bool eager = probe(false);
+        handshake.ready[kHandshakeSlots - 1] = 0;
+        const bool graphed = eager && probe(true);
+        handshake.ready[kHandshakeSlots - 1] = 0;
+        if (!eager || !graphed) {
+            std::fprintf(stderr, "qwen4exp: memop handshake probe failed (%s); host functions stay\n",
+                         !eager ? "eager" : "in a capture");
+            return;
+        }
+        handshake.enabled = true;
+        handshake.coordinator = std::thread([this] {
+            unsigned idle = 0;
+            while (!handshake.stop.load(std::memory_order_relaxed)) {
+                bool did = false;
+                for (std::size_t k = 0; k < static_cast<std::size_t>(kHandshakeSlots); ++k) {
+                    if (__atomic_load_n(&handshake.ready[k], __ATOMIC_ACQUIRE) == 0ULL) { continue; }
+                    __atomic_store_n(&handshake.ready[k], 0ULL, __ATOMIC_RELAXED);
+                    SliceContext* slice = handshake.slice[k].load(std::memory_order_acquire);
+                    if (slice != nullptr) { run_cpu_round(slice); }
+                    __atomic_store_n(&handshake.done[k], 1ULL, __ATOMIC_RELEASE);
+                    did = true;
+                }
+                if (did) { idle = 0; continue; }
+                if (++idle < 2000) { cpu_relax_pause(); } else { std::this_thread::yield(); }
+            }
+        });
+        std::fprintf(stderr, "qwen4exp: memop handshake on: the host round starts on a stream flag and the combine waits on one\n");
+    }
+    static void cpu_relax_pause() {
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
     }
 
     static void fake_wait_round(void* context) {
@@ -652,6 +874,22 @@ struct ExpertSlotCache {
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(slice.mirror->block, cpu_jobs_memory, jobs_block_bytes,
                                    cudaMemcpyDeviceToHost, stream));
+        entry.round_offset = offset + tokens;
+        int partial_device = -1;
+        CUDA_CHECK(cudaGetDevice(&partial_device));
+        if (handshake.enabled && !stagecheck) {
+            // Hand the slice to the coordinator first, then let the stream raise its flag once
+            // the copies above have landed: the coordinator only acts on a flag whose
+            // generation it was told to expect.
+            const std::size_t k = handshake_slot(entry, ordinal);
+            handshake.slice[k].store(&slice, std::memory_order_release);
+            const CUresult rc = stream_write_value64()(
+                stream, handshake.ready_device + k * sizeof(unsigned long long), 1ULL, 0U);
+            if (rc != CUDA_SUCCESS) { throw std::runtime_error("qwen4exp: cuStreamWriteValue64 failed"); }
+            t_partial = PendingPartial{static_cast<const float*>(out_device_alias), nullptr, partial_device,
+                                       handshake.done_device + k * sizeof(unsigned long long)};
+            return;
+        }
         // Fork only the host function onto the side stream so it overlaps the GPU experts.
         CUDA_CHECK(cudaEventRecord(fork_event, stream));
         CUDA_CHECK(cudaStreamWaitEvent(cpu_stream, fork_event, 0));
@@ -662,9 +900,6 @@ struct ExpertSlotCache {
         }
         CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &ExpertSlotCache::run_cpu_round, &slice));
         CUDA_CHECK(cudaEventRecord(join_event, cpu_stream));
-        entry.round_offset = offset + tokens;
-        int partial_device = -1;
-        CUDA_CHECK(cudaGetDevice(&partial_device));
         t_partial =
             PendingPartial{static_cast<const float*>(out_device_alias), join_event, partial_device};
     }
@@ -689,6 +924,7 @@ struct ExpertSlotCache {
         ExpertSlotCache& cache = *entry->owner;
         const std::int32_t tokens =
             static_cast<std::int32_t>(x.numel() / ops::kSparseMoeFlashNextGeometry.hidden);
+        cache.await_prefetch(*entry, stream);
         // The split decision is per round (begin_round); every slice of the round follows it.
         const bool split          = entry->round_split && x.data != nullptr && destination.data != nullptr;
         const std::uint32_t share = split ? cache.share_for(entry->round_total) : 0U;
@@ -709,6 +945,8 @@ struct ExpertSlotCache {
         gather_probe().end(stream);
         gather_probe().tick_gather();
         if (split) { cache.cpu_round(*entry, x, destination, stream); }
+        entry->round_resolved += tokens;
+        cache.prefetch_next_layer(*entry, stream);
         // SUROGATE_SERVE_CPU_MOE_FAKE_WAIT=<ms>: with the split off, still fork a host function
         // that sleeps for <ms> and make the combine wait for it — the host split's stream
         // timing without its data. Tells a data fault in the host path from a latent race
@@ -1020,11 +1258,36 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                        std::getenv("SUROGATE_SERVE_NO_SCAN_RING") == nullptr)
                           ? geometry.experts
                           : 0;
+    // The next-layer prefetch needs a ring of two expert sets, which the directory allows
+    // only up to half the pool: four expert sets of slots, then. Opt-in
+    // (SUROGATE_SERVE_PREFETCH=1): measured on 2026-09-04 it *loses* at one user -- TTFT 1.37 s
+    // against 0.84 -- because the gather is a kernel that holds SMs while it waits on PCIe, so
+    // running it under the next layer's compute starves that compute rather than hiding the
+    // transfer. It earns its keep only with a copy-engine gather, which the captured prefill
+    // graphs cannot host today (a host node cannot issue copies). Kept as that path's scaffold.
+    cache.prefetch_enabled = cache.scan_ring > 0 && cache.slots >= geometry.experts * 4 &&
+                             std::getenv("SUROGATE_SERVE_PREFETCH") != nullptr;
+    if (cache.prefetch_enabled) { cache.scan_ring = geometry.experts * 2; }
     cache.directory = ops::create_expert_slot_directory(TextConfig::expert_layers, geometry.experts,
                                                         cache.slots, cache.scan_ring,
                                                         cache.directory_memory,
                                                         nullptr);
     cache.misses    = ops::create_expert_miss_list(geometry.experts, cache.miss_memory);
+    if (cache.prefetch_enabled) {
+        CUDA_CHECK(cudaMalloc(&cache.prefetch_miss_memory, miss_bytes));
+        cache.prefetch_misses = ops::create_expert_miss_list(geometry.experts, cache.prefetch_miss_memory);
+        std::vector<std::int32_t> every(static_cast<std::size_t>(geometry.experts));
+        for (std::int32_t e = 0; e < geometry.experts; ++e) { every[static_cast<std::size_t>(e)] = e; }
+        CUDA_CHECK(cudaMalloc(&cache.prefetch_ids_memory, every.size() * sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMemcpy(cache.prefetch_ids_memory, every.data(),
+                              every.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+        cache.prefetch_ids = Tensor(cache.prefetch_ids_memory, DType::I32, {geometry.experts});
+        CUDA_CHECK(cudaStreamCreateWithFlags(&cache.prefetch_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&cache.prefetch_fork, cudaEventDisableTiming));
+        for (cudaEvent_t& ready : cache.prefetch_ready) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+        }
+    }
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     cache.layers.resize(static_cast<std::size_t>(TextConfig::expert_layers));
     cache.enabled = true;
@@ -1168,6 +1431,7 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                 cache.cpu_pool = pools[node].lock();
                 if (cache.cpu_pool == nullptr) {
                     cache.cpu_pool = std::make_shared<ops::CpuExpertPool>(geometry, pool_options);
+                    cache.start_handshake();
                     pools[node]    = cache.cpu_pool;
                     if (node >= 0) {
                         std::fprintf(stderr, "qwen4exp: host expert pool for NUMA node %d: %zu threads\n", node,
@@ -1187,9 +1451,10 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         }
     }
     std::fprintf(stderr,
-                 "qwen4exp: expert slot cache ready: %d slots (%.1f GiB pool), scan ring %d\n",
+                 "qwen4exp: expert slot cache ready: %d slots (%.1f GiB pool), scan ring %d%s\n",
                  cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0),
-                 cache.scan_ring);
+                 cache.scan_ring,
+                 cache.prefetch_enabled ? ", next-layer prefetch on wide rounds" : "");
     if (const std::string numa = numa_policy_description(); !numa.empty()) {
         std::fprintf(stderr, "qwen4exp: %s\n", numa.c_str());
     }
@@ -1335,8 +1600,17 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
     maybe_dump_block("blockout", block_output, stream);
     if (t_partial.device_alias != nullptr) {
         check_device_handoff("a host expert partial", t_partial.device);
-        // Join the host round (side stream) before the combine reads its partial.
-        join_probe().wrap(stream, t_partial.join);
+        // Join the host round before the combine reads its partial: the done flag when the
+        // memop handshake carried the round, the side stream's event otherwise.
+        if (t_partial.done_device != 0) {
+            // Wait for the round, then clear the flag so the next raise -- the next replay of
+            // this graph, or the next round through this slot -- starts from zero.
+            CUresult rc = stream_wait_value64()(stream, t_partial.done_device, 1ULL, kStreamWaitValueGeq);
+            if (rc == CUDA_SUCCESS) { rc = stream_write_value64()(stream, t_partial.done_device, 0ULL, 0U); }
+            if (rc != CUDA_SUCCESS) { throw std::runtime_error("qwen4exp: stream memop failed at the combine"); }
+        } else {
+            join_probe().wrap(stream, t_partial.join);
+        }
         ops::hyper_connection_combine(block_output, t_partial.device_alias, t_inject, residual, stream);
         {
             ExpertSlotCache& cache = expert_slot_cache_for_current_device();
@@ -1428,6 +1702,19 @@ void Variant::configure_expert_slots(std::uint32_t slots, std::size_t runtime_fl
     configured_runtime_floor()[device]       = runtime_floor_bytes;
 }
 
+void Variant::prepare_expert_prefetch(const ModelView& model) {
+    // The prefetch for layer L+1 is issued from layer L's hook, before L+1's payload has ever
+    // reached the cache -- so every layer's bank is bound here, once, up front.
+    ExpertSlotCache& cache = expert_slot_cache_for_current_device();
+    if (!cache.enabled || !cache.prefetch_enabled) { return; }
+    for (const auto& gdn : model.gdn_layers) {
+        if (gdn.post_mixer.layer >= 0) { (void)cache.layer(gdn.post_mixer); }
+    }
+    for (const auto& full : model.full_layers) {
+        if (full.post_mixer.layer >= 0) { (void)cache.layer(full.post_mixer); }
+    }
+}
+
 void Variant::prepare_expert_split(const ModelView& model) {
     ExpertSlotCache& cache = expert_slot_cache_for_current_device();
     if (!cache.enabled || !cache.cpu_split_enabled() || !cache.auto_share || cache.share_measured) {
@@ -1486,7 +1773,27 @@ void Variant::prepare_expert_split(const ModelView& model) {
     for (int r = 0; r < kRepeats; ++r) { cache.cpu_pool->run(layer.cpu_bank, round); }
     const double host_s   = std::chrono::duration<double>(std::chrono::steady_clock::now() - h0).count();
     const double host_gbs = expert_bytes * kExpertsTimed * kRepeats / host_s / 1e9;
-    double share = host_gbs / (host_gbs + pcie_gbs);
+    // The two rates that set the split are the ones each side reaches *while the other runs*:
+    // the gather's DMA and the host's reads contend for the same DRAM, and neither standalone
+    // number predicts what is left for it (FreeToken measures this pair the same way). The
+    // gathers are enqueued first and the host rounds run against them; each side is timed
+    // over its own window, which differ by at most one round.
+    CUDA_CHECK(cudaEventRecord(t0, stream));
+    for (int r = 0; r < kRepeats * 4; ++r) { ops::expert_slot_gather(layer.bank, cache.misses, cache.pool, stream); }
+    CUDA_CHECK(cudaEventRecord(t1, stream));
+    const auto o0 = std::chrono::steady_clock::now();
+    int host_rounds = 0;
+    while (cudaEventQuery(t1) == cudaErrorNotReady || host_rounds < kRepeats) {
+        cache.cpu_pool->run(layer.cpu_bank, round);
+        ++host_rounds;
+    }
+    const double host_ov_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - o0).count();
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    float gather_ov_ms = 0.0F;
+    CUDA_CHECK(cudaEventElapsedTime(&gather_ov_ms, t0, t1));
+    const double pcie_ov_gbs = expert_bytes * kExpertsTimed * kRepeats * 4 / (gather_ov_ms * 1e-3) / 1e9;
+    const double host_ov_gbs = expert_bytes * kExpertsTimed * host_rounds / host_ov_s / 1e9;
+    double share = host_ov_gbs / (host_ov_gbs + pcie_ov_gbs);
     share        = std::min(0.9, std::max(0.3, share));
     cache.cpu_share_q16  = static_cast<std::uint32_t>(share * 65536.0);
     cache.share_measured = true;
@@ -1504,8 +1811,10 @@ void Variant::prepare_expert_split(const ModelView& model) {
     CUDA_CHECK(cudaEventDestroy(t0));
     CUDA_CHECK(cudaEventDestroy(t1));
     CUDA_CHECK(cudaStreamDestroy(stream));
-    std::fprintf(stderr, "qwen4exp: CPU split auto share: host %.0f GB/s, PCIe gather %.0f GB/s -> %.0f%% of misses on the host\n",
-                 host_gbs, pcie_gbs, 100.0 * share);
+    std::fprintf(stderr,
+                 "qwen4exp: CPU split auto share: host %.0f GB/s, PCIe gather %.0f GB/s alone; "
+                 "%.0f and %.0f GB/s overlapped -> %.0f%% of misses on the host\n",
+                 host_gbs, pcie_gbs, host_ov_gbs, pcie_ov_gbs, 100.0 * share);
 }
 
 void Variant::configure_cpu_moe_prefill(float share, std::uint32_t prefill_chunk) {
@@ -1850,7 +2159,16 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                 ops::SparseMoeRoundHook shadow_hook{&ExpertSlotCache::resolve_round_shadow, &layer};
                 ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, shadow, leaf2,
                                 stream, shadow_hook);
-                CUDA_CHECK(cudaStreamWaitEvent(stream, t_partial.join, 0));
+                // The host partial is ready when its join event fires, or -- under the memop
+                // handshake -- when its done flag is raised. Wait without clearing the flag:
+                // the combine that follows waits on it too and is the one that clears it.
+                if (t_partial.done_device != 0) {
+                    if (stream_wait_value64()(stream, t_partial.done_device, 1ULL, kStreamWaitValueGeq) != CUDA_SUCCESS) {
+                        throw std::runtime_error("qwen4exp: shadow wait on the done flag failed");
+                    }
+                } else {
+                    CUDA_CHECK(cudaStreamWaitEvent(stream, t_partial.join, 0));
+                }
                 const std::size_t n = static_cast<std::size_t>(kHidden) * tokens;
                 std::vector<std::uint16_t> part(n), full(n);
                 CUDA_CHECK(cudaMemcpyAsync(part.data(), output.data, n * sizeof(std::uint16_t),
