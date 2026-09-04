@@ -92,6 +92,7 @@ struct Options {
     int repeat                      = 50;
     std::uint64_t flush_bytes       = kDefaultFlushBytes;
     std::string csv_out;
+    std::string dump; // write the first eager run's output tensor here, raw BF16
 };
 
 struct RoutePattern {
@@ -330,6 +331,7 @@ void usage(const char* argv0) {
                  "  --repeat N                       Measured samples per point (default 50).\n"
                  "  --flush-mib N                    L2 eviction storage (default 256 MiB).\n"
                  "  --csv-out PATH                   Write result rows as CSV.\n"
+                 "  --dump PATH                      Write the first run's output (raw BF16).\n"
                  "  -h, --help                       Show this text.\n",
                  argv0);
 }
@@ -377,6 +379,8 @@ Options parse_options(int argc, char** argv) {
             options.flush_bytes = mib << 20;
         } else if (argument == "--csv-out") {
             options.csv_out = next("CSV output path");
+        } else if (argument == "--dump") {
+            options.dump = next("dump output path");
         } else if (argument == "--help" || argument == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -661,6 +665,15 @@ public:
                         destination_tensor_, workspace_, stream);
     }
 
+    /// The output as it stands, for comparing two builds of the same kernels.
+    void dump_output(const std::string& path) const {
+        std::vector<std::uint8_t> host(destination_.bytes);
+        CUDA_CHECK(cudaMemcpy(host.data(), destination_.p, destination_.bytes, cudaMemcpyDeviceToHost));
+        std::ofstream out(path, std::ios::binary);
+        if (!out) { throw std::runtime_error("failed to open dump output"); }
+        out.write(reinterpret_cast<const char*>(host.data()), static_cast<std::streamsize>(host.size()));
+    }
+
 private:
     BenchmarkWeights& fixture_;
     RoutePattern route_pattern_;
@@ -791,6 +804,7 @@ std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, s
     state.prepare(CacheState::Warm, stream);
     state.launch(stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!options.dump.empty()) { state.dump_output(options.dump); }
 
     BodyTimedGraph graph;
     if (options.execution != Execution::Eager) {

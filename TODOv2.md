@@ -25,8 +25,8 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Ten open or partly done. Two are decisions waiting on `surogate quantize` as a
-product rather than tasks (1 and 10); the rest are work.
+Nine open or partly done. Two are decisions waiting on `surogate quantize` as a
+product rather than tasks (1 and 9); the rest are work.
 
 1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
@@ -39,7 +39,7 @@ product rather than tasks (1 and 10); the rest are work.
    selects them — the other targets import the names and use `W8G32_F16S` or
    NVFP4. So this is one target's safetensors profile, not five, and it is a
    decision rather than a task: it costs the 27B its groupwise-int route until
-   `surogate quantize` (item 10) is a product.
+   `surogate quantize` (item 9) is a product.
 2. **[ ] FP8, and the two kinds are not the same job (checked 2026-09-03).**
    - *compressed-tensors per-channel/per-tensor* is per-row with an FP32 scale.
      The engine has `FP8_E4M3FN_ROW_BF16S`, so this is either an `_F32S` variant
@@ -143,38 +143,7 @@ product rather than tasks (1 and 10); the rest are work.
    checkpoint tensor becomes which artifact object, and how fused objects are
    assembled. That is the part worth unifying, and the part `hf_mapping` already
    spells out.
-7. **[ ] Q6_K down. Measured and root-caused 2026-09-03; the fix is written
-   down here and not built.** The op benchmark now carries the native codecs
-   (`--codec q4_k-q4_k`, `--codec q4_k-q6_k`). One 5090, 256 unique experts,
-   warm, median of three:
-
-   | tokens | q4_k-q4_k | q4_k-q6_k |
-   |---|---:|---:|
-   | 128 | 518 us | 999 us |
-   | 512 | 655 us | 1,346 us |
-   | 1024 | 764 us | 1,178 us |
-
-   Q6_K down roughly **doubles the whole MoE body**, and reproduces in seconds
-   rather than needing a 22 GB model. The kernel runs at 21.9 % of peak
-   bandwidth where the Q4_K one reaches 38.9 %.
-   **Why, exactly.** A Q6_K block is 210 bytes, so block `b` starts at a
-   16-byte misalignment of `2b mod 16`, cycling with period eight. `cp_async`
-   needs 4-, 8- or 16-byte alignment, so this codec sets `kCpAsync = false` and
-   stages its 96-byte tile as **48 two-byte scalar loads** where every other
-   codec issues 6 sixteen-byte async copies. That is the whole gap; the two
-   `m16n8k16` MMAs the sixteen-wide scales force are the smaller half.
-   **The fix that follows from it.** Within a block the chunks are 16 bytes
-   apart, so a tile's misalignment `off` is constant across its chunks. Stage
-   seven aligned 16-byte chunks from `src & ~15` instead of six from `src`, and
-   the tile's bytes land at shared offset `off`; the shared tile stride is
-   already 112 bytes for the int8 route, so it fits. The consumer then reads
-   `__funnelshift_r(w[0], w[1], 8 * ((off + byte) & 3))` over two aligned words
-   instead of one unaligned one — twice the shared traffic to remove seven
-   eighths of the global staging. `off` varies per row, so the shift is
-   per-thread and must stay branchless.
-   The layer-level reading is the same effect measured the other way: 688 us
-   against the row-split kernel's 337, on `routed_down` of 3 of 40 layers.
-8. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
+7. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.
    - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
@@ -193,7 +162,7 @@ product rather than tasks (1 and 10); the rest are work.
      the file's blocks (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`).
    - **The 28k-prompt board row** (long-context ingestion) has not been re-measured
      since the native path landed.
-9. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
+8. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
    (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
    acceptance — which is the evidence the graph is right — but decode moves
    30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
@@ -201,7 +170,7 @@ product rather than tasks (1 and 10); the rest are work.
    more distinct experts than a single token and pays more PCIe gathers with
    3,172 of 5,110 experts resident. The graph and the levers are in memory
    `project_serve_qwen4exp_mtp`.
-10. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+9. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -457,6 +426,12 @@ Written down so they are not retried.
   because global `qh` then cost Q5_K ~7 µs.
 - **llama.cpp's small-K mmvq schedule.** 862 → 847 here; disabled with the
   measurement beside the condition.
+- *(Shipped, not rejected, but it belongs beside the Q5_K note above.)* **Q6_K's
+  210-byte blocks staged as forty-eight two-byte loads** were the whole of the
+  Q6_K down gap. Covering each span with aligned sixteen-byte `cp_async` from the
+  rounded-down address and folding the row's offset into the readers (`kCover`)
+  took the routed body from 1,014 / 1,362 / 1,182 us to **643 / 842 / 963** at
+  128 / 512 / 1,024 tokens, outputs bit-identical, against Q4_K's 522 / 657 / 764.
 - **K5c's split of a mixed-format fused parent.** Above.
 - **Porting MMQ for prefill (K3).** The wide route dequantises once and uses BF16
   tensor cores instead: ~200 lines against ~6,000, more accurate, and our MoE

@@ -47,6 +47,7 @@ struct GgmlBlockPrefill {
     /// Bytes per 256 values of a row: what the kernels stride rows by.
     static constexpr int kBlockBytes  = (QK_K / kValues) * kBytes;
     static constexpr bool kCpAsync    = false;
+    static constexpr bool kCover   = false;
     static constexpr int kMinBlocks   = 1;
     static_assert(kPrefillTileK % kValues == 0 || kValues % kPrefillTileK == 0,
                   "a tile is a whole number of blocks, or a block a whole number of tiles");
@@ -87,6 +88,7 @@ struct GgmlQ4KPrefill {
     static constexpr int kHeaderBytes = 2 * sizeof(__half) + K_SCALE_SIZE; // per row, per block
     static constexpr int kBlockBytes  = sizeof(block_q4_K);     // 144: a multiple of sixteen,
     static constexpr bool kCpAsync    = true;                   // so `cp_async<16>` is in bounds
+    static constexpr bool kCover     = false;
     /// Its header is one aligned sixteen-byte run, and its tile the narrowest of the three, so
     /// this is the only K-quant whose gate/up fits three blocks to an SM.
     static constexpr int kMinBlocks   = 3;
@@ -169,6 +171,7 @@ struct GgmlQ5KPrefill {
         2 * sizeof(__half) + K_SCALE_SIZE + QK_K / 8; // dm, scales, qh
     static constexpr int kBlockBytes = sizeof(block_q5_K); // 176, also a multiple of sixteen
     static constexpr bool kCpAsync   = true;
+    static constexpr bool kCover     = false;
     static constexpr int kMinBlocks  = 2; // its header carries qh as well, so the tile costs more
 
     // ---- the int8 tensor-core route ----
@@ -241,17 +244,24 @@ struct GgmlQ5KPrefill {
 /// two tiles of a half stage the same ones. Symmetric, so no min term.
 struct GgmlQ6KPrefill {
     using Block = block_q6_K;
-    static constexpr int kTileBytes   = 96;                              // ql[64] then qh[32]
-    static constexpr int kHeaderBytes = QK_K / 16 + sizeof(__half);      // scales, d
     /// 210 bytes, which is not a multiple of sixteen: consecutive blocks are only two-byte
-    /// aligned, so this one stages with scalar loads rather than `cp_async`. llama.cpp reads
-    /// Q6_K through its two-byte-aligned accessors for the same reason.
+    /// aligned, so a tile's bytes start at some even offset `off` below sixteen. Staging them
+    /// with scalar loads -- forty-eight two-byte copies where every other codec issues six
+    /// sixteen-byte `cp_async` -- held the Q6_K down kernel at 22 % of peak bandwidth against
+    /// Q4_K's 39 %. Instead the tile is *covered*: eight aligned sixteen-byte copies from the
+    /// rounded-down addresses, five for the sixty-four `ql` bytes and three for the thirty-two
+    /// `qh`, and the row's `off` is folded into the pointers its readers get (kCover). Within a
+    /// block every span sits a multiple of sixteen from the block's start, so one offset serves
+    /// `ql`, `qh` and the scales alike.
+    static constexpr int kTileBytes   = 128;                             // ql span 80, qh span 48
+    static constexpr int kHeaderBytes = 32;                              // scales[16], d: 18 covered
     static constexpr int kBlockBytes = sizeof(block_q6_K);
-    static constexpr bool kCpAsync   = false;
+    static constexpr bool kCpAsync   = true;
+    static constexpr bool kCover     = true;
     static constexpr int kMinBlocks  = 2;
 
     // ---- the int8 tensor-core route ----
-    static constexpr int kTileStride   = 112; // 96 bytes of codes; twenty-eight words a row
+    static constexpr int kTileStride   = 128;
     static constexpr int kHeaderStride = 32;
     /// Sixteen scales of sixteen values each, so this codec's MMA groups are sixteen deep.
     static constexpr int kScaleGroups = 16;
@@ -268,15 +278,25 @@ struct GgmlQ6KPrefill {
     /// The low half of the tile is stripe `2*odd`, the high half stripe `2*odd + 1`; a stripe's
     /// nibble sits in `ql[32 * (stripe & 1) + i]` shifted by `4 * (stripe >> 1)`, and its two
     /// high bits in `qh[i]` at `2 * stripe`.
+    /// A word at a two-byte-aligned shared address: the two aligned words it straddles,
+    /// funnel-shifted. Branchless, since the offset is the row's and differs per thread.
+    __device__ static __forceinline__ unsigned load_word(const std::uint8_t* p) {
+        const auto addr     = reinterpret_cast<std::uintptr_t>(p);
+        const auto* aligned = reinterpret_cast<const unsigned*>(addr & ~std::uintptr_t{3});
+        const unsigned sh   = static_cast<unsigned>(addr & 3u) * 8u;
+        const unsigned w0   = aligned[0];
+        const unsigned w1   = sh ? aligned[1] : 0u;
+        return __funnelshift_r(w0, w1, sh);
+    }
     __device__ static __forceinline__ void unpack(const std::uint8_t* tile,
                                                   const std::uint8_t* header, int tile_in_block,
                                                   int q, unsigned& lo, unsigned& hi) {
         (void)header;
         const int odd       = tile_in_block & 1;
         const int shift     = 4 * odd;
-        const unsigned ql0  = *reinterpret_cast<const unsigned*>(tile + 4 * q);
-        const unsigned ql1  = *reinterpret_cast<const unsigned*>(tile + 32 + 4 * q);
-        const unsigned qh   = *reinterpret_cast<const unsigned*>(tile + 64 + 4 * q);
+        const unsigned ql0  = load_word(tile + 4 * q);
+        const unsigned ql1  = load_word(tile + 32 + 4 * q);
+        const unsigned qh   = load_word(tile + 80 + 4 * q);
         const unsigned lo6  = ((ql0 >> shift) & 0x0F0F0F0Fu) |
                               (((qh >> (4 * odd)) & 0x03030303u) << 4);
         const unsigned hi6  = ((ql1 >> shift) & 0x0F0F0F0Fu) |
@@ -292,13 +312,14 @@ struct GgmlQ6KPrefill {
         return make_float2(__half2float(d_all) * static_cast<float>(scales[index]), 0.0f);
     }
 
-    /// The tile's first sixty-four bytes come from `ql`, its last thirty-two from `qh`, which
-    /// does not follow `ql` contiguously for the half in question.
+    /// Units 0-4 cover the half's sixty-four `ql` bytes, 5-7 its thirty-two `qh`; the stager
+    /// rounds each source down to sixteen and lands unit `u` at shared byte `16 u`, so the
+    /// logical byte `i` of `ql` sits at `off + i` and of `qh` at `80 + off + i`.
     __device__ static __forceinline__ int chunk_offset(int tile, int chunk) {
         const int block = (tile / kTilesPerBlock) * kBlockBytes;
         const int half  = (tile % kTilesPerBlock) >> 1;
-        return chunk < 4 ? block + offsetof(block_q6_K, ql) + 64 * half + 16 * chunk
-                         : block + offsetof(block_q6_K, qh) + 32 * half + 16 * (chunk - 4);
+        return chunk < 5 ? block + offsetof(block_q6_K, ql) + 64 * half + 16 * chunk
+                         : block + offsetof(block_q6_K, qh) + 32 * half + 16 * (chunk - 5);
     }
     __device__ static __forceinline__ int header_offset(int tile) {
         return (tile / kTilesPerBlock) * kBlockBytes + offsetof(block_q6_K, scales);
@@ -312,7 +333,7 @@ struct GgmlQ6KPrefill {
         const auto* scales = reinterpret_cast<const std::int8_t*>(header);
         const __half d_all = *reinterpret_cast<const __half*>(header + QK_K / 16);
         const std::uint8_t* ql = tile;
-        const std::uint8_t* qh = tile + 64;
+        const std::uint8_t* qh = tile + 80;
         // Stripes within the half: the tile's low thirty-two values are stripe `2*odd`, its high
         // thirty-two stripe `2*odd + 1`, where `odd` says which tile of the half this is.
         const int odd = tile_in_block & 1;

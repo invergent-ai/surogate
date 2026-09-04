@@ -115,6 +115,15 @@ prompt is served from the prefix cache and measures nothing). surogate and llama
 file; surogate's artifact carries the routed experts as the file's own Q4_K, Q5_K and Q6_K
 superblocks, 34.6 B of its 34.7 B parameters copied byte for byte.
 
+**Q6_K down, fixed (2026-09-04).** The op benchmark (`sinfer_sparse_moe_bench --codec
+q4_k-q6_k`, 256 unique experts, warm, graph replay, one 5090) had Q6_K down doubling the MoE
+body: 1,014 / 1,362 / 1,182 us at 128 / 512 / 1,024 tokens against q4_k-q4_k's 522 / 657 / 764.
+Cause: a 210-byte block is only two-byte aligned, so the codec staged its 96-byte tile as
+forty-eight scalar loads where every other codec issues six 16-byte `cp_async`. It now covers
+each span with aligned 16-byte copies from the rounded-down address and folds the row's offset
+into the readers: **643 / 842 / 963 us**, outputs bit-identical, 37 % of peak bandwidth against
+Q4_K's 40 %.
+
 | engine | routed expert format | prefill tok/s | decode tok/s | comments |
 |---|---|---:|---:|---|
 | **surogate** | native K-quant, int8 tensor-core prefill route (2026-09-03) | **13,195** | **315** | the routed experts' prefill on llama.cpp's arithmetic (int8 activations per 32 with block sums, the file's codes as the other MMA operand); decode untouched. Wikitext-2 perplexity, 145 windows of 2048: **6.2370 ± 0.040**, llama.cpp 6.2311 ± 0.040, the BF16-activation path 6.2378 |

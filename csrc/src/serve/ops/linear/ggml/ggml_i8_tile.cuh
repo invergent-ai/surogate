@@ -26,11 +26,30 @@ inline constexpr int kI8BM     = 64; // weight rows per tile
 inline constexpr int kI8BK     = 64; // K per stage, one quarter of a superblock
 inline constexpr int kI8Stages = 2;
 
+__device__ __forceinline__ const std::uint8_t* align_down16(const std::uint8_t* p) {
+    return reinterpret_cast<const std::uint8_t*>(reinterpret_cast<std::uintptr_t>(p) &
+                                                 ~std::uintptr_t{15});
+}
+
+/// For a covering codec, the even offset below sixteen at which the tile's superblock starts:
+/// what its readers add to the staged tile and header. Zero for every other codec.
+template <class Codec>
+__device__ __forceinline__ int cover_offset(const std::uint8_t* row_base, int tile) {
+    if constexpr (Codec::kCover) {
+        return static_cast<int>(reinterpret_cast<std::uintptr_t>(row_base + Codec::header_offset(tile)) & 15u);
+    } else {
+        (void)row_base; (void)tile;
+        return 0;
+    }
+}
+
 template <class Codec>
 __device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const std::uint8_t* row_base,
                                                 int tile, int unit) {
     if constexpr (Codec::kCpAsync) {
-        cp_async<16, Cache::cg>(dst + 16 * unit, row_base + Codec::chunk_offset(tile, unit));
+        const std::uint8_t* src = row_base + Codec::chunk_offset(tile, unit);
+        if constexpr (Codec::kCover) { src = align_down16(src); }
+        cp_async<16, Cache::cg>(dst + 16 * unit, src);
     } else {
         const auto* src = reinterpret_cast<const std::uint16_t*>(
             row_base + Codec::chunk_offset(tile, unit / 8));
@@ -48,6 +67,7 @@ __device__ __forceinline__ void stage_ggml_header(std::uint8_t* dst, const std::
                                                   int tile, int unit) {
     const std::uint8_t* src = row_base + Codec::header_offset(tile);
     if constexpr (Codec::kCpAsync) {
+        if constexpr (Codec::kCover) { src = align_down16(src); }
         cp_async<16, Cache::cg>(dst + 16 * unit, src + 16 * unit);
     } else {
         reinterpret_cast<std::uint16_t*>(dst)[unit] =
@@ -73,6 +93,7 @@ struct GgmlI8Smem {
     alignas(16) std::int8_t Xs[kI8Stages][ExpertBN * kI8Stride];
     alignas(16) Scale Sc[kI8Stages][Codec::kScaleGroups * kI8BM];
     alignas(16) __half2 Ds[kI8Stages][ExpertBN * 2];
+    std::uint8_t Off[kI8Stages][kI8BM]; // a covering codec's per-row offset, by superblock parity
 };
 
 /// The K loop the gate/up and down kernels share. `row_base(local_row)` is a weight row's
@@ -135,6 +156,11 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
                 const int unit = item - row * HeaderUnits;
                 stage_ggml_header<Codec>(&sm.Hdr[slot][row * Codec::kHeaderStride],
                                          row_base(row), kt, unit);
+                if constexpr (Codec::kCover) {
+                    if (unit == 0) {
+                        sm.Off[slot][row] = static_cast<std::uint8_t>(cover_offset<Codec>(row_base(row), kt));
+                    }
+                }
             }
         }
     };
@@ -156,7 +182,8 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
             for (int item = tid; item < Codec::kScaleGroups * kI8BM; item += ExpertThreads) {
                 const int row     = item & (kI8BM - 1);
                 const int idx     = item / kI8BM;
-                const float2 pair = Codec::scale_pair(&sm.Hdr[slot][row * Codec::kHeaderStride], idx);
+                const int off     = Codec::kCover ? sm.Off[slot][row] : 0;
+                const float2 pair = Codec::scale_pair(&sm.Hdr[slot][row * Codec::kHeaderStride] + off, idx);
                 if constexpr (Codec::kHasMin) {
                     sm.Sc[slot][idx * kI8BM + row] = pair;
                 } else {
@@ -169,8 +196,9 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
             const int q   = item & 7;
             unsigned lo   = 0;
             unsigned hi   = 0;
-            Codec::unpack(&sm.Cr[stage][row * Codec::kTileStride],
-                          &sm.Hdr[slot][row * Codec::kHeaderStride], tib, q, lo, hi);
+            const int off = Codec::kCover ? sm.Off[slot][row] : 0;
+            Codec::unpack(&sm.Cr[stage][row * Codec::kTileStride] + off,
+                          &sm.Hdr[slot][row * Codec::kHeaderStride] + off, tib, q, lo, hi);
             *reinterpret_cast<unsigned*>(&sm.As[row * kI8Stride + 4 * q])      = lo;
             *reinterpret_cast<unsigned*>(&sm.As[row * kI8Stride + 32 + 4 * q]) = hi;
         }

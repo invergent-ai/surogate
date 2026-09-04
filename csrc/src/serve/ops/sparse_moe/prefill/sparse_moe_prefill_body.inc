@@ -775,6 +775,7 @@ sparse_moe_prefill_ggml_gate_up_kernel(
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * Codec::kTileBytes];
     __shared__ __align__(16) std::uint8_t Hdr[kExpertStages][kExpertBM * Codec::kHeaderBytes];
+    __shared__ std::uint8_t Off[kExpertStages][kExpertBM]; // a covering codec's per-row offset
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -843,16 +844,23 @@ sparse_moe_prefill_ggml_gate_up_kernel(
                     const int unit = item - row * HeaderUnits;
                     ggml::stage_ggml_header<Codec>(&Hdr[slot][row * Codec::kHeaderBytes], row_base(row),
                                              kt, unit);
+                    if constexpr (Codec::kCover) {
+                        if (unit == 0) {
+                            Off[slot][row] = static_cast<std::uint8_t>(
+                                ggml::cover_offset<Codec>(row_base(row), kt));
+                        }
+                    }
                 }
             }
         };
 
         auto decode_weight = [&](int stage, int kt) {
             for (int row = warp; row < kExpertBM; row += ExpertWarps) {
+                const int slot = (kt / ggml::kTilesPerBlock) & 1;
+                const int off  = Codec::kCover ? Off[slot][row] : 0;
                 const __nv_bfloat162 value = Codec::decode(
-                    &Cr[stage][row * Codec::kTileBytes],
-                    &Hdr[(kt / ggml::kTilesPerBlock) & 1][row * Codec::kHeaderBytes], lane,
-                    kt % ggml::kTilesPerBlock);
+                    &Cr[stage][row * Codec::kTileBytes] + off,
+                    &Hdr[slot][row * Codec::kHeaderBytes] + off, lane, kt % ggml::kTilesPerBlock);
                 store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
             }
         };
@@ -953,6 +961,7 @@ sparse_moe_prefill_ggml_down_kernel(
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * Codec::kTileBytes];
     __shared__ __align__(16) std::uint8_t Hdr[kExpertStages][kExpertBM * Codec::kHeaderBytes];
+    __shared__ std::uint8_t Off[kExpertStages][kExpertBM]; // a covering codec's per-row offset
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -1017,16 +1026,23 @@ sparse_moe_prefill_ggml_down_kernel(
                     const int unit = item - row * HeaderUnits;
                     ggml::stage_ggml_header<Codec>(&Hdr[slot][row * Codec::kHeaderBytes], row_base(row),
                                              kt, unit);
+                    if constexpr (Codec::kCover) {
+                        if (unit == 0) {
+                            Off[slot][row] = static_cast<std::uint8_t>(
+                                ggml::cover_offset<Codec>(row_base(row), kt));
+                        }
+                    }
                 }
             }
         };
 
         auto decode_weight = [&](int stage, int kt) {
             for (int row = warp; row < kExpertBM; row += ExpertWarps) {
+                const int slot = (kt / ggml::kTilesPerBlock) & 1;
+                const int off  = Codec::kCover ? Off[slot][row] : 0;
                 const __nv_bfloat162 value = Codec::decode(
-                    &Cr[stage][row * Codec::kTileBytes],
-                    &Hdr[(kt / ggml::kTilesPerBlock) & 1][row * Codec::kHeaderBytes], lane,
-                    kt % ggml::kTilesPerBlock);
+                    &Cr[stage][row * Codec::kTileBytes] + off,
+                    &Hdr[slot][row * Codec::kHeaderBytes] + off, lane, kt % ggml::kTilesPerBlock);
                 store_vec(&As[row * kExpertBK + gemm_swz64(row, 2 * lane)], value);
             }
         };
