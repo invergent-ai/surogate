@@ -156,14 +156,23 @@ def test_the_cuda_kernel_matches_the_python_reference_metrics():
 
     inputs = rng.integers(0, vocab_size, size=(1, seq_len), dtype=np.int32)
     targets = np.roll(inputs, -1, axis=1).astype(np.int32)
-    position_ids = np.arange(seq_len, dtype=np.int32).reshape(1, seq_len)
     # Two packed samples, not one: a single unpacked range never exercises the
     # per-sample shift, and this branch rewrote how those ranges are derived.
+    # The positions must RESET per sample, as the packer emits them -- a
+    # continuous arange alongside two ranges is contradictory input, and the
+    # kernel faults on it with a misaligned address rather than rejecting it.
     sample_ranges = [(0, 8), (8, seq_len)]
+    position_ids = np.concatenate([np.arange(e - s, dtype=np.int32) for s, e in sample_ranges]).reshape(1, seq_len)
 
-    # Prompt tokens masked out, completion tokens live, matching a real pack.
+    # Prompt masked, completion live -- PER SAMPLE. The first token of every
+    # packed sample must be a masked prompt token: the kernel emits gradients
+    # only for logical [start+1, end-1], so a sample whose first token is live
+    # makes the kernel and the reference disagree by exactly that token. That is
+    # an unvalidated invariant of the packed layout, not a divergence, and a
+    # flat `loss_mask[4:] = True` across two samples silently breaks it.
     loss_mask = np.zeros(seq_len, dtype=bool)
-    loss_mask[4:] = True
+    for start, end in sample_ranges:
+        loss_mask[start + 4 : end] = True
     advantages = rng.normal(0.0, 1.0, size=seq_len).astype(np.float32) * loss_mask
     inference_logprobs = rng.uniform(-4.0, -0.1, size=seq_len).astype(np.float32)
     loss_scale = float(loss_mask.sum())
