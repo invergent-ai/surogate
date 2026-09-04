@@ -1,10 +1,12 @@
 #include "targets/qwen4exp/impl/load/bindings.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 
 #include "artifact/reader.h"
 #include "artifact/typed_binding.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <stdexcept>
@@ -126,18 +128,37 @@ void bind_full_attention(artifact::Binder& binder, const std::string& prefix,
 }
 
 MoePlan bind_moe(artifact::Binder& binder, HostBankPlan& bank, const std::string& prefix,
-                 bool q4) {
+                 HostBankMode mode, bool ggml_artifact) {
     // The Q4 bank still asks for W8 planes, because its requantiser reads them. Otherwise the
-    // format is the artifact's: a GGUF-native one names the file's blocks.
+    // format is the artifact's: a GGUF-native one names the file's blocks -- which the bank
+    // either keeps as they lie (the gather decodes each group on its way into the pool) or
+    // decodes into W8 planes on the way into pinned memory, after which nothing downstream can
+    // tell it from a converted artifact.
     NumericFormat gate_up_format = NumericFormat::W8G32_F16S;
     NumericFormat down_format    = NumericFormat::W8G32_F16S;
     const auto routed = [&](const std::string& name, std::initializer_list<std::uint64_t> shape,
                             NumericFormat& format) {
-        if (q4) { return host_q4(binder, bank, name, NumericFormat::W8G32_F16S, shape); }
-        const artifact::LinearBinding binding =
-            host_linear(binder, bank, name, static_cast<std::int32_t>(*shape.begin()),
-                        static_cast<std::int32_t>(*(shape.begin() + 1)));
+        const auto rows    = static_cast<std::int32_t>(*shape.begin());
+        const auto columns = static_cast<std::int32_t>(*(shape.begin() + 1));
+        if (mode == HostBankMode::Q4 && !ggml_artifact) {
+            return host_q4(binder, bank, name, NumericFormat::W8G32_F16S, shape);
+        }
+        const artifact::LinearBinding binding = host_linear(binder, bank, name, rows, columns);
         format = binding.format;
+        const bool blocks = ops::detail::ggml::is_ggml_qtype(artifact::qtype_for(binding.format));
+        if (blocks && mode != HostBankMode::Native) {
+            HostObjectPlan& plan = bank.objects.back();
+            plan.decode_rows     = rows;
+            plan.decode_k        = columns;
+            plan.decode_type     = artifact::qtype_for(binding.format);
+            if (mode == HostBankMode::Q4) {
+                // Decoded to a row of W8 and requantised from there: the two steps a converted
+                // artifact's bank takes, fused per row so no W8 copy of the experts exists.
+                plan.q4_rows = rows;
+                plan.q4_k    = columns;
+            }
+            format = NumericFormat::W8G32_F16S; // what the bank presents to the runtime
+        }
         return binding.object;
     };
     return MoePlan{
@@ -354,7 +375,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
         routed0 != nullptr ? std::get_if<artifact::TensorDescriptor>(routed0) : nullptr;
     const bool routed_is_ggml =
         routed0_tensor != nullptr && routed0_tensor->layout == artifact::StorageLayout::GgmlBlocksV1;
-    out.host_bank_q4    = host_bank_q4 && !routed_is_ggml;
+    out.host_bank_q4    = host_bank_q4;
+    // A GGUF-native artifact's experts leave the file's block format as they enter the bank:
+    // decoded to W8 planes, or on to Q4G32AM when the Q4 bank was asked for -- the same bank a
+    // converted artifact builds, so the gather is a copy and the host expert path reads planes
+    // at memory speed. The blocks stay blocks only under SUROGATE_SERVE_HOST_BANK_NATIVE=1,
+    // the A/B switch, where every miss decodes on its way to the device.
+    const bool keep_native = std::getenv("SUROGATE_SERVE_HOST_BANK_NATIVE") != nullptr;
+    const HostBankMode bank_mode = host_bank_q4 ? HostBankMode::Q4
+                                   : (routed_is_ggml && !keep_native) ? HostBankMode::DecodeW8
+                                                                      : HostBankMode::Native;
     out.token_embedding = device(binder, "text/token_embedding", NumericFormat::W8G32_F16S,
                                  {kVocab, kHidden});
 
@@ -403,7 +433,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
             target.ple.convolution = device(binder, prefix + "ple/convolution", NumericFormat::BF16,
                                             {TextConfig::ple_conv_kernel, kHcWidth});
         }
-        target.moe = bind_moe(binder, out.host_bank, prefix + "mlp/", out.host_bank_q4);
+        target.moe = bind_moe(binder, out.host_bank, prefix + "mlp/", bank_mode, routed_is_ggml);
     }
     g_layer_placement = TensorPlacement::Device;
 
@@ -429,7 +459,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
         mtp.layer.hc_attention      = bind_hc(binder, "mtp/layer/hc_attn/", true);
         bind_full_attention(binder, "mtp/layer/attention/", mtp.layer.attention);
         mtp.layer.hc_mlp = bind_hc(binder, "mtp/layer/hc_ffn/", true);
-        mtp.layer.moe    = bind_moe(binder, out.host_bank, "mtp/layer/mlp/", out.host_bank_q4);
+        mtp.layer.moe    = bind_moe(binder, out.host_bank, "mtp/layer/mlp/", bank_mode, routed_is_ggml);
         mtp.head_mix     = bind_hc(binder, "mtp/head_hc/", false);
         g_layer_placement = TensorPlacement::Device;
     }

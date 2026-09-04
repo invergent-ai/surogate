@@ -415,7 +415,11 @@ struct ExpertSlotCache {
     std::int32_t* jobs_experts_host = nullptr;
     float* jobs_weights_host        = nullptr;
     long long* jobs_count_host      = nullptr;
-    std::int32_t cpu_min_tokens     = 4; // below this the host round-trip costs more than it saves
+    // Rounds narrower than this take the whole gather. It was 4 ("below this the host round
+    // trip costs more than it saves") when the host measured slower; at one user, where every
+    // decode round is one token, 1 reads 20.2 against 15.3 tok/s on the board shape and 16
+    // users are unmoved by it (2026-09-04, GPU 0).
+    std::int32_t cpu_min_tokens     = 1;
     std::vector<ops::CpuExpertJob> job_scratch;
 
     bool cpu_split_enabled() const { return cpu_pool != nullptr; }
@@ -923,6 +927,18 @@ std::vector<int> node_physical_cpus(int node) {
     return cpus;
 }
 
+/// What the runtime must be left after the pool: the KV floor and headroom the planner asked
+/// for. Zero when no planner said (a test, or a caller that sizes the pool by hand).
+std::unordered_map<int, std::size_t>& configured_derived_reserve() {
+    static std::unordered_map<int, std::size_t> reserves;
+    return reserves;
+}
+
+std::unordered_map<int, std::size_t>& configured_runtime_floor() {
+    static std::unordered_map<int, std::size_t> floors;
+    return floors;
+}
+
 std::unordered_map<int, std::uint32_t>& configured_cpu_min_tokens() {
     static std::unordered_map<int, std::uint32_t> configured;
     return configured;
@@ -958,7 +974,17 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         // single-card measurements use.
         const std::size_t per_slot = ops::expert_slot_pool_bytes(geometry, 1);
         const std::size_t free     = device_free_bytes(device);
-        const std::size_t budget   = free / 2;
+        // Half of what is free, and never into what the runtime's own floor needs: with
+        // --kv-capacity auto that floor is the whole of a full-context request's pages plus
+        // the prefill workspaces, and taking half of free without regard to it was refused at
+        // startup on the board's 16-lane shape (2026-09-04).
+        std::size_t floor = 0;
+        if (auto it = configured_runtime_floor().find(device); it != configured_runtime_floor().end()) {
+            floor = it->second;
+        }
+        constexpr std::size_t kMargin = std::size_t{1} << 30;
+        const std::size_t after_floor = free > floor + kMargin ? free - floor - kMargin : 0;
+        const std::size_t budget      = std::min(free / 2, after_floor);
         const auto whole_model =
             static_cast<long>(TextConfig::expert_layers) * static_cast<long>(geometry.experts);
         requested = per_slot == 0 ? 0 : static_cast<long>(budget / per_slot);
@@ -1379,11 +1405,27 @@ void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& 
     ops::broadcast_streams(embedded, kStreams, residual, stream);
 }
 
-void Variant::configure_expert_slots(std::uint32_t slots) {
+void Variant::configure_derived_reserve(std::size_t bytes) {
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     std::lock_guard<std::mutex> lock(expert_slot_mutex());
-    configured_expert_slots()[device] = slots;
+    configured_derived_reserve()[device] = bytes;
+}
+
+std::size_t Variant::derived_reserve() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(expert_slot_mutex());
+    const auto it = configured_derived_reserve().find(device);
+    return it == configured_derived_reserve().end() ? 0 : it->second;
+}
+
+void Variant::configure_expert_slots(std::uint32_t slots, std::size_t runtime_floor_bytes) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(expert_slot_mutex());
+    configured_expert_slots()[device]        = slots;
+    configured_runtime_floor()[device]       = runtime_floor_bytes;
 }
 
 void Variant::prepare_expert_split(const ModelView& model) {

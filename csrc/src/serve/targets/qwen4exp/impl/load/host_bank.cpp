@@ -3,6 +3,7 @@
 
 #include "api/ops/cpu_expert_compute.h"
 #include "api/ops/expert_slot_cache.h"
+#include "ops/linear/ggml/ggml_host_decode.h"
 #include "core/device.h"
 
 #include <string>
@@ -32,6 +33,15 @@ namespace {
 
 /// Bytes an object occupies once assembled, however it is stored.
 std::size_t object_bytes(const HostObjectPlan& plan) {
+    if (plan.q4_rows != 0) {
+        // Requantised on the way in: the object is the Q4 planes, whatever it came from.
+        return ops::q4_bank_planes(plan.q4_rows, plan.q4_k).total_bytes;
+    }
+    if (plan.decode_rows != 0) {
+        // Decoded on the way in: the object is the W8 planes, not the blocks it came from.
+        return static_cast<std::size_t>(plan.decode_rows) * plan.decode_k +
+               static_cast<std::size_t>(plan.decode_rows) * (plan.decode_k / 32) * 2;
+    }
     if (!plan.parts.empty()) {
         std::size_t total = 0;
         for (const auto& part : plan.parts) { total += part.size(); }
@@ -140,7 +150,83 @@ HostBank::HostBank(const HostBankPlan& plan) {
             (void)madvise(reinterpret_cast<void*>(start), length, MADV_WILLNEED);
         }
         std::vector<std::thread> threads;
-        if (q4) {
+        if (source.decode_rows != 0) {
+            // Decode while copying. The blocks arrive as stretches of the GGUF in row order,
+            // each a whole number of rows; a worker owns a contiguous row range and walks the
+            // stretches to find its rows. The planes it writes are the ones a converted
+            // artifact stores, so nothing downstream learns the bank was decoded here.
+            const std::int64_t rows   = source.decode_rows;
+            const std::int32_t k      = source.decode_k;
+            const std::int64_t row_in = ops::ggml_row_bytes(source.decode_type, k);
+            if (row_in <= 0) {
+                throw std::invalid_argument("host bank object " + source.name +
+                                            " is not a block format this build decodes");
+            }
+            std::vector<std::span<const std::byte>> stretches = source.parts;
+            if (stretches.empty()) { stretches.push_back(source.payload); }
+            // Row r begins at byte r * row_in of the concatenation; a stretch that is not a
+            // whole number of rows would let a row straddle two, which no source produces.
+            std::vector<std::int64_t> first_row;
+            first_row.reserve(stretches.size() + 1);
+            std::int64_t running = 0;
+            for (const auto& part : stretches) {
+                if (part.size() % static_cast<std::size_t>(row_in) != 0) {
+                    throw std::logic_error("host bank object " + source.name +
+                                           " has a run that is not whole rows");
+                }
+                first_row.push_back(running);
+                running += static_cast<std::int64_t>(part.size() / static_cast<std::size_t>(row_in));
+            }
+            first_row.push_back(running);
+            if (running != rows) {
+                throw std::logic_error("host bank object " + source.name +
+                                       " has " + std::to_string(running) + " rows, expected " +
+                                       std::to_string(rows));
+            }
+            // Straight to W8 planes, or -- when the bank is the Q4 one -- through a row of W8
+            // scratch into the packed nibble planes, so a GGUF's blocks reach Q4G32AM by the
+            // same two steps a converted artifact's W8 does, one row at a time.
+            auto* codes  = reinterpret_cast<std::int8_t*>(object.host);
+            auto* scales = reinterpret_cast<std::uint16_t*>(static_cast<std::byte*>(object.host) +
+                                                            static_cast<std::size_t>(rows) * k);
+            auto* q4_dst        = static_cast<std::byte*>(object.host);
+            auto* q4_dst_codes  = reinterpret_cast<std::uint8_t*>(q4_dst);
+            auto* q4_dst_scales = reinterpret_cast<std::uint16_t*>(q4_dst + q4_planes.scales_offset);
+            auto* q4_dst_mins   = reinterpret_cast<std::uint16_t*>(q4_dst + q4_planes.mins_offset);
+            const std::size_t workers = std::max<std::size_t>(16, std::thread::hardware_concurrency());
+            const std::int64_t chunk  = (rows + static_cast<std::int64_t>(workers) - 1) /
+                                       static_cast<std::int64_t>(workers);
+            for (std::size_t w = 0; w < workers; ++w) {
+                const std::int64_t begin = static_cast<std::int64_t>(w) * chunk;
+                if (begin >= rows) { break; }
+                const std::int64_t end = std::min(rows, begin + chunk);
+                threads.emplace_back([=, stretches, first_row, &source] {
+                    std::vector<std::int8_t> row_codes(q4 ? static_cast<std::size_t>(k) : 0);
+                    std::vector<std::uint16_t> row_scales(q4 ? static_cast<std::size_t>(k / 32) : 0);
+                    std::size_t part = 0;
+                    while (part + 1 < first_row.size() && first_row[part + 1] <= begin) { ++part; }
+                    for (std::int64_t r = begin; r < end; ++r) {
+                        while (first_row[part + 1] <= r) { ++part; }
+                        const std::byte* blocks =
+                            stretches[part].data() +
+                            static_cast<std::size_t>(r - first_row[part]) * static_cast<std::size_t>(row_in);
+                        std::int8_t* out_codes    = q4 ? row_codes.data() : codes + r * k;
+                        std::uint16_t* out_scales = q4 ? row_scales.data() : scales + r * (k / 32);
+                        if (!ops::ggml_decode_row_w8(source.decode_type, blocks, k, out_codes,
+                                                     out_scales)) {
+                            throw std::runtime_error("host bank object " + source.name +
+                                                     " failed to decode a row");
+                        }
+                        if (q4) {
+                            const std::int64_t group0 = r * (k / 32);
+                            ops::requantise_w8_expert_groups_to_q4(
+                                out_codes, out_scales, k / 32, q4_dst_codes + group0 * 16,
+                                q4_dst_scales + group0, q4_dst_mins + group0);
+                        }
+                    }
+                });
+            }
+        } else if (q4) {
             // Requantise while copying: every worker owns a contiguous group range of the
             // parallel (row, k-group) order, reading the W8 codes and scales planes and
             // writing the packed nibbles plus the FP16 scale/min planes.

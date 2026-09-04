@@ -1,3 +1,4 @@
+#include "targets/registry.h"
 #include <api/targets/qwen4exp/package.h>
 #include "family/impl/lora_bind.h"
 #include <api/family/frontend_resources.h>
@@ -72,23 +73,27 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
             "not carry; put the model's mtp-*.gguf beside the shards (or under MTP/) and convert "
             "again");
     }
-    if (options.host_expert_bank == EngineOptions::HostExpertBank::Q4 &&
-        options.expert_slots == 0) {
-        throw std::invalid_argument(
-            "qwen3.8-flash-next: --host-expert-bank q4 requires --expert-slots (the zero-copy "
-            "kernels read the W8 bank directly)");
-    }
-    const bool bank_q4 = options.host_expert_bank == EngineOptions::HostExpertBank::Q4 ||
-                         (options.host_expert_bank == EngineOptions::HostExpertBank::Auto &&
-                          options.expert_slots > 0);
+    // The Q4 bank is the default. It halves the bytes every miss moves over PCIe and through
+    // host DRAM against the W8 planes, and on the board's single-card shape that is 27.3
+    // against 20.2 tok/s (2026-09-04, GGUF-native artifact, GPU 0). --host-expert-bank w8
+    // keeps the 8-bit planes for a run that would rather spend the host RAM.
+    const bool bank_q4 = options.host_expert_bank != EngineOptions::HostExpertBank::W8;
     if (bank_q4) {
         std::fprintf(stderr, "qwen4exp: host expert bank Q4G32AM (59 %% of the W8 bytes; "
                              "requantised while loading; --host-expert-bank w8 restores W8)\n");
     }
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile, detail::bind_artifact(binder, features, options.pipeline_stage_first,
-                                               options.pipeline_stage_last, bank_q4,
-                                               options.load_progress)));
+    auto plan = detail::bind_artifact(binder, features, options.pipeline_stage_first,
+                                      options.pipeline_stage_last, bank_q4, options.load_progress);
+    // What the runtime will derive from the resident weights once they are on the device: the
+    // registry subtracts it from free memory before it resolves the KV capacity, so a pool that
+    // sizes itself before that point has to leave it as well.
+    // ...and the weights themselves, which at pool-sizing time are still in the artifact: the
+    // pool is created before the engine measures free memory, and that measurement happens
+    // before materialisation too.
+    detail::Variant::configure_derived_reserve(
+        targets::projected_derived_residency_bytes(binder, plan.materialization) +
+        static_cast<std::size_t>(plan.materialization.device_capacity_bytes));
+    return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(plan)));
 }
 
 SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
@@ -122,8 +127,16 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         WeightsProfile weights_profile,
                                                         const family::TextGeometry& geometry) {
     // The expert slot pool is device memory the KV planner must not count as free: create it
-    // here, before the engine measures free memory for `--kv-capacity auto`.
-    detail::Variant::configure_expert_slots(options.expert_slots);
+    // here, before the engine measures free memory for `--kv-capacity auto`. The planner is
+    // built first because its capacity curve says the least the runtime must be left --
+    // KV floor, round state, workspaces -- and a pool that sizes itself must leave that,
+    // plus the automatic headroom, or the engine refuses to start once it asks for it.
+    auto planner = family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
+                                                                 geometry);
+    const std::size_t runtime_floor =
+        planner.capacity_curve().minimum_device_reservation_bytes +
+        options.kv_capacity.automatic_headroom_bytes + detail::Variant::derived_reserve();
+    detail::Variant::configure_expert_slots(options.expert_slots, runtime_floor);
     {
         // A pipeline stage whose pool holds (nearly) all of its layers' experts gains nothing
         // from the CPU split — every layer would still pay a host round trip — so the split
@@ -154,8 +167,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
         detail::Variant::prewarm_device_scratch();
         CUDA_CHECK(cudaSetDevice(previous));
     }
-    return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                         geometry);
+    return planner;
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {

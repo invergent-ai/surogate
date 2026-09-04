@@ -44,7 +44,11 @@ int main(int argc, char** argv) {
             (*v)[i + 1] = static_cast<std::byte>(0x21);
         }
     }
-    const ops::CpuExpertBank bank{gc.data(), gs.data(), dc.data(), ds.data()};
+    ops::CpuExpertBank bank;
+    bank.gate_up_codes = gc.data();
+    bank.gate_up_scales = gs.data();
+    bank.down_codes = dc.data();
+    bank.down_scales = ds.data();
 
     const int tokens = std::max(1, jobs_per_round / geometry.experts_per_token);
     std::vector<std::uint16_t> x(static_cast<std::size_t>(geometry.hidden) * tokens);

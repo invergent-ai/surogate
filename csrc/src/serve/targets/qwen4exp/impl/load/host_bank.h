@@ -9,6 +9,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "core/tensor.h"
 
 #include <cstddef>
 #include <memory>
@@ -33,6 +34,15 @@ struct HostObjectPlan {
     std::int64_t q4_rows           = 0;
     std::int32_t q4_k              = 0;
     std::size_t q4_w8_scale_offset = 0;
+    // Non-zero: the object is a GGUF's own blocks (`decode_type`, `parts` in row order), and the
+    // bank decodes them into W8 row-split planes while it copies -- `decode_rows x decode_k`
+    // weights, 32 int8 codes and one FP16 scale per group, amax/127, the same requantisation
+    // the device gather does. The bank then holds exactly what a converted artifact would have
+    // handed it: the gather is a copy, the host expert path reads planes, and the file is
+    // still the only copy of the experts on disk.
+    std::int64_t decode_rows = 0;
+    std::int32_t decode_k    = 0;
+    QType decode_type        = QType::W8G32_F16S; // meaningless unless decode_rows != 0
 };
 
 struct HostBankPlan {

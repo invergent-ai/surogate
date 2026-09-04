@@ -13,6 +13,9 @@
 #include <memory>
 #include <variant>
 
+#include "artifact/binder.h"
+#include "artifact/materializer.h"
+
 namespace sinfer {
 
 struct DeviceContext;
@@ -113,6 +116,13 @@ struct ConstructedTarget {
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,
                                                  DeviceContext& device);
+
+/// Device bytes the runtime will derive from the resident W8 weights (FP8/FP4 planes, Marlin
+/// tiles) -- 1.5x their size, an over-estimate on purpose. Subtracted from what is free before
+/// the KV capacity is resolved; a target that sizes its own device pools before that point
+/// must leave it too, which is why it is declared rather than kept to the registry.
+std::size_t projected_derived_residency_bytes(const artifact::Binder& binder,
+                                              const artifact::MaterializationPlan& plan);
 
 } // namespace targets
 } // namespace sinfer

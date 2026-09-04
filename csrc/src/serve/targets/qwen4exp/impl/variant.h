@@ -77,7 +77,13 @@ struct Variant {
     /// Number of expert slots the cache on the current device should hold (0 disables); read
     /// when the cache is created in prewarm_device_scratch. SUROGATE_SERVE_EXPERT_SLOTS is the
     /// fallback when nothing was configured.
-    static void configure_expert_slots(std::uint32_t slots);
+    /// `runtime_floor_bytes`: what the runtime must be left after the pool (KV floor and
+    /// headroom); an automatic pool never sizes itself into it.
+    static void configure_expert_slots(std::uint32_t slots, std::size_t runtime_floor_bytes = 0);
+    /// The registry's projection of what the runtime derives from the resident weights, stashed
+    /// at plan time so the pool can leave it.
+    static void configure_derived_reserve(std::size_t bytes);
+    [[nodiscard]] static std::size_t derived_reserve();
     /// Fraction of a round's missing experts the host computes (SUROGATE_SERVE_CPU_MOE_SHARE is
     /// the fallback when nothing was configured).
     static void configure_cpu_moe_share(float share);

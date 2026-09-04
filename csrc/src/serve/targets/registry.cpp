@@ -125,6 +125,8 @@ std::size_t subtract_saturating(std::size_t value, std::size_t amount) noexcept 
 // Only W8-format tensors are ever derived, so an artifact resident in NVFP4 or
 // FP8 projects nothing and keeps the capacity it had, and a new architecture
 // inherits the reserve from its weight formats without naming itself here.
+} // namespace
+
 std::size_t projected_derived_residency_bytes(const artifact::Binder& binder,
                                               const artifact::MaterializationPlan& plan) {
     if (!ops::detail::w8fp8_plane_enabled() && !ops::detail::marlin_plane_enabled()) { return 0; }
@@ -143,6 +145,8 @@ std::size_t projected_derived_residency_bytes(const artifact::Binder& binder,
     // costs cache.
     return static_cast<std::size_t>(w8_bytes + w8_bytes / 2U);
 }
+
+namespace {
 
 // `max_context = 0` asks for the largest context the device can hold. The per-request ceiling
 // sizes the KV floor (one sequence at full length must fit) and the block tables; the pool

@@ -22,6 +22,11 @@
 #include <condition_variable>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
+#include <array>
+#include <set>
+#include <sstream>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -837,6 +842,88 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
 
 namespace {
 
+/// How busy the host is right now: logical CPUs that spent more than half of a short
+/// window doing someone's work. Two readings of /proc/stat, 100 ms apart.
+struct HostLoad {
+    unsigned busy_logical_cpus = 0;
+};
+
+std::vector<std::array<unsigned long long, 2>> read_cpu_times() {
+    // per cpu: {busy, total}
+    std::vector<std::array<unsigned long long, 2>> out;
+    std::ifstream stat("/proc/stat");
+    std::string line;
+    while (std::getline(stat, line)) {
+        if (line.rfind("cpu", 0) != 0 || line.size() < 4 || !std::isdigit(static_cast<unsigned char>(line[3]))) {
+            continue;
+        }
+        std::istringstream fields(line.substr(line.find(' ')));
+        unsigned long long v[10] = {};
+        int n = 0;
+        while (n < 10 && (fields >> v[n])) { ++n; }
+        // user nice system idle iowait irq softirq steal
+        const unsigned long long idle  = v[3] + v[4];
+        unsigned long long total       = 0;
+        for (int i = 0; i < n; ++i) { total += v[i]; }
+        out.push_back({total - idle, total});
+    }
+    return out;
+}
+
+/// This process's own CPU time (utime + stime, clock ticks) from /proc/self/stat.
+unsigned long long own_cpu_ticks() {
+    std::ifstream stat("/proc/self/stat");
+    std::string line;
+    if (!std::getline(stat, line)) { return 0; }
+    // Fields after the parenthesised command name: state is 3rd, utime 14th, stime 15th.
+    const auto close = line.rfind(')');
+    std::istringstream rest(line.substr(close + 1));
+    std::string field;
+    unsigned long long utime = 0, stime = 0;
+    for (int i = 3; i <= 15 && (rest >> field); ++i) {
+        if (i == 14) { utime = std::strtoull(field.c_str(), nullptr, 10); }
+        if (i == 15) { stime = std::strtoull(field.c_str(), nullptr, 10); }
+    }
+    return utime + stime;
+}
+
+HostLoad sample_host_load() {
+    HostLoad load;
+    const auto a           = read_cpu_times();
+    const auto own_a       = own_cpu_ticks();
+    if (a.empty()) { return load; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto b     = read_cpu_times();
+    const auto own_b = own_cpu_ticks();
+    unsigned busy = 0;
+    unsigned long long window_ticks = 0;
+    for (std::size_t i = 0; i < std::min(a.size(), b.size()); ++i) {
+        const unsigned long long cpu_busy  = b[i][0] - a[i][0];
+        const unsigned long long cpu_total = b[i][1] - a[i][1];
+        window_ticks = std::max(window_ticks, cpu_total);
+        if (cpu_total > 0 && cpu_busy * 2 > cpu_total) { ++busy; }
+    }
+    // The load that is *ours* -- the expert bank still being decoded on thirty-odd threads
+    // when the pool is built -- is not competition for the workers; only what remains is.
+    const unsigned own_busy_cpus =
+        window_ticks > 0 ? static_cast<unsigned>((own_b - own_a + window_ticks / 2) / window_ticks) : 0;
+    load.busy_logical_cpus = busy > own_busy_cpus ? busy - own_busy_cpus : 0;
+    return load;
+}
+
+unsigned physical_core_count() {
+    // Distinct (package, core) pairs from sysfs; the logical count halved as the fallback.
+    std::set<std::pair<int, int>> cores;
+    for (unsigned cpu = 0; cpu < std::thread::hardware_concurrency(); ++cpu) {
+        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
+        std::ifstream core(base + "core_id"), pkg(base + "physical_package_id");
+        int c = -1, p = -1;
+        if (core >> c && pkg >> p) { cores.emplace(p, c); }
+    }
+    if (!cores.empty()) { return static_cast<unsigned>(cores.size()); }
+    return std::max(1U, std::thread::hardware_concurrency() / 2);
+}
+
 constexpr int kPhases      = 4;
 constexpr int kPhaseAChunks = 8;  // gate/up: intermediate split into 8 row ranges
 constexpr int kPhaseBChunks = 8;  // down: hidden split into 8 row ranges
@@ -1389,6 +1476,36 @@ struct CpuExpertPool::Impl {
 
 CpuExpertPool::CpuExpertPool(const SparseMoeGeometry& geometry, Options options)
     : impl_(std::make_unique<Impl>()) {
+    // The pool's shape follows the host it lands on. One pinned worker per physical core is
+    // the fastest pool on an idle box (184-208 GB/s of expert bytes measured 2026-08-28) and
+    // the slowest on a shared one: a pinned worker whose core another job is using stalls
+    // every phase barrier, and the round runs at the pace of its unluckiest thread -- 32
+    // pinned workers read 4-10 GB/s on 2026-09-04 with a fifth of the cores busy, while 16
+    // unpinned ones read 188 and 28 unpinned 194. So: when the host is busy, leave the
+    // busy cores out of the count and let the scheduler move the workers; pin only when
+    // nothing else is running. Both knobs stay overridable.
+    if (options.threads == 0 && options.cpus.empty()) {
+        const HostLoad load = sample_host_load();
+        if (load.busy_logical_cpus > 0) {
+            const unsigned physical = physical_core_count();
+            const unsigned busy     = std::min(load.busy_logical_cpus, physical);
+            const unsigned spare    = physical > busy + 2 ? physical - busy - 2 : 0;
+            options.threads         = std::max(8U, std::min(physical, spare));
+            options.pin_threads     = false;
+            std::fprintf(stderr,
+                         "cpu_expert_compute: host has %u busy cpus; %u unpinned workers\n",
+                         load.busy_logical_cpus, options.threads);
+        }
+    }
+    // SUROGATE_CPU_EXPERT_PIN=0 leaves the workers unpinned regardless of the host's load.
+    if (const char* pin = std::getenv("SUROGATE_CPU_EXPERT_PIN"); pin != nullptr && *pin == '0') {
+        options.pin_threads = false;
+    }
+    // SUROGATE_CPU_EXPERT_THREADS=N overrides the worker count.
+    if (const char* n = std::getenv("SUROGATE_CPU_EXPERT_THREADS"); n != nullptr && *n != '\0') {
+        const long parsed = std::strtol(n, nullptr, 10);
+        if (parsed > 0 && options.cpus.empty()) { options.threads = static_cast<std::uint32_t>(parsed); }
+    }
     require_geometry(geometry);
     impl_->geometry = geometry;
     std::uint32_t threads = options.threads;

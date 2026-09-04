@@ -30,6 +30,13 @@ inline constexpr std::size_t kTextLayers          = TextConfig::layers;
 inline constexpr std::size_t kFullAttentionLayers = TextConfig::full_attention_layers();
 inline constexpr std::size_t kGdnLayers           = TextConfig::gdn_layers();
 
+/// How the pinned expert bank holds the routed experts.
+enum class HostBankMode : std::uint8_t {
+    Native,   ///< the artifact's own bytes: W8 planes from a converted one, blocks from a GGUF
+    DecodeW8, ///< a GGUF's blocks decoded into W8 planes on the way into pinned memory
+    Q4,       ///< W8 planes requantised to Q4G32AM on the way in
+};
+
 struct HyperConnectionPlan {
     artifact::ObjectHandle norm;
     artifact::ObjectHandle down;

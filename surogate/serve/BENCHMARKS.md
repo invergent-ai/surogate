@@ -175,22 +175,28 @@ gap because llama.cpp's server does not batch these as well as its kernels run.
 
 ### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
 
-All surogate rows: 2026-08-30 22:xx, the `b4ee3216` binary (CPU prefill split off by default —
-its removal is the night's +38 % to +64 %), fp8 KV, x16 cards. llama.cpp rows: `-cmoe
+All surogate one-card rows: 2026-09-04, the native GGUF read in place (no artifact repack — the
+Q4G32AM host bank is decoded from the file's blocks at load), **engine defaults**: no
+`--expert-slots`, no `--host-expert-bank`, the pool and the host worker pool size themselves;
+`--cpu-moe-share auto --kv-capacity auto --max-model-len 4096`, chunk 8,192, fp8 KV, GPU 0 —
+an **x16** card (GPUs 2, 3, 5 and 7 of this host are x8 and read half the gather rate). The
+eight-card rows are still the 2026-08-30 `b4ee3216` pass on the repacked artifact. The 08-30
+one-card rows this replaces read 32.0 / 91.1 / 110.1 decode at 1 / 16 / 64 users; the day's
+recovery from 18.8 is in `design/INFERENCE.md`. llama.cpp rows: `-cmoe
 -b 4096 -ub 4096`, the flags its own community benchmarks use — the earlier `-ot exps=CPU` rows
 without batch flags understated it 3.9× and are gone.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 1 | **143** | **32.0** | **175** | **0.85 s** | chunk 8,192, `--expert-slots 3000 --host-expert-bank q4 --cpu-moe-share auto`; decode split auto (70 % of misses), prefill split off. Correctness at this config: coherence 24/24 under 16 users, and the ~1-2 % chunkcount/longprompt miss rate is the model's base rate — present identically with `--no-prefix-reuse` and at the old chunk (three arms × 88 probes) |
-| llama.cpp | 1 | 1 | 93 | 20.8 | 114 | 2.95 s | same GGUF the artifact repacks. surogate **+54 % decode, 3.5× the prompt rate** |
+| **surogate** | 1 | 1 | **145** | **32.6** | **178** | **0.84 s** | defaults: pool 3,004 slots (14.6 GiB, sized to leave the runtime its floor), 22 unpinned host workers (8 cpus busy with other jobs), host 136 GB/s vs PCIe 46 → 75 % of misses on the host, min-tokens 1 so the split fires on one-token rounds |
+| llama.cpp | 1 | 1 | 93 | 20.8 | 114 | 2.95 s | the same GGUF, served by both engines as the file's own blocks now. surogate **+57 % decode, 3.5× the prompt rate** |
 | **surogate** | 1 | 1 | — | **40.8** | — | **7.06 s** | 28k prompt into 131k context (23.1 GiB VRAM): **3,966 tok/s prompt processing**; decode is the post-28k stream rate |
 | llama.cpp | 1 | 1 | — | 27.3 | — | 23.02 s | 28k prompt, 80k context: 1,216 tok/s prompt processing. surogate **3.3× ingestion, +49 % decode** |
 | cafe-llama.cpp `-hmoe` | 1 | 1 | — | 18.8 / 4.3 | — | 3.55 s / 25.46 s | 512 and 28k prompts. Experts pinned in host memory, computed on the GPU over PCIe — **our architecture in their engine** (935-1,100 tok/s at 28k); kept as the like-for-like reference |
-| **surogate** | 1 | 16 | **406** | **91.1** | **497** | **1.75 s** | same config; the old 66.9 row was the prefill split's tax on every mixed round |
-| llama.cpp | 1 | 16 | 253 | 56.8 | 310 | 16.17 s | `-np 16`. surogate **+60 % decode at 9× lower TTFT** |
-| **surogate** | 1 | 64 | **491** | **110.1** | **601** | **6.17 s** | `--expert-slots 2000` so 64 lanes fit; old row 73.8 |
-| llama.cpp | 1 | 64 | 46 | 10.4 | 56 | 655 s | `-np 64`: CPU expert compute serialises across 64 decodes and the queue is the run — every request ~13 min. surogate **10.6×** |
+| **surogate** | 1 | 16 | **374** | **83.9** | **457** | **1.74 s** | defaults, `--max-num-seqs 16`: KV auto 65,536 tokens; 20 unpinned host workers. Run-to-run spread at 16 users is ~±8 % (86.8 on the same day with the board's explicit flags) |
+| llama.cpp | 1 | 16 | 253 | 56.8 | 310 | 16.17 s | `-np 16`. surogate **+48 % decode at 9× lower TTFT** |
+| **surogate** | 1 | 64 | **464** | **104.1** | **568** | **5.14 s** | defaults, `--max-num-seqs 64 --max-pending-requests 512`: the pool sized itself to 1,985 slots so 64 lanes' KV fits (74,240 tokens) — the 2,000 the old row set by hand, derived |
+| llama.cpp | 1 | 64 | 46 | 10.4 | 56 | 655 s | `-np 64`: CPU expert compute serialises across 64 decodes and the queue is the run — every request ~13 min. surogate **10.0×** |
 | ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels, `-ot exps=CPU` |
 | ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s |  |
 | ik_llama.cpp | 1 | 1 | 1,068 | 40.4 | — | — | **reported, not measured here** (2026-08-30): same commit 7cff686d on an **RTX 3090 24 GB + Ryzen 9 9950X**, AD-4.27bpw Q4_K_M, 3-run average at temperature 0, single slot, 10,006-token prompt without cache reuse, 128 generated; KV Q8_0/Q8_0 (their setting — no board row of ours quantises the KV), 22.1 GB VRAM |

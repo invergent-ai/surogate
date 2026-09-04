@@ -80,13 +80,17 @@ A mixture-of-experts model whose experts do not fit on the card turns on the off
 ```bash
 surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
   --port 8080 \
-  --max-num-seqs 16 --max-model-len 2048 --kv-capacity auto \
-  --expert-slots 3000 \
+  --max-num-seqs 16 --max-model-len 4096 --kv-capacity auto \
   --cpu-moe-share auto
 ```
 
-- `--expert-slots N` sizes the device LRU cache of experts and turns on the pinned host bank.
-  Use fewer slots (≈2000) at 32–64 lanes so CUDA graphs and the KV pool still fit.
+- The device expert cache sizes itself: it takes what the card has left after the weights,
+  the KV floor for `--max-num-seqs` lanes and the runtime's own reservation, so 64 lanes
+  simply get a smaller pool. `--expert-slots N` still fixes it by hand.
+- The pinned host bank holds the GGUF's experts decoded to Q4G32AM (about 88 GB for
+  Flash-Next; built at load, ~70 s). The host worker pool follows the machine's load: one
+  pinned worker per physical core on an idle box, fewer and unpinned when other jobs are
+  running.
 - `--cpu-moe-share auto` measures host-memory versus PCIe rates at startup and splits routed
   expert work accordingly. `--cpu-moe-prefill-share 0.7` suits a single user; `0` turns the
   prefill split off.
