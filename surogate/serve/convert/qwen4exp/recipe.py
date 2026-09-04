@@ -61,6 +61,9 @@ NATIVE_EXCLUDE_SUFFIXES = (
     "gdn/output",
     "mlp/shared_gate_up",
     "mlp/shared_down",
+    # The draft head's embedding/hidden fold is an ordinary W8 matmul, so it takes the
+    # row-split planes like every other one rather than staying a block format.
+    "mtp/input_projection",
 )
 
 #: The PLE n-gram table: one GGUF tensor, IQ4_NL, read where it lies. It is not in

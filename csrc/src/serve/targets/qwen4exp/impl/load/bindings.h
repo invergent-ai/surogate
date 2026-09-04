@@ -98,6 +98,22 @@ struct TextLayerPlan {
     bool resident = true;
 };
 
+/// The NextN/MTP draft head. Structurally a trunk full-attention block, so it carries a
+/// `TextLayerPlan` unchanged; only the tensors on either side of it are the head's own.
+/// `embedding_norm`/`hidden_norm`/`input_projection` fold the next token's embedding into the
+/// wide residual on the way in, and `head_mix` collapses the four streams on the way out,
+/// standing in for the output norm this architecture does not have. The embedding table and
+/// the LM head are the trunk's -- the export carries neither.
+struct MtpPlan {
+    bool present = false;  ///< the artifact carries a head
+    bool resident = false; ///< ...and this run asked for one, so its weights are on the device
+    artifact::ObjectHandle embedding_norm;   // [hidden]
+    artifact::ObjectHandle hidden_norm;      // [residual]
+    artifact::ObjectHandle input_projection; // [hidden, 2 * hidden]
+    TextLayerPlan layer;
+    HyperConnectionPlan head_mix;
+};
+
 struct BindingPlan {
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
@@ -125,6 +141,7 @@ struct BindingPlan {
     family::VisionMergerNormPlan vision_merger_norm;
     //: false when the source carried no tower (GGUF exports drop it).
     bool has_vision = false;
+    MtpPlan mtp;
     // Host-resident objects are copied out of the artifact mapping while the reader lives.
     HostBankPlan host_bank;
 };

@@ -98,6 +98,33 @@ HyperConnectionPlan bind_hc(artifact::Binder& binder, const std::string& prefix,
     return plan;
 }
 
+/// One full-attention block's weights. The MTP draft head binds the same set: its block is
+/// structurally a trunk block, so it reads the same objects under its own prefix.
+void bind_full_attention(artifact::Binder& binder, const std::string& prefix,
+                         FullAttentionPlan& out) {
+    out.query_key_gate_value =
+        device(binder, prefix + "query_key_gate_value", NumericFormat::W8G32_F16S,
+               {TextConfig::query_projection_rows, kHidden});
+    out.query_norm = device(binder, prefix + "query_norm", NumericFormat::BF16,
+                            {TextConfig::head_dim});
+    out.key_norm   = device(binder, prefix + "key_norm", NumericFormat::BF16,
+                            {TextConfig::head_dim});
+    out.output     = device(binder, prefix + "output", NumericFormat::W8G32_F16S,
+                            {kHidden, TextConfig::query_size});
+    // QSA indexer (design/INFERENCE.md, phase 4): resident on the layers this program runs;
+    // the selection only engages past `dense_exact_context`.
+    out.indexer.query =
+        device(binder, prefix + "indexer/query", NumericFormat::BF16,
+               {static_cast<std::uint64_t>(TextConfig::indexer_heads) * TextConfig::indexer_head_dim,
+                kHidden});
+    out.indexer.key = device(binder, prefix + "indexer/key", NumericFormat::BF16,
+                             {TextConfig::indexer_head_dim, kHidden});
+    out.indexer.query_norm = device(binder, prefix + "indexer/query_norm", NumericFormat::BF16,
+                                    {TextConfig::indexer_head_dim});
+    out.indexer.key_norm   = device(binder, prefix + "indexer/key_norm", NumericFormat::BF16,
+                                    {TextConfig::indexer_head_dim});
+}
+
 MoePlan bind_moe(artifact::Binder& binder, HostBankPlan& bank, const std::string& prefix,
                  bool q4) {
     // The Q4 bank still asks for W8 planes, because its requantiser reads them. Otherwise the
@@ -339,33 +366,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
         target.hc_mlp            = bind_hc(binder, prefix + "hc_ffn/", true);
         target.is_full_attention = TextConfig::is_full_attention(static_cast<int>(layer));
         if (target.is_full_attention) {
-            target.attention.query_key_gate_value =
-                device(binder, prefix + "attention/query_key_gate_value",
-                       NumericFormat::W8G32_F16S, {TextConfig::query_projection_rows, kHidden});
-            target.attention.query_norm = device(binder, prefix + "attention/query_norm",
-                                                 NumericFormat::BF16, {TextConfig::head_dim});
-            target.attention.key_norm   = device(binder, prefix + "attention/key_norm",
-                                                 NumericFormat::BF16, {TextConfig::head_dim});
-            target.attention.output = device(binder, prefix + "attention/output",
-                                             NumericFormat::W8G32_F16S,
-                                             {kHidden, TextConfig::query_size});
-            // The QSA indexer arrives with the artifact; dense attention serves the exact
-            // context range for now, so its weights are validated but not resident.
-            // QSA indexer (design/INFERENCE.md, phase 4): resident on the layers this
-            // program runs; the selection only engages past `dense_exact_context`.
-            target.attention.indexer.query =
-                device(binder, prefix + "attention/indexer/query", NumericFormat::BF16,
-                       {static_cast<std::uint64_t>(TextConfig::indexer_heads) *
-                            TextConfig::indexer_head_dim,
-                        kHidden});
-            target.attention.indexer.key = device(binder, prefix + "attention/indexer/key",
-                                        NumericFormat::BF16, {TextConfig::indexer_head_dim, kHidden});
-            target.attention.indexer.query_norm =
-                device(binder, prefix + "attention/indexer/query_norm", NumericFormat::BF16,
-                       {TextConfig::indexer_head_dim});
-            target.attention.indexer.key_norm =
-                device(binder, prefix + "attention/indexer/key_norm", NumericFormat::BF16,
-                       {TextConfig::indexer_head_dim});
+            bind_full_attention(binder, prefix + "attention/", target.attention);
         } else {
             target.gdn.a_log   = device(binder, prefix + "gdn/a_log", NumericFormat::FP32,
                                         {TextConfig::gdn_value_heads});
@@ -406,6 +407,30 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
 
     out.output_mix  = bind_hc(binder, "text/output_hc/", false);
     out.output_head = device(binder, "text/output_head", NumericFormat::W8G32_F16S, {kVocab, kHidden});
+
+    // The NextN draft head. Bound whenever the artifact carries one, because every object an
+    // artifact holds has to be consumed by the target that reads it -- but resident only when
+    // the run asked for a draft head, since it is 2.75 GB of weights that an ordinary run
+    // never touches.
+    out.mtp.present = binder.has("mtp/input_projection");
+    if (out.mtp.present) {
+        MtpPlan& mtp      = out.mtp;
+        mtp.resident      = features.mtp();
+        g_layer_placement = mtp.resident ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
+        mtp.embedding_norm = device(binder, "mtp/embedding_norm", NumericFormat::FP32, {kHidden});
+        mtp.hidden_norm    = device(binder, "mtp/hidden_norm", NumericFormat::FP32, {kHcWidth});
+        // fc_embedding and fc_hidden fused side by side, so one matmul over
+        // concat(embedding_norm(e), hidden_norm(h)) is fc_embedding@e + fc_hidden@h.
+        mtp.input_projection = device(binder, "mtp/input_projection", NumericFormat::W8G32_F16S,
+                                      {kHidden, 2 * kHidden});
+        mtp.layer.is_full_attention = true;
+        mtp.layer.hc_attention      = bind_hc(binder, "mtp/layer/hc_attn/", true);
+        bind_full_attention(binder, "mtp/layer/attention/", mtp.layer.attention);
+        mtp.layer.hc_mlp = bind_hc(binder, "mtp/layer/hc_ffn/", true);
+        mtp.layer.moe    = bind_moe(binder, out.host_bank, "mtp/layer/mlp/", out.host_bank_q4);
+        mtp.head_mix     = bind_hc(binder, "mtp/head_hc/", false);
+        g_layer_placement = TensorPlacement::Device;
+    }
 
     const artifact::ObjectHandle multipliers =
         artifact::bind_tensor(binder, "text/ple/multipliers", NumericFormat::I32,
