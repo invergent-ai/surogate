@@ -461,6 +461,23 @@ def grpo_colocate(
     )
     watchdog_thread.start()
 
+    # A terminal Ctrl-C reaches vLLM's EngineCore children too: unlike the split
+    # runner, colocate does not `setsid` them, so they share our process group.
+    # They die, `_run_vllm_server` sets `error_event`, and if the watchdog wins
+    # that race a user-initiated stop is reported as a component crash and exits
+    # non-zero. Marking the shutdown planned *before* the interrupt propagates
+    # makes the watchdog return quietly, so an interrupt stays an interrupt.
+    def _interrupt_is_a_planned_stop(signum, frame):
+        shutdown_event.set()
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _interrupt_is_a_planned_stop)
+    except ValueError:
+        # Not the main thread, so there is no handler to install. Nothing below
+        # depends on it; the teardown mask is installed separately.
+        pass
+
     try:
         from surogate.grpo.orchestrator.grpo_orch import orchestrate
 
@@ -476,6 +493,14 @@ def grpo_colocate(
         logger.error(f"Orchestrator error: {e}")
         raise
     finally:
+        # Mask FIRST. The watchdog can pass its own `shutdown_event` check and
+        # still be inside `logger.error` when we enter here; its `os.kill` would
+        # then land during the joins below, raise KeyboardInterrupt out of this
+        # `finally`, and skip the event-loop stop, the joins and the raise after
+        # it. Split has masked here all along; colocate did not.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
         logger.info("GRPO pipeline shutting down")
 
         # Tell the watchdog this teardown is intentional and tell the vLLM

@@ -181,6 +181,54 @@ def test_a_planned_teardown_is_not_reported_as_a_crash():
     assert not killed.called
 
 
+def test_a_late_trainer_crash_is_not_discarded_by_teardown():
+    """The re-check added for planned teardown must not swallow a real crash.
+
+    Teardown kills the vLLM subprocesses, so their sentinels fire exactly like a
+    crash and have to be re-checked against `shutdown_event`. The trainer is
+    different: teardown only *joins* that thread, so `trainer_failed` is never a
+    consequence of shutting down. Applying the re-check to it as well downgraded
+    a trainer that died on the final step to a clean exit 0.
+    """
+    trainer_failed = threading.Event()
+    trainer_failed.set()
+    abort = AbortReason()
+
+    # is_set() is read by the `while`, then the post-wait guard. Teardown lands
+    # right after, which used to discard the crash the watchdog had just seen.
+    shutdown = mock.MagicMock()
+    shutdown.is_set.side_effect = [False, False, True, True, True]
+
+    with (
+        mock.patch.object(split.multiprocessing.connection, "wait", return_value=[]),
+        mock.patch.object(split.os, "kill") as killed,
+    ):
+        split._watch_components([], trainer_failed, shutdown, abort)
+
+    assert abort.reason, "a trainer crash must survive a concurrent teardown"
+    assert killed.called
+
+
+def test_a_colocate_interrupt_marks_the_shutdown_planned():
+    """A terminal Ctrl-C also reaches vLLM's EngineCore children, which colocate
+    does not `setsid`. They die, the vLLM thread sets `error_event`, and the
+    watchdog would report a user stop as a component crash. The SIGINT handler
+    sets `shutdown_event` first so the watchdog returns quietly."""
+    error_event = threading.Event()
+    shutdown = threading.Event()
+    abort = AbortReason()
+
+    # What the handler does, then what the watchdog sees afterwards.
+    shutdown.set()
+    error_event.set()
+
+    with mock.patch.object(colocate.os, "kill") as killed:
+        colocate._watch_components(error_event, shutdown, abort)
+
+    assert abort.reason is None, "an interrupt is not a crash"
+    assert not killed.called
+
+
 def test_the_colocate_watchdog_records_why_it_aborted():
     error_event = threading.Event()
     error_event.set()

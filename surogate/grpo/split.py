@@ -124,14 +124,19 @@ def _watch_components(
                 crashed = f"{label} subprocess died unexpectedly (exitcode={proc.exitcode})"
                 break
         if crashed:
+            # Only a sentinel can fire as a side effect of planned teardown, which
+            # kills the vLLM subprocesses; re-check before calling that a crash, or
+            # a successful run gets marked failed. The trainer branch below needs
+            # no such re-check: teardown only *joins* the trainer thread, so
+            # `trainer_failed` is never a consequence of shutting down, and
+            # discarding it here would downgrade a real late crash to exit 0.
+            if shutdown_event.is_set():
+                return
             break
         if trainer_failed.is_set():
             crashed = "Trainer thread crashed"
             break
-    # Re-check: a planned teardown kills the vLLM subprocesses, so their
-    # sentinels fire exactly like a crash. Aborting on that would now mark a
-    # successful run as failed.
-    if crashed is None or shutdown_event.is_set():
+    if crashed is None:
         return
     logger.error(f"{crashed} — aborting GRPO pipeline")
     # Record before signalling: the main thread reads this to tell our own
@@ -256,16 +261,20 @@ def grpo_split(
         logger.error(f"Split GRPO pipeline error: {e}")
         raise
     finally:
+        # Mask FIRST, before anything that can be interrupted. These two lines
+        # used to sit below the log and the event set, leaving a window where a
+        # watchdog SIGINT would raise inside the `finally` itself -- skipping the
+        # vLLM reap entirely and stranding the process trees on their GPUs, which
+        # is the exact outcome the trailing raise is placed after teardown to
+        # avoid. Also covers a second Ctrl-C during cleanup.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
         logger.info("Split GRPO pipeline shutting down")
 
         # Tell the watchdog this teardown is intentional; otherwise it would see
         # vLLM's planned death and re-fire SIGINT.
         shutdown_event.set()
-
-        # Ignore further Ctrl-Cs/SIGTERMs so cleanup runs to completion. Without this,
-        # a second Ctrl-C interrupts the vLLM teardown and leaks the subprocess tree.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
         # Reap vLLMs in parallel — each can take up to 15s on SIGTERM→SIGKILL escalation.
         # Sequential teardown would double that on a typical RULER topology. This is the
