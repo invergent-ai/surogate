@@ -287,7 +287,8 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
                                                     first, last);
     }
     return ops::attn_input_proj_workspace_capacity_bytes(
-        QType::W8G32_F16S, 9216, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
+        QType::W8G32_F16S, TextConfig::mtp_attention_input_rows, TextConfig::hidden,
+        ops::LinearPolicy::A16Only, first, last);
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights,
@@ -319,7 +320,8 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(const family:
                                                              ops::LinearPolicy::AllowA4, first, last));
     }
     return ops::gdn_input_proj_workspace_capacity_bytes(
-        QType::W8G32_F16S, 12288, TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
+        QType::W8G32_F16S, TextConfig::convolution_dim + TextConfig::value_dim,
+        TextConfig::hidden, ops::LinearPolicy::A16Only, first, last);
 }
 
 std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights,

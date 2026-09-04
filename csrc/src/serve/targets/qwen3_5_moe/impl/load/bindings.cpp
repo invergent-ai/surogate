@@ -178,8 +178,8 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
             bind(prefix + "routed_down_act_scale", NumericFormat::FP32, {kRoutedExperts});
         plan.routed_down_alpha =
             bind(prefix + "routed_down_alpha", NumericFormat::FP32, {kRoutedExperts});
-        require_identity_divisor(binder, plan.routed_down.object, prefix + "routed_down", 524288,
-                                 512);
+        require_identity_divisor(binder, plan.routed_down.object, prefix + "routed_down",
+                                 kExperts * g.hidden, g.intermediate);
     }
     return plan;
 }
@@ -189,7 +189,7 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
     SparseMoePayload payload{
         .op = {
             .router_shared_gate = artifact::materialized_weight(
-                materialized, plan.router_shared_gate, NumericFormat::BF16, 257, 2048),
+                materialized, plan.router_shared_gate, NumericFormat::BF16, kExperts + 1, g.hidden),
             // The stored format decides how these bytes are read. Passing the profile's
             // expectation instead decoded a GGUF's Q4_K/Q5_K superblocks as the groupwise-int
             // row-split codec: same byte count, entirely different meaning, and every routed
@@ -242,7 +242,6 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
 }
 
 void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle) {
-    constexpr std::size_t kDraftVocab     = 131072;
     constexpr std::size_t kTokenizerVocab = 248077;
     const auto bytes                      = binder.payload(handle).data;
     std::vector<bool> seen(kTokenizerVocab, false);
@@ -288,9 +287,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
             if (binder.has(prefix + "attention/query")) {
                 target.attention.split = SplitAttentionPlan{
                     .query = artifact::bind_linear(binder, prefix + "attention/query", g.query_size(), g.hidden),
-                    .key   = artifact::bind_linear(binder, prefix + "attention/key", 512, 2048),
+                    .key   = artifact::bind_linear(binder, prefix + "attention/key", g.kv_size(), g.hidden),
                     .gate  = artifact::bind_linear(binder, prefix + "attention/gate", g.query_size(), g.hidden),
-                    .value = artifact::bind_linear(binder, prefix + "attention/value", 512, 2048),
+                    .value = artifact::bind_linear(binder, prefix + "attention/value", g.kv_size(), g.hidden),
                 };
             } else {
                 target.attention.query_key_gate_value = artifact::bind_linear(
@@ -341,7 +340,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
     // A GGUF serves the draft head as its own K-quant; a converted checkpoint as Q4.
-    out.draft_head = artifact::bind_linear(binder, "text/draft_head", 131072, 2048,
+    out.draft_head = artifact::bind_linear(binder, "text/draft_head", kDraftVocab, g.hidden,
                                            proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
         binder, "text/draft_head_token_ids", NumericFormat::I32, {kDraftVocab},
@@ -369,13 +368,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
         out.mtp.hidden_norm    = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {g.hidden});
         out.mtp.input_norm     = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {g.hidden});
         out.mtp.attention.query_key_gate_value = artifact::bind_linear(
-            binder, "mtp/layer/attention/query_key_gate_value", 9216, 2048, mtp_placement);
+            binder, "mtp/layer/attention/query_key_gate_value", g.mtp_attention_input_rows(),
+            g.hidden, mtp_placement);
         out.mtp.attention.query_norm =
             bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {g.head_dim});
         out.mtp.attention.key_norm =
             bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {g.head_dim});
         out.mtp.attention.output =
-            artifact::bind_linear(binder, "mtp/layer/attention/output", 2048, 4096, mtp_placement);
+            artifact::bind_linear(binder, "mtp/layer/attention/output", g.hidden, g.query_size(),
+                                  mtp_placement);
         out.mtp.post_attention_norm =
             bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {g.hidden});
         out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
@@ -486,9 +487,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 const SplitAttentionPlan& split = *source.attention.split;
                 target.projection.split         = SplitAttentionWeights{
                             .query = artifact::materialized_linear(backing, split.query, g.query_size(), g.hidden),
-                            .key   = artifact::materialized_linear(backing, split.key, 512, 2048),
+                            .key   = artifact::materialized_linear(backing, split.key, g.kv_size(), g.hidden),
                             .gate  = artifact::materialized_linear(backing, split.gate, g.query_size(), g.hidden),
-                            .value = artifact::materialized_linear(backing, split.value, 512, 2048),
+                            .value = artifact::materialized_linear(backing, split.value, g.kv_size(), g.hidden),
                 };
             } else {
                 target.projection.query_key_gate_value = artifact::materialized_linear(
@@ -515,7 +516,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.convolution = artifact::materialized_tensor(backing, source.gdn.convolution,
                                                                NumericFormat::BF16, {g.convolution_dim(), g.gdn_conv_kernel});
             target.projection.a_b_projection = artifact::materialized_weight(
-                backing, source.gdn.a_b_projection, NumericFormat::BF16, 64, 2048);
+                backing, source.gdn.a_b_projection, NumericFormat::BF16, 2 * g.gdn_value_heads,
+                g.hidden);
             if (source.gdn.split) {
                 const SplitGdnInputPlan& split = *source.gdn.split;
                 target.projection.split        = SplitGdnInputWeights{

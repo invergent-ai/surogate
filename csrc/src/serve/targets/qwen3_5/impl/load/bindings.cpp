@@ -575,8 +575,11 @@ void bind_nvfp4_all_text_layers(artifact::Binder& binder, BindingPlan& out) {
     }
 }
 
+/// Rows of the draft head. Not a geometry member: the shortlist is a property of the draft
+/// block, chosen when it was trained, and it is the same at every size of this family.
+constexpr std::int32_t kDraftVocab = 131072;
+
 void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle) {
-    constexpr std::size_t kDraftVocab     = 131072;
     constexpr std::size_t kTokenizerVocab = 248077;
     const auto bytes                      = binder.payload(handle).data;
     std::vector<bool> seen(kTokenizerVocab, false);
@@ -640,10 +643,11 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_linear(binder, "text/draft_head", 131072, g.hidden,
+    out.draft_head = artifact::bind_linear(binder, "text/draft_head", kDraftVocab, g.hidden,
                                            proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
-        binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
+        binder, "text/draft_head_token_ids", NumericFormat::I32, {kDraftVocab},
+        proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
     // Community GGUF exports often strip the MTP (nextn) block, so those artifacts carry no
@@ -796,9 +800,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     output_head = materialized_weight(backing, plan.output_head, g.output_rows, g.hidden);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
-        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, 131072, g.hidden);
+        proposal.head      = artifact::materialized_linear(backing, plan.draft_head, kDraftVocab, g.hidden);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
-                                                           NumericFormat::I32, {131072});
+                                                           NumericFormat::I32, {kDraftVocab});
     }
 
     if (plan.features.mtp() && plan.has_mtp) {
