@@ -69,11 +69,11 @@ stood. Item 6 has what it took.
 
 ## Roadmap
 
-Six of eleven are closed. Two are decisions rather than tasks (2 and 11, both
-waiting on `surogate quantize` as a product). Three are open with what an
-attempt needs written down: FP8 (4), the two smaller NVFP4 sizes (5), the
-trainer/serve mapping duplication (7), and the Q6_K down kernel (10).
-
+Six of eleven are closed (1, 3, 6, 8, 9, and 5's first size). Two are decisions
+waiting on `surogate quantize` as a product rather than tasks (2 and 11). The
+rest are open, each with what an attempt needs written down: FP8 (4), the two
+smaller NVFP4 sizes (5), the trainer/serve mapping duplication (7), and the
+Q6_K down kernel (10).
 
 1. **[x] Close the native prefill gap — the int8 tensor-core route (2026-09-03).**
    The BF16-activation kernel was at its floor (eleven variants); the route
