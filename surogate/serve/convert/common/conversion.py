@@ -119,6 +119,11 @@ def _synthesize_generation_config(root: Path) -> bytes:
     return json.dumps(generation, indent=2).encode()
 
 
+#: The artifact objects a checkpoint may legitimately not carry.
+_CHAT_TEMPLATE = "frontend/chat_template.jinja"
+OPTIONAL_RESOURCES = (_CHAT_TEMPLATE,)
+
+
 def build_object_plan(
     object_specs: Sequence[StoredObjectSpec],
     resources: Mapping[str, bytes],
@@ -126,12 +131,22 @@ def build_object_plan(
     expected_resources = tuple(
         spec.name for spec in object_specs if isinstance(spec, ResourceSpec)
     )
+    # The chat template is the one resource a checkpoint may legitimately not have: a base
+    # model publishes none. Its absence drops the object from the artifact, and the engine
+    # reads that absence as "no chat endpoints for this one". Every other resource missing is
+    # still a converter that lost track of its own contract.
+    if OPTIONAL_RESOURCES and _CHAT_TEMPLATE not in resources:
+        expected_resources = tuple(
+            name for name in expected_resources if name != _CHAT_TEMPLATE
+        )
     if tuple(resources) != expected_resources:
         raise ValueError("resource mapping does not match canonical inventory order")
 
     specs: list[ObjectSpec] = []
     for spec in object_specs:
         if isinstance(spec, ResourceSpec):
+            if spec.name not in resources:
+                continue
             specs.append(
                 ArtifactResourceSpec(spec.name, spec.encoding, len(resources[spec.name]))
             )

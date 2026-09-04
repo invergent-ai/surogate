@@ -152,7 +152,11 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
         if path.exists():
             data = path.read_bytes()
         elif filename == "chat_template.jinja":
-            data = official_resources.chat_template_bytes(root)
+            # A base model has none; the artifact simply does not carry the object.
+            template = official_resources.chat_template_bytes(root)
+            if template is None:
+                continue
+            data = template
         elif filename == "generation_config.json":
             data = family_conversion._synthesize_generation_config(root)  # noqa: SLF001
         else:
@@ -468,6 +472,10 @@ def convert(
             for index, spec in enumerate(checkpoint_specs, start=1):
                 repacked = False
                 if isinstance(spec, inventory.ResourceSpec):
+                    # A base model carries no chat template, and the plan drops the object
+                    # rather than storing an empty one.
+                    if spec.name not in resources:
+                        continue
                     payload = resources[spec.name]
                 elif repack is not None and spec.name in half_lookup:
                     parent, row_slice = half_lookup[spec.name]

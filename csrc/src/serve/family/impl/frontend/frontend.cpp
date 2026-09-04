@@ -287,6 +287,9 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
         // malformed template fail loudly here rather than mid-request.
         return fi::CompiledChatTemplate::resolve(override_template);
     }
+    // A base model publishes none, and there is nothing to validate or compile: only the
+    // chat-shaped endpoints read this, and they refuse such an artifact by name.
+    if (resources.chat_template_jinja.empty()) { return fi::CompiledChatTemplate::resolve({}); }
     validate_tokenizer_config(resources);
     // The artifact's own template may reference eos_token; the recognised ones
     // write their markers themselves and ignore it.

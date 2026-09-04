@@ -391,9 +391,13 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
         filename = spec.name.removeprefix("frontend/")
         path = root / filename
         if filename == "chat_template.jinja":
+            # A base model has none; the artifact simply does not carry the object.
+            if template is None:
+                continue
             data = template
         elif filename == "tokenizer_config.json":
-            data = _tokenizer_config_with_template(path.read_bytes(), template)
+            data = (path.read_bytes() if template is None
+                    else _tokenizer_config_with_template(path.read_bytes(), template))
         elif path.exists():
             data = path.read_bytes()
         elif filename == "generation_config.json":
@@ -759,6 +763,10 @@ def convert(
                     first += rows
             for index, spec in enumerate(preflight.object_specs, start=1):
                 if isinstance(spec, inventory.ResourceSpec):
+                    # A base model carries no chat template, and the plan drops the object
+                    # rather than storing an empty one.
+                    if spec.name not in resources:
+                        continue
                     payload = resources[spec.name]
                 elif repack is not None and spec.name in half_lookup:
                     parent, row_slice = half_lookup[spec.name]

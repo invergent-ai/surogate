@@ -668,6 +668,10 @@ def convert(
             for index, spec in enumerate(active_object_specs, start=1):
                 repacked = False
                 if isinstance(spec, inventory.ResourceSpec):
+                    # A base model carries no chat template, and the plan drops the object
+                    # rather than storing an empty one.
+                    if spec.name not in resources:
+                        continue
                     payload = resources[spec.name]
                 elif repack is not None and spec.name in half_lookup:
                     parent, row_slice = half_lookup[spec.name]

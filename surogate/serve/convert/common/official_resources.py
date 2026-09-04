@@ -149,17 +149,16 @@ __all__ = [
 ]
 
 
-def chat_template_bytes(root: Path) -> bytes:
+def chat_template_bytes(root: Path) -> bytes | None:
     """The template the artifact serves, from whichever place the release states it.
 
     Written out verbatim, with no added trailing newline: the engine compares it byte for
     byte against the copy in `tokenizer_config.json`.
 
-    A checkpoint that publishes none is almost always a base model rather than a broken
-    release -- Gemma 3 270M is one -- and the shortfall is on this side: every endpoint the
-    engine serves is chat-shaped, so there is nothing here for a model that was never taught
-    a turn structure. The message says that, because reading it as a missing file sends the
-    next person looking for a file that was never meant to exist.
+    None when the checkpoint publishes none, which is what a base model looks like rather
+    than a broken release -- Gemma 3 270M is one. The artifact then carries no
+    `frontend/chat_template.jinja`, the engine reads its absence as "this is a base model",
+    and the chat-shaped endpoints refuse it by name while `/v1/completions` serves it.
     """
 
     path = root / "chat_template.jinja"
@@ -168,9 +167,5 @@ def chat_template_bytes(root: Path) -> bytes:
     config = json.loads((root / "tokenizer_config.json").read_text(encoding="utf-8"))
     template = config.get("chat_template")
     if not isinstance(template, str) or not template:
-        raise ValueError(
-            "this checkpoint publishes no chat template, which is what a base model looks "
-            "like. The engine serves chat-shaped endpoints only, so it has nothing to serve "
-            "a base model through; use the instruction-tuned release of this model."
-        )
+        return None
     return template.encode("utf-8")

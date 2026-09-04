@@ -343,6 +343,16 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    // A base model has no chat template, so there is no turn structure to render this into.
+    // Refused here rather than in each handler: every chat-shaped endpoint arrives through
+    // this one path, and /v1/completions is the shape that does fit.
+    if (!request.raw_prompt.has_value() && !engine_->supports_chat()) {
+        ApiError error;
+        error.message = "this model publishes no chat template, which is what a base model "
+                        "looks like; ask it through /v1/completions instead";
+        error.code    = "chat_not_supported";
+        throw ApiException(std::move(error));
+    }
     PreparedRequest prepared;
     sinfer::RequestOptions request_options = to_request_options(request, options_);
     // The adapter the request named, as its bank slot. Resolved here rather than
@@ -648,6 +658,15 @@ std::size_t GenerationService::active_requests() const {
 void GenerationService::warmup() {
     try {
         GenerationRequest request;
+        request.max_tokens     = 4;
+        request.max_tokens_set = true;
+        // A base model would refuse the chat shape, so warm it the way it will be asked.
+        if (!engine_->supports_chat()) {
+            request.raw_prompt = "hi";
+            PreparedRequest base = prepare(request);
+            run(base, nullptr);
+            return;
+        }
         ChatTurn turn;
         turn.role = ChatRole::User;
         ContentPart content;

@@ -16,6 +16,9 @@ struct FrontendResourcePlan {
     artifact::ObjectHandle tokenizer_json;
     artifact::ObjectHandle tokenizer_config_json;
     artifact::ObjectHandle chat_template_jinja;
+    /// Whether the artifact carried one. A base model does not, and `chat_template_jinja`
+    /// then names nothing -- the handle is an index, so absence needs its own bit.
+    bool has_chat_template = true;
     artifact::ObjectHandle generation_config_json;
     artifact::ObjectHandle preprocessor_config_json;
     artifact::ObjectHandle video_preprocessor_config_json;
