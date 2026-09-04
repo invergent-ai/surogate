@@ -2,6 +2,8 @@
 // of the same quantised arithmetic, single job and pooled rounds (no GPU needed).
 #include "api/ops/cpu_expert_compute.h"
 
+#include "ops/linear/ggml/ggml_host_decode.h"
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -302,6 +304,66 @@ int main() {
         }
         failures += bad;
     }
+    // --- GGML-block bank -------------------------------------------------------------------
+    // The blocks are the bank; the CPU path decodes a chunk of rows at a time into W8 staging
+    // and reads them at an offset. That offset arithmetic, not the decoders (which
+    // test-ggml-k owns), is what this checks: the single-job reference walks whole rows and
+    // the pool walks chunks, so agreeing means the chunking is right. Random bytes are a legal
+    // block of every format, which is what lets one loop cover the vocabulary.
+    {
+        // A K-quant superblock is 256 values, so this section needs a geometry whose rows are
+        // a whole number of blocks -- the 128-wide one above cannot hold one.
+        constexpr ops::SparseMoeGeometry kBlockGeometry{256, 4, 2, 256};
+        const int H = kBlockGeometry.hidden, I = kBlockGeometry.intermediate,
+                  E = kBlockGeometry.experts;
+        std::vector<std::byte> gscratch(ops::cpu_expert_scratch_bytes(kBlockGeometry) + 64);
+        for (const auto& [name, type] : std::vector<std::pair<const char*, QType>>{
+                 {"Q4_K", QType::Q4_K}, {"Q5_K", QType::Q5_K}, {"Q6_K", QType::Q6_K},
+                 {"Q2_K", QType::Q2_K}, {"Q3_K", QType::Q3_K}, {"Q8_0", QType::Q8_0},
+                 {"Q4_1", QType::Q4_1}, {"Q5_1", QType::Q5_1}, {"IQ4_NL", QType::IQ4_NL},
+                 {"Q4_0", QType::Q4_0}, {"Q5_0", QType::Q5_0}}) {
+            const std::int64_t gate_row = ops::ggml_row_bytes(type, H);
+            const std::int64_t down_row = ops::ggml_row_bytes(type, I);
+            std::vector<std::byte> gate(static_cast<std::size_t>(E) * 2 * I * gate_row);
+            std::vector<std::byte> down(static_cast<std::size_t>(E) * H * down_row);
+            std::uniform_int_distribution<int> byte(0, 255);
+            // Exponent bytes kept small so the fp16 scales stay in a sane range: a random
+            // half is as likely to be an inf as anything else, and inf weights compare as NaN.
+            for (auto& b : gate) { b = static_cast<std::byte>(byte(rng) & 0x3F); }
+            for (auto& b : down) { b = static_cast<std::byte>(byte(rng) & 0x3F); }
+            ops::CpuExpertBank gbank;
+            gbank.format        = ops::ExpertBankFormat::GgmlBlocks;
+            gbank.gate_up_ggml  = type;
+            gbank.down_ggml     = type;
+            gbank.gate_up_codes = gate.data();
+            gbank.down_codes    = down.data();
+
+            const int gt = 5;
+            std::vector<std::uint16_t> gx(static_cast<std::size_t>(H) * gt);
+            for (auto& v : gx) { v = float_to_bf16(act(rng)); }
+            std::vector<ops::CpuExpertJob> gj;
+            std::uniform_real_distribution<float> wd(0.05F, 0.95F);
+            for (int t2 = 0; t2 < gt; ++t2) {
+                gj.push_back({t2, t2 % E, wd(rng)});
+                gj.push_back({t2, (t2 * 3 + 1) % E, wd(rng)});
+            }
+            std::vector<float> gpool(static_cast<std::size_t>(H) * gt, 0.0F);
+            ops::CpuExpertPool gp(kBlockGeometry, {.threads = 5, .pin_threads = false});
+            ops::CpuExpertRound gr{gx.data(), gpool.data(), gt, gj};
+            gp.run(gbank, gr);
+            // The single-job entry point is the oracle: same weights, whole rows, no chunking.
+            std::vector<double> want(static_cast<std::size_t>(H) * gt, 0.0);
+            std::vector<float> one(H, 0.0F);
+            for (const auto& j : gj) {
+                std::fill(one.begin(), one.end(), 0.0F);
+                ops::cpu_expert_compute_job(kBlockGeometry, gbank, j, gx.data() + j.token * H,
+                                            one.data(), gscratch.data());
+                for (int i = 0; i < H; ++i) { want[static_cast<std::size_t>(j.token) * H + i] += one[i]; }
+            }
+            failures += compare(std::string("ggml ") + name + " pooled vs single job", gpool, want);
+        }
+    }
+
     // Stress: many tiny rounds on a full-width pool exercise the wake-up/barrier protocol; a
     // lost wake-up shows up as a hang, so the test runs it with a watchdog thread.
     {

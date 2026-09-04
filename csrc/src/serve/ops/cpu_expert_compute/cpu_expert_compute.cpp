@@ -14,6 +14,8 @@
 
 #include "api/ops/cpu_expert_compute.h"
 
+#include "ops/linear/ggml/ggml_host_decode.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -620,6 +622,8 @@ struct Scratch {
     float* h;
     std::int8_t* hq;
     float* hs;
+    std::int8_t* wq;  // GgmlBlocks: two decoded rows of W8 codes...
+    std::uint16_t* ws; // ...and their FP16 group scales
 };
 
 Scratch carve_scratch(const SparseMoeGeometry& geometry, std::byte* base) {
@@ -631,7 +635,10 @@ Scratch carve_scratch(const SparseMoeGeometry& geometry, std::byte* base) {
     s.xs      = reinterpret_cast<float*>(base + offset); offset += align(sizeof(float) * (geometry.hidden / kGroup));
     s.h       = reinterpret_cast<float*>(base + offset); offset += align(sizeof(float) * geometry.intermediate);
     s.hq      = reinterpret_cast<std::int8_t*>(base + offset); offset += align(geometry.intermediate);
-    s.hs      = reinterpret_cast<float*>(base + offset);
+    s.hs      = reinterpret_cast<float*>(base + offset); offset += align(sizeof(float) * (geometry.intermediate / kGroup));
+    const std::size_t wide = static_cast<std::size_t>(std::max(geometry.hidden, geometry.intermediate));
+    s.wq      = reinterpret_cast<std::int8_t*>(base + offset); offset += align(2 * wide);
+    s.ws      = reinterpret_cast<std::uint16_t*>(base + offset);
     return s;
 }
 
@@ -683,9 +690,11 @@ bool cpu_expert_compute_has_tile() noexcept { return kUseTile; }
 std::size_t cpu_expert_scratch_bytes(const SparseMoeGeometry& geometry) {
     require_geometry(geometry);
     auto align = [](std::size_t v) { return (v + 63) / 64 * 64; };
+    const std::size_t wide = static_cast<std::size_t>(std::max(geometry.hidden, geometry.intermediate));
     return align(sizeof(float) * geometry.hidden) + align(geometry.hidden) +
            align(sizeof(float) * (geometry.hidden / kGroup)) + align(sizeof(float) * geometry.intermediate) +
-           align(geometry.intermediate) + align(sizeof(float) * (geometry.intermediate / kGroup)) + 64;
+           align(geometry.intermediate) + align(sizeof(float) * (geometry.intermediate / kGroup)) +
+           align(2 * wide) + align(2 * (wide / kGroup) * 2) + 64;
 }
 
 void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBank& bank,
@@ -702,11 +711,43 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
     quantise_groups(s.x_float, hidden, s.xq, s.xs);
 
     if (bank.format == ExpertBankFormat::GgmlBlocks) {
-        // No GGML decoder on this path yet. Reading the blocks as W8 planes would answer with
-        // nonsense rather than fail, so it fails.
-        throw std::invalid_argument(
-            "cpu_expert_compute: a GGML-block expert bank has no CPU path; run the experts on "
-            "the device, or convert with --host-expert-bank w8");
+        // Decode a row at a time into W8 and run the same dot the other formats do. The codec
+        // is the device gather's, so a miss computed here matches a hit fetched there.
+        const std::int64_t gate_row = ggml_row_bytes(bank.gate_up_ggml, hidden);
+        const std::int64_t down_row = ggml_row_bytes(bank.down_ggml, intermediate);
+        if (gate_row == 0 || down_row == 0) {
+            throw std::invalid_argument(
+                "cpu_expert_compute: the expert bank's blocks are not a format this build "
+                "decodes");
+        }
+        const std::size_t groups_h  = static_cast<std::size_t>(hidden / kGroup);
+        const std::size_t gate_rows = static_cast<std::size_t>(2) * intermediate;
+        const auto* gate_blocks     = bank.gate_up_codes +
+                                  static_cast<std::size_t>(job.expert) * gate_rows *
+                                      static_cast<std::size_t>(gate_row);
+        const auto row = [&](const std::byte* base, std::int64_t stride, std::size_t index,
+                             QType type, std::int64_t k, int slot) {
+            const bool ok = ggml_decode_row_w8(type, base + index * static_cast<std::size_t>(stride),
+                                               k, s.wq + slot * k, s.ws + slot * (k / kGroup));
+            if (!ok) { throw std::invalid_argument("cpu_expert_compute: GGML row decode failed"); }
+        };
+        for (int j = 0; j < intermediate; ++j) {
+            row(gate_blocks, gate_row, static_cast<std::size_t>(j), bank.gate_up_ggml, hidden, 0);
+            row(gate_blocks, gate_row, static_cast<std::size_t>(intermediate + j),
+                bank.gate_up_ggml, hidden, 1);
+            float g = 0.0F, u = 0.0F;
+            dot_two_rows(s.wq, s.ws, s.wq + hidden, s.ws + groups_h, s.xq, s.xs, hidden, g, u);
+            s.h[j] = silu(g) * u;
+        }
+        quantise_groups(s.h, intermediate, s.hq, s.hs);
+        const auto* down_blocks = bank.down_codes + static_cast<std::size_t>(job.expert) *
+                                                        static_cast<std::size_t>(hidden) *
+                                                        static_cast<std::size_t>(down_row);
+        for (int r = 0; r < hidden; ++r) {
+            row(down_blocks, down_row, static_cast<std::size_t>(r), bank.down_ggml, intermediate, 0);
+            out_column[r] += job.weight * dot_row(s.wq, s.ws, s.hq, s.hs, intermediate);
+        }
+        return;
     }
     if (bank.format == ExpertBankFormat::Q4G32AM) {
         // Reference path for the Q4 bank: the scalar Q4 dot is the oracle the SIMD kernels are
@@ -839,6 +880,46 @@ struct CpuExpertPool::Impl {
     std::vector<std::byte> tiles;  // [threads][tile scratch] repacked expert chunk
     std::size_t tile_bytes = 0;    // per worker
     std::vector<float> x_float;    // [threads][hidden] scratch for phase 0
+    // GgmlBlocks only: one chunk's rows decoded to W8, per worker. Sized to the wider of the
+    // two chunks (gate+up rows of one gate/up chunk, or the rows of one down chunk), and
+    // allocated only when a round actually brings a GGML bank.
+    std::vector<std::int8_t> ggml_codes;
+    std::vector<std::uint16_t> ggml_scales;
+    std::size_t ggml_codes_per_worker  = 0;
+    std::size_t ggml_scales_per_worker = 0;
+    std::int64_t gate_row_bytes        = 0; // block bytes of one gate/up row, this round's bank
+    std::int64_t down_row_bytes        = 0;
+
+    /// Decodes matrix row `row` of a GGML-block object into staging row `slot`.
+    void decode_ggml_row(const std::byte* blocks, std::int64_t row_bytes, int row, QType type,
+                         int k, std::int8_t* codes, std::uint16_t* scales, int slot) const {
+        const std::byte* src = blocks + static_cast<std::size_t>(row) * static_cast<std::size_t>(row_bytes);
+        if (!ggml_decode_row_w8(type, src, k, codes + static_cast<std::size_t>(slot) * k,
+                                scales + static_cast<std::size_t>(slot) * (k / kGroup))) {
+            throw std::invalid_argument("cpu_expert_compute: GGML row decode failed");
+        }
+    }
+
+    /// Reads the round's bank format, sizing the decode staging when it holds blocks.
+    void prepare_ggml() {
+        if (bank->format != ExpertBankFormat::GgmlBlocks) { return; }
+        gate_row_bytes = ggml_row_bytes(bank->gate_up_ggml, geometry.hidden);
+        down_row_bytes = ggml_row_bytes(bank->down_ggml, geometry.intermediate);
+        if (gate_row_bytes == 0 || down_row_bytes == 0) {
+            throw std::invalid_argument(
+                "cpu_expert_compute: the expert bank's blocks are not a format this build decodes");
+        }
+        const std::size_t gate_chunk =
+            static_cast<std::size_t>(2) * (geometry.intermediate / kPhaseAChunks + 1) * geometry.hidden;
+        const std::size_t down_chunk =
+            static_cast<std::size_t>(geometry.hidden / kPhaseBChunks + 1) * geometry.intermediate;
+        const std::size_t need = std::max(gate_chunk, down_chunk);
+        if (need <= ggml_codes_per_worker) { return; }
+        ggml_codes_per_worker  = need;
+        ggml_scales_per_worker = need / kGroup;
+        ggml_codes.resize(static_cast<std::size_t>(threads) * ggml_codes_per_worker);
+        ggml_scales.resize(static_cast<std::size_t>(threads) * ggml_scales_per_worker);
+    }
     // Jobs grouped by expert: `order` lists job indices expert by expert, group g spans
     // order[group_start[g] .. group_start[g+1]).
     std::vector<std::int32_t> order;
@@ -902,10 +983,35 @@ struct CpuExpertPool::Impl {
             const int j0 = chunk * per_chunk;
             const int j1 = chunk == kPhaseAChunks - 1 ? intermediate : j0 + per_chunk;
             const std::size_t gate_rows = static_cast<std::size_t>(2) * intermediate;
-            const auto* gate_codes = reinterpret_cast<const std::int8_t*>(bank->gate_up_codes) +
-                                     static_cast<std::size_t>(expert) * gate_rows * hidden;
-            const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(bank->gate_up_scales) +
-                                      static_cast<std::size_t>(expert) * gate_rows * groups_h;
+            const std::int8_t* gate_codes = reinterpret_cast<const std::int8_t*>(bank->gate_up_codes) +
+                                            static_cast<std::size_t>(expert) * gate_rows * hidden;
+            const std::uint16_t* gate_scales =
+                reinterpret_cast<const std::uint16_t*>(bank->gate_up_scales) +
+                static_cast<std::size_t>(expert) * gate_rows * groups_h;
+            // A GGML bank holds blocks, not W8 planes. Decode this chunk's gate rows and up
+            // rows into the worker's staging -- once per chunk, serving every token of the
+            // expert group -- and read them below through a row offset. The staging is compact
+            // (gate rows then up rows), so `gate_row` and `up_row` say which staging row a
+            // matrix row landed on; for a W8 bank both are the identity.
+            int gate_row = 0;
+            int up_row   = 0;
+            if (bank->format == ExpertBankFormat::GgmlBlocks) {
+                std::int8_t* wq   = ggml_codes.data() + static_cast<std::size_t>(worker) * ggml_codes_per_worker;
+                std::uint16_t* ws = ggml_scales.data() + static_cast<std::size_t>(worker) * ggml_scales_per_worker;
+                const auto* blocks = bank->gate_up_codes + static_cast<std::size_t>(expert) *
+                                                               gate_rows * static_cast<std::size_t>(gate_row_bytes);
+                const int rows = j1 - j0;
+                for (int j = j0; j < j1; ++j) {
+                    decode_ggml_row(blocks, gate_row_bytes, j, bank->gate_up_ggml, hidden, wq, ws,
+                                    j - j0);
+                    decode_ggml_row(blocks, gate_row_bytes, intermediate + j, bank->gate_up_ggml,
+                                    hidden, wq, ws, rows + j - j0);
+                }
+                gate_codes  = wq;
+                gate_scales = ws;
+                gate_row    = j0;                       // matrix row j       -> staging j - j0
+                up_row      = intermediate + j0 - rows; // matrix row I + j   -> staging rows + j - j0
+            }
             if (bank->format == ExpertBankFormat::Q4G32AM) {
                 const auto* gate4 = reinterpret_cast<const std::uint8_t*>(bank->gate_up_codes) +
                                     static_cast<std::size_t>(expert) * gate_rows *
@@ -963,11 +1069,11 @@ struct CpuExpertPool::Impl {
                 const int blocks     = (j1 - j0) / kTileRows;
                 const std::size_t bb = tile_block_bytes(hidden);
                 for (int b = 0; b < blocks; ++b) {
-                    repack_tile_block_vnni(gate_codes + static_cast<std::size_t>(j0 + b * kTileRows) * hidden,
-                                           gate_scales + static_cast<std::size_t>(j0 + b * kTileRows) * groups_h, hidden,
+                    repack_tile_block_vnni(gate_codes + static_cast<std::size_t>(j0 + b * kTileRows - gate_row) * hidden,
+                                           gate_scales + static_cast<std::size_t>(j0 + b * kTileRows - gate_row) * groups_h, hidden,
                                            tile + static_cast<std::size_t>(b) * bb);
-                    repack_tile_block_vnni(gate_codes + static_cast<std::size_t>(intermediate + j0 + b * kTileRows) * hidden,
-                                           gate_scales + static_cast<std::size_t>(intermediate + j0 + b * kTileRows) * groups_h,
+                    repack_tile_block_vnni(gate_codes + static_cast<std::size_t>(intermediate + j0 + b * kTileRows - up_row) * hidden,
+                                           gate_scales + static_cast<std::size_t>(intermediate + j0 + b * kTileRows - up_row) * groups_h,
                                            hidden, tile + static_cast<std::size_t>(blocks + b) * bb);
                 }
                 alignas(64) float ga[kTileRows], gb[kTileRows], ua[kTileRows], ub[kTileRows];
@@ -992,10 +1098,10 @@ struct CpuExpertPool::Impl {
                 return;
             }
             for (int j = j0; j < j1; ++j) {
-                const std::int8_t* gc = gate_codes + static_cast<std::size_t>(j) * hidden;
-                const std::uint16_t* gs = gate_scales + static_cast<std::size_t>(j) * groups_h;
-                const std::int8_t* uc = gate_codes + static_cast<std::size_t>(intermediate + j) * hidden;
-                const std::uint16_t* us = gate_scales + static_cast<std::size_t>(intermediate + j) * groups_h;
+                const std::int8_t* gc = gate_codes + static_cast<std::size_t>(j - gate_row) * hidden;
+                const std::uint16_t* gs = gate_scales + static_cast<std::size_t>(j - gate_row) * groups_h;
+                const std::int8_t* uc = gate_codes + static_cast<std::size_t>(intermediate + j - up_row) * hidden;
+                const std::uint16_t* us = gate_scales + static_cast<std::size_t>(intermediate + j - up_row) * groups_h;
                 std::int32_t i = g0;
                 for (; i + 1 < g1; i += 2) {
                     const CpuExpertJob& ja = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(i)])];
@@ -1038,10 +1144,25 @@ struct CpuExpertPool::Impl {
         const int per_chunk   = hidden / kPhaseBChunks;
         const int r0 = chunk * per_chunk;
         const int r1 = chunk == kPhaseBChunks - 1 ? hidden : r0 + per_chunk;
-        const auto* down_codes = reinterpret_cast<const std::int8_t*>(bank->down_codes) +
-                                 static_cast<std::size_t>(expert) * hidden * intermediate;
-        const auto* down_scales = reinterpret_cast<const std::uint16_t*>(bank->down_scales) +
-                                  static_cast<std::size_t>(expert) * hidden * groups_i;
+        const std::int8_t* down_codes = reinterpret_cast<const std::int8_t*>(bank->down_codes) +
+                                        static_cast<std::size_t>(expert) * hidden * intermediate;
+        const std::uint16_t* down_scales = reinterpret_cast<const std::uint16_t*>(bank->down_scales) +
+                                           static_cast<std::size_t>(expert) * hidden * groups_i;
+        int down_row = 0;
+        if (bank->format == ExpertBankFormat::GgmlBlocks) {
+            std::int8_t* wq   = ggml_codes.data() + static_cast<std::size_t>(worker) * ggml_codes_per_worker;
+            std::uint16_t* ws = ggml_scales.data() + static_cast<std::size_t>(worker) * ggml_scales_per_worker;
+            const auto* blocks = bank->down_codes + static_cast<std::size_t>(expert) *
+                                                        static_cast<std::size_t>(hidden) *
+                                                        static_cast<std::size_t>(down_row_bytes);
+            for (int r = r0; r < r1; ++r) {
+                decode_ggml_row(blocks, down_row_bytes, r, bank->down_ggml, intermediate, wq, ws,
+                                r - r0);
+            }
+            down_codes  = wq;
+            down_scales = ws;
+            down_row    = r0;
+        }
         if (bank->format == ExpertBankFormat::Q4G32AM) {
             const auto* down4 = reinterpret_cast<const std::uint8_t*>(bank->down_codes) +
                                 static_cast<std::size_t>(expert) * hidden *
@@ -1110,8 +1231,8 @@ struct CpuExpertPool::Impl {
             const int blocks     = (r1 - r0) / kTileRows;
             const std::size_t bb = tile_block_bytes(intermediate);
             for (int b = 0; b < blocks; ++b) {
-                repack_tile_block_vnni(down_codes + static_cast<std::size_t>(r0 + b * kTileRows) * intermediate,
-                                       down_scales + static_cast<std::size_t>(r0 + b * kTileRows) * groups_i, intermediate,
+                repack_tile_block_vnni(down_codes + static_cast<std::size_t>(r0 + b * kTileRows - down_row) * intermediate,
+                                       down_scales + static_cast<std::size_t>(r0 + b * kTileRows - down_row) * groups_i, intermediate,
                                        tile + static_cast<std::size_t>(b) * bb);
             }
             alignas(64) float ya[kTileRows], yb[kTileRows];
@@ -1138,10 +1259,10 @@ struct CpuExpertPool::Impl {
         // this width).
         int r = r0;
         for (; r + 1 < r1; r += 2) {
-            const std::int8_t* c0 = down_codes + static_cast<std::size_t>(r) * intermediate;
-            const std::uint16_t* s0 = down_scales + static_cast<std::size_t>(r) * groups_i;
-            const std::int8_t* c1 = down_codes + static_cast<std::size_t>(r + 1) * intermediate;
-            const std::uint16_t* s1 = down_scales + static_cast<std::size_t>(r + 1) * groups_i;
+            const std::int8_t* c0 = down_codes + static_cast<std::size_t>(r - down_row) * intermediate;
+            const std::uint16_t* s0 = down_scales + static_cast<std::size_t>(r - down_row) * groups_i;
+            const std::int8_t* c1 = down_codes + static_cast<std::size_t>(r + 1 - down_row) * intermediate;
+            const std::uint16_t* s1 = down_scales + static_cast<std::size_t>(r + 1 - down_row) * groups_i;
             std::int32_t i = g0;
             for (; i + 1 < g1; i += 2) {
                 const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1175,8 +1296,8 @@ struct CpuExpertPool::Impl {
                 const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
                 const CpuExpertJob& ja = round->jobs[ia];
                 atomic_add(round->out + static_cast<std::size_t>(ja.token) * hidden + r,
-                           ja.weight * dot_row(down_codes + static_cast<std::size_t>(r) * intermediate,
-                                               down_scales + static_cast<std::size_t>(r) * groups_i,
+                           ja.weight * dot_row(down_codes + static_cast<std::size_t>(r - down_row) * intermediate,
+                                               down_scales + static_cast<std::size_t>(r - down_row) * groups_i,
                                                hq.data() + ia * intermediate, hs.data() + ia * groups_i, intermediate));
             }
         }
@@ -1340,6 +1461,7 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
     impl.hu.resize(jobs * impl.geometry.intermediate);
     impl.bank  = &bank;
     impl.round = &round;
+    impl.prepare_ggml();
     impl.group_jobs();
     impl.finished.store(0, std::memory_order_relaxed);
     impl.phase.store(0, std::memory_order_release);

@@ -14,6 +14,7 @@
 // split, activation/weight hand-off, host-function handshake) follows.
 
 #include "api/ops/sparse_moe.h"
+#include "core/tensor.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +27,8 @@ namespace sinfer::ops {
 /// One layer's routed experts in host memory (the pinned bank's host pointers).
 /// Storage of the routed expert bank the host (and the miss gather) read.
 /// - W8G32: int8 codes, one FP16 scale per 32-group (the artifact's own encoding).
+/// - GgmlBlocks: the GGUF's own blocks, decoded a row at a time into W8 groups by the same
+///   codec the device gather uses (see `gate_up_ggml`/`down_ggml` for the format).
 /// - Q4G32AM: unsigned 4-bit codes packed two per byte (low nibble = even element), one FP16
 ///   scale AND one FP16 min per 32-group (`w = scale * q + min`). Requantised from W8 at load;
 ///   the affine form reproduces the Q4_K-derived weights almost exactly at 59 % of the bytes.
@@ -36,6 +39,13 @@ enum class ExpertBankFormat : std::uint8_t { W8G32 = 0, Q4G32AM = 1, GgmlBlocks 
 
 struct CpuExpertBank {
     ExpertBankFormat format         = ExpertBankFormat::W8G32;
+    /// GgmlBlocks only: which block format each half holds. The codes pointer addresses the
+    /// blocks and the scales pointer is unused, because a GGML block carries its own. Left
+    /// without a default for the same reason `ExpertHostBank` does -- QType(0) is not a GGML
+    /// format, so a caller that forgets these is refused rather than reading one layout as
+    /// another.
+    QType gate_up_ggml;
+    QType down_ggml;
     const std::byte* gate_up_codes  = nullptr; // [experts][2*intermediate][hidden] int8 | u4x2
     const std::byte* gate_up_scales = nullptr; // [experts][2*intermediate][hidden/32] fp16
     const std::byte* gate_up_mins   = nullptr; // Q4G32AM only, same shape as the scales

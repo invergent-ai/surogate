@@ -8,6 +8,10 @@
 // owns eight consecutive values of a 256-value superblock, which every K-quant layout supports
 // exactly because eight divides both sub-block sizes (32 for Q4_K/Q5_K, 16 for Q6_K) -- a run of
 // eight never straddles a scale boundary or a nibble half.
+//
+// Host as well as device: the CPU expert path decodes the same blocks with the same
+// arithmetic, so a routed expert answers alike whether the slot cache had it or the host
+// computed it. One decoder, not two that drift.
 
 #include "ops/linear/ggml/ggml_blocks.h"
 #include "ops/linear/ggml/ggml_mmvq.h"
@@ -19,13 +23,13 @@ namespace sinfer::ops::detail::ggml {
 
 /// Eight consecutive values starting at `lane * 8` of superblock `ib`.
 template <GgmlType type>
-__device__ __forceinline__ void decode_eight(const void* blocks, std::int64_t ib, int lane,
+__host__ __device__ __forceinline__ void decode_eight(const void* blocks, std::int64_t ib, int lane,
                                              float (&w)[8]);
 
 /// Q2_K: sixteen sub-blocks of sixteen, `x = d*sc*q - dmin*m` with sc and m four bits each.
 /// Eight consecutive values share one sub-block, because eight divides sixteen.
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q2_K>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q2_K>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q2_K* x = static_cast<const block_q2_K*>(blocks) + ib;
     const int v0 = lane * 8;
@@ -46,7 +50,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q2_K>(const void* blocks,
 /// Q3_K: the same stripe geometry with a 6-bit scale split across two bytes and the third bit
 /// of each quant living inverted in `hmask`.
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q3_K>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q3_K>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q3_K* x = static_cast<const block_q3_K*>(blocks) + ib;
     const int v0  = lane * 8;
@@ -73,7 +77,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q3_K>(const void* blocks,
 }
 
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q4_K>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q4_K>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q4_K* x = static_cast<const block_q4_K*>(blocks) + ib;
     const int v0 = lane * 8;
@@ -95,7 +99,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q4_K>(const void* blocks,
 }
 
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q5_K>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q5_K>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q5_K* x = static_cast<const block_q5_K*>(blocks) + ib;
     const int v0 = lane * 8;
@@ -119,7 +123,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q5_K>(const void* blocks,
 }
 
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q6_K>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q6_K>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q6_K* x = static_cast<const block_q6_K*>(blocks) + ib;
     const int v0  = lane * 8;
@@ -140,7 +144,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q6_K>(const void* blocks,
 }
 
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q8_0>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q8_0>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     // A Q8_0 block is 32 values, so four lanes cover one rather than thirty-two: `ib` is the
     // block and `lane` its eighth-of-a-block, exactly as the callers already index.
@@ -153,7 +157,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q8_0>(const void* blocks,
 /// The plain 32-value blocks. Four lanes cover one, and eight consecutive values never
 /// straddle the block's single scale, so each lane reads one nibble half of eight bytes.
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q4_0>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q4_0>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q4_0* x = static_cast<const block_q4_0*>(blocks) + ib;
     const int base      = lane * 8;
@@ -168,7 +172,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q4_0>(const void* blocks,
 }
 
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q4_1>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q4_1>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q4_1* x = static_cast<const block_q4_1*>(blocks) + ib;
     const int base      = lane * 8;
@@ -183,7 +187,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q4_1>(const void* blocks,
 }
 
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q5_0>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q5_0>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q5_0* x = static_cast<const block_q5_0*>(blocks) + ib;
     const int base      = lane * 8;
@@ -201,7 +205,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q5_0>(const void* blocks,
 }
 
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::Q5_1>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::Q5_1>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     const block_q5_1* x = static_cast<const block_q5_1*>(blocks) + ib;
     const int base      = lane * 8;
@@ -219,7 +223,7 @@ __device__ __forceinline__ void decode_eight<GgmlType::Q5_1>(const void* blocks,
 }
 
 template <>
-__device__ __forceinline__ void decode_eight<GgmlType::IQ4_NL>(const void* blocks, std::int64_t ib,
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ4_NL>(const void* blocks, std::int64_t ib,
                                                                int lane, float (&w)[8]) {
     const block_iq4_nl* x = static_cast<const block_iq4_nl*>(blocks) + ib;
     const int base        = lane * 8;
@@ -258,7 +262,7 @@ struct GgmlMoeCodec {
 /// Thirty-two consecutive values starting at `group * 32`, for a caller that owns a whole
 /// group rather than eight of them. A 32-value block is one group; a superblock is eight.
 template <GgmlType type>
-__device__ __forceinline__ void decode_group_32(const void* blocks, std::int64_t group,
+__host__ __device__ __forceinline__ void decode_group_32(const void* blocks, std::int64_t group,
                                                 float (&v)[32]) {
     constexpr int kValues = block_values(type);
     const std::int64_t base = group * 32;

@@ -355,10 +355,21 @@ struct ExpertSlotCache {
             }
             entry.bank  = ops::expert_host_bank(geometry, weights.op.routed_gate_up,
                                                 weights.op.routed_down);
-            // A GGML-block bank has no host planes for the CPU path to read, so the CPU split
-            // is simply not offered for it; `cpu_expert_compute` refuses one by name if it
-            // ever arrives anyway.
-            if (entry.bank.format == ops::ExpertBankFormat::GgmlBlocks) { return entry; }
+            if (entry.bank.format == ops::ExpertBankFormat::GgmlBlocks) {
+                // The blocks are the bank: the CPU path decodes a row at a time with the same
+                // codec the gather uses, so the host reads exactly the bytes the GGUF holds and
+                // the artifact still stores no second copy of the experts.
+                entry.cpu_bank.format       = ops::ExpertBankFormat::GgmlBlocks;
+                entry.cpu_bank.gate_up_ggml = entry.bank.gate_up_ggml;
+                entry.cpu_bank.down_ggml    = entry.bank.down_ggml;
+                entry.cpu_bank.gate_up_codes = weights.host_gate_up != nullptr
+                                                   ? weights.host_gate_up
+                                                   : entry.bank.gate_up_codes;
+                entry.cpu_bank.down_codes = weights.host_down != nullptr
+                                                ? weights.host_down
+                                                : entry.bank.down_codes;
+                return entry;
+            }
             if (weights.host_gate_up != nullptr && weights.host_down != nullptr) {
                 // Plane offsets are the same in the host and device views of the object.
                 const auto gate_scale_offset = static_cast<const std::byte*>(weights.op.routed_gate_up.scales) -

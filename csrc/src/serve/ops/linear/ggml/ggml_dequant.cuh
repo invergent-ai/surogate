@@ -85,7 +85,7 @@ static __device__ __forceinline__ void dequantize_q3_K(const void * vx, const in
     }
 }
 
-static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+static inline __host__ __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
     if (j < 4) {
         d = q[j] & 63; m = q[j + 4] & 63;
     } else {
