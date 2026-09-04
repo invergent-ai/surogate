@@ -27,6 +27,29 @@ from surogate.grpo.utils.utils import (
 )
 
 
+# A task whose rollouts fail back to back with none completing in between is
+# not going to recover: the same request is rejected the same way every time.
+# Observed 2026-09-03 as a vLLM 400 the server could never accept — 10,729 of
+# them in twenty minutes, ``(0/4 complete)`` never advancing, two GPUs held,
+# the run still ``running`` with no error until a human cancelled it.
+#
+# 64 rather than a handful because no transient cause can reach it: the OpenAI
+# client already retries connection errors and 5xx ten times each with backoff,
+# so a restarting server yields failures seconds apart, while a permanently
+# invalid request is not retried at all and hits the cap within seconds. Any
+# rollout that completes resets the count.
+MAX_CONSECUTIVE_ROLLOUT_FAILURES = 64
+
+
+class RolloutFailureLoop(RuntimeError):
+    """One task's rollouts failed consecutively with nothing completing.
+
+    Its own type because ``generate_batch``'s rollout handling ends in a broad
+    ``except Exception`` that logs and carries on — which is the behaviour this
+    exists to stop, and which would otherwise swallow it.
+    """
+
+
 class InflightRolloutInfo(NamedTuple):
     """Metadata for an in-flight request."""
 
@@ -126,6 +149,10 @@ class Scheduler:
         self.inflight_policy_update_task: asyncio.Task | None = None
         self.policy_update_lock = asyncio.Lock()
         self.cancelled_rollouts_count = 0
+        # Deliberately not cleared in get_metrics() alongside the three
+        # per-step counters below: this one measures a streak, and a reset
+        # every step would hide a task that fails every rollout of every step.
+        self.consecutive_failures_by_task: dict[str, int] = defaultdict(int)
         self.empty_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
@@ -210,6 +237,24 @@ class Scheduler:
             clients = self.inference_pool.clients
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
+
+    def _note_rollout_outcome(self, task: str, failure: str | None) -> None:
+        """Track a task's failure streak, and stop the run once it cannot recover.
+
+        ``failure`` is the reason this rollout is being re-scheduled, or None
+        when it completed. Re-scheduling is right for a flaky rollout and wrong
+        for a rejected one, and the two are told apart by whether anything ever
+        gets through: nothing does when the request itself is invalid.
+        """
+        if failure is None:
+            self.consecutive_failures_by_task[task] = 0
+            return
+        self.consecutive_failures_by_task[task] += 1
+        if self.consecutive_failures_by_task[task] >= MAX_CONSECUTIVE_ROLLOUT_FAILURES:
+            raise RolloutFailureLoop(
+                f"{task}: {MAX_CONSECUTIVE_ROLLOUT_FAILURES} rollouts failed in a row with none "
+                f"completing, so re-scheduling cannot recover. Last failure: {failure}"
+            )
 
     async def drop_group(self, group_id: int) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it."""
@@ -486,9 +531,11 @@ class Scheduler:
                     task = rollout_info.task
                     self.total_rollouts_by_task[task] += 1
                     should_reschedule = False
+                    failure: str | None = None
                     if len(rollout["trajectory"]) == 0:
                         self.empty_rollouts_by_task[task] += 1
                         should_reschedule = True
+                        failure = "empty trajectory"
                         self.logger.warning(
                             f"Empty trajectory in group {group_id} ({task}), re-scheduling "
                             f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete)"
@@ -496,11 +543,13 @@ class Scheduler:
                     if rollout["error"] is not None:
                         self.errored_rollouts_by_task[task] += 1
                         should_reschedule = True
+                        failure = rollout["error"]["error_chain_repr"]
                         self.logger.warning(
                             f"Rollout error in group {group_id} ({task}), re-scheduling "
                             f"({len(group.completed_rollouts)}/{self.rollouts_per_example} complete): "
                             f"{rollout['error']['error_chain_repr']}"
                         )
+                    self._note_rollout_outcome(task, failure if should_reschedule else None)
                     if should_reschedule:
                         group.rollouts_to_schedule += 1
                         continue
@@ -514,6 +563,8 @@ class Scheduler:
                     if group_id is not None:
                         await self.drop_group(group_id)
                     continue
+                except RolloutFailureLoop:
+                    raise
                 except Exception as e:
                     self.logger.warning(f"Rollout failed: {e}")
                     if group_id is not None:

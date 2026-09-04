@@ -186,3 +186,31 @@ class TestPatchedTargets:
         upstream = list(inspect.signature(api_server.build_app).parameters)
         ours = list(inspect.signature(custom_build_app).parameters)
         assert ours == upstream
+
+
+class TestToolParserConstruction:
+    """vLLM builds a fresh parser per request, so a patch that pins the tool
+    parser's ``__init__`` signature breaks every chat completion — and nothing
+    else notices, because the tool parser is only reachable with
+    ``--enable-auto-tool-choice`` on, which no run used until now.
+
+    That is what happened: a patch declared ``_patched_init(self, tokenizer)``
+    against a wheel whose ``__init__`` had gained a ``tools`` argument, so
+    ``Parser.__init__``'s ``tool_parser_cls(tokenizer, tools)`` raised
+    ``TypeError`` 10,729 times in one 20-minute run and produced no rollouts.
+    """
+
+    def test_hermes_parser_constructs_the_way_vllm_constructs_it(self):
+        import surogate.grpo.inference.vllm.server  # noqa: F401  (applies the patches)
+        from vllm.parser.parser_manager import ParserManager
+        from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
+
+        parser_cls = ParserManager.get_parser(tool_parser_name="hermes", enable_auto_tools=True)
+        assert parser_cls is not None
+
+        # Exactly the call in chat_completion/serving.py, which reaches
+        # ``tool_parser_cls(tokenizer, tools)`` in Parser.__init__. The
+        # tokenizer is only stored and truth-tested here, so a stand-in is
+        # enough — the point is the arity, not the tokenizer.
+        parser = parser_cls(object(), [], chat_template_kwargs={}, model_config=None)
+        assert isinstance(parser._tool_parser, Hermes2ProToolParser)
