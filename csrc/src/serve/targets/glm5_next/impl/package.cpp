@@ -224,9 +224,16 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     // The program captures its decode graphs at construction, so everything that would
     // allocate has to exist first. The latent expansion's key half is BF16, which routes
-    // through cuBLASLt, and that route creates its handle and workspace on first use.
-    ops::detail::bf16_cublaslt_prewarm();
-    detail::Variant::prewarm_device_scratch();
+    // through cuBLASLt, and that route creates its handle and workspace per *device* on first
+    // use -- so the current device has to be this stage's, not whichever one ran last.
+    {
+        int previous = 0;
+        CUDA_CHECK(cudaGetDevice(&previous));
+        CUDA_CHECK(cudaSetDevice(device.device));
+        ops::detail::bf16_cublaslt_prewarm();
+        detail::Variant::prewarm_device_scratch();
+        CUDA_CHECK(cudaSetDevice(previous));
+    }
     return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }

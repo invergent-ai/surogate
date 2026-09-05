@@ -143,6 +143,20 @@ Tensor gate_matrix(const Tensor& output_gate, std::int32_t rows) {
     return output_gate.view({rows, static_cast<std::int32_t>(total / rows)});
 }
 
+/// One projection, named. An unbound weight is a binding mistake -- a stage that did not
+/// upload something it runs, or a layer whose inventory index went astray -- and the op it
+/// reaches sees only `n` and `k`, so it can say the shape is wrong but not whose. Every linear
+/// leaf of this target goes through here so the answer is in the message.
+void project(const char* what, const Tensor& x, const Weight& w, Tensor& out,
+             WorkspaceArena& workspace, cudaStream_t stream) {
+    if (w.n <= 0 || w.k <= 0 || w.qdata == nullptr) {
+        throw std::logic_error(std::string("glm5_next: ") + what +
+                               " is not bound on this stage (n " + std::to_string(w.n) + ", k " +
+                               std::to_string(w.k) + ")");
+    }
+    ops::linear(x, w, out, kTextPolicy, workspace, stream);
+}
+
 [[noreturn]] void no_short_conv(const char* leaf) {
     throw std::logic_error(
         std::string("glm5_next: ") + leaf +
@@ -265,19 +279,19 @@ void Variant::attention_projection(const Tensor& hidden,
     auto scope                = workspace.scope();
     Tensor q_low  = workspace.alloc(DType::BF16, {weights.query_a.n, tokens});
     Tensor kv_low = workspace.alloc(DType::BF16, {weights.kv_a.n, tokens});
-    ops::linear(hidden, weights.query_a, q_low, kTextPolicy, workspace, stream);
-    ops::linear(hidden, weights.kv_a, kv_low, kTextPolicy, workspace, stream);
+    project("mla/query_a", hidden, weights.query_a, q_low, workspace, stream);
+    project("mla/kv_a", hidden, weights.kv_a, kv_low, workspace, stream);
     // Each low rank is normalised whole, which is what replaces the per-head query and key
     // norms every other target in this family carries.
     ops::rmsnorm(q_low, weights.query_a_norm, weights.rms_epsilon, /*unit_offset=*/false, q_low,
                  stream);
     ops::rmsnorm(kv_low, weights.kv_a_norm, weights.rms_epsilon, /*unit_offset=*/false, kv_low,
                  stream);
-    ops::linear(q_low, weights.query_b, query, kTextPolicy, workspace, stream);
+    project("mla/query_b", q_low, weights.query_b, query, workspace, stream);
     // The expansion, one head at a time in the weight's own row order: the latent becomes this
     // layer's keys and values, which the cache then holds as an ordinary attention's.
-    ops::linear(kv_low, weights.k_b, key, kTextPolicy, workspace, stream);
-    ops::linear(kv_low, weights.v_b, value, kTextPolicy, workspace, stream);
+    project("mla/k_b", kv_low, weights.k_b, key, workspace, stream);
+    project("mla/v_b", kv_low, weights.v_b, value, workspace, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
@@ -285,7 +299,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope = workspace.scope();
     Tensor out = workspace.alloc(DType::BF16, {weight.n, attention.ne[1]});
-    ops::linear(attention, weight, out, kTextPolicy, workspace, stream);
+    project("mla/output", attention, weight, out, workspace, stream);
     apply_lora(weight, 3, attention, out, stream);
     combine_into(out, residual, stream);
 }
@@ -302,9 +316,9 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
     Tensor decay_low = workspace.alloc(DType::BF16, {weights.decay_a.n, tokens});
     Tensor decay     = workspace.alloc(DType::BF16, {weights.decay_b.n, tokens});
     Tensor update    = workspace.alloc(DType::BF16, {weights.beta.n, tokens});
-    ops::linear(hidden, weights.decay_a, decay_low, kTextPolicy, workspace, stream);
-    ops::linear(decay_low, weights.decay_b, decay, kTextPolicy, workspace, stream);
-    ops::linear(hidden, weights.beta, update, kTextPolicy, workspace, stream);
+    project("kda/decay_a", hidden, weights.decay_a, decay_low, workspace, stream);
+    project("kda/decay_b", decay_low, weights.decay_b, decay, workspace, stream);
+    project("kda/beta", hidden, weights.beta, update, workspace, stream);
     ops::kda_gating(decay, update, weights.a_log, weights.decay_bias, weights.gate_lower_bound, g,
                     beta, stream);
 }
@@ -316,10 +330,10 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     auto scope                = workspace.scope();
     Tensor gate_low = workspace.alloc(DType::BF16, {weights.gate_a.n, tokens});
     Tensor gate     = gate_matrix(output_gate, weights.gate_b.n);
-    ops::linear(hidden, weights.query_key_value, qkv, kTextPolicy, workspace, stream);
+    project("kda/query_key_value", hidden, weights.query_key_value, qkv, workspace, stream);
     // The output gate is low-rank, so it is two projections rather than rows of the fused one.
-    ops::linear(hidden, weights.gate_a, gate_low, kTextPolicy, workspace, stream);
-    ops::linear(gate_low, weights.gate_b, gate, kTextPolicy, workspace, stream);
+    project("kda/gate_a", hidden, weights.gate_a, gate_low, workspace, stream);
+    project("kda/gate_b", gate_low, weights.gate_b, gate, workspace, stream);
 }
 
 void Variant::gdn_input_projection_snapshot(
@@ -336,7 +350,8 @@ void Variant::gdn_input_projection_snapshot(
     Tensor projected   = workspace.alloc(DType::BF16, {rows, width * batch});
     Tensor convolved   = workspace.alloc(DType::BF16, {rows, width * batch});
     Tensor gate_low    = workspace.alloc(DType::BF16, {weights.gate_a.n, width * batch});
-    ops::linear(flat_hidden, weights.query_key_value, projected, kTextPolicy, workspace, stream);
+    project("kda/query_key_value", flat_hidden, weights.query_key_value, projected, workspace,
+            stream);
     // One convolution over the fused q|k|v, checkpointed per lane, then the three spans are
     // taken apart. The fused snapshot op the delta-net targets use projects the output gate as
     // rows of the same parent; here the gate is low-rank and cannot ride along.
@@ -344,12 +359,16 @@ void Variant::gdn_input_projection_snapshot(
     Tensor convolved_lanes = convolved.view({rows, width, batch});
     ops::causal_conv1d_silu_snapshot(projected_lanes, conv_weight, conv_states, valid_columns,
                                      initial_slot, snapshot_base_slot, convolved_lanes, stream);
-    ops::extract_bf16_columns(convolved, 0, query, stream);
-    ops::extract_bf16_columns(convolved, per, key, stream);
-    ops::extract_bf16_columns(convolved, 2 * per, value, stream);
+    // The family hands q, k and v over shaped by lane; the extract wants [D', T].
+    Tensor flat_query = query.view({query.ne[0], width * batch});
+    Tensor flat_key   = key.view({key.ne[0], width * batch});
+    Tensor flat_value = value.view({value.ne[0], width * batch});
+    ops::extract_bf16_columns(convolved, 0, flat_query, stream);
+    ops::extract_bf16_columns(convolved, per, flat_key, stream);
+    ops::extract_bf16_columns(convolved, 2 * per, flat_value, stream);
     Tensor flat_gate = gate_matrix(output_gate, weights.gate_b.n);
-    ops::linear(flat_hidden, weights.gate_a, gate_low, kTextPolicy, workspace, stream);
-    ops::linear(gate_low, weights.gate_b, flat_gate, kTextPolicy, workspace, stream);
+    project("kda/gate_a", flat_hidden, weights.gate_a, gate_low, workspace, stream);
+    project("kda/gate_b", gate_low, weights.gate_b, flat_gate, workspace, stream);
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
@@ -357,7 +376,7 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
                                     cudaStream_t stream) {
     auto scope = workspace.scope();
     Tensor out = workspace.alloc(DType::BF16, {weight.n, hidden.ne[1]});
-    ops::linear(hidden, weight, out, kTextPolicy, workspace, stream);
+    project("kda/output", hidden, weight, out, workspace, stream);
     apply_lora(weight, 3, hidden, out, stream);
     combine_into(out, residual, stream);
 }
@@ -386,7 +405,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
         ops::linear_rows(hidden, weights.gate_up, width, up, &workspace, stream);
         ops::silu_mul(gate, up, gate, stream);
-        ops::linear(gate, weights.down, out, kTextPolicy, workspace, stream);
+        project("mlp/down", gate, weights.down, out, workspace, stream);
     }
     combine_into(out, residual, stream);
 }

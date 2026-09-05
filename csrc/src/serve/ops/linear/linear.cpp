@@ -64,7 +64,13 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
         throw std::invalid_argument("linear: out must have shape [N,T]");
     }
     if (w.n <= 0 || w.k <= 0) {
-        throw std::invalid_argument("linear: weight n/k must be positive");
+        // An unbound weight reaches here as zeros, and the rule alone does not say whose. The
+        // operand shapes do: they are the caller's geometry, which names the projection.
+        throw std::invalid_argument(
+            "linear: weight n/k must be positive (n " + std::to_string(w.n) + ", k " +
+            std::to_string(w.k) + ") for x [" + std::to_string(x.ne[0]) + "," +
+            std::to_string(x.ne[1]) + "] into out [" + std::to_string(out.ne[0]) + "," +
+            std::to_string(out.ne[1]) + "]");
     }
     if (x.ne[0] != w.k || out.ne[0] != w.n || out.ne[1] != x.ne[1]) {
         // Name the shapes: a mismatch here is a caller's geometry against a weight's, and the
