@@ -415,6 +415,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        prepared.want_logprobs    = request.want_logprobs;
+        prepared.return_token_ids = request.return_token_ids;
+        // Read before the submit takes the prompt: these are the ids the model
+        // actually sees, which is the thing a trainer must score against and is not
+        // reliably reproducible by re-rendering the messages.
+        if (request.return_token_ids) { prepared.prompt_token_ids = prompt.token_ids(); }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
@@ -482,6 +488,17 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
     outcome.finish_reason     = result.finish_reason;
+    if (prepared.return_token_ids) {
+        outcome.prompt_token_ids     = std::move(prepared.prompt_token_ids);
+        outcome.completion_token_ids = result.generated_token_ids;
+    }
+    if (prepared.want_logprobs) {
+        outcome.token_logprobs = std::move(result.token_logprobs);
+        if (!result.generated_token_ids.empty()) {
+            outcome.token_texts = engine_->token_texts(std::span<const sinfer::TokenId>(
+                result.generated_token_ids.data(), result.generated_token_ids.size()));
+        }
+    }
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

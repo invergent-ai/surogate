@@ -50,10 +50,23 @@ std::string new_completion_id();
 // Non-streaming chat completion response body (JSON string). When `reasoning` is
 // non-empty it is attached as `message.reasoning_content` (the DeepSeek/vLLM-style
 // convention consumed by Chatbox, Open WebUI, etc.), leaving `content` = answer.
+/// The per-token detail a client asked to be given back: the ids it should score
+/// and the probability each token was drawn with. Empty vectors render nothing, so
+/// an ordinary chat response is byte-identical to what it was.
+struct TokenDetail {
+    std::vector<sinfer::TokenId> prompt_token_ids;
+    std::vector<sinfer::TokenId> completion_token_ids;
+    std::vector<float> logprobs;      ///< as long as `completion_token_ids`, or empty
+    std::vector<std::string> texts;   ///< the text of each completion token, or empty
+    bool include_token_ids = false;
+    bool include_logprobs  = false;
+};
+
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
-                                          const CompletionUsage& usage);
+                                          const CompletionUsage& usage,
+                                          const TokenDetail& detail = {});
 std::string make_chat_completion_tool_response(const std::string& id, const std::string& model,
                                                std::int64_t created, const std::string& content,
                                                const std::string& reasoning,

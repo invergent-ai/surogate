@@ -36,7 +36,12 @@ sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     sinfer::SamplingOverrides sampling = server.sampling_overrides;
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
-    if (request.top_k) { sampling.top_k = static_cast<std::int32_t>(*request.top_k); }
+    // vLLM spells "do not truncate" as -1 and every RL rollout sends it. The engine
+    // contract takes 0 for the same thing and refuses a negative, so the wire value
+    // is normalised here rather than loosened there.
+    if (request.top_k) {
+        sampling.top_k = *request.top_k < 0 ? 0 : static_cast<std::int32_t>(*request.top_k);
+    }
     if (request.presence_penalty) {
         sampling.presence_penalty = static_cast<float>(*request.presence_penalty);
     }
@@ -64,8 +69,12 @@ sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (sampling.top_p && (*sampling.top_p < 0.0F || *sampling.top_p > 1.0F)) {
         invalid_sampling("top_p must be in [0,1]", "top_p");
     }
-    if (sampling.top_k && *sampling.top_k < 0) {
-        invalid_sampling("top_k must be nonnegative", "top_k");
+    // A negative top_k is how vLLM spells "do not truncate", and every rollout an
+    // RL trainer sends carries -1. Refusing it rejected the request outright; it
+    // means the same thing zero does here, which the sampler reads as "no limit of
+    // the caller's own".
+    if (sampling.top_k && *sampling.top_k < -1) {
+        invalid_sampling("top_k must be -1 (no limit) or nonnegative", "top_k");
     }
     if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
         invalid_sampling("min_p must be in [0,1]", "min_p");

@@ -513,6 +513,11 @@ enum class PrefixReusePath : std::uint8_t {
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
+    /// The log-probability of each generated token under the full vocabulary at
+    /// the position that produced it, temperature-scaled the way the sampler saw
+    /// it. Same length as `generated_token_ids`, or empty when nothing produced
+    /// them; an individual entry is NaN when its route could not.
+    std::vector<float> token_logprobs;
     std::string content;
     std::string reasoning;
     std::uint32_t reasoning_tokens     = 0;

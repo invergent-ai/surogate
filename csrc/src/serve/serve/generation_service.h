@@ -50,6 +50,14 @@ struct GenerationOutcome {
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;
     std::size_t streamed_content_bytes = 0;
+    /// Populated only when the request asked for them. `token_logprobs` is either
+    /// empty or exactly as long as `completion_token_ids`.
+    std::vector<sinfer::TokenId> prompt_token_ids;
+    std::vector<sinfer::TokenId> completion_token_ids;
+    std::vector<float> token_logprobs;
+    /// The text of each completion token, so a probability names the token it
+    /// belongs to. Filled only alongside `token_logprobs`.
+    std::vector<std::string> token_texts;
     sinfer::FinishReason finish_reason = sinfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
 };
@@ -79,6 +87,11 @@ struct PreparedRequest {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
+    /// What the client asked to be given back, and the prompt ids to give it.
+    /// Snapshotted before the prompt is submitted, because submitting consumes it.
+    bool want_logprobs    = false;
+    bool return_token_ids = false;
+    std::vector<sinfer::TokenId> prompt_token_ids;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 

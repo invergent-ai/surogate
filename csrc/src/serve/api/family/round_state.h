@@ -44,6 +44,13 @@ struct OrdinaryDecodeIngress {
 
 struct OrdinaryDecodeEgress {
     std::array<TokenId, kMaximumConcurrency> sampled_tokens{};
+    /// The log-probability of each sampled token under that lane's full-vocabulary
+    /// temperature-scaled distribution. It rides in the egress rather than a
+    /// buffer of its own because this struct is already the round's
+    /// device-to-host channel, and a reinforcement-learning client needs the
+    /// number for every token it was given -- there is no request that wants the
+    /// token but not its probability.
+    std::array<float, kMaximumConcurrency> sampled_logprobs{};
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
@@ -173,6 +180,7 @@ struct RoundStateLayout {
     std::optional<OrdinaryDecodeStateLayout> ordinary;
     MixedPrefillFinalizeLayout prefill_finalize;
     TensorRegion token;
+    TensorRegion logprob;
     TensorRegion pos;
     TensorRegion rope_pos;
     TensorRegion rope_delta;
@@ -197,6 +205,7 @@ struct OrdinaryDecodeState {
     Tensor lora_slots;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
+    Tensor sampled_logprobs;
     Tensor logits;
     Tensor hidden;
 
@@ -305,6 +314,9 @@ struct RoundState {
     std::optional<OrdinaryDecodeState> ordinary;
     MixedPrefillFinalizeState prefill_finalize;
     Tensor token;
+    /// The step token's log-probability, the prefill twin of
+    /// `OrdinaryDecodeEgress::sampled_logprobs`.
+    Tensor logprob;
     Tensor pos;
     Tensor rope_pos;
     Tensor rope_delta;

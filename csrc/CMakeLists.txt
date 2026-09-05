@@ -1012,6 +1012,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/residual_add.cu
   ${SERVE_ROOT}/ops/launcher/rmsnorm.cu
   ${SERVE_ROOT}/ops/launcher/next_token_nll.cu
+  ${SERVE_ROOT}/ops/launcher/sampled_logprob.cu
   ${SERVE_ROOT}/ops/launcher/rope.cu
   ${SERVE_ROOT}/ops/launcher/sampling.cu
   ${SERVE_ROOT}/ops/launcher/scalar.cu
@@ -1220,6 +1221,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/residual_add.cpp
   ${SERVE_ROOT}/ops/wrapper/rmsnorm.cpp
   ${SERVE_ROOT}/ops/wrapper/next_token_nll.cpp
+  ${SERVE_ROOT}/ops/wrapper/sampled_logprob.cpp
   ${SERVE_ROOT}/ops/wrapper/rope.cpp
   ${SERVE_ROOT}/ops/wrapper/sampling.cpp
   ${SERVE_ROOT}/ops/wrapper/scalar.cpp

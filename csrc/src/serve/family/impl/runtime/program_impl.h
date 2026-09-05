@@ -10,6 +10,7 @@
 
 #include "family/impl/runtime/schedule.h"
 #include "api/ops/lora_store.h"
+#include "api/ops/sampled_logprob.h"
 #include "api/ops/gdn_replay.h"
 #include "api/ops/prepare_ragged_prefix.h"
 #include "ops/linear/fp8/fp8_cublaslt.h"
@@ -283,7 +284,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
-      round_host(sizeof(TokenId)),
+      round_host(sizeof(TokenId) + sizeof(float)),
       ordinary_host(
           plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(family::OrdinaryDecodeIngress) +
@@ -396,6 +397,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     set_device_i32(chain_one, 1);
 
     host_tokens = static_cast<TokenId*>(round_host.data());
+    host_token_logprob =
+        reinterpret_cast<float*>(static_cast<unsigned char*>(round_host.data()) + sizeof(TokenId));
+    *host_token_logprob = std::numeric_limits<float>::quiet_NaN();
     if (ordinary_host) {
         ordinary_host_ingress = static_cast<family::OrdinaryDecodeIngress*>(ordinary_host->data());
         ordinary_host_egress  = reinterpret_cast<family::OrdinaryDecodeEgress*>(
@@ -454,6 +458,10 @@ void ProgramImplCore::burst_egress_copy_host(void* user) noexcept {
     const auto* ctx = static_cast<const BurstEgressCopy*>(user);
     std::memcpy(ctx->destination, ctx->source,
                 static_cast<std::size_t>(ctx->count) * sizeof(TokenId));
+    if (ctx->logprob_destination != nullptr && ctx->logprob_source != nullptr) {
+        std::memcpy(ctx->logprob_destination, ctx->logprob_source,
+                    static_cast<std::size_t>(ctx->count) * sizeof(float));
+    }
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -1833,6 +1841,10 @@ void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
 void ProgramImplCore::copy_round_token() {
     CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
                                device.stream));
+    if (io.logprob.data != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(host_token_logprob, io.logprob.data, sizeof(float),
+                                   cudaMemcpyDeviceToHost, device.stream));
+    }
 }
 
 void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
@@ -2185,7 +2197,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         request.lifecycle = Lifecycle::Pending;
         return runtime::PrefillStepResult{
             .summary = summary,
-            .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
+            .round   = runtime::GeneratedRound{
+                .tokens   = std::span<const TokenId>(host_tokens, 1),
+                .logprobs = std::span<const float>(host_token_logprob, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
         };
@@ -2331,9 +2345,11 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
                                                         chained);
             }
             burst_copy_ctx[round] = BurstEgressCopy{
-                .destination = burst_rounds.data() + round * kMaximumConcurrency,
-                .source      = ordinary_host_egress->sampled_tokens.data(),
-                .count       = static_cast<std::int32_t>(lanes.size())};
+                .destination         = burst_rounds.data() + round * kMaximumConcurrency,
+                .source              = ordinary_host_egress->sampled_tokens.data(),
+                .logprob_destination = burst_rounds_logprobs.data() + round * kMaximumConcurrency,
+                .logprob_source      = ordinary_host_egress->sampled_logprobs.data(),
+                .count               = static_cast<std::int32_t>(lanes.size())};
             CUDA_CHECK(cudaLaunchHostFunc(device.stream, &ProgramImplCore::burst_egress_copy_host,
                                           &burst_copy_ctx[round]));
         }
@@ -2377,8 +2393,10 @@ ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
             const std::uint32_t base_E = sequence.execution_frontier;
             const std::uint32_t base_S = sequence.ledger_frontier;
             TokenId* row_tokens        = burst_tokens.data() + row * burst;
+            float* row_logprobs        = burst_logprobs.data() + row * burst;
             for (std::uint32_t round = 0; round < burst; ++round) {
-                row_tokens[round] = burst_rounds[round * kMaximumConcurrency + row];
+                row_tokens[round]   = burst_rounds[round * kMaximumConcurrency + row];
+                row_logprobs[round] = burst_rounds_logprobs[round * kMaximumConcurrency + row];
             }
             validate_licensed_tokens(std::span<const TokenId>(row_tokens, burst));
             sequence.text_kv_valid     = base_E + burst;
@@ -2402,6 +2420,7 @@ ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(burst_tokens.data(), lanes.size() * burst),
+            .logprobs   = std::span<const float>(burst_logprobs.data(), lanes.size() * burst),
             .row_counts = std::span<const std::int32_t>(burst_counts.data(), lanes.size()),
             .row_stride = burst};
     } catch (...) {
@@ -2758,6 +2777,9 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             ops::scatter(slice.hidden, lanes_tensor, tail_hidden_store, device.stream);
             ops::sample(slice.logits, sampled, cfg.token_domain, ordinary.sampling,
                         cache_positions, ops::kSamplePurposeDecode, work, device.stream);
+            Tensor sampled_logprobs = ordinary.sampled_logprobs.slice(0, 0, rows);
+            ops::sampled_logprob(slice.logits, sampled, sampled_logprobs, cfg.token_domain,
+                                 ordinary.sampling, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(ordinary_host_egress, ordinary.egress.data,
                                        sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                        device.stream));
@@ -2834,7 +2856,9 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
 
         runtime::MixedRoundResult result;
         result.round = runtime::BatchedGeneratedRound{
-            .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
+            .tokens   = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
+                                               lanes.size()),
+            .logprobs = std::span<const float>(ordinary_host_egress->sampled_logprobs.data(),
                                                lanes.size())};
         // Each staged prompt advances by its own chunk; the graph path processes exactly the
         // first one, so its count matches what the forward consumed.

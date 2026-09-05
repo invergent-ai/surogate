@@ -358,9 +358,11 @@ public:
     Tensor chain_one;
     static constexpr std::uint32_t kChainBurstLimit = 8;
     struct BurstEgressCopy {
-        TokenId* destination      = nullptr;
-        const TokenId* source     = nullptr;
-        std::int32_t count        = 0;
+        TokenId* destination           = nullptr;
+        const TokenId* source          = nullptr;
+        float* logprob_destination     = nullptr;
+        const float* logprob_source    = nullptr;
+        std::int32_t count             = 0;
     };
         // Round lifecycle state (runtime/contract/round_lifecycle.h): what the
     // launch half hands the consume half. Depth is one today; overlap means
@@ -393,6 +395,8 @@ public:
 
     std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_rounds{};
     std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_tokens{};
+    std::array<float, kMaximumConcurrency * kChainBurstLimit> burst_logprobs{};
+    std::array<float, kMaximumConcurrency * kChainBurstLimit> burst_rounds_logprobs{};
     std::array<std::int32_t, kMaximumConcurrency> burst_counts{};
     std::array<BurstEgressCopy, kChainBurstLimit> burst_copy_ctx{};
     std::uint32_t round_burst_limit = 1;
@@ -404,6 +408,8 @@ public:
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
+/// The step token's log-probability, pinned beside it in `round_host`.
+float* host_token_logprob = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     family::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     family::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;

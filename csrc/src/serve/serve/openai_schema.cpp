@@ -383,6 +383,16 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     if (body.contains("ignore_eos") && body.at("ignore_eos").is_boolean()) {
         out.ignore_eos = body.at("ignore_eos").get<bool>();
     }
+    // `logprobs` is OpenAI's own; `return_token_ids` is vLLM's extension, and an
+    // RL client sends both. They were accepted and ignored before, which is worse
+    // than refusing them: the rollout came back looking complete and carried
+    // nothing to train on.
+    if (body.contains("logprobs") && body.at("logprobs").is_boolean()) {
+        out.want_logprobs = body.at("logprobs").get<bool>();
+    }
+    if (body.contains("return_token_ids") && body.at("return_token_ids").is_boolean()) {
+        out.return_token_ids = body.at("return_token_ids").get<bool>();
+    }
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
     const Json& stop = body.at("stop");
     if (stop.is_string()) {
@@ -626,20 +636,39 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
-                                          const CompletionUsage& usage) {
+                                          const CompletionUsage& usage,
+                                          const TokenDetail& detail) {
     Json message = {{"role", "assistant"}, {"content", content}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    const Json payload = {
+    Json choice = {{"index", 0}, {"message", std::move(message)},
+                   {"finish_reason", finish_reason}};
+    if (detail.include_logprobs) {
+        // OpenAI's shape: one entry per generated token, in order. `top_logprobs`
+        // stays empty -- nothing asks this engine for alternatives, and an empty
+        // array is what the schema says when none were requested.
+        Json entries = Json::array();
+        for (std::size_t i = 0; i < detail.logprobs.size(); ++i) {
+            entries.push_back(Json{
+                {"token", i < detail.texts.size() ? detail.texts[i] : std::string{}},
+                {"logprob", detail.logprobs[i]},
+                {"bytes", nullptr},
+                {"top_logprobs", Json::array()}});
+        }
+        choice["logprobs"] = Json{{"content", std::move(entries)}};
+    }
+    if (detail.include_token_ids) { choice["token_ids"] = detail.completion_token_ids; }
+    Json payload = {
         {"id", id},
         {"object", "chat.completion"},
         {"created", created},
         {"model", model},
-        {"choices",
-         Json::array({Json{
-             {"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}}})},
+        {"choices", Json::array({std::move(choice)})},
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+    // The prompt's ids sit at the top level, where vLLM puts them, because they
+    // belong to the request rather than to any one choice.
+    if (detail.include_token_ids) { payload["prompt_token_ids"] = detail.prompt_token_ids; }
     return payload.dump();
 }
 

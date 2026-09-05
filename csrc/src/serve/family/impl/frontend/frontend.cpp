@@ -1124,6 +1124,15 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     return PreparedPrompt(std::move(prepared));
 }
 
+std::vector<std::string> Frontend::token_texts(std::span<const TokenId> ids) const {
+    std::vector<std::string> out;
+    out.reserve(ids.size());
+    for (const TokenId id : ids) {
+        out.push_back(impl_->tokenizer->decode_token_bytes(static_cast<int>(id), false));
+    }
+    return out;
+}
+
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
     const PromptOptions options           = input.options;

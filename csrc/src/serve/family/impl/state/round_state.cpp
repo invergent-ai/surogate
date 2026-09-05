@@ -86,6 +86,7 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
                                          "mixed prefill finalize sampling");
     }
     layout.token      = add_tensor(builder, DType::I32, {1}, "step token");
+    layout.logprob    = add_tensor(builder, DType::FP32, {1}, "step token logprob");
     layout.pos        = add_tensor(builder, DType::I32, {1}, "step position");
     layout.rope_pos   = add_tensor(builder, DType::I32, {1}, "step rope position");
     layout.rope_delta = add_tensor(builder, DType::I32, {1}, "step rope delta");
@@ -123,6 +124,9 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     sampled_tokens = Tensor(static_cast<unsigned char*>(egress.data) +
                                 offsetof(OrdinaryDecodeEgress, sampled_tokens),
                             DType::I32, {count});
+    sampled_logprobs = Tensor(static_cast<unsigned char*>(egress.data) +
+                                  offsetof(OrdinaryDecodeEgress, sampled_logprobs),
+                              DType::FP32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
 }
@@ -374,6 +378,7 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
             static_cast<ops::SamplingConfig*>(fl.sampling.bind(backing).data);
     }
     token                = layout.token.bind(backing);
+    logprob              = layout.logprob.bind(backing);
     pos                  = layout.pos.bind(backing);
     rope_pos             = layout.rope_pos.bind(backing);
     rope_delta           = layout.rope_delta.bind(backing);

@@ -14,6 +14,7 @@
 #include <cstdlib>
 
 #include "api/ops/lora_store.h"
+#include "api/ops/sampled_logprob.h"
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 namespace {
@@ -191,6 +192,11 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                 state.execution.model.geometry.token_domain, state.sampling,
                 state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
+    // The same quantity the decode rounds record, for the one token a prefill
+    // licenses -- a client that asks for probabilities wants the first one too.
+    ops::sampled_logprob(logits, state.execution.io.token, state.execution.io.logprob,
+                         state.execution.model.geometry.token_domain, state.sampling,
+                         state.execution.device.stream);
     state.execution.work.reset();
 }
 

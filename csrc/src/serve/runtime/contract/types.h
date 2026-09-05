@@ -69,10 +69,18 @@ struct BeginSummary {
 
 struct GeneratedRound {
     std::span<const TokenId> tokens;
+    /// The log-probability of each token under the full vocabulary, same order and
+    /// length as `tokens`. Empty from a route that does not produce them -- the
+    /// speculative ones, whose licensed tokens come from a verify step rather than
+    /// from one sampled column -- so a consumer checks before reading.
+    std::span<const float> logprobs;
 };
 
 struct BatchedGeneratedRound {
     std::span<const TokenId> tokens;
+    /// As `GeneratedRound::logprobs`, laid out exactly like `tokens`: the same
+    /// `row_stride` per row. Empty when the route does not produce them.
+    std::span<const float> logprobs;
     std::span<const std::int32_t> row_counts;
     std::uint32_t row_stride = 1;
 };

@@ -730,9 +730,21 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 response_body = make_chat_completion_tool_response(
                     id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage);
             } else {
+                TokenDetail detail;
+                detail.include_token_ids = !outcome.completion_token_ids.empty() ||
+                                           !outcome.prompt_token_ids.empty();
+                detail.include_logprobs  = !outcome.token_logprobs.empty();
+                if (detail.include_token_ids) {
+                    detail.prompt_token_ids     = outcome.prompt_token_ids;
+                    detail.completion_token_ids = outcome.completion_token_ids;
+                }
+                if (detail.include_logprobs) {
+                    detail.logprobs = outcome.token_logprobs;
+                    detail.texts    = outcome.token_texts;
+                }
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
-                    finish_reason_wire(outcome.finish_reason), usage);
+                    finish_reason_wire(outcome.finish_reason), usage, detail);
             }
             set_owned_content(res, std::move(response_body), prepared.lifetime);
         } catch (const std::exception& e) {

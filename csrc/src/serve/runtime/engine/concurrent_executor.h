@@ -22,6 +22,7 @@
 #include "core/limits.h"
 #include <deque>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -355,6 +356,11 @@ private:
         std::optional<GenerationBudget> budget;
         std::optional<BeginSummary> begin;
         std::vector<TokenId> generated;
+        /// One per entry of `generated`, from the round that sampled it. A route
+        /// that does not produce them contributes nothing, so this is either empty
+        /// or exactly as long as `generated` -- never partly filled, which would
+        /// silently misalign a client reading the two together.
+        std::vector<float> generated_logprobs;
         std::string content;
         std::string reasoning;
         std::optional<std::uint32_t> lane;
@@ -490,6 +496,7 @@ private:
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
+        result.token_logprobs          = std::move(request->generated_logprobs);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.reasoning_tokens        = request->output.reasoning_tokens();
@@ -528,7 +535,7 @@ private:
         complete_success(request, FinishReason::Cancelled);
     }
 
-    bool resolve_round(const std::shared_ptr<Request>& request, TokenId token,
+    bool resolve_round(const std::shared_ptr<Request>& request, TokenId token, float logprob,
                        bool cancel_at_boundary) {
         const std::uint32_t lane = *request->lane;
         if (cancel_at_boundary) {
@@ -546,6 +553,7 @@ private:
             throw std::logic_error("prefill output policy did not accept its licensed token");
         }
         request->generated.push_back(token);
+        request->generated_logprobs.push_back(logprob);
         instance_.program->resolve_prefill_lane(lane, decision.finished());
         request->budget->commit(1);
         auto published = request->output.commit_preview();
@@ -706,7 +714,10 @@ private:
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
         }
-        if (resolve_round(request, step.round.tokens.front(), false)) {
+        const float first_logprob =
+            step.round.logprobs.empty() ? std::numeric_limits<float>::quiet_NaN()
+                                        : step.round.logprobs.front();
+        if (resolve_round(request, step.round.tokens.front(), first_logprob, false)) {
             remove_completed_slot(*request->lane);
         } else {
             request->decode_ready = true;
@@ -1408,6 +1419,19 @@ private:
                     row * round.row_stride, static_cast<std::size_t>(accepted[row]));
                 request->generated.insert(request->generated.end(), row_tokens.begin(),
                                           row_tokens.end());
+                // A route without probabilities contributes NaN rather than nothing,
+                // so the two vectors stay the same length and a client reading them
+                // together cannot silently pair a token with another token's number.
+                if (round.logprobs.size() >= round.tokens.size()) {
+                    const auto row_logprobs = round.logprobs.subspan(
+                        row * round.row_stride, static_cast<std::size_t>(accepted[row]));
+                    request->generated_logprobs.insert(request->generated_logprobs.end(),
+                                                       row_logprobs.begin(), row_logprobs.end());
+                } else {
+                    request->generated_logprobs.insert(request->generated_logprobs.end(),
+                                                       accepted[row],
+                                                       std::numeric_limits<float>::quiet_NaN());
+                }
                 request->budget->commit(accepted[row]);
                 consume_service_work(request, accepted[row]);
             }

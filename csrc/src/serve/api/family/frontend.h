@@ -156,6 +156,13 @@ public:
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
+    /// The text of each token id, one string per id.
+    ///
+    /// Per-token rather than per-sequence: a client that asks for probabilities is
+    /// given one number per token and needs the token each belongs to. Decoding the
+    /// ids together instead would merge them into one string, which is the right
+    /// answer to a different question.
+    [[nodiscard]] std::vector<std::string> token_texts(std::span<const TokenId> ids) const;
 
 private:
     class Impl;

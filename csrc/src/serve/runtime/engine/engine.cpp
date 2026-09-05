@@ -1,3 +1,4 @@
+#include "api/family/prepared_prompt.h"
 #include "api/engine.h"
 
 #include "core/device.h"
@@ -63,6 +64,11 @@ public:
     SamplingMode sampling_mode = SamplingMode::Thinking;
     family::PreparedPrompt value;
 };
+
+std::vector<TokenId> PreparedPrompt::token_ids() const {
+    if (!impl_) { return {}; }
+    return family::PreparedPromptAccess::view(impl_->value).token_ids;
+}
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
 PreparedPrompt::~PreparedPrompt()                                    = default;
@@ -306,6 +312,16 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
             const PromptPreparationStats preparation = prepared.preparation_stats();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
                 info, preparation, SamplingMode::Thinking, std::move(prepared)));
+        },
+        impl_->active);
+}
+
+std::vector<std::string> Engine::token_texts(std::span<const TokenId> ids) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& target_ptr) {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.token_texts(ids);
         },
         impl_->active);
 }

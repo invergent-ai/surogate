@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "api/ops/lora_store.h"
+#include "api/ops/sampled_logprob.h"
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 namespace {
@@ -62,6 +63,15 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         ops::sample(logits, sampled, state.execution.model.geometry.token_domain,
                     ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
+        // The chosen token's probability under the whole vocabulary, for the same
+        // round and inside the same capture. It reads the logits once more -- a
+        // fraction of a percent of what the head that produced them cost -- so it
+        // runs unconditionally rather than behind a flag that would have to be
+        // decided before the first graph was recorded.
+        Tensor sampled_logprobs = ordinary.sampled_logprobs.slice(0, 0, batch_size);
+        ops::sampled_logprob(logits, sampled, sampled_logprobs,
+                             state.execution.model.geometry.token_domain, ordinary.sampling,
+                             state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
@@ -120,6 +130,15 @@ auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch
         ops::sample(logits, sampled, state.execution.model.geometry.token_domain,
                     ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
+        // The chosen token's probability under the whole vocabulary, for the same
+        // round and inside the same capture. It reads the logits once more -- a
+        // fraction of a percent of what the head that produced them cost -- so it
+        // runs unconditionally rather than behind a flag that would have to be
+        // decided before the first graph was recorded.
+        Tensor sampled_logprobs = ordinary.sampled_logprobs.slice(0, 0, batch_size);
+        ops::sampled_logprob(logits, sampled, sampled_logprobs,
+                             state.execution.model.geometry.token_domain, ordinary.sampling,
+                             state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));

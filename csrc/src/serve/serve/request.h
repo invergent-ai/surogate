@@ -187,6 +187,12 @@ struct GenerationRequest {
     std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
+    /// Per-token log-probabilities in the response (`logprobs`), and the prompt and
+    /// completion token ids beside them (`return_token_ids`, vLLM's extension). An
+    /// RL trainer needs all three: it scores the exact ids it was given against the
+    /// probabilities they were drawn with.
+    bool want_logprobs    = false;
+    bool return_token_ids = false;
     SamplingParams sampling;
 
     /// The adapter this request selected by naming it in `model`, empty for the

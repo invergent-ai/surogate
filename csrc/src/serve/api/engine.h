@@ -1,5 +1,6 @@
 #pragma once
 
+#include <span>
 #include "api/types.h"
 
 #include <chrono>
@@ -25,6 +26,14 @@ public:
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
     [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
+    /// The prompt's token ids, as the model will see them.
+    ///
+    /// A reinforcement-learning client needs these to score the sequence it was
+    /// given, and it must be the engine's own tokenisation rather than the
+    /// client's -- re-rendering a chat prompt is not guaranteed to reproduce it.
+    /// Copied on request, because a prompt is submitted far more often than it is
+    /// asked for.
+    [[nodiscard]] std::vector<TokenId> token_ids() const;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:
@@ -84,6 +93,10 @@ public:
     /// Whether the loaded artifact carries a chat template. False for a base model, and the
     /// chat-shaped endpoints refuse rather than render nothing.
     [[nodiscard]] bool supports_chat() const;
+
+    /// The text of each token id, one string per id -- what an OpenAI `logprobs`
+    /// entry names beside its number.
+    [[nodiscard]] std::vector<std::string> token_texts(std::span<const TokenId> ids) const;
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
