@@ -76,16 +76,18 @@ serve-test-build:
 	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
 		--target surogate-engine-cli surogate-engine serve-tests
 
-# The quantiser `surogate quantize` drives, from the vendored llama.cpp subset. CPU-only and
-# independent of the engine build, so it has its own tree; the sources are tracked and the
-# objects are not. Provenance and the pinned revision:
-# csrc/src/third_party/llama.cpp/PROVENANCE.md
-LLAMA_CPP_DIR ?= csrc/src/third_party/llama.cpp
+# The quantiser `surogate quantize` drives. Fetched from a pinned llama.cpp and built CPU-only,
+# then installed into the package where the command looks for it -- the same two steps the
+# wheel takes, so a source tree and an installed wheel behave alike. Revision and rationale:
+# csrc/cmake/llama_cpp_quantizer.cmake
+QUANTIZER_BUILD_DIR ?= build/quantizer
 
 quantizer:
-	cmake -S $(LLAMA_CPP_DIR) -B $(LLAMA_CPP_DIR)/build -G Ninja -DCMAKE_BUILD_TYPE=Release
-	cmake --build $(LLAMA_CPP_DIR)/build --parallel $(PARALLEL_JOBS) --target llama-quantize
-	@echo "==> $(LLAMA_CPP_DIR)/build/tools/quantize/llama-quantize"
+	cmake -S csrc -B $(QUANTIZER_BUILD_DIR) -G Ninja -DCMAKE_BUILD_TYPE=Release \
+		-DSUROGATE_BUILD_QUANTIZER=ON -DPYTHON_BINDING=OFF -DBUILD_TESTS=OFF
+	cmake --build $(QUANTIZER_BUILD_DIR) --parallel $(PARALLEL_JOBS) --target llama-quantize
+	cmake --install $(QUANTIZER_BUILD_DIR) --prefix . --component quantizer
+	@echo "==> surogate/serve/_llama_cpp/bin/llama-quantize"
 
 # The engine's own suite: 107 tests, ~3 minutes on one GPU. A test whose fixture is absent
 # exits 77 and ctest reports it skipped, so a machine without the real weights still gets a

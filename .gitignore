@@ -42,5 +42,6 @@ design/
 
 .env
 
-# The vendored llama.cpp builds into its own tree; the sources are tracked, the objects are not.
-csrc/src/third_party/llama.cpp/build/
+# `surogate quantize`'s toolchain: fetched from a pinned llama.cpp and installed here by the
+# build (csrc/cmake/llama_cpp_quantizer.cmake). A build product, not source.
+surogate/serve/_llama_cpp/

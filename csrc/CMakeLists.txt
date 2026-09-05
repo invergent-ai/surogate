@@ -708,6 +708,15 @@ if (NOT SKBUILD)
 endif ()
 
 
+# The quantiser `surogate quantize` drives. Built here rather than by a separate command
+# because a step someone has to remember is a step that does not happen: the wheel, the Docker
+# image and every CI job drive this file, so building it here is what makes it automatic.
+# Off by default for an ordinary trainer build, which has no use for it.
+option(SUROGATE_BUILD_QUANTIZER "Fetch and build llama-quantize for `surogate quantize`" OFF)
+if (SUROGATE_BUILD_QUANTIZER)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama_cpp_quantizer.cmake)
+endif()
+
 if (PYTHON_BINDING)
     find_package(Python COMPONENTS Interpreter Development.Module OPTIONAL_COMPONENTS Development.SABIModule)
     FetchContent_MakeAvailable(nanobind)

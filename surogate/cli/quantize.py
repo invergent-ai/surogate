@@ -22,6 +22,7 @@ output; the space is checked before the first pass rather than discovered during
 """
 
 import argparse
+import glob
 import os
 import shutil
 import subprocess
@@ -39,20 +40,26 @@ COMMON_TYPES = (
     "q5_k_s", "q5_k_m", "q6_k", "q8_0", "bf16", "f16", "f32",
 )
 
-# The vendored tree: the quantiser's sources live in this repository, pinned to one upstream
-# revision, and `make quantizer` builds them. Before that this pointed at `study/llama.cpp-master`,
-# a clone git did not track and no installed copy of the package would have -- so the command
-# failed on any machine but the one it was written on, and two machines could produce different
-# weights from the same checkpoint with nothing to say why. See PROVENANCE.md beside the sources.
-# `SUROGATE_LLAMA_CPP` still points at an llama.cpp elsewhere, for a caller who wants one.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-VENDORED_LLAMA_CPP = os.path.join(_REPO_ROOT, "csrc", "src", "third_party", "llama.cpp")
+# Where the quantiser lives once the build has installed it. `surogate quantize` needs three
+# things at run time -- the binary, the Hugging-Face-to-GGUF converter, and the `gguf` library
+# that converter puts on `sys.path` ahead of anything installed -- and CMake puts all three
+# here, in the package, so an installed wheel has them without anyone building anything.
+#
+# Before this the command looked for a clone at `study/llama.cpp-master` that git did not track
+# and no installed copy would have, so it worked on one machine and nowhere else. The revision
+# is pinned in `csrc/cmake/llama_cpp_quantizer.cmake`.
+#
+# `SUROGATE_LLAMA_CPP` still points the whole thing at an llama.cpp checkout of your own; then
+# its converter and its `gguf-py` are used too, because a converter and its library have to be
+# one revision. They went out of step on the first run otherwise: a checkpoint whose
+# architecture the pinned converter knew failed against the installed `gguf` release.
+_PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+INSTALLED_LLAMA_CPP = os.path.join(_PACKAGE_ROOT, "serve", "_llama_cpp")
 
-#: The HF -> BF16 GGUF converter, vendored beside the engine's Python rather than in the C++
-#: tree because it is a script the package ships, not something the build produces.
-VENDORED_CONVERTER = os.path.join(
-    _REPO_ROOT, "surogate", "serve", "vendor", "llama_cpp", "convert_hf_to_gguf.py"
-)
+#: The build tree, for a developer who has run cmake but not installed. Kept second so an
+#: installed package never reaches outside itself.
+_REPO_ROOT = os.path.dirname(_PACKAGE_ROOT)
+_BUILD_TREE_GLOB = os.path.join(_REPO_ROOT, "build", "*", "_deps", "llama_cpp-src")
 
 
 def prepare_command_parser(parser=None):
@@ -100,20 +107,25 @@ def prepare_command_parser(parser=None):
 
 
 def _llama_cpp_dir(explicit):
-    """The llama.cpp checkout to drive: the flag, then the environment, then the vendored tree."""
-    for candidate in (explicit, os.environ.get("SUROGATE_LLAMA_CPP"), VENDORED_LLAMA_CPP):
+    """Where to find the quantiser and its converter: the flag, the environment, then what the
+    build installed into the package."""
+    for candidate in (explicit, os.environ.get("SUROGATE_LLAMA_CPP")):
         if candidate:
             return os.path.abspath(candidate)
-    return None
+    if os.path.isdir(INSTALLED_LLAMA_CPP):
+        return INSTALLED_LLAMA_CPP
+    matches = sorted(glob.glob(_BUILD_TREE_GLOB))
+    return matches[-1] if matches else INSTALLED_LLAMA_CPP
 
 
 def _find_quantizer(llama_cpp, build):
     """The `llama-quantize` binary, built on request when it is the only thing missing."""
     candidates = (
-        # Where our own build puts it; upstream's layout follows, for a caller pointing
+        # Where our own install puts it, then upstream's own layouts, for a caller pointing
         # `SUROGATE_LLAMA_CPP` at an llama.cpp checkout of their own.
-        os.path.join(llama_cpp, "build", "tools", "quantize", "llama-quantize"),
+        os.path.join(llama_cpp, "bin", "llama-quantize"),
         os.path.join(llama_cpp, "build", "bin", "llama-quantize"),
+        os.path.join(llama_cpp, "build", "tools", "quantize", "llama-quantize"),
         os.path.join(llama_cpp, "build", "bin", "Release", "llama-quantize.exe"),
         os.path.join(llama_cpp, "llama-quantize"),
     )
@@ -123,14 +135,15 @@ def _find_quantizer(llama_cpp, build):
     command = ["cmake", "--build", "build", "--target", "llama-quantize", "-j", "16"]
     if not build:
         logger.error(
-            f"llama-quantize is not built in {llama_cpp}. Build it with:\n"
-            f"    cd {llama_cpp} && {' '.join(command)}\n"
-            f"or pass --build to have this command do it."
+            f"llama-quantize is not in {llama_cpp}. An installed wheel ships it; a source "
+            f"tree builds it with:\n"
+            f"    cmake -S csrc -B build -DSUROGATE_BUILD_QUANTIZER=ON && "
+            f"cmake --build build --target llama-quantize"
         )
         return None
-    logger.info(f"Building llama-quantize in {llama_cpp}")
+    logger.info(f"building llama-quantize in {llama_cpp}")
     if subprocess.run(command, cwd=llama_cpp).returncode != 0:
-        logger.error("The llama-quantize build failed; its output is above.")
+        logger.error("building llama-quantize failed; its output is above")
         return None
     return _find_quantizer(llama_cpp, build=False)
 
@@ -138,14 +151,6 @@ def _find_quantizer(llama_cpp, build):
 def _find_converter(llama_cpp):
     """The HF -> BF16 GGUF converter. The vendored one unless the caller pointed at an
     llama.cpp of their own, in which case theirs is the one that matches their quantiser."""
-    if os.path.abspath(llama_cpp) == os.path.abspath(VENDORED_LLAMA_CPP):
-        if os.path.isfile(VENDORED_CONVERTER):
-            return VENDORED_CONVERTER
-        logger.error(
-            f"the vendored converter is missing at {VENDORED_CONVERTER}; the checkout is "
-            f"incomplete (see csrc/src/third_party/llama.cpp/PROVENANCE.md)"
-        )
-        return None
     for name in ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py"):
         candidate = os.path.join(llama_cpp, name)
         if os.path.isfile(candidate):

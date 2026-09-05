@@ -1,0 +1,83 @@
+# The quantiser `surogate quantize` drives, built on every push.
+#
+# It is fetched from llama.cpp at a pinned commit and built CPU-only, which takes about half a
+# minute; the wheel and the Docker image build it the same way, so this job is what tells us
+# the pinned revision still compiles before either of those does. It also fails loudly if the
+# pin is moved to a revision that does not build, which is the whole reason the dependency
+# stopped being a path on somebody's disk.
+name: Quantizer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - release-*
+      - serve-engine
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: quantizer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build llama-quantize (CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build ccache
+
+      # The fetched tarball is keyed by the pinned commit, so the cache hits until the pin moves
+      # -- which is exactly when we want a cold build anyway.
+      - name: Cache the fetched source
+        uses: actions/cache@v4
+        with:
+          path: build/quantizer/_deps
+          key: llama-cpp-${{ hashFiles('csrc/cmake/llama_cpp_quantizer.cmake') }}
+
+      - name: Configure
+        run: |
+          cmake -S csrc -B build/quantizer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSUROGATE_BUILD_QUANTIZER=ON \
+            -DPYTHON_BINDING=OFF \
+            -DBUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build/quantizer --parallel --target llama-quantize
+
+      # Installing is the half that a wheel does, and it is where a wrong destination would
+      # show up: the binary, the converter, its conversion package and the `gguf` library the
+      # converter puts on sys.path all have to land inside `surogate/`, or an installed package
+      # has a command with nothing to run.
+      - name: Install into the package and check what landed
+        run: |
+          cmake --install build/quantizer --prefix . --component quantizer
+          test -x surogate/serve/_llama_cpp/bin/llama-quantize
+          test -f surogate/serve/_llama_cpp/convert_hf_to_gguf.py
+          test -d surogate/serve/_llama_cpp/conversion
+          test -f surogate/serve/_llama_cpp/gguf-py/gguf/__init__.py
+          test -f surogate/serve/_llama_cpp/LICENSE
+          surogate/serve/_llama_cpp/bin/llama-quantize --help > /dev/null
+
+      # The revision the binary reports has to be the revision we pinned. A tarball carries no
+      # git, so these come from two CMake variables; if the pin is bumped and they are not,
+      # every file this quantiser writes would claim a revision that did not make it.
+      - name: The binary reports the pinned revision
+        run: |
+          pinned=$(grep -oP 'LLAMA_BUILD_COMMIT "\K[0-9a-f]+' csrc/cmake/llama_cpp_quantizer.cmake)
+          echo "pinned: $pinned"
+          surogate/serve/_llama_cpp/bin/llama-quantize --version 2>&1 | tee /tmp/version.txt
+          grep -q "$pinned" /tmp/version.txt || {
+            echo "::error::llama-quantize reports a revision other than the pinned $pinned;"\
+                 "LLAMA_BUILD_COMMIT and LLAMA_CPP_COMMIT are out of step"
+            exit 1
+          }

@@ -63,11 +63,16 @@ minimum-version = "build-system.requires"
 metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
 wheel.py-api = "cp312"
 wheel.packages = ["surogate"]
-build.targets = ["_surogate"]
+# The quantiser is a second product of this build; naming it here is what makes
+# `uv build --wheel` produce it rather than only the extension module.
+build.targets = ["_surogate", "llama-quantize"]
 build-dir = "build/{wheel_tag}"
 cmake.build-type = "Release"
 
 [tool.scikit-build.cmake.define]
+# `surogate quantize` ships with the wheel, so the quantiser is built and installed with it.
+# Without this the command exists in the package and has nothing to run.
+SUROGATE_BUILD_QUANTIZER = "ON"
 PYTHON_BINDING = "ON"
 # USE_CUFILE / REQUIRE_CUFILE are deliberately not set here: they default to ON in
 # csrc/CMakeLists.txt. An explicit USE_CUFILE = "OFF" here is what silently shipped
