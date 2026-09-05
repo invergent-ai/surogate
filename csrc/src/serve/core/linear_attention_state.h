@@ -19,6 +19,12 @@ struct LinearAttentionStatePoolSpec {
     std::int32_t key_head_dim   = 0;
     std::int32_t slot_count     = 1;
     DType conv_dtype            = DType::BF16;
+
+    /// Whether the mixer carries a recurrent state beside its convolution. A gated delta net
+    /// does -- that matrix is the mixer. A short convolution does not: its whole memory is the
+    /// K-1 columns behind the round, and the three head dimensions are left at zero to say so,
+    /// which costs the pool nothing rather than a zero-sized region per layer.
+    [[nodiscard]] constexpr bool has_recurrent() const noexcept { return value_heads > 0; }
 };
 
 struct LinearAttentionStatePoolLayout {

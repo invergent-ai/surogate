@@ -89,10 +89,18 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
     validate_positive(spec.conv_channels,
                       "LinearAttentionStatePool conv_channels must be positive");
     validate_positive(spec.conv_width, "LinearAttentionStatePool conv_width must be positive");
-    validate_positive(spec.value_heads, "LinearAttentionStatePool value_heads must be positive");
-    validate_positive(spec.value_head_dim,
-                      "LinearAttentionStatePool value_head_dim must be positive");
-    validate_positive(spec.key_head_dim, "LinearAttentionStatePool key_head_dim must be positive");
+    // All three recurrent dimensions or none: a mixer either carries a recurrent state or it
+    // does not, and a spec that names two of the three has lost one of them somewhere rather
+    // than describing a model.
+    if (spec.has_recurrent()) {
+        validate_positive(spec.value_head_dim,
+                          "LinearAttentionStatePool value_head_dim must be positive");
+        validate_positive(spec.key_head_dim,
+                          "LinearAttentionStatePool key_head_dim must be positive");
+    } else if (spec.value_head_dim != 0 || spec.key_head_dim != 0) {
+        throw std::invalid_argument("LinearAttentionStatePool declares recurrent head dimensions "
+                                    "without any heads to carry them");
+    }
     validate_positive(spec.slot_count, "LinearAttentionStatePool slot_count must be positive");
     if (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP32) {
         throw std::invalid_argument("LinearAttentionStatePool conv_dtype must be BF16 or FP32");
@@ -107,12 +115,14 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
     LinearAttentionStatePoolLayout layout;
     layout.spec = spec;
     layout.conv.reserve(spec.layers);
-    layout.recurrent.reserve(spec.layers);
+    if (spec.has_recurrent()) { layout.recurrent.reserve(spec.layers); }
     for (std::uint32_t layer = 0; layer < spec.layers; ++layer) {
         const std::string prefix = "Linear Attention layer " + std::to_string(layer);
         layout.conv.push_back(builder.add(conv_shape.bytes(), kArenaAlign, prefix + " conv"));
-        layout.recurrent.push_back(
-            builder.add(recurrent_shape.bytes(), kArenaAlign, prefix + " recurrent"));
+        if (spec.has_recurrent()) {
+            layout.recurrent.push_back(
+                builder.add(recurrent_shape.bytes(), kArenaAlign, prefix + " recurrent"));
+        }
     }
     return layout;
 }
@@ -127,7 +137,8 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
         }
         return; // pure-attention target: nothing to map
     }
-    if (layout.conv.empty() || layout.recurrent.size() != layout.conv.size() ||
+    const std::size_t expected_recurrent = spec.has_recurrent() ? layout.conv.size() : 0U;
+    if (layout.conv.empty() || layout.recurrent.size() != expected_recurrent ||
         layout.conv.size() != spec.layers) {
         throw std::invalid_argument(
             "LinearAttentionStatePool layout layer counts are inconsistent");
@@ -141,14 +152,18 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
     conv.reserve(layout.conv.size());
     recurrent.reserve(layout.recurrent.size());
     for (std::size_t layer = 0; layer < layout.conv.size(); ++layer) {
-        if (layout.conv[layer].bytes != conv_shape.bytes() ||
-            layout.recurrent[layer].bytes != recurrent_shape.bytes()) {
+        if (layout.conv[layer].bytes != conv_shape.bytes()) {
             throw std::logic_error(
                 "LinearAttentionStatePool layout tensor byte size is inconsistent");
         }
         conv.emplace_back(layout.conv[layer].bind(backing).data, spec.conv_dtype,
                           std::initializer_list<std::int32_t>{spec.conv_channels, spec.conv_width,
                                                               spec.slot_count});
+        if (!spec.has_recurrent()) { continue; }
+        if (layout.recurrent[layer].bytes != recurrent_shape.bytes()) {
+            throw std::logic_error(
+                "LinearAttentionStatePool layout tensor byte size is inconsistent");
+        }
         recurrent.emplace_back(
             layout.recurrent[layer].bind(backing).data, DType::BF16,
             std::initializer_list<std::int32_t>{spec.key_head_dim, spec.value_head_dim,
@@ -168,18 +183,21 @@ std::int64_t LinearAttentionStatePool::conv_slot_stride_elements() const noexcep
 }
 
 std::int64_t LinearAttentionStatePool::recurrent_slot_stride_elements() const noexcept {
+    if (!spec.has_recurrent()) { return 0; }
     return static_cast<std::int64_t>(spec.key_head_dim) *
            static_cast<std::int64_t>(spec.value_head_dim) *
            static_cast<std::int64_t>(spec.value_heads);
 }
 
 LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() const {
-    if (conv.size() != spec.layers || recurrent.size() != spec.layers || conv.empty()) {
+    const std::size_t expected_recurrent = spec.has_recurrent() ? spec.layers : 0U;
+    if (conv.size() != spec.layers || recurrent.size() != expected_recurrent || conv.empty()) {
         throw std::logic_error("LinearAttentionStatePool layer inventory is inconsistent");
     }
     for (std::size_t layer = 0; layer < conv.size(); ++layer) {
         validate_state_tensor(conv[layer], spec.conv_dtype,
                               {spec.conv_channels, spec.conv_width, spec.slot_count}, "conv");
+        if (!spec.has_recurrent()) { continue; }
         validate_state_tensor(
             recurrent[layer], DType::BF16,
             {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count},
@@ -187,9 +205,12 @@ LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() co
     }
     return LinearAttentionStateAllLayersView{
         .conv_layer0                  = conv.front(),
-        .recurrent_layer0             = recurrent.front(),
+        // A conv-only mixer has no recurrent image, and a null tensor is what says so. Every
+        // reader of this view is a gated-delta kernel, which a short-conv target never reaches.
+        .recurrent_layer0             = spec.has_recurrent() ? recurrent.front() : Tensor{},
         .conv_layer_stride_bytes      = layer_stride_bytes(conv, "conv"),
-        .recurrent_layer_stride_bytes = layer_stride_bytes(recurrent, "recurrent"),
+        .recurrent_layer_stride_bytes =
+            spec.has_recurrent() ? layer_stride_bytes(recurrent, "recurrent") : 0,
         .spec                         = spec,
     };
 }
@@ -200,6 +221,9 @@ Tensor LinearAttentionStatePool::conv_slot(std::uint32_t layer, std::int32_t slo
 }
 
 Tensor LinearAttentionStatePool::recurrent_slot(std::uint32_t layer, std::int32_t slot) const {
+    if (!spec.has_recurrent()) {
+        throw std::logic_error("LinearAttentionStatePool has no recurrent state to slot into");
+    }
     validate_layer_slot(*this, layer, slot, "LinearAttentionStatePool recurrent_slot");
     return recurrent.at(layer)
         .slice(3, slot, 1)
@@ -220,6 +244,7 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
         CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
                                    cudaMemcpyDeviceToDevice, stream));
     }
+    if (!spec.has_recurrent()) { return; }
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor source      = recurrent_slot(layer, src);
         const Tensor destination = recurrent_slot(layer, dst);
@@ -235,6 +260,7 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
         const Tensor state = conv_slot(layer, slot);
         CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
     }
+    if (!spec.has_recurrent()) { return; }
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor state = recurrent_slot(layer, slot);
         CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));

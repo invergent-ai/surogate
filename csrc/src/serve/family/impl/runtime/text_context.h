@@ -67,13 +67,24 @@ struct ModelConfig {
     float rope_theta        = TextConfig::rope_theta;
     int mtp_layers          = TextConfig::mtp_layers;
 
-    [[nodiscard]] static constexpr bool is_full(int layer) {
-        return TextConfig::is_full_attention(layer);
+    /// The schedule the artifact declared, if it declared one. A family that repeats a fixed
+    /// interval declares nothing and every predicate below falls through to the compiled
+    /// `TextConfig`, exactly as it did when they were static.
+    std::array<std::uint64_t, 4> attention_mask{};
+    bool schedule_declared = false;
+
+    /// Whether `layer` attends. No longer static: for a family whose checkpoint picks its own
+    /// layer kinds -- LFM2 attends at six irregular layers of sixteen, and at different ones
+    /// per size -- the answer is a property of the model that was loaded, not of the target
+    /// that was compiled.
+    [[nodiscard]] constexpr bool is_full(int layer) const {
+        if (!schedule_declared) { return TextConfig::is_full_attention(layer); }
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        return word < attention_mask.size() &&
+               ((attention_mask[word] >> (static_cast<unsigned>(layer) % 64U)) & 1U) != 0U;
     }
 
-    /// How many layers attend and how many are linear. Which *kind* a layer is stays
-    /// compiled -- that is the family's schedule, not a dimension -- but how many there
-    /// are follows the layer count, which the artifact may declare.
+    /// How many layers attend and how many are linear.
     [[nodiscard]] constexpr int n_full() const {
         int count = 0;
         for (int layer = 0; layer < n_layers; ++layer) { count += is_full(layer) ? 1 : 0; }
@@ -82,11 +93,26 @@ struct ModelConfig {
 
     [[nodiscard]] constexpr int n_gdn() const { return n_layers - n_full(); }
 
-    [[nodiscard]] static constexpr int full_idx(int layer) {
-        return TextConfig::full_attention_index(layer);
+    /// A layer's index among its own kind. Counted rather than computed when the schedule is
+    /// declared, because an irregular one has no closed form; the loop is over layers already
+    /// walked, on the launch path, and costs nothing measurable next to the round it launches.
+    [[nodiscard]] constexpr int full_idx(int layer) const {
+        if (!schedule_declared) { return TextConfig::full_attention_index(layer); }
+        return count_before(layer, true);
     }
 
-    [[nodiscard]] static constexpr int gdn_idx(int layer) { return TextConfig::gdn_index(layer); }
+    [[nodiscard]] constexpr int gdn_idx(int layer) const {
+        if (!schedule_declared) { return TextConfig::gdn_index(layer); }
+        return count_before(layer, false);
+    }
+
+    [[nodiscard]] constexpr int count_before(int layer, bool attending) const {
+        int index = 0;
+        for (int earlier = 0; earlier < layer; ++earlier) {
+            index += is_full(earlier) == attending ? 1 : 0;
+        }
+        return index;
+    }
 
     /// The compiled defaults, which is what a target without a declared geometry gets.
     ModelConfig() = default;
@@ -119,7 +145,12 @@ struct ModelConfig {
           mtp_mlp_gateup_rows(geometry.mtp_mlp_gate_up_rows()),
           rms_eps(geometry.rms_epsilon),
           rope_theta(geometry.rope_theta),
-          mtp_layers(geometry.mtp_layers) {}
+          mtp_layers(geometry.mtp_layers) {
+        if (geometry.attention_schedule_declared) {
+            attention_mask    = geometry.attention_layer_mask;
+            schedule_declared = true;
+        }
+    }
 };
 
 inline const ModelConfig kCfg{};

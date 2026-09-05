@@ -317,10 +317,10 @@ void TextContext::bind() {
     gdn_in_b_.resize(static_cast<std::size_t>(cfg_.n_gdn()));
     gdn_conv1d_views_.resize(static_cast<std::size_t>(cfg_.n_gdn()));
     for (int layer = 0; layer < cfg_.n_layers; ++layer) {
-        if (ModelConfig::is_full(layer)) {
-            FullLayerW& out = full_[static_cast<std::size_t>(ModelConfig::full_idx(layer))];
+        if (cfg_.is_full(layer)) {
+            FullLayerW& out = full_[static_cast<std::size_t>(cfg_.full_idx(layer))];
             const auto& source =
-                weights_.full_layers[static_cast<std::size_t>(ModelConfig::full_idx(layer))];
+                weights_.full_layers[static_cast<std::size_t>(cfg_.full_idx(layer))];
             out.input_norm     = &source.input_norm;
             out.projection     = &source.projection;
             out.o_proj         = &source.output;
@@ -329,7 +329,7 @@ void TextContext::bind() {
             out.post_attn_norm = &source.post_attention_norm;
             out.mlp            = bind_mlp(source.post_mixer);
         } else {
-            const std::size_t gidx = static_cast<std::size_t>(ModelConfig::gdn_idx(layer));
+            const std::size_t gidx = static_cast<std::size_t>(cfg_.gdn_idx(layer));
             GdnLayerW& out         = gdn_[gidx];
             const auto& source     = weights_.gdn_layers[gidx];
             out.input_norm         = &source.input_norm;
@@ -1526,8 +1526,8 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     };
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
-        if (ModelConfig::is_full(layer)) {
-            const int fidx         = ModelConfig::full_idx(layer);
+        if (cfg_.is_full(layer)) {
+            const int fidx         = cfg_.full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
             nvtx::ScopedRange layer_range(
                 prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull,
@@ -1552,7 +1552,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
-            const int gidx       = ModelConfig::gdn_idx(layer);
+            const int gidx       = cfg_.gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
             nvtx::ScopedRange layer_range(prefill ? nvtx::Name::PrefillLayerGdn
                                                   : nvtx::Name::VerifyLayerGdn,
@@ -1846,8 +1846,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     };
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
-        if (ModelConfig::is_full(layer)) {
-            const int fidx         = ModelConfig::full_idx(layer);
+        if (cfg_.is_full(layer)) {
+            const int fidx         = cfg_.full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
             {
                 auto mixer_scope      = work_.scope();
@@ -1964,7 +1964,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 if (timing) { lap(timer.begin, timer.mlp_full, acc_mlp_full); }
             }
         } else {
-            const int gidx       = ModelConfig::gdn_idx(layer);
+            const int gidx       = cfg_.gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
             {
                 auto mixer_scope   = work_.scope();
@@ -2299,8 +2299,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
 
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
-        if (ModelConfig::is_full(layer)) {
-            const int fidx         = ModelConfig::full_idx(layer);
+        if (cfg_.is_full(layer)) {
+            const int fidx         = cfg_.full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
             {
                 auto mixer_scope      = work_.scope();
@@ -2400,7 +2400,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 mlp_tail(full.post_attn_norm, full.mlp, x, Phase::Prefill);
             }
         } else {
-            const int gidx       = ModelConfig::gdn_idx(layer);
+            const int gidx       = cfg_.gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
             {
                 auto mixer_scope   = work_.scope();

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -12,8 +14,9 @@ namespace sinfer::family {
 /// Every target compiles one `TextConfig` of static constants, which is why the engine serves
 /// one size of each family. This is the same set of numbers as a value: a target fills it from
 /// its compiled config, then lets the artifact override whatever it declares, and everything
-/// that plans a buffer or checks a shape reads it from here. Structure -- which layers attend,
-/// what a variant fuses, how a schedule repeats -- stays compiled; only the sizes move.
+/// that plans a buffer or checks a shape reads it from here. What a variant fuses stays compiled.
+/// So does the schedule, for every family that repeats a fixed interval -- but not for one whose
+/// checkpoint chooses its own, which is why `attention_layer_mask` is below.
 ///
 /// Only primary dimensions are members. Everything a target derives from them (`key_dim`,
 /// `convolution_dim`, the MTP row counts) is a function here, so an artifact that declares
@@ -44,6 +47,40 @@ struct TextGeometry {
     std::int32_t sliding_window     = 0;
     float rms_epsilon               = 0.0F;
     float rope_theta                = 0.0F;
+
+    /// Which layers attend, for a family whose checkpoint chooses its own schedule instead of
+    /// repeating a fixed interval. LFM2 attends at layers 2, 5, 8, 10, 12 and 14 of sixteen and
+    /// convolves at the rest -- a list, not a period, and a different list at each size. Left
+    /// undeclared it means nothing at all and the target's compiled schedule answers, which is
+    /// what every family here did before it existed.
+    ///
+    /// A bitmask because the question is asked once per layer per round and has to answer in
+    /// constant time, and four words because nothing this engine serves has more than 256
+    /// layers. Deliberately not a member of the numeric override map below: a 64-bit mask does
+    /// not survive a double, and a target that has a schedule builds it from the artifact's own
+    /// blocks rather than from a number somebody would then have to keep in step by hand.
+    std::array<std::uint64_t, 4> attention_layer_mask{};
+    bool attention_schedule_declared = false;
+
+    /// Record that `layer` attends. A layer outside the mask's reach is refused rather than
+    /// folded onto another word: a schedule that is quietly wrong runs the wrong mixer at every
+    /// round and says nothing about it.
+    constexpr void declare_attention_layer(std::int32_t layer) {
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        if (layer < 0 || word >= attention_layer_mask.size()) {
+            throw std::out_of_range("TextGeometry attention schedule layer is out of range");
+        }
+        attention_layer_mask[word] |= std::uint64_t{1} << (static_cast<unsigned>(layer) % 64U);
+        attention_schedule_declared = true;
+    }
+
+    /// Whether `layer` attends by the declared schedule. Meaningful only where one is declared;
+    /// the runtime is what chooses between this and the compiled predicate.
+    [[nodiscard]] constexpr bool layer_attends(std::int32_t layer) const noexcept {
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        if (layer < 0 || word >= attention_layer_mask.size()) { return false; }
+        return ((attention_layer_mask[word] >> (static_cast<unsigned>(layer) % 64U)) & 1U) != 0U;
+    }
 
     [[nodiscard]] constexpr std::int32_t query_size() const noexcept { return query_heads * head_dim; }
     [[nodiscard]] constexpr std::int32_t kv_size() const noexcept { return kv_heads * head_dim; }
