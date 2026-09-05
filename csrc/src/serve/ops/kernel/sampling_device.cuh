@@ -59,8 +59,9 @@ __device__ __forceinline__ unsigned long long sampling_splitmix64(unsigned long 
 
 // Uniform float in [0,1) from (seed, position, purpose, sub). Pure function of
 // its inputs so it is safe under CUDA-graph replay (no mutable RNG state).
-__device__ __forceinline__ float sampling_uniform(unsigned long long seed, int position,
-                                                  int purpose, unsigned int sub) {
+__device__ __forceinline__ unsigned int sampling_uniform_bits(unsigned long long seed,
+                                                              int position, int purpose,
+                                                              unsigned int sub) {
     unsigned long long key = seed;
     key                    = sampling_splitmix64(
         key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
@@ -68,8 +69,63 @@ __device__ __forceinline__ float sampling_uniform(unsigned long long seed, int p
     key = sampling_splitmix64(
         key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(purpose)) << 21) ^
         (static_cast<unsigned long long>(sub) * 0x2545F4914F6CDD1Dull));
-    const unsigned int bits = static_cast<unsigned int>(key >> 40); // 24 bits
-    return static_cast<float>(bits) * (1.0f / 16777216.0f);
+    return static_cast<unsigned int>(key >> 40); // 24 bits
+}
+
+__device__ __forceinline__ float sampling_uniform(unsigned long long seed, int position,
+                                                  int purpose, unsigned int sub) {
+    return static_cast<float>(sampling_uniform_bits(seed, position, purpose, sub)) *
+           (1.0f / 16777216.0f);
+}
+
+/// The draw moved off both endpoints, into the open interval.
+///
+/// The half-open form above is right for an inverse-CDF walk, where a zero simply
+/// selects the first candidate. The Gumbel route below needs both ends open.
+__device__ __forceinline__ float sampling_uniform_open(unsigned long long seed, int position,
+                                                       int purpose, unsigned int sub) {
+    return (static_cast<float>(sampling_uniform_bits(seed, position, purpose, sub)) + 0.5f) *
+           (1.0f / 16777216.0f);
+}
+
+/// Whether this row asked for no truncation at all.
+///
+/// `top_k <= 0` is the caller saying "no limit of mine", and it is what a
+/// reinforcement-learning rollout sends (vLLM spells it -1). It used to select the
+/// pipeline's candidate cap, so "no limit" quietly meant the top twenty. A nucleus
+/// below 1 still needs an ordered prefix, which a single pass cannot produce, so
+/// that keeps the candidate route.
+__device__ __forceinline__ bool sampling_untruncated(const SamplingConfig& cfg) {
+    return cfg.temperature > 0.0f && cfg.top_k <= 0 && cfg.top_p >= 1.0f;
+}
+
+/// A Gumbel(0,1) variate for one token of one row.
+///
+/// `argmax_v (logit_v / T + Gumbel_v)` is an exact draw from the softmax over
+/// every v, which is what lets an untruncated row be sampled in one pass with no
+/// sort, no normalisation and no workspace. The variate is keyed by the token id,
+/// so the draw is reproducible from (seed, position, purpose) exactly as the
+/// inverse-CDF route's single uniform is.
+__device__ __forceinline__ float sampling_gumbel(unsigned long long seed, int position, int purpose,
+                                                 unsigned int v) {
+    // Written through the exponential variate rather than as -log(-log(u)).
+    //
+    // The largest Gumbel values come from a u nearest 1, and that is exactly where
+    // float32 cannot hold one: the spacing of floats below 1 is about 1.2e-7, so
+    // every u within that of 1 rounds to exactly 1.0f, whose logarithm is zero and
+    // whose Gumbel is therefore infinite. A token drawing one would win against any
+    // logit at all. With a 24-bit draw over a 151k vocabulary that happened on
+    // roughly one round in a hundred, which showed up as a tail sampled about
+    // thirty times too often.
+    //
+    // So the near-1 end is never formed. `w` is uniform on (0,1) and the
+    // exponential variate is -log(1-w), taken with log1p so that a small w -- the
+    // one that produces the largest Gumbel -- keeps every bit it was given. The
+    // result is finite for every draw, and its maximum is the honest -log of the
+    // smallest representable w rather than infinity.
+    const float w = (static_cast<float>(sampling_uniform_bits(seed, position, purpose, v)) + 0.5f) *
+                    (1.0f / 16777216.0f);
+    return -__logf(-log1pf(-w));
 }
 
 // Candidate ordering: higher value wins, ties broken by lower vocab index.

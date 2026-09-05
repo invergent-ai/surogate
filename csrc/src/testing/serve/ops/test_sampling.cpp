@@ -92,8 +92,14 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
         return a.token < b.token;
     });
 
+    // A row that asked for no limit and no nucleus is drawn from the whole
+    // vocabulary; every other row keeps the pipeline's candidate cap.
     int cap = 20;
-    if (config.top_k > 0 && config.top_k < 20) { cap = config.top_k; }
+    if (config.top_k <= 0 && config.top_p >= 1.0f) {
+        cap = token_domain;
+    } else if (config.top_k > 0 && config.top_k < 20) {
+        cap = config.top_k;
+    }
     cap = std::min(cap, token_domain);
     candidates.resize(static_cast<std::size_t>(cap));
 
@@ -498,6 +504,97 @@ int capped_distribution_contract() {
            verify_distribution("sample top-k public cap", result.tokens, oracle);
 }
 
+// A row with `top_k <= 0` and no nucleus is drawn from every token, not from the
+// twenty best.
+//
+// The tail is what proves it. This column puts about a third of its mass beyond
+// rank twenty, spread over hundreds of tokens that the candidate route cannot
+// reach at all -- so the test fails on the old behaviour by sampling nothing out
+// there, and the FP64 oracle it is checked against is the full-vocabulary softmax
+// rather than a renormalised top twenty.
+int untruncated_distribution_contract() {
+    constexpr int token_domain = 512;
+    std::vector<float> column(token_domain, 0.0f);
+    // A shallow ramp: the best token is only a little ahead of the worst, so the
+    // mass past rank twenty is large enough to measure in a few thousand draws.
+    for (int token = 0; token < token_domain; ++token) {
+        column[static_cast<std::size_t>(token)] =
+            2.0f - 0.004f * static_cast<float>(token);
+    }
+    round_to_bf16(column);
+
+    ops::SamplingConfig config;
+    config.temperature = 1.0f;
+    config.top_k       = 0;   // "no limit of the caller's own"
+    config.top_p       = 1.0f;
+    config.min_p       = 0.0f;
+    config.seed        = 24680;
+    const Distribution oracle = distribution_oracle(column, token_domain, config);
+
+    constexpr int samples = 8192;
+    const RunResult result =
+        run_repeated(column, token_domain, samples, 8, config, 500, ops::kSamplePurposeDecode);
+
+    int failures = result.integrity_failures;
+    failures += verify_distribution("sample untruncated full vocabulary", result.tokens, oracle);
+
+    // The candidate route could only ever return one of the first twenty tokens.
+    int beyond_cap = 0;
+    for (const int token : result.tokens) {
+        if (token >= ops::kSamplerFastCandidates) { ++beyond_cap; }
+    }
+    if (beyond_cap == 0) {
+        std::cerr << "sample untruncated full vocabulary: no token past rank "
+                  << ops::kSamplerFastCandidates << " was ever drawn -- the row was truncated\n";
+        ++failures;
+    } else {
+        std::cout << "    sample untruncated full vocabulary reached the tail (" << beyond_cap
+                  << " of " << samples << " draws past rank " << ops::kSamplerFastCandidates << ")\n";
+    }
+    return failures;
+}
+
+// The same route on a real vocabulary with a peaked distribution.
+//
+// The shallow-ramp case above would pass even if the tail were over-weighted, and
+// a served model's first token is often near-certain -- so this checks the shape
+// that matters: one token holding almost all the mass over a full-size domain. A
+// draw from anywhere else should be rare, and a heavy upper tail in the underlying
+// variate shows up here as a flood of them.
+int untruncated_peaked_contract() {
+    constexpr int token_domain = 151936;
+    std::vector<float> column(token_domain, 0.0f);
+    column[7] = 20.0f; // exp(20) against 151935 flat tokens: p_peak ~ 0.99969
+    round_to_bf16(column);
+
+    ops::SamplingConfig config;
+    config.temperature = 1.0f;
+    config.top_k       = 0;
+    config.top_p       = 1.0f;
+    config.seed        = 13579;
+
+    constexpr int samples = 4096;
+    const RunResult result =
+        run_repeated(column, token_domain, samples, 8, config, 900, ops::kSamplePurposeDecode);
+
+    int off_peak = 0;
+    for (const int token : result.tokens) {
+        if (token != 7) { ++off_peak; }
+    }
+    const double peak_weight = std::exp(20.0);
+    const double total       = peak_weight + static_cast<double>(token_domain - 1);
+    const double expected    = static_cast<double>(samples) * (1.0 - peak_weight / total);
+    const double sigma       = std::sqrt(expected * (peak_weight / total));
+    std::cout << "    untruncated peaked: off-peak draws " << off_peak << ", oracle expects "
+              << expected << " +/- " << (3.0 * sigma) << '\n';
+    if (std::fabs(static_cast<double>(off_peak) - expected) > 5.0 * sigma + 5.0) {
+        std::cerr << "sample untruncated peaked: off-peak draws " << off_peak
+                  << " but the full-vocabulary oracle expects " << expected << '\n';
+        return result.integrity_failures + 1;
+    }
+    return result.integrity_failures;
+}
+
 int real_shape_distribution_contract() {
     constexpr int physical_rows = 248320;
     constexpr int token_domain  = 248077;
@@ -619,6 +716,8 @@ int main() {
     failures += heterogeneous_batch_contract();
     failures += filtered_distribution_contract();
     failures += capped_distribution_contract();
+    failures += untruncated_distribution_contract();
+    failures += untruncated_peaked_contract();
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();

@@ -21,6 +21,16 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     const std::int32_t batch             = logits.ne[1];
     const auto* positions                = static_cast<const std::int32_t*>(logical_positions.data);
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, batch);
+    // Rows that asked for no truncation are drawn from the whole vocabulary. Which
+    // rows those are is a property of the device-resident configs, so the choice is
+    // made per column inside the kernels rather than here: this launch handles the
+    // untruncated columns and returns immediately for the rest, and the candidate
+    // routes below do the reverse. Always launched, so a captured graph records the
+    // same node set whatever a later round happens to ask for.
+    sampling_full_vocab_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
+        configs, positions, purpose, token_domain, physical_rows);
+    CUDA_CHECK(cudaGetLastError());
     if (!layout.multiblock) {
         sample_row_kernel<<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),

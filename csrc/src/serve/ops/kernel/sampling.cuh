@@ -11,6 +11,95 @@
 
 namespace sinfer::ops {
 
+/// One token per column, drawn from the whole vocabulary.
+///
+/// The candidate routes below keep the best `cap` tokens and draw from those. That
+/// is what top_k asks for, but a row that asked for *no* limit was getting the same
+/// twenty -- so the tail of the distribution could not be sampled at all, and a
+/// trainer comparing its own full-vocabulary log-probability against ours was
+/// comparing against a different policy than the one that generated.
+///
+/// This route draws exactly, in one pass, by the Gumbel-max identity: adding an
+/// independent Gumbel(0,1) to each scaled logit and taking the argmax is a draw
+/// from the softmax over every token. No sort, no normalisation, no workspace --
+/// and one block per column, which is affordable because it is one more read of a
+/// logits row the head has already produced.
+///
+/// Only rows `sampling_untruncated` claims are handled; the others return at once
+/// and are served by the candidate routes, which skip these rows in turn. Exactly
+/// one route writes each column, so neither the token counts nor the output is
+/// touched twice.
+__launch_bounds__(kSamplerBlock) __global__
+    void sampling_full_vocab_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+                                    const SamplingConfig* configs,
+                                    const std::int32_t* logical_positions, std::int32_t purpose,
+                                    std::int32_t token_domain, std::int32_t physical_rows) {
+    const int col            = static_cast<int>(blockIdx.x);
+    const SamplingConfig cfg = configs[col];
+    if (!sampling_untruncated(cfg)) { return; }
+
+    const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
+    const int tid           = static_cast<int>(threadIdx.x);
+    const float inv_temp    = 1.0f / cfg.temperature;
+    const int position      = logical_positions[col];
+
+    __shared__ float red_val[kSamplerBlock];
+    __shared__ int red_idx[kSamplerBlock];
+
+    // min_p is a floor on a token's probability relative to the most likely one,
+    // which on the scaled logits is a shift of the row maximum -- so it needs the
+    // maximum, and only then. Without it the argmax below is shift-invariant and
+    // this pass would buy nothing.
+    float floor_value = -CUDART_INF_F;
+    if (cfg.min_p > 0.0f) {
+        float local = -CUDART_INF_F;
+        for (int v = tid; v < token_domain; v += kSamplerBlock) {
+            local = fmaxf(local,
+                          sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg) *
+                              inv_temp);
+        }
+        red_val[tid] = local;
+        __syncthreads();
+        for (int s = kSamplerBlock / 2; s > 0; s >>= 1) {
+            if (tid < s) { red_val[tid] = fmaxf(red_val[tid], red_val[tid + s]); }
+            __syncthreads();
+        }
+        floor_value = red_val[0] + __logf(cfg.min_p);
+        __syncthreads();
+    }
+
+    float best = -CUDART_INF_F;
+    int best_v = INT_MAX;
+    for (int v = tid; v < token_domain; v += kSamplerBlock) {
+        const float x =
+            sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg) * inv_temp;
+        if (x < floor_value) { continue; }
+        const float z = x + sampling_gumbel(cfg.seed, position, purpose, static_cast<unsigned>(v));
+        if (sampling_better(z, v, best, best_v)) {
+            best   = z;
+            best_v = v;
+        }
+    }
+    red_val[tid] = best;
+    red_idx[tid] = best_v;
+    __syncthreads();
+    for (int s = kSamplerBlock / 2; s > 0; s >>= 1) {
+        if (tid < s &&
+            sampling_better(red_val[tid + s], red_idx[tid + s], red_val[tid], red_idx[tid])) {
+            red_val[tid] = red_val[tid + s];
+            red_idx[tid] = red_idx[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        // Every token can fall below the min_p floor only if the floor is above the
+        // maximum, which it cannot be; the guard is for a row of non-finite logits.
+        const int picked = red_idx[0] == INT_MAX ? 0 : red_idx[0];
+        out[col]         = picked;
+        if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
+    }
+}
+
 __launch_bounds__(kSamplerBlock) __global__
     void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
@@ -49,6 +138,10 @@ __launch_bounds__(kSamplerBlock) __global__
         if (tid == 0) { out[row] = red_idx[0]; }
         return;
     }
+
+    // Untruncated rows belong to sampling_full_vocab_kernel. Returning before the
+    // draw is what keeps the token counts single-counted.
+    if (sampling_untruncated(cfg)) { return; }
 
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
@@ -97,6 +190,7 @@ __launch_bounds__(kSamplerBlock) __global__
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = cfg_ptr[col];
     if (partial == 0 && threadIdx.x == 0) { workspace.group_done[col] = 0; }
+    if (sampling_untruncated(cfg)) { return; } // sampling_full_vocab_kernel owns this column
 
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
     __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
@@ -159,6 +253,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     __shared__ unsigned long long greedy_warp_keys[kSamplerGroupBlock / 32];
     unsigned long long keys[kSamplerGroupItemsPerThread];
 
+    if (sampling_untruncated(cfg)) { return; } // sampling_full_vocab_kernel owns this column
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes group_done[col], so caller-owned
