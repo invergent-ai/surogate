@@ -29,11 +29,13 @@ namespace sinfer::ops {
  * one matmul; slicing them here costs nothing and reading them apart would cost a
  * copy.
  *
- * Shapes. `bcx` is contiguous BF16 [3*channels, T]; `taps` contiguous BF16 [K,
- * channels], tap-major so the inner sum reads consecutive channels; `state` is
- * contiguous BF16 [channels, K-1], oldest column first; `out` is contiguous BF16
- * [channels, T]. K is taken from `taps.ne[0]` and must be in [2,4]. T may be any
- * positive value.
+ * Shapes, in this engine's layout, where the first dimension is the fastest and a
+ * column's channels are therefore contiguous. `bcx` is contiguous BF16
+ * [3*channels, T], so one column holds its B, C and x parts one after another;
+ * `taps` is contiguous BF16 [channels, K], one tap plane after another, exactly
+ * as the linear-attention convolution stores its own; `state` is contiguous BF16
+ * [channels, K-1], oldest column first; `out` is contiguous BF16 [channels, T].
+ * K is taken from `taps.ne[1]` and must be in [2,4]. T may be any positive value.
  *
  * Effects. Writes all of `out`. `state` is read as the initial window and replaced
  * with the trailing `K-1` columns of `u`, so a decode round carries its own
@@ -41,5 +43,30 @@ namespace sinfer::ops {
  */
 void short_conv(const Tensor& bcx, const Tensor& taps, Tensor& state, Tensor& out,
                 std::int32_t channels, cudaStream_t stream);
+
+/**
+ * Snapshot form, for B independent sequences that do not share a history.
+ *
+ * A decode round carries one column for each of B lanes, and each lane's convolution must
+ * continue that lane's own K-1 columns -- so the state is a pool of slots and every row says
+ * which one it starts from and where its new windows go.
+ *
+ * Shapes. `bcx` is contiguous BF16 [3*channels, W, B] and `out` contiguous BF16 [channels, W, B].
+ * `conv_states` is contiguous BF16 [channels, K-1, slots], so a slot's window is contiguous. `initial_state_slots` and
+ * `snapshot_base_slots` are contiguous I32 [B]. `valid_columns` is contiguous I32 [B] with every
+ * value in [1,W], or an empty Tensor meaning every row is W columns wide.
+ *
+ * Effects. Row b reads the window in `initial_state_slots[b]` and, after each valid column j,
+ * writes the window that follows it to `snapshot_base_slots[b] + j` -- one checkpoint per
+ * column, which is what lets a round be rolled back to any column it accepted. Output columns
+ * past a row's valid count are exact BF16 zero and change no state. The caller reserves the
+ * whole [base, base+W) interval for every row, all reservations disjoint; a row's own initial
+ * slot may lie inside its own reservation, which is the ordinary decode case where a lane
+ * overwrites the window it just read.
+ */
+void short_conv_snapshot(const Tensor& bcx, const Tensor& taps, Tensor& conv_states,
+                         const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
+                         const Tensor& valid_columns, Tensor& out, std::int32_t channels,
+                         cudaStream_t stream);
 
 } // namespace sinfer::ops
