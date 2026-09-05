@@ -247,8 +247,13 @@ void manifold_hyper_connection_mix(const Tensor& residual,
     if (weights.mix.qtype != QType::BF16_CTRL || weights.mix.layout != QuantLayout::Contiguous ||
         weights.mix.qdata == nullptr || weights.mix.ndim != 2 || weights.mix.n != rows ||
         weights.mix.k != width) {
-        throw std::invalid_argument("manifold_hyper_connection: mix must be contiguous BF16 [" +
-                                    std::to_string(rows) + "," + std::to_string(width) + "]");
+        // The expected shape comes from the residual's own width, so a mismatch is as often
+        // the caller handing over the wrong tensor as the weight being wrong. Both are named.
+        throw std::invalid_argument(
+            "manifold_hyper_connection: mix must be contiguous BF16 [" + std::to_string(rows) +
+            "," + std::to_string(width) + "] for a residual of " + std::to_string(streams) +
+            " x " + std::to_string(hidden) + "; got n " + std::to_string(weights.mix.n) + ", k " +
+            std::to_string(weights.mix.k) + ", ndim " + std::to_string(weights.mix.ndim));
     }
     if (weights.base.dtype != DType::FP32 || weights.base.ne[0] != rows ||
         weights.base.data == nullptr) {

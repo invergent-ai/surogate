@@ -214,8 +214,9 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
 
 HyperConnectionPayload load_hyper_connection(const artifact::MaterializedArtifact& backing,
                                              const HyperConnectionPlan& plan,
-                                             const family::TextGeometry& g) {
+                                             const family::TextGeometry& g, std::int32_t layer) {
     HyperConnectionPayload out;
+    out.layer         = layer;
     out.weights.mix   = materialized_weight(backing, plan.mix, g.hyper_connection_mix_rows(),
                                             g.residual);
     out.weights.base  = artifact::materialized_tensor(
@@ -227,9 +228,9 @@ HyperConnectionPayload load_hyper_connection(const artifact::MaterializedArtifac
 
 FeedForwardPayload load_feed_forward(const artifact::MaterializedArtifact& backing,
                                      const TextLayerPlan& source, const family::TextGeometry& g,
-                                     const Tensor& post_norm) {
+                                     const Tensor& post_norm, std::int32_t layer) {
     FeedForwardPayload out;
-    out.hc          = load_hyper_connection(backing, source.feed_forward_hc, g);
+    out.hc          = load_hyper_connection(backing, source.feed_forward_hc, g, layer);
     out.norm        = post_norm;
     out.rms_epsilon = g.rms_epsilon;
     out.sparse      = source.feed_forward.sparse;
@@ -304,28 +305,32 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
     const family::TextGeometry& g         = out.geometry;
-    // The two endpoints are 1.3 GB together and only two of the eight stages read them: the
-    // runtime already asks `stage_embeds()` and `stage_finishes()` before touching either, so
-    // a middle stage validates them and uploads neither. On a 200 GB checkpoint split eight
-    // ways that is the difference between the last stage fitting and not.
-    const bool staged        = stage_last > 0;
-    out.embeds               = !staged || stage_first == 0;
-    out.finishes             = !staged || stage_last >= g.layers;
-    g_layer_placement        = out.embeds ? artifact::TensorPlacement::Device
-                                          : artifact::TensorPlacement::ValidateOnly;
+    // The embedding table is 0.65 GB and only the first stage reads it: every call site goes
+    // through `Hooks::embed`, and the runtime asks `stage_embeds()` at each one, so a later
+    // stage validates it and uploads nothing. On a 200 GB checkpoint split eight ways that is
+    // the difference between the last stage fitting and not.
+    //
+    // The output head is *not* pruned the same way, though only the last stage should read it.
+    // `sample_from_hidden` reaches it without asking `stage_finishes()`, and every other
+    // pipeline-capable target uploads the head everywhere, so the gap has never shown. Pruning
+    // it here would trade 0.65 GB for a crash on a path this target cannot yet prove is
+    // unreachable; the honest thing is to carry it and leave the gap named.
+    const bool staged   = stage_last > 0;
+    out.embeds          = !staged || stage_first == 0;
+    out.finishes        = true;
+    g_layer_placement   = out.embeds ? artifact::TensorPlacement::Device
+                                     : artifact::TensorPlacement::ValidateOnly;
     out.token_embedding = bind_weight(binder, "text/token_embedding", vocabulary_format,
                                       {static_cast<std::uint64_t>(g.output_rows),
                                        static_cast<std::uint64_t>(g.hidden)});
     g_layer_placement   = artifact::TensorPlacement::Device;
     bind_text_layers(binder, weights_profile, stage_first, stage_last, out);
-    g_layer_placement   = out.finishes ? artifact::TensorPlacement::Device
-                                       : artifact::TensorPlacement::ValidateOnly;
-    out.final_norm      = bind_layer_tensor(binder, "text/final_norm", NumericFormat::BF16,
-                                            {static_cast<std::uint64_t>(g.hidden)});
+    out.final_norm      = artifact::bind_device_tensor(
+        binder, "text/final_norm", NumericFormat::BF16,
+        {static_cast<std::uint64_t>(g.hidden)});
     out.output_head     = bind_weight(binder, "text/output_head", vocabulary_format,
                                       {static_cast<std::uint64_t>(g.output_rows),
                                        static_cast<std::uint64_t>(g.hidden)});
-    g_layer_placement   = artifact::TensorPlacement::Device;
 
     load_plan.materialization = binder.finish();
     return load_plan;
@@ -351,7 +356,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     std::size_t full_index = 0;
     std::size_t kda_index  = 0;
+    std::int32_t layer     = -1;
     for (const TextLayerPlan& source : plan.text_layers) {
+        ++layer;
         if (!source.resident) { // another stage's layer: keep the index bookkeeping only
             (source.attends ? full_index : kda_index) += 1;
             continue;
@@ -366,7 +373,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             FullAttentionWeights& target = runtime.full_layers.at(full_index++);
             target.input_norm            = input_norm;
             LatentAttentionPayload payload;
-            payload.hc          = load_hyper_connection(backing, source.attention_hc, g);
+            payload.hc          = load_hyper_connection(backing, source.attention_hc, g, layer);
             payload.norm        = input_norm;
             payload.rms_epsilon = g.rms_epsilon;
             payload.query_a = materialized_weight(backing, source.attention.query_a, g.q_lora_rank,
@@ -391,12 +398,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = materialized_weight(backing, source.attention.output, g.hidden,
                                                 g.query_size());
             target.post_attention_norm = post_norm;
-            target.post_mixer          = load_feed_forward(backing, source, g, post_norm);
+            target.post_mixer          = load_feed_forward(backing, source, g, post_norm, layer);
         } else {
             KdaWeights& target = runtime.gdn_layers.at(kda_index++);
             target.input_norm  = input_norm;
             KdaProjectionPayload payload;
-            payload.hc               = load_hyper_connection(backing, source.attention_hc, g);
+            payload.hc               = load_hyper_connection(backing, source.attention_hc, g,
+                                                                layer);
             payload.rms_epsilon      = g.rms_epsilon;
             payload.gate_lower_bound = TextConfig::kda_gate_lower_bound;
             payload.query_key_value = materialized_weight(backing, source.kda.query_key_value,
@@ -428,12 +436,37 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = materialized_weight(backing, source.kda.output, g.hidden,
                                                 g.value_dim());
             target.post_attention_norm = post_norm;
-            target.post_mixer          = load_feed_forward(backing, source, g, post_norm);
+            target.post_mixer          = load_feed_forward(backing, source, g, post_norm, layer);
         }
     }
 
     if (plan.finishes) {
-        runtime.final_norm  = artifact::materialized_tensor(
+        // Every layer this stage runs must have arrived, and no layer it does not run may have.
+    // The inventories are indexed by position among the layers of that kind over the *whole*
+    // model -- which is what the runtime's `full_idx` and `gdn_idx` compute -- so an index that
+    // slipped shows up here as a bound layer in the wrong slot rather than as a null weight
+    // eight minutes into a forward pass.
+    {
+        std::size_t full_at = 0;
+        std::size_t kda_at  = 0;
+        for (const TextLayerPlan& source : plan.text_layers) {
+            const bool attends = source.attends;
+            const bool bound   = attends
+                                     ? runtime.full_layers.at(full_at).projection.hc.weights.mix.n > 0
+                                     : runtime.gdn_layers.at(kda_at).projection.hc.weights.mix.n > 0;
+            if (bound != source.resident) {
+                throw std::logic_error(
+                    std::string("glm5_next: the ") + (attends ? "attention" : "linear") +
+                    " layer at inventory index " +
+                    std::to_string(attends ? full_at : kda_at) + " is " +
+                    (bound ? "bound" : "unbound") + " but this stage " +
+                    (source.resident ? "runs" : "does not run") + " it");
+            }
+            (attends ? full_at : kda_at) += 1;
+        }
+    }
+
+    runtime.final_norm  = artifact::materialized_tensor(
             backing, plan.final_norm, NumericFormat::BF16,
             {static_cast<std::uint64_t>(g.hidden)});
         runtime.output_head =

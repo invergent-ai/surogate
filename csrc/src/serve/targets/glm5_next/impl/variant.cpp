@@ -109,6 +109,12 @@ void mix_into(const Tensor& residual, const HyperConnectionPayload& hc, const Te
                 DType::FP32, {kStreams, kStreams, tokens});
     auto scope = workspace.scope();
     Tensor collapsed = workspace.alloc(DType::BF16, {residual.ne[0] / kStreams, tokens});
+    if (hc.weights.mix.n <= 0) {
+        throw std::logic_error(
+            "glm5_next: the hyper-connection of layer " + std::to_string(hc.layer) +
+            " is not bound on this stage, so this round is running a layer the stage does not "
+            "hold");
+    }
     ops::manifold_hyper_connection_mix(residual, hc.weights, kStreams, eps,
                                        TextConfig::hc_epsilon,
                                        TextConfig::hc_sinkhorn_iterations, collapsed, post, comb,

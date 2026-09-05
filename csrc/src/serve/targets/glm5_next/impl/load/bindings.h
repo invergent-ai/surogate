@@ -101,8 +101,9 @@ struct BindingPlan {
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
-    /// Whether this stage reads the embedding table and the output head. Every stage validates
-    /// both; only the first and last upload them.
+    /// Whether this stage reads the embedding table. Every stage validates it; only the first
+    /// uploads it. `finishes` is always true today -- see `bind_artifact` for why the head is
+    /// carried everywhere.
     bool embeds   = true;
     bool finishes = true;
 
@@ -130,6 +131,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 /// The mixings a site's hyper-connection produces, carried with the weights that produce them.
 struct HyperConnectionPayload {
     ops::ManifoldHyperConnectionWeights weights;
+    /// Which model layer these belong to. Carried so a refusal can name the layer rather than
+    /// the shape alone: on a pipeline stage the interesting question about an unbound weight is
+    /// always "which layer, and does this stage run it".
+    std::int32_t layer = -1;
 };
 
 /// The attention site's payload: its hyper-connection and the latent projections.
