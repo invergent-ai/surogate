@@ -115,7 +115,18 @@ long last_real_user_query(const std::vector<ChatMessage>& messages) {
             return i;
         }
     }
-    throw std::invalid_argument("no user query found in chat messages");
+    // No user turn at all. That is not a malformed conversation: a client that
+    // stitches turns tokenises a single assistant message on its own, to measure
+    // what the template puts between turns. Refusing it made that measurement
+    // impossible and the client silently re-rendered every turn instead.
+    //
+    // The index returned is past the end, so nothing counts as coming after the
+    // last user query and every assistant message renders as a past turn. That is
+    // what makes the measurement usable: the same assistant message renders the
+    // same whether or not a user turn follows it, which is the prefix property the
+    // stitch is checking for. The opposite choice -- treating them all as recent --
+    // keeps their think blocks and renders them differently in the two calls.
+    return static_cast<long>(messages.size());
 }
 
 std::string lstrip_newlines(std::string text) {

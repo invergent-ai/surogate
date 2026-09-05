@@ -237,6 +237,7 @@ struct ModelSamplingDefaults {
 // explicit zero remains a real override (including temperature=0 for exact argmax).
 struct SamplingOverrides {
     std::optional<float> temperature;
+    std::optional<float> repetition_penalty;
     std::optional<std::int32_t> top_k;
     std::optional<float> top_p;
     std::optional<float> min_p;
@@ -253,6 +254,8 @@ struct ResolvedSamplingParameters {
     float min_p             = 0.0F;
     float presence_penalty  = 0.0F;
     float frequency_penalty = 0.0F;
+    /// Multiplicative penalty on already-seen tokens; 1 disables it.
+    float repetition_penalty = 1.0F;
     std::uint64_t seed      = 0;
 };
 
@@ -282,6 +285,13 @@ struct ExecutionOptions {
     /// model. A slot rather than a name: the round stages an integer per lane,
     /// and every token of the batch may carry a different one.
     std::int32_t lora_slot = -1;
+    /// The fewest tokens this request must produce before a stop token may be
+    /// drawn, and the ids barred until it has. The caller resolves which ids those
+    /// are -- the model's own stops, plus any the request added -- because the
+    /// round only knows numbers.
+    std::uint32_t min_tokens              = 0;
+    std::array<TokenId, 4> stop_barrier{};
+    std::uint32_t stop_barrier_count      = 0;
 };
 
 struct OutputOptions {

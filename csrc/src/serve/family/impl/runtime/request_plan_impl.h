@@ -16,8 +16,14 @@ namespace {
 void validate_sampling(const ResolvedSamplingParameters& sampling) {
     if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
         !std::isfinite(sampling.min_p) || !std::isfinite(sampling.presence_penalty) ||
-        !std::isfinite(sampling.frequency_penalty)) {
+        !std::isfinite(sampling.frequency_penalty) ||
+        !std::isfinite(sampling.repetition_penalty)) {
         throw std::invalid_argument("sampling parameters must be finite");
+    }
+    // Zero would divide a positive logit by nothing; a negative one would flip the
+    // sign of every seen token, which is not a penalty.
+    if (sampling.repetition_penalty <= 0.0F) {
+        throw std::invalid_argument("repetition_penalty must be positive");
     }
     if (sampling.top_p < 0.0F || sampling.top_p > 1.0F) {
         throw std::invalid_argument("top_p must be in [0,1]");
@@ -35,6 +41,7 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
     out.min_p             = source.min_p;
     out.presence_penalty  = source.presence_penalty;
     out.frequency_penalty = source.frequency_penalty;
+    out.repetition_penalty = source.repetition_penalty;
     out.seed              = source.seed;
     out.token_counts      = nullptr;
     return out;
@@ -109,6 +116,15 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->lora_slot                      = options.lora_slot;
+    base->min_tokens                     = options.min_tokens;
+    base->stop_barrier_count =
+        std::min<std::uint32_t>(options.stop_barrier_count, ops::SamplingConfig::kMaxSuppressed);
+    for (std::uint32_t i = 0; i < base->stop_barrier_count; ++i) {
+        base->sampling.suppressed[i] = options.stop_barrier[i];
+    }
+    // Nothing has been produced yet, so the barrier is up for the prefill's own
+    // token; the per-round staging lowers it once the request is long enough.
+    base->sampling.suppressed_count = static_cast<std::int32_t>(base->stop_barrier_count);
     // A prefill graph chunk writes its whole 128-rounded bucket, pad columns included,
     // so the request must own the pages that window can reach as well as its output
     // extent, or mapping the chunk lands outside the entitlement and the round dies.
@@ -212,6 +228,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->lora_slot                   = base.lora_slot;
+    plan->min_tokens                  = base.min_tokens;
+    plan->stop_barrier_count          = base.stop_barrier_count;
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =

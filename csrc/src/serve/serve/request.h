@@ -115,6 +115,8 @@ struct SamplingParams {
     /// engine has always taken it; the wire layer simply never read it, so a
     /// request that asked for it got a distribution that ignored it.
     std::optional<double> min_p;
+    /// vLLM's multiplicative repetition penalty. 1 asks for nothing.
+    std::optional<double> repetition_penalty;
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
@@ -182,6 +184,8 @@ struct GenerationRequest {
     // Benchmark knob (vLLM-compatible): generation ignores the model's stop tokens and runs to
     // max_tokens, so throughput is measured on a fixed output length.
     bool ignore_eos = false;
+    /// The fewest tokens to generate before a stop token may be drawn.
+    int min_tokens = 0;
     int max_tokens      = 0; // 0 => use server default
     bool max_tokens_set = false;
     bool stream         = false;

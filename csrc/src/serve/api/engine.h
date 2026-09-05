@@ -93,6 +93,9 @@ public:
     /// Whether the loaded artifact carries a chat template. False for a base model, and the
     /// chat-shaped endpoints refuse rather than render nothing.
     [[nodiscard]] bool supports_chat() const;
+    /// The stop token ids this model ends on by default. A request asking for a
+    /// minimum length bars exactly these until it is reached.
+    [[nodiscard]] std::vector<TokenId> default_stop_tokens() const;
 
     /// The text of each token id, one string per id -- what an OpenAI `logprobs`
     /// entry names beside its number.

@@ -190,14 +190,32 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // the penalty at each column sees the same prefix a per-token sampler would.
 // Non-speculative callers pass no overlay. The scan is bounded by k and
 // only runs when penalties are active, so it is free on the no-penalty path.
+/// Whether this row bars this token id outright. Zero cost when nothing is barred,
+/// which is every request that did not ask for a minimum length.
+__device__ __forceinline__ bool sampling_suppressed(const SamplingConfig& c, int v) {
+    for (int j = 0; j < c.suppressed_count; ++j) {
+        if (c.suppressed[j] == v) { return true; }
+    }
+    return false;
+}
+
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
     float x = raw;
-    if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
+    if (sampling_suppressed(c, v)) { return -CUDART_INF_F; }
+    if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f &&
+        c.repetition_penalty == 1.0f) {
+        return x;
+    }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
     for (int j = 0; j < overlay_len; ++j) {
         if (overlay[j] == v) { ++cnt; }
+    }
+    // Multiplicative first, then additive: the order vLLM applies them in, and the
+    // one the two kinds were tuned against separately.
+    if (cnt > 0 && c.repetition_penalty != 1.0f) {
+        x = x > 0.0f ? x / c.repetition_penalty : x * c.repetition_penalty;
     }
     if (cnt > 0) { x -= c.presence_penalty; }
     if (c.frequency_penalty != 0.0f) { x -= c.frequency_penalty * static_cast<float>(cnt); }

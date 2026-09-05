@@ -360,6 +360,27 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     // deeper because this is the last place the name exists: the round stages an
     // integer per lane and nothing below knows adapters by name.
     request_options.execution.lora_slot = lora_slot(request.lora_adapter);
+    // A minimum length is honoured by barring the stop ids until it is reached, and
+    // the round only knows numbers -- so resolve which ids those are here, where
+    // the model's own stops and the request's are both in reach.
+    request_options.execution.min_tokens = static_cast<std::uint32_t>(request.min_tokens);
+    if (request.min_tokens > 0) {
+        std::vector<sinfer::TokenId> barrier = engine_->default_stop_tokens();
+        for (const sinfer::TokenId id : request_options.stop.token_ids) { barrier.push_back(id); }
+        std::sort(barrier.begin(), barrier.end());
+        barrier.erase(std::unique(barrier.begin(), barrier.end()), barrier.end());
+        if (barrier.size() > request_options.execution.stop_barrier.size()) {
+            throw ApiException(ApiError{
+                .status  = 400,
+                .message = "min_tokens needs every stop token barred, and this model has more of "
+                           "them than the sampler can bar at once",
+                .param   = "min_tokens"});
+        }
+        request_options.execution.stop_barrier_count = static_cast<std::uint32_t>(barrier.size());
+        for (std::size_t i = 0; i < barrier.size(); ++i) {
+            request_options.execution.stop_barrier[i] = barrier[i];
+        }
+    }
     prepared.include_usage                 = request.include_usage;
     // --enable-auto-tool-choice, vLLM's gate. Without it a request may still name a
     // function or demand one; what it may not do is leave the choice to the model,

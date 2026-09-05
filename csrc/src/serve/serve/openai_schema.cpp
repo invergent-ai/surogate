@@ -399,6 +399,10 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     if (body.contains("ignore_eos") && body.at("ignore_eos").is_boolean()) {
         out.ignore_eos = body.at("ignore_eos").get<bool>();
     }
+    if (const std::optional<int> minimum = get_int(body, "min_tokens")) {
+        if (*minimum < 0) { bad_request("min_tokens must be nonnegative", "min_tokens"); }
+        out.min_tokens = *minimum;
+    }
     // `logprobs` is OpenAI's own; `return_token_ids` is vLLM's extension, and an
     // RL client sends both. They were accepted and ignored before, which is worse
     // than refusing them: the rollout came back looking complete and carried
@@ -413,19 +417,6 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     // is the failure this whole endpoint has been bitten by twice: the caller gets
     // a response that looks complete and is not what it asked for. A value that
     // asks for nothing -- the defaults every client sends -- is still accepted.
-    if (body.contains("min_tokens") && body.at("min_tokens").is_number_integer() &&
-        body.at("min_tokens").get<std::int64_t>() > 0) {
-        bad_request("min_tokens is not implemented: this engine cannot suppress the stop token "
-                    "for a minimum length, and generating without it would return a shorter "
-                    "completion than asked for",
-                    "min_tokens");
-    }
-    if (body.contains("repetition_penalty") && body.at("repetition_penalty").is_number() &&
-        body.at("repetition_penalty").get<double>() != 1.0) {
-        bad_request("repetition_penalty is not implemented; use presence_penalty or "
-                    "frequency_penalty, which this engine applies",
-                    "repetition_penalty");
-    }
     if (body.contains("prompt_logprobs") && !body.at("prompt_logprobs").is_null() &&
         !(body.at("prompt_logprobs").is_boolean() && !body.at("prompt_logprobs").get<bool>())) {
         bad_request("prompt_logprobs is not implemented: scoring every prompt position needs the "
@@ -472,6 +463,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     s.top_p             = get_number(body, "top_p");
     s.top_k             = get_int(body, "top_k");
     s.min_p             = get_number(body, "min_p");
+    s.repetition_penalty = get_number(body, "repetition_penalty");
     s.presence_penalty  = get_number(body, "presence_penalty");
     s.frequency_penalty = get_number(body, "frequency_penalty");
     s.seed              = get_u64(body, "seed");
@@ -570,7 +562,12 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
             bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
         }
         for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
-            if (it.key() != "preserve_thinking" && !it.value().is_null()) {
+            // `enable_thinking` is where every other server takes Qwen3's thinking
+            // switch, and this engine has always had the switch -- it just read it
+            // only from the top level, so a client that put it where the model card
+            // says to got its whole request refused.
+            if (it.key() != "preserve_thinking" && it.key() != "enable_thinking" &&
+                !it.value().is_null()) {
                 bad_request("chat_template_kwargs." + it.key() + " is not supported",
                             "chat_template_kwargs", "chat_template_option_not_supported");
             }
@@ -669,6 +666,16 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     out.stream = get_bool(body, "stream", false);
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
+    }
+    if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object() &&
+        body.at("chat_template_kwargs").contains("enable_thinking") &&
+        !body.at("chat_template_kwargs").at("enable_thinking").is_null()) {
+        const Json& value = body.at("chat_template_kwargs").at("enable_thinking");
+        if (!value.is_boolean()) {
+            bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
+                        "chat_template_kwargs");
+        }
+        out.enable_thinking = value.get<bool>();
     }
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
         out.enable_thinking = get_bool(body, "enable_thinking", false);

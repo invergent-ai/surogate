@@ -43,6 +43,9 @@ sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
         sampling.top_k = *request.top_k < 0 ? 0 : static_cast<std::int32_t>(*request.top_k);
     }
     if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }
+    if (request.repetition_penalty) {
+        sampling.repetition_penalty = static_cast<float>(*request.repetition_penalty);
+    }
     if (request.presence_penalty) {
         sampling.presence_penalty = static_cast<float>(*request.presence_penalty);
     }

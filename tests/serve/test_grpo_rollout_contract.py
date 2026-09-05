@@ -176,33 +176,46 @@ def test_two_turn_rollout_yields_training_samples(engine):
 
 
 @needs_engine
-def test_unimplemented_sampling_fields_are_refused_not_ignored(engine):
-    """A field we cannot honour must fail loudly; the values that ask for nothing must not."""
+def test_every_sampling_field_a_rollout_sends_is_honoured(engine):
+    """Each field either changes generation or fails loudly. Silently ignoring one is what
+    left a run training on rollouts that were not drawn the way it asked."""
     import urllib.error
     import urllib.request
 
     port = engine
     model = _model_id(port)
 
-    def post(extra: dict) -> int:
-        body = {"model": model, "prompt": "The", "max_tokens": 1, "temperature": 1.0}
+    def post(extra: dict, prompt_body: dict | None = None):
+        body = {"model": model, "messages": [{"role": "user", "content": "Say hi."}],
+                "max_tokens": 400, "temperature": 1.0, "top_p": 1.0, "seed": 5}
+        body.update(prompt_body or {})
         body.update(extra)
         request = urllib.request.Request(
-            f"http://127.0.0.1:{port}/v1/completions", data=json.dumps(body).encode(),
+            f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
             headers={"content-type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                response.read()
-                return 200
+            with urllib.request.urlopen(request, timeout=180) as response:
+                return 200, json.load(response)
         except urllib.error.HTTPError as error:
-            return int(error.code)
+            return int(error.code), json.loads(error.read().decode())
 
-    for accepted in ({"min_tokens": 0}, {"repetition_penalty": 1.0},
-                     {"prompt_logprobs": False}, {"min_p": 0.0}, {"top_k": -1}):
-        assert post(accepted) == 200, f"a request asking for nothing was refused: {accepted}"
+    # The whole set a rollout sends, together.
+    code, body = post({"min_tokens": 8, "repetition_penalty": 1.05, "min_p": 0.0, "top_k": -1,
+                       "logprobs": True, "return_token_ids": True,
+                       "chat_template_kwargs": {"enable_thinking": True}})
+    assert code == 200, f"a rollout's own sampling arguments were refused: {body}"
+    choice = body["choices"][0]
+    assert len(choice["token_ids"]) == len(choice["logprobs"]["content"])
 
-    for refused in ({"min_tokens": 8}, {"repetition_penalty": 1.2}, {"prompt_logprobs": True}):
-        assert post(refused) == 400, (
-            f"{refused} is not implemented but was accepted; the caller would get a "
-            f"completion that silently ignored it"
-        )
+    # min_tokens has to actually lengthen a completion that would stop earlier.
+    natural = [post({}, {"seed": s})[1]["usage"]["completion_tokens"] for s in range(3)]
+    floor = max(natural) + 80
+    forced = [post({"min_tokens": floor}, {"seed": s})[1]["usage"]["completion_tokens"]
+              for s in range(3)]
+    assert all(n >= floor for n in forced), (
+        f"min_tokens={floor} did not lengthen anything: natural={natural} forced={forced}")
+
+    # prompt_logprobs is the one we do not implement, and it must say so.
+    code, body = post({"prompt_logprobs": True})
+    assert code == 400, "prompt_logprobs is not implemented but was accepted"
+    assert "prompt_logprobs" in json.dumps(body)

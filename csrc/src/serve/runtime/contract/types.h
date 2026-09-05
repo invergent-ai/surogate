@@ -26,6 +26,10 @@ struct ResolvedExecutionOptions {
     bool allow_prefix_reuse               = true;
     /// Bank slot of the LoRA adapter this request selected, -1 for the base model.
     std::int32_t lora_slot = -1;
+    /// A minimum length, and the stop ids barred until it is reached.
+    std::uint32_t min_tokens         = 0;
+    std::array<TokenId, 4> stop_barrier{};
+    std::uint32_t stop_barrier_count = 0;
 };
 
 struct ResolvedRequestOptions {

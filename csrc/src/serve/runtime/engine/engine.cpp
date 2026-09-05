@@ -40,6 +40,9 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.lora_slot               = options.execution.lora_slot;
+    resolved.execution.min_tokens              = options.execution.min_tokens;
+    resolved.execution.stop_barrier            = options.execution.stop_barrier;
+    resolved.execution.stop_barrier_count      = options.execution.stop_barrier_count;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;
@@ -322,6 +325,17 @@ std::vector<std::string> Engine::token_texts(std::span<const TokenId> ids) const
         [&](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
             return target_ptr->loaded->frontend.token_texts(ids);
+        },
+        impl_->active);
+}
+
+std::vector<TokenId> Engine::default_stop_tokens() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& target_ptr) -> std::vector<TokenId> {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            const StopPolicy& policy = target_ptr->loaded->frontend.default_stop_policy();
+            return policy.token_ids;
         },
         impl_->active);
 }

@@ -75,6 +75,10 @@ struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     bool allow_prefix_reuse = false;
     /// The adapter slot the request selected; copied into RequestControl at admit.
     std::int32_t lora_slot = -1;
+    /// A minimum length and the stop ids barred until it is reached; both copied
+    /// into RequestControl at admit, where the per-round staging reads them.
+    std::uint32_t min_tokens         = 0;
+    std::uint32_t stop_barrier_count = 0;
 };
 
 template <>
@@ -94,6 +98,8 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     std::uint32_t backend_kv_page_entitlement = 0;
     /// The adapter slot the request selected; read once at admission.
     std::int32_t lora_slot = -1;
+    std::uint32_t min_tokens         = 0;
+    std::uint32_t stop_barrier_count = 0;
 };
 
 } // namespace sinfer::family::detail
@@ -188,6 +194,12 @@ struct RequestControl {
     ops::SamplingConfig sampling_host;
     /// The adapter slot this request selected; staged per lane every round.
     std::int32_t lora_slot = -1;
+    /// A minimum length, and what it takes to honour it: the stop ids stay barred
+    /// in `sampling_host` until the request has produced this many tokens. Zero
+    /// means the request asked for no minimum and nothing is ever barred.
+    std::uint32_t min_tokens         = 0;
+    std::uint32_t stop_barrier_count = 0;
+    std::uint32_t prompt_tokens      = 0;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
@@ -426,6 +438,8 @@ private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
+    [[nodiscard]] ops::SamplingConfig staged_sampling(const RequestControl& request,
+                                                      const SequenceState& sequence) const;
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);

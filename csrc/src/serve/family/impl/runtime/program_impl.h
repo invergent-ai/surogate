@@ -559,7 +559,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
     // Fixed for the request's lifetime, so it is read once here and staged per
     // round rather than looked up on the hot path.
-    request.lora_slot = request_plan.lora_slot;
+    request.lora_slot         = request_plan.lora_slot;
+    request.min_tokens        = request_plan.min_tokens;
+    request.stop_barrier_count = request_plan.stop_barrier_count;
 
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (prompt_tokens != request_plan.summary.prompt_tokens ||
@@ -1804,6 +1806,24 @@ void ProgramImplCore::prepare_graphs() {
 
 }
 
+/// The request's sampling config for this round, with the minimum-length barrier
+/// raised or lowered.
+///
+/// A request that asked for a minimum length bars the stop ids until it has
+/// produced that many tokens, and this is where "how many so far" is known: the
+/// ledger holds the prompt and everything generated after it. A request that asked
+/// for no minimum has nothing barred and this returns its config untouched.
+ops::SamplingConfig ProgramImplCore::staged_sampling(const RequestControl& request,
+                                                     const SequenceState& sequence) const {
+    ops::SamplingConfig staged = request.sampling_host;
+    if (request.stop_barrier_count == 0) { return staged; }
+    const std::size_t ledger   = sequence.ledger.size();
+    const std::size_t produced = ledger > request.prompt_tokens ? ledger - request.prompt_tokens : 0;
+    staged.suppressed_count =
+        produced < request.min_tokens ? static_cast<std::int32_t>(request.stop_barrier_count) : 0;
+    return staged;
+}
+
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
@@ -1817,7 +1837,8 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
         .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
-                           request.sampling_host.frequency_penalty != 0.0F;
+                           request.sampling_host.frequency_penalty != 0.0F ||
+                           request.sampling_host.repetition_penalty != 1.0F;
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
@@ -2194,6 +2215,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                              .base_S        = 0,
                                              .prompt_tokens = prompt_tokens,
                                              .produced      = 1};
+        // Kept for the life of the request, not just this pending step: the
+        // minimum-length barrier measures what has been generated as the ledger
+        // beyond the prompt, every round.
+        request.prompt_tokens = prompt_tokens;
         request.lifecycle = Lifecycle::Pending;
         return runtime::PrefillStepResult{
             .summary = summary,
@@ -2297,7 +2322,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
                 checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
-            ordinary_host_ingress->sampling[row] = request.sampling_host;
+            ordinary_host_ingress->sampling[row] = staged_sampling(request, sequence);
             ordinary_host_ingress->lora_slots[row] = request.lora_slot;
             if (std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr) {
                 std::fprintf(stderr, "lora-debug: row=%zu lane=%u slot=%d\n", row,
@@ -2543,7 +2568,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 checked_i32(frontier, "mixed round RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
-            ordinary_host_ingress->sampling[row] = request.sampling_host;
+            ordinary_host_ingress->sampling[row] = staged_sampling(request, sequence);
             ordinary_host_ingress->lora_slots[row] = request.lora_slot;
             if (std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr) {
                 std::fprintf(stderr, "lora-debug: row=%zu lane=%u slot=%d\n", row,

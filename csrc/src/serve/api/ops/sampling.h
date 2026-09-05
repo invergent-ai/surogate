@@ -30,8 +30,25 @@ struct SamplingConfig {
     float min_p                = 0.0f; // <= 0 => disabled
     float presence_penalty     = 0.0f;
     float frequency_penalty    = 0.0f;
+    /// vLLM's multiplicative penalty on tokens seen already: a positive logit is
+    /// divided by it and a negative one multiplied, so a value above 1 pushes both
+    /// towards zero. 1 disables it. Distinct from the two additive penalties above,
+    /// and applied before them.
+    float repetition_penalty   = 1.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    /// Token ids barred from being drawn at all, and how many of the four slots
+    /// are in use. This is how a minimum length is honoured: the stop tokens are
+    /// barred until the request has produced enough, which is the only way to get
+    /// one -- refusing to *finish* on a stop token would still have emitted it, and
+    /// the model would go on proposing it.
+    ///
+    /// Inline rather than a device pointer because this struct is already copied
+    /// to the device every round, so a bar that changes with the token count costs
+    /// nothing extra to publish. Four is more than any stop set these models carry.
+    static constexpr int kMaxSuppressed = 4;
+    std::int32_t suppressed[kMaxSuppressed] = {-1, -1, -1, -1};
+    std::int32_t suppressed_count           = 0;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
