@@ -32,6 +32,11 @@ function(sinfer_add_test name)
       SINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
   add_test(NAME ${name} COMMAND ${name})
+  # Every test joins one aggregate target. Without it nothing builds these: they are
+  # excluded from `all`, so `cmake --build` skips them and ctest then reports "Not Run"
+  # for a binary that was never compiled -- which is how six of them came to be broken
+  # against renamed symbols without anyone noticing.
+  set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS ${name})
   # 77 is this suite's skip convention: a test whose fixture is absent (real
   # weights, tokenizer resources) says so and exits 77. Without this property
   # ctest reads that as a failure, which is how the frontend test came to be
@@ -390,3 +395,13 @@ foreach(test_target IN LISTS sinfer_qwen3_5_internal_tests)
     ${SERVE_ROOT}/targets/qwen3_5/export
     ${SERVE_ROOT}/family/export)
 endforeach()
+
+
+# The aggregate: `cmake --build <dir> --target serve-tests` builds every registered test,
+# and `ctest` then has a binary for each of them.
+get_property(_sinfer_serve_test_targets GLOBAL PROPERTY SINFER_SERVE_TEST_TARGETS)
+if(_sinfer_serve_test_targets)
+  add_custom_target(serve-tests DEPENDS ${_sinfer_serve_test_targets})
+  list(LENGTH _sinfer_serve_test_targets _sinfer_serve_test_count)
+  message(STATUS "serve tests: ${_sinfer_serve_test_count} targets under `serve-tests`")
+endif()

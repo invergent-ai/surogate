@@ -49,6 +49,9 @@ build: configure
 # design/serve-engine-plan.md). Uses a separate build dir so serve builds
 # never touch the live training build in $(BUILD_DIR).
 SERVE_BUILD_DIR ?= csrc/build-serve
+# The project's own venv, not `uv run`: `uv run` would rebuild the CUDA extension to satisfy
+# the project dependency, and these tests need none of it.
+PYTEST ?= .venv/bin/python -m pytest
 
 serve-configure:
 	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
@@ -62,15 +65,32 @@ serve-build: serve-configure
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so surogate/ 2>/dev/null || true
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so .venv/lib/python3.12/site-packages/surogate/ 2>/dev/null || true
 
+# Build the engine *and* every registered test binary. The tests are excluded from `all`,
+# so naming the aggregate is what makes them exist; without it ctest reports "Not Run"
+# against binaries nobody compiled.
 serve-test-build:
 	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_CUDA_ARCHITECTURES=120a \
-		-DSUROGATE_SERVE_TESTS=ON
+		-DSUROGATE_SERVE_TESTS=ON $(CCACHE_FLAGS)
 	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
-		--target surogate-engine-cli surogate-engine
+		--target surogate-engine-cli surogate-engine serve-tests
 
-.PHONY: serve-configure serve-build serve-test-build
+# The engine's own suite: 107 tests, ~3 minutes on one GPU. A test whose fixture is absent
+# exits 77 and ctest reports it skipped, so a machine without the real weights still gets a
+# meaningful pass.
+serve-test: serve-test-build
+	cd $(SERVE_BUILD_DIR) && ctest --output-on-failure $(CTEST_FLAGS)
+
+# The Python half: converters, artifact container, declaration contract. No GPU, seconds.
+serve-test-py:
+	$(PYTEST) -q tests/serve tests/test_serve_contract.py
+
+# Everything the serving engine has. This is the command a change to `csrc/src/serve` or
+# `surogate/serve` has to pass.
+serve-check: serve-test-py serve-test
+
+.PHONY: serve-configure serve-build serve-test-build serve-test serve-test-py serve-check
 
 # Internal helper: build + repair wheel for a given CUDA tag
 # Usage: $(call build_wheel,cu128)

@@ -58,6 +58,10 @@ private:
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     /// GET /kv_stats: per-model KV pool physical occupancy, for elastic-KV sizing.
     void handle_kv_stats(const httplib::Request& req, httplib::Response& res) const;
+    /// Prometheus text exposition of the same snapshot `/kv_stats` reads. Behind the API key
+    /// when one is set: it names every attached model and its token counts, which is not
+    /// something to hand an unauthenticated caller. A scraper sends the key like any client.
+    void handle_metrics(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
     // The process-wide console logger serializes lines from request and reporter threads.

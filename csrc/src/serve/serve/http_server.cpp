@@ -295,6 +295,9 @@ void HttpServer::register_routes() {
     server_.Get("/kv_stats", [this](const httplib::Request& req, httplib::Response& res) {
         handle_kv_stats(req, res);
     });
+    server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_metrics(req, res);
+    });
     server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_model(req, res);
     });
@@ -512,6 +515,135 @@ void HttpServer::handle_kv_stats(const httplib::Request&, httplib::Response& res
         {"models", models},
     };
     res.set_content(out.dump(), "application/json");
+}
+
+void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res) const {
+    // Same source as `/kv_stats`: the executor's published snapshot, never
+    // `Engine::memory_summary()`, which takes the execution lock a busy engine holds for a
+    // whole round. A scrape every fifteen seconds must never queue behind a decode.
+    std::string out;
+    out.reserve(4096);
+    const auto label = [](std::string_view value) {
+        std::string escaped;
+        escaped.reserve(value.size() + 2);
+        for (const char c : value) {
+            if (c == '\\' || c == '"') { escaped.push_back('\\'); }
+            if (c == '\n') { escaped += "\\n"; continue; }
+            escaped.push_back(c);
+        }
+        return escaped;
+    };
+    const auto help = [&out](std::string_view name, std::string_view kind, std::string_view what) {
+        out += "# HELP surogate_";
+        out += name;
+        out += ' ';
+        out += what;
+        out += "\n# TYPE surogate_";
+        out += name;
+        out += ' ';
+        out += kind;
+        out += '\n';
+    };
+    const auto metric = [&out](std::string_view name, const std::string& model,
+                               std::uint64_t value) {
+        out += "surogate_";
+        out += name;
+        out += "{model=\"";
+        out += model;
+        out += "\"} ";
+        out += std::to_string(value);
+        out += '\n';
+    };
+
+    struct Row {
+        std::string model;
+        sinfer::RuntimeStats stats;
+        bool sleeping = false;
+        std::uint64_t kv_capacity = 0;
+        std::uint64_t weights_bytes = 0;
+    };
+    std::vector<Row> rows;
+    const auto collect = [&](const std::string& name, const GenerationService& service) {
+        const auto found = attached_memory_.find(&service);
+        rows.push_back(Row{
+            label(name), service.runtime_stats(), service.is_sleeping(),
+            found == attached_memory_.end() ? 0U : found->second.kv_capacity,
+            found == attached_memory_.end() ? 0UL : found->second.weights.capacity_bytes,
+        });
+    };
+    collect(public_model_id_, *service_);
+    for (const auto& [name, service] : extra_services_) { collect(name, *service); }
+
+    help("up", "gauge", "1 when the server is answering.");
+    out += "surogate_up 1\n";
+    help("device_free_bytes", "gauge", "Free device memory on the serving GPU.");
+    out += "surogate_device_free_bytes " + std::to_string(sinfer::device_free_bytes(device_)) +
+           "\n";
+
+    // Counters first: these are what a rate() is taken over, and the two that matter are the
+    // prompt tokens actually computed (prefix hits excluded) and the tokens decode committed.
+    help("prefill_tokens_total", "counter", "Prompt tokens evaluated by prefill.");
+    for (const Row& r : rows) { metric("prefill_tokens_total", r.model, r.stats.computed_prefill_tokens); }
+    help("decode_tokens_total", "counter", "Tokens committed by decode rounds.");
+    for (const Row& r : rows) { metric("decode_tokens_total", r.model, r.stats.committed_decode_tokens); }
+    help("decode_rounds_total", "counter", "Decode batch executions.");
+    for (const Row& r : rows) { metric("decode_rounds_total", r.model, r.stats.decode_rounds); }
+    help("decode_rows_total", "counter", "Summed batch size over decode rounds; over rounds it is the mean batch.");
+    for (const Row& r : rows) { metric("decode_rows_total", r.model, r.stats.decode_row_rounds); }
+
+    help("requests", "gauge", "Requests in each scheduler state.");
+    for (const Row& r : rows) {
+        const auto state = [&](std::string_view which, std::uint64_t value) {
+            out += "surogate_requests{model=\"" + r.model + "\",state=\"";
+            out += which;
+            out += "\"} " + std::to_string(value) + "\n";
+        };
+        state("running", r.stats.running_requests);
+        state("prefilling", r.stats.prefilling_requests);
+        state("decode_ready", r.stats.decode_ready_requests);
+        state("waiting", r.stats.waiting_requests);
+    }
+
+    // The KV pool is the resource that decides whether a request queues, so it is exported in
+    // pages *and* bytes: pages are what the planner reasons in, bytes are what an operator has
+    // a budget for.
+    help("kv_pages", "gauge", "KV pages by kind: the pool, what is entitled, live demand, resident, mapped.");
+    for (const Row& r : rows) {
+        const auto pages = [&](std::string_view kind, std::uint64_t value) {
+            out += "surogate_kv_pages{model=\"" + r.model + "\",kind=\"";
+            out += kind;
+            out += "\"} " + std::to_string(value) + "\n";
+        };
+        pages("pool", r.stats.kv_pages);
+        pages("entitled", r.stats.kv_pages_entitled);
+        pages("in_use", r.stats.kv_pages_in_use);
+        pages("resident_at_granule", r.stats.kv_pages_resident_at_granule);
+        pages("mapped", r.stats.kv_pages_mapped);
+    }
+    help("kv_page_bytes", "gauge", "Bytes in one KV page.");
+    for (const Row& r : rows) { metric("kv_page_bytes", r.model, r.stats.kv_page_bytes); }
+    help("kv_bytes", "gauge", "KV pool bytes by kind.");
+    for (const Row& r : rows) {
+        const auto bytes = [&](std::string_view kind, std::uint32_t page_count) {
+            out += "surogate_kv_bytes{model=\"" + r.model + "\",kind=\"";
+            out += kind;
+            out += "\"} " +
+                   std::to_string(static_cast<std::uint64_t>(page_count) * r.stats.kv_page_bytes) +
+                   "\n";
+        };
+        bytes("pool", r.stats.kv_pages);
+        bytes("in_use", r.stats.kv_pages_in_use);
+        bytes("resident_at_granule", r.stats.kv_pages_resident_at_granule);
+        bytes("mapped", r.stats.kv_pages_mapped);
+    }
+    help("kv_capacity_tokens", "gauge", "Tokens the KV pool was sized for.");
+    for (const Row& r : rows) { metric("kv_capacity_tokens", r.model, r.kv_capacity); }
+    help("weights_bytes", "gauge", "Device bytes this model's weights occupy.");
+    for (const Row& r : rows) { metric("weights_bytes", r.model, r.weights_bytes); }
+    help("sleeping", "gauge", "1 while a model's weights are released to host memory.");
+    for (const Row& r : rows) { metric("sleeping", r.model, r.sleeping ? 1U : 0U); }
+
+    res.set_content(out, "text/plain; version=0.0.4; charset=utf-8");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {

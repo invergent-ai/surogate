@@ -46,13 +46,13 @@ bool valid_divisors(const WeightPlan& weight) {
 
 int verify_groupwise(const std::filesystem::path& path) {
     sinfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen36GroupwiseInt) {
+    if (Package::resolve_weights(reader.identity()) != WeightsProfile::GroupwiseInt) {
         std::cerr << "groupwise identity resolved to the wrong profile\n";
         return 1;
     }
     sinfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
-        bind_artifact(binder, WeightsProfile::Qwen36GroupwiseInt, all_features());
+        bind_artifact(binder, WeightsProfile::GroupwiseInt, all_features());
     if (plan.materialization.object_count != 1124 ||
         plan.materialization.device_objects.size() != 1118 ||
         plan.materialization.host_objects.size() != 6 ||
@@ -71,7 +71,7 @@ int verify_groupwise(const std::filesystem::path& path) {
                 std::cerr << "groupwise attention parent boundary changed\n";
                 return 1;
             }
-        } else if (!std::holds_alternative<SplitGdnInputProjectionPlan>(
+        } else if (!std::holds_alternative<QkPlusVzGdnInputProjectionPlan>(
                        layer.gdn.input_projection)) {
             std::cerr << "groupwise GDN parent boundary changed\n";
             return 1;
@@ -87,13 +87,13 @@ int verify_groupwise(const std::filesystem::path& path) {
 
 int verify_nvfp4(const std::filesystem::path& path) {
     sinfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen36Nvfp4) {
+    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Nvfp4MixedBf16) {
         std::cerr << "NVFP4 identity resolved to the wrong profile\n";
         return 1;
     }
     sinfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
-        bind_artifact(binder, WeightsProfile::Qwen36Nvfp4, all_features());
+        bind_artifact(binder, WeightsProfile::Nvfp4MixedBf16, all_features());
     if (plan.materialization.object_count != 1307 ||
         plan.materialization.device_objects.size() != 1054 ||
         plan.materialization.host_objects.size() != 6 ||
@@ -181,14 +181,14 @@ int verify_profile_mismatch_rejection() {
     options.prefill_chunk  = 128;
     options.use_cuda_graph = false;
     auto planner =
-        Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt,
+        Package::make_sequence_planner(device, options, WeightsProfile::GroupwiseInt,
                           sinfer::family::TextGeometry::compiled<Variant::TextConfig>());
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
     try {
         (void)sinfer::family::create_program<Variant>(
-            empty_model, WeightsProfile::Qwen36Nvfp4, std::move(sequence), device);
+            empty_model, WeightsProfile::Nvfp4MixedBf16, std::move(sequence), device);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }
