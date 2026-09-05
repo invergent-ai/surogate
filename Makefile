@@ -76,6 +76,17 @@ serve-test-build:
 	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
 		--target surogate-engine-cli surogate-engine serve-tests
 
+# The quantiser `surogate quantize` drives, from the vendored llama.cpp subset. CPU-only and
+# independent of the engine build, so it has its own tree; the sources are tracked and the
+# objects are not. Provenance and the pinned revision:
+# csrc/src/third_party/llama.cpp/PROVENANCE.md
+LLAMA_CPP_DIR ?= csrc/src/third_party/llama.cpp
+
+quantizer:
+	cmake -S $(LLAMA_CPP_DIR) -B $(LLAMA_CPP_DIR)/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(LLAMA_CPP_DIR)/build --parallel $(PARALLEL_JOBS) --target llama-quantize
+	@echo "==> $(LLAMA_CPP_DIR)/build/tools/quantize/llama-quantize"
+
 # The engine's own suite: 107 tests, ~3 minutes on one GPU. A test whose fixture is absent
 # exits 77 and ctest reports it skipped, so a machine without the real weights still gets a
 # meaningful pass.
@@ -90,7 +101,7 @@ serve-test-py:
 # `surogate/serve` has to pass.
 serve-check: serve-test-py serve-test
 
-.PHONY: serve-configure serve-build serve-test-build serve-test serve-test-py serve-check
+.PHONY: serve-configure serve-build serve-test-build serve-test serve-test-py serve-check quantizer
 
 # Internal helper: build + repair wheel for a given CUDA tag
 # Usage: $(call build_wheel,cu128)

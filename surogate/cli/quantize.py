@@ -39,11 +39,19 @@ COMMON_TYPES = (
     "q5_k_s", "q5_k_m", "q6_k", "q8_0", "bf16", "f16", "f32",
 )
 
-# The vendored tree, used when nothing else says otherwise. It is a checkout rather than part of
-# the package, so the environment variable exists for an installed llama.cpp elsewhere.
-VENDORED_LLAMA_CPP = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "study", "llama.cpp-master",
+# The vendored tree: the quantiser's sources live in this repository, pinned to one upstream
+# revision, and `make quantizer` builds them. Before that this pointed at `study/llama.cpp-master`,
+# a clone git did not track and no installed copy of the package would have -- so the command
+# failed on any machine but the one it was written on, and two machines could produce different
+# weights from the same checkpoint with nothing to say why. See PROVENANCE.md beside the sources.
+# `SUROGATE_LLAMA_CPP` still points at an llama.cpp elsewhere, for a caller who wants one.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+VENDORED_LLAMA_CPP = os.path.join(_REPO_ROOT, "csrc", "src", "third_party", "llama.cpp")
+
+#: The HF -> BF16 GGUF converter, vendored beside the engine's Python rather than in the C++
+#: tree because it is a script the package ships, not something the build produces.
+VENDORED_CONVERTER = os.path.join(
+    _REPO_ROOT, "surogate", "serve", "vendor", "llama_cpp", "convert_hf_to_gguf.py"
 )
 
 
@@ -102,6 +110,9 @@ def _llama_cpp_dir(explicit):
 def _find_quantizer(llama_cpp, build):
     """The `llama-quantize` binary, built on request when it is the only thing missing."""
     candidates = (
+        # Where our own build puts it; upstream's layout follows, for a caller pointing
+        # `SUROGATE_LLAMA_CPP` at an llama.cpp checkout of their own.
+        os.path.join(llama_cpp, "build", "tools", "quantize", "llama-quantize"),
         os.path.join(llama_cpp, "build", "bin", "llama-quantize"),
         os.path.join(llama_cpp, "build", "bin", "Release", "llama-quantize.exe"),
         os.path.join(llama_cpp, "llama-quantize"),
@@ -125,14 +136,22 @@ def _find_quantizer(llama_cpp, build):
 
 
 def _find_converter(llama_cpp):
-    """llama.cpp's Hugging-Face-to-GGUF script, whichever name this revision uses."""
+    """The HF -> BF16 GGUF converter. The vendored one unless the caller pointed at an
+    llama.cpp of their own, in which case theirs is the one that matches their quantiser."""
+    if os.path.abspath(llama_cpp) == os.path.abspath(VENDORED_LLAMA_CPP):
+        if os.path.isfile(VENDORED_CONVERTER):
+            return VENDORED_CONVERTER
+        logger.error(
+            f"the vendored converter is missing at {VENDORED_CONVERTER}; the checkout is "
+            f"incomplete (see csrc/src/third_party/llama.cpp/PROVENANCE.md)"
+        )
+        return None
     for name in ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py"):
-        path = os.path.join(llama_cpp, name)
-        if os.path.isfile(path):
-            return path
+        candidate = os.path.join(llama_cpp, name)
+        if os.path.isfile(candidate):
+            return candidate
     logger.error(f"No convert_hf_to_gguf.py in {llama_cpp}; is that a llama.cpp checkout?")
     return None
-
 
 def _checkpoint_bytes(model_dir):
     """Bytes of weight files in a checkpoint, for the scratch-space estimate."""

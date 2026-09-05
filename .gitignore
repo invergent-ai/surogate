@@ -41,3 +41,6 @@ models/**
 design/
 
 .env
+
+# The vendored llama.cpp builds into its own tree; the sources are tracked, the objects are not.
+csrc/src/third_party/llama.cpp/build/
