@@ -148,10 +148,17 @@ llama-perplexity's 14.9713 on the same file, and against the published Q4_K_M's
   Whether a Surogate preset should exist — the "UD" mixes are exactly this — is
   a quality question that wants perplexity evidence per candidate, which the
   gate in `tools/eval/perplexity.py` can now supply.
-- **The llama.cpp dependency is a checkout, not a dependency.** It resolves to
-  `study/llama.cpp-master`, which is a study tree and not shippable. A product
-  version either vendors the quantiser sources into `csrc` or fetches a pinned
-  release the way unsloth does.
+- ~~**The llama.cpp dependency is a checkout, not a dependency.**~~ **Done
+  2026-09-05: vendored.** Both halves are in the tree, pinned to 163a4079
+  (b10797-10, 2026-09-04): the CPU-only C++ subset under
+  `csrc/src/third_party/llama.cpp` with our own top-level CMakeLists and every
+  accelerator backend off, built by `make quantizer`; the converter, its
+  `conversion` package and `gguf-py` under `surogate/serve/vendor/llama_cpp`.
+  `gguf-py` had to come too — the converter puts its own on `sys.path` ahead of
+  anything installed and the pip release lags it, so the pair went out of step on
+  the first run. Quantising the 0.8B through the vendored toolchain produces a file
+  **byte-identical** to the one the checkout produced. `PROVENANCE.md` beside each
+  half records the revision and how to update, including re-running the gate.
 - **No MoE-specific handling, no vision towers, no sharded output**
   (`--keep-split`), and no LoRA-adapter GGUF path (`convert_lora_to_gguf.py`
   exists upstream).
