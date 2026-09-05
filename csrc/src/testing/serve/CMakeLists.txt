@@ -275,6 +275,7 @@ set(sinfer_op_tests
   scalar
   cast
   scatter
+  short_conv
   position)
 foreach(op IN LISTS sinfer_op_tests)
   sinfer_add_op_test(sinfer_${op}_test
