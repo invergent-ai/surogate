@@ -43,6 +43,9 @@ struct TextConfig {
     static constexpr int gdn_value_head_dim   = 128;
     /// The forget and output gates are low-rank: hidden -> this -> the full width.
     static constexpr int kda_gate_rank = 128;
+    /// The bound the forget gate's logistic is scaled by (`kda.gate_lower_bound`). A decay of
+    /// exp(g) then lies in [exp(-5), 1): the state neither grows nor is erased outright.
+    static constexpr float kda_gate_lower_bound = -5.0F;
 
     // Multi-head latent attention, NoPE: the query and key/value low ranks, and the per-head
     // widths they expand to. 64 query heads and 64 key/value heads -- this is MHA over an

@@ -125,6 +125,11 @@ struct HyperConnectionPayload {
 /// The attention site's payload: its hyper-connection and the latent projections.
 struct LatentAttentionPayload {
     HyperConnectionPayload hc;
+    /// The layer's `input_layernorm`, applied to the collapsed stream. It is the same tensor
+    /// the family holds beside this payload; the collapse hook receives only the payload, so
+    /// the norm it applies afterwards travels with it.
+    Tensor norm;
+    float rms_epsilon = 0.0F;
     Weight query_a;
     Tensor query_a_norm;
     Weight query_b;
@@ -137,6 +142,9 @@ struct LatentAttentionPayload {
 /// The mixer site's payload, in the slot the family names for the linear mixer's projection.
 struct KdaProjectionPayload {
     HyperConnectionPayload hc;
+    float rms_epsilon = 0.0F;
+    /// The bound the forget gate's logistic is scaled by, from `kda.gate_lower_bound`.
+    float gate_lower_bound = 0.0F;
     Weight query_key_value;
     Weight decay_a;
     Weight decay_b;
@@ -151,6 +159,10 @@ struct KdaProjectionPayload {
 /// mixture. `sparse` says which; the other half is left empty rather than filled with zeros.
 struct FeedForwardPayload {
     HyperConnectionPayload hc;
+    /// The layer's `post_attention_layernorm`, for the same reason `LatentAttentionPayload`
+    /// carries its own.
+    Tensor norm;
+    float rms_epsilon = 0.0F;
     bool sparse = false;
     Weight gate_up;
     Weight down;

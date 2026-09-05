@@ -208,10 +208,13 @@ HyperConnectionPayload load_hyper_connection(const artifact::MaterializedArtifac
 }
 
 FeedForwardPayload load_feed_forward(const artifact::MaterializedArtifact& backing,
-                                     const TextLayerPlan& source, const family::TextGeometry& g) {
+                                     const TextLayerPlan& source, const family::TextGeometry& g,
+                                     const Tensor& post_norm) {
     FeedForwardPayload out;
-    out.hc     = load_hyper_connection(backing, source.feed_forward_hc, g);
-    out.sparse = source.feed_forward.sparse;
+    out.hc          = load_hyper_connection(backing, source.feed_forward_hc, g);
+    out.norm        = post_norm;
+    out.rms_epsilon = g.rms_epsilon;
+    out.sparse      = source.feed_forward.sparse;
     if (!out.sparse) {
         out.gate_up = materialized_weight(backing, source.feed_forward.gate_up,
                                           2 * g.dense_intermediate, g.hidden);
@@ -326,7 +329,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             FullAttentionWeights& target = runtime.full_layers.at(full_index++);
             target.input_norm            = input_norm;
             LatentAttentionPayload payload;
-            payload.hc      = load_hyper_connection(backing, source.attention_hc, g);
+            payload.hc          = load_hyper_connection(backing, source.attention_hc, g);
+            payload.norm        = input_norm;
+            payload.rms_epsilon = g.rms_epsilon;
             payload.query_a = materialized_weight(backing, source.attention.query_a, g.q_lora_rank,
                                                   g.hidden);
             payload.query_a_norm = artifact::materialized_tensor(
@@ -349,12 +354,14 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = materialized_weight(backing, source.attention.output, g.hidden,
                                                 g.query_size());
             target.post_attention_norm = post_norm;
-            target.post_mixer          = load_feed_forward(backing, source, g);
+            target.post_mixer          = load_feed_forward(backing, source, g, post_norm);
         } else {
             KdaWeights& target = runtime.gdn_layers.at(kda_index++);
             target.input_norm  = input_norm;
             KdaProjectionPayload payload;
-            payload.hc              = load_hyper_connection(backing, source.attention_hc, g);
+            payload.hc               = load_hyper_connection(backing, source.attention_hc, g);
+            payload.rms_epsilon      = g.rms_epsilon;
+            payload.gate_lower_bound = TextConfig::kda_gate_lower_bound;
             payload.query_key_value = materialized_weight(backing, source.kda.query_key_value,
                                                           g.convolution_dim(), g.hidden);
             payload.decay_a = materialized_weight(backing, source.kda.decay_a, g.kda_gate_rank,
@@ -384,7 +391,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = materialized_weight(backing, source.kda.output, g.hidden,
                                                 g.value_dim());
             target.post_attention_norm = post_norm;
-            target.post_mixer          = load_feed_forward(backing, source, g);
+            target.post_mixer          = load_feed_forward(backing, source, g, post_norm);
         }
     }
 
