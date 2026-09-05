@@ -5,8 +5,10 @@ K-quants first, then compressed-tensors NVFP4, FP8 and the rest — without a
 per-model converter or a per-export profile. `TODO.md` remains the tracker for
 pre-existing review items; nothing moves between the two.
 
-Legend: `[~]` partly done · `[ ]` open. Completed items are not kept here —
-what shipped is in `git log --oneline c5d327fe..` and `design/INFERENCE.md`.
+Completed items are not kept here — what shipped is in `git log --oneline
+c5d327fe..` and `design/INFERENCE.md`. As of 2026-09-05 the roadmap is empty and
+what remains is below: the decisions that govern the engine, the traps that cost
+real time, and what was measured and rejected.
 
 ---
 
@@ -46,27 +48,21 @@ Board rows are `surogate/serve/BENCHMARKS.md`; the history of what was tried is
 
 ## Roadmap
 
-One open, and it is a decision about product scope rather than blocked work.
-Nothing here is waiting on someone to find time.
+**Empty.** Every item this file opened with is either shipped, measured and
+rejected, or settled as a decision — the record is in `git log --oneline
+c5d327fe..` and `design/INFERENCE.md`, and the decisions are below.
 
-1. **[ ] `surogate quantize` as a product — the engine blocker is gone (2026-09-05).**
-   The recorded blocker was ours: every MTP binding demanded `W8G32_F16S` or BF16, so
-   an export that quantised its own nextn block was refused at
-   `mtp/input_projection`. The MTP matrices bind at whatever format the artifact
-   declares now, and the whole chain runs: `surogate quantize --type q4_k_m` on
-   Qwen3.5-0.8B writes 335 tensors carrying the nextn block at Q4_K, the engine
-   serves it, and it scores **14.9559** against llama-perplexity's 14.9713 on the
-   same file — better than the *published* Q4_K_M of the same model (15.031/15.025),
-   which is what a full-precision source and llama.cpp's own mixture buy.
-   So nothing here is engine work any more, and the toolchain is no longer a
-   checkout on somebody's disk: llama.cpp is fetched at a pinned commit and built
-   into the wheel. What is left is product scope, listed below — no importance
-   matrix, no mixture of our own, untested beyond the 0.8B and on anything we
-   trained ourselves. **This is a decision about what to build, not a blocked task.**
+`surogate quantize` was the last entry and it was not a task: what it listed as
+remaining — an importance matrix, a mixture of our own, MoE and vision handling,
+sharded output, a LoRA path — are features nobody has asked for yet, not loose
+ends of the thing that exists. Judged against what it claims to do, it is done;
+see the section below for what it does and the two limits it still has.
+
+The work that remains is architectures, not engine. See **Status**.
 
 ---
 
-## `surogate quantize`, as investigated (2026-09-03)
+## `surogate quantize`, and what it does not do
 
 A downloaded model is already a GGUF and is served where it lies. A model
 trained here has none, so producing one is ours to do: `surogate sft` →
@@ -123,7 +119,25 @@ block at Q4_K; the engine serves it at 798 tok/s and scores **14.9559** against
 llama-perplexity's 14.9713 on the same file, and against the published Q4_K_M's
 15.031. A full-precision source and llama.cpp's own mixture beat the download.
 
-**What is deliberately not built, and is the actual work when this comes back:**
+**Tested on three checkpoints across two architectures (2026-09-05)**, each
+quantised with our own command and served:
+
+| checkpoint | result | served |
+|---|---|---|
+| Qwen3.5-0.8B | 542 MB, 168 Q4_K / 27 Q6_K / 140 F32, nextn block kept at Q4_K | 798 tok/s, **14.9559** vs llama-perplexity 14.9713 |
+| Qwen3-0.6B | 484 MB, 169 Q4_K / 29 Q6_K / 113 F32 | 707.6 tok/s, coherent |
+| Qwen3.5-2B | 1,312 MB, 168 Q4_K / 27 Q6_K / 140 F32 | 574.7 tok/s, coherent |
+
+**Two limits, stated rather than tracked.** Neither is a blocked task; both are
+things to know before relying on the command.
+
+- **Untested on a checkpoint we trained ourselves.** Every test above is a
+  published model. The path has no reason to care, but nobody has run it.
+- **Dense text models only.** No MoE-specific handling, no vision towers, no
+  sharded output (`--keep-split`), no LoRA-adapter GGUF path
+  (`convert_lora_to_gguf.py` exists upstream), and no tensor pinning.
+
+**What it deliberately does not do, and would be new work if ever wanted:**
 
 - **No importance matrix.** `--imatrix` is passed through, but nothing produces
   one, and the IQ types require it. Generating one means running the model over
@@ -133,12 +147,10 @@ llama-perplexity's 14.9713 on the same file, and against the published Q4_K_M's
   Whether a Surogate preset should exist — the "UD" mixes are exactly this — is
   a quality question that wants perplexity evidence per candidate, which the
   gate in `tools/eval/perplexity.py` can now supply.
-- **No MoE-specific handling, no vision towers, no sharded output**
-  (`--keep-split`), and no LoRA-adapter GGUF path (`convert_lora_to_gguf.py`
-  exists upstream).
-- **Untested beyond the 0.8B**, and untested on anything we trained ourselves.
-- **No tensor pinning.** The MTP failure above needs it, and so would any other
-  contract that wants a particular format for a particular tensor.
+- **No tensor pinning.** `--tensor-type` reaches llama.cpp, but nothing chooses a
+  format per tensor on our behalf. The MTP failure above would have needed it had
+  the engine not been fixed instead, and any future contract wanting a particular
+  format for a particular tensor would too.
 
 ---
 
@@ -208,8 +220,8 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
   `surogate quantize` stays, it takes a trained checkpoint to a GGUF, and the
   quantisation arithmetic is llama.cpp's rather than ours. **It is a separate
   product and not on the critical path** (owner, 2026-09-03): the serving engine
-  comes first, and the export command is revisited after. See item 1 for what
-  exists and what does not.
+  comes first, and the export command is revisited after. It works end to end as
+  of 2026-09-05; the section below says what it does and does not do.
 - **`.sinfer` is a transparent cache, never an interchange format** (owner,
   2026-08-24). Never published, never required. The eight-entry hardcoded
   registry in `ingest.py` is the rejected shape.
