@@ -142,6 +142,11 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "TwoHv": 2 * heads_v,
         "Vd": dim_v,
         "ValueDim": value_dim,
+        # Three times hidden: a short-conv mixer projects to B, C and x at once.
+        "ThreeC": 3 * hidden,
+        # The short-conv kernel width, which is not the linear-attention one below:
+        # a model may carry either mixer, and they size their convolutions apart.
+        "ShortConvK": config.get("conv_kernel", 0),
         "ConvK": config.get("linear_conv_kernel_dim", 0),
         "ConvDim": conv_dim,
         "GdnFusedRows": conv_dim + value_dim,
