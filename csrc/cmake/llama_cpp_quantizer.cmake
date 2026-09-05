@@ -50,6 +50,12 @@ set(LLAMA_BUILD_COMMIT "163a4079")
 FetchContent_Declare(llama_cpp
     URL https://github.com/ggml-org/llama.cpp/archive/${LLAMA_CPP_COMMIT}.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+
+# ggml installs its public headers and a CMake package config unconditionally -- 23 files of
+# `include/ggml-*.h` and `lib/cmake/ggml`, which a Python wheel has no use for. They are
+# dropped by `wheel.exclude` in pyproject.toml rather than here: `CMAKE_SKIP_INSTALL_RULES`
+# stops the subproject's `cmake_install.cmake` being generated while the parent still includes
+# it, so the install fails outright.
 FetchContent_MakeAvailable(llama_cpp)
 
 # Where an installed package looks. `surogate quantize` needs three things at run time: the

@@ -66,6 +66,10 @@ wheel.packages = ["surogate"]
 # The quantiser is a second product of this build; naming it here is what makes
 # `uv build --wheel` produce it rather than only the extension module.
 build.targets = ["_surogate", "llama-quantize"]
+# ggml installs its public headers and a CMake package config whether or not anyone asked;
+# a Python wheel has no use for a C library's headers. The quantiser itself lands under
+# `surogate/serve/_llama_cpp` and is kept.
+wheel.exclude = ["include/**", "lib/cmake/**", "lib/pkgconfig/**"]
 build-dir = "build/{wheel_tag}"
 cmake.build-type = "Release"
 
