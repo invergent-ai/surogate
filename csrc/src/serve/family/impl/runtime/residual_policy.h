@@ -203,6 +203,17 @@ template <class Variant>
     }
 }
 
+/// Which mixer the non-attending layers run. The delta net unless the variant says otherwise,
+/// which is what every target that predates a second mixer means by saying nothing.
+template <class Variant>
+[[nodiscard]] constexpr family::LinearMixer linear_mixer() {
+    if constexpr (requires { Variant::linear_mixer; }) {
+        return Variant::linear_mixer;
+    } else {
+        return family::LinearMixer::GatedDelta;
+    }
+}
+
 template <class Variant>
 struct ResidualHooks {
     using Model = typename Variant::ModelView;

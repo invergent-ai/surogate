@@ -1255,6 +1255,104 @@ struct PrefillWindowLaps {
     }
 };
 
+/// The short-convolution mixer.
+///
+/// Four steps and no state beyond the K-1 columns behind the round: normalise the residual,
+/// project it to B, C and x at once, convolve the gated input B*x under C, and add the output
+/// projection back to the residual. There is no recurrence, so nothing here is sequential in t
+/// and a chunk of any width is one pass -- which is why a prefill needs no separate route from
+/// a decode, only a different way of reaching the state.
+///
+/// The state is where the two phases differ. A prefill chunk is one sequence continuing one
+/// history, so it reads and rewrites a single slot. A decode round is B lanes that share no
+/// history at all, so every row says which slot it starts from and where its new windows go,
+/// and the op resolves that indirection itself.
+void TextContext::short_conv_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
+    cudaStream_t s   = ctx_.stream;
+    const int T      = x.ne[1];
+    const auto roots = workspace_recipe::short_conv(work_, cfg_geometry(), T);
+    Tensor bcx       = roots.projected;
+    Tensor convolved = roots.convolved;
+
+    Variant::short_conv_projection(x, *w.input_norm, cfg_.rms_eps, *w.projection, bcx, ph, work_,
+                                   s);
+    debug_probe<Variant>("short_conv_in", bcx, s);
+
+    if (ph == Phase::Verify) {
+        if (active_sequence_batch_ == 0 || active_linear_state_slots_ == nullptr) {
+            throw std::logic_error(
+                "Verify short_conv requires an explicit sequence batch and state slots");
+        }
+        const std::int32_t width = active_sequence_width_;
+        if (width <= 0 || width * active_sequence_batch_ != T) {
+            throw std::logic_error(
+                "short_conv sequence batch binding does not match aggregate columns");
+        }
+        Tensor rows_in  = bcx.view({3 * cfg_.hidden, width, active_sequence_batch_});
+        Tensor rows_out = convolved.view({cfg_.hidden, width, active_sequence_batch_});
+        Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
+        const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        ops::short_conv_snapshot(rows_in, *w.conv1d, conv_states, *active_linear_state_slots_,
+                                 *active_linear_state_slots_, valid, rows_out, cfg_.hidden, s);
+    } else {
+        Tensor conv_state =
+            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        debug_probe<Variant>("short_conv_state_in", conv_state, s);
+        if (graph_pad_valid_ != nullptr) {
+            // Bucket-padded graph body: the window this round leaves behind must end at the
+            // real token count, not at the captured width.
+            ops::short_conv(bcx, *w.conv1d, conv_state, convolved, cfg_.hidden, *graph_pad_valid_,
+                            s);
+        } else {
+            ops::short_conv(bcx, *w.conv1d, conv_state, convolved, cfg_.hidden, s);
+        }
+    }
+    debug_probe<Variant>("short_conv_out", convolved, s);
+
+    // The same linear-add the delta net ends with, and the same leaf: an output projection is an
+    // output projection whichever mixer produced the value it reads.
+    Variant::gdn_output_projection(convolved, *w.out_proj, x, ph, work_, s);
+}
+
+/// The short-convolution mixer over a mixed round: some columns continue prefill sequences,
+/// the rest are one column each for decode lanes.
+///
+/// The split is the same one the delta net makes, and for the same reason -- a prefill segment
+/// continues one history in one slot, while the lanes behind it each continue their own -- but
+/// it is the whole of the difference here, because a convolution has no scan to run afterwards.
+/// `segment_slots` gives one (offset, columns, slot) per prefill segment; `valid` is the padded
+/// column count they share, or empty.
+void TextContext::short_conv_mix_mixed(const GdnLayerW& w, Tensor& x, int gidx,
+                                       std::span<const ShortConvSegment> segments,
+                                       std::int32_t prefill_columns, std::int32_t batch,
+                                       const Tensor& valid, const Tensor& decode_slots) {
+    cudaStream_t s   = ctx_.stream;
+    const int total  = x.ne[1];
+    const auto roots = workspace_recipe::short_conv(work_, cfg_geometry(), total);
+    Tensor bcx       = roots.projected;
+    Tensor convolved = roots.convolved;
+
+    Variant::short_conv_projection(x, *w.input_norm, cfg_.rms_eps, *w.projection, bcx,
+                                   Phase::Prefill, work_, s);
+
+    for (const ShortConvSegment& segment : segments) {
+        Tensor part_in    = bcx.slice(1, segment.offset, segment.columns);
+        Tensor part_out   = convolved.slice(1, segment.offset, segment.columns);
+        Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), segment.state_slot);
+        ops::short_conv(part_in, *w.conv1d, conv_state, part_out, cfg_.hidden, valid, s);
+    }
+    if (batch > 0) {
+        Tensor rows_in  = bcx.slice(1, prefill_columns, batch)
+                             .view({3 * cfg_.hidden, 1, batch});
+        Tensor rows_out = convolved.slice(1, prefill_columns, batch)
+                              .view({cfg_.hidden, 1, batch});
+        ops::short_conv_snapshot(rows_in, *w.conv1d, state_.conv.at(static_cast<std::size_t>(gidx)),
+                                 decode_slots, decode_slots, Tensor{}, rows_out, cfg_.hidden, s);
+    }
+
+    Variant::gdn_output_projection(convolved, *w.out_proj, x, Phase::Prefill, work_, s);
+}
+
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1563,7 +1661,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
                 if (timing) { cudaEventRecord(timer.begin, ctx_.stream); }
-                gdn_mix(gdn, x, gidx, ph);
+                if constexpr (kLinearMixer == family::LinearMixer::ShortConv) {
+                    short_conv_mix(gdn, x, gidx, ph);
+                } else {
+                    gdn_mix(gdn, x, gidx, ph);
+                }
                 if (timing) { lap(timer.begin, timer.gdn, acc_gdn); }
             }
             {
@@ -1966,7 +2068,20 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         } else {
             const int gidx       = cfg_.gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
-            {
+            if constexpr (kLinearMixer == family::LinearMixer::ShortConv) {
+                auto mixer_scope = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, s); }
+                std::vector<ShortConvSegment> parts;
+                parts.reserve(segments.size());
+                for (std::size_t sg = 0; sg < segments.size(); ++sg) {
+                    parts.push_back({segment_begin[sg],
+                                     static_cast<std::int32_t>(segments[sg].ids.size()),
+                                     static_cast<std::int32_t>(segments[sg].state_slot)});
+                }
+                short_conv_mix_mixed(gdn, x, gidx, parts, prefill_cols, batch, Tensor{},
+                                     decode.linear_state_slots);
+                if (timing) { lap(timer.begin, timer.gdn, acc_gdn); }
+            } else {
                 auto mixer_scope   = work_.scope();
                 if (timing) { cudaEventRecord(timer.begin, s); }
                 const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), total);
@@ -2402,7 +2517,13 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         } else {
             const int gidx       = cfg_.gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
-            {
+            if constexpr (kLinearMixer == family::LinearMixer::ShortConv) {
+                auto mixer_scope = work_.scope();
+                const ShortConvSegment window{0, prefill_cols,
+                                              static_cast<std::int32_t>(linear_state_current_slot_)};
+                short_conv_mix_mixed(gdn, x, gidx, std::span<const ShortConvSegment>(&window, 1),
+                                     prefill_cols, batch, valid, decode.linear_state_slots);
+            } else {
                 auto mixer_scope   = work_.scope();
                 const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), total);
                 Tensor h           = control.hidden;

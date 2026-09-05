@@ -103,6 +103,13 @@ struct Variant {
     static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                       family::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream);
+    /// The short-convolution mixer's input: RMSNorm the residual, then one projection that
+    /// yields B, C and x stacked. Only a target whose `linear_mixer` is `ShortConv` runs it;
+    /// the rest refuse, exactly as a dense target refuses the delta net's leaves.
+    static void short_conv_projection(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                      const GdnProjectionWeights& weights, Tensor& bcx,
+                                      family::TextPhase phase, WorkspaceArena& workspace,
+                                      cudaStream_t stream);
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
                                             float eps, const GdnProjectionWeights& weights,
                                             Tensor& hidden, Tensor& g, Tensor& beta,
@@ -136,6 +143,11 @@ struct Variant {
         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     gdn_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile,
+                                                   family::TextPhase phase, std::int32_t first,
+                                                   std::int32_t last);
+    [[nodiscard]] static std::size_t
+    short_conv_projection_workspace_capacity_bytes(const family::TextGeometry& geometry,
+                                                   WeightsProfile weights_profile,
                                                    family::TextPhase phase, std::int32_t first,
                                                    std::int32_t last);
     [[nodiscard]] static std::size_t

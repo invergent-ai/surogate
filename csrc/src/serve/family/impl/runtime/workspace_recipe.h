@@ -140,6 +140,22 @@ Tensor gdn_normalized_output(Allocator& allocator, const family::TextGeometry& g
     return matrix(allocator, DType::BF16, geometry.value_dim(), tokens);
 }
 
+/// The short-convolution mixer's two roots: the projection's three stacked parts, and the
+/// convolved value the output projection reads. Both are per-round, neither is state.
+struct ShortConvRoots {
+    Tensor projected;
+    Tensor convolved;
+};
+
+template <class Allocator>
+ShortConvRoots short_conv(Allocator& allocator, const family::TextGeometry& geometry,
+                          std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, 3 * geometry.hidden, tokens),
+        matrix(allocator, DType::BF16, geometry.hidden, tokens),
+    };
+}
+
 template <class Allocator>
 Tensor post_mixer_hidden(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
     return matrix(allocator, DType::BF16, geometry.hidden, tokens);

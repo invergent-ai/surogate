@@ -20,6 +20,18 @@ struct DeviceContext;
 
 namespace sinfer::family {
 
+/// Which mixer a family's non-attending layers run.
+///
+/// Every hybrid target here ran a gated delta net, so that stayed implicit. LFM2's non-attending
+/// layers run a short convolution instead -- three taps, a gate applied outside, no recurrent
+/// state at all -- which is a different mixer in the same slot of the same schedule, not a
+/// differently-shaped one. A target names its kind; one that names nothing gets the delta net,
+/// so nothing about the registered targets changes.
+enum class LinearMixer : std::uint8_t {
+    GatedDelta,
+    ShortConv,
+};
+
 enum class TextPhase {
     Prefill,
     Verify,

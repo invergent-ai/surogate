@@ -402,4 +402,22 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextG
                                                     last);
 }
 
+
+// This family's non-attending layers run a gated delta net, not a short convolution. The leaf
+// is declared because the runtime is a template over the whole Variant interface, and it
+// refuses rather than returning quietly: a mixer that contributed nothing to the residual reads
+// as a model that merely answers badly.
+void Variant::short_conv_projection(const Tensor&, const Tensor&, float,
+                                    const GdnProjectionWeights&, Tensor&, family::TextPhase,
+                                    WorkspaceArena&, cudaStream_t) {
+    throw std::logic_error("short_conv_projection: this target's linear mixer is a gated delta net");
+}
+
+std::size_t Variant::short_conv_projection_workspace_capacity_bytes(const family::TextGeometry&,
+                                                                    WeightsProfile,
+                                                                    family::TextPhase,
+                                                                    std::int32_t, std::int32_t) {
+    return 0;
+}
+
 } // namespace sinfer::targets::qwen3_5_moe::detail

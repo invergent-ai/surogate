@@ -10,6 +10,11 @@ namespace sinfer::ops {
 
 void short_conv(const Tensor& bcx, const Tensor& taps, Tensor& state, Tensor& out,
                 std::int32_t channels, cudaStream_t stream) {
+    short_conv(bcx, taps, state, out, channels, Tensor{}, stream);
+}
+
+void short_conv(const Tensor& bcx, const Tensor& taps, Tensor& state, Tensor& out,
+                std::int32_t channels, const Tensor& valid_columns, cudaStream_t stream) {
     if (channels <= 0) { throw std::invalid_argument("short_conv: channels must be positive"); }
     if (bcx.dtype != DType::BF16 || bcx.data == nullptr || bcx.ne[1] <= 0 || bcx.ne[2] != 1 ||
         bcx.ne[3] != 1) {
@@ -38,7 +43,13 @@ void short_conv(const Tensor& bcx, const Tensor& taps, Tensor& state, Tensor& ou
         out.ne[1] != columns) {
         throw std::invalid_argument("short_conv: out must be BF16 [channels, T]");
     }
-    detail::short_conv_launch(bcx, taps, state, out, channels, stream);
+    if (valid_columns.data != nullptr &&
+        (valid_columns.dtype != DType::I32 || valid_columns.numel() != 1 ||
+         !valid_columns.is_contiguous())) {
+        throw std::invalid_argument(
+            "short_conv: valid_columns must be empty or a contiguous I32 scalar");
+    }
+    detail::short_conv_launch(bcx, taps, state, out, channels, valid_columns, stream);
 }
 
 void short_conv_snapshot(const Tensor& bcx, const Tensor& taps, Tensor& conv_states,

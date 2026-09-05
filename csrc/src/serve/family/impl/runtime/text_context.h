@@ -12,6 +12,7 @@
 #include "api/ops/sampling.h"
 #include "api/ops/gqa_attention.h"
 #include "api/ops/qsa_indexer.h"
+#include "api/ops/short_conv.h"
 #include <api/family/text_geometry.h>
 #include <api/family/decoder_state.h>
 #include <api/family/prepared_prompt.h>
@@ -159,10 +160,21 @@ inline constexpr float kAttnScale                     = kAttentionScale;
 // False only for a target whose attention has no output gate (a dense GQA
 // stack); every hybrid target in the family leaves it at the default.
 inline constexpr bool kAttentionOutputGate            = family::detail::attention_output_gate<Variant>();
+// Which mixer the non-attending layers run. A compile-time constant, so the branch that is not
+// this target's costs nothing and the leaves it would have called are never reached.
+inline constexpr family::LinearMixer kLinearMixer      = family::detail::linear_mixer<Variant>();
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
 struct MlpW {
     const MlpWeights* payload = nullptr;
+};
+
+/// One prefill segment of a mixed round, as the short-convolution mixer needs it: where its
+/// columns start, how many there are, and which state slot continues its history.
+struct ShortConvSegment {
+    std::int32_t offset     = 0;
+    std::int32_t columns    = 0;
+    std::int32_t state_slot = 0;
 };
 
 struct FullLayerW {
@@ -449,6 +461,13 @@ private:
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, int layer, Phase phase,
                   KvPlane plane = KvPlane::Text);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
+    /// The short-convolution mixer, for a family whose non-attending layers run one. Same slot
+    /// in the same schedule as `gdn_mix`, and the same three phases; a different mixer.
+    void short_conv_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
+    void short_conv_mix_mixed(const GdnLayerW& weights, Tensor& x, int index,
+                              std::span<const ShortConvSegment> segments,
+                              std::int32_t prefill_columns, std::int32_t batch,
+                              const Tensor& valid, const Tensor& decode_slots);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>

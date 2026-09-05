@@ -84,6 +84,19 @@
         return 0; \
     } \
  \
+    void Variant::short_conv_projection(const Tensor&, const Tensor&, float, \
+                                        const GdnProjectionWeights&, Tensor&, family::TextPhase, \
+                                        WorkspaceArena&, cudaStream_t) { \
+        NO_LINEAR("short_conv_projection"); \
+    } \
+ \
+    std::size_t Variant::short_conv_projection_workspace_capacity_bytes(const family::TextGeometry&, \
+                                                                        WeightsProfile, \
+                                                                        family::TextPhase, \
+                                                                        std::int32_t, std::int32_t) { \
+        return 0; \
+    } \
+ \
     void Variant::mtp_attention_projection(const Tensor&, const MtpAttentionProjectionWeights&, Tensor&, \
                                            Tensor&, Tensor&, Tensor&, WorkspaceArena&, cudaStream_t) { \
         NO_SPEC("mtp_attention_projection"); \

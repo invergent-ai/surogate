@@ -45,6 +45,17 @@ void short_conv(const Tensor& bcx, const Tensor& taps, Tensor& state, Tensor& ou
                 std::int32_t channels, cudaStream_t stream);
 
 /**
+ * Bucket-padded form: identical to the one above except that the trailing window consumes
+ * `min(*valid_columns, T)` columns, with the count read from a device I32 scalar at execution
+ * time -- so a graph captured at a bucket width can be replayed for a shorter round. Output
+ * columns past the valid count are computed and carry junk, exactly as the linear-attention
+ * convolution's padded form leaves them; their consumers are masked. Columns below it match the
+ * unpadded op.
+ */
+void short_conv(const Tensor& bcx, const Tensor& taps, Tensor& state, Tensor& out,
+                std::int32_t channels, const Tensor& valid_columns, cudaStream_t stream);
+
+/**
  * Snapshot form, for B independent sequences that do not share a history.
  *
  * A decode round carries one column for each of B lanes, and each lane's convolution must

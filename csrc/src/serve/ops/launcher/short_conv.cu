@@ -66,15 +66,18 @@ short_conv_kernel(const __nv_bfloat16* __restrict__ bcx, const __nv_bfloat16* __
 /// and there is no ordering to get wrong between threads that never touch the same bytes.
 __global__ void __launch_bounds__(kThreads)
 short_conv_snapshot_kernel(const __nv_bfloat16* __restrict__ bcx,
-                           __nv_bfloat16* __restrict__ state, int channels, int columns,
-                           int width) {
+                           __nv_bfloat16* __restrict__ state, const int* __restrict__ valid,
+                           int channels, int columns, int width) {
     const int history     = width - 1;
     const long long parts = 3LL * channels;
+    // The window ends at the last column the round actually carries, which under graph bucket
+    // padding is fewer than the captured width.
+    const int live = valid == nullptr ? columns : min(*valid, columns);
     for (int channel = blockIdx.x * blockDim.x + threadIdx.x; channel < channels;
          channel += gridDim.x * blockDim.x) {
         float window[kMaxTaps];
         for (int i = 0; i < history; ++i) {
-            const int source = columns - history + i;
+            const int source = live - history + i;
             if (source >= 0) {
                 const long long base = static_cast<long long>(source) * parts + channel;
                 window[i] = __bfloat162float(bcx[base]) *
@@ -193,7 +196,7 @@ short_conv_rows_snapshot_kernel(const __nv_bfloat16* __restrict__ bcx,
 } // namespace
 
 void short_conv_launch(const Tensor& bcx, const Tensor& taps, Tensor& state, Tensor& out,
-                       std::int32_t channels, cudaStream_t stream) {
+                       std::int32_t channels, const Tensor& valid_columns, cudaStream_t stream) {
     const int columns = bcx.ne[1];
     const int width   = taps.ne[1];
     if (columns <= 0 || channels <= 0) { return; }
@@ -213,7 +216,9 @@ void short_conv_launch(const Tensor& bcx, const Tensor& taps, Tensor& state, Ten
         short_conv_snapshot_kernel<<<snapshot_blocks == 0 ? 1U : snapshot_blocks, kThreads, 0,
                                      stream>>>(
             static_cast<const __nv_bfloat16*>(bcx.data),
-            static_cast<__nv_bfloat16*>(state.data), channels, columns, width);
+            static_cast<__nv_bfloat16*>(state.data),
+            valid_columns.data == nullptr ? nullptr : static_cast<const int*>(valid_columns.data),
+            channels, columns, width);
         CUDA_CHECK(cudaGetLastError());
     }
 }
