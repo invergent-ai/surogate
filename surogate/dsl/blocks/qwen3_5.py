@@ -145,7 +145,7 @@ QWEN3_5_VL_MODEL_NAME_REMAP: dict[str, str] = {
 
 
 # ---- How a serving artifact stores these blocks -------------------------------
-# Shapes are written against the symbols `emit_inventory.geometry` resolves from
+# Shapes are written against the symbols `declaration.symbols_for` resolves from
 # the declaration, so a target of any size derives its own inventory. `quantised`
 # leaves the width to the export profile; norms are pinned because a norm is never
 # quantised, which is a property of the model rather than of an export.
@@ -156,10 +156,12 @@ _DENSE_NORM_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("post_attention_norm", "bf16", ("C",), ("ln2_weight",)),
 )
 
-#: The SwiGLU MLP. The declaration already fuses gate and up into one parameter,
-#: with `LoRATarget` offsets naming the halves, so this is a straight pass-through.
+#: The SwiGLU MLP. The declaration fuses gate and up into one parameter whose
+#: `LoRATarget`s name the halves — `up` first, then `gate` — and the artifact stores
+#: them the other way round, so the object names the halves in its own row order.
 _DENSE_MLP_OBJECTS: tuple[ServeObject, ...] = (
-    ServeObject("mlp/gate_up", "quantised", ("TwoM", "C"), ("mlp_up_weight",)),
+    ServeObject("mlp/gate_up", "quantised", ("TwoM", "C"),
+                ("mlp_up_weight.gate", "mlp_up_weight.up")),
     ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
 )
 

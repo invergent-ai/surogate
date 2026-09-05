@@ -63,6 +63,10 @@ class ServeObject:
     scope: Literal["block", "model"] = "block"
     #: What a target must implement to consume this object; see `ServeSection`.
     capability: str = "text"
+    #: The checkpoint tensor, relative to the section's `hf_prefix`, for an object the
+    #: training graph has no parameter for (a draft head's own norms and projection).
+    #: An object names either components or a source, never both.
+    source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,12 @@ class ServeSection:
     #: holding objects no binder consumes — so the section is declared and simply
     #: not exported for it.
     capability: str = "text"
+    #: Where the checkpoint keeps this section: `hf_prefix` roots its `source` objects,
+    #: `hf_layer` roots the block objects it replays (`mtp.layers.0` for a draft head's
+    #: decoder layer, `{index}` for a section that repeats), so their components resolve
+    #: through the same block mapping the text layers use.
+    hf_prefix: str = ""
+    hf_layer: str | None = None
 
 
 @dataclass(frozen=True)

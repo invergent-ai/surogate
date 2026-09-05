@@ -476,3 +476,91 @@ def test_attention_scale_prefers_the_declared_pre_attention_scalar(specs):
     # Absent, the head dim is what the model uses, and every other target relies
     # on exactly that.
     assert dense_spec(target_spec).attention_scale == pytest.approx(256.0**-0.5)
+
+
+# ---------------------------------------------------------------------------
+# The conversion recipe is derived from the declaration's own checkpoint mapping.
+# ---------------------------------------------------------------------------
+
+#: Targets whose recipes are derived from `hf_mapping` and `ServeObject.components`,
+#: with the checkpoint configs the derivation is checked against. `27b` has no config
+#: on this machine; the inventory's registered geometry stands in for it.
+DERIVED_RECIPE_TARGETS = (
+    ("qwen3_5", "hub:models--Qwen--Qwen3.5-0.8B"),
+    ("qwen3_5", "hub:models--Qwen--Qwen3.5-2B"),
+    ("qwen3_5", "hub:models--Qwen--Qwen3.5-4B"),
+    ("qwen3_5", "geometry:GEOMETRY_27B"),
+)
+
+
+def _derived_case(target, source):
+    import importlib
+    inventory = importlib.import_module(f"surogate.serve.convert.{target}.inventory")
+    recipe = importlib.import_module(f"surogate.serve.convert.{target}.recipe")
+    if source.startswith("geometry:"):
+        return inventory, recipe, getattr(inventory, source.split(":", 1)[1]), None, None
+    config_path = _resolve_source(source)
+    if config_path is None:
+        pytest.skip(f"no checkpoint config for {source}")
+    hf_config = json.loads(config_path.read_text())
+    return inventory, recipe, inventory.geometry_from_config(hf_config), hf_config, config_path.parent
+
+
+@pytest.mark.parametrize("target,source", DERIVED_RECIPE_TARGETS)
+def test_derived_recipes_cover_the_inventory_at_every_size(target, source):
+    """The recipes built from the declaration must name exactly the objects the
+    inventory lists, in its order, at the inventory's shapes — for the checkpoint in
+    hand and, when only a geometry is known, for the config that geometry implies."""
+    from surogate.serve.convert.common.recipe import validate_recipe_coverage
+    inventory, recipe, geometry, hf_config, _ = _derived_case(target, source)
+    specs = inventory.build_tensor_specs(geometry)
+    validate_recipe_coverage(recipe.build_recipes(geometry, hf_config=hf_config), specs)
+    if hf_config is not None:
+        validate_recipe_coverage(recipe.build_recipes(geometry), specs)
+
+
+@pytest.mark.parametrize("target,source", DERIVED_RECIPE_TARGETS[:3])
+def test_derived_recipes_read_tensors_the_checkpoint_has(target, source):
+    """Every source a derived recipe names must exist in the checkpoint's shard index,
+    at the shape the declaration gives it. The reader folds the official releases'
+    `model.language_model.` nesting onto the flat dialect the recipes are written in."""
+    from surogate.serve.convert.common.recipe import expression_sources
+    _, recipe, geometry, hf_config, model_dir = _derived_case(target, source)
+    index = model_dir / "model.safetensors.index.json"
+    if not index.exists():
+        pytest.skip("no shard index beside this config")
+    stored = set(json.loads(index.read_text())["weight_map"])
+    flat = {("model." + n[len("model.language_model."):]) if n.startswith("model.language_model.") else n
+            for n in stored}
+    wanted = {
+        s.name
+        for r in recipe.build_recipes(geometry, hf_config=hf_config)
+        if not r.object_name.startswith("vision/")
+        for s in expression_sources(r.expression)
+    }
+    missing = sorted(wanted - flat)
+    assert not missing, f"{target}: derived sources the checkpoint lacks: {missing[:6]}"
+
+
+def test_row_cut_names_the_parts_it_falls_on():
+    """Cutting a fused object on a component boundary must yield the components, not a
+    slice of their concatenation — that is what keeps a typed-apart export's recipes
+    readable and its GGUF repack a row gather rather than a dequantisation."""
+    from surogate.serve.convert.common.declaration import cut_rows, slice_rows
+    from surogate.serve.convert.common.recipe import Concat, Slice, SourceTensor, TensorRecipe
+    q, k, g, v = (SourceTensor(n, (rows, 8)) for n, rows in (("q", 4), ("k", 2), ("g", 4), ("v", 2)))
+    fused = Concat((q, k, g, v), 0)
+    assert slice_rows(fused, 0, 6) == Concat((q, k), 0)
+    assert slice_rows(fused, 6, 12) == Concat((g, v), 0)
+    assert slice_rows(fused, 0, 3) == Slice(q, 0, 0, 3)
+    assert slice_rows(fused, 5, 12) == Concat((Slice(k, 0, 1, 2), g, v), 0)
+    cut = cut_rows(
+        (TensorRecipe("text/layers/0/attention/qkgv", fused), TensorRecipe("mtp/layer/attention/qkgv", fused)),
+        {"attention/qkgv": (("attention/qk", 6), ("attention/gv", 6))},
+        prefix="text/layers/",
+    )
+    assert [r.object_name for r in cut] == [
+        "text/layers/0/attention/qk", "text/layers/0/attention/gv", "mtp/layer/attention/qkgv",
+    ]
+    with pytest.raises(ValueError):
+        cut_rows((TensorRecipe("x/attention/qkgv", fused),), {"attention/qkgv": (("attention/qk", 6),)})

@@ -168,6 +168,37 @@ def geometry_from_config(config) -> Geometry:
     )
 
 
+def hf_config_for(geometry: Geometry) -> dict:
+    """The `config.json` a checkpoint of these dimensions would carry, for callers that
+    have a geometry and no checkpoint — the recipes are derived from the declaration
+    compiled against a config, so the inverse of `geometry_from_config` is what lets
+    them be built for a registered size. The flat text architecture is used: recipes
+    are written in the flat dialect either way."""
+    return {
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": geometry.model_type or "qwen3_5",
+        "hidden_size": geometry.hidden,
+        "num_hidden_layers": geometry.layers,
+        "intermediate_size": geometry.intermediate,
+        "vocab_size": geometry.vocab,
+        "num_attention_heads": geometry.query_heads,
+        "num_key_value_heads": geometry.kv_heads,
+        "head_dim": geometry.head_dim,
+        "linear_num_key_heads": geometry.gdn_key_heads,
+        "linear_key_head_dim": geometry.gdn_key_head_dim,
+        "linear_num_value_heads": geometry.gdn_value_heads,
+        "linear_value_head_dim": geometry.gdn_value_head_dim,
+        "linear_conv_kernel_dim": geometry.gdn_conv_kernel,
+        "full_attention_interval": geometry.full_attention_interval,
+        "layer_types": [
+            "full_attention" if layer in set(geometry.full_attention_layers) else "linear_attention"
+            for layer in range(geometry.layers)
+        ],
+        # The smaller sizes tie the output head to the embedding; the 27B ships its own.
+        "tie_word_embeddings": not is_27b(geometry),
+    }
+
+
 #: GGUF architecture strings this family is exported under, and the `model_type` each means.
 #: 3.5 and 3.6 share one string; 3.8 has its own, which is the only thing that tells it from
 #: the 3.6 at the same dimensions.

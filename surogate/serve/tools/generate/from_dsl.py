@@ -26,11 +26,21 @@ from a production incident.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
 from target_spec import AttentionSpec, LinearAttentionSpec, LoraSlice, ParamSpec, TargetSpec
+
+# Reading the declaration — compiling it for a config, the runtime config, the model
+# class behind an architecture — is owned by the converter package, which derives the
+# artifact inventory and the conversion recipes from the same reading. The names below
+# are kept so the emitters and their tests keep one import.
+from surogate.serve.convert.common.declaration import (  # noqa: E402
+    compile_ir as _compile,
+    ir_config as _config,
+    ir_module as _module,
+    model_class,
+)
 
 #: Quantities the declaration does not derive — read verbatim from the
 #: checkpoint config. Keep this list short and explicit: every entry is a place
@@ -38,27 +48,6 @@ from target_spec import AttentionSpec, LinearAttentionSpec, LoraSlice, ParamSpec
 CONFIG_PASSTHROUGH = ("rope_theta",)
 
 _LAYER_INDEX = re.compile(r"blocks\[(\d+)\]\.(.+)")
-
-
-def _compile(architecture: str, hf_config: dict[str, Any]) -> dict[str, Any]:
-    from surogate.dsl.py_compiler import compile_model_for_hf
-
-    raw = compile_model_for_hf(architecture, hf_config)
-    ir = json.loads(raw) if isinstance(raw, str) else raw
-    if not ir.get("success"):
-        raise ValueError(f"DSL compilation failed for {architecture}: {ir.get('errors')}")
-    return ir
-
-
-def _module(ir: dict[str, Any]) -> dict[str, Any]:
-    modules = ir.get("modules") or []
-    if not modules:
-        raise ValueError("DSL IR carries no modules")
-    return modules[0]
-
-
-def _config(ir: dict[str, Any]) -> dict[str, Any]:
-    return ir.get("config") or (_module(ir).get("config") or {})
 
 
 def _nested(config: dict[str, Any], dotted: str) -> Any:
@@ -110,27 +99,6 @@ def _hf_name(hf_mapping: dict[str, Any], dsl_name: str) -> str | None:
         if isinstance(template, str):
             return template.replace("{layer}", layer)
     return None
-
-
-def model_class(architecture: str) -> Any:
-    """The declared model class behind an architecture string.
-
-    The IR is a projection of the declaration and does not carry its hooks, so
-    every consumer that needs one (the artifact inventory, the window schedule)
-    has to come back to the class. One lookup, here, rather than one per
-    consumer.
-    """
-
-    from surogate.dsl.decorators import _model_registry  # noqa: PLC2701 - one contract
-
-    spec = next(
-        (s for s in _model_registry.values()
-         if s.hf_config and architecture in (s.hf_config.architecture, s.hf_config.model_type)),
-        None,
-    )
-    if spec is None or not getattr(spec, "_nn_model_class", None):
-        raise ValueError(f"no DSL model registered for {architecture}")
-    return spec._nn_model_class  # noqa: SLF001
 
 
 def window_schedule(architecture: str, config: dict[str, Any]) -> tuple[bool, ...]:

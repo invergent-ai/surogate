@@ -119,18 +119,32 @@ product rather than tasks (1 and 6); the rest are work.
    of the int8 tile itself, fixed here: its activation planes carried the raw Σx and now
    carry d·Σq, matching the GEMV route (real-tensor error 1.25e-2 -> 1.77e-3 relative).
 
-3. **[ ] Unify weight loading with the trainer, still true but smaller than it
-   was (checked 2026-09-03).** Serve's `recipe.py` + `inventory.py` per target
-   restate what the trainer's declarations in `surogate/dsl/models/` already say.
-   Both sides describe the same nineteen architectures: the DSL has `qwen3.py`,
-   `qwen3_5.py`, `llama.py`, `gemma3.py` and fifteen more, and serve has a recipe
-   per converter — 4,468 lines of them.
-   The remaining duplication is smaller than it was. The recipes no longer
-   restate *dimensions*, because the artifact carries them and the binder
-   validates against them; what they still restate is the *mapping* — which
-   checkpoint tensor becomes which artifact object, and how fused objects are
-   assembled. That is the part worth unifying, and the part `hf_mapping` already
-   spells out.
+3. **[~] Unify weight loading with the trainer: the mapping is derived now, for
+   the first family (2026-09-05).** The recipes no longer restate *dimensions*
+   (the artifact carries them) and, for Qwen3.5, no longer restate the *mapping*
+   either: `surogate/serve/convert/common/declaration.py` reads the declaration —
+   `hf_mapping` for where every parameter lives in the checkpoint,
+   `ServeObject.components` for which parameters each artifact object is built
+   from, in row order — and derives the recipe. A component is a parameter or
+   `param.slice`, a LoRA target name, which is how `mlp/gate_up` is spelled
+   `gate | up` where the trainer's fused parameter is `up | gate` (that "straight
+   pass-through" was never one). The MTP section says where the checkpoint keeps
+   it (`hf_prefix`, `hf_layer`) and replays the attention block's objects through
+   the same mapping. What the converter still states is exactly what the
+   declaration does not describe: the 27B storage cut (a row cut on the derived
+   fused object, `cut_rows`, folded so it names the parts), the draft head's
+   ranking policy, and the vision tower. `qwen3_5/recipe.py`: 358 → 160 lines.
+   - Proven by regeneration: derived recipes equal the committed hand-written ones
+     expression for expression, in inventory order, for the 0.8B/2B/4B configs (with
+     and without the checkpoint config in hand), the registered 2B, the 27B and the
+     3.8. Then gated: 0.8B Q4_K_M through the re-derived repack plan 15.031 vs
+     llama.cpp 15.025; 0.8B HF→W8 artifact 14.78 (BF16 torch reference 14.60).
+   - The next targets, and why each is not a mechanical repeat: `qwen3` declares no
+     serve objects yet; `gemma3`'s declared `attention/query` does not assemble to
+     its own shape from its components (the derivation is the check that found it);
+     the MoE families map experts with `stack_experts`, which the derivation refuses
+     rather than guesses at; `qwen4exp`'s recipes are written against GGUF names, a
+     different dialect from `hf_mapping`.
 4. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.
