@@ -138,6 +138,27 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "HcCount": config.get("hc_count", 0),
         "HcWidth": config.get("hc_count", 0) * hidden,
         "HcLowRank": config.get("hc_lowrank", 0),
+        # The mixing matrix a hyper-connected block learns, as wide as the streams it mixes.
+        "HcMix": config.get("hc_mix", 0),
+        # Kimi Delta Attention, the linear mixer GLM-5.3 runs where the other hybrids run a
+        # gated delta net. Its projections are per head like theirs, but the decay is a
+        # low-rank pair through a head-width bottleneck rather than a scalar per head, so the
+        # geometry needs both widths.
+        "KdaHeads": config.get("linear_num_heads", 0),
+        "KdaHeadDim": config.get("linear_head_dim", 0),
+        "KdaDim": config.get("linear_num_heads", 0) * config.get("linear_head_dim", 0),
+        # q, k and v share one projection and one depthwise convolution.
+        "KdaConvDim": 3 * config.get("linear_num_heads", 0) * config.get("linear_head_dim", 0),
+        "KdaConvK": config.get("linear_conv_kernel_dim", 0),
+        # Multi-head latent attention: the query and key/value low ranks, the query rows they
+        # expand to, and the value width the output projection reads.
+        "QRank": config.get("q_lora_rank", 0),
+        "KVRank": config.get("kv_lora_rank", 0),
+        "QDim": config["num_query_heads"] * (config.get("qk_nope_head_dim", 0)
+                                             + config.get("qk_rope_head_dim", 0)),
+        "VDim": config["num_query_heads"] * config.get("v_head_dim", 0),
+        "KVBDim": config["num_query_heads"] * (config.get("qk_nope_head_dim", 0)
+                                               + config.get("v_head_dim", 0)),
         "Hv": heads_v,
         "TwoHv": 2 * heads_v,
         "Vd": dim_v,
