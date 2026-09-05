@@ -5,8 +5,11 @@ touches it. A model trained here has no published GGUF, and this is the step tha
 
     surogate sft ...                                   # a LoRA checkpoint
     surogate merge --base-model B --checkpoint-dir C --output merged
-    surogate quantize --model merged --output model.gguf --type q4_k_m
+    surogate quantize --model merged --output model.gguf   # q8_0 unless told otherwise
     surogate serve model.gguf
+
+`--type q4_k_m` halves the file and is the better artifact; `q8_0` is the default because it
+quantises in seconds and needs no judgement about a mixture. See `DEFAULT_TYPE`.
 
 Two facts shape the implementation. The quantisation arithmetic is llama.cpp's, because every
 published GGUF was made with it and because the reference K-quant encoders exist nowhere else:
@@ -39,6 +42,24 @@ COMMON_TYPES = (
     "q2_k", "q3_k_s", "q3_k_m", "q3_k_l", "q4_k_s", "q4_k_m",
     "q5_k_s", "q5_k_m", "q6_k", "q8_0", "bf16", "f16", "f32",
 )
+
+#: What you get for asking for nothing.
+#:
+#: Q8_0 is one scale per 32 values and no mixture to compute, so it quantises in seconds where
+#: a K-quant runs llama.cpp's per-tensor recipe. That matters because the command sits at the
+#: end of a training loop: somebody has just finished a run and wants a file to serve, and a
+#: default that makes them wait is a default they will work around. It is also the safest
+#: answer -- at eight bits the choice of mixture stops mattering, which is the part a default
+#: cannot make well on the user's behalf.
+#:
+#: `q4_k_m` is the better artifact and it is one flag away: half the bytes, and measured on
+#: Qwen3.5-0.8B it scores 14.9559 against llama-perplexity's own 14.9713 on the same file, and
+#: better than the published Q4_K_M of that model. Ask for it when the file is going somewhere
+#: rather than straight back into a serve.
+#:
+#: unsloth reaches the same default by the same reasoning: their `fast_quantized`, which is
+#: what `save_pretrained_gguf` uses when nobody says otherwise, resolves to q8_0.
+DEFAULT_TYPE = "q8_0"
 
 # Where the quantiser lives once the build has installed it. `surogate quantize` needs three
 # things at run time -- the binary, the Hugging-Face-to-GGUF converter, and the `gguf` library
@@ -76,8 +97,8 @@ def prepare_command_parser(parser=None):
     parser.add_argument("--output", required=True, help="Output .gguf path")
     parser.add_argument(
         "--type",
-        default="q4_k_m",
-        help=f"Quantization type, default q4_k_m. Common: {', '.join(COMMON_TYPES)}",
+        default=DEFAULT_TYPE,
+        help=f"Quantization type, default {DEFAULT_TYPE}. Common: {', '.join(COMMON_TYPES)}",
     )
     parser.add_argument(
         "--threads", type=int, default=None, help="Quantizer threads, default the CPU count"

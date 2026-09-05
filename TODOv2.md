@@ -119,6 +119,15 @@ block at Q4_K; the engine serves it at 798 tok/s and scores **14.9559** against
 llama-perplexity's 14.9713 on the same file, and against the published Q4_K_M's
 15.031. A full-precision source and llama.cpp's own mixture beat the download.
 
+**The default is `q8_0`** (2026-09-05), which is what `surogate quantize` produces
+when nobody names a type. Q8_0 is one scale per 32 values and no mixture to
+compute, so it finishes in seconds — 3.4 s on the 0.8B against ~6 s for `q4_k_m` —
+and at eight bits the choice of mixture stops mattering, which is the judgement a
+default cannot make on someone's behalf. The command sits at the end of a training
+run, where a wait is a reason to work around it. `--type q4_k_m` halves the file
+and is the better artifact; it is one flag away. unsloth reaches the same default
+by the same reasoning: their `fast_quantized` resolves to `q8_0`.
+
 **Tested on three checkpoints across two architectures (2026-09-05)**, each
 quantised with our own command and served:
 
