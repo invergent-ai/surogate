@@ -425,7 +425,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 plan.geometry, plan.weights_profile, phase, first, last));
             return;
         }
-        (void)workspace_recipe::gdn_control(layout, plan.geometry, last);
+        (void)workspace_recipe::gdn_control(layout, plan.geometry, last, schedule::kLinearMixer);
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(plan.geometry, first, last));
         (void)workspace_recipe::gdn_projection(layout, plan.geometry, last);
         if (path == GdnWorkspacePath::Snapshot) {

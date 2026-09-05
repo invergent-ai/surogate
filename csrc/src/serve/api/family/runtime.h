@@ -30,7 +30,18 @@ namespace sinfer::family {
 enum class LinearMixer : std::uint8_t {
     GatedDelta,
     ShortConv,
+    /// Kimi Delta Attention: the gated delta net's recurrence with the forget gate per key
+    /// channel rather than per head. Everything around it -- the fused q|k|v, the causal
+    /// convolution, the gated output norm, the output projection -- is the delta net's, so a
+    /// target that runs it takes the same leaves and only the gate is wider.
+    KimiDelta,
 };
+
+/// Whether a mixer's forget gate is one value per value head or one per key channel of it.
+/// The control projection writes that many rows and the recurrence reads them.
+[[nodiscard]] constexpr bool linear_mixer_gate_is_per_channel(LinearMixer mixer) noexcept {
+    return mixer == LinearMixer::KimiDelta;
+}
 
 enum class TextPhase {
     Prefill,

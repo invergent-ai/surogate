@@ -8,7 +8,9 @@
 #include <api/family/text_geometry.h>
 
 #include "api/ops/embedding.h"
+#include "api/ops/gated_delta_net.h"
 #include "api/ops/gated_rmsnorm.h"
+#include "api/ops/kimi_delta_net.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/scale.h"
 #include "core/arena.h"
@@ -156,6 +158,23 @@ template <class Variant>
     }
 }
 
+/// Whether the attention rotates its queries and keys.
+///
+/// Every model the family had served does, so nothing declared it. GLM-5.3's latent attention
+/// is the NoPE variant -- its checkpoint states `rope.dimension_count` 0 and carries no rotary
+/// split at all -- and rotating it by a zero-width rotation is not what "no rotary" means; the
+/// step is skipped. A target that says nothing keeps the rotation it always had, and a target
+/// with an unset `rotary_dim` still reaches `ops::rope` and is refused there, which is the
+/// difference between declaring this and testing the width.
+template <class Variant>
+[[nodiscard]] constexpr bool applies_rotary() {
+    if constexpr (requires { Variant::applies_rotary; }) {
+        return Variant::applies_rotary;
+    } else {
+        return true;
+    }
+}
+
 /// Debug probe for parity work: a variant may observe intermediate tensors of the family's
 /// layer loop by tag (the default is a no-op that compiles away).
 template <class Variant>
@@ -211,6 +230,66 @@ template <class Variant>
         return Variant::linear_mixer;
     } else {
         return family::LinearMixer::GatedDelta;
+    }
+}
+
+/// The forget gate as the mixer's recurrence reads it: one value per value head, or one per key
+/// channel of every head. It is the same buffer either way -- the control projection wrote as
+/// many rows as the mixer asks for -- so only the view differs.
+template <class Variant>
+[[nodiscard]] inline Tensor linear_gate_view(const Tensor& gate, std::int32_t value_head_dim,
+                                             std::int32_t value_heads, std::int32_t width) {
+    if constexpr (family::linear_mixer_gate_is_per_channel(linear_mixer<Variant>())) {
+        return gate.view({value_head_dim, value_heads, width});
+    } else {
+        (void)value_head_dim;
+        return gate.view({value_heads, width});
+    }
+}
+
+template <class Variant>
+[[nodiscard]] inline Tensor linear_gate_view(const Tensor& gate, std::int32_t value_head_dim,
+                                             std::int32_t value_heads, std::int32_t width,
+                                             std::int32_t batch) {
+    if constexpr (family::linear_mixer_gate_is_per_channel(linear_mixer<Variant>())) {
+        return gate.view({value_head_dim, value_heads, width, batch});
+    } else {
+        (void)value_head_dim;
+        return gate.view({value_heads, width, batch});
+    }
+}
+
+/// The mixer's recurrence over one sequence, reading and writing its own state.
+template <class Variant>
+inline void linear_recurrence(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                              const Tensor& beta, float scale, WorkspaceArena& work,
+                              Tensor& state, Tensor& out, cudaStream_t stream) {
+    if constexpr (linear_mixer<Variant>() == family::LinearMixer::KimiDelta) {
+        (void)work;
+        ops::kimi_delta_net(q, k, v, g, beta, scale, /*normalize_qk=*/true, state, out, stream);
+    } else {
+        ops::gated_delta_net(q, k, v, g, beta, scale, /*normalize_qk=*/true, work, state, out,
+                             stream);
+    }
+}
+
+/// The mixer's recurrence over B independent lanes, checkpointing after every valid column.
+/// This is the shape an ordinary decode round has, so a mixer without it cannot decode.
+template <class Variant>
+inline void linear_recurrence_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
+                                       const Tensor& g, const Tensor& beta, float scale,
+                                       Tensor& states, const Tensor& valid_columns,
+                                       const Tensor& initial_state_slots,
+                                       const Tensor& snapshot_base_slots, Tensor& out,
+                                       cudaStream_t stream) {
+    if constexpr (linear_mixer<Variant>() == family::LinearMixer::KimiDelta) {
+        ops::kimi_delta_net_snapshot(q, k, v, g, beta, scale, /*normalize_qk=*/true, states,
+                                     valid_columns, initial_state_slots, snapshot_base_slots, out,
+                                     stream);
+    } else {
+        ops::gated_delta_net_snapshot(q, k, v, g, beta, scale, /*normalize_qk=*/true, states,
+                                      valid_columns, initial_state_slots, snapshot_base_slots, out,
+                                      stream);
     }
 }
 

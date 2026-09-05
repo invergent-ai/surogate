@@ -408,7 +408,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rmsnorm(q, *mtp_.q_norm, cfg_.rms_eps, true, qn, s);
     ops::rmsnorm(k, *mtp_.k_norm, cfg_.rms_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, cfg_.rotary_dim, cfg_.rope_theta, qn, kn, s);
+    if constexpr (applies_rotary<Variant>()) {
+        ops::rope(rope_for_op, cfg_.rotary_dim, cfg_.rope_theta, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({cfg_.head_dim, cfg_.n_q, T});
     if (active_sequence_batch_ != 0) {
@@ -590,7 +592,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor v  = v_flat.view({cfg_.head_dim, cfg_.n_kv, T});
         Tensor kn = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, cfg_.rms_eps, true, kn, s);
-        ops::rope(rope_positions, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
+        if constexpr (applies_rotary<Variant>()) {
+            ops::rope(rope_positions, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
+        }
         ops::gqa_kv_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
@@ -630,7 +634,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
         }
-        ops::rope(last_rope_position, cfg_.rotary_dim, cfg_.rope_theta, qn, s);
+        if constexpr (applies_rotary<Variant>()) {
+            ops::rope(last_rope_position, cfg_.rotary_dim, cfg_.rope_theta, qn, s);
+        }
 
         Tensor a = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
         ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
@@ -1100,7 +1106,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn, s);
+    if constexpr (applies_rotary<Variant>()) {
+        ops::rope(rope_for_op, cfg_.rotary_dim,
+                  layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn, s);
+    }
     debug_probe<Variant>("q_post_rope", qn.view({cfg_.q_size, T}), s);
     debug_probe<Variant>("k_post_rope", kn.view({cfg_.kv_size, T}), s);
 
@@ -1375,7 +1384,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     };
     if (sub_timing) { cudaEventRecord(ftimer.sub_begin, s); }
 
-    const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), T);
+    const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), T, kLinearMixer);
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
@@ -1464,29 +1473,41 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor k_batch =
             k_recurrent.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, width, active_sequence_batch_});
         Tensor v_batch = vv.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, width, active_sequence_batch_});
-        Tensor g_batch = g.view({cfg_.gdn_v_heads, width, active_sequence_batch_});
+        Tensor g_batch    = family::detail::linear_gate_view<Variant>(
+            g, cfg_.gdn_v_dim, cfg_.gdn_v_heads, width, active_sequence_batch_);
         Tensor beta_batch = beta.view({cfg_.gdn_v_heads, width, active_sequence_batch_});
         Tensor out_batch =
             o.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
-                                               kGdnScale, recurrent_states, valid,
-                                               *active_linear_state_slots_, records.key,
-                                               records.value, records.gate, out_batch, s);
+            if constexpr (kLinearMixer != family::LinearMixer::GatedDelta) {
+                // Replay-record exists so a speculative round can be re-folded from the tokens
+                // it accepted. Only the delta net has that form; a target whose mixer is
+                // another one reaches this only by having been given a draft head it cannot
+                // verify, and saying so beats recording the wrong recurrence.
+                throw std::logic_error(
+                    "this target's linear mixer has no replay-record form, so it cannot verify "
+                    "a speculative round");
+            } else {
+                GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+                ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
+                                                   kGdnScale, recurrent_states, valid,
+                                                   *active_linear_state_slots_, records.key,
+                                                   records.value, records.gate, out_batch, s);
+            }
         } else {
-            ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
-                                          /*normalize_qk=*/true, recurrent_states, valid,
-                                          *active_linear_state_slots_, *active_linear_state_slots_,
-                                          out_batch, s);
+            family::detail::linear_recurrence_snapshot<Variant>(
+                q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,
+                *active_linear_state_slots_, *active_linear_state_slots_, out_batch, s);
         }
     } else {
         Tensor recurrent_state =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
         debug_probe<Variant>("gdn_recurrent_state_in", recurrent_state, s);
-        ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                             /*normalize_qk=*/true, work_, recurrent_state, o, s);
+        family::detail::linear_recurrence<Variant>(
+            q_recurrent, k_recurrent, vv,
+            family::detail::linear_gate_view<Variant>(g, cfg_.gdn_v_dim, cfg_.gdn_v_heads, T), beta,
+            kGdnScale, work_, recurrent_state, o, s);
         debug_probe<Variant>("gdn_o", o, s);
     }
 
@@ -2002,8 +2023,10 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                    sizeof(std::int32_t),
                                                cudaMemcpyDeviceToDevice, s));
                 }
-                ops::rope(rope_all, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn,
-                          s);
+                if constexpr (applies_rotary<Variant>()) {
+                    ops::rope(rope_all, cfg_.rotary_dim,
+                              layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn, s);
+                }
                 // A windowed layer looks at fewer keys than the round is sized for;
                 // see layer_sliding_window() in residual_policy.h.
                 const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer, weights_.geometry);
@@ -2084,7 +2107,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             } else {
                 auto mixer_scope   = work_.scope();
                 if (timing) { cudaEventRecord(timer.begin, s); }
-                const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), total);
+                const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), total, kLinearMixer);
                 Tensor h           = control.hidden;
                 Tensor g           = control.g;
                 Tensor beta        = control.beta;
@@ -2147,14 +2170,15 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     Tensor qa = q_recurrent.slice(2, off, len);
                     Tensor ka = k_recurrent.slice(2, off, len);
                     Tensor va = vv.slice(2, off, len);
-                    Tensor ga = g.slice(1, off, len);
+                    Tensor ga = family::detail::linear_gate_view<Variant>(
+                        g.slice(1, off, len), cfg_.gdn_v_dim, cfg_.gdn_v_heads, len);
                     Tensor ba = beta.slice(1, off, len);
                     Tensor oa = o.slice(2, off, len);
                     Tensor recurrent_state = state_.recurrent_slot(
                         static_cast<std::uint32_t>(gidx),
                         static_cast<std::uint32_t>(segments[sg].state_slot));
-                    ops::gated_delta_net(qa, ka, va, ga, ba, kGdnScale, true, work_,
-                                         recurrent_state, oa, s);
+                    family::detail::linear_recurrence<Variant>(qa, ka, va, ga, ba, kGdnScale,
+                                                              work_, recurrent_state, oa, s);
                     }
                 }
                 if (batch > 0) {
@@ -2164,13 +2188,15 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                     .view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, 1, batch});
                     Tensor vb = vv.slice(2, prefill_cols, batch)
                                     .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1, batch});
-                    Tensor gb = g.slice(1, prefill_cols, batch).view({cfg_.gdn_v_heads, 1, batch});
+                    Tensor gb = family::detail::linear_gate_view<Variant>(
+                        g.slice(1, prefill_cols, batch), cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1,
+                        batch);
                     Tensor bb =
                         beta.slice(1, prefill_cols, batch).view({cfg_.gdn_v_heads, 1, batch});
                     Tensor ob = o.slice(2, prefill_cols, batch)
                                     .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1, batch});
-                    ops::gated_delta_net_snapshot(
-                        qb, kb, vb, gb, bb, kGdnScale, true,
+                    family::detail::linear_recurrence_snapshot<Variant>(
+                        qb, kb, vb, gb, bb, kGdnScale,
                         state_.recurrent.at(static_cast<std::size_t>(gidx)), Tensor{},
                         decode.linear_state_slots, decode.linear_state_slots, ob, s);
                 }
@@ -2457,8 +2483,10 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                                    sizeof(std::int32_t),
                                                cudaMemcpyDeviceToDevice, s));
                 }
-                ops::rope(rope_all, cfg_.rotary_dim, layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn,
-                          s);
+                if constexpr (applies_rotary<Variant>()) {
+                    ops::rope(rope_all, cfg_.rotary_dim,
+                              layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn, s);
+                }
                 // A windowed layer looks at fewer keys than the round is sized for;
                 // see layer_sliding_window() in residual_policy.h.
                 const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer, weights_.geometry);
@@ -2525,7 +2553,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                      prefill_cols, batch, valid, decode.linear_state_slots);
             } else {
                 auto mixer_scope   = work_.scope();
-                const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), total);
+                const auto control = workspace_recipe::gdn_control(work_, cfg_geometry(), total, kLinearMixer);
                 Tensor h           = control.hidden;
                 Tensor g           = control.g;
                 Tensor beta        = control.beta;
@@ -2581,14 +2609,16 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     Tensor qa = q_recurrent.slice(2, 0, prefill_cols);
                     Tensor ka = k_recurrent.slice(2, 0, prefill_cols);
                     Tensor va = vv.slice(2, 0, prefill_cols);
-                    Tensor ga = g.slice(1, 0, prefill_cols);
+                    Tensor ga = family::detail::linear_gate_view<Variant>(
+                        g.slice(1, 0, prefill_cols), cfg_.gdn_v_dim, cfg_.gdn_v_heads,
+                        prefill_cols);
                     Tensor ba = beta.slice(1, 0, prefill_cols);
                     Tensor oa = o.slice(2, 0, prefill_cols);
                     Tensor recurrent_state =
                         state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
                                               linear_state_current_slot_);
-                    ops::gated_delta_net(qa, ka, va, ga, ba, kGdnScale, true, work_,
-                                         recurrent_state, oa, s);
+                    family::detail::linear_recurrence<Variant>(qa, ka, va, ga, ba, kGdnScale,
+                                                              work_, recurrent_state, oa, s);
                 }
                 if (batch > 0) {
                     Tensor qb = q_recurrent.slice(2, prefill_cols, batch)
@@ -2597,13 +2627,15 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                     .view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, 1, batch});
                     Tensor vb = vv.slice(2, prefill_cols, batch)
                                     .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1, batch});
-                    Tensor gb = g.slice(1, prefill_cols, batch).view({cfg_.gdn_v_heads, 1, batch});
+                    Tensor gb = family::detail::linear_gate_view<Variant>(
+                        g.slice(1, prefill_cols, batch), cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1,
+                        batch);
                     Tensor bb =
                         beta.slice(1, prefill_cols, batch).view({cfg_.gdn_v_heads, 1, batch});
                     Tensor ob = o.slice(2, prefill_cols, batch)
                                     .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1, batch});
-                    ops::gated_delta_net_snapshot(
-                        qb, kb, vb, gb, bb, kGdnScale, true,
+                    family::detail::linear_recurrence_snapshot<Variant>(
+                        qb, kb, vb, gb, bb, kGdnScale,
                         state_.recurrent.at(static_cast<std::size_t>(gidx)), Tensor{},
                         decode.linear_state_slots, decode.linear_state_slots, ob, s);
                 }

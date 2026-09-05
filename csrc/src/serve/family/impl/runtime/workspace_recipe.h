@@ -91,11 +91,21 @@ struct GdnControlRoots {
     Tensor beta;
 };
 
+/// The forget gate's rows. One per value head for the delta net; one per key channel of every
+/// head for Kimi Delta Attention, which is the whole difference between the two recurrences and
+/// therefore between the two control projections.
+[[nodiscard]] constexpr std::int32_t gdn_gate_rows(const family::TextGeometry& geometry,
+                                                   family::LinearMixer mixer) {
+    return family::linear_mixer_gate_is_per_channel(mixer) ? geometry.value_dim()
+                                                           : geometry.gdn_value_heads;
+}
+
 template <class Allocator>
-GdnControlRoots gdn_control(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+GdnControlRoots gdn_control(Allocator& allocator, const family::TextGeometry& geometry,
+                            std::int32_t tokens, family::LinearMixer mixer) {
     return {
         matrix(allocator, DType::BF16, geometry.hidden, tokens),
-        matrix(allocator, DType::FP32, geometry.gdn_value_heads, tokens),
+        matrix(allocator, DType::FP32, gdn_gate_rows(geometry, mixer), tokens),
         matrix(allocator, DType::FP32, geometry.gdn_value_heads, tokens),
     };
 }
