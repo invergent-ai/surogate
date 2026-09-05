@@ -45,7 +45,8 @@ namespace sinfer::ops::detail {
     constexpr int kPaths                  = kGeometry.paths();                         \
     constexpr SparseMoeGating kGating     = kGeometry.gating;                          \
     constexpr float kRoutedScale          = kGeometry.routed_scale;                    \
-    constexpr bool kSharedGated           = kGeometry.shared_gated;
+    constexpr bool kSharedGated           = kGeometry.shared_gated;                    \
+    constexpr float kSwigluLimit          = kGeometry.swiglu_limit;
 
 namespace geometry_qwen36 {
 SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen36Geometry)
@@ -62,6 +63,11 @@ SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen3MoeGeometry)
 #include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
 } // namespace geometry_qwen3_moe
 
+namespace geometry_glm53 {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeGlm53Geometry)
+#include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
+} // namespace geometry_glm53
+
 void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                                const SparseMoeWeights& weights, Tensor& destination,
                                const SparseMoePrefillPlan& plan,
@@ -77,6 +83,10 @@ void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& 
     }
     if (geometry == kSparseMoeQwen3MoeGeometry) {
         geometry_qwen3_moe::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeGlm53Geometry) {
+        geometry_glm53::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled prefill kernels");

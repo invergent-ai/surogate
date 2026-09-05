@@ -513,15 +513,15 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
                     const int local_col1 = local_col0 + 1;
                     if (local_col0 < cols) {
                         activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                            __float2bfloat16_rn(silu(acc[mi][ni][0]) * acc[mi + 2][ni][0]);
+                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][0], acc[mi + 2][ni][0], kSwigluLimit));
                         activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                            __float2bfloat16_rn(silu(acc[mi][ni][2]) * acc[mi + 2][ni][2]);
+                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][2], acc[mi + 2][ni][2], kSwigluLimit));
                     }
                     if (local_col1 < cols) {
                         activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                            __float2bfloat16_rn(silu(acc[mi][ni][1]) * acc[mi + 2][ni][1]);
+                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][1], acc[mi + 2][ni][1], kSwigluLimit));
                         activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                            __float2bfloat16_rn(silu(acc[mi][ni][3]) * acc[mi + 2][ni][3]);
+                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][3], acc[mi + 2][ni][3], kSwigluLimit));
                     }
                 }
             }
@@ -713,15 +713,15 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
                 const int local_col1 = local_col0 + 1;
                 if (local_col0 < cols) {
                     activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                        __float2bfloat16_rn(silu(acc[mi][0]) * acc[mi + 2][0]);
+                        __float2bfloat16_rn(swiglu_clamped(acc[mi][0], acc[mi + 2][0], kSwigluLimit));
                     activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                        __float2bfloat16_rn(silu(acc[mi][2]) * acc[mi + 2][2]);
+                        __float2bfloat16_rn(swiglu_clamped(acc[mi][2], acc[mi + 2][2], kSwigluLimit));
                 }
                 if (local_col1 < cols) {
                     activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                        __float2bfloat16_rn(silu(acc[mi][1]) * acc[mi + 2][1]);
+                        __float2bfloat16_rn(swiglu_clamped(acc[mi][1], acc[mi + 2][1], kSwigluLimit));
                     activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                        __float2bfloat16_rn(silu(acc[mi][3]) * acc[mi + 2][3]);
+                        __float2bfloat16_rn(swiglu_clamped(acc[mi][3], acc[mi + 2][3], kSwigluLimit));
                 }
             }
         }
@@ -929,15 +929,15 @@ sparse_moe_prefill_ggml_gate_up_kernel(
                     const int local_col1 = local_col0 + 1;
                     if (local_col0 < cols) {
                         activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                            __float2bfloat16_rn(silu(acc[mi][ni][0]) * acc[mi + 2][ni][0]);
+                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][0], acc[mi + 2][ni][0], kSwigluLimit));
                         activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                            __float2bfloat16_rn(silu(acc[mi][ni][2]) * acc[mi + 2][ni][2]);
+                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][2], acc[mi + 2][ni][2], kSwigluLimit));
                     }
                     if (local_col1 < cols) {
                         activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                            __float2bfloat16_rn(silu(acc[mi][ni][1]) * acc[mi + 2][ni][1]);
+                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][1], acc[mi + 2][ni][1], kSwigluLimit));
                         activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                            __float2bfloat16_rn(silu(acc[mi][ni][3]) * acc[mi + 2][ni][3]);
+                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][3], acc[mi + 2][ni][3], kSwigluLimit));
                     }
                 }
             }
@@ -1193,15 +1193,15 @@ sparse_moe_prefill_ggml_i8_gate_up_kernel(
                 const int col1       = col0 + 1;
                 if (local_col0 < cols) {
                     activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                        __float2bfloat16_rn(silu(acc[mi][0]) * acc[mi + 2][0]);
+                        __float2bfloat16_rn(swiglu_clamped(acc[mi][0], acc[mi + 2][0], kSwigluLimit));
                     activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                        __float2bfloat16_rn(silu(acc[mi][2]) * acc[mi + 2][2]);
+                        __float2bfloat16_rn(swiglu_clamped(acc[mi][2], acc[mi + 2][2], kSwigluLimit));
                 }
                 if (local_col1 < cols) {
                     activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                        __float2bfloat16_rn(silu(acc[mi][1]) * acc[mi + 2][1]);
+                        __float2bfloat16_rn(swiglu_clamped(acc[mi][1], acc[mi + 2][1], kSwigluLimit));
                     activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                        __float2bfloat16_rn(silu(acc[mi][3]) * acc[mi + 2][3]);
+                        __float2bfloat16_rn(swiglu_clamped(acc[mi][3], acc[mi + 2][3], kSwigluLimit));
                 }
             }
         }

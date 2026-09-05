@@ -12,6 +12,20 @@ namespace sinfer::ops {
 
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
+/// SwiGLU with the clamp a checkpoint may have been trained under.
+///
+/// GLM-5.3 bounds both halves before the product -- the gate from above only, the linear half
+/// from both sides -- so a value that saturated in training saturates here too. `limit <= 0`
+/// is the unclamped product every other mixture computes, and compiles to exactly that when
+/// the limit is a compile-time constant.
+__device__ __forceinline__ float swiglu_clamped(float gate, float up, float limit) {
+    if (limit > 0.0f) {
+        gate = fminf(gate, limit);
+        up   = fminf(fmaxf(up, -limit), limit);
+    }
+    return silu(gate) * up;
+}
+
 __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 __device__ __forceinline__ float softplus(float x) { return (x > 20.0f) ? x : log1pf(expf(x)); }

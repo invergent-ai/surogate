@@ -115,33 +115,42 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     out.route_job_columns             = arena.alloc(DType::I32, {max_route_jobs}, 256);
     out.route_job_count               = arena.alloc(DType::I32, {1}, 256);
 
-    // Lifetime unions must hold both tenants; the per-token byte counts are checked here so a
-    // new geometry cannot silently overrun them. The score storage's second tenant is the
-    // shared expert's activation, so a mixture without one has only a single tenant there and
-    // nothing to check -- and nothing to hold: 128 experts of FP32 scores are narrower than a
-    // 768-wide BF16 activation, which is a union that would have to grow for an activation that
-    // is never written.
+    // Three buffers each host two tenants with disjoint lifetimes. Which tenant is the larger
+    // depends on the mixture -- with 128 experts and a 768-wide FFN the scores are narrower
+    // than the shared activation, and with GLM-5.3's 288 and 2,048 they are narrower again by
+    // four times -- so each is sized for both rather than asserted to be dominated by one. An
+    // assertion here used to stand in for the arithmetic, and it read as a property of the op
+    // when it was really a property of the three mixtures that happened to be registered.
     const std::int32_t score_rows = sparse_moe_router_score_rows(geometry);
-    const bool score_union_holds =
-        !geometry.has_shared() ||
-        static_cast<std::int64_t>(score_rows) * 4 >= static_cast<std::int64_t>(inter) * 2;
-    if (!score_union_holds ||
-        static_cast<std::int64_t>(inter) * geometry.experts_per_token * 2 <
-            static_cast<std::int64_t>(hidden) * 4 ||
-        static_cast<std::int64_t>(hidden) * geometry.experts_per_token * 2 <
-            static_cast<std::int64_t>(geometry.paths()) * inter * 4) {
-        throw std::invalid_argument("sparse_moe prefill: geometry breaks a workspace union");
-    }
-    out.score_storage = arena.alloc(DType::FP32, {score_rows, capacity_tokens}, 256);
+    const auto per_token          = [](std::int64_t a, std::int64_t b) { return a > b ? a : b; };
+    const auto span               = [&](std::int64_t bytes_per_token) {
+        return arena.alloc_bytes(static_cast<std::size_t>(bytes_per_token * capacity_tokens), 256);
+    };
+
+    // Either the router's scores (FP32 [score_rows, T]) or, where the mixture has an always-on
+    // expert, that expert's activation (BF16 [intermediate, T]).
+    const DeviceSpan score_span = span(per_token(
+        static_cast<std::int64_t>(score_rows) * 4,
+        geometry.has_shared() ? static_cast<std::int64_t>(inter) * 2 : 0));
+    out.score_storage = Tensor(score_span.data, DType::FP32, {score_rows, capacity_tokens});
     out.shared_activation =
-        geometry.has_shared()
-            ? Tensor(out.score_storage.data, DType::BF16, {inter, capacity_tokens})
-            : Tensor{};
+        geometry.has_shared() ? Tensor(score_span.data, DType::BF16, {inter, capacity_tokens})
+                              : Tensor{};
 
-    out.grouped_io = arena.alloc(DType::BF16, {hidden, assignments}, 256);
+    // Either the gathered expert inputs (BF16 [hidden, top_k*T]) or the adaptive route's
+    // per-path activations (FP32 [paths*intermediate, T]).
+    const DeviceSpan grouped_span =
+        span(per_token(static_cast<std::int64_t>(hidden) * geometry.experts_per_token * 2,
+                       static_cast<std::int64_t>(geometry.paths()) * inter * 4));
+    out.grouped_io = Tensor(grouped_span.data, DType::BF16, {hidden, assignments});
 
-    out.routed_storage = arena.alloc(DType::BF16, {inter, assignments}, 256);
-    out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {hidden, capacity_tokens});
+    // Either the routed experts' activations (BF16 [intermediate, top_k*T]) or their weighted
+    // sum (FP32 [hidden, T]).
+    const DeviceSpan routed_span =
+        span(per_token(static_cast<std::int64_t>(inter) * geometry.experts_per_token * 2,
+                       static_cast<std::int64_t>(hidden) * 4));
+    out.routed_storage = Tensor(routed_span.data, DType::BF16, {inter, assignments});
+    out.routed_sum     = Tensor(routed_span.data, DType::FP32, {hidden, capacity_tokens});
     if (routed_int8) {
         out.column_token = arena.alloc(DType::I32, {assignments}, 256);
         out.act_codes    = arena.alloc(DType::I8, {hidden, capacity_tokens}, 256);

@@ -57,7 +57,12 @@ struct CodecProfile {
     constexpr std::int32_t kRoutedGateRows = kGeometry.routed_gate_rows();                         \
     constexpr std::int32_t kRoutedDownRows = kGeometry.routed_down_rows();                          \
     constexpr std::int32_t kSharedGateRows = kGeometry.shared_rows();                              \
-    constexpr bool kHasShared              = kGeometry.has_shared();
+    constexpr bool kHasShared              = kGeometry.has_shared();                                    \
+    constexpr bool kSharedGated            = kGeometry.shared_gated;                               \
+    constexpr bool kSigmoidRouter =                                                                \
+        kGeometry.gating == ops::SparseMoeGating::SigmoidBiasTopK;                                 \
+    constexpr float kRoutedScale           = kGeometry.routed_scale;                               \
+    constexpr float kSwigluLimit           = kGeometry.swiglu_limit;
 
 namespace qwen36 {
 SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeQwen36Geometry)
@@ -68,6 +73,11 @@ namespace qwen3_moe {
 SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeQwen3MoeGeometry)
 #include "ops/test_sparse_moe_body.inc"
 } // namespace qwen3_moe
+
+namespace glm53 {
+SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeGlm53Geometry)
+#include "ops/test_sparse_moe_body.inc"
+} // namespace glm53
 
 } // namespace
 
@@ -117,6 +127,21 @@ int main() {
         if (baked_for_512) { continue; }
         failures += qwen3_moe::run_profile(profile);
     }
+    // The third registered mixture is GLM-5.3's, and every axis of it is new: its router
+    // ranks on a sigmoid plus a learned per-expert bias rather than on a logit, its always-on
+    // expert is added with weight one instead of a router gate, its routed weights are scaled
+    // by 2.5, and both halves of every SwiGLU are clamped. The fixture's bias promotes an
+    // expert nothing else would select, so a router that ignored it would fail here rather
+    // than merely be a little off.
+    for (const CodecProfile& profile : profiles) {
+        // The same width argument as above: this mixture's intermediate is 2,048, and the Q5
+        // and Q6 routed-down kernels are baked for 512.
+        const bool baked_for_512 = profile.routed_down == QType::Q5G64_F16S ||
+                                   profile.routed_down == QType::Q6G64_F16S;
+        if (baked_for_512) { continue; }
+        failures += glm53::run_profile(profile);
+    }
+
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";
     return failures == 0 ? 0 : 1;
 }

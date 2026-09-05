@@ -341,7 +341,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
         dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
                                        x_shared, 0, kHidden, gate, up);
     }
-    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
+    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = swiglu_clamped(gate, up, kSwigluLimit); }
 }
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive>
@@ -414,7 +414,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
         if (lane == 0) {
             token_activations[(static_cast<std::int64_t>(token) * kPaths + path) *
                                   kIntermediate +
-                              j] = silu(gate) * up;
+                              j] = swiglu_clamped(gate, up, kSwigluLimit);
         }
         if constexpr (Adaptive) { __syncthreads(); }
     }

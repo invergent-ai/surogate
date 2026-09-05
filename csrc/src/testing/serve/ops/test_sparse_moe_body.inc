@@ -352,18 +352,19 @@ struct RoutePattern {
     int tied_excluded = -1;
 };
 
-/// Nine distinct expert ids spread evenly across the mixture, both ends included.
+/// Ten distinct expert ids spread evenly across the mixture, both ends included.
 ///
 /// The three patterns below name them by position rather than by number, so the same three
 /// cases describe a mixture of any size: what they exercise is the ordering, the tie at the
 /// last rank and the excluded expert, not which expert happens to sit at 255. Written as ids
-/// they described a 256-expert mixture and nothing else.
-constexpr int kRouteSlots = 9;
+/// they described a 256-expert mixture and nothing else. The tenth slot is named by no pattern
+/// and exists for the bias to promote (see `kBiasPromoted`).
+constexpr int kRouteSlots = 10;
 
 constexpr int route_expert(int slot) { return slot * (kExperts - 1) / (kRouteSlots - 1); }
 
 static_assert(kExperts >= kRouteSlots,
-              "the route patterns need nine distinct experts to name");
+              "the route patterns need ten distinct experts to name");
 static_assert(kTopK == 8, "the route patterns below select eight experts");
 
 constexpr RoutePattern route_pattern(std::array<int, kTopK> slots, int tied_slot) {
@@ -435,6 +436,40 @@ std::vector<float> make_router() {
     }
     round_to_bf16(router);
     return router;
+}
+
+/// The expert a `SigmoidBiasTopK` router is made to promote by its bias alone.
+///
+/// Nothing marks its rows, so its routing score is whatever an unmarked expert's is -- well
+/// below every marked one. Only the bias can put it in the top-K, and the bias is dropped again
+/// before the weights are formed, so its weight stays the small one its raw score earns. A
+/// kernel that ranked without the bias would not select it; one that weighted with the bias
+/// would give it a weight near the largest rather than near the smallest.
+constexpr int kBiasPromoted = route_expert(kRouteSlots - 1);
+constexpr float kPromotingBias = 2.0F;
+
+constexpr bool bias_promoted_is_unmarked() {
+    for (const RoutePattern& route : kRoutePatterns) {
+        if (route.tied_excluded == kBiasPromoted) { return false; }
+        for (const int expert : route.selected) {
+            if (expert == kBiasPromoted) { return false; }
+        }
+    }
+    return true;
+}
+static_assert(bias_promoted_is_unmarked(),
+              "the promoted expert must be one no route pattern marks, or the bias would be "
+              "promoting an expert that was going to be selected anyway");
+// A score is a sigmoid, so it is below one: any bias at or above one outranks every unbiased
+// expert whatever the router's weights turn out to be. Nothing here depends on measuring them.
+static_assert(kPromotingBias >= 1.0F);
+
+/// The per-expert ranking bias. Zero everywhere but the one expert the test promotes; a
+/// softmax-routed mixture has no such tensor at all and binds none.
+std::vector<float> make_router_bias() {
+    std::vector<float> bias(static_cast<std::size_t>(kExperts), 0.0f);
+    bias[static_cast<std::size_t>(kBiasPromoted)] = kPromotingBias;
+    return bias;
 }
 
 std::vector<float> make_gate_up(std::int32_t rows, std::int32_t columns, std::uint32_t seed,
@@ -543,9 +578,21 @@ void round_activation_to_nvfp4(std::vector<double>& values, float activation_sca
 // The one SparseMoe oracle. It directly evaluates the complete public formula from represented
 // BF16 values and independently decoded logical weights, with FP64 accumulation throughout.
 // It has no production route, staging cast, workspace dtype, reduction tree, or output rounding.
+/// The expert activation, with the clamp the mixture declares. `kSwigluLimit` is zero for a
+/// mixture that does not clamp, and the bound then never binds.
+double clamped_swiglu(double gate, double up) {
+    if constexpr (kSwigluLimit > 0.0F) {
+        gate = std::min(gate, static_cast<double>(kSwigluLimit));
+        up   = std::min(std::max(up, -static_cast<double>(kSwigluLimit)),
+                        static_cast<double>(kSwigluLimit));
+    }
+    return (gate / (1.0 + std::exp(-gate))) * up;
+}
+
 std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
                                       const std::vector<float>& residual,
                                       const std::vector<float>& router,
+                                      const std::vector<float>& bias,
                                       const std::vector<HostExpert>& experts,
                                       const quantized_weight::PackedWeight& shared_gate_up,
                                       const quantized_weight::PackedWeight& shared_down,
@@ -558,28 +605,69 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
     sinfer::test::parallel_rows(kGeometry.router_rows(),
                   [&](std::int32_t row) { scores[row] = dot_fp64(router, row, kHidden, x); });
 
+    // Two different numbers per expert, and which is which is the whole of the routing rule.
+    // A softmax router ranks and weights on the same logit. A sigmoid one ranks on the score
+    // plus a learned bias and weights on the score alone, so the bias steers the choice without
+    // being worth anything once the choice is made.
+    std::vector<double> rank_score(kExperts), weight_score(kExperts);
+    for (int expert = 0; expert < kExperts; ++expert) {
+        if constexpr (kSigmoidRouter) {
+            weight_score[expert] = 1.0 / (1.0 + std::exp(-scores[expert]));
+            rank_score[expert]   = weight_score[expert] + static_cast<double>(bias[expert]);
+        } else {
+            weight_score[expert] = scores[expert];
+            rank_score[expert]   = scores[expert];
+        }
+    }
+
     std::vector<int> ranked(kExperts);
     std::iota(ranked.begin(), ranked.end(), 0);
     std::sort(ranked.begin(), ranked.end(), [&](int left, int right) {
-        return scores[left] > scores[right] || (scores[left] == scores[right] && left < right);
+        return rank_score[left] > rank_score[right] ||
+               (rank_score[left] == rank_score[right] && left < right);
     });
 
     std::array<int, kTopK> selected{};
     std::array<double, kTopK> route_weight{};
     double route_denominator = 0.0;
-    for (int route = 0; route < kTopK; ++route) {
-        selected[route]     = ranked[route];
-        route_weight[route] = std::exp(scores[selected[route]] - scores[selected[0]]);
-        route_denominator += route_weight[route];
+    for (int route = 0; route < kTopK; ++route) { selected[route] = ranked[route]; }
+    if constexpr (kSigmoidRouter) {
+        for (int route = 0; route < kTopK; ++route) {
+            route_weight[route] = weight_score[selected[route]];
+            route_denominator += route_weight[route];
+        }
+        for (double& weight : route_weight) {
+            weight = weight / (route_denominator + 1.0e-20) * static_cast<double>(kRoutedScale);
+        }
+        // What the bias was constructed to do: promote one unmarked expert, displacing the
+        // weakest marked one. Stated as the property rather than as an order, because the
+        // interleaving of the promoted expert among the marked ones is not the point.
+        std::array<int, kTopK> expected = intended_route.selected;
+        expected[kTopK - 1]             = kBiasPromoted;
+        std::array<int, kTopK> got      = selected;
+        std::sort(expected.begin(), expected.end());
+        std::sort(got.begin(), got.end());
+        if (got != expected) {
+            throw std::logic_error("sparse_moe test router did not select the intended experts "
+                                   "plus the one its bias promotes");
+        }
+    } else {
+        for (int route = 0; route < kTopK; ++route) {
+            route_weight[route] = std::exp(scores[selected[route]] - scores[selected[0]]);
+            route_denominator += route_weight[route];
+        }
+        for (double& weight : route_weight) { weight /= route_denominator; }
+        if (selected != intended_route.selected) {
+            throw std::logic_error(
+                "sparse_moe test router did not create its intended ordered top-8");
+        }
     }
-    for (double& weight : route_weight) { weight /= route_denominator; }
-    if (selected != intended_route.selected) {
-        throw std::logic_error("sparse_moe test router did not create its intended ordered top-8");
-    }
-    // Only a mixture with an always-on expert has a gate logit to read; without one the
-    // scale is never used, and computing it would index past the router.
-    const double shared_scale =
-        kHasShared ? 1.0 / (1.0 + std::exp(-scores[kExperts])) : 0.0;
+    // Only a mixture with a *gated* always-on expert has a gate logit to read. Without one the
+    // scale is never used (and computing it would index past the router); with an ungated one
+    // the expert is simply added.
+    const double shared_scale = !kHasShared         ? 0.0
+                                : !kSharedGated     ? 1.0
+                                                    : 1.0 / (1.0 + std::exp(-scores[kExperts]));
 
     std::array<std::vector<double>, kTopK> routed_activation;
     for (int route = 0; route < kTopK; ++route) {
@@ -599,7 +687,7 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
                 gate = static_cast<double>(bf16_to_f32(f32_to_bf16(static_cast<float>(gate))));
                 up   = static_cast<double>(bf16_to_f32(f32_to_bf16(static_cast<float>(up))));
             }
-            routed_activation[route][row] = (gate / (1.0 + std::exp(-gate))) * up;
+            routed_activation[route][row] = clamped_swiglu(gate, up);
         });
         if (activation.enabled()) {
             round_activation_to_nvfp4(
@@ -614,7 +702,7 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
         sinfer::test::parallel_rows(kIntermediate, [&](std::int32_t row) {
             const double gate = dot_fp64(shared_gate_up.dequant, row, kHidden, x);
             const double up = dot_fp64(shared_gate_up.dequant, kIntermediate + row, kHidden, x);
-            shared_activation[row] = (gate / (1.0 + std::exp(-gate))) * up;
+            shared_activation[row] = clamped_swiglu(gate, up);
         });
     }
 
@@ -644,7 +732,8 @@ class SparseMoeFixture {
 public:
     explicit SparseMoeFixture(const CodecProfile& profile)
         : profile_(profile), router_(make_router()), router_bits_(bf16_bits(router_)),
-          device_router_(to_device(router_bits_)),
+          device_router_(to_device(router_bits_)), router_bias_(make_router_bias()),
+          device_router_bias_(kSigmoidRouter ? to_device(router_bias_) : DeviceBuffer{}),
           routed_gate_(profile.routed_gate_up, kRoutedGateRows, kHidden),
           routed_down_(profile.routed_down, kRoutedDownRows, kIntermediate),
           shared_gate_(kHasShared ? std::optional<DeviceRowSplit>(std::in_place,
@@ -663,13 +752,18 @@ public:
         }
 
         std::vector<int> expert_ids;
-        for (const RoutePattern& route : kRoutePatterns) {
-            for (int expert : route.selected) {
-                if (std::find(expert_ids.begin(), expert_ids.end(), expert) == expert_ids.end()) {
-                    expert_ids.push_back(expert);
-                }
+        const auto want = [&](int expert) {
+            if (std::find(expert_ids.begin(), expert_ids.end(), expert) == expert_ids.end()) {
+                expert_ids.push_back(expert);
             }
+        };
+        for (const RoutePattern& route : kRoutePatterns) {
+            for (int expert : route.selected) { want(expert); }
         }
+        // No pattern names the promoted expert -- that is the point of it -- so it has to be
+        // asked for here or the bias would select an expert with no weights behind it.
+        if constexpr (kSigmoidRouter) { want(kBiasPromoted); }
+        
         std::sort(expert_ids.begin(), expert_ids.end());
         for (int expert : expert_ids) {
             const float factor = 0.8f + static_cast<float>((expert * 3) % 11) * 0.045f;
@@ -725,6 +819,7 @@ public:
 
         for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
             references_.push_back(sparse_moe_oracle(inputs_[pattern], residuals_[pattern], router_,
+                                                   router_bias_,
                                                     experts_, shared_gate_host_, shared_down_host_,
                                                     kRoutePatterns[pattern]));
             // The NVFP4 profile computes two different functions: our own kernels keep the
@@ -732,8 +827,9 @@ public:
             // a round is decided by its width, so the suite carries both references and asserts
             // against the one the width selects.
             w4a4_references_.push_back(sparse_moe_oracle(
-                inputs_[pattern], residuals_[pattern], router_, experts_, shared_gate_host_,
-                shared_down_host_, kRoutePatterns[pattern], {}, activation_model()));
+                inputs_[pattern], residuals_[pattern], router_, router_bias_, experts_,
+                shared_gate_host_, shared_down_host_, kRoutePatterns[pattern], {},
+                activation_model()));
         }
     }
 
@@ -768,6 +864,12 @@ public:
         ops::SparseMoeWeights weights{
             .router_shared_gate = dense_bf16_weight(device_router_.p, kGeometry.router_rows(),
                                                     kHidden),
+            .router_bias        = kSigmoidRouter
+                                      ? static_cast<const float*>(device_router_bias_.p)
+                                      : nullptr,
+            .routed_scale       = kRoutedScale,
+            .shared_gated       = kSharedGated,
+            .swiglu_limit       = kSwigluLimit,
             .routed_gate_up     = routed_gate_.weight(),
             .routed_down        = routed_down_.weight(),
             .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
@@ -837,7 +939,7 @@ public:
             std::copy(residuals_[pattern].begin(), residuals_[pattern].end(),
                       residual.begin() + static_cast<std::size_t>(token) * kHidden);
             const std::vector<double> partial =
-                sparse_moe_oracle(inputs_[pattern], residuals_[pattern], router_, experts_,
+                sparse_moe_oracle(inputs_[pattern], residuals_[pattern], router_, router_bias_, experts_,
                                   shared_gate_host_, shared_down_host_, kRoutePatterns[pattern],
                                   excluded, runs_on_runner(tokens) ? activation_model()
                                                                    : Nvfp4ActivationModel{});
@@ -863,6 +965,12 @@ public:
         ops::SparseMoeWeights weights{
             .router_shared_gate = dense_bf16_weight(device_router_.p, kGeometry.router_rows(),
                                                     kHidden),
+            .router_bias        = kSigmoidRouter
+                                      ? static_cast<const float*>(device_router_bias_.p)
+                                      : nullptr,
+            .routed_scale       = kRoutedScale,
+            .shared_gated       = kSharedGated,
+            .swiglu_limit       = kSwigluLimit,
             .routed_gate_up     = routed_gate_.weight(),
             .routed_down        = routed_down_.weight(),
             .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
@@ -1013,6 +1121,9 @@ private:
     std::vector<float> router_;
     std::vector<std::uint16_t> router_bits_;
     DeviceBuffer device_router_;
+    /// The per-expert ranking bias, bound only where the mixture's router ranks with one.
+    std::vector<float> router_bias_;
+    DeviceBuffer device_router_bias_;
     DeviceRowSplit routed_gate_;
     DeviceRowSplit routed_down_;
     std::optional<DeviceRowSplit> shared_gate_;

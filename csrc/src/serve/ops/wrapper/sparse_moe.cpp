@@ -320,6 +320,7 @@ SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights) {
         .routed_scale        = weights.routed_scale,
         .shared_gated        = weights.shared_gated,
         .shared_intermediate = shared ? weights.shared_down.k : 0,
+        .swiglu_limit        = weights.swiglu_limit,
     };
     require_registered(geometry);
     return geometry;

@@ -53,6 +53,11 @@ struct SparseMoeGeometry {
     /// had no width at all, not merely a missing path. Zero here means the mixture is routed
     /// and nothing else: no extra router row, one fewer path per token, no shared weights.
     std::int32_t shared_intermediate = 0;
+    /// The bound both halves of every expert's SwiGLU are clamped to before the product, or
+    /// zero for the unclamped product. GLM-5.3 states 10 per layer (`swiglu_clamp_exp`); it is
+    /// a training-time stability device, so a checkpoint trained under it produces activations
+    /// that reach it and serving without the clamp is serving a different function.
+    float swiglu_limit = 0.0F;
 
     [[nodiscard]] constexpr bool has_shared() const noexcept { return shared_intermediate > 0; }
     /// The router carries one row per expert, plus the shared expert's gate where it has one.
@@ -94,8 +99,8 @@ inline constexpr SparseMoeGeometry kSparseMoeQwen3MoeGeometry{
 /// the sigmoid-plus-bias router its checkpoint declares (`expert_gating_func` 2,
 /// `expert_weights_scale` 2.5).
 inline constexpr SparseMoeGeometry kSparseMoeGlm53Geometry{
-    4096, 288, 8, 2048, SparseMoeGating::SigmoidBiasTopK, 2.5F, /*shared_gated=*/false,
-    2048};
+    4096, 288, 8, 2048, SparseMoeGating::SigmoidBiasTopK, 2.5F, /*shared_gated=*/false, 2048,
+    /*swiglu_limit=*/10.0F};
 
 /// Every mixture this op serves. One list, so registering a geometry is one line here and one
 /// kernel-body instantiation per route rather than a predicate repeated in five places.
@@ -118,6 +123,9 @@ struct SparseMoeWeights {
     /// Whether the always-on expert is weighted by a router row or added with weight one. Also
     /// unreadable from the shapes -- a 288-row router is 288 experts ungated or 287 and a gate.
     bool shared_gated = true;
+    /// The SwiGLU clamp the mixture was trained under, or zero for none. Unreadable from any
+    /// shape, like the two above; it must match the registered geometry's.
+    float swiglu_limit = 0.0F;
     Weight routed_gate_up;
     Weight routed_down;
     Weight shared_gate_up;
