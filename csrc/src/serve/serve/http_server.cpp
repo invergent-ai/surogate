@@ -305,6 +305,16 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    // The same handler: a body carrying `tokens` uses them as the prompt, and this
+    // path is the one an RL client posts that body to. It is a separate route
+    // rather than a flag because that is the contract the client already speaks.
+    server_.Post("/v1/chat/completions/tokens",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_chat_completions(req, res);
+                 });
+    server_.Post("/tokenize", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_tokenize(req, res);
+    });
     server_.Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
         handle_completions(req, res);
     });
@@ -381,8 +391,10 @@ void HttpServer::register_routes() {
     });
 
     // vLLM's runtime adapter management routes, same request bodies.
-    server_.Post("/v1/load_lora_adapter", [this](const httplib::Request& req,
-                                                 httplib::Response& res) {
+    // Registered at both paths. The RL client strips the version prefix from its
+    // admin base url and posts to the root, which is where vLLM's own extension
+    // routes live; the versioned path is what everything else already calls.
+    const auto load_lora_adapter_handler = [this](const httplib::Request& req, httplib::Response& res) {
         nlohmann::json body;
         try {
             body = nlohmann::json::parse(req.body);
@@ -422,9 +434,13 @@ void HttpServer::register_routes() {
         }
         log_line("lora: loaded adapter '" + name + "' from " + path);
         res.set_content("Success: LoRA adapter '" + name + "' added successfully", "text/plain");
-    });
-    server_.Post("/v1/unload_lora_adapter", [this](const httplib::Request& req,
-                                                   httplib::Response& res) {
+    };
+    server_.Post("/v1/load_lora_adapter", load_lora_adapter_handler);
+    server_.Post("/load_lora_adapter", load_lora_adapter_handler);
+    // Registered at both paths. The RL client strips the version prefix from its
+    // admin base url and posts to the root, which is where vLLM's own extension
+    // routes live; the versioned path is what everything else already calls.
+    const auto unload_lora_adapter_handler = [this](const httplib::Request& req, httplib::Response& res) {
         nlohmann::json body;
         try {
             body = nlohmann::json::parse(req.body);
@@ -448,7 +464,9 @@ void HttpServer::register_routes() {
         }
         log_line("lora: unloaded adapter '" + name + "'");
         res.set_content("Success: LoRA adapter '" + name + "' removed successfully", "text/plain");
-    });
+    };
+    server_.Post("/v1/unload_lora_adapter", unload_lora_adapter_handler);
+    server_.Post("/unload_lora_adapter", unload_lora_adapter_handler);
     server_.Post("/v1/messages/count_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
@@ -659,6 +677,61 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         return;
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+}
+
+// What a prompt tokenises to, without generating anything.
+//
+// A multi-turn RL client uses this to stitch turns: it asks what the next prompt
+// renders to so it can check that the ids it already holds are a prefix of it. So
+// the answer has to be this engine's own tokenisation of its own template, which
+// is exactly what preparing the prompt produces.
+void HttpServer::handle_tokenize(const httplib::Request& req, httplib::Response& res) {
+    t_routed_service = nullptr;
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception&) {
+        ApiError error;
+        error.status  = 400;
+        error.message = "request body is not valid JSON";
+        write_error(res, error);
+        return;
+    }
+    try {
+        RequestLimits limits;
+        limits.default_max_tokens = options_.default_max_tokens;
+        // `max_tokens` is meaningless here and a caller need not send one, so the
+        // body is completed before it is parsed as a generation request.
+        nlohmann::json completed = body;
+        if (!completed.contains("messages") && !completed.contains("prompt")) {
+            ApiError error;
+            error.status  = 400;
+            error.message = "tokenize needs `messages` or `prompt`";
+            write_error(res, error);
+            return;
+        }
+        GenerationRequest request =
+            completed.contains("messages")
+                ? parse_chat_completion_request(completed, limits)
+                : parse_completion_request(completed, limits);
+        t_routed_service = &route_model(request.model, &request.lora_adapter);
+        if (scheduler_ != nullptr) { scheduler_->ensure_awake(t_routed_service); }
+        const std::vector<sinfer::TokenId> ids = svc().tokenize(request);
+        nlohmann::json out{{"count", ids.size()},
+                           {"max_model_len", svc().max_context()},
+                           {"tokens", ids}};
+        if (body.value("with_token_strings", false)) {
+            out["token_strs"] = svc().token_texts(ids);
+        }
+        res.set_content(out.dump(), "application/json");
+    } catch (const ApiException& e) {
+        write_error(res, e.error());
+    } catch (const std::exception& e) {
+        ApiError error;
+        error.status  = 400;
+        error.message = e.what();
+        write_error(res, error);
+    }
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {

@@ -119,6 +119,15 @@ public:
     /// refusal -- bad adapter, name taken, no free slot, module not applicable.
     /// Whether any of this engine's stores adapts anything. Under a pipeline the
     /// stores are per stage, so the question is asked of all of them.
+    /// What a request's prompt tokenises to, without generating anything. Ids the
+    /// client supplied are returned as given -- they are already the answer.
+    [[nodiscard]] std::vector<sinfer::TokenId> tokenize(const GenerationRequest& request);
+    /// The text of each token id, for a tokenize response that asks for it.
+    [[nodiscard]] std::vector<std::string> token_texts(const std::vector<sinfer::TokenId>& ids);
+    /// The context this engine was configured for, which a stitching client needs
+    /// to know before it decides a prompt is too long.
+    [[nodiscard]] std::uint32_t max_context() const;
+
     [[nodiscard]] bool any_lora_bindings() const;
     /// Scrub one adapter slot on every store, so nothing in flight reads it.
     void clear_lora_slot_everywhere(std::int32_t slot);

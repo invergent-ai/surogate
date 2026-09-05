@@ -393,6 +393,18 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     if (body.contains("return_token_ids") && body.at("return_token_ids").is_boolean()) {
         out.return_token_ids = body.at("return_token_ids").get<bool>();
     }
+    if (body.contains("tokens") && !body.at("tokens").is_null()) {
+        const Json& tokens = body.at("tokens");
+        if (!tokens.is_array()) { bad_request("tokens must be an array of integers", "tokens"); }
+        out.prompt_token_ids.reserve(tokens.size());
+        for (const Json& item : tokens) {
+            if (!item.is_number_integer()) {
+                bad_request("tokens must be an array of integers", "tokens");
+            }
+            out.prompt_token_ids.push_back(static_cast<sinfer::TokenId>(item.get<std::int64_t>()));
+        }
+        if (out.prompt_token_ids.empty()) { bad_request("tokens must not be empty", "tokens"); }
+    }
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
     const Json& stop = body.at("stop");
     if (stop.is_string()) {

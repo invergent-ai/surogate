@@ -193,6 +193,16 @@ struct GenerationRequest {
     /// probabilities they were drawn with.
     bool want_logprobs    = false;
     bool return_token_ids = false;
+    /// The prompt as token ids, replacing whatever `messages` would have rendered
+    /// to. Empty unless the client sent them.
+    ///
+    /// A multi-turn RL rollout holds the exact ids of the turn it just generated
+    /// and needs the next prompt to extend them. Re-rendering the messages is not
+    /// guaranteed to reproduce that prefix -- a template that strips earlier
+    /// `<think>` blocks changes it -- and a prompt that is not an extension breaks
+    /// the trajectory into separate training samples. `messages` is still parsed
+    /// and still carries the tools and the parser state; only the ids change.
+    std::vector<sinfer::TokenId> prompt_token_ids;
     SamplingParams sampling;
 
     /// The adapter this request selected by naming it in `model`, empty for the

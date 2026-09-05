@@ -407,9 +407,15 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
         };
-        sinfer::PreparedPrompt prompt = request.raw_prompt.has_value()
-                                            ? engine_->prepare_text(*request.raw_prompt)
-                                            : engine_->prepare(std::move(*input), control);
+        // Ids given by the client win over anything the template would render: that
+        // is the whole point of the token-in endpoint, and the messages are still
+        // parsed above for the tools and the parser state they carry.
+        sinfer::PreparedPrompt prompt =
+            !request.prompt_token_ids.empty()
+                ? engine_->prepare_tokens(request.prompt_token_ids)
+                : (request.raw_prompt.has_value()
+                       ? engine_->prepare_text(*request.raw_prompt)
+                       : engine_->prepare(std::move(*input), control));
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
@@ -539,6 +545,34 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
     }
     return outcome;
+}
+
+std::vector<sinfer::TokenId> GenerationService::tokenize(const GenerationRequest& request) {
+    if (!request.prompt_token_ids.empty()) { return request.prompt_token_ids; }
+    if (request.raw_prompt.has_value()) {
+        return engine_->prepare_text(*request.raw_prompt).token_ids();
+    }
+    const ResolvedPromptSemantics semantics =
+        resolve_prompt_semantics(request, options_, prompt_capabilities_);
+    std::size_t remaining_media_bytes =
+        std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
+    const auto never_cancelled = [] { return false; };
+    sinfer::PromptInput input  = to_prompt_input(request, semantics, [&](const ContentPart& part) {
+        return acquire_media(part, Clock::now() + std::chrono::seconds(30), never_cancelled,
+                             remaining_media_bytes);
+    });
+    return engine_->prepare(std::move(input)).token_ids();
+}
+
+std::vector<std::string> GenerationService::token_texts(const std::vector<sinfer::TokenId>& ids) {
+    if (ids.empty()) { return {}; }
+    return engine_->token_texts(std::span<const sinfer::TokenId>(ids.data(), ids.size()));
+}
+
+std::uint32_t GenerationService::max_context() const {
+    // The configured ceiling, not `memory_summary()`: that call takes the engine's
+    // execution lock, and a tokenize request must not queue behind a round.
+    return engine_->options().max_context;
 }
 
 bool GenerationService::any_lora_bindings() const {
