@@ -114,7 +114,8 @@ __global__ void sparse_moe_prefill_select_count_kernel(const float* __restrict__
                                                        float* __restrict__ alpha,
                                                        float* __restrict__ shared_scale,
                                                        int* __restrict__ local_rank,
-                                                       int* __restrict__ tile_counts, int tokens) {
+                                                       int* __restrict__ tile_counts, int tokens,
+                                                       const float* __restrict__ router_bias) {
     __shared__ int counts[kExperts];
     __shared__ float selected_logits[kSparseMoeRouteTileTokens][kTopK];
     const int tid  = static_cast<int>(threadIdx.x);
@@ -125,10 +126,10 @@ __global__ void sparse_moe_prefill_select_count_kernel(const float* __restrict__
 
     const int token = static_cast<int>(blockIdx.x) * kSparseMoeRouteTileTokens + warp;
     if (token < tokens) {
-        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared>(
+        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating>(
             scores + static_cast<std::int64_t>(token) * kSparseMoeRouterScoreRows,
             ids + token * kTopK, alpha + token * kTopK, shared_scale + token,
-            selected_logits[warp]);
+            selected_logits[warp], router_bias, kRoutedScale);
         __syncwarp();
         if (lane == 0) {
 #pragma unroll
@@ -1838,7 +1839,8 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
         CUDA_CHECK(cudaGetLastError());
 
         sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
-            scores, ids, alpha, shared_scale, packed_index, tile_counts, tokens);
+            scores, ids, alpha, shared_scale, packed_index, tile_counts, tokens,
+            weights.router_bias);
         CUDA_CHECK(cudaGetLastError());
         if (hook != nullptr && hook->resolve != nullptr) {
             const Tensor slice_ids(ids, DType::I32, {assignments});

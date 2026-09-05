@@ -16,11 +16,30 @@ namespace sinfer::ops {
  * registered geometry; the wrapper derives the geometry from the weights and refuses any
  * combination that is not registered.
  */
+/// How a mixture turns router logits into the weights a token's experts are summed with.
+///
+/// The engine served one of these for as long as it served one family. GLM-5.3 uses the other:
+/// scores are a sigmoid rather than a softmax, selection is on the score plus a learned
+/// per-expert bias, and the winners are renormalised among themselves and scaled. The bias
+/// steers *which* experts are chosen without changing what they are worth once chosen, which
+/// is why it is added for the ranking and dropped for the weight.
+enum class SparseMoeGating : std::uint8_t {
+    /// Rank on the logits, softmax over the winners. Qwen3.5/3.6, Qwen3.8-Flash-Next, Qwen3-MoE.
+    SoftmaxTopK,
+    /// Rank on sigmoid(logit) + bias, renormalise the winners' sigmoid scores, scale.
+    SigmoidBiasTopK,
+};
+
 struct SparseMoeGeometry {
     std::int32_t hidden            = 0;
     std::int32_t experts           = 0;
     std::int32_t experts_per_token = 0;
     std::int32_t intermediate      = 0;
+    /// How the router weights a token's experts. See `SparseMoeGating`.
+    SparseMoeGating gating = SparseMoeGating::SoftmaxTopK;
+    /// What the renormalised routed weights are multiplied by. One for every mixture whose
+    /// router does not say otherwise; GLM-5.3 states 2.5.
+    float routed_scale = 1.0F;
     /// The always-on expert's FFN width, or zero where there is no always-on expert.
     ///
     /// Not every mixture has one. Qwen3-30B-A3B, LFM2-MoE, GPT-OSS and Gemma 4 route every
@@ -56,21 +75,40 @@ struct SparseMoeGeometry {
 
 /// Qwen3.5/3.6 MoE (35B-A3B and the 4B/2B MTP heads): 256 experts, top-8, FFN 512, hidden 2048,
 /// plus a shared expert of the same width.
-inline constexpr SparseMoeGeometry kSparseMoeQwen36Geometry{2048, 256, 8, 512, 512};
+inline constexpr SparseMoeGeometry kSparseMoeQwen36Geometry{
+    2048, 256, 8, 512, SparseMoeGating::SoftmaxTopK, 1.0F, 512};
 /// Qwen3.8-Flash-Next: 512 experts, top-10, FFN 640, hidden 2560, shared expert of the same
 /// width.
-inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{2560, 512, 10, 640, 640};
+inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{
+    2560, 512, 10, 640, SparseMoeGating::SoftmaxTopK, 1.0F, 640};
 /// Qwen3-30B-A3B: 128 experts, top-8, FFN 768, hidden 2048, and no shared expert at all -- the
 /// first registered mixture that routes every token entirely.
-inline constexpr SparseMoeGeometry kSparseMoeQwen3MoeGeometry{2048, 128, 8, 768, 0};
+inline constexpr SparseMoeGeometry kSparseMoeQwen3MoeGeometry{
+    2048, 128, 8, 768, SparseMoeGating::SoftmaxTopK, 1.0F, 0};
+/// GLM-5.3-Flash: 288 experts, top-8, FFN 2048 with an always-on expert of the same width, and
+/// the sigmoid-plus-bias router its checkpoint declares (`expert_gating_func` 2,
+/// `expert_weights_scale` 2.5).
+inline constexpr SparseMoeGeometry kSparseMoeGlm53Geometry{
+    4096, 288, 8, 2048, SparseMoeGating::SigmoidBiasTopK, 2.5F, 2048};
 
 /// Every mixture this op serves. One list, so registering a geometry is one line here and one
 /// kernel-body instantiation per route rather than a predicate repeated in five places.
-inline constexpr std::array<SparseMoeGeometry, 3> kSparseMoeGeometries{
-    kSparseMoeQwen36Geometry, kSparseMoeFlashNextGeometry, kSparseMoeQwen3MoeGeometry};
+inline constexpr std::array<SparseMoeGeometry, 4> kSparseMoeGeometries{
+    kSparseMoeQwen36Geometry, kSparseMoeFlashNextGeometry, kSparseMoeQwen3MoeGeometry,
+    kSparseMoeGlm53Geometry};
 
 struct SparseMoeWeights {
     Weight router_shared_gate;
+    /// Device FP32 [experts]: the per-expert bias a `SigmoidBiasTopK` router ranks with.
+    ///
+    /// Its presence is what says which router this mixture has -- a softmax router has no such
+    /// tensor and a sigmoid one cannot select without it -- so the geometry's gating is derived
+    /// from it rather than stated twice. A router that silently ignored it would choose
+    /// different experts from the ones the checkpoint was trained to.
+    const float* router_bias = nullptr;
+    /// What the renormalised routed weights are multiplied by. Cannot be read off any shape, so
+    /// the caller states it; it must match the registered geometry's.
+    float routed_scale = 1.0F;
     Weight routed_gate_up;
     Weight routed_down;
     Weight shared_gate_up;

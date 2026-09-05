@@ -168,6 +168,20 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
         throw std::invalid_argument(
             "sparse_moe: routed_down must be Q5, Q6, W8, NVFP4, or a GGML K-quant");
     }
+    if (geometry.gating == SparseMoeGating::SigmoidBiasTopK) {
+        if (weights.router_bias == nullptr) {
+            throw std::invalid_argument(
+                "sparse_moe: a sigmoid router selects on the score plus a per-expert bias and "
+                "cannot rank without it");
+        }
+        ranges.push_back(address_range(weights.router_bias,
+                                       static_cast<std::size_t>(geometry.experts) * sizeof(float),
+                                       "router_bias"));
+    } else if (weights.router_bias != nullptr) {
+        throw std::invalid_argument(
+            "sparse_moe: this mixture's router is a softmax over the logits and has no bias to "
+            "rank with; passing one means the caller expects a router this geometry is not");
+    }
     if (geometry.has_shared()) {
         if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
             weights.shared_down.qtype != QType::W8G32_F16S) {
@@ -296,6 +310,11 @@ SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights) {
         .experts             = weights.router_shared_gate.n - (shared ? 1 : 0),
         .experts_per_token   = weights.experts_per_token,
         .intermediate        = weights.routed_down.k,
+        // The router's own bias says which gating this is: a softmax router has no such tensor
+        // and a sigmoid one cannot rank without it.
+        .gating              = weights.router_bias != nullptr ? SparseMoeGating::SigmoidBiasTopK
+                                                              : SparseMoeGating::SoftmaxTopK,
+        .routed_scale        = weights.routed_scale,
         .shared_intermediate = shared ? weights.shared_down.k : 0,
     };
     require_registered(geometry);

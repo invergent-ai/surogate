@@ -1,5 +1,6 @@
 #pragma once
 
+#include "api/ops/sparse_moe.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 
@@ -7,6 +8,8 @@
 #include <math_constants.h>
 
 namespace sinfer::ops::detail {
+
+using ::sinfer::ops::SparseMoeGating;
 
 struct SparseMoeRankedValue {
     float value;
@@ -38,10 +41,13 @@ __device__ __forceinline__ SparseMoeRankedValue sparse_moe_warp_best(SparseMoeRa
 // renormalises them with a softmax, and -- where the mixture has an always-on expert -- reads
 // its gate from logit `Experts`. A routed-only router has exactly `Experts` rows, so there is no
 // such logit to read and `HasShared` is what says so; `shared_scale` is then untouched.
-template <int Experts, int TopK, bool HasShared = true>
+template <int Experts, int TopK, bool HasShared = true,
+          SparseMoeGating Gating = SparseMoeGating::SoftmaxTopK>
 __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores, int* ids,
                                                              float* alpha, float* shared_scale,
-                                                             float* selected_logits) {
+                                                             float* selected_logits,
+                                                             const float* router_bias = nullptr,
+                                                             float routed_scale = 1.0f) {
     static_assert(Experts % 32 == 0 && TopK >= 1 && TopK <= 32);
     constexpr int kPerLane = Experts / 32;
     const int lane         = static_cast<int>(threadIdx.x) & 31;
@@ -49,7 +55,13 @@ __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores
 #pragma unroll
     for (int item = 0; item < kPerLane; ++item) {
         const int id = lane + item * 32;
-        local[item]  = {scores[id], id, lane};
+        // What the ranking sees. A softmax router ranks the logits themselves; a sigmoid one
+        // ranks the score plus a learned per-expert bias, and the bias is dropped again once
+        // the winners are known -- it steers which experts are chosen, not what they are worth.
+        const float ranked = Gating == SparseMoeGating::SigmoidBiasTopK
+                                 ? sigmoid(scores[id]) + router_bias[id]
+                                 : scores[id];
+        local[item]  = {ranked, id, lane};
     }
 #pragma unroll
     for (int i = 1; i < kPerLane; ++i) {
@@ -77,11 +89,21 @@ __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores
         __syncwarp();
     }
 
-    float exponential = 0.0f;
-    if (lane < TopK) { exponential = expf(selected_logits[lane] - selected_logits[0]); }
-    float denominator = warp_reduce_sum(exponential);
-    denominator       = __shfl_sync(kFullWarpMask, denominator, 0);
-    if (lane < TopK) { alpha[lane] = exponential / denominator; }
+    if constexpr (Gating == SparseMoeGating::SigmoidBiasTopK) {
+        // The weight is the winner's own sigmoid score, without the bias that selected it,
+        // renormalised over the winners and scaled.
+        float weight = 0.0f;
+        if (lane < TopK) { weight = sigmoid(scores[ids[lane]]); }
+        float denominator = warp_reduce_sum(weight);
+        denominator       = __shfl_sync(kFullWarpMask, denominator, 0);
+        if (lane < TopK) { alpha[lane] = routed_scale * weight / denominator; }
+    } else {
+        float exponential = 0.0f;
+        if (lane < TopK) { exponential = expf(selected_logits[lane] - selected_logits[0]); }
+        float denominator = warp_reduce_sum(exponential);
+        denominator       = __shfl_sync(kFullWarpMask, denominator, 0);
+        if (lane < TopK) { alpha[lane] = exponential / denominator; }
+    }
     if constexpr (HasShared) {
         if (lane == 0) { *shared_scale = sigmoid(scores[Experts]); }
     }

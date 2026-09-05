@@ -63,11 +63,12 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
 
 __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int* __restrict__ ids,
                                           float* __restrict__ alpha,
-                                          float* __restrict__ shared_scale) {
+                                          float* __restrict__ shared_scale,
+                                          const float* __restrict__ router_bias) {
     __shared__ float selected_logits[kTopK];
     if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared>(scores, ids, alpha, shared_scale,
-                                                  selected_logits);
+    sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating>(
+        scores, ids, alpha, shared_scale, selected_logits, router_bias, kRoutedScale);
 }
 
 /// An expert's gate/up block stores the gate rows first in every groupwise-int and W8 artifact.
@@ -699,7 +700,8 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
     auto* ids          = static_cast<int*>(workspace.ids.data);
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
     auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
-    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale);
+    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale,
+                                                   weights.router_bias);
     CUDA_CHECK(cudaGetLastError());
     // The round hook sees the final ids before the expert kernels; its launches sit between
     // D2 and D3 on the stream, so D3's programmatic wait resolves against them.

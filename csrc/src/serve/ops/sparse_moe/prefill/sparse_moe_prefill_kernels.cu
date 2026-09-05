@@ -42,7 +42,9 @@ namespace sinfer::ops::detail {
     constexpr int kTopK                   = kGeometry.experts_per_token;                           \
     constexpr bool kHasShared             = kGeometry.has_shared();                                \
     constexpr int kIntermediate           = kGeometry.intermediate;             \
-    constexpr int kPaths                  = kGeometry.paths();
+    constexpr int kPaths                  = kGeometry.paths();                         \
+    constexpr SparseMoeGating kGating     = kGeometry.gating;                          \
+    constexpr float kRoutedScale          = kGeometry.routed_scale;
 
 namespace geometry_qwen36 {
 SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen36Geometry)

@@ -762,13 +762,17 @@ public:
                               cudaMemcpyDeviceToDevice),
                    "seed SparseMoe destination");
 
+        // Named, not positional: this struct grew a member between the router and the routed
+        // experts when a second kind of router arrived, and positional initialisation had every
+        // weight land one field to the left of where it belonged.
         ops::SparseMoeWeights weights{
-            dense_bf16_weight(device_router_.p, kGeometry.router_rows(), kHidden),
-            routed_gate_.weight(),
-            routed_down_.weight(),
-            kHasShared ? shared_gate_->weight() : Weight{},
-            kHasShared ? shared_down_device_->weight() : Weight{},
-            kTopK,
+            .router_shared_gate = dense_bf16_weight(device_router_.p, kGeometry.router_rows(),
+                                                    kHidden),
+            .routed_gate_up     = routed_gate_.weight(),
+            .routed_down        = routed_down_.weight(),
+            .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
+            .shared_down        = kHasShared ? shared_down_device_->weight() : Weight{},
+            .experts_per_token  = kTopK,
         };
         attach_nvfp4_scales(weights);
         Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
@@ -853,13 +857,17 @@ public:
         cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.p, residual_seed.bytes,
                               cudaMemcpyDeviceToDevice),
                    "seed SparseMoe destination");
+        // Named, not positional: this struct grew a member between the router and the routed
+        // experts when a second kind of router arrived, and positional initialisation had every
+        // weight land one field to the left of where it belonged.
         ops::SparseMoeWeights weights{
-            dense_bf16_weight(device_router_.p, kGeometry.router_rows(), kHidden),
-            routed_gate_.weight(),
-            routed_down_.weight(),
-            kHasShared ? shared_gate_->weight() : Weight{},
-            kHasShared ? shared_down_device_->weight() : Weight{},
-            kTopK,
+            .router_shared_gate = dense_bf16_weight(device_router_.p, kGeometry.router_rows(),
+                                                    kHidden),
+            .routed_gate_up     = routed_gate_.weight(),
+            .routed_down        = routed_down_.weight(),
+            .shared_gate_up     = kHasShared ? shared_gate_->weight() : Weight{},
+            .shared_down        = kHasShared ? shared_down_device_->weight() : Weight{},
+            .experts_per_token  = kTopK,
         };
         weights.slot_of_expert = static_cast<const std::int32_t*>(device_table.p);
         attach_nvfp4_scales(weights);
