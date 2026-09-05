@@ -307,7 +307,10 @@ SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights) {
         .hidden              = weights.router_shared_gate.k,
         // The router's extra row is the shared expert's gate, so it is there exactly when the
         // shared expert is.
-        .experts             = weights.router_shared_gate.n - (shared ? 1 : 0),
+        // The extra router row is the shared expert's gate, so it is there exactly when the
+        // shared expert is *and* is gated -- GLM-5.3 has one and does not gate it.
+        .experts             = weights.router_shared_gate.n -
+                               (shared && weights.shared_gated ? 1 : 0),
         .experts_per_token   = weights.experts_per_token,
         .intermediate        = weights.routed_down.k,
         // The router's own bias says which gating this is: a softmax router has no such tensor
@@ -315,6 +318,7 @@ SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights) {
         .gating              = weights.router_bias != nullptr ? SparseMoeGating::SigmoidBiasTopK
                                                               : SparseMoeGating::SoftmaxTopK,
         .routed_scale        = weights.routed_scale,
+        .shared_gated        = weights.shared_gated,
         .shared_intermediate = shared ? weights.shared_down.k : 0,
     };
     require_registered(geometry);

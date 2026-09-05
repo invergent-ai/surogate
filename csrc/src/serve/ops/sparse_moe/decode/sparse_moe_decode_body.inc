@@ -67,7 +67,7 @@ __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int*
                                           const float* __restrict__ router_bias) {
     __shared__ float selected_logits[kTopK];
     if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating>(
+    sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated>(
         scores, ids, alpha, shared_scale, selected_logits, router_bias, kRoutedScale);
 }
 

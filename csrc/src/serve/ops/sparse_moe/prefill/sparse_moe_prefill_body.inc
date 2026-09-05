@@ -126,7 +126,7 @@ __global__ void sparse_moe_prefill_select_count_kernel(const float* __restrict__
 
     const int token = static_cast<int>(blockIdx.x) * kSparseMoeRouteTileTokens + warp;
     if (token < tokens) {
-        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating>(
+        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated>(
             scores + static_cast<std::int64_t>(token) * kSparseMoeRouterScoreRows,
             ids + token * kTopK, alpha + token * kTopK, shared_scale + token,
             selected_logits[warp], router_bias, kRoutedScale);

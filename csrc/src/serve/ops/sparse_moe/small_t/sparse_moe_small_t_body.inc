@@ -86,7 +86,7 @@ sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __re
 
     const int resident_warps = static_cast<int>(blockDim.x) >> 5;
     for (int token = tid >> 5; token < Tokens; token += resident_warps) {
-        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating>(scores[token], token_ids + token * kTopK,
+        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated>(scores[token], token_ids + token * kTopK,
                                                       token_alpha + token * kTopK,
                                                       shared_scale + token,
                                                       selected_logits[token], router_bias, kRoutedScale);
@@ -128,7 +128,7 @@ __global__ void sparse_moe_small_t_s2_two_batch_kernel(const float* __restrict__
         __syncthreads();
         if (warp < batch_tokens) {
             const int token = token_begin + warp;
-            sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating>(scores[warp], token_ids + token * kTopK,
+            sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated>(scores[warp], token_ids + token * kTopK,
                                                           token_alpha + token * kTopK,
                                                           shared_scale + token,
                                                           selected_logits[warp], router_bias, kRoutedScale);

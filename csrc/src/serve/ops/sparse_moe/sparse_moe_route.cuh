@@ -42,7 +42,7 @@ __device__ __forceinline__ SparseMoeRankedValue sparse_moe_warp_best(SparseMoeRa
 // its gate from logit `Experts`. A routed-only router has exactly `Experts` rows, so there is no
 // such logit to read and `HasShared` is what says so; `shared_scale` is then untouched.
 template <int Experts, int TopK, bool HasShared = true,
-          SparseMoeGating Gating = SparseMoeGating::SoftmaxTopK>
+          SparseMoeGating Gating = SparseMoeGating::SoftmaxTopK, bool SharedGated = true>
 __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores, int* ids,
                                                              float* alpha, float* shared_scale,
                                                              float* selected_logits,
@@ -105,7 +105,9 @@ __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores
         if (lane < TopK) { alpha[lane] = exponential / denominator; }
     }
     if constexpr (HasShared) {
-        if (lane == 0) { *shared_scale = sigmoid(scores[Experts]); }
+        // An ungated shared expert is added with weight one, and its router has no row to read:
+        // `scores[Experts]` would be one past the end of a table sized to the experts alone.
+        if (lane == 0) { *shared_scale = SharedGated ? sigmoid(scores[Experts]) : 1.0f; }
     }
 }
 

@@ -35,7 +35,8 @@ namespace sinfer::ops::detail {
     constexpr bool kHasShared             = kGeometry.has_shared();                                \
     constexpr int kPaths                  = kGeometry.paths();                         \
     constexpr SparseMoeGating kGating     = kGeometry.gating;                          \
-    constexpr float kRoutedScale          = kGeometry.routed_scale;
+    constexpr float kRoutedScale          = kGeometry.routed_scale;                    \
+    constexpr bool kSharedGated           = kGeometry.shared_gated;
 
 namespace geometry_qwen36 {
 SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen36Geometry)

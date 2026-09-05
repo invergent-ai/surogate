@@ -40,6 +40,11 @@ struct SparseMoeGeometry {
     /// What the renormalised routed weights are multiplied by. One for every mixture whose
     /// router does not say otherwise; GLM-5.3 states 2.5.
     float routed_scale = 1.0F;
+    /// Whether the always-on expert is gated, which is a separate question from whether there
+    /// is one. Qwen's shared expert is weighted by a sigmoid the router carries as one extra
+    /// row; GLM-5.3's is added with weight one and its router has exactly one row per expert.
+    /// Coupling the two would read a 288-row router as 287 experts and a gate.
+    bool shared_gated = true;
     /// The always-on expert's FFN width, or zero where there is no always-on expert.
     ///
     /// Not every mixture has one. Qwen3-30B-A3B, LFM2-MoE, GPT-OSS and Gemma 4 route every
@@ -50,9 +55,9 @@ struct SparseMoeGeometry {
     std::int32_t shared_intermediate = 0;
 
     [[nodiscard]] constexpr bool has_shared() const noexcept { return shared_intermediate > 0; }
-    /// The router carries one row per expert, plus the shared expert's gate where there is one.
+    /// The router carries one row per expert, plus the shared expert's gate where it has one.
     [[nodiscard]] constexpr std::int32_t router_rows() const noexcept {
-        return experts + (has_shared() ? 1 : 0);
+        return experts + (has_shared() && shared_gated ? 1 : 0);
     }
     [[nodiscard]] constexpr std::int32_t expert_rows() const noexcept { return 2 * intermediate; }
     [[nodiscard]] constexpr std::int32_t shared_rows() const noexcept {
@@ -76,20 +81,21 @@ struct SparseMoeGeometry {
 /// Qwen3.5/3.6 MoE (35B-A3B and the 4B/2B MTP heads): 256 experts, top-8, FFN 512, hidden 2048,
 /// plus a shared expert of the same width.
 inline constexpr SparseMoeGeometry kSparseMoeQwen36Geometry{
-    2048, 256, 8, 512, SparseMoeGating::SoftmaxTopK, 1.0F, 512};
+    2048, 256, 8, 512, SparseMoeGating::SoftmaxTopK, 1.0F, true, 512};
 /// Qwen3.8-Flash-Next: 512 experts, top-10, FFN 640, hidden 2560, shared expert of the same
 /// width.
 inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{
-    2560, 512, 10, 640, SparseMoeGating::SoftmaxTopK, 1.0F, 640};
+    2560, 512, 10, 640, SparseMoeGating::SoftmaxTopK, 1.0F, true, 640};
 /// Qwen3-30B-A3B: 128 experts, top-8, FFN 768, hidden 2048, and no shared expert at all -- the
 /// first registered mixture that routes every token entirely.
 inline constexpr SparseMoeGeometry kSparseMoeQwen3MoeGeometry{
-    2048, 128, 8, 768, SparseMoeGating::SoftmaxTopK, 1.0F, 0};
+    2048, 128, 8, 768, SparseMoeGating::SoftmaxTopK, 1.0F, true, 0};
 /// GLM-5.3-Flash: 288 experts, top-8, FFN 2048 with an always-on expert of the same width, and
 /// the sigmoid-plus-bias router its checkpoint declares (`expert_gating_func` 2,
 /// `expert_weights_scale` 2.5).
 inline constexpr SparseMoeGeometry kSparseMoeGlm53Geometry{
-    4096, 288, 8, 2048, SparseMoeGating::SigmoidBiasTopK, 2.5F, 2048};
+    4096, 288, 8, 2048, SparseMoeGating::SigmoidBiasTopK, 2.5F, /*shared_gated=*/false,
+    2048};
 
 /// Every mixture this op serves. One list, so registering a geometry is one line here and one
 /// kernel-body instantiation per route rather than a predicate repeated in five places.
@@ -109,6 +115,9 @@ struct SparseMoeWeights {
     /// What the renormalised routed weights are multiplied by. Cannot be read off any shape, so
     /// the caller states it; it must match the registered geometry's.
     float routed_scale = 1.0F;
+    /// Whether the always-on expert is weighted by a router row or added with weight one. Also
+    /// unreadable from the shapes -- a 288-row router is 288 experts ungated or 287 and a gate.
+    bool shared_gated = true;
     Weight routed_gate_up;
     Weight routed_down;
     Weight shared_gate_up;
