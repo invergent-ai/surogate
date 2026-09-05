@@ -74,6 +74,28 @@ class ShardReader:
         self._reset_handle()
 
     @classmethod
+    def for_directory(cls, model_dir: str | Path) -> ShardReader:
+        """The reader a model directory needs, sharded or not.
+
+        A checkpoint small enough to fit one file ships no
+        `model.safetensors.index.json`, and asking for one is a FileNotFoundError
+        rather than a useful message. Both layouts are ordinary, so both are read
+        here: the index when it exists, the single file when it does not.
+        """
+        root = Path(model_dir)
+        index = root / "model.safetensors.index.json"
+        if index.is_file():
+            return cls(root)
+        singles = sorted(root.glob("*.safetensors"))
+        if len(singles) == 1:
+            return cls.from_file(singles[0])
+        if not singles:
+            raise FileNotFoundError(f"no safetensors weights in {root}")
+        raise FileNotFoundError(
+            f"{root} holds {len(singles)} safetensors files and no index naming them"
+        )
+
+    @classmethod
     def from_index(cls, index_path: str | Path) -> ShardReader:
         path = Path(index_path)
         return cls(path.parent, path.name)
