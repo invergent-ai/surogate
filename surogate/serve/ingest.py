@@ -78,6 +78,10 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     if model_type == "qwen3" and hidden > 0 and layers > 0:
         return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3",
                                gguf_repack=True)
+    # LFM2 interleaves attention with a short convolution; which layer is which is
+    # in the checkpoint, so the architecture is the only gate here too.
+    if model_type == "lfm2" and hidden > 0 and layers > 0:
+        return ConverterTarget("lfm2", "surogate.serve.convert.lfm2.convert", "LFM2")
     if model_type == "llama" and hidden > 0 and layers > 0:
         return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "Llama",
                                gguf_repack=True)
