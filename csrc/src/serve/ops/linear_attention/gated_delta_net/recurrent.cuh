@@ -63,7 +63,11 @@ __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], __
     pair[1]              = __floats2bfloat162_rn(reg[2], reg[3]);
 }
 
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+// `static`: a non-template kernel defined in a header has external linkage, so a second
+// translation unit including this file collides with the first at link time -- which is what
+// happened the moment the Kimi delta rule reused these lane helpers. Every other kernel here is
+// a template and already has the linkage a header needs.
+static __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_fp32_kernel(const float* __restrict__ q, const float* __restrict__ k,
                           const float* __restrict__ v, const float* __restrict__ g,
                           const float* __restrict__ beta, float* __restrict__ ssm_state,

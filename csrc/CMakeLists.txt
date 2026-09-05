@@ -1031,6 +1031,8 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/replay.cpp
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/recurrent.cu
+  ${SERVE_ROOT}/ops/linear_attention/kimi_delta_net/kimi_delta_net.cpp
+  ${SERVE_ROOT}/ops/linear_attention/kimi_delta_net/recurrent.cu
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/launch.cu
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
   ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/state_passing.cu

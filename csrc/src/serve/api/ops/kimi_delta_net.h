@@ -1,0 +1,61 @@
+#pragma once
+
+#include "core/arena.h"
+#include "core/tensor.h"
+
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace sinfer::ops {
+
+/**
+ * Op: kimi_delta_net
+ *
+ * Kimi Delta Attention's recurrence, which is GLM-5.3's linear mixer. It is the gated delta
+ * net's recurrence with one difference, and the difference is the whole reason it is a separate
+ * op: the forget gate is one value per *key channel* rather than one per head, so the state
+ * decays by a diagonal instead of a scalar.
+ *
+ * For each value head h, with G = value_heads/qk_heads and its Q/K head qh = floor(h/G),
+ * starting from S_h and for t in increasing order:
+ *
+ *   alpha[c]     = exp(g[c,h,t])                       one per key channel
+ *   delta        = beta[h,t] * (v[:,h,t] - S_h * (alpha ⊙ k[:,qh,t]))
+ *   S_h[:,c]     = alpha[c] * S_h[:,c] + delta * k[c,qh,t]
+ *   ideal[:,h,t] = scale * S_h * q[:,qh,t]
+ *
+ * Read against `gated_delta_net`: there, `alpha` is a scalar and multiplies the whole state, so
+ * it can be pulled out of the dot product. Here it belongs inside it -- the prediction the delta
+ * corrects is the state *after* this token's decay, and each key channel has decayed by its own
+ * amount.
+ *
+ * Shapes/dtypes are contiguous q/k BF16 [128,Hqk,T], v/out BF16 [128,Hv,T], g FP32 [128,Hv,T]
+ * (the per-channel gate, laid out like v), beta FP32 [Hv,T], and state FP32 [128,128,Hv], where
+ * Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale` is 1/sqrt(128). When `normalize_qk` is true the
+ * implementation consumes raw q/k and applies x / sqrt(sum(x^2) + 1e-6) to every 128-element row
+ * before using it; when false they are consumed as supplied.
+ *
+ * The oracle evaluates the complete recurrence and `ideal` naively in FP64 from the represented
+ * inputs and the FP32 initial state. The BF16 out is promoted and compared with that; output
+ * storage rounding belongs to the Op's numerical criterion, not the oracle. Inputs and out do
+ * not overlap the state or one another. T may be any positive value.
+ *
+ * This overload reads and writes the same `ssm_state`, publishing it after all T tokens.
+ */
+void kimi_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                    const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
+                    Tensor& out, cudaStream_t stream);
+
+/**
+ * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
+ * `ssm_state_in` and `ssm_state_out` may be disjoint or exactly the same storage. No other
+ * argument may overlap either state.
+ */
+void kimi_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                    const Tensor& beta, float scale, bool normalize_qk,
+                    const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                    cudaStream_t stream);
+
+} // namespace sinfer::ops

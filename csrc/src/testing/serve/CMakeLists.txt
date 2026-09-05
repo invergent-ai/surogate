@@ -300,6 +300,9 @@ sinfer_add_op_test(sinfer_kv_cache_append_prefix_test
 sinfer_add_op_test(sinfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
   LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_kimi_delta_net_test
+  SOURCES ops/test_kimi_delta_net.cpp
+  LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
   LIBRARIES sinfer_ops)
