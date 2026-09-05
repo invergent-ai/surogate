@@ -101,6 +101,7 @@ using LoadedQwen38FlashNext = LoadedTarget<Qwen38FlashNext>;
 using Qwen38FlashNextInstance = TargetInstance<Qwen38FlashNext>;
 
 
+using Glm5NextPipeline   = runtime::PipelineInstance<Glm5NextInstance>;
 using Qwen38FlashNextPipeline = runtime::PipelineInstance<Qwen38FlashNextInstance>;
 using Qwen3_5Pipeline    = runtime::PipelineInstance<Qwen3_5Instance>;
 using Qwen3_5MoePipeline = runtime::PipelineInstance<Qwen3_5MoeInstance>;
@@ -113,6 +114,7 @@ using ActiveTarget =
                  std::unique_ptr<Qwen3_5Instance>,
                  std::unique_ptr<Qwen3_5MoeInstance>,
                  std::unique_ptr<Qwen38FlashNextInstance>,
+                 std::unique_ptr<Glm5NextPipeline>,
                  std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_5Pipeline>,
                  std::unique_ptr<Qwen3_5MoePipeline>>;
 

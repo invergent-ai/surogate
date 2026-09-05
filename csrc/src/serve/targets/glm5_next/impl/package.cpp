@@ -9,6 +9,9 @@
 #include "targets/glm5_next/impl/load/bindings.h"
 #include "targets/glm5_next/impl/variant.h"
 
+#include "core/device.h"
+#include "ops/linear/bf16/bf16_cublaslt.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
@@ -155,7 +158,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
+    if (identity.model_id == model_id && identity.weights_id == "w8-mhc-v1") {
         return WeightsProfile::GroupwiseInt;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -166,7 +169,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, family::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, family::startup_features(options),
+                              options.pipeline_stage_first, options.pipeline_stage_last)));
 }
 
 SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
@@ -193,8 +197,20 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile,
                                                         const family::TextGeometry& geometry) {
-    return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                         geometry);
+    auto planner = family::make_sequence_planner<detail::Variant>(device, options,
+                                                                  weights_profile, geometry);
+    // The stream mixings travel between a site's collapse and its scatter in a device buffer
+    // this target owns, and every device that runs a layer needs its own before the first
+    // forward -- a pipeline stage plans on the device it will run on, so this is where it is
+    // reachable.
+    {
+        int previous = 0;
+        CUDA_CHECK(cudaGetDevice(&previous));
+        CUDA_CHECK(cudaSetDevice(device.device));
+        detail::Variant::prewarm_device_scratch();
+        CUDA_CHECK(cudaSetDevice(previous));
+    }
+    return planner;
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
@@ -206,6 +222,11 @@ family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) 
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    // The program captures its decode graphs at construction, so everything that would
+    // allocate has to exist first. The latent expansion's key half is BF16, which routes
+    // through cuBLASLt, and that route creates its handle and workspace on first use.
+    ops::detail::bf16_cublaslt_prewarm();
+    detail::Variant::prewarm_device_scratch();
     return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }

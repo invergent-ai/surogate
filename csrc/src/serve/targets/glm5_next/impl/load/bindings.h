@@ -83,6 +83,10 @@ struct FeedForwardPlan {
 
 struct TextLayerPlan {
     bool attends = false;
+    /// Whether this pipeline stage runs this layer. A stage still *binds* every layer -- the
+    /// artifact's shapes are validated whole, and every object it holds has to be consumed by
+    /// the target that reads it -- but uploads only its own.
+    bool resident = true;
     HyperConnectionPlan attention_hc;
     artifact::ObjectHandle input_norm;
     LatentAttentionPlan attention;
@@ -97,6 +101,11 @@ struct BindingPlan {
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
+    /// Whether this stage reads the embedding table and the output head. Every stage validates
+    /// both; only the first and last upload them.
+    bool embeds   = true;
+    bool finishes = true;
+
     WeightPlan token_embedding;
     std::vector<TextLayerPlan> text_layers;
     artifact::ObjectHandle final_norm;
@@ -109,7 +118,8 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               family::StartupFeatures features);
+                               family::StartupFeatures features, int stage_first = 0,
+                               int stage_last = 0);
 
 /// Which layers of this artifact attend, read from the objects it holds rather than from a
 /// number beside them: a layer carrying a latent key/value projection attends, one carrying

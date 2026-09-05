@@ -22,6 +22,11 @@ using artifact::NumericFormat;
 /// names the one entry it serves rather than deriving numbers the kernels cannot honour.
 inline constexpr ops::SparseMoeGeometry kMoeGeometry = ops::kSparseMoeGlm53Geometry;
 
+/// Placement of the layer being bound: Device for the layers this stage runs, ValidateOnly for
+/// another stage's -- validated, never uploaded. A 200 GB checkpoint does not fit on one card,
+/// so this is what makes eight of them enough.
+thread_local artifact::TensorPlacement g_layer_placement = artifact::TensorPlacement::Device;
+
 NumericFormat endpoint_format(WeightsProfile weights_profile) {
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
@@ -36,8 +41,14 @@ WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericF
     const auto dims = std::vector<std::uint64_t>(shape);
     const artifact::LinearBinding binding =
         artifact::bind_linear(binder, name, static_cast<std::int32_t>(dims[0]),
-                              static_cast<std::int32_t>(dims[1]));
+                              static_cast<std::int32_t>(dims[1]), g_layer_placement);
     return WeightPlan{.object = binding.object, .format = binding.format};
+}
+
+artifact::ObjectHandle bind_layer_tensor(artifact::Binder& binder, const std::string& name,
+                                         NumericFormat format,
+                                         std::initializer_list<std::uint64_t> shape) {
+    return artifact::bind_tensor(binder, name, format, shape, g_layer_placement);
 }
 
 Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
@@ -59,10 +70,10 @@ HyperConnectionPlan bind_hyper_connection(artifact::Binder& binder, const std::s
     out.mix   = bind_weight(binder, base + "_mix", NumericFormat::BF16,
                             {static_cast<std::uint64_t>(g.hyper_connection_mix_rows()),
                              static_cast<std::uint64_t>(g.residual)});
-    out.base  = artifact::bind_device_tensor(
+    out.base  = bind_layer_tensor(
         binder, base + "_base", NumericFormat::FP32,
         {static_cast<std::uint64_t>(g.hyper_connection_mix_rows())});
-    out.scale = artifact::bind_device_tensor(binder, base + "_scale", NumericFormat::FP32, {3});
+    out.scale = bind_layer_tensor(binder, base + "_scale", NumericFormat::FP32, {3});
     return out;
 }
 
@@ -85,8 +96,8 @@ void bind_feed_forward(artifact::Binder& binder, const std::string& prefix, bool
     out.router      = bind_weight(binder, prefix + "moe/router", NumericFormat::BF16,
                                   {static_cast<std::uint64_t>(kMoeGeometry.router_rows()),
                                    static_cast<std::uint64_t>(g.hidden)});
-    out.router_bias = artifact::bind_device_tensor(binder, prefix + "moe/router_bias",
-                                                   NumericFormat::FP32, {experts});
+    out.router_bias = bind_layer_tensor(binder, prefix + "moe/router_bias", NumericFormat::FP32,
+                                        {experts});
     out.routed_gate_up =
         bind_weight(binder, prefix + "moe/routed_gate_up", weights,
                     {experts * static_cast<std::uint64_t>(kMoeGeometry.expert_rows()),
@@ -103,7 +114,8 @@ void bind_feed_forward(artifact::Binder& binder, const std::string& prefix, bool
                                    static_cast<std::uint64_t>(kMoeGeometry.shared_intermediate)});
 }
 
-void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, BindingPlan& out) {
+void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, int stage_first,
+                      int stage_last, BindingPlan& out) {
     const NumericFormat weights   = endpoint_format(weights_profile);
     const family::TextGeometry& g = out.geometry;
     out.text_layers.resize(static_cast<std::size_t>(g.layers));
@@ -111,17 +123,22 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = layer_prefix(layer);
         target.attends           = g.layer_attends(static_cast<std::int32_t>(layer));
+        const bool staged        = stage_last > 0;
+        target.resident          = !staged || (static_cast<int>(layer) >= stage_first &&
+                                      static_cast<int>(layer) < stage_last);
+        g_layer_placement        = target.resident ? artifact::TensorPlacement::Device
+                                                   : artifact::TensorPlacement::ValidateOnly;
 
         target.attention_hc = bind_hyper_connection(binder, prefix, "attn", g);
-        target.input_norm   = artifact::bind_device_tensor(
-            binder, prefix + "input_norm", NumericFormat::BF16,
-            {static_cast<std::uint64_t>(g.hidden)});
+        target.input_norm   = bind_layer_tensor(binder, prefix + "input_norm",
+                                                NumericFormat::BF16,
+                                                {static_cast<std::uint64_t>(g.hidden)});
         if (target.attends) {
             LatentAttentionPlan& mla = target.attention;
             mla.query_a      = bind_weight(binder, prefix + "mla/query_a", weights,
                                            {static_cast<std::uint64_t>(g.q_lora_rank),
                                             static_cast<std::uint64_t>(g.hidden)});
-            mla.query_a_norm = artifact::bind_device_tensor(
+            mla.query_a_norm = bind_layer_tensor(
                 binder, prefix + "mla/query_a_norm", NumericFormat::BF16,
                 {static_cast<std::uint64_t>(g.q_lora_rank)});
             mla.query_b      = bind_weight(binder, prefix + "mla/query_b", weights,
@@ -130,7 +147,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
             mla.kv_a         = bind_weight(binder, prefix + "mla/kv_a", weights,
                                            {static_cast<std::uint64_t>(g.kv_lora_rank),
                                             static_cast<std::uint64_t>(g.hidden)});
-            mla.kv_a_norm    = artifact::bind_device_tensor(
+            mla.kv_a_norm    = bind_layer_tensor(
                 binder, prefix + "mla/kv_a_norm", NumericFormat::BF16,
                 {static_cast<std::uint64_t>(g.kv_lora_rank)});
             // BF16: llama.cpp stores the key half of the expansion transposed, so it is the one
@@ -151,7 +168,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
                                                static_cast<std::uint64_t>(g.hidden)});
             // Tap-major, [K, channels] as the artifact writes it, which is [channels, K] in the
             // engine's own layout.
-            kda.convolution = artifact::bind_device_tensor(
+            kda.convolution = bind_layer_tensor(
                 binder, prefix + "kda/convolution", NumericFormat::BF16,
                 {static_cast<std::uint64_t>(g.gdn_conv_kernel),
                  static_cast<std::uint64_t>(g.convolution_dim())});
@@ -161,10 +178,10 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
             kda.decay_b    = bind_weight(binder, prefix + "kda/decay_b", weights,
                                          {static_cast<std::uint64_t>(g.value_dim()),
                                           static_cast<std::uint64_t>(g.kda_gate_rank)});
-            kda.decay_bias = artifact::bind_device_tensor(
+            kda.decay_bias = bind_layer_tensor(
                 binder, prefix + "kda/decay_bias", NumericFormat::FP32,
                 {static_cast<std::uint64_t>(g.value_dim())});
-            kda.a_log      = artifact::bind_device_tensor(
+            kda.a_log      = bind_layer_tensor(
                 binder, prefix + "kda/a_log", NumericFormat::FP32,
                 {static_cast<std::uint64_t>(g.gdn_value_heads)});
             kda.beta       = bind_weight(binder, prefix + "kda/beta", weights,
@@ -176,7 +193,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
             kda.gate_b     = bind_weight(binder, prefix + "kda/gate_b", weights,
                                          {static_cast<std::uint64_t>(g.value_dim()),
                                           static_cast<std::uint64_t>(g.kda_gate_rank)});
-            kda.norm       = artifact::bind_device_tensor(
+            kda.norm       = bind_layer_tensor(
                 binder, prefix + "kda/norm", NumericFormat::BF16,
                 {static_cast<std::uint64_t>(g.gdn_value_head_dim)});
             kda.output     = bind_weight(binder, prefix + "kda/output", weights,
@@ -184,14 +201,15 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
                                           static_cast<std::uint64_t>(g.value_dim())});
         }
         target.feed_forward_hc     = bind_hyper_connection(binder, prefix, "ffn", g);
-        target.post_attention_norm = artifact::bind_device_tensor(
-            binder, prefix + "post_attention_norm", NumericFormat::BF16,
-            {static_cast<std::uint64_t>(g.hidden)});
+        target.post_attention_norm = bind_layer_tensor(binder, prefix + "post_attention_norm",
+                                                       NumericFormat::BF16,
+                                                       {static_cast<std::uint64_t>(g.hidden)});
         // Which layers are dense is the artifact's to say too, and it says it the same way:
         // a layer holding a router is a mixture layer.
         const bool sparse = binder.reader().find(prefix + "moe/router") != nullptr;
         bind_feed_forward(binder, prefix, sparse, weights, g, target.feed_forward);
     }
+    g_layer_placement = artifact::TensorPlacement::Device;
 }
 
 HyperConnectionPayload load_hyper_connection(const artifact::MaterializedArtifact& backing,
@@ -266,7 +284,8 @@ family::TextGeometry declared_geometry_with_schedule(const artifact::Reader& rea
 }
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               family::StartupFeatures features) {
+                               family::StartupFeatures features, int stage_first,
+                               int stage_last) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.geometry     = declared_geometry_with_schedule(binder.reader());
@@ -285,16 +304,28 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
     const family::TextGeometry& g         = out.geometry;
+    // The two endpoints are 1.3 GB together and only two of the eight stages read them: the
+    // runtime already asks `stage_embeds()` and `stage_finishes()` before touching either, so
+    // a middle stage validates them and uploads neither. On a 200 GB checkpoint split eight
+    // ways that is the difference between the last stage fitting and not.
+    const bool staged        = stage_last > 0;
+    out.embeds               = !staged || stage_first == 0;
+    out.finishes             = !staged || stage_last >= g.layers;
+    g_layer_placement        = out.embeds ? artifact::TensorPlacement::Device
+                                          : artifact::TensorPlacement::ValidateOnly;
     out.token_embedding = bind_weight(binder, "text/token_embedding", vocabulary_format,
                                       {static_cast<std::uint64_t>(g.output_rows),
                                        static_cast<std::uint64_t>(g.hidden)});
-    bind_text_layers(binder, weights_profile, out);
-    out.final_norm      = artifact::bind_device_tensor(
-        binder, "text/final_norm", NumericFormat::BF16,
-        {static_cast<std::uint64_t>(g.hidden)});
+    g_layer_placement   = artifact::TensorPlacement::Device;
+    bind_text_layers(binder, weights_profile, stage_first, stage_last, out);
+    g_layer_placement   = out.finishes ? artifact::TensorPlacement::Device
+                                       : artifact::TensorPlacement::ValidateOnly;
+    out.final_norm      = bind_layer_tensor(binder, "text/final_norm", NumericFormat::BF16,
+                                            {static_cast<std::uint64_t>(g.hidden)});
     out.output_head     = bind_weight(binder, "text/output_head", vocabulary_format,
                                       {static_cast<std::uint64_t>(g.output_rows),
                                        static_cast<std::uint64_t>(g.hidden)});
+    g_layer_placement   = artifact::TensorPlacement::Device;
 
     load_plan.materialization = binder.finish();
     return load_plan;
@@ -313,12 +344,18 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
-    runtime.token_embedding =
-        materialized_weight(backing, plan.token_embedding, g.output_rows, g.hidden);
+    if (plan.embeds) {
+        runtime.token_embedding =
+            materialized_weight(backing, plan.token_embedding, g.output_rows, g.hidden);
+    }
 
     std::size_t full_index = 0;
     std::size_t kda_index  = 0;
     for (const TextLayerPlan& source : plan.text_layers) {
+        if (!source.resident) { // another stage's layer: keep the index bookkeeping only
+            (source.attends ? full_index : kda_index) += 1;
+            continue;
+        }
         const Tensor input_norm = artifact::materialized_tensor(
             backing, source.input_norm, NumericFormat::BF16,
             {static_cast<std::uint64_t>(g.hidden)});
@@ -395,10 +432,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         }
     }
 
-    runtime.final_norm  = artifact::materialized_tensor(
-        backing, plan.final_norm, NumericFormat::BF16,
-        {static_cast<std::uint64_t>(g.hidden)});
-    runtime.output_head = materialized_weight(backing, plan.output_head, g.output_rows, g.hidden);
+    if (plan.finishes) {
+        runtime.final_norm  = artifact::materialized_tensor(
+            backing, plan.final_norm, NumericFormat::BF16,
+            {static_cast<std::uint64_t>(g.hidden)});
+        runtime.output_head =
+            materialized_weight(backing, plan.output_head, g.output_rows, g.hidden);
+    }
 }
 
 } // namespace sinfer::targets::glm5_next::detail

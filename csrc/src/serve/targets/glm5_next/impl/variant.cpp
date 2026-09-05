@@ -5,7 +5,7 @@
 #include "api/ops/gdn_gating.h"
 #include "api/ops/hyper_connection.h"
 #include "api/ops/linear.h"
-#include "api/ops/linear_swiglu.h"
+#include "api/ops/silu_mul.h"
 #include "api/ops/manifold_hyper_connection.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/scatter.h"
@@ -130,6 +130,17 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
     t_post          = Tensor{};
     t_comb          = Tensor{};
     t_mixing_device = -1;
+}
+
+/// The output-gate plane as a matrix. The family hands it over shaped by head -- `[value_dim,
+/// heads, T]` in a prefill and `[value_dim, W, B]` in a decode round -- and a projection writes
+/// `[N, T]`, so the rows the weight produces name the split.
+Tensor gate_matrix(const Tensor& output_gate, std::int32_t rows) {
+    const std::int64_t total = output_gate.numel();
+    if (rows <= 0 || total % rows != 0) {
+        throw std::logic_error("glm5_next: the output gate plane is not a whole number of rows");
+    }
+    return output_gate.view({rows, static_cast<std::int32_t>(total / rows)});
 }
 
 [[noreturn]] void no_short_conv(const char* leaf) {
@@ -304,10 +315,11 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     const std::int32_t tokens = hidden.ne[1];
     auto scope                = workspace.scope();
     Tensor gate_low = workspace.alloc(DType::BF16, {weights.gate_a.n, tokens});
+    Tensor gate     = gate_matrix(output_gate, weights.gate_b.n);
     ops::linear(hidden, weights.query_key_value, qkv, kTextPolicy, workspace, stream);
     // The output gate is low-rank, so it is two projections rather than rows of the fused one.
     ops::linear(hidden, weights.gate_a, gate_low, kTextPolicy, workspace, stream);
-    ops::linear(gate_low, weights.gate_b, output_gate, kTextPolicy, workspace, stream);
+    ops::linear(gate_low, weights.gate_b, gate, kTextPolicy, workspace, stream);
 }
 
 void Variant::gdn_input_projection_snapshot(
@@ -335,7 +347,7 @@ void Variant::gdn_input_projection_snapshot(
     ops::extract_bf16_columns(convolved, 0, query, stream);
     ops::extract_bf16_columns(convolved, per, key, stream);
     ops::extract_bf16_columns(convolved, 2 * per, value, stream);
-    Tensor flat_gate = output_gate.view({output_gate.ne[0], width * batch});
+    Tensor flat_gate = gate_matrix(output_gate, weights.gate_b.n);
     ops::linear(flat_hidden, weights.gate_a, gate_low, kTextPolicy, workspace, stream);
     ops::linear(gate_low, weights.gate_b, flat_gate, kTextPolicy, workspace, stream);
 }
@@ -364,9 +376,17 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         CUDA_CHECK(cudaMemsetAsync(out.data, 0, out.bytes(), stream));
         run_sparse_moe(hidden, weights.moe, out, workspace, stream);
     } else {
-        Tensor activated = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, tokens});
-        ops::linear_swiglu(hidden, weights.gate_up, activated, kTextPolicy, workspace, stream);
-        ops::linear(activated, weights.down, out, kTextPolicy, workspace, stream);
+        // The dense feed-forward as two row-range projections and a pointwise, not the fused
+        // SwiGLU. That op's kernels are instantiated per (intermediate, k), and this shape --
+        // 12,288 over 4,096 -- would be three more instantiations for three of forty-five
+        // layers. `linear_rows` reads the same fused parent and is shape-free.
+        const std::int32_t width = weights.gate_up.n / 2;
+        Tensor gate = workspace.alloc(DType::BF16, {width, tokens});
+        Tensor up   = workspace.alloc(DType::BF16, {width, tokens});
+        ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
+        ops::linear_rows(hidden, weights.gate_up, width, up, &workspace, stream);
+        ops::silu_mul(gate, up, gate, stream);
+        ops::linear(gate, weights.down, out, kTextPolicy, workspace, stream);
     }
     combine_into(out, residual, stream);
 }
@@ -473,7 +493,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
                                                  last),
     });
     const std::size_t dense =
-        plane_bytes(geometry.dense_intermediate, last, DType::BF16) +
+        2 * plane_bytes(geometry.dense_intermediate, last, DType::BF16) +
         std::max(linear_capacity(weights_profile, 2 * geometry.dense_intermediate, geometry.hidden,
                                  first, last),
                  linear_capacity(weights_profile, geometry.hidden, geometry.dense_intermediate,

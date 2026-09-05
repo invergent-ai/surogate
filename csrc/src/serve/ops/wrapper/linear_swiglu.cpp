@@ -18,7 +18,10 @@
 
 #include <string>
 #include <cstdint>
+#include <algorithm>
+#include <array>
 #include <stdexcept>
+#include <utility>
 
 namespace sinfer::ops {
 
@@ -152,38 +155,40 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
-    const std::int32_t t   = x.ne[1];
-    const bool large_shape = x.ne[0] == 5120 && out.ne[0] == 17408 && gate_up_weight.n == 34816 &&
-                             gate_up_weight.k == 5120 && gate_up_weight.padded_shape[0] == 34816 &&
-                             gate_up_weight.padded_shape[1] == 5120;
-    const bool w8_shape = x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
-                          gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
-                          gate_up_weight.padded_shape[1] == 2048;
-    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp (1024 -> 2x3584).
-    const bool q08_shape = x.ne[0] == 1024 && out.ne[0] == 3584 && gate_up_weight.n == 7168 &&
-                           gate_up_weight.k == 1024 && gate_up_weight.padded_shape[0] == 7168 &&
-                           gate_up_weight.padded_shape[1] == 1024;
-    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b mlp (2560 -> 2x9216).
-    const bool q4b_shape = x.ne[0] == 2560 && out.ne[0] == 9216 && gate_up_weight.n == 18432 &&
-                           gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 18432 &&
-                           gate_up_weight.padded_shape[1] == 2560;
-    // qwen3-0.6b mlp (1024 -> 2x3072).
-    const bool q3_06b_shape = x.ne[0] == 1024 && out.ne[0] == 3072 && gate_up_weight.n == 6144 &&
-                              gate_up_weight.k == 1024 && gate_up_weight.padded_shape[0] == 6144 &&
-                              gate_up_weight.padded_shape[1] == 1024;
-    // tinyllama-1.1b mlp (2048 -> 2x5632).
-    const bool tinyllama_shape = x.ne[0] == 2048 && out.ne[0] == 5632 &&
-                                 gate_up_weight.n == 11264 && gate_up_weight.k == 2048 &&
-                                 gate_up_weight.padded_shape[0] == 11264 &&
-                                 gate_up_weight.padded_shape[1] == 2048;
-    // lfm2-1.2b mlp (2048 -> 2x8192).
-    const bool lfm2_shape = x.ne[0] == 2048 && out.ne[0] == 8192 && gate_up_weight.n == 16384 &&
-                            gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 16384 &&
-                            gate_up_weight.padded_shape[1] == 2048;
+    const std::int32_t t = x.ne[1];
+    // The fused route's registered shapes, and which stored format each one may arrive in.
+    // These were seven booleans named after the checkpoints they came from, each testing the
+    // same five numbers, and three more disjunctions further down deciding the route from
+    // them. One list says both things once, and registering a shape is one line.
+    struct FusedShape {
+        std::int32_t input_rows;
+        std::int32_t gate_up_rows;
+        bool q4;             ///< Q4G64 row-split
+        bool w8;             ///< W8G32 row-split
+        bool nvfp4_native;   ///< NVFP4 through the shape's own geometry
+        bool nvfp4_generic;  ///< NVFP4 through the generic GEMM-then-fold route (#84)
+        bool fp8;            ///< row-scaled FP8, via Marlin
+    };
+    static constexpr std::array<FusedShape, 8> kFusedShapes{{
+        {5120, 34816, true, false, true, false, true},    // Qwen3.5-27B
+        {2048, 12288, false, true, false, true, false},   // Qwen3.5/3.6
+        {1024, 7168, false, true, false, true, false},    // Qwen3.5-0.8B
+        {2560, 18432, false, true, false, true, false},   // Qwen3.5-4B
+        {1024, 6144, false, true, false, false, false},   // Qwen3-0.6B
+        {2048, 11264, false, true, false, false, false},  // TinyLlama-1.1B
+        {2048, 16384, false, true, false, false, false},  // LFM2-1.2B
+        {4096, 24576, false, true, false, false, false},  // GLM-5.3-Flash's dense layers
+    }};
+    const auto matched = std::find_if(
+        kFusedShapes.begin(), kFusedShapes.end(), [&](const FusedShape& shape) {
+            return x.ne[0] == shape.input_rows && out.ne[0] == shape.gate_up_rows / 2 &&
+                   gate_up_weight.n == shape.gate_up_rows &&
+                   gate_up_weight.k == shape.input_rows &&
+                   gate_up_weight.padded_shape[0] == shape.gate_up_rows &&
+                   gate_up_weight.padded_shape[1] == shape.input_rows;
+        });
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 ||
-        (!large_shape && !w8_shape && !q08_shape && !q4b_shape && !q3_06b_shape &&
-         !tinyllama_shape && !lfm2_shape)) {
+        out.ne[3] != 1 || matched == kFusedShapes.end()) {
         throw std::invalid_argument(
             "linear_swiglu: invalid tensor shape (x " + std::to_string(x.ne[0]) + "x" +
             std::to_string(x.ne[1]) + ", out " + std::to_string(out.ne[0]) + "x" +
@@ -192,12 +197,6 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
             std::to_string(gate_up_weight.padded_shape[0]) + "x" +
             std::to_string(gate_up_weight.padded_shape[1]) + ")");
     }
-    if (!x.is_contiguous() || !out.is_contiguous()) {
-        throw std::invalid_argument("linear_swiglu: x/out must be contiguous");
-    }
-    if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
-        throw std::invalid_argument("linear_swiglu: x/out must be non-null and 16-byte aligned");
-    }
 
     const bool common_row_split =
         gate_up_weight.layout == QuantLayout::RowSplit &&
@@ -205,22 +204,20 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.shape[0] == gate_up_weight.n &&
         gate_up_weight.shape[1] == gate_up_weight.k && gate_up_weight.qdata != nullptr &&
         gate_up_weight.scales != nullptr;
-    const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4G64_F16S &&
+    const bool q4_weight = matched->q4 && gate_up_weight.qtype == QType::Q4G64_F16S &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
-    const bool w8_weight = (w8_shape || q08_shape || q4b_shape || q3_06b_shape ||
-                            tinyllama_shape || lfm2_shape) &&
-                           gate_up_weight.qtype == QType::W8G32_F16S &&
+    const bool w8_weight = matched->w8 && gate_up_weight.qtype == QType::W8G32_F16S &&
                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
                            gate_up_weight.qhigh == nullptr &&
                            gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight =
         gate_up_weight.qtype == QType::NVFP4 &&
-        (large_shape ||
+        (matched->nvfp4_native ||
          // outside the 27B geometry: GEMM into a BF16 plane, then fold (#84)
-         ((w8_shape || q08_shape || q4b_shape) &&
+         (matched->nvfp4_generic &&
           detail::is_nvfp4_generic_problem(gate_up_weight.n, gate_up_weight.k)));
-    const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16S;
+    const bool fp8_weight = matched->fp8 && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16S;
     if (!q4_weight && !w8_weight && !nvfp4_weight && !fp8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
@@ -274,7 +271,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 
     if (nvfp4_weight) {
         (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
-        if (!large_shape) {
+        if (!matched->nvfp4_native) {
             auto scope = ws.scope();
             Tensor fused = ws.alloc(DType::BF16, {gate_up_weight.n, t}, 256);
             linear(x, gate_up_weight, fused, policy, ws, stream);

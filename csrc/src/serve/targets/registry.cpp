@@ -473,6 +473,7 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
             Target::declared_geometry(reader).layers);
     };
     std::optional<ConstructedTarget> constructed;
+    dispatch.template operator()<Glm5Next, LoadedGlm5Next, Glm5NextInstance>(constructed);
     dispatch.template operator()<Qwen38FlashNext, LoadedQwen38FlashNext,
                                  Qwen38FlashNextInstance>(constructed);
     dispatch.template operator()<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(constructed);
