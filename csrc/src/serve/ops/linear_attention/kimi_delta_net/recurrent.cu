@@ -22,39 +22,6 @@
 namespace sinfer::ops::detail::gated_delta_net {
 namespace {
 
-/// One token of the recurrence, with a diagonal forget gate.
-///
-///   partial_r = sum_c S[r][c] * alpha[c] * k[c]      the decayed state's prediction
-///   delta_r   = beta * (v_r - partial_r)
-///   S[r][c]   = alpha[c] * S[r][c] + delta_r * k[c]
-///
-/// Set every alpha to the same value and this is `apply_gdn_transition` exactly, which is the
-/// check to make when reading the two side by side.
-__device__ __forceinline__ void apply_kda_transition(float (&state)[kDvPerWarp][kQkPerLane],
-                                                     const float (&key)[kQkPerLane],
-                                                     const float (&gate)[kQkPerLane],
-                                                     float v_local, float beta) {
-    float alpha[kQkPerLane];
-#pragma unroll
-    for (int c = 0; c < kQkPerLane; ++c) { alpha[c] = __expf(gate[c]); }
-
-#pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        float partial = 0.0f;
-#pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * alpha[c] * key[c]; }
-        partial = warp_sum<kWarpSize>(partial);
-
-        const float v_r   = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
-        const float delta = beta * (v_r - partial);
-
-#pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) {
-            state[r][c] = alpha[c] * state[r][c] + delta * key[c];
-        }
-    }
-}
-
 template <bool NormalizeQK>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     kda_recurrent_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
@@ -160,6 +127,17 @@ void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       cudaStream_t stream) {
     ::sinfer::ops::detail::gated_delta_net::kda_launch_recurrent(
         q, k, v, g, beta, scale, normalize_qk, ssm_state_in, ssm_state_out, out, stream);
+}
+
+void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                               const Tensor& beta, float scale, bool normalize_qk,
+                               Tensor& ssm_states, const Tensor& valid_columns,
+                               const Tensor& initial_state_slots,
+                               const Tensor& snapshot_base_slots, Tensor& out,
+                               cudaStream_t stream) {
+    ::sinfer::ops::detail::gated_delta_net::kda_launch_recurrent_snapshot(
+        q, k, v, g, beta, scale, normalize_qk, ssm_states, valid_columns, initial_state_slots,
+        snapshot_base_slots, out, stream);
 }
 
 } // namespace sinfer::ops::detail::kimi_delta_net

@@ -58,4 +58,28 @@ void kimi_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
                     const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                     cudaStream_t stream);
 
+/**
+ * Snapshot form for B independent recurrences, the shape a decode round has: q/k are contiguous
+ * BF16 [128,Hqk,W,B], v/out BF16 [128,Hv,W,B], `g` FP32 [128,Hv,W,B], `beta` FP32 [Hv,W,B], and
+ * `ssm_states` contiguous [128,128,Hv,Slots] in the engine's linear-attention state storage,
+ * which is BF16 -- the op checks its extents, not its dtype. `initial_state_slots` and
+ * `snapshot_base_slots` are contiguous I32 [B]; `valid_columns` is contiguous I32 [B] with every
+ * value in [1,W], or an empty Tensor meaning every row has W valid columns.
+ *
+ * Row b starts from initial_state_slots[b] and writes the state after valid column j to
+ * snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16 zero and do not mutate
+ * state. The caller reserves disjoint complete [base,base+W) intervals and prevents one row from
+ * overwriting another row's initial slot; a row may overwrite its own initial slot after loading
+ * it. No arena allocation; `ssm_states` is the only persistent state mutated.
+ *
+ * The delta net's snapshot form with the gate read per key channel instead of per head -- and
+ * the same kernel, which is what makes "these two differ in one function" a fact about the code
+ * rather than a claim about it.
+ */
+void kimi_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                             const Tensor& beta, float scale, bool normalize_qk,
+                             Tensor& ssm_states, const Tensor& valid_columns,
+                             const Tensor& initial_state_slots,
+                             const Tensor& snapshot_base_slots, Tensor& out, cudaStream_t stream);
+
 } // namespace sinfer::ops

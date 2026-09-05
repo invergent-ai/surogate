@@ -44,6 +44,16 @@ void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v
                                const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
                                Tensor& out, cudaStream_t stream);
 
+/// The same kernel with a diagonal forget gate: Kimi Delta Attention's snapshot form. It lives
+/// here because the loop, the tiling and every lane helper it uses are this file's; only the
+/// transition and the gate's layout differ, and both are selected by a template parameter.
+void kda_launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   bool normalize_qk, Tensor& ssm_states,
+                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                   const Tensor& snapshot_base_slots, Tensor& out,
+                                   cudaStream_t stream);
+
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,

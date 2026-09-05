@@ -15,6 +15,7 @@
 
 #include "ops/op_tester.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -276,6 +277,158 @@ int run_against_gated_delta_net(std::uint32_t seed) {
                              from_device_bf16(o2.data(), vb.size()), kAgreement);
 }
 
+/// The decode round's shape: B independent lanes, each starting from its own state slot and
+/// checkpointing the state after every valid column into its own reserved interval.
+struct SnapshotCase {
+    const char* name;
+    int qk_heads;
+    int value_heads;
+    int width;
+    int batch;
+    /// Per-lane valid column counts, or empty for dense rows.
+    std::vector<int> valid;
+};
+
+int run_snapshot_case(const SnapshotCase& item, std::uint32_t seed) {
+    const int S = kStateDim, Hq = item.qk_heads, Hv = item.value_heads;
+    const int W = item.width, B = item.batch;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(S));
+    // Lane b reads slot b and writes W slots starting at B + b*W, so no lane's interval touches
+    // another's initial slot and the intervals are disjoint.
+    const int slots = B + B * W;
+
+    const std::size_t qk = static_cast<std::size_t>(S) * Hq * W * B;
+    const std::size_t vv = static_cast<std::size_t>(S) * Hv * W * B;
+    std::vector<float> q(qk), k(qk), v(vv), g(vv);
+    std::vector<float> beta(static_cast<std::size_t>(Hv) * W * B);
+    std::vector<float> pool(static_cast<std::size_t>(S) * S * Hv * slots);
+    fill_uniform(q, seed, -1.0f, 1.0f);
+    fill_uniform(k, seed + 1, -1.0f, 1.0f);
+    fill_uniform(v, seed + 2, -1.0f, 1.0f);
+    fill_uniform(pool, seed + 3, -0.5f, 0.5f);
+    fill_uniform(g, seed + 4, -0.75f, -0.02f);
+    fill_uniform(beta, seed + 5, 0.05f, 0.95f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    round_to_bf16(v);
+    round_to_bf16(pool);
+
+    std::vector<int> initial(B), base(B), valid(item.valid);
+    for (int b = 0; b < B; ++b) {
+        initial[static_cast<std::size_t>(b)] = b;
+        base[static_cast<std::size_t>(b)]    = B + b * W;
+    }
+
+    // The oracle runs each lane through the single-sequence form it already qualifies, then
+    // says where every checkpoint landed. The addressing is the contract's, not the kernel's.
+    std::vector<double> expected_out(vv, 0.0);
+    std::vector<double> expected_pool(pool.begin(), pool.end());
+    for (int b = 0; b < B; ++b) {
+        const int columns = valid.empty() ? W : valid[static_cast<std::size_t>(b)];
+        Inputs lane{Hq, Hv, columns, {}, {}, {}, {}, {}, {}};
+        lane.q.resize(static_cast<std::size_t>(S) * Hq * columns);
+        lane.k.resize(lane.q.size());
+        lane.v.resize(static_cast<std::size_t>(S) * Hv * columns);
+        lane.g.resize(lane.v.size());
+        lane.beta.resize(static_cast<std::size_t>(Hv) * columns);
+        lane.state.resize(static_cast<std::size_t>(S) * S * Hv);
+        for (int t = 0; t < columns; ++t) {
+            const std::size_t qk_from = (static_cast<std::size_t>(b) * W + t) * S * Hq;
+            const std::size_t v_from  = (static_cast<std::size_t>(b) * W + t) * S * Hv;
+            std::copy_n(q.begin() + qk_from, static_cast<std::size_t>(S) * Hq,
+                        lane.q.begin() + static_cast<std::size_t>(t) * S * Hq);
+            std::copy_n(k.begin() + qk_from, static_cast<std::size_t>(S) * Hq,
+                        lane.k.begin() + static_cast<std::size_t>(t) * S * Hq);
+            std::copy_n(v.begin() + v_from, static_cast<std::size_t>(S) * Hv,
+                        lane.v.begin() + static_cast<std::size_t>(t) * S * Hv);
+            std::copy_n(g.begin() + v_from, static_cast<std::size_t>(S) * Hv,
+                        lane.g.begin() + static_cast<std::size_t>(t) * S * Hv);
+            std::copy_n(beta.begin() + (static_cast<std::size_t>(b) * W + t) * Hv,
+                        static_cast<std::size_t>(Hv),
+                        lane.beta.begin() + static_cast<std::size_t>(t) * Hv);
+        }
+        std::copy_n(pool.begin() + static_cast<std::size_t>(initial[static_cast<std::size_t>(b)]) *
+                        S * S * Hv,
+                    lane.state.size(), lane.state.begin());
+        // One column at a time, because a checkpoint is taken after each and the contract says
+        // which slot it lands in.
+        std::vector<float> carried = lane.state;
+        for (int t = 0; t < columns; ++t) {
+            Inputs step{Hq, Hv, 1, {}, {}, {}, {}, {}, carried};
+            step.q.assign(lane.q.begin() + static_cast<std::size_t>(t) * S * Hq,
+                          lane.q.begin() + static_cast<std::size_t>(t + 1) * S * Hq);
+            step.k.assign(lane.k.begin() + static_cast<std::size_t>(t) * S * Hq,
+                          lane.k.begin() + static_cast<std::size_t>(t + 1) * S * Hq);
+            step.v.assign(lane.v.begin() + static_cast<std::size_t>(t) * S * Hv,
+                          lane.v.begin() + static_cast<std::size_t>(t + 1) * S * Hv);
+            step.g.assign(lane.g.begin() + static_cast<std::size_t>(t) * S * Hv,
+                          lane.g.begin() + static_cast<std::size_t>(t + 1) * S * Hv);
+            step.beta.assign(lane.beta.begin() + static_cast<std::size_t>(t) * Hv,
+                             lane.beta.begin() + static_cast<std::size_t>(t + 1) * Hv);
+            const Reference ref = evaluate(step, static_cast<double>(scale), true);
+            for (std::size_t i = 0; i < ref.out.size(); ++i) {
+                expected_out[(static_cast<std::size_t>(b) * W + t) * S * Hv + i] = ref.out[i];
+            }
+            const std::size_t at =
+                static_cast<std::size_t>(base[static_cast<std::size_t>(b)] + t) * S * S * Hv;
+            for (std::size_t i = 0; i < ref.final_state.size(); ++i) {
+                expected_pool[at + i] = ref.final_state[i];
+            }
+            // The next column starts from the checkpoint just taken, as BF16: that is what the
+            // pool holds and what the kernel carries.
+            carried.assign(ref.final_state.begin(), ref.final_state.end());
+            round_to_bf16(carried);
+        }
+        // An invalid tail is exact zero and leaves its reserved slots untouched.
+        for (int t = columns; t < W; ++t) {
+            for (std::size_t i = 0; i < static_cast<std::size_t>(S) * Hv; ++i) {
+                expected_out[(static_cast<std::size_t>(b) * W + t) * S * Hv + i] = 0.0;
+            }
+        }
+    }
+
+    GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2);
+    GuardedDeviceBuffer dg(g.size() * 4), db(beta.size() * 4);
+    GuardedDeviceBuffer dpool(pool.size() * 2), dout(v.size() * 2);
+    GuardedDeviceBuffer dinitial(initial.size() * 4), dbase(base.size() * 4);
+    GuardedDeviceBuffer dvalid(std::max<std::size_t>(valid.size(), 1) * 4);
+    const auto qb = bf16_bits(q), kb = bf16_bits(k), vb = bf16_bits(v), pb = bf16_bits(pool);
+    dq.copy_from_host(qb.data(), dq.bytes());
+    dk.copy_from_host(kb.data(), dk.bytes());
+    dv.copy_from_host(vb.data(), dv.bytes());
+    dg.copy_from_host(g.data(), dg.bytes());
+    db.copy_from_host(beta.data(), db.bytes());
+    dpool.copy_from_host(pb.data(), dpool.bytes());
+    dinitial.copy_from_host(initial.data(), dinitial.bytes());
+    dbase.copy_from_host(base.data(), dbase.bytes());
+    if (!valid.empty()) { dvalid.copy_from_host(valid.data(), valid.size() * 4); }
+
+    Tensor qt(dq.data(), DType::BF16, {S, Hq, W, B});
+    Tensor kt(dk.data(), DType::BF16, {S, Hq, W, B});
+    Tensor vt(dv.data(), DType::BF16, {S, Hv, W, B});
+    Tensor gt(dg.data(), DType::FP32, {S, Hv, W, B});
+    Tensor bt(db.data(), DType::FP32, {Hv, W, B});
+    Tensor pt(dpool.data(), DType::BF16, {S, S, Hv, slots});
+    Tensor ot(dout.data(), DType::BF16, {S, Hv, W, B});
+    Tensor it(dinitial.data(), DType::I32, {B});
+    Tensor bs(dbase.data(), DType::I32, {B});
+    Tensor vc = valid.empty() ? Tensor{} : Tensor(dvalid.data(), DType::I32, {B});
+    ops::kimi_delta_net_snapshot(qt, kt, vt, gt, bt, scale, true, pt, vc, it, bs, ot, nullptr);
+    cuda_synchronize();
+
+    const std::string label = std::string("kimi_delta_net_snapshot ") + item.name;
+    int failures = verify_recurrence(label, from_device_bf16(dout.data(), v.size()), expected_out,
+                                     output_criterion());
+    failures += verify_recurrence(label + " pool",
+                                  from_device_bf16(dpool.data(), pool.size()), expected_pool,
+                                  state_criterion());
+    failures += dq.verify_guards((label + " q").c_str());
+    failures += dg.verify_guards((label + " g").c_str());
+    failures += dpool.verify_guards((label + " pool").c_str());
+    failures += dout.verify_guards((label + " out").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -294,6 +447,18 @@ int main() {
     std::uint32_t seed = 7u;
     for (const Case& item : cases) { failures += run_case(item, seed += 17u); }
     failures += run_against_gated_delta_net(seed + 31u);
+
+    // The decode round's shape. Every lane owns a state slot and a reserved interval, and the
+    // pool is checked whole: a lane that wrote outside its interval would show up as a
+    // difference in a slot the oracle left alone.
+    const SnapshotCase snapshots[] = {
+        {"decode 4 lanes", 4, 4, 1, 4, {}},
+        {"8 lanes x 3 columns", 2, 8, 3, 8, {}},
+        {"ragged lanes", 4, 8, 4, 4, {4, 1, 3, 2}},
+        {"one lane, wide round", 8, 8, 12, 1, {}},
+        {"grouped heads, ragged", 2, 8, 5, 3, {5, 2, 4}},
+    };
+    for (const SnapshotCase& item : snapshots) { failures += run_snapshot_case(item, seed += 23u); }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " kimi_delta_net correctness\n";
     return failures == 0 ? 0 : 1;

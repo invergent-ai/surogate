@@ -59,7 +59,8 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool NormalizeInputs, bool Batched, bool Masked>
+template <bool NormalizeInputs, bool Batched, bool Masked,
+          ForgetGate Gate = ForgetGate::Scalar>
 void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                      const Tensor& g, const Tensor& beta, float scale,
                                      Tensor& ssm_states, const Tensor& valid_columns,
@@ -72,7 +73,7 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const SnapshotAccess<Batched, Masked> access{
+    const SnapshotAccess<Batched, Masked, Gate> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -88,7 +89,8 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
         state_slot_stride,
         scale,
     };
-    recurrent_snapshot_kernel<NormalizeInputs, Batched, Masked><<<grid, block, 0, stream>>>(access);
+    recurrent_snapshot_kernel<NormalizeInputs, Batched, Masked, Gate>
+        <<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -186,37 +188,64 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
     }
 }
 
+/// The six shapes the snapshot kernel is baked for, at either gate. `Gate` is the only thing
+/// that differs between the delta net's entry point and Kimi Delta Attention's, which is why
+/// there is one of these rather than two ladders.
+template <ForgetGate Gate>
+void launch_recurrent_snapshot_gated(const Tensor& q, const Tensor& k, const Tensor& v,
+                                     const Tensor& g, const Tensor& beta, float scale,
+                                     bool normalize_qk, Tensor& ssm_states,
+                                     const Tensor& valid_columns,
+                                     const Tensor& initial_state_slots,
+                                     const Tensor& snapshot_base_slots, Tensor& out,
+                                     cudaStream_t stream) {
+    const bool dense_single = q.ne[3] == 1 && valid_columns.data == nullptr;
+    if (dense_single && normalize_qk) {
+        launch_recurrent_snapshot_fixed<true, false, false, Gate>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, out, stream);
+    } else if (dense_single) {
+        launch_recurrent_snapshot_fixed<false, false, false, Gate>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, out, stream);
+    } else if (valid_columns.data == nullptr && normalize_qk) {
+        launch_recurrent_snapshot_fixed<true, true, false, Gate>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, out, stream);
+    } else if (valid_columns.data == nullptr) {
+        launch_recurrent_snapshot_fixed<false, true, false, Gate>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, out, stream);
+    } else if (normalize_qk) {
+        launch_recurrent_snapshot_fixed<true, true, true, Gate>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, out, stream);
+    } else {
+        launch_recurrent_snapshot_fixed<false, true, true, Gate>(
+            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+            snapshot_base_slots, out, stream);
+    }
+}
+
+void kda_launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   bool normalize_qk, Tensor& ssm_states,
+                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                   const Tensor& snapshot_base_slots, Tensor& out,
+                                   cudaStream_t stream) {
+    launch_recurrent_snapshot_gated<ForgetGate::Diagonal>(
+        q, k, v, g, beta, scale, normalize_qk, ssm_states, valid_columns, initial_state_slots,
+        snapshot_base_slots, out, stream);
+}
+
 void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                                const Tensor& beta, float scale, bool normalize_qk,
                                Tensor& ssm_states, const Tensor& valid_columns,
                                const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
                                Tensor& out, cudaStream_t stream) {
-    const bool dense_single = q.ne[3] == 1 && valid_columns.data == nullptr;
-    if (dense_single && normalize_qk) {
-        launch_recurrent_snapshot_fixed<true, false, false>(q, k, v, g, beta, scale, ssm_states,
-                                                            valid_columns, initial_state_slots,
-                                                            snapshot_base_slots, out, stream);
-    } else if (dense_single) {
-        launch_recurrent_snapshot_fixed<false, false, false>(q, k, v, g, beta, scale, ssm_states,
-                                                             valid_columns, initial_state_slots,
-                                                             snapshot_base_slots, out, stream);
-    } else if (valid_columns.data == nullptr && normalize_qk) {
-        launch_recurrent_snapshot_fixed<true, true, false>(q, k, v, g, beta, scale, ssm_states,
-                                                           valid_columns, initial_state_slots,
-                                                           snapshot_base_slots, out, stream);
-    } else if (valid_columns.data == nullptr) {
-        launch_recurrent_snapshot_fixed<false, true, false>(q, k, v, g, beta, scale, ssm_states,
-                                                            valid_columns, initial_state_slots,
-                                                            snapshot_base_slots, out, stream);
-    } else if (normalize_qk) {
-        launch_recurrent_snapshot_fixed<true, true, true>(q, k, v, g, beta, scale, ssm_states,
-                                                          valid_columns, initial_state_slots,
-                                                          snapshot_base_slots, out, stream);
-    } else {
-        launch_recurrent_snapshot_fixed<false, true, true>(q, k, v, g, beta, scale, ssm_states,
-                                                           valid_columns, initial_state_slots,
-                                                           snapshot_base_slots, out, stream);
-    }
+    launch_recurrent_snapshot_gated<ForgetGate::Scalar>(
+        q, k, v, g, beta, scale, normalize_qk, ssm_states, valid_columns, initial_state_slots,
+        snapshot_base_slots, out, stream);
 }
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

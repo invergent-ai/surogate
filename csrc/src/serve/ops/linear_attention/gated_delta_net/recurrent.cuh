@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace sinfer::ops::detail::gated_delta_net {
 
@@ -165,6 +166,23 @@ struct RawGatePair {
     float beta;
 };
 
+/// Which forget gate a recurrence has. The delta net's is one value per head, so it multiplies
+/// the whole state and can be pulled out of the dot product; Kimi Delta Attention's is one per
+/// *key channel*, so the state decays by a diagonal and the gate belongs inside. Everything
+/// else about the two recurrences -- the tiling, the lane loads, the readout, the snapshot --
+/// is the same, which is why they share this loop instead of each having one.
+enum class ForgetGate { Scalar, Diagonal };
+
+/// A diagonal gate as a lane sees it: the key channels it owns, and the head's beta.
+struct RawDiagonalGate {
+    float channel[kQkPerLane];
+    float beta;
+};
+
+/// The payload the loop carries for a gate of either shape.
+template <ForgetGate Gate>
+using GateOf = std::conditional_t<Gate == ForgetGate::Diagonal, RawDiagonalGate, RawGatePair>;
+
 __device__ __forceinline__ RawQkLane load_raw_qk_lane(const __nv_bfloat16* base,
                                                       std::uint32_t dqk_base) {
     RawQkLane out;
@@ -231,6 +249,51 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
 
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { state[r][c] = alpha * state[r][c] + delta * key[c]; }
+    }
+}
+
+/// One token of the recurrence with a diagonal forget gate.
+///
+///   partial_r = sum_c S[r][c] * alpha[c] * k[c]      the decayed state's prediction
+///   delta_r   = beta * (v_r - partial_r)
+///   S[r][c]   = alpha[c] * S[r][c] + delta_r * k[c]
+///
+/// Set every alpha to the same value and this is `apply_gdn_transition` exactly, which is the
+/// check to make when reading the two side by side.
+__device__ __forceinline__ void apply_kda_transition(float (&state)[kDvPerWarp][kQkPerLane],
+                                                     const float (&key)[kQkPerLane],
+                                                     const float (&gate)[kQkPerLane],
+                                                     float v_local, float beta) {
+    float alpha[kQkPerLane];
+#pragma unroll
+    for (int c = 0; c < kQkPerLane; ++c) { alpha[c] = __expf(gate[c]); }
+
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * alpha[c] * key[c]; }
+        partial = warp_sum<kWarpSize>(partial);
+
+        const float v_r   = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
+        const float delta = beta * (v_r - partial);
+
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) {
+            state[r][c] = alpha[c] * state[r][c] + delta * key[c];
+        }
+    }
+}
+
+/// The transition either gate asks for, so the shared loop names one thing.
+template <ForgetGate Gate>
+__device__ __forceinline__ void apply_transition(float (&state)[kDvPerWarp][kQkPerLane],
+                                                 const float (&key)[kQkPerLane], float v_local,
+                                                 const GateOf<Gate>& gate) {
+    if constexpr (Gate == ForgetGate::Diagonal) {
+        apply_kda_transition(state, key, gate.channel, v_local, gate.beta);
+    } else {
+        apply_gdn_transition(state, key, v_local, gate.g, gate.beta);
     }
 }
 
@@ -342,8 +405,10 @@ __device__ __forceinline__ RecurrentCoordinates make_coordinates(std::int32_t ba
             qk_head, dv_base,    static_cast<std::uint32_t>(lane * kQkPerLane)};
 }
 
-template <bool Batched, bool Masked>
+template <bool Batched, bool Masked, ForgetGate Gate = ForgetGate::Scalar>
 struct SnapshotAccess {
+    static constexpr ForgetGate kGate = Gate;
+
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
@@ -391,9 +456,19 @@ struct SnapshotAccess {
         return v + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
     }
 
-    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
-                                                     std::int32_t token) const {
-        return load_source_gate(g, beta, column(coord, token) * heads.H_v + coord.value_head);
+    __device__ __forceinline__ GateOf<Gate> load_gate(const RecurrentCoordinates& coord,
+                                                      std::int32_t token) const {
+        const std::int64_t offset = column(coord, token) * heads.H_v + coord.value_head;
+        if constexpr (Gate == ForgetGate::Diagonal) {
+            // A diagonal gate is laid out like v -- one value per channel per head per token --
+            // so a lane reads the same key channels of it that it owns of the key.
+            RawDiagonalGate out_gate;
+            load_qk_lane(out_gate.channel, g + offset * kStateDim, coord.dqk_base);
+            out_gate.beta = beta[offset];
+            return out_gate;
+        } else {
+            return load_source_gate(g, beta, offset);
+        }
     }
 
     __device__ __forceinline__ const __nv_bfloat16* query_ptr(const RecurrentCoordinates& coord,
@@ -424,6 +499,8 @@ struct SnapshotAccess {
 
 template <bool Masked>
 struct RecordAccess {
+    static constexpr ForgetGate kGate = ForgetGate::Scalar;
+
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
@@ -539,6 +616,8 @@ using FoldGeometry18x16 = FoldGeometry<18, 16, 16, 6144>;
 
 template <class Geometry>
 struct FoldAccess {
+    static constexpr ForgetGate kGate = ForgetGate::Scalar;
+
     const __nv_bfloat16* key_record;
     const __nv_bfloat16* value_record;
     const uint2* gate_record;
@@ -679,7 +758,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
     normalize_qk_lane<NormalizeInputs>(key.value, coord.lane);
 
     for (std::int32_t token = 0; token < valid; ++token) {
-        const RawGatePair gate = access.load_gate(coord, token);
+        const GateOf<Access::kGate> gate = access.load_gate(coord, token);
         const RawValueLane value =
             load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
         if constexpr (Mode == RecurrentMode::Record) {
@@ -687,7 +766,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
             access.store_gate(coord, token, gate);
         }
 
-        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+        apply_transition<Access::kGate>(state, key.value, value.value, gate);
 
         if (token + 1 < valid) {
             key = load_raw_qk_lane(access.key_ptr(coord, token + 1), coord.dqk_base);
@@ -720,9 +799,9 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
     }
 }
 
-template <bool NormalizeInputs, bool Batched, bool Masked>
+template <bool NormalizeInputs, bool Batched, bool Masked, ForgetGate Gate = ForgetGate::Scalar>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_snapshot_kernel(SnapshotAccess<Batched, Masked> access) {
+    recurrent_snapshot_kernel(SnapshotAccess<Batched, Masked, Gate> access) {
     static_assert(!Masked || Batched);
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Snapshot, NormalizeInputs>(access, coord, access.width,
