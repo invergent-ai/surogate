@@ -36,30 +36,34 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Two open, and both are decisions rather than blocked work. Every GGML weight type
+One open, and it is a decision about product scope rather than blocked work. Every GGML weight type
 llama.cpp stores is read where it lies, F16 included; the engine's own suite builds
 and runs; and what a checkpoint declares about its quantisation is honoured or
 refused. The Flash-Next levers were measured and written off — see "Measured and
 rejected" — so nothing on this list is waiting on someone to find time.
 
-1. **[ ] Retire Q4G64/Q5G64/Q6G64 — now a deletion with a proven replacement
-   (re-checked 2026-09-05).** Two things changed since this was written as a
-   trade-off.
-   **It is not one target's profile.** The group-wise route quantises at *every*
-   size, not only the 27B: a plain BF16 safetensors Qwen3.5-0.8B converts to 48
-   Q4G64 + 48 Q5G64 + 1 Q6G64 objects, the 27B to 183 + 246 + 3. So handing the
-   engine an unquantised checkpoint gets it quantised to four and five bits — which
-   is **quantising what a user brings us**, the one thing "Decisions that govern"
-   rules out. The rule and the code disagree, and the code is the newer of the two.
-   **The replacement is proven.** `surogate quantize` now takes a checkpoint to a
-   GGUF the engine serves better than the published one (item 2). A user with a BF16
-   checkpoint has a path that does not involve us inventing a quantisation.
-   What the deletion costs is one piece of work, not a capability: the group-wise
-   profile is also what a BF16 checkpoint's *unquantised* objects travel through, so
-   retiring it means a BF16 pass-through profile first — the engine already serves
-   BF16 at any 8-aligned shape, and that profile already emits 338 BF16 objects at
-   0.8B. Then roughly 262 references go. **The decision is whether to build the
-   pass-through; the formats follow it out.**
+1. **[x] Keep Q4G64/Q5G64/Q6G64 — measured 2026-09-05, they are not spare.**
+   Retiring them was never the objective; performance is, and a GGUF is already
+   served directly rather than quantised at runtime. So the only question was
+   whether anything still needs them. It does.
+   **Where they are actually used**, from `build_tensor_specs`:
+   - 0.8B/2B-class: the **vision tower only** — 48 Q4G64, 48 Q5G64, 1 Q6G64. The
+     text stack at these sizes is W8 throughout, so the formats are not in that
+     comparison at all.
+   - 27B-class: the **text stack** — 129 Q4G64, 192 Q5G64, 2 Q6G64 — plus its tower.
+     Reached when converting a BF16 safetensors 27B; a 27B GGUF is served in place.
+   Nothing else stores the tower, at any size. Removing them would mean giving the
+   tower another format, not deleting dead code.
+   **On bytes, which is what decode is bound by**, Q4G64 is 0.531 B/value against
+   GGML Q4_K's 0.5625 and W8's 1.062 — denser than both. Measured on the 0.8B
+   (GPU 1, three 256-token generations each), where the group-wise text stack is W8:
+   group-wise **734.9 tok/s** decode against a native Q4_K_M GGUF's **771.5**, which
+   is the 2x in bytes showing up as 5 % of decode. That is a W8-versus-K-quant
+   result, not a verdict on Q4G64, and it is an argument for the *denser* format
+   rather than against it. (Prefill was measured too but is not comparable here:
+   the repeated prompt hits the prefix cache.)
+   **Closed as keep.** Reopen only if the tower gains a K-quant route and a 27B
+   safetensors conversion measures worse than one through `surogate quantize`.
 
 2. **[ ] `surogate quantize` as a product — the engine blocker is gone (2026-09-05).**
    The recorded blocker was ours: every MTP binding demanded `W8G32_F16S` or BF16, so
