@@ -355,11 +355,49 @@ class Export:
 
 
 #: The 3.6-27B additive NVFP4 export left these layers in BF16, and the 3.8 MLP-only export
-#: left its last eight MLPs in FP8. Both are properties of the published files.
+#: left its last eight MLPs in FP8. Both are properties of the published files -- which is
+#: exactly why they must be checked against the file in hand rather than trusted: see
+#: `exception_disagreement` below, and the note there on the two published 27B NVFP4 exports
+#: that match neither table.
 _BF16_ATTENTION_INPUT_LAYERS = (3, 7, 11, 15, 19, 23)
 _BF16_ATTENTION_OUTPUT_LAYERS = (3, 7)
 _BF16_GDN_OUTPUT_LAYERS = (4,)
 _FP8_MLP_LAYERS = tuple(range(56, 64))
+
+
+#: Which checkpoint modules carry each role the export table names exceptions for. A role is
+#: at its exception width on a layer exactly when that layer's modules are stored unquantised,
+#: which the tensor names show directly.
+_ROLE_MODULES = {
+    "attention_input": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"),
+    "attention_output": ("self_attn.o_proj",),
+    "gdn_output": ("linear_attn.out_proj",),
+    "mlp": ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"),
+}
+
+
+def exception_disagreement(export: "Export", observed) -> dict[str, tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Where an export table's exception layers differ from the checkpoint's own tensors.
+
+    The tables were measured from published files and written down, and a written-down
+    measurement goes stale silently. Both `nvidia/Qwen3.6-27B-NVFP4` and
+    `unsloth/Qwen3.6-27B-NVFP4` quantise every attention and MLP layer, so neither matches
+    `_BF16_ATTENTION_INPUT_LAYERS`; whatever file those were taken from, it is not either of
+    the ones published today. This turns that into a raise instead of a wrong artifact.
+
+    Returns {role: (declared_by_the_table, found_in_the_file)} for the roles that differ.
+    """
+    out: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+    for role, (_width, layers) in export.exceptions.items():
+        modules = _ROLE_MODULES.get(role)
+        if modules is None:
+            continue
+        found: set[int] = set()
+        for module in modules:
+            found.update(observed.layers_of(module, quantised=False))
+        if tuple(sorted(found)) != tuple(sorted(layers)):
+            out[role] = (tuple(sorted(layers)), tuple(sorted(found)))
+    return out
 
 
 def export_for(profile: str, geometry: Geometry = GEOMETRY) -> Export:

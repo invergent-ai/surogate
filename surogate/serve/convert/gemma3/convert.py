@@ -583,6 +583,12 @@ def preflight_conversion(
     model = Path(model_dir)
     config = family_conversion.load_json(model / "config.json")
     geometry, summary = validate_config(config)
+    # What the checkpoint says about its own quantisation: refused where the serving path
+    # cannot honour it, reported where the declaration disagrees with the checkpoint's own
+    # tensors. A claim about a file is not the file.
+    _scope = family_conversion.honour_declared_scope(config, geometry, model, what=family_conversion.checkpoint_label(model))
+    if _scope:
+        print(_scope, flush=True)
     # Whether the head is its own object is a property of the checkpoint, not of
     # the target, so both the recipe and the object list are built for the
     # checkpoint in hand rather than the module-level ones being used blind.

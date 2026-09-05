@@ -818,7 +818,34 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="source checkpoint has no MTP (nextn) block; "
                              "emit the artifact variant without mtp/* objects")
     args = parser.parse_args(argv)
-    profile = args.profile or profile_for_checkpoint(_load_config(Path(args.model)))
+    _model = Path(args.model)
+    _config = _load_config(_model)
+    # What the checkpoint says about its own quantisation. Here rather than in
+    # `preflight_conversion` because every export profile funnels through this dispatch and
+    # only some of them take that path.
+    _scope = family_conversion.honour_declared_scope(
+        _config, inventory.geometry_from_config(_config), _model, what=family_conversion.checkpoint_label(_model))
+    if _scope:
+        print(_scope, flush=True)
+    profile = args.profile or profile_for_checkpoint(_config)
+    # An export table that names exception layers is a measurement of a published file. Check
+    # it against the file in hand: a stale table builds an artifact whose formats do not match
+    # its own weights, and nothing downstream would say so.
+    _export = inventory.export_for(profile, inventory.geometry_from_config(_config))
+    if _export.exceptions:
+        from surogate.serve.convert.common import quant_scope as _qs
+        _observed = _qs.observed_scope(family_conversion.checkpoint_tensor_names(_model))
+        _differ = inventory.exception_disagreement(_export, _observed)
+        if _differ:
+            _detail = "; ".join(
+                f"{role}: the table says {table} and the checkpoint has {found}"
+                for role, (table, found) in sorted(_differ.items())
+            )
+            raise SystemExit(
+                f"the {profile} export table does not describe this checkpoint -- {_detail}. "
+                f"The tables were measured from published files; this one differs, so the "
+                f"artifact would claim formats its own weights do not have."
+            )
     if profile == inventory.GROUPWISE_INT:
         convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack,
                 mtp=not args.no_mtp, vision=not args.no_vision)

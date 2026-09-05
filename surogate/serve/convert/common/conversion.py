@@ -17,6 +17,7 @@ from typing import Mapping, Sequence
 
 import torch
 
+from surogate.serve.convert.common import quant_scope
 from surogate.serve.artifact.container import (
     ArtifactIdentity,
     ArtifactObject,
@@ -244,6 +245,65 @@ def environment(device: torch.device) -> dict[str, object]:
         "resolved_device": str(device),
         "gpu": gpu,
     }
+
+
+def checkpoint_label(model_dir) -> str:
+    """A name a reader recognises. A Hugging Face cache path ends in a snapshot hash, which
+    names nothing; the repo two levels up is what the user asked for."""
+    root = Path(model_dir).resolve()
+    for parent in root.parents:
+        if parent.name.startswith("models--"):
+            return parent.name[len("models--"):].replace("--", "/", 1)
+    return root.name
+
+
+def checkpoint_tensor_names(model_dir) -> tuple[str, ...]:
+    """The checkpoint's tensor names from its index, without opening a shard.
+
+    Empty when there is no index and no single-file checkpoint, which only narrows the
+    cross-check: it is diagnostic and never load-bearing.
+    """
+    root = Path(model_dir)
+    index = root / "model.safetensors.index.json"
+    if index.exists():
+        try:
+            return tuple(json.loads(index.read_text())["weight_map"])
+        except (ValueError, KeyError, TypeError):
+            return ()
+    single = root / "model.safetensors"
+    if not single.exists():
+        return ()
+    try:
+        from safetensors import safe_open
+        with safe_open(str(single), framework="pt") as handle:
+            return tuple(handle.keys())
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def honour_declared_scope(
+    config,
+    geometry,
+    names=(),
+    *,
+    what: str = "checkpoint",
+) -> str:
+    """Refuse what a checkpoint's `quantization_config` asks for and we do not implement, and
+    report where its declaration disagrees with its own tensors.
+
+    Every converter runs this, because the failure it rules out is not per-family: a field
+    nobody reads is a field a checkpoint is served against. `geometry` supplies the one number
+    the KV decision turns on, so a request the engine's default already satisfies is honoured
+    rather than refused. `names` is the checkpoint's tensor inventory when the caller has it;
+    without it only the refusal half runs.
+
+    Returns the line for the conversion log, empty for an unquantised checkpoint.
+    """
+    gdn = len(getattr(geometry, "gdn_layers", ()) or ()) if geometry is not None else 0
+    quant_scope.require_honourable(config, gdn_layers=gdn, what=what)
+    if isinstance(names, (str, Path)):
+        names = checkpoint_tensor_names(names)
+    return quant_scope.report(config, tuple(names), what=what) if names else ""
 
 
 def build_conversion_report(

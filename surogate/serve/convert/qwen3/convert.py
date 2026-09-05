@@ -294,6 +294,12 @@ def preflight_conversion(
     config = family_conversion.load_json(model / "config.json")
     geometry, summary = validate_config(config)
     preflight_inventory()
+    # What the checkpoint says about its own quantisation: refused where the serving path
+    # cannot honour it, reported where the declaration disagrees with the checkpoint's own
+    # tensors. A claim about a file is not the file.
+    _scope = family_conversion.honour_declared_scope(config, geometry, model, what=family_conversion.checkpoint_label(model))
+    if _scope:
+        print(_scope, flush=True)
     tied = bool(config.get("tie_word_embeddings", False))
     # Which tensor the output head reads is a property of the checkpoint, not of
     # the target, so the recipe is rebuilt for the checkpoint in hand rather than

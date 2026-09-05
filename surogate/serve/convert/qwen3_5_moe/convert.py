@@ -18,6 +18,7 @@ import argparse
 import os
 from dataclasses import dataclass
 import json
+from types import SimpleNamespace
 from pathlib import Path
 import time
 from typing import Mapping, Sequence
@@ -384,6 +385,16 @@ def preflight_conversion(
 
     model = Path(model_dir)
     dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
+    # What the checkpoint says about its own quantisation. This target's geometry lives in
+    # `inventory` rather than in a Geometry object, so the GDN layer count is passed directly:
+    # it is the one number the KV decision turns on.
+    _scope = family_conversion.honour_declared_scope(
+        family_conversion.load_json(model / "config.json"),
+        SimpleNamespace(gdn_layers=inventory.GDN_LAYERS), model,
+        what=family_conversion.checkpoint_label(model),
+    )
+    if _scope:
+        print(_scope, flush=True)
     # A compressed-tensors export supplies every role itself: its config says which
     # modules are quantized, its packed routed experts come from the same shards, and
     # the modules it left alone are read as the BF16 they are stored in.

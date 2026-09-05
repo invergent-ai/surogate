@@ -187,7 +187,7 @@ MoE). What is not:
 | W4A16 / W4A16_ASYM | **[ ]** `Q4G64_F16S` is symmetric with no zero point and no actorder |
 | MXFP4 / MXFP8 | **[ ]** nothing in serve; the trainer decodes MXFP4 |
 | GPTQ / AWQ | **[ ]** off the roadmap by owner decision |
-| `kv_cache_scheme` | **[ ]** refuse or support — do not ignore silently. Checked 2026-09-05: the key appears nowhere in the tree, so a checkpoint that asks for a quantised KV cache is served with the engine's own default and never told. |
+| `kv_cache_scheme` | **[x]** honoured where the engine's `auto` already satisfies it, refused with the flag to pass where it does not, refused outright for an integer cache (2026-09-05) |
 | F16 (GGUF) | **[x]** read where it lies (2026-09-05), as 32-value windows onto the dense bytes |
 | F32 (GGUF) | **[~]** bridged, and correctly so: every F32 tensor in a real file is a norm, an `A_log` or a conv1d, each of which needs a value or shape transform. 0.07 % of the elements. |
 
@@ -253,6 +253,22 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
 - **Dequantise-and-requantise is not free.** Measured on Qwen3.5-0.8B-Q4_K_M:
   K-quant → BF16 → W8 adds 5.7e-3 relative error and *doubles* the bytes. That is
   why the native path exists.
+- **A checkpoint's `quantization_config` states more than its format, and the rest is
+  read now (2026-09-05).** `kv_cache_scheme` is honoured where `auto` already resolves to
+  what it asks and refused, naming the flag, where it does not; `sparsity_config` and
+  `transform_config` are refused. And the declaration is cross-checked against the
+  checkpoint's own tensors, because it is a claim rather than a fact: a weight is quantised
+  exactly when a scale sits beside it. Two published NVFP4 exports of the same 27B declare
+  `ignore` lists of 2 and 303 entries while quantising identical tensors, and one of them
+  omits 27 unquantised vision projections it never mentions. **Where the two differ, the
+  tensors win and the disagreement is printed.**
+- **A measurement written down goes stale silently.** The `nvfp4-mixed-bf16` export table
+  names six attention layers left in BF16, measured from a published file. Neither
+  `nvidia/Qwen3.6-27B-NVFP4` nor `unsloth/Qwen3.6-27B-NVFP4` has any: both quantise every
+  attention and MLP layer. Whatever file the table describes, it is not either of the ones
+  published today, so converting one now refuses instead of building an artifact that claims
+  formats its own weights do not have. The tables stay until a checkpoint proves what should
+  replace them; the check is what makes that visible.
 - **A format the index cannot hold is a format we quietly re-quantise**
   (2026-09-05). F16 was the last one, and the breach was invisible because the
   numbers looked fine: `Qwen3.5-0.8B-UD-Q8_K_XL` scored 14.6946 against
