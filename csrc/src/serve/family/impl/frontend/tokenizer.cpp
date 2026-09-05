@@ -446,7 +446,10 @@ std::size_t span_end_offset(std::string_view text, const std::vector<uni::Codepo
     return spans.at(end).offset;
 }
 
-std::vector<std::string_view> qwen_split_words(std::string_view text) {
+/// The pre-tokenizer's word split. `max_digit_run` is the only thing that differs between the
+/// checkpoints this family serves: one digit per word for the Qwen-family rule (`\p{N}`), up to
+/// three for GLM-5.3's (`\p{N}{1,3}`).
+std::vector<std::string_view> split_words(std::string_view text, std::size_t max_digit_run) {
     const std::vector<uni::CodepointSpan> spans =
         uni::utf8_codepoints(text, "Tokenizer::encode input");
     std::vector<std::string_view> words;
@@ -484,8 +487,14 @@ std::vector<std::string_view> qwen_split_words(std::string_view text) {
         }
 
         if (uni::is_number(cp)) {
-            words.emplace_back(text.substr(begin_offset, spans[i].length));
-            ++i;
+            std::size_t end = i + 1;
+            while (end < spans.size() && end - i < max_digit_run &&
+                   uni::is_number(spans[end].value)) {
+                ++end;
+            }
+            words.emplace_back(
+                text.substr(begin_offset, span_end_offset(text, spans, end) - begin_offset));
+            i = end;
             goto next_word;
         }
 
@@ -601,6 +610,7 @@ void append_symbol_id(std::vector<int>& ids,
 }
 
 void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_merges,
+                    std::size_t max_digit_run,
                     const std::unordered_map<std::string, int>& merge_ranks,
                     const std::unordered_map<std::string, int>& token_to_id) {
     if (text.empty()) { return; }
@@ -610,7 +620,7 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
     }
 
     const std::string normalized = uni::normalize_nfc(text);
-    for (const std::string_view word : qwen_split_words(normalized)) {
+    for (const std::string_view word : split_words(normalized, max_digit_run)) {
         std::vector<std::string> symbols = byte_level_symbols(byte_level_encode(word));
         while (symbols.size() > 1) {
             int best_rank              = std::numeric_limits<int>::max();
@@ -673,6 +683,41 @@ bool describes_sentencepiece(const Json& root) {
 } // namespace
 
 Tokenizer::~Tokenizer()                            = default;
+namespace {
+
+/// How many digits the checkpoint's pre-tokenizer keeps in one word.
+///
+/// Read from the `Split` pattern `tokenizer.json` declares rather than compiled in. Every
+/// checkpoint this family served until GLM-5.3 writes `\p{N}` and gets one digit a word; GLM-5.3
+/// writes `\p{N}{1,3}` and gets up to three, which is the difference between "3,344" tokenising
+/// as `3` `,` `34` `4` and as five separate digits -- and, for a model asked how many sheep are
+/// left of seventeen, between reading "17" and reading "1" "7".
+///
+/// A pattern naming neither is left at one, which is what every such checkpoint has always had.
+std::size_t declared_digit_run(const Json& root, std::string_view label) {
+    (void)label;
+    std::size_t run = 1;
+    const auto scan = [&run](const Json& node) {
+        if (!node.is_object() || !node.contains("pattern")) { return; }
+        const Json& pattern = node.at("pattern");
+        if (!pattern.is_object() || !pattern.contains("Regex")) { return; }
+        const Json& regex = pattern.at("Regex");
+        if (!regex.is_string()) { return; }
+        const std::string text = regex.get<std::string>();
+        if (text.find("\\p{N}{1,3}") != std::string::npos) { run = 3; }
+    };
+    if (!root.contains("pre_tokenizer") || root.at("pre_tokenizer").is_null()) { return run; }
+    const Json& pre = root.at("pre_tokenizer");
+    if (pre.is_object() && pre.contains("pretokenizers") && pre.at("pretokenizers").is_array()) {
+        for (const Json& sub : pre.at("pretokenizers")) { scan(sub); }
+    } else {
+        scan(pre);
+    }
+    return run;
+}
+
+} // namespace
+
 Tokenizer::Tokenizer(Tokenizer&&) noexcept         = default;
 Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
 
@@ -686,6 +731,7 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const Json root = read_json_asset(resources.tokenizer_json, tokenizer_label);
     const Json tokenizer_config =
         read_json_asset(resources.tokenizer_config_json, tokenizer_config_label);
+    max_digit_run_    = declared_digit_run(root, tokenizer_label);
     const Json& model = require_object_field(root, "model", tokenizer_label);
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
@@ -771,7 +817,8 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     }
     if (!options.parse_added_tokens) {
         std::vector<int> ids;
-        append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_);
+        append_bpe_ids(ids, text, has_bpe_merges_, max_digit_run_, bpe_merge_ranks_,
+                       vocab_token_to_id_);
         return ids;
     }
 
@@ -797,6 +844,7 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
 
         if (pos > ordinary_begin) {
             append_bpe_ids(ids, text.substr(ordinary_begin, pos - ordinary_begin), has_bpe_merges_,
+                           max_digit_run_,
                            bpe_merge_ranks_, vocab_token_to_id_);
         }
 
@@ -805,7 +853,8 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         ordinary_begin = pos;
     }
     if (ordinary_begin < text.size()) {
-        append_bpe_ids(ids, text.substr(ordinary_begin), has_bpe_merges_, bpe_merge_ranks_,
+        append_bpe_ids(ids, text.substr(ordinary_begin), has_bpe_merges_, max_digit_run_,
+                       bpe_merge_ranks_,
                        vocab_token_to_id_);
     }
     return ids;

@@ -91,6 +91,12 @@ private:
     std::unordered_map<std::string, int> vocab_token_to_id_;
     std::unordered_map<std::string, int> bpe_merge_ranks_;
     bool has_bpe_merges_ = true;
+    /// How many digits a pre-token may hold. Every checkpoint this family served until GLM-5.3
+    /// declares `\p{N}` and takes one; GLM-5.3 declares `\p{N}{1,3}` and takes up to three,
+    /// which is what makes "3,344" tokenise as `3` `,` `34` `4` rather than as five digits. It
+    /// is read from the pre-tokenizer the artifact declares, not compiled in: the rule was the
+    /// Qwen family's, and it was the splitter's name that said so.
+    std::size_t max_digit_run_ = 1;
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;

@@ -127,6 +127,13 @@ target_include_directories(sinfer_family_frontend_test PRIVATE
   ${SERVE_ROOT}/family/impl)
 # The tokenizer_config.json chat-template contract: three JSON strings and no
 # tokenizer, so it runs where sinfer_family_frontend_test skips.
+sinfer_add_test(sinfer_family_pretokenizer_digits_test
+  SOURCES family/test_pretokenizer_digits.cpp
+  LIBRARIES sinfer_engine sinfer_core)
+target_include_directories(sinfer_family_pretokenizer_digits_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
+
 sinfer_add_test(sinfer_family_tokenizer_config_test
   SOURCES family/test_tokenizer_config.cpp
   LIBRARIES sinfer_engine sinfer_core)

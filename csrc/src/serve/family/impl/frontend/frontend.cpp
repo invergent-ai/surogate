@@ -1025,6 +1025,17 @@ void FrontendTestAccess::check_tokenizer_config(const FrontendResources& resourc
     sinfer::family::validate_tokenizer_config(resources);
 }
 
+std::vector<int> FrontendTestAccess::encode_with(const FrontendResources& resources,
+                                                std::string_view text) {
+    frontend_internal::TokenizerResources sources;
+    sources.tokenizer_json        = resources.tokenizer_json;
+    sources.tokenizer_config_json = resources.tokenizer_config_json;
+    sources.generation_config_json = resources.generation_config_json;
+    sources.chat_template_jinja   = resources.chat_template_jinja;
+    frontend_internal::Tokenizer tokenizer(sources);
+    return tokenizer.encode(text, {});
+}
+
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {
     return PreparedPromptAccess::view(prompt);
 }
