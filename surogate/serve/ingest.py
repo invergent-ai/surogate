@@ -82,6 +82,11 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     # in the checkpoint, so the architecture is the only gate here too.
     if model_type == "lfm2" and hidden > 0 and layers > 0:
         return ConverterTarget("lfm2", "surogate.serve.convert.lfm2.convert", "LFM2")
+    # Qwen3-MoE: the same attention as the dense Qwen3 over a routed mixture with no
+    # always-on expert. Its GGUF keeps its experts as K-quants, so it takes the repack path.
+    if model_type == "qwen3_moe" and hidden > 0 and layers > 0:
+        return ConverterTarget("qwen3_moe", "surogate.serve.convert.qwen3_moe.convert",
+                               "Qwen3-MoE", gguf_repack=True)
     if model_type == "llama" and hidden > 0 and layers > 0:
         return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "Llama",
                                gguf_repack=True)
@@ -225,7 +230,7 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
     # Every target reads its GGUF where it lies: the bridge dequantises only what a value
     # transform forces, not the whole checkpoint.
-    repack_targets = {"qwen3", "llama", "gemma3", "qwen3_5", "qwen3_5_moe"}
+    repack_targets = {"qwen3", "llama", "gemma3", "qwen3_5", "qwen3_5_moe", "qwen3_moe"}
     converter_key = serve_gguf.gguf_converter_key(gguf_path, reader)
     planner = _repack_planner(root, converter_key) if target_key in repack_targets else None
     # No-MTP variant (PATCHES.md #15): community exports may strip nextn.

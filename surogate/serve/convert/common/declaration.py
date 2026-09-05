@@ -482,6 +482,70 @@ class Declaration:
     def source_name(self, name: str) -> str:
         return flat_name(name) if self.flat_sources else name
 
+    def _stacked_experts(self, name: str, mapping: dict[str, Any],
+                         shape: tuple[int, ...]) -> Expression:
+        """A mixture's experts, stacked into the expert-major parameter the graph holds.
+
+        HuggingFace stores one tensor per expert per projection; the training parameter is
+        `[experts, rows, cols]`. The declaration says so with a `stack_experts` record naming
+        the pattern, and the artifact's `flatten_experts` transform then writes those numbers as
+        rows -- so what this has to produce is exactly the batched parameter, not the rows.
+
+        `fuse_gate_up` means the pattern names the gate projection and each expert also has an
+        `up_proj` beside it, the two making one expert's `[2M, C]`. They concatenate on the
+        expert's own output axis, which is the order the fused parameter has; concatenating the
+        experts on that axis instead would interleave them.
+        """
+        if len(shape) != 3:
+            raise ValueError(
+                f"{name!r} stacks per-expert tensors, so its parameter is "
+                f"[experts, rows, cols]; the declaration says {shape}"
+            )
+        experts, rows, cols = shape
+        pattern = str(mapping["pattern"])
+        up_pattern = str(mapping.get("up_pattern") or "")
+        fuse_gate_up = bool(mapping.get("fuse_gate_up", False))
+        if fuse_gate_up and not up_pattern:
+            # The conventional spelling: the gate's own name with `gate` replaced.
+            up_pattern = pattern.replace("gate_proj", "up_proj")
+            if up_pattern == pattern:
+                raise ValueError(
+                    f"{name!r} asks to fuse gate and up, and its pattern {pattern!r} does not "
+                    f"name a gate projection to find the up beside"
+                )
+        halves = 2 if up_pattern else 1
+        if rows % halves != 0:
+            raise ValueError(
+                f"{name!r} fuses {halves} projections per expert, which does not divide its "
+                f"{rows} rows"
+            )
+        per_half = rows // halves
+        per_expert: list[Expression] = []
+        for expert in range(experts):
+            def tensor(source: str) -> Expression:
+                return SourceTensor(self.source_name(source.format(expert=expert)),
+                                    (per_half, cols))
+            one = tensor(pattern) if halves == 1 else Concat(
+                (tensor(pattern), tensor(up_pattern)), 0)
+            per_expert.append(Reshape(one, (1, rows, cols)))
+        stacked = Concat(tuple(per_expert), 0)
+
+        # A GGUF holds a layer's experts in one tensor per projection, already expert-major,
+        # and the bridge keeps them that way -- the same numbers in the same order as the
+        # per-expert files above, under a name with no expert in it. That is a source-format
+        # convention rather than architecture, so both spellings are offered and the resolver
+        # takes whichever the checkpoint at hand has.
+        def whole(source: str) -> Expression:
+            return SourceTensor(self.source_name(source.replace("{expert}.", "")),
+                                (experts, per_half, cols))
+        if "{expert}." not in pattern:
+            return stacked
+        # Concatenated on the expert's *output* axis, which is the order the fused parameter
+        # has; concatenating on the expert axis would interleave the two projections.
+        together = whole(pattern) if halves == 1 else Concat(
+            (whole(pattern), whole(up_pattern)), 1)
+        return AnyOf((stacked, together))
+
     def component(self, component: str, *, layer: int | None, hf_layer: str | None = None,
                   shape: tuple[int, ...] | None = None) -> Expression:
         """The expression producing one component: a whole parameter's checkpoint tensor,
@@ -510,6 +574,12 @@ class Declaration:
                     f"{component}: {name!r} maps to one checkpoint tensor and has no slices to name"
                 )
             return SourceTensor(self.source_name(mapping), shape)
+        if isinstance(mapping, dict) and mapping.get("type") == "stack_experts":
+            if slice_name:
+                raise ValueError(
+                    f"{component}: {name!r} stacks per-expert tensors and has no slices to name"
+                )
+            return self._stacked_experts(name, mapping, shape)
         if not isinstance(mapping, dict) or mapping.get("type") != "fuse":
             raise NotImplementedError(
                 f"{component}: {name!r} is mapped by a {mapping.get('type') if isinstance(mapping, dict) else type(mapping).__name__} "

@@ -93,6 +93,11 @@ _HF_ALIAS_FIXUPS: dict[str, tuple[tuple[str, str], ...]] = {
     # Gemma 3 spells them the same way Qwen3 does.
     "gemma3": (("self_attn.q_layernorm", "self_attn.q_norm"),
                ("self_attn.k_layernorm", "self_attn.k_norm")),
+    # Qwen3-MoE spells its per-head norms like the dense Qwen3, and puts its router under
+    # `mlp.gate` where the generic map reaches it as Mixtral's `block_sparse_moe.gate`.
+    "qwen3moe": (("self_attn.q_layernorm", "self_attn.q_norm"),
+                 ("self_attn.k_layernorm", "self_attn.k_norm"),
+                 ("block_sparse_moe.gate", "mlp.gate")),
 }
 
 
@@ -226,6 +231,31 @@ def synthesised_config(reader, arch: str) -> dict | None:
     if arch == "qwen3":
         return {**common, "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
                 "hidden_act": "silu", "sliding_window": None, "use_sliding_window": False,
+                "max_window_layers": layers}
+    if arch == "qwen3moe":
+        # Qwen3-30B-A3B and its siblings: the same attention as the dense Qwen3 over a routed
+        # mixture. Everything the converter reads is in the file -- the expert count, how many
+        # a token uses, and their FFN width, which is `expert_feed_forward_length` and not the
+        # `feed_forward_length` beside it: this architecture has no dense MLP, and reading that
+        # one would size every expert eight times too wide.
+        #
+        # `expert_shared_feed_forward_length` is what a mixture with an always-on expert states.
+        # This family has none, and the zero says so all the way down to the router, which then
+        # carries one row per expert and no gate.
+        shared = int(kv("expert_shared_feed_forward_length", 0) or 0)
+        return {**common,
+                "architectures": ["Qwen3MoeForCausalLM"],
+                "model_type": "qwen3_moe",
+                "hidden_act": "silu",
+                "num_experts": int(kv("expert_count", 0) or 0),
+                "num_experts_per_tok": int(kv("expert_used_count", 0) or 0),
+                "moe_intermediate_size": int(kv("expert_feed_forward_length", 0) or 0),
+                "shared_expert_intermediate_size": shared,
+                "norm_topk_prob": True,
+                "decoder_sparse_step": 1,
+                "mlp_only_layers": [],
+                "sliding_window": None,
+                "use_sliding_window": False,
                 "max_window_layers": layers}
     if arch == "llama":
         return {**common, "architectures": ["LlamaForCausalLM"], "model_type": "llama",
@@ -607,7 +637,12 @@ def gguf_target_key(gguf_path: Path, reader=None):
     # Qwen3.5, 3.6 and 3.8 are one interleaved gated-delta architecture at different sizes, so
     # they are one target and one converter; the artifact declares the dimensions it binds
     # against, and the architecture string tells 3.8 apart where the dimensions cannot.
-    # `qwen3moe` is deliberately not in this list. It is llama.cpp's name for Qwen3-30B-A3B --
+    # Qwen3-30B-A3B and its siblings: plain attention over a routed mixture with no always-on
+    # expert. llama.cpp spells it `qwen3moe`, which is one character from the interleaved
+    # gated-delta family's `qwen35moe` and was once folded into it.
+    if arch == "qwen3moe" and hidden > 0 and layers > 0:
+        return "qwen3_moe"
+    # `qwen3moe` is deliberately not in the list below. It is llama.cpp's name for Qwen3-30B-A3B --
     # plain attention with a routed mixture and no always-on expert -- and it was accepted here
     # as a defensive spelling of the interleaved gated-delta family, which would have bound a
     # 48-layer dense-attention checkpoint against a target that expects a linear mixer at three
