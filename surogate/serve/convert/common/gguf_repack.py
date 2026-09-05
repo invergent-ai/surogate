@@ -138,9 +138,13 @@ NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210, 
                 "Q4_1": 20, "Q5_1": 24, "IQ4_NL": 18,
                 "Q4_0": 18, "Q5_0": 22,
                 "IQ2_XXS": 66, "IQ2_XS": 74, "IQ2_S": 82, "IQ3_XXS": 98, "IQ3_S": 110, "IQ1_S": 50, "IQ1_M": 56, "IQ4_XS": 136,
-                "TQ1_0": 54, "TQ2_0": 66, "MXFP4": 17, "NVFP4": 36, "Q1_0": 18, "Q2_0": 18}
+                "TQ1_0": 54, "TQ2_0": 66, "MXFP4": 17, "NVFP4": 36, "Q1_0": 18, "Q2_0": 18,
+                # Not quantised at all: 32 halves, and (k/32)*64 == k*2 is exactly the dense
+                # bytes the file holds, so the rows are indexed where they lie.
+                "F16": 64}
 NATIVE_BLOCK_VALUES = {"Q8_0": 32, "Q4_1": 32, "Q5_1": 32, "IQ4_NL": 32, "Q4_0": 32,
-                       "Q5_0": 32, "MXFP4": 32, "NVFP4": 64, "Q1_0": 128, "Q2_0": 64}
+                       "Q5_0": 32, "MXFP4": 32, "NVFP4": 64, "Q1_0": 128, "Q2_0": 64,
+                       "F16": 32}
 # The GGUF spells its microscaling block type "NVFP4", a name the artifact already gives the
 # compressed-tensors block-scaled format; as a stored block type it is "NVFP4_GGML". Both
 # tables answer to both spellings so a lookup by either side's name lands.
@@ -323,8 +327,8 @@ class GgufRepackSource:
                               "transform carries that")
         if k % _GROUP != 0:
             raise RepackError(f"{hf_name}: k={k} is not a multiple of {_GROUP}")
-        if entry["type"] in NATIVE_TYPES and native_block_values(str(entry["type"])) == 256:
-            raise RepackError(f"{hf_name}: {entry['type']} is a superblock format, not planes")
+        if entry["type"] not in REPACKABLE_TYPES:
+            raise RepackError(f"{hf_name}: {entry['type']} has no exact W8 plane decoding")
         block_bytes, decoder = REPACKABLE_TYPES[entry["type"]]
         offset = int(entry["offset"])
         nbytes = n * (k // _GROUP) * block_bytes
@@ -392,7 +396,7 @@ class GgufRepackSource:
             if program is None:
                 continue
             if any(
-                (t := self.native_type_of(name)) is not None and native_block_values(t) == 256
+                (t := self.native_type_of(name)) is not None and t not in REPACKABLE_TYPES
                 for name in program.sources
             ):
                 # A source held as a *superblock* K-quant never deinterleaves into W8 planes: the

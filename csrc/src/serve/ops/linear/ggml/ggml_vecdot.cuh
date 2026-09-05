@@ -382,6 +382,23 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict
     return __half2float(bq8_0->d) * __half2float(__low2half(bq8_1->ds)) * static_cast<float>(sumi);
 }
 
+/// F16 against the quantised activation. There is no integer product to accumulate — the
+/// weight is already a number — so this is a plain float FMA over the four values a lane owns.
+/// Exact in the weight (half to float loses nothing); the only error is the activation's own
+/// int8-per-32, which every other type served from a GGUF pays too.
+__device__ __forceinline__ float vec_dot_f16_q8_1(const void* __restrict__ vbq,
+                                                  const block_q8_1* __restrict__ bq8_1,
+                                                  const int& kbx, const int& iqs) {
+    const block_f16* bf16 = static_cast<const block_f16*>(vbq) + kbx;
+    float sum             = 0.0F;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sum += __half2float(bf16->qs[4 * iqs + i]) *
+               static_cast<float>(bq8_1->qs[4 * iqs + i]);
+    }
+    return __half2float(__low2half(bq8_1->ds)) * sum;
+}
+
 __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 

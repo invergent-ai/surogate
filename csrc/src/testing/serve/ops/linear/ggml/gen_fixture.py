@@ -23,6 +23,10 @@ class _Q2_0:
 Q2_0 = getattr(T, "Q2_0", None) or _Q2_0()
 QUANT_SIZES = dict(gguf.GGML_QUANT_SIZES)
 QUANT_SIZES.setdefault(Q2_0, (64, 18))
+# gguf-py calls F16 a one-value "block" of two bytes. The engine reads it in 32-value windows,
+# because that is the unit every other route here already works in, and the two descriptions
+# cover exactly the same bytes.
+QUANT_SIZES[T.F16] = (32, 64)
 HALF_FIELDS = {  # byte offsets of the fp16 super-scales inside each block
     T.Q2_K: (80, 82), T.Q3_K: (108,), T.Q4_K: (0, 2), T.Q5_K: (0, 2), T.Q6_K: (208,),
     # Q4_1/Q5_1 are 32-value blocks, not superblocks: (d, m) sit at the front of each.
@@ -32,17 +36,19 @@ HALF_FIELDS = {  # byte offsets of the fp16 super-scales inside each block
     T.IQ2_XXS: (0,), T.IQ2_XS: (0,), T.IQ2_S: (0,), T.IQ3_XXS: (0,), T.IQ3_S: (0,), T.IQ1_S: (0,),
     T.IQ1_M: (), T.IQ4_XS: (0,), T.TQ1_0: (52,), T.TQ2_0: (64,), T.MXFP4: (), T.NVFP4: (),
     T.Q1_0: (0,), Q2_0: (0,),
+    # F16 has no scale field at all; its values are drawn directly below.
+    T.F16: (),
 }
 
 #: Values a block of each type holds. Only the K-quants are superblocks.
 BLOCK_VALUES = {T.Q4_1: 32, T.Q5_1: 32, T.Q8_0: 32, T.IQ4_NL: 32, T.Q4_0: 32, T.Q5_0: 32,
-                T.MXFP4: 32, T.NVFP4: 64, T.Q1_0: 128, Q2_0: 64}
+                T.MXFP4: 32, T.NVFP4: 64, T.Q1_0: 128, Q2_0: 64, T.F16: 32}
 
 #: Every format the engine reads where it lies. Q2_0 is absent from the installed gguf-py, so
 #: its oracle is the hand decoder below rather than gguf.quants.dequantize.
 TYPES = (T.Q2_K, T.Q3_K, T.Q4_K, T.Q5_K, T.Q6_K, T.Q8_0, T.Q4_1, T.Q5_1, T.IQ4_NL, T.Q4_0, T.Q5_0,
          T.IQ2_XXS, T.IQ2_XS, T.IQ2_S, T.IQ3_XXS, T.IQ3_S, T.IQ1_S, T.IQ1_M, T.IQ4_XS,
-         T.TQ1_0, T.TQ2_0, T.MXFP4, T.NVFP4, T.Q1_0, Q2_0)
+         T.TQ1_0, T.TQ2_0, T.MXFP4, T.NVFP4, T.Q1_0, Q2_0, T.F16)
 
 
 def synthetic(t: T, n: int, k: int, seed: int) -> np.ndarray:
@@ -60,6 +66,11 @@ def synthetic(t: T, n: int, k: int, seed: int) -> np.ndarray:
         for i in range(4):
             words[:, :, i] = (words[:, :, i] & 0x0FFF) | (((vals >> (4 * i)) & 0xF) << 12)
         blocks[:, :, 48:56] = words.view(np.uint8).reshape(n, k // per, 8)
+    if t == T.F16:
+        # Every byte pair is a value, so draw halves rather than fixing up random bytes: the
+        # fixture then spans both signs and a realistic magnitude range.
+        vals = rng.uniform(-1.0, 1.0, size=(n, k // per, per)).astype(np.float16)
+        return vals.view(np.uint8).reshape(n, -1)
     if t == T.MXFP4:
         # E8M0 exponents near one, so the tile stays representable in BF16
         blocks[:, :, 0] = rng.integers(118, 128, size=(n, k // per), dtype=np.uint8)
@@ -110,7 +121,9 @@ def _hub(name: str) -> list[pathlib.Path]:
 REAL_FILES = ([pathlib.Path(x) for x in os.environ["SINFER_GGML_FIXTURE_GGUFS"].split(",") if x]
               if "SINFER_GGML_FIXTURE_GGUFS" in os.environ else
               [REAL] + [p for name in ("Qwen3-0.6B-UD-IQ1_M.gguf", "Qwen3-0.6B-UD-IQ2_M.gguf",
-                                       "Qwen3-0.6B-IQ4_XS.gguf", "Qwen3-0.6B-UD-IQ3_XXS.gguf")
+                                       "Qwen3-0.6B-IQ4_XS.gguf", "Qwen3-0.6B-UD-IQ3_XXS.gguf",
+                                       # the XL mixes keep their most sensitive tensors at F16
+                                       "Qwen3.5-0.8B-UD-Q8_K_XL.gguf")
                         for p in _hub(name)[:1]])
 REAL_TYPES = {t.name for t in TYPES}
 seen = set()
@@ -124,9 +137,13 @@ for real in REAL_FILES:
         if t.name in REAL_TYPES and t.name not in ("Q2_K", "Q3_K") and t not in seen and len(tensor.shape) == 2:
             k, n = int(tensor.shape[0]), int(tensor.shape[1])
             rows = min(n, 512)
-            data = np.asarray(tensor.data).reshape(n, -1)[:rows]
+            # gguf-py hands back a typed array for the unquantised types and raw bytes for
+            # everything else; the fixture is always the stored bytes.
+            raw = np.asarray(tensor.data)
+            raw = raw if raw.dtype == np.uint8 else raw.view(np.uint8)
+            data = raw.reshape(n, -1)[:rows]
             write(t, np.ascontiguousarray(data), rows, k, "real")
             seen.add(t)
             if tensor.name == "token_embd.weight" and real == REAL:
                 # the whole table: the lm_head's row count, which the small cases never reach
-                write(t, np.ascontiguousarray(np.asarray(tensor.data).reshape(n, -1)), n, k, "big")
+                write(t, np.ascontiguousarray(raw.reshape(n, -1)), n, k, "big")

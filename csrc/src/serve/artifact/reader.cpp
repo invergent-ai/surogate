@@ -138,6 +138,7 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "NVFP4_GGML") { return NumericFormat::NVFP4_GGML; }
     if (name == "Q1_0") { return NumericFormat::Q1_0; }
     if (name == "Q2_0") { return NumericFormat::Q2_0; }
+    if (name == "F16") { return NumericFormat::F16; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 

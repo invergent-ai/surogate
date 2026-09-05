@@ -114,6 +114,10 @@ MXFP4 = GgmlBlockFormat("MXFP4", 4.25, 17, 32)
 NVFP4_GGML = GgmlBlockFormat("NVFP4_GGML", 4.5, 36, 64)
 Q1_0 = GgmlBlockFormat("Q1_0", 1.125, 18, 128)
 Q2_0 = GgmlBlockFormat("Q2_0", 2.25, 18, 64)
+#: The GGUF's unquantised half, described as 32-value windows onto the dense bytes so it
+#: travels the same route every stored block type does. `(k / 32) * 64 == k * 2`, so the
+#: object's runs point straight at the file and nothing is copied or re-encoded.
+F16 = GgmlBlockFormat("F16", 16.0, 64, 32)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -131,7 +135,7 @@ FP8_ROW_FORMATS = MappingProxyType(
 )
 GGML_BLOCK_FORMATS = MappingProxyType(
     {item.name: item for item in (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0,
-                            IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4_GGML, Q1_0, Q2_0)}
+                            IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4_GGML, Q1_0, Q2_0, F16)}
 )
 FP8_BLOCK_FORMATS = {FP8_E4M3FN_BLK128_F32S.name: FP8_E4M3FN_BLK128_F32S,
                      FP8_E4M3FN_ROW_F32S.name: FP8_E4M3FN_ROW_F32S}

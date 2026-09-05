@@ -18,6 +18,12 @@ using vec_dot_q_cuda_t = float (*)(const void* __restrict__, const block_q8_1* _
                                    const int&, const int&);
 
 template <GgmlType type> struct Traits;
+template <> struct Traits<GgmlType::F16> {
+    // `vdr = 1` is one activation int32 — four values — per lane, so `qi / vdr = 8` lanes
+    // tile the 32-value block.
+    static constexpr int qk = QK_F16, qi = QK_F16 / 4, vdr = 1;
+    static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_f16_q8_1;
+};
 template <> struct Traits<GgmlType::Q2_K> {
     static constexpr int qk = QK_K, qi = QI2_K, vdr = VDR_Q2_K_Q8_1_MMVQ;
     static constexpr vec_dot_q_cuda_t vec_dot = vec_dot_q2_K_q8_1;

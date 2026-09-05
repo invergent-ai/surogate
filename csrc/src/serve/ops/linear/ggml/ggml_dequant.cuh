@@ -20,6 +20,7 @@ template <GgmlType type>
 __host__ __device__ constexpr int dequant_threads() {
     // llama.cpp launches Q4_K's dequantiser with 32 threads and the other K-quants with 64; a
     // Q8_0 block is 32 values, one per lane.
+    if constexpr (type == GgmlType::F16) { return QK_F16; }
     if constexpr (type == GgmlType::Q8_0) { return QK8_0; }
     if constexpr (type == GgmlType::Q4_1) { return QK4_1; }
     if constexpr (type == GgmlType::Q5_1) { return QK5_1; }
@@ -167,6 +168,13 @@ static __device__ __forceinline__ void dequantize_q5_K(const void * vx, const in
 }
 
 /// One value per lane: a Q8_0 block is 32 quants and a single scale.
+template <typename dst_t>
+__device__ __forceinline__ void dequantize_f16(const void* blocks, std::int64_t ib, dst_t* out,
+                                               int tid) {
+    const block_f16* x = static_cast<const block_f16*>(blocks) + ib;
+    if (tid < QK_F16) { out[tid] = cast_to<dst_t>(__half2float(x->qs[tid])); }
+}
+
 template <typename dst_t>
 __device__ __forceinline__ void dequantize_q8_0(const void* blocks, std::int64_t ib, dst_t* out,
                                                 int tid) {
@@ -462,6 +470,7 @@ __device__ __forceinline__ void dequantize_superblock(const void* blocks, std::i
     if constexpr (type == GgmlType::Q4_K) { dequantize_q4_K(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q5_K) { dequantize_q5_K(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q6_K) { dequantize_q6_K(blocks, ib, out, tid); }
+    if constexpr (type == GgmlType::F16) { dequantize_f16(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q8_0) { dequantize_q8_0(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q4_1) { dequantize_q4_1(blocks, ib, out, tid); }
     if constexpr (type == GgmlType::Q5_1) { dequantize_q5_1(blocks, ib, out, tid); }

@@ -39,6 +39,14 @@ inline constexpr int VDR_Q8_0_Q8_1_MMVQ = 2;
 
 // The int8 activation block the vec-dots consume: 32 values, (d, sum) as half2.
 inline constexpr int QK8_1 = 32;
+
+/// Values an F16 "block" holds. The type is not quantised — a GGUF stores it as plain IEEE
+/// halves — but every route here is written over blocks, and 32 is the unit the activation
+/// quantiser, the column permutation and the prefill tiles already use. So the block is a
+/// window onto the dense bytes rather than a container: no scale, no packing, and
+/// `(k / 32) * 64 == k * 2`, which is exactly what the file holds. That is what lets the rows
+/// be indexed where they lie instead of copied.
+inline constexpr int QK_F16 = 32;
 inline constexpr int QR8_1 = 1;
 inline constexpr int QI8_1 = QK8_1 / (4 * QR8_1);
 
@@ -129,6 +137,11 @@ struct block_iq4_nl {
 };
 static_assert(sizeof(block_iq4_nl) == sizeof(__half) + QK4_NL / 2,
               "wrong iq4_nl block size/padding");
+
+struct block_f16 {
+    __half qs[QK_F16];
+};
+static_assert(sizeof(block_f16) == QK_F16 * sizeof(__half), "wrong f16 block size/padding");
 
 struct block_q8_1 {
     __half2 ds;          // d (scale), s (sum of the 32 unquantised values)

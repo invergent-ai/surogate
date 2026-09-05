@@ -52,6 +52,7 @@ StorageLayout storage_layout_for(NumericFormat format) {
     case NumericFormat::NVFP4_GGML:
     case NumericFormat::Q1_0:
     case NumericFormat::Q2_0:
+    case NumericFormat::F16:
         return StorageLayout::GgmlBlocksV1;
     case NumericFormat::NVFP4:
         return StorageLayout::BlockScaleK16M128x4V1;
@@ -261,6 +262,8 @@ QType qtype_for(NumericFormat format) {
         return QType::Q1_0;
     case NumericFormat::Q2_0:
         return QType::Q2_0;
+    case NumericFormat::F16:
+        return QType::F16;
     case NumericFormat::NVFP4:
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
@@ -433,6 +436,7 @@ bool is_linear_format(NumericFormat format) noexcept {
     case NumericFormat::NVFP4_GGML:
     case NumericFormat::Q1_0:
     case NumericFormat::Q2_0:
+    case NumericFormat::F16:
         return true;
     case NumericFormat::FP32:
     case NumericFormat::I32:

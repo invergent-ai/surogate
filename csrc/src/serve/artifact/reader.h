@@ -56,6 +56,7 @@ enum class NumericFormat {
     NVFP4_GGML,
     Q1_0,
     Q2_0,
+    F16,
 };
 
 enum class StorageLayout {

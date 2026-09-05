@@ -27,10 +27,7 @@ the history of what was tried is `design/INFERENCE.md`.
 
 Five open or partly done. Two are decisions waiting on `surogate quantize` as a
 product rather than tasks (1 and 5); of the rest, item 2's substance shipped and
-items 3 and 4 are the same measured obstacle on Flash-Next's offload path. The
-largest unclaimed piece of engineering is not in this list but in **Format
-coverage** below: F16 GGUF tensors are still bridged rather than read where they
-lie, which is most of every `UD-Q8_K_XL` file.
+items 3 and 4 are the same measured obstacle on Flash-Next's offload path.
 
 1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
@@ -249,7 +246,7 @@ block. The second is the real fix and belongs to the engine, not to this item.
 
 Routed today, everywhere the runtime needs them: **every GGML weight type llama.cpp
 stores** -- Q2_K–Q6_K, Q8_0, Q4_0/Q4_1/Q5_0/Q5_1, IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/
-IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS, TQ1_0/TQ2_0, MXFP4, NVFP4_GGML, Q1_0/Q2_0 -- on linear,
+IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS, TQ1_0/TQ2_0, MXFP4, NVFP4_GGML, Q1_0/Q2_0, F16 -- on linear,
 embedding and MoE decode/small-T/prefill (Q4_K/Q5_K/Q6_K on the int8 tensor-core
 route, the rest on the BF16 route), read from the GGUF; **BF16** at any 8-aligned
 shape, **W8G32_F16S**, and **NVFP4 compressed-tensors** (TRT-LLM cutlass for routed
@@ -263,7 +260,8 @@ MoE). What is not:
 | MXFP4 / MXFP8 | **[ ]** nothing in serve; the trainer decodes MXFP4 |
 | GPTQ / AWQ | **[ ]** off the roadmap by owner decision |
 | `kv_cache_scheme` | **[ ]** refuse or support — do not ignore silently. Checked 2026-09-05: the key appears nowhere in the tree, so a checkpoint that asks for a quantised KV cache is served with the engine's own default and never told. |
-| F16 (GGUF) | **[ ]** bridged to BF16, three mantissa bits lost, and the file is copied rather than indexed; UD-Q8_K_XL is mostly F16. The largest remaining format gap. |
+| F16 (GGUF) | **[x]** read where it lies (2026-09-05), as 32-value windows onto the dense bytes |
+| F32 (GGUF) | **[~]** bridged, and correctly so: every F32 tensor in a real file is a norm, an `A_log` or a conv1d, each of which needs a value or shape transform. 0.07 % of the elements. |
 
 Known runtime constraints: NVFP4 needs `n % 128 == 0 && k % 64 == 0` with no
 padding path; `embedding` has no NVFP4 or Q4/Q5; `linear_pair` is W8 only.

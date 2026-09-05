@@ -136,6 +136,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "Q1_0";
     case NumericFormat::Q2_0:
         return "Q2_0";
+    case NumericFormat::F16:
+        return "F16";
     }
     return {};
 }
@@ -180,6 +182,7 @@ std::uint64_t ggml_block_values(NumericFormat format) {
     case NumericFormat::NVFP4_GGML: return 64;
     case NumericFormat::Q1_0: return 128;
     case NumericFormat::Q2_0: return 64;
+    case NumericFormat::F16: return 32;
     default: return 256;
     }
 }
@@ -211,6 +214,7 @@ std::uint64_t ggml_block_bytes(NumericFormat format) {
     case NumericFormat::NVFP4_GGML: return 36;
     case NumericFormat::Q1_0: return 18;
     case NumericFormat::Q2_0: return 18;
+    case NumericFormat::F16: return 64;
     default: break;
     }
     throw ArtifactError("format is not a GGML superblock format");

@@ -144,6 +144,15 @@ __host__ __device__ __forceinline__ void decode_eight<GgmlType::Q6_K>(const void
 }
 
 template <>
+__host__ __device__ __forceinline__ void decode_eight<GgmlType::F16>(const void* blocks, std::int64_t ib,
+                                                             int lane, float (&w)[8]) {
+    // Like Q8_0: 32 values, so four lanes cover one block. There is no scale to apply.
+    const block_f16* x = static_cast<const block_f16*>(blocks) + ib;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) { w[l] = __half2float(x->qs[lane * 8 + l]); }
+}
+
+template <>
 __host__ __device__ __forceinline__ void decode_eight<GgmlType::Q8_0>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
     // A Q8_0 block is 32 values, so four lanes cover one rather than thirty-two: `ib` is the

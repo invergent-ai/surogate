@@ -11,7 +11,8 @@ namespace sinfer::ops::detail::ggml {
 
 enum class GgmlType : std::uint8_t {
     Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_1, Q5_1, IQ4_NL, Q4_0, Q5_0,
-    IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4_GGML, Q1_0, Q2_0
+    IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, IQ4_XS, TQ1_0, TQ2_0, MXFP4, NVFP4_GGML, Q1_0, Q2_0,
+    F16
 };
 
 /// Every stored block format, in one place. A dispatch written over this covers the whole
@@ -41,7 +42,8 @@ enum class GgmlType : std::uint8_t {
     X(MXFP4)                                                                         \
     X(NVFP4_GGML)                                                                       \
     X(Q1_0)                                                                          \
-    X(Q2_0)                                                                          
+    X(Q2_0)                                                                          \
+    X(F16)                                                                           
 
 /// Values per stored block. A K-quant or an IQ superblock is 256; the plain block types are
 /// 32, except the two that are not: NVFP4 holds 64 under four sub-scales, Q1_0 128 under one.
@@ -55,6 +57,7 @@ __host__ __device__ constexpr std::int32_t block_values(GgmlType type) noexcept 
     case GgmlType::Q5_0:
     case GgmlType::MXFP4: return QK8_0;
     case GgmlType::NVFP4_GGML: return QK_NVFP4;
+    case GgmlType::F16: return QK_F16;
     case GgmlType::Q1_0: return QK1_0;
     case GgmlType::Q2_0: return QK2_0;
     default: return QK_K;
@@ -88,6 +91,7 @@ __host__ __device__ constexpr std::int32_t block_bytes(GgmlType type) noexcept {
     case GgmlType::NVFP4_GGML: return sizeof(block_nvfp4);
     case GgmlType::Q1_0: return sizeof(block_q1_0);
     case GgmlType::Q2_0: return sizeof(block_q2_0);
+    case GgmlType::F16: return sizeof(block_f16);
     }
     return 0;
 }
@@ -118,6 +122,7 @@ constexpr const char* type_name(GgmlType type) noexcept {
     case GgmlType::NVFP4_GGML: return "NVFP4_GGML";
     case GgmlType::Q1_0: return "Q1_0";
     case GgmlType::Q2_0: return "Q2_0";
+    case GgmlType::F16: return "F16";
     }
     return "?";
 }

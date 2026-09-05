@@ -146,7 +146,7 @@ GGML_BLOCKS_V1 = Layout(
     "ggml-blocks-v1",
     256,
     frozenset(("Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "Q4_1", "Q5_1", "IQ4_NL", "Q4_0", "Q5_0",
-               "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M", "IQ4_XS", "TQ1_0", "TQ2_0", "MXFP4", "NVFP4_GGML", "Q1_0", "Q2_0")),
+               "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M", "IQ4_XS", "TQ1_0", "TQ2_0", "MXFP4", "NVFP4_GGML", "Q1_0", "Q2_0", "F16")),
 )
 
 LAYOUTS = MappingProxyType(

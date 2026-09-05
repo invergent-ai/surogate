@@ -82,6 +82,10 @@ enum class QType : std::uint16_t {
     NVFP4_GGML           = 31,
     Q1_0                 = 32,
     Q2_0                 = 33,
+    /// The GGUF's unquantised half. Served where it lies, as 32-value windows onto the dense
+    /// bytes: a `UD-Q8_K_XL` keeps its most sensitive tensors at sixteen bits deliberately,
+    /// and re-encoding them would be quantising what the user brought us.
+    F16                  = 34,
 };
 
 enum class QuantLayout : std::uint16_t {
