@@ -1055,7 +1055,11 @@ int run_profile(const CodecProfile& profile) {
         ++failures;
     }
     if (profile.routed_gate_up == QType::W8G32_F16S) {
-        constexpr std::array<int, 2> kHostBound{{17, 191}};
+        // Two of the experts pattern 0 selects, named by position like the patterns themselves.
+        // They were written as 17 and 191 -- ids of a 256-expert mixture -- and 191 indexes 63
+        // elements past the slot table of a 128-expert one, which is a heap overrun that shows
+        // up as a corrupt free somewhere else entirely.
+        const std::array<int, 2> kHostBound{{route_expert(1), route_expert(5)}};
         for (const std::int32_t tokens : {std::int32_t{20}, std::int32_t{768}}) {
             failures += fixture.run_host_bound(tokens, 0, kHostBound);
         }

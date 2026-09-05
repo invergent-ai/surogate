@@ -60,6 +60,10 @@ using Gqa256_8q2   = GqaGeometry<256, 8, 2, 2>;  // qwen3.5-0.8b
 using Gqa256_16q4  = GqaGeometry<256, 16, 4, 2>; // qwen3.5-4b, qwen3.5-2b
 using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of twelve)
 using Gqa128_16q8  = GqaGeometry<128, 16, 8, 1>; // qwen3-0.6b (the first 128-wide head)
+// Qwen3-30B-A3B: 32 query heads over 4 KV heads at head dim 128. DecodeSplitScale 1 for the
+// reason the other four-KV-head shapes take it -- four KV heads reach the registry's modal
+// KVHeads*DecodeSplits at scale 1, and the grid takes its parallelism from that dimension.
+using Gqa128_32q4  = GqaGeometry<128, 32, 4, 1>; // qwen3-30b-a3b
 // DecodeSplitScale 1: the grid is (KVHeads, splits, batch) and the registry's
 // modal KVHeads*DecodeSplits is about 340, which four KV heads reach at scale 1 --
 // the same reasoning, and the same answer, as the other four-KV-head shape above.
@@ -95,6 +99,7 @@ using Gqa256_4q1   = GqaGeometry<256, 4, 1, 4>;  // gemma-3-270m (the first MQA 
     X(Gqa256_16q4)                                                                                 \
     X(Gqa256_24q2)                                                                                 \
     X(Gqa128_16q8)                                                                                 \
+    X(Gqa128_32q4)                                                                                 \
     X(Gqa64_32q4)                                                                                 \
     X(Gqa64_32q8)                                                                                 \
     X(Gqa256_4q1)
@@ -109,27 +114,27 @@ struct GqaGeometryListEnd {
     static constexpr int KVHeads = 0;
 };
 
-// Registered shapes must be distinct in (QHeads, KVHeads): the dispatchers that
-// see only the head counts — workspace sizing and split capacity, whose public
-// signatures carry no head dimension — rely on that pair naming one shape, and
-// picking the wrong one there under-sizes the split buffers the kernel writes.
-template <typename... Geometries>
-constexpr bool gqa_head_counts_are_distinct() {
-    constexpr std::size_t kCount = sizeof...(Geometries);
-    const int q_heads[kCount]    = {Geometries::QHeads...};
-    const int kv_heads[kCount]   = {Geometries::KVHeads...};
-    for (std::size_t i = 0; i < kCount; ++i) {
-        for (std::size_t j = i + 1; j < kCount; ++j) {
-            if (q_heads[i] == q_heads[j] && kv_heads[i] == kv_heads[j]) { return false; }
+// Registered shapes must be distinct in (HeadDim, QHeads, KVHeads). The head counts alone are
+// not enough: TinyLlama attends with 32 query heads over 4 KV heads at a head dimension of 64,
+// and Qwen3-30B-A3B does the same at 128. Every dispatcher therefore carries the width.
+template <class... Geometries>
+constexpr bool gqa_shapes_are_distinct() {
+    constexpr int kCount = sizeof...(Geometries);
+    constexpr int dims[kCount]  = {Geometries::HeadDim...};
+    constexpr int qs[kCount]    = {Geometries::QHeads...};
+    constexpr int kvs[kCount]   = {Geometries::KVHeads...};
+    for (int i = 0; i < kCount; ++i) {
+        for (int j = i + 1; j < kCount; ++j) {
+            if (dims[i] == dims[j] && qs[i] == qs[j] && kvs[i] == kvs[j]) { return false; }
         }
     }
     return true;
 }
 
 #define SINFER_GQA_LIST_GEOMETRY(Name) Name,
-static_assert(gqa_head_counts_are_distinct<SINFER_GQA_FOR_EACH_GEOMETRY(
+static_assert(gqa_shapes_are_distinct<SINFER_GQA_FOR_EACH_GEOMETRY(
                   SINFER_GQA_LIST_GEOMETRY) GqaGeometryListEnd>(),
-              "two registered geometries share a (query heads, KV heads) pair");
+              "two registered geometries share a (head dim, query heads, KV heads) shape");
 #undef SINFER_GQA_LIST_GEOMETRY
 
 // A dispatcher that knows only some of the triple passes 0 for the rest, which
@@ -205,29 +210,30 @@ inline bool gqa_kv_shape_is_registered(std::int64_t head_dim, std::int64_t kv_he
     return false;
 }
 
-// The head dimension of the registered shape carrying this (query, KV) head
-// pair, for callers that hold the head counts and need the width the kernels
-// will address -- workspace sizing, and the validation that refuses a q/out
-// tensor or a softmax scale belonging to another shape. The pair is unique across
-// the registry (asserted above); an unregistered one throws.
-inline std::int64_t gqa_registered_head_dim(std::int64_t q_heads, std::int64_t kv_heads) {
-#define SINFER_GQA_HEAD_DIM_ARM(Name)                                                              \
-    if (q_heads == Name::QHeads && kv_heads == Name::KVHeads) { return Name::HeadDim; }
-    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_HEAD_DIM_ARM)
-#undef SINFER_GQA_HEAD_DIM_ARM
-    detail::throw_unregistered_geometry(0, q_heads, kv_heads);
+// Whether the registry carries this exact shape, for callers that hold all three numbers --
+// the head dimension comes off the query tensor -- and need to refuse one it does not.
+inline bool gqa_shape_is_registered(std::int64_t head_dim, std::int64_t q_heads,
+                                    std::int64_t kv_heads) {
+#define SINFER_GQA_SHAPE_MATCH(Name)                                                               \
+    if (head_dim == Name::HeadDim && q_heads == Name::QHeads && kv_heads == Name::KVHeads) {       \
+        return true;                                                                               \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_SHAPE_MATCH)
+#undef SINFER_GQA_SHAPE_MATCH
+    return false;
 }
 
-// The KV-head count of the registered shape serving `q_heads`. A query count can
-// be registered against more than one KV count (16 queries over 2 or 4 KV heads;
-// 24 over 4 or 2), which is why callers pass the head count of whatever KV
-// source they hold; pass 0 when holding none, which resolves only a query count
-// that is unique in the registry. Unresolvable pairs throw.
-inline std::int64_t gqa_registered_kv_heads(std::int64_t q_heads, std::int64_t source_kv_heads) {
+// The KV-head count of the registered shape serving `head_dim` and `q_heads`. A query count can
+// be registered against more than one KV count (16 queries over 2 or 4 KV heads; 24 over 4 or
+// 2), which is why callers pass the head count of whatever KV source they hold; pass 0 when
+// holding none, which resolves only a count that is unique at that width. Unresolvable
+// combinations throw.
+inline std::int64_t gqa_registered_kv_heads(std::int64_t head_dim, std::int64_t q_heads,
+                                            std::int64_t source_kv_heads) {
     std::int64_t sole_match = 0;
     int matches             = 0;
 #define SINFER_GQA_KV_ARM(Name)                                                                    \
-    if (q_heads == Name::QHeads) {                                                                 \
+    if (head_dim == Name::HeadDim && q_heads == Name::QHeads) {                                    \
         if (source_kv_heads == Name::KVHeads) { return Name::KVHeads; }                            \
         sole_match = Name::KVHeads;                                                                \
         ++matches;                                                                                 \
@@ -235,7 +241,7 @@ inline std::int64_t gqa_registered_kv_heads(std::int64_t q_heads, std::int64_t s
     SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_KV_ARM)
 #undef SINFER_GQA_KV_ARM
     if (matches == 1) { return sole_match; }
-    detail::throw_unregistered_geometry(0, q_heads, source_kv_heads);
+    detail::throw_unregistered_geometry(head_dim, q_heads, source_kv_heads);
 }
 
 } // namespace sinfer::ops

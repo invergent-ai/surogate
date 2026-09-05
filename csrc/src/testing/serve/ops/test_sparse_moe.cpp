@@ -110,6 +110,8 @@ int main() {
     // baked for an intermediate of 512 and this mixture's is 768, which the op refuses by name
     // rather than approximating, so listing them here would test that refusal and nothing else.
     for (const CodecProfile& profile : profiles) {
+        // Q5 and Q6 routed-down kernels are baked for an intermediate of 512 and this mixture's
+        // is 768, which the op refuses by name rather than approximating.
         const bool baked_for_512 = profile.routed_down == QType::Q5G64_F16S ||
                                    profile.routed_down == QType::Q6G64_F16S;
         if (baked_for_512) { continue; }

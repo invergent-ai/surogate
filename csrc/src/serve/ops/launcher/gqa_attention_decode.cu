@@ -33,9 +33,9 @@ std::int32_t gqa_attention_small_t_max_width(std::int32_t q_heads, std::int32_t 
     return rows < 6 ? rows : 6;
 }
 
-std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_heads,
-                                          std::int32_t tokens, DType cache_dtype,
-                                          GqaExecutionEnvelope envelope) {
+std::int32_t gqa_attention_split_capacity(std::int32_t head_dim, std::int32_t q_heads,
+                                          std::int32_t kv_heads, std::int32_t tokens,
+                                          DType cache_dtype, GqaExecutionEnvelope envelope) {
     if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
          cache_dtype != DType::FP8_E4M3FN) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
@@ -44,7 +44,7 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_
     // Sizes the split buffers the launcher writes, so it has to resolve the same
     // geometry the launcher will: the split count follows DecodeSplitScale, and
     // two shapes sharing a query count need not share it.
-    return gqa_dispatch_geometry(q_heads, kv_heads, [&]<typename Geometry>() {
+    return gqa_dispatch_geometry(head_dim, q_heads, kv_heads, [&]<typename Geometry>() {
         return gqa_small_t_launch_capacity<Geometry>(envelope, tokens, cache_dtype);
     });
 }

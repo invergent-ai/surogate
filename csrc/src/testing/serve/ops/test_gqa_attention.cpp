@@ -47,6 +47,10 @@ struct Geometry {
     const char* name;
     std::int32_t q_heads;
     std::int32_t kv_heads;
+    /// Every case below is a 256-wide head. It is a member because the head dimension is part
+    /// of a registered shape rather than derivable from its head counts -- two models attend
+    /// with 32 query heads over 4 KV heads at different widths.
+    std::int32_t head_dim = kHeadDim;
 
     [[nodiscard]] std::int32_t query_group() const { return q_heads / kv_heads; }
 };
@@ -994,7 +998,8 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max, test_case.sliding_window};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, geometry.kv_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.head_dim, geometry.q_heads, geometry.kv_heads, dtype, envelope, 1,
+        test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     // Poison the partial buffers. A split kernel returns without writing when it
     // is past the active count, so an unwritten split leaves whatever was here;
@@ -1063,7 +1068,8 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                              test_case.envelope_max, test_case.sliding_window};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, geometry.kv_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
+        geometry.head_dim, geometry.q_heads, geometry.kv_heads, dtype, envelope, 1,
+        test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     // Poison the partial buffers. A split kernel returns without writing when it
     // is past the active count, so an unwritten split leaves whatever was here;
@@ -1243,7 +1249,8 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(maximum_visible),
                                              static_cast<std::uint32_t>(maximum_visible)};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, geometry.kv_heads, dtype, envelope, batch, test_case.width, test_case.width);
+        geometry.head_dim, geometry.q_heads, geometry.kv_heads, dtype, envelope, batch,
+        test_case.width, test_case.width);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     // Poison the partial buffers. A split kernel returns without writing when it
     // is past the active count, so an unwritten split leaves whatever was here;
@@ -1394,18 +1401,19 @@ int run_geometry(const Geometry& geometry) {
 int verify_geometry_registration_contract() {
     int failures = 0;
     constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
-    const auto accepted = [&](std::int32_t q_heads, std::int32_t kv_heads) {
+    const auto accepted = [&](std::int32_t head_dim, std::int32_t q_heads,
+                              std::int32_t kv_heads) {
         try {
-            (void)ops::gqa_attention_workspace_capacity_bytes(q_heads, kv_heads, DType::BF16,
-                                                              envelope, 1, 1, 8);
+            (void)ops::gqa_attention_workspace_capacity_bytes(head_dim, q_heads, kv_heads,
+                                                              DType::BF16, envelope, 1, 1, 8);
             return true;
         } catch (const std::invalid_argument&) { return false; }
     };
 
 #define SINFER_GQA_REGISTERED_CASE(Name)                                                           \
-    if (!accepted(ops::Name::QHeads, ops::Name::KVHeads)) {                                        \
-        std::cerr << "gqa_attention rejected registered geometry " << ops::Name::QHeads << "q"     \
-                  << ops::Name::KVHeads << "\n";                                                   \
+    if (!accepted(ops::Name::HeadDim, ops::Name::QHeads, ops::Name::KVHeads)) {                    \
+        std::cerr << "gqa_attention rejected registered geometry " << ops::Name::HeadDim << "d"    \
+                  << ops::Name::QHeads << "q" << ops::Name::KVHeads << "\n";                       \
         ++failures;                                                                                \
     }
     SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_REGISTERED_CASE)
@@ -1414,18 +1422,28 @@ int verify_geometry_registration_contract() {
     // Two unregistered query counts; two unregistered pairings of counts that are
     // each registered elsewhere; and a KV count no shape carries at all.
     //
-    // Unlike the accepted half above, this list does not extend itself off the
-    // registry macro, so registering a geometry can make an entry here stale --
-    // {16, 8} was listed as carrying an unheld KV count until Gqa128_16q8 was
-    // added, and {32, 8} until Gqa64_32q8 was added for LFM2. Revisit this list
-    // whenever the registry gains a shape.
-    const std::pair<std::int32_t, std::int32_t> unregistered[] = {
-        {32, 2}, {12, 4}, {8, 4}, {24, 8}, {16, 16},
+    // Unlike the accepted half above, this list does not extend itself off the registry macro,
+    // so registering a geometry can make an entry here stale -- {256, 16, 8} was listed as
+    // carrying an unheld KV count until Gqa128_16q8 was added, {32, 8} until Gqa64_32q8 was
+    // added for LFM2, and the head dimension joined every entry when Gqa128_32q4 was added
+    // beside Gqa64_32q4 and the counts alone stopped naming a shape. Revisit this list whenever
+    // the registry gains one.
+    //
+    // The last two are the case the width now carries: head counts that *are* registered --
+    // 32 over 4 at 64 and 128, 32 over 8 at 64 -- named at a width that is not.
+    struct Shape {
+        std::int32_t head_dim;
+        std::int32_t q_heads;
+        std::int32_t kv_heads;
     };
-    for (const auto& [q_heads, kv_heads] : unregistered) {
-        if (accepted(q_heads, kv_heads)) {
-            std::cerr << "gqa_attention accepted unregistered geometry " << q_heads << "q"
-                      << kv_heads << "\n";
+    const Shape unregistered[] = {
+        {256, 32, 2}, {256, 12, 4}, {256, 8, 4}, {256, 24, 8}, {256, 16, 16},
+        {256, 32, 4}, {256, 32, 8},
+    };
+    for (const auto& [head_dim, q_heads, kv_heads] : unregistered) {
+        if (accepted(head_dim, q_heads, kv_heads)) {
+            std::cerr << "gqa_attention accepted unregistered geometry " << head_dim << "d"
+                      << q_heads << "q" << kv_heads << "\n";
             ++failures;
         }
     }
@@ -1437,11 +1455,11 @@ int verify_workspace_capacity_contract() {
     for (const DType dtype : {DType::BF16, DType::I8}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
-            ops::gqa_attention_workspace_capacity_bytes(16, 2, dtype, envelope, 1, 1, 17);
+            ops::gqa_attention_workspace_capacity_bytes(kHeadDim, 16, 2, dtype, envelope, 1, 1, 17);
         std::size_t witness = 0;
         for (std::int32_t tokens = 1; tokens <= 17; ++tokens) {
             witness = std::max(witness, ops::gqa_attention_workspace_capacity_bytes(
-                                            16, 2, dtype, envelope, 1, tokens, tokens));
+                                            kHeadDim, 16, 2, dtype, envelope, 1, tokens, tokens));
         }
         if (interval != witness) {
             std::cerr << "gqa_attention interval capacity has no exact route witness\n";
@@ -1450,14 +1468,14 @@ int verify_workspace_capacity_contract() {
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, 2, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
+            kHeadDim, 16, 2, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
     } catch (const std::invalid_argument&) {
         std::cerr << "gqa_attention rejected its maximum visible-key envelope\n";
         ++failures;
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, 2, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+            kHeadDim, 16, 2, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
         std::cerr << "gqa_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}

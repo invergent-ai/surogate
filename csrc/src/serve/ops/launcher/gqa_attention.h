@@ -29,7 +29,8 @@ struct GqaSmallTInvocation {
 // Splits the launcher will use for this shape, which sizes the partial buffers
 // it writes. The head counts must be the served shape's: they select the same
 // registered geometry the launcher selects.
-std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_heads,
+std::int32_t gqa_attention_split_capacity(std::int32_t head_dim, std::int32_t q_heads,
+                                          std::int32_t kv_heads,
                                           std::int32_t tokens, DType cache_dtype,
                                           GqaExecutionEnvelope envelope);
 

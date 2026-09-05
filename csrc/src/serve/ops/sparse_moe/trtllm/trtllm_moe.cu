@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <tuple>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -71,11 +73,11 @@ struct WorkspaceLayout {
     std::size_t total         = 0;
 };
 
-Runner& runner();
+Runner& runner(const Geometry& geometry);
 
 WorkspaceLayout workspace_layout(const Geometry& geometry, std::int32_t max_tokens) {
     WorkspaceLayout out;
-    out.runner_bytes = runner().getWorkspaceSize(
+    out.runner_bytes = runner(geometry).getWorkspaceSize(
         max_tokens, geometry.hidden, geometry.intermediate, geometry.experts,
         geometry.experts_per_token, tkc::ActivationType::Swiglu, tkc::MOEParallelismConfig{},
         /*use_lora*/ false, /*use_deepseek_fp8_block_scale*/ false, /*use_mxfp8_act_scaling*/ false,
@@ -103,20 +105,59 @@ struct TacticKey {
     }
 };
 
+/// Everything the vendored runner keeps between calls, and it is all per geometry.
+///
+/// This used to be one instance for the process, which was wrong the moment a second mixture
+/// was registered: the runner is stateful -- `configureWsPtrs` carves the caller's workspace
+/// against the tactic it is about to run -- and the tactic map was keyed by (bucket, GEMM) with
+/// no room for a second shape, so a process serving two mixtures would have run the first
+/// one's tuned tactics for the second's rounds. Nothing had two mixtures to run until the
+/// sparse-MoE test gained one, so nothing had found it.
 struct State {
     std::mutex mutex;
     Runner runner;
     std::map<TacticKey, tce::CutlassGemmConfig> tactics;
     std::string cache_path;
     bool cache_loaded = false;
+    /// The tactic list a runner offers is a property of that runner, so it is cached beside it
+    /// rather than in a function-local static shared by every geometry.
+    std::vector<tce::CutlassGemmConfig> gemm1_tactics;
+    std::vector<tce::CutlassGemmConfig> gemm2_tactics;
+    bool tactics_listed = false;
 };
 
-State& state() {
-    static State instance;
-    return instance;
+/// Orders geometries so each can hold its own state. Any total order will do; this one is the
+/// members in declaration order.
+struct GeometryKey {
+    std::int32_t hidden;
+    std::int32_t experts;
+    std::int32_t experts_per_token;
+    std::int32_t intermediate;
+
+    friend bool operator<(const GeometryKey& a, const GeometryKey& b) noexcept {
+        return std::tie(a.hidden, a.experts, a.experts_per_token, a.intermediate) <
+               std::tie(b.hidden, b.experts, b.experts_per_token, b.intermediate);
+    }
+};
+
+GeometryKey key_of(const Geometry& geometry) {
+    return GeometryKey{geometry.hidden, geometry.experts, geometry.experts_per_token,
+                       geometry.intermediate};
 }
 
-Runner& runner() { return state().runner; }
+State& state(const Geometry& geometry) {
+    // The map itself is shared, so it has a lock of its own; each State then has the lock the
+    // callers below take. States are never erased, so a reference stays valid once handed out.
+    static std::mutex registry_mutex;
+    static std::map<GeometryKey, std::unique_ptr<State>> registry;
+    const GeometryKey key = key_of(geometry);
+    std::lock_guard<std::mutex> guard(registry_mutex);
+    std::unique_ptr<State>& slot = registry[key];
+    if (!slot) { slot = std::make_unique<State>(); }
+    return *slot;
+}
+
+Runner& runner(const Geometry& geometry) { return state(geometry).runner; }
 
 std::string cache_directory() {
     if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg != nullptr && xdg[0] != '\0') {
@@ -156,13 +197,15 @@ bool make_cache_directory() {
 }
 
 /// The tactic list is a property of the runner and the GEMM, not of the round, so one lookup
-/// serves every bucket.
-const std::vector<tce::CutlassGemmConfig>& tactics_for(int gemm) {
-    static std::vector<tce::CutlassGemmConfig> gemm1 =
-        state().runner.getTactics(tkc::MoeGemmId::GEMM_1);
-    static std::vector<tce::CutlassGemmConfig> gemm2 =
-        state().runner.getTactics(tkc::MoeGemmId::GEMM_2);
-    return gemm == 1 ? gemm1 : gemm2;
+/// serves every bucket -- of that geometry. It was a function-local static, which made it one
+/// list for the process and handed a second geometry the first one's tactics.
+const std::vector<tce::CutlassGemmConfig>& tactics_for(State& owner, int gemm) {
+    if (!owner.tactics_listed) {
+        owner.gemm1_tactics = owner.runner.getTactics(tkc::MoeGemmId::GEMM_1);
+        owner.gemm2_tactics = owner.runner.getTactics(tkc::MoeGemmId::GEMM_2);
+        owner.tactics_listed = true;
+    }
+    return gemm == 1 ? owner.gemm1_tactics : owner.gemm2_tactics;
 }
 
 /// `CutlassGemmConfig::toString` prints several lines; the cache is one record per line, so the
@@ -191,7 +234,7 @@ std::string flattened(const tce::CutlassGemmConfig& config) {
 /// A tactic is stored by its printed form, not its index: an index would silently select a
 /// different kernel if the vendored tactic list ever changes order.
 void load_cache(const Geometry& geometry) {
-    State& s = state();
+    State& s = state(geometry);
     if (s.cache_loaded) { return; }
     s.cache_loaded = true;
     s.cache_path   = cache_path(geometry);
@@ -208,7 +251,7 @@ void load_cache(const Geometry& geometry) {
         std::getline(parsed, printed);
         if (!printed.empty() && printed.front() == ' ') { printed.erase(0, 1); }
         if (gemm != 1 && gemm != 2) { continue; }
-        const std::vector<tce::CutlassGemmConfig>& candidates = tactics_for(gemm);
+        const std::vector<tce::CutlassGemmConfig>& candidates = tactics_for(s, gemm);
         for (const tce::CutlassGemmConfig& candidate : candidates) {
             if (flattened(candidate) == printed) {
                 s.tactics[TacticKey{bucket, gemm}] = candidate;
@@ -218,8 +261,8 @@ void load_cache(const Geometry& geometry) {
     }
 }
 
-void store_cache() {
-    State& s = state();
+void store_cache(const Geometry& geometry) {
+    State& s = state(geometry);
     if (s.cache_path.empty() || !make_cache_directory()) { return; }
     std::ofstream file(s.cache_path, std::ios::trunc);
     if (!file) { return; }
@@ -245,11 +288,30 @@ tkc::QuantParams quant_params_of(const Nvfp4RoutedExperts& experts) {
 /// `output`; the caller converts it.
 void launch(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t tokens,
             const std::int32_t* ids, const float* final_scales,
-            const Nvfp4RoutedExperts& experts, char* runner_workspace, __nv_bfloat16* output,
+            const Nvfp4RoutedExperts& experts, char* runner_workspace,
+            std::size_t runner_workspace_bytes, __nv_bfloat16* output,
             std::int32_t* permutation_map, cudaStream_t stream) {
+    // The runner slices this buffer against the *tactic* it is about to run, not against the
+    // dimensions alone: `configureWsPtrs` asks `getWorkspaceDeviceBufferSizes` for a layout that
+    // depends on the selected GEMM configs' epilogue fusion. The reservation was made when the
+    // round was planned, before any tactic was set, so the two can disagree -- and when they do
+    // the runner writes past the end of the buffer and the process dies somewhere else entirely,
+    // with a corrupt heap and a backtrace pointing at whatever freed next.
+    const std::size_t required = state(geometry).runner.getWorkspaceSize(
+        tokens, geometry.hidden, geometry.intermediate, geometry.experts,
+        geometry.experts_per_token, tkc::ActivationType::Swiglu, tkc::MOEParallelismConfig{},
+        /*use_lora*/ false, /*use_deepseek_fp8_block_scale*/ false, /*use_mxfp8_act_scaling*/ false,
+        /*min_latency_mode*/ false, /*use_awq*/ false);
+    if (required > runner_workspace_bytes) {
+        throw std::runtime_error(
+            "trtllm_moe: the selected tactic needs " + std::to_string(required) +
+            " workspace bytes and the round reserved " + std::to_string(runner_workspace_bytes) +
+            "; the reservation is made before a tactic is chosen, so this shape's tactics do not "
+            "all fit the size its dimensions imply");
+    }
     tk::LoraParams lora_params{};
     tkc::MoeMinLatencyParams min_latency_params{};
-    state().runner.runMoe(
+    state(geometry).runner.runMoe(
         x, /*input_sf*/ nullptr, /*swizzled_input_sf*/ false, ids, final_scales,
         experts.gate_up_codes, /*fc1_expert_biases*/ nullptr,
         tkc::ActivationParams(tkc::ActivationType::Swiglu), experts.down_codes,
@@ -337,9 +399,10 @@ std::optional<float> time_candidate(const Geometry& geometry, std::int32_t bucke
 
     const auto attempt = [&]() -> bool {
         try {
-            state().runner.setTactic(gemm1, gemm2);
+            state(geometry).runner.setTactic(gemm1, gemm2);
             launch(geometry, buffers.x, bucket, buffers.ids, buffers.scales, experts,
-                   base + layout.runner_offset, output, permutation_map, stream);
+                   base + layout.runner_offset, layout.runner_bytes, output, permutation_map,
+                   stream);
         } catch (const std::exception&) {
             (void)cudaGetLastError();
             return false;
@@ -384,9 +447,9 @@ std::optional<float> time_candidate(const Geometry& geometry, std::int32_t bucke
 /// would cost |t1| * |t2| timings to reach the same pair.
 void tune_bucket(const Geometry& geometry, std::int32_t bucket, const Nvfp4RoutedExperts& experts,
                  const TuningBuffers& buffers, const WorkspaceLayout& layout, cudaStream_t stream) {
-    State& s                                            = state();
-    const std::vector<tce::CutlassGemmConfig>& gemm1_all = tactics_for(1);
-    const std::vector<tce::CutlassGemmConfig>& gemm2_all = tactics_for(2);
+    State& s                                            = state(geometry);
+    const std::vector<tce::CutlassGemmConfig>& gemm1_all = tactics_for(s, 1);
+    const std::vector<tce::CutlassGemmConfig>& gemm2_all = tactics_for(s, 2);
     if (gemm1_all.empty() || gemm2_all.empty()) {
         throw std::runtime_error("trtllm_moe: the vendored runner offers no tactics");
     }
@@ -480,7 +543,7 @@ std::size_t workspace_bytes(const Geometry& geometry, std::int32_t max_tokens) {
     if (max_tokens < 1 || max_tokens > kMaxTokens) {
         throw std::invalid_argument("trtllm_moe: workspace width out of range");
     }
-    std::lock_guard<std::mutex> guard(state().mutex);
+    std::lock_guard<std::mutex> guard(state(geometry).mutex);
     return workspace_layout(geometry, max_tokens).total;
 }
 
@@ -496,7 +559,7 @@ void prepare(const Geometry& geometry, const Nvfp4RoutedExperts& sample, std::in
         throw std::logic_error("trtllm_moe: prepare cannot run inside a stream capture");
     }
 
-    std::lock_guard<std::mutex> guard(state().mutex);
+    std::lock_guard<std::mutex> guard(state(geometry).mutex);
     load_cache(geometry);
 
     // Every bucket a round of up to `max_tokens` rows can land in, which is the ladder up to and
@@ -505,8 +568,8 @@ void prepare(const Geometry& geometry, const Nvfp4RoutedExperts& sample, std::in
     std::vector<std::int32_t> missing;
     for (const std::int32_t bucket : ladder()) {
         if (bucket > last) { break; }
-        if (state().tactics.find(TacticKey{bucket, 1}) == state().tactics.end() ||
-            state().tactics.find(TacticKey{bucket, 2}) == state().tactics.end()) {
+        if (state(geometry).tactics.find(TacticKey{bucket, 1}) == state(geometry).tactics.end() ||
+            state(geometry).tactics.find(TacticKey{bucket, 2}) == state(geometry).tactics.end()) {
             missing.push_back(bucket);
         }
     }
@@ -518,7 +581,7 @@ void prepare(const Geometry& geometry, const Nvfp4RoutedExperts& sample, std::in
     for (const std::int32_t bucket : missing) {
         tune_bucket(geometry, bucket, sample, buffers, layout, stream);
     }
-    store_cache();
+    store_cache(geometry);
 }
 
 void run(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t tokens,
@@ -527,7 +590,7 @@ void run(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t tokens,
     require_geometry(geometry);
     const std::int32_t bucket = bucket_of(tokens);
 
-    std::lock_guard<std::mutex> guard(state().mutex);
+    std::lock_guard<std::mutex> guard(state(geometry).mutex);
     load_cache(geometry);
 
     const WorkspaceLayout layout = workspace_layout(geometry, tokens);
@@ -535,9 +598,9 @@ void run(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t tokens,
         throw std::invalid_argument("trtllm_moe: insufficient workspace");
     }
 
-    auto gemm1 = state().tactics.find(TacticKey{bucket, 1});
-    auto gemm2 = state().tactics.find(TacticKey{bucket, 2});
-    if (gemm1 == state().tactics.end() || gemm2 == state().tactics.end()) {
+    auto gemm1 = state(geometry).tactics.find(TacticKey{bucket, 1});
+    auto gemm2 = state(geometry).tactics.find(TacticKey{bucket, 2});
+    if (gemm1 == state(geometry).tactics.end() || gemm2 == state(geometry).tactics.end()) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
         if (capture != cudaStreamCaptureStatusNone) {
@@ -550,17 +613,17 @@ void run(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t tokens,
         TuningBuffers buffers;
         allocate_tuning_buffers(geometry, bucket, tuning_layout, buffers, stream);
         tune_bucket(geometry, bucket, experts, buffers, tuning_layout, stream);
-        store_cache();
-        gemm1 = state().tactics.find(TacticKey{bucket, 1});
-        gemm2 = state().tactics.find(TacticKey{bucket, 2});
+        store_cache(geometry);
+        gemm1 = state(geometry).tactics.find(TacticKey{bucket, 1});
+        gemm2 = state(geometry).tactics.find(TacticKey{bucket, 2});
     }
 
     auto* base            = static_cast<char*>(workspace);
     auto* output          = reinterpret_cast<__nv_bfloat16*>(base + layout.output_offset);
     auto* permutation_map = reinterpret_cast<std::int32_t*>(base + layout.map_offset);
-    state().runner.setTactic(gemm1->second, gemm2->second);
-    launch(geometry, x, tokens, ids, final_scales, experts, base + layout.runner_offset, output,
-           permutation_map, stream);
+    state(geometry).runner.setTactic(gemm1->second, gemm2->second);
+    launch(geometry, x, tokens, ids, final_scales, experts, base + layout.runner_offset,
+           layout.runner_bytes, output, permutation_map, stream);
     widen(output, routed_sum, static_cast<std::int64_t>(tokens) * geometry.hidden, stream);
 }
 

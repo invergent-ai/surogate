@@ -989,6 +989,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa128_16q8.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa128_32q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa64_32q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa64_32q8.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_4q1.cu
@@ -1395,6 +1396,7 @@ add_subdirectory(${SERVE_ROOT}/targets/qwen3 serve_t_qwen3 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/lfm2 serve_t_lfm2 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/llama serve_t_llama EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/gemma3 serve_t_gemma3 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_moe serve_t_qwen3_moe EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5 serve_t_qwen3_5 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_moe serve_t_qwen3_5_moe EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen4exp serve_t_qwen4exp EXCLUDE_FROM_ALL)

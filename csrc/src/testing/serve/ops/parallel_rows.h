@@ -38,6 +38,20 @@ inline std::int32_t oracle_pool_threads() {
     return std::min(hardware, std::int32_t{8});
 }
 
+/// The pool, and there is exactly one of it.
+///
+/// It used to be a `static` inside the two templates below, which reads like one pool but is
+/// one *per instantiation* -- per distinct lambda type passed to them. A test with a dozen
+/// oracles therefore held a dozen pools of eight threads apiece, each constructed on first use
+/// and joined by an exit handler, which is exactly the oversubscription the comment above says
+/// to avoid: eight test processes were holding far more than eight threads apiece.
+///
+/// One function, not a template, so there is one pool however many oracles call it.
+inline HostWorkerPool& oracle_pool() {
+    static HostWorkerPool pool(static_cast<std::uint32_t>(oracle_pool_threads()), 4096);
+    return pool;
+}
+
 /// Applies `function(begin, end)` to a partition of [0, rows) over a shared
 /// pool. Use this when a chunk carries state of its own -- a scratch buffer
 /// per thread, say -- so it is built once per chunk rather than once per row.
@@ -45,7 +59,7 @@ template <class Function>
 void parallel_row_ranges(std::int32_t rows, Function&& function) {
     if (rows <= 0) { return; }
     static const std::int32_t available = oracle_pool_threads();
-    static HostWorkerPool pool(static_cast<std::uint32_t>(available), 4096);
+    HostWorkerPool& pool                = oracle_pool();
 
     const std::int32_t threads = std::min(rows, available);
     const auto chunk           = [&](std::int32_t index) {
@@ -75,7 +89,7 @@ template <class Function>
 void parallel_rows(std::int32_t rows, Function&& function) {
     if (rows <= 0) { return; }
     static const std::int32_t available = oracle_pool_threads();
-    static HostWorkerPool pool(static_cast<std::uint32_t>(available), 4096);
+    HostWorkerPool& pool                = oracle_pool();
 
     const std::int32_t threads = std::min(rows, available);
     const auto chunk           = [&](std::int32_t index) {

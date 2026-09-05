@@ -8,6 +8,7 @@
 #include <api/targets/llama/package.h>
 #include <api/targets/qwen3/package.h>
 #include <api/targets/qwen3_5/package.h>
+#include <api/targets/qwen3_moe/package.h>
 #include <api/targets/qwen3_5_moe/package.h>
 #include <api/targets/qwen4exp/package.h>
 
@@ -27,6 +28,7 @@ using Gemma3          = gemma3_270m::Package;
 using Lfm2            = lfm2::Package;
 using Llama           = llama::Package;
 using Qwen3Dense      = qwen3::Package;
+using Qwen3Moe        = qwen3_moe::Package;
 /// One architecture, every size and generation that shares it: Qwen3.5, 3.6 and 3.8.
 using Qwen3_5     = qwen3_5::Package;
 using Qwen3_5Moe  = qwen3_5_moe::Package;
@@ -85,6 +87,8 @@ using LoadedLlama = LoadedTarget<Llama>;
 using LlamaInstance = TargetInstance<Llama>;
 using LoadedQwen3Dense = LoadedTarget<Qwen3Dense>;
 using Qwen3DenseInstance = TargetInstance<Qwen3Dense>;
+using LoadedQwen3Moe = LoadedTarget<Qwen3Moe>;
+using Qwen3MoeInstance = TargetInstance<Qwen3Moe>;
 using LoadedQwen3_5 = LoadedTarget<Qwen3_5>;
 using Qwen3_5Instance = TargetInstance<Qwen3_5>;
 using LoadedQwen3_5Moe = LoadedTarget<Qwen3_5Moe>;
@@ -100,6 +104,7 @@ using Qwen3_5MoePipeline = runtime::PipelineInstance<Qwen3_5MoeInstance>;
 using ActiveTarget =
     std::variant<std::unique_ptr<Gemma3Instance>, std::unique_ptr<Lfm2Instance>,
                  std::unique_ptr<LlamaInstance>, std::unique_ptr<Qwen3DenseInstance>,
+                 std::unique_ptr<Qwen3MoeInstance>,
                  std::unique_ptr<Qwen3_5Instance>,
                  std::unique_ptr<Qwen3_5MoeInstance>,
                  std::unique_ptr<Qwen38FlashNextInstance>,
