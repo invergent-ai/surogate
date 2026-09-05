@@ -410,7 +410,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         Tensor up   = workspace.alloc(DType::BF16, {width, tokens});
         ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
         ops::linear_rows(hidden, weights.gate_up, width, up, &workspace, stream);
-        ops::silu_mul(gate, up, gate, stream);
+        // Clamped, like every other SwiGLU this model has.
+        ops::silu_mul(gate, up, gate, kMoeGeometry.swiglu_limit, stream);
         project("mlp/down", gate, weights.down, out, workspace, stream);
     }
     combine_into(out, residual, stream);

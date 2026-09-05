@@ -11,6 +11,7 @@
 namespace sinfer::ops::detail {
 
 // Host entry; assumes inputs already validated by the wrapper.
-void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream);
+void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, float limit,
+                         cudaStream_t stream);
 
 } // namespace sinfer::ops::detail

@@ -34,7 +34,8 @@ bool can_use_dim0_split_fast_path(const Tensor& gate, const Tensor& up, const Te
 
 } // namespace
 
-void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
+void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, float limit,
+                         cudaStream_t stream) {
     const std::int64_t n = out.numel();
     constexpr int kBlock = 128;
     if (!gate.is_contiguous() || !up.is_contiguous()) {
@@ -54,7 +55,7 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
                     static_cast<const __nv_bfloat16*>(up_slice.data),
                     static_cast<__nv_bfloat16*>(out_slice.data), gate.ne[0],
                     gate.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
-                    up.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+                    up.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)), limit);
                 CUDA_CHECK(cudaGetLastError());
             });
             return;
@@ -64,7 +65,7 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
             static_cast<const __nv_bfloat16*>(gate.data),
             static_cast<const __nv_bfloat16*>(up.data), static_cast<__nv_bfloat16*>(out.data), n,
             gate.ne[0], gate.ne[1], gate.ne[2], gate.nb[0], gate.nb[1], gate.nb[2], gate.nb[3],
-            up.nb[0], up.nb[1], up.nb[2], up.nb[3]);
+            up.nb[0], up.nb[1], up.nb[2], up.nb[3], limit);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -76,7 +77,7 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
         const int scalar_grid = static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
         silu_and_mul_scalar_kernel<<<scalar_grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(gate.data),
-            static_cast<const __nv_bfloat16*>(up.data), static_cast<__nv_bfloat16*>(out.data), n);
+            static_cast<const __nv_bfloat16*>(up.data), static_cast<__nv_bfloat16*>(out.data), n, limit);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -87,7 +88,7 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
 
     silu_and_mul_kernel<<<grid, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(gate.data),
                                                      static_cast<const __nv_bfloat16*>(up.data),
-                                                     static_cast<__nv_bfloat16*>(out.data), n);
+                                                     static_cast<__nv_bfloat16*>(out.data), n, limit);
     CUDA_CHECK(cudaGetLastError());
 }
 

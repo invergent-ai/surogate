@@ -22,13 +22,55 @@ std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
     return bits;
 }
 
-std::vector<double> silu_mul_oracle(const std::vector<float>& gate, const std::vector<float>& up) {
+std::vector<double> silu_mul_oracle(const std::vector<float>& gate, const std::vector<float>& up,
+                                    double limit = 0.0) {
     std::vector<double> expected(gate.size());
     for (std::size_t i = 0; i < gate.size(); ++i) {
-        const double g = gate[i];
-        expected[i]    = (g / (1.0 + std::exp(-g))) * static_cast<double>(up[i]);
+        double g = gate[i];
+        double u = up[i];
+        if (limit > 0.0) {
+            g = std::min(g, limit);
+            u = std::min(std::max(u, -limit), limit);
+        }
+        expected[i] = (g / (1.0 + std::exp(-g))) * u;
     }
     return expected;
+}
+
+/// The clamped form. The inputs deliberately run past the bound on both sides, so most of the
+/// tensor exercises it rather than the handful of values a natural range would put there.
+int run_clamped_case(const char* label, std::int32_t rows, std::int32_t columns, float limit,
+                     std::uint32_t seed) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    std::vector<float> gate(count), up(count);
+    fill_uniform(gate, seed, -3.0f * limit, 3.0f * limit);
+    fill_uniform(up, seed + 1, -3.0f * limit, 3.0f * limit);
+    round_to_bf16(gate);
+    round_to_bf16(up);
+
+    const auto expected  = silu_mul_oracle(gate, up, limit);
+    const auto gate_bits = encode_bf16(gate);
+    const auto up_bits   = encode_bf16(up);
+    GuardedDeviceBuffer device_gate(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_up(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_out(count * sizeof(std::uint16_t));
+    device_gate.copy_from_host(gate_bits.data(), device_gate.bytes());
+    device_up.copy_from_host(up_bits.data(), device_up.bytes());
+
+    Tensor gate_tensor(device_gate.data(), DType::BF16, {rows, columns});
+    Tensor up_tensor(device_up.data(), DType::BF16, {rows, columns});
+    Tensor out_tensor(device_out.data(), DType::BF16, {rows, columns});
+    ops::silu_mul(gate_tensor, up_tensor, out_tensor, limit, nullptr);
+    cuda_synchronize();
+
+    int failures = verify_pointwise(label, from_device_bf16(device_out.data(), count), expected,
+                                    silu_mul_bf16_criterion());
+    failures += device_out.verify_guards(label);
+    // The clamp is asymmetric: the gate is bounded above only, so a large negative gate still
+    // drives the product toward zero and a large positive one saturates it at silu(limit)*up.
+    // Both halves of that appear in the range above, and an implementation that clamped the
+    // gate from below too would disagree on the negative half rather than everywhere.
+    return failures;
 }
 
 int run_contiguous_case(const char* label, std::int32_t rows, std::int32_t columns,
@@ -150,6 +192,8 @@ int main() {
     int failures = 0;
     failures += run_contiguous_case("silu_mul [17408,1]", 17408, 1, 101u);
     failures += run_contiguous_case("silu_mul [17408,48]", 17408, 48, 102u);
+    failures += run_clamped_case("silu_mul clamped at 10 [4096,7]", 4096, 7, 10.0f, 201u);
+    failures += run_clamped_case("silu_mul clamped at 2.5 [1024,3]", 1024, 3, 2.5f, 202u);
     failures += run_strided_gate_up_case();
     failures += run_edge_case();
     std::cout << (failures ? "FAIL" : "OK") << " silu_mul\n";

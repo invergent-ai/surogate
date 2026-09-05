@@ -9,7 +9,8 @@
 
 namespace sinfer::ops {
 
-void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
+void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, float limit,
+              cudaStream_t stream) {
     if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("silu_mul: gate/up/out must be BF16");
     }
@@ -24,7 +25,11 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
         throw std::invalid_argument("silu_mul: gate/up/out data must be non-null");
     }
 
-    detail::silu_and_mul_launch(gate, up, out, stream); // single variant -> direct dispatch
+    detail::silu_and_mul_launch(gate, up, out, limit, stream);
+}
+
+void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
+    silu_mul(gate, up, out, /*limit=*/0.0F, stream);
 }
 
 } // namespace sinfer::ops
