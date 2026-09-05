@@ -114,18 +114,30 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
     kv_size = config["num_kv_heads"] * config["head_size"]
     # MoE-only quantities: a dense declaration simply has none of them.
     experts = config.get("num_experts", 0)
-    expert_ffn = config["d_ff"]
+    # A family may state two feed-forward widths: `d_ff` for the dense layers and `moe_d_ff`
+    # for the routed experts. GLM-5.3 does -- 12,288 dense against 2,048 per expert -- where
+    # every earlier MoE here has one width under `d_ff` and the two names mean the same number.
+    # Collapsing them would size 288 experts at the dense width, which is six times the model.
+    dense_ffn = config["d_ff"]
+    expert_ffn = config.get("moe_d_ff") or dense_ffn
     shared = config.get("shared_expert_intermediate", 0)
+    # How many residual streams a hyper-connected block carries. `hc_count` is qwen4exp's
+    # spelling and `hc_mult` GLM-5.3's; a family with no hyper-connections has neither.
+    hc_streams = int(config.get("hc_count") or config.get("hc_mult") or 0)
     ngram, per_gram = config.get("ngram_size", 0), config.get("heads_per_ngram", 0)
     ple_heads = (ngram - 1) * per_gram if ngram else 0
     return {
         "C": hidden,
         "TwoC": 2 * hidden,
-        "M": expert_ffn,
-        "TwoM": 2 * expert_ffn,
+        # `M` is the dense feed-forward's width; `MoeM` the routed experts'. They are the same
+        # number wherever a family states only one, which is every family but GLM-5.3.
+        "M": dense_ffn,
+        "TwoM": 2 * dense_ffn,
+        "MoeM": expert_ffn,
+        "MoeTwoM": 2 * expert_ffn,
         # The fused SwiGLU parameter, spelled `MUp` by the dense blocks and
         # `2M`/`TwoM` by the hybrid ones. One quantity, two names in the wild.
-        "MUp": 2 * expert_ffn,
+        "MUp": 2 * dense_ffn,
         "DraftVocab": config.get("draft_head_vocab", 0),
         "Vocab": config["vocab_size"],
         "HeadDim": config["head_size"],
@@ -135,11 +147,14 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "QKV": query_size + 2 * kv_size,
         "AttnDim": query_size,
         "KvDim": kv_size,
-        "HcCount": config.get("hc_count", 0),
-        "HcWidth": config.get("hc_count", 0) * hidden,
+        "HcCount": hc_streams,
+        "HcWidth": hc_streams * hidden,
         "HcLowRank": config.get("hc_lowrank", 0),
-        # The mixing matrix a hyper-connected block learns, as wide as the streams it mixes.
-        "HcMix": config.get("hc_mix", 0),
+        # The rows of the mixing matrix a hyper-connected block learns: a pre- and a post-weight
+        # per stream, and the stream-by-stream combination. Derived rather than read, because
+        # the two families that carry hyper-connections spell the stream count differently and
+        # neither states this number.
+        "HcMix": (2 + hc_streams) * hc_streams,
         # Kimi Delta Attention, the linear mixer GLM-5.3 runs where the other hybrids run a
         # gated delta net. Its projections are per head like theirs, but the decay is a
         # low-rank pair through a head-width bottleneck rather than a scalar per head, so the

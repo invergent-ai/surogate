@@ -50,6 +50,7 @@ from __future__ import annotations
 
 from .. import nn
 from ..block_schema import (
+    ServeObject,
     BlockSchema,
     DistributionDecl,
     EPTopology,
@@ -188,6 +189,93 @@ def _glm5_routing() -> RoutingSchema:
     )
 
 
+#: How a serving artifact stores a GLM-5.3 block.
+#:
+#: Four kinds -- {KDA, MLA} x {dense feed-forward, mixture} -- built from four lists, because
+#: the hyper-connection mix and the two norms are the same on every one of them.
+_HC_SERVE_OBJECTS: tuple[ServeObject, ...] = tuple(
+    obj
+    for site in ("attn", "ffn")
+    for obj in (
+        ServeObject(f"hc/{site}_mix", "quantised", ("HcMix", "HcWidth"), (f"hc_{site}_fn",)),
+        ServeObject(f"hc/{site}_base", "fp32", ("HcMix",), (f"hc_{site}_base",)),
+        ServeObject(f"hc/{site}_scale", "fp32", (3,), (f"hc_{site}_scale",)),
+    )
+)
+
+_GLM5_NORM_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",)),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ln2_weight",)),
+)
+
+#: Kimi Delta Attention. q, k and v share one projection and one depthwise convolution, which
+#: is what the reference does at runtime and what the engine's convolution reads; the decay is a
+#: low-rank pair through a head-width bottleneck, and so is the output gate.
+_KDA_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("kda/query_key_value", "quantised", ("KdaConvDim", "C"), ("kda_qkv_weight",)),
+    # Stored [K, channels] like the linear-attention convolution's taps, which is the layout its
+    # kernel reads; the checkpoint holds them [channels, 1, K].
+    ServeObject("kda/convolution", "bf16", ("KdaConvK", "KdaConvDim"), ("kda_conv_weight",),
+                transform="transpose_taps"),
+    ServeObject("kda/decay_a", "quantised", ("KdaHeadDim", "C"), ("kda_f_a_weight",)),
+    ServeObject("kda/decay_b", "quantised", ("KdaDim", "KdaHeadDim"), ("kda_f_b_weight",)),
+    ServeObject("kda/decay_bias", "fp32", ("KdaDim",), ("kda_dt_bias",)),
+    ServeObject("kda/a_log", "fp32", ("KdaHeads",), ("kda_A_log",)),
+    ServeObject("kda/beta", "quantised", ("KdaHeads", "C"), ("kda_b_weight",)),
+    ServeObject("kda/gate_a", "quantised", ("KdaHeadDim", "C"), ("kda_g_a_weight",)),
+    ServeObject("kda/gate_b", "quantised", ("KdaDim", "KdaHeadDim"), ("kda_g_b_weight",)),
+    ServeObject("kda/norm", "bf16", ("KdaHeadDim",), ("kda_o_norm_weight",)),
+    ServeObject("kda/output", "quantised", ("C", "KdaDim"), ("kda_out_weight",)),
+)
+
+#: Multi-head latent attention, NoPE. Two low-rank projections with a norm inside each; the
+#: attention they feed is ordinary, because `kv_b` gives every head its own key and value.
+_MLA_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("mla/query_a", "quantised", ("QRank", "C"), ("mla_q_a_weight",)),
+    ServeObject("mla/query_a_norm", "bf16", ("QRank",), ("mla_q_a_norm_weight",)),
+    ServeObject("mla/query_b", "quantised", ("QDim", "QRank"), ("mla_q_b_weight",)),
+    ServeObject("mla/kv_a", "quantised", ("KVRank", "C"), ("mla_kv_a_weight",)),
+    ServeObject("mla/kv_a_norm", "bf16", ("KVRank",), ("mla_kv_a_norm_weight",)),
+    ServeObject("mla/kv_b", "quantised", ("KVBDim", "KVRank"), ("mla_kv_b_weight",)),
+    ServeObject("mla/output", "quantised", ("C", "VDim"), ("mla_out_weight",)),
+)
+
+#: The dense feed-forward of the leading layers, at `intermediate_size` rather than the
+#: mixture's width.
+_GLM5_DENSE_FFN_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("mlp/gate_up", "quantised", ("TwoM", "C"),
+                ("mlp_up_weight.gate", "mlp_up_weight.up")),
+    ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
+)
+
+#: The mixture. Its router is one row per expert and nothing else: the always-on expert is
+#: added with weight one, so there is no gate row to fuse on -- unlike every other MoE family
+#: here, whose shared expert is weighted by a sigmoid the router carries.
+_GLM5_MOE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("moe/router", "bf16", ("E", "C"), ("router_weight",)),
+    # Selection is on the score plus this bias; the weight is the score without it.
+    ServeObject("moe/router_bias", "fp32", ("E",), ("e_score_correction_bias",)),
+    ServeObject("moe/routed_gate_up", "quantised", ("RoutedGateUpRows", "C"),
+                ("experts_gate_up",), transform="flatten_experts", residency="auto"),
+    ServeObject("moe/routed_down", "quantised", ("RoutedDownRows", "MoeM"),
+                ("experts_down",), transform="flatten_experts", residency="auto"),
+    ServeObject("moe/shared_gate_up", "quantised", ("SharedGateUpRows", "C"),
+                ("shared_expert_gate", "shared_expert_up")),
+    ServeObject("moe/shared_down", "quantised", ("C", "SharedM"), ("shared_expert_down",)),
+)
+
+
+def _glm5_serve_objects(*, mixer: str, sparse: bool) -> tuple[ServeObject, ...]:
+    """The objects one block kind holds, in the order the artifact stores them."""
+    return (
+        *_HC_SERVE_OBJECTS,
+        _GLM5_NORM_OBJECTS[0],
+        *(_KDA_SERVE_OBJECTS if mixer == "kda" else _MLA_SERVE_OBJECTS),
+        _GLM5_NORM_OBJECTS[1],
+        *(_GLM5_MOE_OBJECTS if sparse else _GLM5_DENSE_FFN_OBJECTS),
+    )
+
+
 def _glm5_schema(block_family: str, *, mixer: str, sparse: bool) -> BlockSchema:
     mixer_slots = _KDA_SLOTS if mixer == "kda" else _MLA_SLOTS
     slots = (
@@ -203,6 +291,7 @@ def _glm5_schema(block_family: str, *, mixer: str, sparse: bool) -> BlockSchema:
         routing=_glm5_routing() if sparse else None,
         ep_topology=EPTopology(ep_size_param="ep_size") if sparse else None,
         attrs={"block_family": block_family},
+        serve_objects=_glm5_serve_objects(mixer=mixer, sparse=sparse),
     )
 
 

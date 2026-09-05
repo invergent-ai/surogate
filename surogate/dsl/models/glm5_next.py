@@ -61,6 +61,7 @@ from ..blocks.glm5_next import (
     Glm5NextMlaDenseBlock,
     Glm5NextMlaMoEBlock,
 )
+from ..block_schema import ServeObject
 from ..hf import fuse, stack_experts
 from ..modules import Embedding, LMHead, RMSNorm, StreamBroadcast
 from ..modules.glm5_next import Glm5NextHyperHead
@@ -342,6 +343,40 @@ def _resolve_glm5_next_block_types(
 )
 class Glm5NextConditionalModel(nn.Model):
     """GLM-5.3-Flash text stack for ``Glm5NextForConditionalGeneration``."""
+
+    #: The endpoints. Per-layer objects come from whichever of the four block schemas the
+    #: schedule puts on that layer.
+    _serve_objects_ = (
+        ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",),
+                    scope="model"),
+        ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
+        ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",), scope="model"),
+    )
+    #: Two independent axes -- which mixer, and whether the feed-forward is dense or a mixture --
+    #: so four block kinds rather than one per layer position.
+    _serve_blocks_ = {
+        "kda": Glm5NextKdaDenseBlock,
+        "kda_moe": Glm5NextKdaMoEBlock,
+        "mla": Glm5NextMlaDenseBlock,
+        "mla_moe": Glm5NextMlaMoEBlock,
+    }
+
+    @staticmethod
+    def _serve_block_schedule_(config: dict) -> list[str]:
+        """Which block runs at each layer.
+
+        Both axes come from the checkpoint: `layer_types` says where the attention is -- an
+        irregular list, not a period, ending 39, 43, 45 on the released model -- and
+        `mlp_layer_types` (or `first_k_dense_replace`) says which layers are dense. The
+        resolver is the one training uses, so the two schedules cannot drift apart.
+        """
+        block_types, _, _ = _resolve_glm5_next_block_types(
+            n_layers=int(config["n_layers"]),
+            layer_types=config.get("layer_types"),
+            mlp_layer_types=config.get("mlp_layer_types"),
+            first_k_dense_replace=int(config.get("first_k_dense_replace", 0) or 0),
+        )
+        return block_types
 
     _name_remap_ = GLM5_NEXT_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_glm5_next_block_mappings(
