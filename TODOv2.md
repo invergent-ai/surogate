@@ -18,6 +18,10 @@ architectures — gemma3, llama, qwen3, qwen3_5, qwen3_5_moe, qwen4exp — and n
 names a size: the artifact declares its dimensions and the binder validates
 against them.
 
+"Where it lies" is now literal for every GGML type: the artifact beside
+`Qwen3.5-0.8B-UD-Q8_K_XL` is 18 MB against the file's 1.19 GB, and nothing in
+the serving path re-encodes a weight.
+
 What is left is in this file. Board rows are `surogate/serve/BENCHMARKS.md`;
 the history of what was tried is `design/INFERENCE.md`.
 
@@ -25,9 +29,12 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Five open or partly done. Two are decisions waiting on `surogate quantize` as a
-product rather than tasks (1 and 5); of the rest, item 2's substance shipped and
-items 3 and 4 are the same measured obstacle on Flash-Next's offload path.
+Four open or partly done, and none of them is a format. Two are decisions
+waiting on `surogate quantize` as a product rather than tasks (1 and 4); the
+other two are one measured obstacle on Flash-Next's offload path, seen from two
+sides. Every GGML weight type llama.cpp stores is now read where it lies, F16
+included, so what remains is performance and product shape rather than
+coverage.
 
 1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
@@ -40,87 +47,8 @@ items 3 and 4 are the same measured obstacle on Flash-Next's offload path.
    selects them — the other targets import the names and use `W8G32_F16S` or
    NVFP4. So this is one target's safetensors profile, not five, and it is a
    decision rather than a task: it costs the 27B its groupwise-int route until
-   `surogate quantize` (item 6) is a product.
-2. **[~] Every GGML weight type is read where it lies (2026-09-04); what the UD mixtures
-   still cost.** The 27B's refusal was never about vision: unsloth's "UD-Q4_K_M" holds 117
-   IQ4_XS and 4 IQ3_S tensors, and the engine read 13 of llama.cpp's 27 storable types. The
-   other fourteen shipped in 6613389f -- the eight IQ formats, TQ1_0/TQ2_0, MXFP4, ggml's
-   NVFP4 (`NVFP4_GGML` here: the name was taken), Q1_0, Q2_0 -- on every route, 1,307
-   fixture cases against gguf-py's dequantiser plus real tensors from the UD files, and
-   every type switch in the tree now expands the one list. Perplexity, wikitext-2 test, 40
-   windows of 2048, ours (eager, raw prompt) against llama-perplexity on the same windows:
-
-   | file | ours | llama.cpp |
-   |---|---:|---:|
-   | Qwen3.5-0.8B-IQ4_XS (50 % IQ4_XS) | 15.094 +/- 0.225 | 15.151 +/- 0.226 |
-   | Qwen3.5-0.8B-UD-Q2_K_XL (Q2_K/Q3_K + IQ3_S/IQ3_XXS/IQ2_S/IQ4_XS) | 20.209 +/- 0.305 | 20.016 +/- 0.302 |
-   | Qwen3-0.6B-UD-IQ2_M (IQ2_S/IQ3_S/IQ3_XXS) | 40.128 +/- 0.702 | 42.045 +/- 0.743 |
-   | Qwen3-0.6B-UD-IQ3_XXS | 29.509 +/- 0.505 | 30.250 +/- 0.522 |
-   | Qwen3-0.6B-IQ4_XS (64 % IQ4_XS, 35 % Q6_K) | 18.330 +/- 0.294 | 17.866 +/- 0.286 |
-
-   The IQ2/IQ3 rows come out ahead because the vec-dots evaluate the block scale exactly
-   where llama.cpp's integer form truncates. The 0.6B IQ4_XS row is 2.6 % behind (1.6
-   sigma) while the 0.8B IQ4_XS row is not. The Q4_K_M control on the same target reads
-   17.675 +/- 0.28 against llama.cpp's 17.510 +/- 0.28 (+0.9 %, old types only), so the offset
-   was the `qwen3` target's, not the codec's. **Found (2026-09-04): the FP8 KV cache.** A
-   probe ladder against an fp32 transformers forward over the same GGUF weights put every
-   attention *input* at BF16 noise (5e-3) and the attention *output* at 3e-2; recomputing the
-   attention from the engine's own q/k/v in fp32 reproduced the 3e-2, and a BF16 cache took it
-   to 1.5e-3. e4m3's three mantissa bits are ~2 % of noise on every K and V, which a
-   pure-attention stack pays in every layer: with a BF16 cache Qwen3-0.6B-Q4_K_M reads
-   **17.4315** (llama.cpp 17.5103; fp32 reference 17.4127) and IQ4_XS **17.8580** (17.8659).
-   The 27B, a 3:1 GDN stack, moves only 5.1699 -> 5.1495 against 5.0166, so its gap is
-   elsewhere (below). The KV default is now `auto`: BF16 for a pure-attention target, e4m3
-   where linear-attention layers carry the stack -- "Decisions that govern". Left:
-   **The 27B-class GGUF serves, with MTP (2026-09-04).** `unsloth/Qwen3.8-27B-GGUF`
-   UD-Q4_K_M, by the end of the day: **83.3 tok/s** decode with `--spec mtp --draft-tokens 1`
-   against llama.cpp's 44.8 on the same file (46.5 at noon), TTFT 0.24 s against 1.18 s,
-   perplexity **5.0477 +/- 0.129** against 5.0166 +/- 0.127 (5.1699 at noon). What the UD
-   mixture still cost, and what removed it: the file quantises the components of a fused
-   parent to different types (q Q5_K beside k Q4_K, gate IQ4_XS beside up Q4_K, 25 of 48
-   `value_z`), and llama.cpp's V-head reorder puts a *column* permutation on every GDN
-   `out_proj`; both were dequantised and requantised to Q4G64/Q5G64 -- 33 % of the bytes, a
-   second quantisation, and the whole of the 2.6 % gap (the 0.8B, 3 % bridged, matched). Now a
-   native object may carry typed row `segments` (the fused ops already projected row ranges,
-   and a component never straddles a type run: `ggml_weight_rows` resolves the range to its
-   segment; `ops::weight_rows` is public and the qwen3_5 loader's row views use it), and a
-   single-source object whose source has a column map keeps the file's column order and
-   carries `group_map` with no transform -- the runtime permutes the activation's 32-row groups
-   before the launch (`input_for`, one small kernel per GDN layer, measured free). 328 of 330
-   objects, 16.97 GB, read in place; the two left are Q8_0 a/b projections of a few MB.
-   The first segmented board read *35.8*: the decode profile put 70 % of the round in the
-   IQ4_XS GEMV at 232 us/call (Q4_K: 19) -- a per-lane `__constant__` table read, serialised
-   32-way -- which the bridge had hidden on most IQ4_XS tensors. The byte-permute lookup the
-   file already used for MXFP4 fixed it; the old 46.5 had been throttled by the same kernel.
-   Four things were wrong at noon, none of them the formats: the repack planner was not a fixed
-   point; a GGUF's `block_count` includes the MTP block; the native path silently dropped the
-   column permutation llama.cpp's V-head reorder puts on the GDN `out_proj` (48 objects, and
-   the reason the model produced confident noise at 4.6M perplexity); and the 27B-class
-   groupwise runtime had been incomplete since f308f747 -- the split attention loader was cut
-   as unreachable, the GDN `QkPlusVz` payload had no runtime, and the W8 capacity queries
-   refused shapes their routes never registered. `mtp/input_projection` was bound with
-   `K = query_size` where the object is `[hidden, 2*hidden]`; the two coincide at the size this
-   target compiles, so every larger model failed at its first draft round.
-   **Prefill, measured (2026-09-04).** Through the server we lead: a 2,048-token prompt is
-   **752 ms** TTFT against llama.cpp's 1,265 (812 at noon), and **2,804 tok/s** of prompt-eval
-   against its 2,565. `llama-bench pp2048` is the compute bar at 3,190 -- it gets one
-   2,048-wide batch where the server splits into 512s -- and we are 14 % under it, 149 TFLOP/s
-   effective against 174. The noon nsys capture (`--cuda-graph-trace=node`, or the graph hides
-   everything) said prefill is GEMM-bound with no scheduling gap: 42 % cutlass BF16 (the
-   dequantise-then-GEMM route), 38 % our groupwise kernels on the re-encoded halves (gone
-   with the native pass), 7.5 % `dequantize_rows` staging, ~4 % GDN and attention. Measured route rates at the dominant MLP shape: BF16 222 TFLOP/s, Q4G64
-   187, fused Q4 SwiGLU 183, W8 159, against 838 of int8/fp8 tensor throughput on the card.
-   **The int8 dense prefill GEMM on the routed experts' tile was built and measured a loss**
-   (881 ms against 812; "Measured and rejected" below has the design and the reason: the
-   per-32 scale-apply is the instruction stream, not the MMA). Re-routing the groupwise
-   weights through the BF16 path is measured and *not* worth it either -- the staging pass
-   moves the crossover to T ~= 1,500 for a ~5 % win. What is left on prefill is the 38 % in
-   the groupwise kernels on re-encoded halves, which a native mixed-type fused parent would
-   put on the BF16 route (222 against 183-187 TFLOP/s, ~5 % whole-model), and the numerics
-   of the int8 tile itself, fixed here: its activation planes carried the raw Σx and now
-   carry d·Σq, matching the GEMV route (real-tensor error 1.25e-2 -> 1.77e-3 relative).
-
-3. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
+   `surogate quantize` (item 4) is a product.
+2. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.
    - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
@@ -142,7 +70,7 @@ items 3 and 4 are the same measured obstacle on Flash-Next's offload path.
      `--max-num-batched-tokens 8192` (row: 7.06 / 3,966 / 40.8). The defaults carry
      prefill chunk 2,048 now -- the 8-card pipeline's compromise -- which reads 11.6 s /
      2,434 tok/s on the same request, so a one-card long-prompt serve passes the flag.
-4. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
+3. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
    (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
    acceptance — which is the evidence the graph is right — but decode moves
    30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
@@ -156,7 +84,7 @@ items 3 and 4 are the same measured obstacle on Flash-Next's offload path.
    column costs a wider expert gather and the acceptance falls off fast. `--spec mtp
    --draft-tokens 1` is the setting to serve with; the +8 % is what the head is worth
    on an offloaded MoE until the verify round's gather is cheaper.
-5. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+4. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -271,7 +199,7 @@ padding path; `embedding` has no NVFP4 or Q4/Q5; `linear_pair` is W8 only.
 ## What an index can hold
 
 The artifact directory is an *index*, not a container: it names the GGUF and,
-per object, the byte runs it is assembled from. Four things a future object can
+per object, the byte runs it is assembled from. Five things an object can
 declare, in the order they were needed:
 
 - **`external` + per-object `runs`** — the file it does not contain, and the
@@ -283,6 +211,10 @@ declare, in the order they were needed:
   kernel that wants a different arrangement of the same numbers.
 - **A permutation map** — a row map composes into the run program, a column map
   rides on the transform.
+- **Typed row `segments`** — one object whose rows come in more than one format,
+  which is what a UD mixture makes of a fused parent (q Q5_K beside k Q4_K, or
+  Q8_0 rows beside F16 ones). A component never straddles a type run, so a row
+  range resolves to its segment and the fused ops project into it unchanged.
 
 Only a **value** transform forces the dequantise path: `A_log`'s logarithm, a
 plus-one norm's subtraction. Which tensor needs which is family knowledge
@@ -303,7 +235,7 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
   `surogate quantize` stays, it takes a trained checkpoint to a GGUF, and the
   quantisation arithmetic is llama.cpp's rather than ours. **It is a separate
   product and not on the critical path** (owner, 2026-09-03): the serving engine
-  comes first, and the export command is revisited after. See item 5 for what
+  comes first, and the export command is revisited after. See item 4 for what
   exists and what does not.
 - **`.sinfer` is a transparent cache, never an interchange format** (owner,
   2026-08-24). Never published, never required. The eight-entry hardcoded
@@ -321,6 +253,15 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
 - **Dequantise-and-requantise is not free.** Measured on Qwen3.5-0.8B-Q4_K_M:
   K-quant → BF16 → W8 adds 5.7e-3 relative error and *doubles* the bytes. That is
   why the native path exists.
+- **A format the index cannot hold is a format we quietly re-quantise**
+  (2026-09-05). F16 was the last one, and the breach was invisible because the
+  numbers looked fine: `Qwen3.5-0.8B-UD-Q8_K_XL` scored 14.6946 against
+  llama.cpp's 14.7129 while 53 % of its elements were being re-encoded to eight
+  bits. Being *below* the reference was the tell — we were not serving the same
+  model. Reading the file faithfully moved us to 14.7167, which is what agreement
+  looks like. **Check what the artifact stores, not only what it scores:**
+  `formats` and `indexed vs stored` over the objects say in one line what a
+  perplexity number can hide.
 
 ---
 
@@ -422,7 +363,19 @@ Each of these cost real time; none is inferable from the code.
   dispatch with `if constexpr` on the geometry rather than `static_assert`, or
   geometries that will never run it fail to compile.
 - **`plan()` skipped anything with a "native" source**, which silently orphaned
-  Q8_0 objects the moment Q8_0 became native. Guard on 256-value superblocks.
+  Q8_0 objects the moment Q8_0 became native. The fix guarded on "is the block
+  256 values", which was the *wrong question* and only ever right by accident:
+  Q1_0 (128), Q2_0 (64), MXFP4 (32) and NVFP4 (64) would each have reached a
+  `KeyError` in `planes()`, and F16 (32) actually did. It asks whether the W8
+  plane path can decode the type now. **When a predicate stands in for a
+  capability, name the capability.**
+- **A new GGML type fails silently in four places, and this build has no
+  `-Werror=switch`.** `block_bytes` and `type_name` fall through to `0` and
+  `"?"`; `block_values` defaults to `QK_K` (256); `dequantize_superblock`'s
+  `if constexpr` chain has no `else`. Python has the same shape:
+  `native_block_values` defaults to 256, so a type absent from
+  `NATIVE_BLOCK_VALUES` gets 256-value rows and corrupt byte runs with no
+  exception. Only the `Traits`, `decode_eight` and vec-dot templates fail loud.
 - **Read the harness's criterion before chasing a kernel.** The A4 op oracle does
   not model activation quantisation; its allowance is the format's own headroom.
 
