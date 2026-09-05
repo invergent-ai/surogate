@@ -393,6 +393,29 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     if (body.contains("return_token_ids") && body.at("return_token_ids").is_boolean()) {
         out.return_token_ids = body.at("return_token_ids").get<bool>();
     }
+    // Fields this engine does not implement. Accepting them and generating anyway
+    // is the failure this whole endpoint has been bitten by twice: the caller gets
+    // a response that looks complete and is not what it asked for. A value that
+    // asks for nothing -- the defaults every client sends -- is still accepted.
+    if (body.contains("min_tokens") && body.at("min_tokens").is_number_integer() &&
+        body.at("min_tokens").get<std::int64_t>() > 0) {
+        bad_request("min_tokens is not implemented: this engine cannot suppress the stop token "
+                    "for a minimum length, and generating without it would return a shorter "
+                    "completion than asked for",
+                    "min_tokens");
+    }
+    if (body.contains("repetition_penalty") && body.at("repetition_penalty").is_number() &&
+        body.at("repetition_penalty").get<double>() != 1.0) {
+        bad_request("repetition_penalty is not implemented; use presence_penalty or "
+                    "frequency_penalty, which this engine applies",
+                    "repetition_penalty");
+    }
+    if (body.contains("prompt_logprobs") && !body.at("prompt_logprobs").is_null() &&
+        !(body.at("prompt_logprobs").is_boolean() && !body.at("prompt_logprobs").get<bool>())) {
+        bad_request("prompt_logprobs is not implemented: scoring every prompt position needs the "
+                    "logits of a whole prefill, which this engine does not retain",
+                    "prompt_logprobs");
+    }
     if (body.contains("add_generation_prompt") &&
         body.at("add_generation_prompt").is_boolean()) {
         out.add_generation_prompt = body.at("add_generation_prompt").get<bool>();
@@ -432,6 +455,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     s.temperature       = get_number(body, "temperature");
     s.top_p             = get_number(body, "top_p");
     s.top_k             = get_int(body, "top_k");
+    s.min_p             = get_number(body, "min_p");
     s.presence_penalty  = get_number(body, "presence_penalty");
     s.frequency_penalty = get_number(body, "frequency_penalty");
     s.seed              = get_u64(body, "seed");

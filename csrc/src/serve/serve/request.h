@@ -111,6 +111,10 @@ struct SamplingParams {
     std::optional<double> temperature;
     std::optional<double> top_p;
     std::optional<int> top_k;
+    /// vLLM's floor on a token's probability relative to the most likely one. The
+    /// engine has always taken it; the wire layer simply never read it, so a
+    /// request that asked for it got a distribution that ignored it.
+    std::optional<double> min_p;
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
