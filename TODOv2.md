@@ -25,8 +25,12 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Six open or partly done. Two are decisions waiting on `surogate quantize` as a
-product rather than tasks (1 and 6); the rest are work.
+Five open or partly done. Two are decisions waiting on `surogate quantize` as a
+product rather than tasks (1 and 5); of the rest, item 2's substance shipped and
+items 3 and 4 are the same measured obstacle on Flash-Next's offload path. The
+largest unclaimed piece of engineering is not in this list but in **Format
+coverage** below: F16 GGUF tensors are still bridged rather than read where they
+lie, which is most of every `UD-Q8_K_XL` file.
 
 1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
    converters that produce them would leave together, roughly 140 references.
@@ -119,55 +123,7 @@ product rather than tasks (1 and 6); the rest are work.
    of the int8 tile itself, fixed here: its activation planes carried the raw Σx and now
    carry d·Σq, matching the GEMV route (real-tensor error 1.25e-2 -> 1.77e-3 relative).
 
-3. **[x] Unify weight loading with the trainer — done (2026-09-05).** Every target
-   that reads a checkpoint the trainer can also read now derives its mapping from
-   the declaration instead of restating it.
-   `surogate/serve/convert/common/declaration.py` reads `hf_mapping` for where each
-   parameter lives and `ServeObject.components` for which parameters build each
-   artifact object, in row order, and emits the recipe. A component may name a LoRA
-   slice of a fused parameter (`mlp_up_weight.gate`), which is how the artifact's
-   `gate | up` is spelled against the trainer's `up | gate`. A sub-stack the training
-   graph does not compute — a draft head, a scorer that ships as its own checkpoint —
-   names its tensors directly through `ServeObject.source` and `ServeSection`'s
-   `hf_prefix`/`hf_layer`.
-
-   | target | recipe lines | what it derives |
-   |---|---|---|
-   | qwen3_5 | 358 → 158 | text stack + MTP head |
-   | qwen3_5_moe | 620 → 323 | text stack + MTP head + DFlash scorer |
-   | gemma3 | 215 → 163 | whole artifact |
-   | llama | 187 → 130 | whole artifact |
-   | qwen3 | 188 → 126 | whole artifact |
-
-   Qwen3 and Llama had no serve declaration at all and gained one. Gemma 3 had one
-   that was wrong in a way only derivation could catch: its three attention objects
-   each named the whole fused `qkv` parameter rather than their own slice of it.
-
-   What the converters still state is what the declaration does not describe: a
-   storage decision that cuts a fused object into typed halves (the 27B, applied as a
-   row cut), the draft head's ranking policy over the vocabulary, the vision tower,
-   and the per-profile format tables.
-
-   Correctness is by regeneration: every derived recipe equals the committed
-   hand-written one, expression for expression and in inventory order, at every size
-   and both tie settings, with the MoE's source-count typo guards unchanged (1,127
-   and 69). Gated: 35B-A3B Q4_K_M 5.5752 against llama.cpp 5.5776 on the same
-   40 windows; 0.8B Q4_K_M 15.031 against 15.025; 0.8B HF→W8 14.78 against a BF16
-   torch reference of 14.60; Qwen3-0.6B, TinyLlama-1.1B and Gemma 3 270M each
-   converted from their checkpoints and answered coherently.
-
-   **Not unified, and not a restatement:** `qwen4exp` and `gemma_embedding` read
-   GGUFs and nothing else — Flash-Next's draft head is a GGUF too. Their recipes name
-   llama.cpp tensors (`blk.N.attn_q.weight`) and carry llama.cpp's own value
-   inversions: the tiled GDN value-head order and the column-tiled `ssm_out`. None of
-   that is in `hf_mapping`, because the trainer cannot read those files. Unifying them
-   would mean putting llama.cpp's naming into the training declaration, where nineteen
-   architectures would inherit it, rather than leaving it in `serve/gguf/` and the
-   converters, which is where GGUF naming already lives. `gemma_embedding` is already
-   joined to the declaration as far as that allows: it derives its object list, keys
-   its sources by the declaration's own object names, and validates both directions.
-
-4. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
+3. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.
    - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
@@ -189,7 +145,7 @@ product rather than tasks (1 and 6); the rest are work.
      `--max-num-batched-tokens 8192` (row: 7.06 / 3,966 / 40.8). The defaults carry
      prefill chunk 2,048 now -- the 8-card pipeline's compromise -- which reads 11.6 s /
      2,434 tok/s on the same request, so a one-card long-prompt serve passes the flag.
-5. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
+4. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
    (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
    acceptance — which is the evidence the graph is right — but decode moves
    30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
@@ -203,7 +159,7 @@ product rather than tasks (1 and 6); the rest are work.
    column costs a wider expert gather and the acceptance falls off fast. `--spec mtp
    --draft-tokens 1` is the setting to serve with; the +8 % is what the head is worth
    on an offloaded MoE until the verify round's gather is cheaper.
-6. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
+5. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
    model we trained.** Revisit once the serving engine is complete (owner,
    2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
    turned out to be two subprocess calls; everything a real product needs
@@ -301,13 +257,13 @@ MoE). What is not:
 
 | Format | Status |
 |---|---|
-| NVFP4 (ModelOpt) | **[~]** the 4B serves; the 0.8B and 2B need a recipe (roadmap 3) |
-| FP8 | **[~]** only `FP8_E4M3FN_ROW_BF16S`; per-tensor, per-channel and block unsupported (roadmap 2) |
+| NVFP4 (ModelOpt) | **[x]** 0.8B, 2B and 4B all serve; the quality is the checkpoints' (see below) |
+| FP8 | **[~]** per-row, per-channel and [128,128] block all serve; per-*tensor* (one scalar scale) is unsupported |
 | W4A16 / W4A16_ASYM | **[ ]** `Q4G64_F16S` is symmetric with no zero point and no actorder |
 | MXFP4 / MXFP8 | **[ ]** nothing in serve; the trainer decodes MXFP4 |
 | GPTQ / AWQ | **[ ]** off the roadmap by owner decision |
-| `kv_cache_scheme` | **[ ]** refuse or support — do not ignore silently |
-| F16 (GGUF) | **[ ]** bridged to BF16, three mantissa bits lost; UD-Q8_K_XL is mostly F16 |
+| `kv_cache_scheme` | **[ ]** refuse or support — do not ignore silently. Checked 2026-09-05: the key appears nowhere in the tree, so a checkpoint that asks for a quantised KV cache is served with the engine's own default and never told. |
+| F16 (GGUF) | **[ ]** bridged to BF16, three mantissa bits lost, and the file is copied rather than indexed; UD-Q8_K_XL is mostly F16. The largest remaining format gap. |
 
 Known runtime constraints: NVFP4 needs `n % 128 == 0 && k % 64 == 0` with no
 padding path; `embedding` has no NVFP4 or Q4/Q5; `linear_pair` is W8 only.
@@ -349,7 +305,7 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
   `surogate quantize` stays, it takes a trained checkpoint to a GGUF, and the
   quantisation arithmetic is llama.cpp's rather than ours. **It is a separate
   product and not on the critical path** (owner, 2026-09-03): the serving engine
-  comes first, and the export command is revisited after. See item 11 for what
+  comes first, and the export command is revisited after. See item 5 for what
   exists and what does not.
 - **`.sinfer` is a transparent cache, never an interchange format** (owner,
   2026-08-24). Never published, never required. The eight-entry hardcoded
