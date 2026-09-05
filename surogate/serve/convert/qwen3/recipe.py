@@ -7,13 +7,13 @@ from pathlib import Path
 
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common.recipe import (
-    Concat,
     SourcePreflight,
     TensorRecipe,
     expression_sources,
     preflight_source_reader,
-    source,
 )
+from surogate.serve.convert.common.declaration import declare, derive_recipes
+from surogate.dsl.ir_builder import resolve_architecture
 from surogate.serve.convert.common.recipe import (
     validate_recipe_coverage as _validate_recipe_coverage,
 )
@@ -52,88 +52,26 @@ def build_recipes(
     geometry: inventory.Geometry = inventory.GEOMETRY,
     *,
     tied_output_head: bool = True,
+    hf_config: Mapping[str, object] | None = None,
 ) -> tuple[TensorRecipe, ...]:
-    """Where every artifact object comes from in the checkpoint, in object order."""
+    """Where every artifact object comes from in the checkpoint, in object order.
 
-    hidden = geometry.hidden
-    query, kv = geometry.query_size, geometry.kv_size
-    embedding = source("model.embed_tokens.weight", (geometry.vocab, hidden))
+    Not written here: derived from the training declaration, which maps every
+    parameter to its checkpoint tensor (`hf_mapping`) and says which parameters
+    each artifact object is built from, in row order (`ServeObject.components`).
+    `hf_config` is the checkpoint's own `config.json` when the caller has it, and
+    the registered geometry's implied config otherwise.
 
-    recipes: list[TensorRecipe] = [TensorRecipe("text/token_embedding", embedding)]
-
-    for layer in range(geometry.layers):
-        src = f"model.layers.{layer}."
-        obj = f"text/layers/{layer}/"
-        recipes.extend(
-            (
-                TensorRecipe(
-                    obj + "input_norm",
-                    source(src + "input_layernorm.weight", (hidden,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/query_key_value",
-                    # Ungated attention: q | k | v, with no gate block between
-                    # k and v. The row order is the one the fused decode kernel
-                    # reads and the one `LOGICAL_ROW_VIEW_SPECS` publishes.
-                    Concat(
-                        (
-                            source(src + "self_attn.q_proj.weight", (query, hidden)),
-                            source(src + "self_attn.k_proj.weight", (kv, hidden)),
-                            source(src + "self_attn.v_proj.weight", (kv, hidden)),
-                        ),
-                        0,
-                    ),
-                ),
-                TensorRecipe(
-                    obj + "attention/query_norm",
-                    source(src + "self_attn.q_norm.weight", (geometry.head_dim,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/key_norm",
-                    source(src + "self_attn.k_norm.weight", (geometry.head_dim,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/output",
-                    source(src + "self_attn.o_proj.weight", (hidden, query)),
-                ),
-                TensorRecipe(
-                    obj + "post_attention_norm",
-                    source(src + "post_attention_layernorm.weight", (hidden,)),
-                ),
-                TensorRecipe(
-                    obj + "mlp/gate_up",
-                    Concat(
-                        (
-                            source(src + "mlp.gate_proj.weight",
-                                   (geometry.intermediate, hidden)),
-                            source(src + "mlp.up_proj.weight",
-                                   (geometry.intermediate, hidden)),
-                        ),
-                        0,
-                    ),
-                ),
-                TensorRecipe(
-                    obj + "mlp/down",
-                    source(src + "mlp.down_proj.weight", (hidden, geometry.intermediate)),
-                ),
-            )
-        )
-
-    recipes.extend(
-        (
-            TensorRecipe("text/final_norm", source("model.norm.weight", (hidden,))),
-            TensorRecipe(
-                "text/output_head",
-                # tie_word_embeddings=True: Qwen3-0.6B still ships an
-                # `lm_head.weight`, bit-identical to the embedding, but not every
-                # tied export does, so the tied path reads the embedding.
-                embedding
-                if tied_output_head
-                else source("lm_head.weight", (geometry.vocab, hidden)),
-            ),
-        )
+    `tied_output_head` stays an argument rather than being read from the config:
+    it is a property of the file in hand, and the converter has already resolved
+    it against what the checkpoint actually ships.
+    """
+    config = dict(hf_config) if hf_config is not None else inventory.hf_config_for(geometry)
+    declaration = declare(resolve_architecture(config), config)
+    recipes = derive_recipes(
+        declaration, capabilities={"text"}, tied_output_head=tied_output_head
     )
-    return tuple(recipes)
+    return recipes
 
 
 RECIPE_SPECS = build_recipes()

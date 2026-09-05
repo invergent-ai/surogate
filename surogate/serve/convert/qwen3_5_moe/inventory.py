@@ -38,6 +38,43 @@ Q6_ROUTED_DOWN_LAYERS = (34, 38, 39)
 DFLASH_LAYERS = tuple(range(6))
 
 
+#: The `config.json` of the one checkpoint this target serves, for callers that derive
+#: the conversion recipes without one in hand. This target serves 35B-A3B and nothing
+#: else — every width in this package is that checkpoint's — so the numbers below are
+#: the registered size, the way the other targets register a `Geometry`. The nesting and
+#: the architecture string are the published release's: the declaration maps its text
+#: tower under `model.language_model.`, which is the dialect this converter's recipes
+#: and its GGUF repack plan are written in.
+def hf_config_for() -> dict:
+    return {
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "num_hidden_layers": len(TEXT_LAYERS),
+            "hidden_size": 2048,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "vocab_size": 248320,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 32,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+            "layer_types": [
+                "full_attention" if layer in FULL_ATTENTION_LAYERS else "linear_attention"
+                for layer in TEXT_LAYERS
+            ],
+            "tie_word_embeddings": False,
+        },
+    }
+
+
 def _routed_down_format(layer: int) -> str:
     return Q6 if layer in Q6_ROUTED_DOWN_LAYERS else Q5
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from surogate.serve.convert.common import declaration
 from surogate.serve.convert.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
@@ -98,6 +99,26 @@ QWEN3_0_6B = Geometry(
 )
 
 GEOMETRY = QWEN3_0_6B
+
+def hf_config_for(geometry: Geometry = GEOMETRY) -> dict:
+    """The `config.json` a checkpoint of these dimensions would carry.
+
+    The inverse of `recipe.geometry_from_config`, and what lets a caller holding only
+    a registered geometry derive the conversion recipes: the declaration those come
+    from is compiled against a config either way.
+    """
+    return declaration.text_config(
+        "Qwen3ForCausalLM",
+        "qwen3",
+        layers=geometry.layers,
+        hidden=geometry.hidden,
+        intermediate=geometry.intermediate,
+        vocab=geometry.vocab,
+        query_heads=geometry.query_heads,
+        kv_heads=geometry.kv_heads,
+        head_dim=geometry.head_dim,
+    )
+
 
 LAYERS = GEOMETRY.layers
 HIDDEN = GEOMETRY.hidden

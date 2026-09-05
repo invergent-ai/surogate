@@ -6,7 +6,6 @@ from pathlib import Path
 
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common.recipe import (
-    AnyOf,
     Cast,
     Concat,
     DraftHeadTokenIds,
@@ -19,7 +18,6 @@ from surogate.serve.convert.common.recipe import (
     SourceTensor,
     TensorRecipe,
     Transpose,
-    attention_qproj_part,
     build_vision_recipes,
     expression_shape,
     expression_sources,
@@ -30,6 +28,8 @@ from surogate.serve.convert.common.recipe import (
     source_requirements as _common_source_requirements,
     validate_recipe_coverage as _common_validate_recipe_coverage,
 )
+from surogate.serve.convert.common.declaration import declare, derive_recipes
+from surogate.dsl.ir_builder import resolve_architecture
 
 from . import inventory
 
@@ -54,248 +54,24 @@ NATIVE_EXCLUDE_SUFFIXES = (
 )
 
 
-def _attention_part(source_name: str, *, gate: bool) -> Expression:
-    return attention_qproj_part(
-        source_name,
-        gate,
-        num_heads=16,
-        hidden_size=2048,
-    )
+def _build_declared_recipes() -> tuple[TensorRecipe, ...]:
+    """The text stack and the MTP head, from the training declaration.
 
+    Not written here: the declaration maps every parameter to its checkpoint tensor
+    (`hf_mapping`) and says which parameters each artifact object is built from, in row
+    order (`ServeObject.components`). The expert objects carry `transform="flatten_experts"`,
+    which is what turns the training graph's expert-major `[E, rows, cols]` parameter into
+    the rows the artifact stores — and, where the checkpoint fuses gate and up, also
+    accepts the stacked spelling a GGUF of the same model keeps them in.
 
-def _moe_recipes(source_prefix: str, object_prefix: str) -> tuple[TensorRecipe, ...]:
-    """Build one expert-major sparse-MoE source transform.
-
-    The routed gate/up source is already expert-major and half-split inside
-    each expert.  A contiguous reshape therefore implements exactly
-    ``stored_row(e,p,r) = e*1024 + p*512 + r`` without a permutation.
+    `flat_sources=False` keeps the source names in the nested `model.language_model.`
+    dialect this converter's recipes, its preflight and its GGUF repack plan are all
+    written against; the reader canonicalises both spellings, so this is a convention,
+    not a constraint.
     """
-
-    return (
-        TensorRecipe(
-            object_prefix + "router_shared_gate",
-            Concat(
-                (
-                    source(source_prefix + "gate.weight", (256, 2048)),
-                    source(source_prefix + "shared_expert_gate.weight", (1, 2048)),
-                ),
-                0,
-            ),
-        ),
-        TensorRecipe(
-            object_prefix + "routed_gate_up",
-            # Two spellings of the same rows. An HF checkpoint fuses gate and up into one
-            # expert-major tensor; a GGUF of the same model keeps them as two stacked
-            # tensors, and concatenating those on the expert's output axis reproduces
-            # stored_row(e, p, r) = e*1024 + p*512 + r exactly -- so a GGUF's routed experts
-            # are a row gather over blocks, not something that has to be dequantised.
-            AnyOf((
-                Reshape(
-                    source(source_prefix + "experts.gate_up_proj", (256, 1024, 2048)),
-                    (262144, 2048),
-                ),
-                Reshape(
-                    Concat(
-                        (
-                            source(source_prefix + "experts.gate_proj", (256, 512, 2048)),
-                            source(source_prefix + "experts.up_proj", (256, 512, 2048)),
-                        ),
-                        1,
-                    ),
-                    (262144, 2048),
-                ),
-            )),
-        ),
-        TensorRecipe(
-            object_prefix + "routed_down",
-            Reshape(
-                source(source_prefix + "experts.down_proj", (256, 2048, 512)),
-                (524288, 512),
-            ),
-        ),
-        TensorRecipe(
-            object_prefix + "shared_gate_up",
-            Concat(
-                (
-                    source(
-                        source_prefix + "shared_expert.gate_proj.weight",
-                        (512, 2048),
-                    ),
-                    source(
-                        source_prefix + "shared_expert.up_proj.weight",
-                        (512, 2048),
-                    ),
-                ),
-                0,
-            ),
-        ),
-        TensorRecipe(
-            object_prefix + "shared_down",
-            source(
-                source_prefix + "shared_expert.down_proj.weight",
-                (2048, 512),
-            ),
-        ),
-    )
-
-
-def _build_text_recipes() -> tuple[TensorRecipe, ...]:
-    recipes: list[TensorRecipe] = [
-        TensorRecipe(
-            "text/token_embedding",
-            source("model.language_model.embed_tokens.weight", (248320, 2048)),
-        )
-    ]
-
-    for layer in inventory.TEXT_LAYERS:
-        source_prefix = f"model.language_model.layers.{layer}."
-        object_prefix = f"text/layers/{layer}/"
-        recipes.append(
-            TensorRecipe(
-                object_prefix + "input_norm",
-                source(source_prefix + "input_layernorm.weight", (2048,)),
-            )
-        )
-
-        if layer in inventory.FULL_ATTENTION_LAYERS:
-            q_proj = source_prefix + "self_attn.q_proj.weight"
-            recipes.extend(
-                (
-                    TensorRecipe(
-                        object_prefix + "attention/query_key_gate_value",
-                        Concat(
-                            (
-                                _attention_part(q_proj, gate=False),
-                                source(
-                                    source_prefix + "self_attn.k_proj.weight",
-                                    (512, 2048),
-                                ),
-                                _attention_part(q_proj, gate=True),
-                                source(
-                                    source_prefix + "self_attn.v_proj.weight",
-                                    (512, 2048),
-                                ),
-                            ),
-                            0,
-                        ),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "attention/query_norm",
-                        source(source_prefix + "self_attn.q_norm.weight", (256,)),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "attention/key_norm",
-                        source(source_prefix + "self_attn.k_norm.weight", (256,)),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "attention/output",
-                        source(
-                            source_prefix + "self_attn.o_proj.weight",
-                            (2048, 4096),
-                        ),
-                    ),
-                )
-            )
-        else:
-            convolution = source(
-                source_prefix + "linear_attn.conv1d.weight",
-                (8192, 1, 4),
-            )
-            recipes.extend(
-                (
-                    TensorRecipe(
-                        object_prefix + "gdn/a_log",
-                        Cast(
-                            source(source_prefix + "linear_attn.A_log", (32,)),
-                            inventory.FP32,
-                        ),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "gdn/dt_bias",
-                        Cast(
-                            source(source_prefix + "linear_attn.dt_bias", (32,)),
-                            inventory.FP32,
-                        ),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "gdn/convolution",
-                        Transpose(
-                            Reshape(Slice(convolution, 1, 0, 1), (8192, 4)),
-                            (1, 0),
-                        ),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "gdn/a_b_projection",
-                        Concat(
-                            (
-                                source(
-                                    source_prefix + "linear_attn.in_proj_a.weight",
-                                    (32, 2048),
-                                ),
-                                source(
-                                    source_prefix + "linear_attn.in_proj_b.weight",
-                                    (32, 2048),
-                                ),
-                            ),
-                            0,
-                        ),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "gdn/query_key_value_z",
-                        Concat(
-                            (
-                                source(
-                                    source_prefix + "linear_attn.in_proj_qkv.weight",
-                                    (8192, 2048),
-                                ),
-                                source(
-                                    source_prefix + "linear_attn.in_proj_z.weight",
-                                    (4096, 2048),
-                                ),
-                            ),
-                            0,
-                        ),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "gdn/norm",
-                        source(source_prefix + "linear_attn.norm.weight", (128,)),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "gdn/output",
-                        source(
-                            source_prefix + "linear_attn.out_proj.weight",
-                            (2048, 4096),
-                        ),
-                    ),
-                )
-            )
-
-        recipes.append(
-            TensorRecipe(
-                object_prefix + "post_attention_norm",
-                source(source_prefix + "post_attention_layernorm.weight", (2048,)),
-            )
-        )
-        recipes.extend(
-            _moe_recipes(
-                source_prefix + "mlp.",
-                object_prefix + "moe/",
-            )
-        )
-
-    recipes.extend(
-        (
-            TensorRecipe(
-                "text/final_norm",
-                source("model.language_model.norm.weight", (2048,)),
-            ),
-            TensorRecipe(
-                "text/output_head",
-                source("lm_head.weight", (248320, 2048)),
-            ),
-        )
-    )
-    return tuple(recipes)
+    config = inventory.hf_config_for()
+    declaration = declare(resolve_architecture(config), config, flat_sources=False)
+    return derive_recipes(declaration, capabilities={"text"})
 
 
 def _build_draft_head_recipes() -> tuple[TensorRecipe, ...]:
@@ -468,10 +244,15 @@ def _build_dflash_recipes() -> tuple[TensorRecipe, ...]:
     return tuple(recipes)
 
 
+_DECLARED_RECIPE_SPECS = _build_declared_recipes()
+_TEXT_RECIPE_SPECS = tuple(r for r in _DECLARED_RECIPE_SPECS if not r.object_name.startswith("mtp/"))
+_MTP_RECIPE_SPECS = tuple(r for r in _DECLARED_RECIPE_SPECS if r.object_name.startswith("mtp/"))
+
+#: The inventory's order: the text stack, the draft head, the MTP head, then the tower.
 BASE_RECIPE_SPECS = (
-    _build_text_recipes()
+    _TEXT_RECIPE_SPECS
     + _build_draft_head_recipes()
-    + _build_mtp_recipes()
+    + _MTP_RECIPE_SPECS
     + build_vision_recipes(2048)
 )
 DFLASH_RECIPE_SPECS = _build_dflash_recipes()

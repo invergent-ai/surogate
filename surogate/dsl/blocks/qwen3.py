@@ -7,7 +7,29 @@ from ..block_schema import BlockSchema, SlotDecl
 from ..modules import GenericGQAttention, GenericMLP, RMSNorm
 from ..attention import AttentionConfig
 from ..mlp import MLPConfig
+from ..block_schema import ServeObject
 from .common import DENSE_BLOCK_NAME_REMAP
+
+
+#: How a serving artifact stores this block. Shapes are written against the symbols
+#: `serve/convert/common/declaration.symbols_for` resolves from the runtime config.
+#:
+#: The declaration fuses q, k and v into one parameter and the artifact stores the
+#: same matrix, so `attention/query_key_value` is a pass-through; ungated attention
+#: means there is no gate block between k and v. The SwiGLU parameter fuses `up |
+#: gate` and the artifact stores `gate | up`, so that object names the halves in its
+#: own row order rather than the parameter as a whole.
+_QWEN3_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",)),
+    ServeObject("attention/query_key_value", "quantised", ("QKV", "C"), ("qkv_weight",)),
+    ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",)),
+    ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",)),
+    ServeObject("attention/output", "quantised", ("C", "AttnDim"), ("out_weight",)),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ln2_weight",)),
+    ServeObject("mlp/gate_up", "quantised", ("MUp", "C"),
+                ("mlp_up_weight.gate", "mlp_up_weight.up")),
+    ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
+)
 
 
 class Qwen3Block(nn.Block):
@@ -23,6 +45,7 @@ class Qwen3Block(nn.Block):
             SlotDecl("res_att", shape=("B", "T", "C")),
             SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
         ),
+        serve_objects=_QWEN3_SERVE_OBJECTS,
         attrs={"block_family": "qwen3_dense"},
     )
 

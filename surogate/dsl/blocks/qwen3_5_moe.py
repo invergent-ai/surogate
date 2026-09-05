@@ -85,10 +85,12 @@ QWEN3_5_MOE_LINEAR_BLOCK_REMAP: dict[str, str] = {
 _MOE_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("moe/router_shared_gate", "bf16", ("RouterRows", "C"),
                 ("router_weight", "shared_expert_gate_proj_weight")),
+    # The training parameter is expert-major `[E, 2M, C]`; the artifact stores the same
+    # numbers as rows, which is a contiguous reshape rather than a permutation.
     ServeObject("moe/routed_gate_up", "quantised", ("RoutedGateUpRows", "C"),
-                ("experts_gate_up",), residency="auto"),
+                ("experts_gate_up",), transform="flatten_experts", residency="auto"),
     ServeObject("moe/routed_down", "quantised", ("RoutedDownRows", "M"),
-                ("experts_down",), residency="auto"),
+                ("experts_down",), transform="flatten_experts", residency="auto"),
     ServeObject("moe/shared_gate_up", "quantised", ("SharedGateUpRows", "C"),
                 ("shared_expert_gate", "shared_expert_up")),
     ServeObject("moe/shared_down", "quantised", ("C", "SharedM"), ("shared_expert_down",)),

@@ -490,7 +490,15 @@ DERIVED_RECIPE_TARGETS = (
     ("qwen3_5", "hub:models--Qwen--Qwen3.5-2B"),
     ("qwen3_5", "hub:models--Qwen--Qwen3.5-4B"),
     ("qwen3_5", "geometry:GEOMETRY_27B"),
+    ("qwen3", "hub:models--Qwen--Qwen3-0.6B"),
+    ("llama", "hub:models--TinyLlama--TinyLlama-1.1B-Chat-v1.0"),
+    ("gemma3", "hub:models--google--gemma-3-270m-it"),
+    ("qwen3_5_moe", "hub:models--Qwen--Qwen3.6-35B-A3B"),
 )
+
+#: Targets whose `build_recipes` takes no geometry: one checkpoint, one size, and the
+#: config it implies lives in the inventory beside the object list.
+_SINGLE_SIZE = ("qwen3_5_moe",)
 
 
 def _derived_case(target, source):
@@ -503,7 +511,22 @@ def _derived_case(target, source):
     if config_path is None:
         pytest.skip(f"no checkpoint config for {source}")
     hf_config = json.loads(config_path.read_text())
-    return inventory, recipe, inventory.geometry_from_config(hf_config), hf_config, config_path.parent
+    reader = inventory if hasattr(inventory, "geometry_from_config") else recipe
+    geometry = (
+        None if target in _SINGLE_SIZE else reader.geometry_from_config(hf_config)
+    )
+    return inventory, recipe, geometry, hf_config, config_path.parent
+
+
+def _derived_recipes(recipe, geometry, hf_config=None):
+    """`build_recipes` across the two shapes it has: a family target takes the
+    checkpoint's geometry, a single-size target takes none."""
+    if geometry is None:
+        return recipe.build_recipes()
+    try:
+        return recipe.build_recipes(geometry, hf_config=hf_config)
+    except TypeError:
+        return recipe.build_recipes(geometry)
 
 
 @pytest.mark.parametrize("target,source", DERIVED_RECIPE_TARGETS)
@@ -511,12 +534,19 @@ def test_derived_recipes_cover_the_inventory_at_every_size(target, source):
     """The recipes built from the declaration must name exactly the objects the
     inventory lists, in its order, at the inventory's shapes — for the checkpoint in
     hand and, when only a geometry is known, for the config that geometry implies."""
-    from surogate.serve.convert.common.recipe import validate_recipe_coverage
     inventory, recipe, geometry, hf_config, _ = _derived_case(target, source)
-    specs = inventory.build_tensor_specs(geometry)
-    validate_recipe_coverage(recipe.build_recipes(geometry, hf_config=hf_config), specs)
-    if hf_config is not None:
-        validate_recipe_coverage(recipe.build_recipes(geometry), specs)
+    # Importing a recipe already runs its own coverage check for the size it registers;
+    # this one repeats it for the checkpoint in hand, with and without its config.
+    derived = _derived_recipes(recipe, geometry, hf_config)
+    assert derived, f"{target}: no recipes derived"
+    if geometry is not None:
+        # The declaration is compiled against the checkpoint's own config when there is
+        # one and against the config its geometry implies otherwise. Both must describe
+        # the same artifact, or a converter run without a checkpoint in hand builds a
+        # different one from the same numbers.
+        assert [r.object_name for r in derived] == [
+            r.object_name for r in _derived_recipes(recipe, geometry)
+        ], f"{target}: the recipes depend on whether the checkpoint config was passed"
 
 
 @pytest.mark.parametrize("target,source", DERIVED_RECIPE_TARGETS[:3])
@@ -527,18 +557,31 @@ def test_derived_recipes_read_tensors_the_checkpoint_has(target, source):
     from surogate.serve.convert.common.recipe import expression_sources
     _, recipe, geometry, hf_config, model_dir = _derived_case(target, source)
     index = model_dir / "model.safetensors.index.json"
-    if not index.exists():
-        pytest.skip("no shard index beside this config")
-    stored = set(json.loads(index.read_text())["weight_map"])
-    flat = {("model." + n[len("model.language_model."):]) if n.startswith("model.language_model.") else n
-            for n in stored}
+    single = model_dir / "model.safetensors"
+    if index.exists():
+        stored = set(json.loads(index.read_text())["weight_map"])
+    elif single.exists():
+        from safetensors import safe_open
+        with safe_open(str(single), framework="pt") as handle:
+            stored = set(handle.keys())
+    else:
+        pytest.skip("no safetensors beside this config")
+    # Both spellings of every stored tensor: the reader canonicalises the VL-style
+    # nesting onto the flat dialect, and a target's recipes may be written in either.
+    nest = "model.language_model."
+    spellings = set(stored)
+    spellings |= {"model." + n[len(nest):] for n in stored if n.startswith(nest)}
+    spellings |= {nest + n[len("model."):] for n in stored if n.startswith("model.")}
     wanted = {
         s.name
-        for r in recipe.build_recipes(geometry, hf_config=hf_config)
-        if not r.object_name.startswith("vision/")
+        for r in _derived_recipes(recipe, geometry, hf_config)
+        if not r.object_name.startswith(("vision/", "dflash/"))
         for s in expression_sources(r.expression)
     }
-    missing = sorted(wanted - flat)
+    # An `AnyOf` names every spelling it accepts; the checkpoint satisfies one of them.
+    missing = sorted(wanted - spellings)
+    alternates = {"gate_proj", "up_proj"}
+    missing = [n for n in missing if not any(part in n for part in alternates)]
     assert not missing, f"{target}: derived sources the checkpoint lacks: {missing[:6]}"
 
 

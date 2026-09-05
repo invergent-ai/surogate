@@ -13,6 +13,8 @@ from surogate.serve.convert.common.recipe import (
     preflight_source_reader,
     source,
 )
+from surogate.serve.convert.common.declaration import declare, derive_recipes
+from surogate.dsl.ir_builder import resolve_architecture
 from surogate.serve.convert.common.recipe import (
     validate_recipe_coverage as _validate_recipe_coverage,
 )
@@ -63,99 +65,45 @@ def build_recipes(
     geometry: inventory.Geometry = inventory.GEOMETRY,
     *,
     tied_output_head: bool = True,
+    hf_config: Mapping[str, object] | None = None,
 ) -> tuple[TensorRecipe, ...]:
     """Where every artifact object comes from in the checkpoint, in object order.
 
-    Every entry is a plain read. Gemma 3 fuses nothing, so there is no `Concat`
-    anywhere in this recipe — and the norms are copied rather than adjusted,
-    because a safetensors checkpoint already stores the unfolded `w` the runtime
-    wants (see the module docstring).
+    Not written here: derived from the training declaration, which maps every
+    parameter to its checkpoint tensor (`hf_mapping`) and says which parameters
+    each artifact object is built from, in row order (`ServeObject.components`).
+    `hf_config` is the checkpoint's own `config.json` when the caller has it, and
+    the registered geometry's implied config otherwise.
+
+    `tied_output_head` stays an argument rather than being read from the config:
+    it is a property of the file in hand, and the converter has already resolved
+    it against what the checkpoint actually ships.
+
+    A tied Gemma 3 has no `text/output_head` object at all — `inventory.ALIAS_SPECS`
+    makes the head a role served by `text/token_embedding` — so that recipe is
+    dropped rather than given the embedding's expression, which would quantise the
+    same 167.8M elements twice and write ~170 MB of byte-identical duplicate.
     """
-
-    hidden = geometry.hidden
-    query, kv = geometry.query_size, geometry.kv_size
-    embedding = source("model.embed_tokens.weight", (geometry.vocab, hidden))
-
-    recipes: list[TensorRecipe] = [TensorRecipe("text/token_embedding", embedding)]
-
-    for layer in range(geometry.layers):
-        src = f"model.layers.{layer}."
-        obj = f"text/layers/{layer}/"
-        recipes.extend(
-            (
-                TensorRecipe(
-                    obj + "input_norm",
-                    source(src + "input_layernorm.weight", (hidden,)),
-                ),
-                TensorRecipe(
-                    obj + "post_attention_norm",
-                    source(src + "post_attention_layernorm.weight", (hidden,)),
-                ),
-                TensorRecipe(
-                    obj + "pre_feedforward_norm",
-                    source(src + "pre_feedforward_layernorm.weight", (hidden,)),
-                ),
-                TensorRecipe(
-                    obj + "post_feedforward_norm",
-                    source(src + "post_feedforward_layernorm.weight", (hidden,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/query",
-                    source(src + "self_attn.q_proj.weight", (query, hidden)),
-                ),
-                TensorRecipe(
-                    obj + "attention/key",
-                    source(src + "self_attn.k_proj.weight", (kv, hidden)),
-                ),
-                TensorRecipe(
-                    obj + "attention/value",
-                    source(src + "self_attn.v_proj.weight", (kv, hidden)),
-                ),
-                TensorRecipe(
-                    obj + "attention/query_norm",
-                    source(src + "self_attn.q_norm.weight", (geometry.head_dim,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/key_norm",
-                    source(src + "self_attn.k_norm.weight", (geometry.head_dim,)),
-                ),
-                TensorRecipe(
-                    obj + "attention/output",
-                    source(src + "self_attn.o_proj.weight", (hidden, query)),
-                ),
-                TensorRecipe(
-                    obj + "mlp/gate",
-                    source(src + "mlp.gate_proj.weight", (geometry.intermediate, hidden)),
-                ),
-                TensorRecipe(
-                    obj + "mlp/up",
-                    source(src + "mlp.up_proj.weight", (geometry.intermediate, hidden)),
-                ),
-                TensorRecipe(
-                    obj + "mlp/down",
-                    source(src + "mlp.down_proj.weight", (hidden, geometry.intermediate)),
-                ),
-            )
+    config = dict(hf_config) if hf_config is not None else inventory.hf_config_for(geometry)
+    declaration = declare(resolve_architecture(config), config)
+    recipes = derive_recipes(
+        declaration, capabilities={"text"}, tied_output_head=tied_output_head
+    )
+    if tied_output_head:
+        recipes = tuple(r for r in recipes if r.object_name != "text/output_head")
+    else:
+        # The declaration states that this architecture ties, and maps `lm_head` to the
+        # embedding tensor accordingly — every published `Gemma3ForCausalLM` does, and
+        # gemma-3-270m-it ships no `lm_head.weight` at all. A file that unties stores a
+        # head of its own, which is a property of that file rather than of the
+        # architecture, so the converter names it here. This is the branch that does not
+        # run today.
+        head = TensorRecipe(
+            "text/output_head",
+            source("lm_head.weight", (geometry.vocab, geometry.hidden)),
         )
-
-    recipes.append(TensorRecipe("text/final_norm", source("model.norm.weight", (hidden,))))
-    if not tied_output_head:
-        # `tie_word_embeddings` is a property of the checkpoint in hand, not of
-        # the architecture, so an untied Gemma 3 stores a head of its own and
-        # reads it from `lm_head.weight`. Every published `Gemma3ForCausalLM`
-        # ties, and gemma-3-270m-it ships no `lm_head.weight` at all, so this is
-        # the branch that does not run today.
-        recipes.append(
-            TensorRecipe(
-                "text/output_head", source("lm_head.weight", (geometry.vocab, hidden))
-            )
-        )
-    # The tied case has no `text/output_head` recipe because it has no such
-    # object: `inventory.ALIAS_SPECS` makes the head a role served by
-    # `text/token_embedding`, and the binder fills both from the one table.
-    # Giving it the embedding's expression instead would quantise 167.8M elements
-    # a second time and write ~170 MB of byte-identical duplicate.
-    return tuple(recipes)
+        recipes = tuple(head if r.object_name == "text/output_head" else r for r in recipes)
+    return recipes
 
 
 RECIPE_SPECS = build_recipes()

@@ -41,15 +41,18 @@ QWEN3_5_MOE_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
 #: is the only difference from the dense family's section.
 QWEN3_5_MOE_MTP_SERVE_SECTION = ServeSection(
     prefix="mtp/",
+    hf_prefix="mtp.",
+    hf_layer="mtp.layers.0",
     objects=(
-        ServeObject("input_projection", "quantised", ("C", "TwoC")),
-        ServeObject("embedding_norm", "bf16", ("C",)),
-        ServeObject("hidden_norm", "bf16", ("C",)),
+        ServeObject("input_projection", "quantised", ("C", "TwoC"), source="fc.weight"),
+        ServeObject("embedding_norm", "bf16", ("C",), source="pre_fc_norm_embedding.weight"),
+        ServeObject("hidden_norm", "bf16", ("C",), source="pre_fc_norm_hidden.weight"),
         *(
-            ServeObject("layer/" + o.name, o.format, o.shape, transform=o.transform)
+            ServeObject("layer/" + o.name, o.format, o.shape, o.components,
+                        transform=o.transform)
             for o in _MOE_ATTENTION_BLOCK_OBJECTS
         ),
-        ServeObject("final_norm", "bf16", ("C",)),
+        ServeObject("final_norm", "bf16", ("C",), source="norm.weight"),
     ),
 )
 

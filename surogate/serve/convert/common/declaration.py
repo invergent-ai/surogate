@@ -33,6 +33,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .inventory import FP32
 from .recipe import (
+    AnyOf,
     Cast,
     Concat,
     Expression,
@@ -122,6 +123,9 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "TwoC": 2 * hidden,
         "M": expert_ffn,
         "TwoM": 2 * expert_ffn,
+        # The fused SwiGLU parameter, spelled `MUp` by the dense blocks and
+        # `2M`/`TwoM` by the hybrid ones. One quantity, two names in the wild.
+        "MUp": 2 * expert_ffn,
         "DraftVocab": config.get("draft_head_vocab", 0),
         "Vocab": config["vocab_size"],
         "HeadDim": config["head_size"],
@@ -141,6 +145,7 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "ConvK": config.get("linear_conv_kernel_dim", 0),
         "ConvDim": conv_dim,
         "GdnFusedRows": conv_dim + value_dim,
+        "E": experts,
         "RouterRows": experts + 1,
         "RoutedGateUpRows": experts * 2 * expert_ffn,
         "RoutedDownRows": experts * hidden,
@@ -304,6 +309,12 @@ class Declaration:
     architecture: str
     hf_config: dict[str, Any] = field(repr=False)
     ir: dict[str, Any] = field(repr=False)
+    #: Whether to name sources in the flat dialect. The shard reader canonicalises the
+    #: VL-style `model.language_model.` nesting onto `model.`, so both spellings read
+    #: every checkpoint; which one a target's recipes are written in is that target's
+    #: settled convention, and changing it would change every name its GGUF repack plan
+    #: and its preflight match against.
+    flat_sources: bool = True
 
     @cached_property
     def module(self) -> dict[str, Any]:
@@ -462,11 +473,29 @@ class Declaration:
     def dims(self, decl: ParamDecl) -> tuple[int, ...]:
         return tuple(_dim(text, self.symbols, self.config) for text in decl.shape)
 
-    def component(self, component: str, *, layer: int | None, hf_layer: str | None = None) -> Expression:
+    def source_name(self, name: str) -> str:
+        return flat_name(name) if self.flat_sources else name
+
+    def component(self, component: str, *, layer: int | None, hf_layer: str | None = None,
+                  shape: tuple[int, ...] | None = None) -> Expression:
         """The expression producing one component: a whole parameter's checkpoint tensor,
-        a fused parameter reassembled from its sources, or one named slice of it."""
+        a fused parameter reassembled from its sources, or one named slice of it.
+
+        `shape` is the declared shape of an object that has this component and no other,
+        used when the declaration maps a checkpoint tensor under a name its graph does
+        not register as a parameter — Gemma 3 reads its QK norms inside the attention
+        module rather than tracing them. The mapping still says where the tensor lives;
+        the object says how big it is. Anything more than a whole-tensor pass-through
+        still needs the parameter, because only it carries the fused parts.
+        """
         name, _, slice_name = component.partition(".")
-        decl = self.param(name, layer)
+        try:
+            decl = self.param(name, layer)
+        except KeyError:
+            untraced = None if slice_name or shape is None else self.mapping(name, layer, hf_layer)
+            if not isinstance(untraced, str):
+                raise
+            return SourceTensor(self.source_name(untraced), shape)
         mapping = self.mapping(name, layer, hf_layer)
         shape = self.dims(decl)
         if isinstance(mapping, str):
@@ -474,7 +503,7 @@ class Declaration:
                 raise ValueError(
                     f"{component}: {name!r} maps to one checkpoint tensor and has no slices to name"
                 )
-            return SourceTensor(flat_name(mapping), shape)
+            return SourceTensor(self.source_name(mapping), shape)
         if not isinstance(mapping, dict) or mapping.get("type") != "fuse":
             raise NotImplementedError(
                 f"{component}: {name!r} is mapped by a {mapping.get('type') if isinstance(mapping, dict) else type(mapping).__name__} "
@@ -499,7 +528,7 @@ class Declaration:
         def part(lora: LoraSlice, source: str) -> SourceTensor:
             part_shape = list(shape)
             part_shape[dim] = lora.size
-            return SourceTensor(flat_name(source), tuple(part_shape))
+            return SourceTensor(self.source_name(source), tuple(part_shape))
 
         if slice_name:
             for lora, source in zip(slices, sources):
@@ -509,8 +538,49 @@ class Declaration:
         return Concat(tuple(part(lora, source) for lora, source in zip(slices, sources)), dim)
 
 
-def declare(architecture: str, hf_config: dict[str, Any]) -> Declaration:
-    return Declaration(architecture=architecture, hf_config=hf_config, ir=compile_ir(architecture, hf_config))
+def text_config(
+    architecture: str,
+    model_type: str,
+    *,
+    layers: int,
+    hidden: int,
+    intermediate: int,
+    vocab: int,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    **extra: Any,
+) -> dict[str, Any]:
+    """The `config.json` a text checkpoint of these dimensions would carry.
+
+    The inverse of a converter's `geometry_from_config`, and the reason a caller with
+    a registered geometry and no checkpoint in hand can still derive recipes: the
+    declaration is compiled against a config either way. Only the dimensions the
+    object list is a function of are stated; `extra` carries whatever else a
+    particular family's declaration reads.
+    """
+    return {
+        "architectures": [architecture],
+        "model_type": model_type,
+        "num_hidden_layers": layers,
+        "hidden_size": hidden,
+        "intermediate_size": intermediate,
+        "vocab_size": vocab,
+        "num_attention_heads": query_heads,
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
+        **extra,
+    }
+
+
+def declare(architecture: str, hf_config: dict[str, Any], *,
+            flat_sources: bool = True) -> Declaration:
+    return Declaration(
+        architecture=architecture,
+        hf_config=hf_config,
+        ir=compile_ir(architecture, hf_config),
+        flat_sources=flat_sources,
+    )
 
 
 def flat_name(name: str) -> str:
@@ -603,12 +673,50 @@ def _transpose_taps(parts: Sequence[Expression], obj: DeclaredObject, decl: Decl
     return Transpose(Reshape(Slice(convolution, 1, 0, 1), (channels, taps)), (1, 0))
 
 
+def _flatten_experts(parts: Sequence[Expression], obj: DeclaredObject, decl: Declaration) -> Expression:
+    """An expert-major parameter `[experts, rows, cols]` as the rows the artifact stores.
+
+    The training graph holds every expert of a layer in one batched parameter; the
+    serving artifact stores the same numbers as a plain row-major matrix, so
+    `stored_row(e, r) = e * rows + r` is a contiguous reshape rather than a permutation.
+
+    A checkpoint that fuses gate and up into one expert-major tensor and a GGUF of the
+    same model that keeps them as two stacked tensors describe identical rows in
+    identical order. That is a source-format convention like the `model.language_model.`
+    folding, not architecture, so the object accepts both spellings and the resolver
+    takes whichever one the checkpoint at hand provides.
+    """
+    (batched,) = parts
+    shape = expression_shape(batched)
+    if len(shape) != 3:
+        raise ValueError(
+            f"{obj.name}: flatten_experts wants an expert-major [experts, rows, cols] "
+            f"source, and this one is {shape}"
+        )
+    experts, rows, cols = shape
+    fused = Reshape(batched, obj.shape)
+    if not isinstance(batched, SourceTensor) or _FUSED_GATE_UP not in batched.name:
+        return fused
+    stacked = tuple(
+        SourceTensor(batched.name.replace(_FUSED_GATE_UP, half), (experts, rows // 2, cols))
+        for half in ("gate_proj", "up_proj")
+    )
+    # Concatenated on the expert's *output* axis, which is what reproduces the fused
+    # tensor's row order; concatenating on the expert axis would interleave them.
+    return AnyOf((fused, Reshape(Concat(stacked, 1), obj.shape)))
+
+
+#: The fused expert projection's name, and the token that gives away its two halves.
+_FUSED_GATE_UP = "gate_up_proj"
+
+
 #: Transforms whose work happens at load or in the kernel: the recipe passes the
 #: tensor through and the name only records that the served form differs.
 TRANSFORMS: dict[str | None, Transform] = {
     None: _concat_rows,
     "split_interleaved_query_gate": _split_interleaved_query_gate,
     "transpose_taps": _transpose_taps,
+    "flatten_experts": _flatten_experts,
     "log_negate": _concat_rows,
     "unfold_unit_offset": _concat_rows,
 }
@@ -639,11 +747,16 @@ def derive_recipes(
     for obj in declaration.objects(capabilities=capabilities):
         if obj.source is not None:
             prefix = getattr(obj.section, "hf_prefix", "") if obj.section is not None else ""
-            expression: Expression = SourceTensor(flat_name(prefix + obj.source), obj.shape)
+            expression: Expression = SourceTensor(
+                declaration.source_name(prefix + obj.source), obj.shape
+            )
         elif obj.components:
             hf_layer = getattr(obj.section, "hf_layer", None) if obj.section is not None else None
             if hf_layer is not None and obj.index is not None:
                 hf_layer = hf_layer.replace("{index}", str(obj.index))
+            # An object built from one component is that component, so its declared
+            # shape can stand in for a parameter the graph does not trace.
+            only = obj.shape if len(obj.components) == 1 else None
             parts = []
             for component in obj.components:
                 if tied and component in TIED_COMPONENTS:
@@ -653,7 +766,8 @@ def derive_recipes(
                         raise ValueError(f"{obj.name}: {component} is tied to a tensor of another shape")
                     parts.append(tensor)
                 else:
-                    parts.append(declaration.component(component, layer=obj.layer, hf_layer=hf_layer))
+                    parts.append(declaration.component(component, layer=obj.layer,
+                                                       hf_layer=hf_layer, shape=only))
             if obj.transform not in transforms:
                 raise KeyError(f"{obj.name}: transform {obj.transform!r} has no implementation")
             expression = transforms[obj.transform](parts, obj, declaration)

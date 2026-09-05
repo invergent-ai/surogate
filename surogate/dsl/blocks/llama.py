@@ -7,7 +7,22 @@ from ..block_schema import BlockSchema, SlotDecl
 from ..modules import GenericGQAttention, GenericMLP, RMSNorm
 from ..attention import AttentionConfig
 from ..mlp import MLPConfig
+from ..block_schema import ServeObject
 from .common import DENSE_BLOCK_NAME_REMAP
+
+
+#: How a serving artifact stores this block. Qwen3's block with no QK norms: the
+#: fused q|k|v parameter is stored as it stands, and the SwiGLU parameter's halves
+#: are named in the artifact's own order (`gate | up` against the trainer's `up | gate`).
+_LLAMA_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",)),
+    ServeObject("attention/query_key_value", "quantised", ("QKV", "C"), ("qkv_weight",)),
+    ServeObject("attention/output", "quantised", ("C", "AttnDim"), ("out_weight",)),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ln2_weight",)),
+    ServeObject("mlp/gate_up", "quantised", ("MUp", "C"),
+                ("mlp_up_weight.gate", "mlp_up_weight.up")),
+    ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
+)
 
 
 class LlamaBlock(nn.Block):
@@ -33,6 +48,7 @@ class LlamaBlock(nn.Block):
             SlotDecl("swiglu", shape=("B", "T", "M")),
             SlotDecl("mlp_down", shape=("B", "T", "C")),
         ),
+        serve_objects=_LLAMA_SERVE_OBJECTS,
         attrs={"block_family": "llama_dense"},
     )
 

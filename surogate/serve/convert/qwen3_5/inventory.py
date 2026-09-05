@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from surogate.serve.convert.common import declaration
 from surogate.serve.convert.common.inventory import (
     tied_duplicate_objects,
     BF16,
@@ -174,16 +175,17 @@ def hf_config_for(geometry: Geometry) -> dict:
     compiled against a config, so the inverse of `geometry_from_config` is what lets
     them be built for a registered size. The flat text architecture is used: recipes
     are written in the flat dialect either way."""
-    return {
-        "architectures": ["Qwen3_5ForCausalLM"],
-        "model_type": geometry.model_type or "qwen3_5",
-        "hidden_size": geometry.hidden,
-        "num_hidden_layers": geometry.layers,
-        "intermediate_size": geometry.intermediate,
-        "vocab_size": geometry.vocab,
-        "num_attention_heads": geometry.query_heads,
-        "num_key_value_heads": geometry.kv_heads,
-        "head_dim": geometry.head_dim,
+    return declaration.text_config(
+        "Qwen3_5ForCausalLM",
+        geometry.model_type or "qwen3_5",
+        layers=geometry.layers,
+        hidden=geometry.hidden,
+        intermediate=geometry.intermediate,
+        vocab=geometry.vocab,
+        query_heads=geometry.query_heads,
+        kv_heads=geometry.kv_heads,
+        head_dim=geometry.head_dim,
+        **{
         "linear_num_key_heads": geometry.gdn_key_heads,
         "linear_key_head_dim": geometry.gdn_key_head_dim,
         "linear_num_value_heads": geometry.gdn_value_heads,
@@ -196,7 +198,8 @@ def hf_config_for(geometry: Geometry) -> dict:
         ],
         # The smaller sizes tie the output head to the embedding; the 27B ships its own.
         "tie_word_embeddings": not is_27b(geometry),
-    }
+        },
+    )
 
 
 #: GGUF architecture strings this family is exported under, and the `model_type` each means.

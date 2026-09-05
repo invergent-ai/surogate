@@ -155,9 +155,12 @@ _GEMMA3_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     # not adjacent. Three GEMMs compose from ops that already exist; the fused
     # form needs a split-norm-rope kernel written and tested first. Same FLOPs
     # either way, and all three repack bit-exactly instead of concatenating.
-    ServeObject("attention/query", "quantised", ("AttnDim", "C"), ("qkv_weight",)),
-    ServeObject("attention/key", "quantised", ("KvDim", "C"), ("qkv_weight",)),
-    ServeObject("attention/value", "quantised", ("KvDim", "C"), ("qkv_weight",)),
+    # Each names its own slice of the fused training parameter: `("qkv_weight",)`
+    # would say this object is the whole [QKV, C] matrix, which is three times the
+    # rows it holds. Deriving the recipe from these components is what caught it.
+    ServeObject("attention/query", "quantised", ("AttnDim", "C"), ("qkv_weight.q",)),
+    ServeObject("attention/key", "quantised", ("KvDim", "C"), ("qkv_weight.k",)),
+    ServeObject("attention/value", "quantised", ("KvDim", "C"), ("qkv_weight.v",)),
     ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",),
                 transform="unfold_unit_offset"),
     ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",),
