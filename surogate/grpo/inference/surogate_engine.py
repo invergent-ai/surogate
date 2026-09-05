@@ -60,6 +60,14 @@ def build_argv(config: GRPOInferenceConfig) -> list[str]:
         argv += ["--max-model-len", str(config.max_model_len)]
     if config.max_num_seqs is not None:
         argv += ["--max-num-seqs", str(config.max_num_seqs)]
+    # Size the KV cache from free memory rather than leaving it at its default.
+    #
+    # A rollout step issues every sequence at once and each may run to the full
+    # context, so the cache is what decides how many actually run together. Left at
+    # the default the engine held one 2048-token sequence: it admitted one request,
+    # queued the rest, and ran with 29 GiB free and a decode batch of 1. Sizing it
+    # from what is free took the same run from 13.6-25.3s per step to 3.2-4.9s.
+    argv += ["--kv-capacity", "auto"]
     if config.kv_cache_dtype:
         argv += ["--kv-dtype", str(config.kv_cache_dtype)]
     if config.enable_lora:
