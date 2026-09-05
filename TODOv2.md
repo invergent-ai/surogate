@@ -36,66 +36,44 @@ the history of what was tried is `design/INFERENCE.md`.
 
 ## Roadmap
 
-Four open or partly done, and none of them is a format. Two are decisions
-waiting on `surogate quantize` as a product rather than tasks (1 and 4); the
-other two are one measured obstacle on Flash-Next's offload path, seen from two
-sides. Every GGML weight type llama.cpp stores is now read where it lies, F16
-included, so what remains is performance and product shape rather than
-coverage.
+Two open, and both are decisions rather than blocked work. Every GGML weight type
+llama.cpp stores is read where it lies, F16 included; the engine's own suite builds
+and runs; and what a checkpoint declares about its quantisation is honoured or
+refused. The Flash-Next levers were measured and written off — see "Measured and
+rejected" — so nothing on this list is waiting on someone to find time.
 
-1. **[~] Retire Q4G64/Q5G64/Q6G64.** The three home-grown formats and the
-   converters that produce them would leave together, roughly 140 references.
-   The old argument against it is stale: with the int8 route the K-quant path
-   measures 13,195 tok/s against the row-split path's 13,700, and decode is
-   unaffected.
-   **What the deletion strands, checked 2026-09-03.** One live path still
-   produces these formats: the 27B's `Qwen36GroupwiseInt` profile, whose
-   endpoints bind `Q6G64_F16S` and whose layers bind `Q4G64_F16S`. Nothing else
-   selects them — the other targets import the names and use `W8G32_F16S` or
-   NVFP4. So this is one target's safetensors profile, not five, and it is a
-   decision rather than a task: it costs the 27B its groupwise-int route until
-   `surogate quantize` (item 4) is a product.
-2. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
-   board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
-   users); what is left is above them.
-   - **A copy-engine gather.** Our expert gather is a kernel, so it holds SMs
-     while it waits on PCIe. That is why the next-layer prefetch was built,
-     measured a loss (TTFT 1.37 s against 0.84) and discarded: overlapping a
-     kernel gather with the next layer's compute starves that compute rather
-     than hiding the transfer. `cudaMemcpyBatchAsync` off the SMs would change
-     that, but it needs the miss list on the host, and a host node inside a
-     captured prefill graph cannot issue copies — so it is an eager-prefill
-     path first, if at all. Design and measurements: memory
-     `reference_freetoken`.
-   - **The CPU expert path decodes GGML blocks scalar.** `--cpu-moe-share` works
-     on a GGML-block bank, but auto measures the host at ~1 GB/s against a
-     24 GB/s PCIe gather and takes 30 % of misses, which is not yet a win. The
-     bank is decoded to Q4G32AM at load now, so this only bites a run that keeps
-     the file's blocks (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`).
-   - **The 28k-prompt board row re-measured (2026-09-04): it holds.** 7.07 s TTFT,
-     3,989 tok/s prompt processing, 39.1 tok/s after the prompt with
-     `--max-num-batched-tokens 8192` (row: 7.06 / 3,966 / 40.8). The defaults carry
-     prefill chunk 2,048 now -- the 8-card pipeline's compromise -- which reads 11.6 s /
-     2,434 tok/s on the same request, so a one-card long-prompt serve passes the flag.
-3. **[~] MTP for Flash-Next serves; the acceptance is not the speedup
-   (2026-09-04).** `--spec mtp` runs the NextN head end to end at 78.6 %
-   acceptance — which is the evidence the graph is right — but decode moves
-   30.6 → 34.1 tok/s, not the 1.3-1.7x the head is advertised at. Acceptance
-   being high, the cost is the round, not the drafts: a 4-6 column verify touches
-   more distinct experts than a single token and pays more PCIe gathers with
-   3,172 of 5,110 experts resident. The graph and the levers are in memory
-   `project_serve_qwen4exp_mtp`.
-   **Draft-length sweep (2026-09-04 23:40, one 5090, board 512/128, defaults):** off
-   32.6 tok/s; draft 1 **35.2** (71.6 % accepted); draft 2 34.6 (55 %); draft 3 32.6
-   (45 %). The shortest draft wins, as on the 27B (83.3 at draft 1): every extra
-   column costs a wider expert gather and the acceptance falls off fast. `--spec mtp
-   --draft-tokens 1` is the setting to serve with; the +8 % is what the head is worth
-   on an offloaded MoE until the verify round's gather is cheaper.
-4. **[~] DEFERRED, off the critical path — `surogate quantize`, the export of a
-   model we trained.** Revisit once the serving engine is complete (owner,
-   2026-09-03). The thin version is in (`surogate/cli/quantize.py`) because it
-   turned out to be two subprocess calls; everything a real product needs
-   around it is not, and is listed below.
+1. **[ ] Retire Q4G64/Q5G64/Q6G64 — now a deletion with a proven replacement
+   (re-checked 2026-09-05).** Two things changed since this was written as a
+   trade-off.
+   **It is not one target's profile.** The group-wise route quantises at *every*
+   size, not only the 27B: a plain BF16 safetensors Qwen3.5-0.8B converts to 48
+   Q4G64 + 48 Q5G64 + 1 Q6G64 objects, the 27B to 183 + 246 + 3. So handing the
+   engine an unquantised checkpoint gets it quantised to four and five bits — which
+   is **quantising what a user brings us**, the one thing "Decisions that govern"
+   rules out. The rule and the code disagree, and the code is the newer of the two.
+   **The replacement is proven.** `surogate quantize` now takes a checkpoint to a
+   GGUF the engine serves better than the published one (item 2). A user with a BF16
+   checkpoint has a path that does not involve us inventing a quantisation.
+   What the deletion costs is one piece of work, not a capability: the group-wise
+   profile is also what a BF16 checkpoint's *unquantised* objects travel through, so
+   retiring it means a BF16 pass-through profile first — the engine already serves
+   BF16 at any 8-aligned shape, and that profile already emits 338 BF16 objects at
+   0.8B. Then roughly 262 references go. **The decision is whether to build the
+   pass-through; the formats follow it out.**
+
+2. **[ ] `surogate quantize` as a product — the engine blocker is gone (2026-09-05).**
+   The recorded blocker was ours: every MTP binding demanded `W8G32_F16S` or BF16, so
+   an export that quantised its own nextn block was refused at
+   `mtp/input_projection`. The MTP matrices bind at whatever format the artifact
+   declares now, and the whole chain runs: `surogate quantize --type q4_k_m` on
+   Qwen3.5-0.8B writes 335 tensors carrying the nextn block at Q4_K, the engine
+   serves it, and it scores **14.9559** against llama-perplexity's 14.9713 on the
+   same file — better than the *published* Q4_K_M of the same model (15.031/15.025),
+   which is what a full-precision source and llama.cpp's own mixture buy.
+   So nothing here is engine work any more. What is left is product scope, listed
+   below: no importance matrix, no mixture of our own, llama.cpp is a checkout
+   rather than a dependency, and it is untested beyond the 0.8B and on anything we
+   trained ourselves. **This is a decision about what to build, not a blocked task.**
 
 ---
 
@@ -140,19 +118,21 @@ the vendored tree with one `cmake --build build --target llama-quantize`.
 Q4_K_M at 456 MiB (5.09 bits a weight) in 5.1 s of quantiser time. Qwen3.5-0.8B:
 1.56 GB BF16 → 265 MB Q4_K_M. Both conversions and both quantisations are clean.
 
-**Serving our own export fails, and the blocker is on the engine's side.** The
-0.8B export loads to `tensor descriptor does not match target contract:
-mtp/input_projection`. The cause is not the exporter: our conversion keeps the
-MTP block (`blk.24.nextn.eh_proj.weight` and friends) and llama.cpp's `q4_k_m`
-mixture quantised it to Q4_K, while every MTP binding in the target contract
-demands `W8G32_F16S` or BF16 — eleven bindings across the 0.8B and 2B targets,
-none of which accepts a K-quant. It has never shown up because the published
-0.8B GGUFs we validated against strip the nextn block entirely, so ingest takes
-the no-MTP variant and the bindings are never exercised. Two ways out, and the
-first is one flag: pin the MTP tensors at quantise time
-(`--tensor-type "nextn=q8_0"` and the rest of `blk.<mtp>.`, which is exactly the
-mechanism behind unsloth's presets), or teach the binder to read a K-quant MTP
-block. The second is the real fix and belongs to the engine, not to this item.
+**Serving our own export worked, once the engine stopped refusing it (2026-09-05).**
+It used to fail at `tensor descriptor does not match target contract:
+mtp/input_projection`: our conversion keeps the MTP block
+(`blk.24.nextn.eh_proj.weight` and friends) and llama.cpp's `q4_k_m` mixture
+quantised it to Q4_K, while every MTP binding demanded `W8G32_F16S` or BF16. It
+had never shown up because the published 0.8B GGUFs strip the nextn block, so
+ingest took the no-MTP variant and those bindings were never exercised. The right
+fix was the engine's and it is in: `MtpPlan` binds its five matrices at whatever
+format the artifact declares, because the kernels dispatch on the weight's qtype
+and demanding one format refused a file for no reason they had.
+**Measured end to end (2026-09-05):** `surogate quantize --type q4_k_m` on
+Qwen3.5-0.8B writes 335 tensors — 168 Q4_K, 27 Q6_K, 140 F32 — with the nextn
+block at Q4_K; the engine serves it at 798 tok/s and scores **14.9559** against
+llama-perplexity's 14.9713 on the same file, and against the published Q4_K_M's
+15.031. A full-precision source and llama.cpp's own mixture beat the download.
 
 **What is deliberately not built, and is the actual work when this comes back:**
 
@@ -456,6 +436,25 @@ Written down so they are not retried.
   multiplies and the (d, dmin) pair once per 256 — which needs one activation
   scale per 256, not per 32, i.e. a numerics change against llama.cpp that the
   perplexity gate would have to judge. Not retried without that design.
+- **Flash-Next's remaining offload levers (closed 2026-09-05).** All three were
+  measured and none is worth building as things stand.
+  *A copy-engine gather* would take the expert fetch off the SMs, which is the real
+  constraint: our gather is a kernel holding SMs while it waits on PCIe. But
+  `cudaMemcpyBatchAsync` needs the miss list on the host, and a host node inside a
+  captured prefill graph cannot issue copies, so it is an eager-prefill path or
+  nothing. The next-layer prefetch built to hide the same cost measured a loss
+  (TTFT 1.37 s against 0.84) and was removed. *The CPU expert path* decodes GGML
+  blocks scalar at ~1 GB/s against a 24 GB/s PCIe gather, so the auto split takes
+  30 % of misses and does not pay; the bank is decoded to Q4G32AM at load now, so
+  this only bites `SUROGATE_SERVE_HOST_BANK_NATIVE=1`. *MTP on an offloaded MoE* is
+  worth +8 % at draft 1 (35.2 against 32.6 tok/s, 71.6 % accepted) and less at every
+  longer draft, because a wider verify round touches more distinct experts and pays
+  more gathers — the same constraint again. The board rows are met on defaults
+  (33.6 / 85.7 / 116.4 at 1 / 16 / 64 users) and the 28k row holds at 7.07 s TTFT
+  with `--max-num-batched-tokens 8192`. Design and measurements: memory
+  `reference_freetoken`, `project_serve_flash_next_board_recovery`,
+  `project_serve_qwen4exp_mtp`. **Reopen only with a copy-engine gather design that
+  survives a captured graph.**
 - **Q8_0 codecs in the fused-projection kernels.** They cp_async 16-byte chunks
   out of separate code/scale planes, so Q8_0's 34-byte blocks mean six kernel
   rewrites. The load transform gets the same result and touches no kernel.
