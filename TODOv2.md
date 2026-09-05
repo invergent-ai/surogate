@@ -22,6 +22,13 @@ against them.
 `Qwen3.5-0.8B-UD-Q8_K_XL` is 18 MB against the file's 1.19 GB, and nothing in
 the serving path re-encodes a weight.
 
+**The suite runs.** `make serve-check` is the command a change to `csrc/src/serve` or
+`surogate/serve` has to pass: 107 C++ tests (~3 min on one GPU) and 148 Python tests
+(~20 s, no GPU, no checkpoint). The Python half runs in CI on every push. Until
+2026-09-05 nothing ran either, the C++ tests were excluded from `all` and built by
+nothing, and one had been failing to compile against a rename for long enough that
+nobody remembered it.
+
 What is left is in this file. Board rows are `surogate/serve/BENCHMARKS.md`;
 the history of what was tried is `design/INFERENCE.md`.
 
