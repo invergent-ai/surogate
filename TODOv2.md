@@ -29,43 +29,27 @@ the serving path re-encodes a weight.
 nothing, and one had been failing to compile against a rename for long enough that
 nobody remembered it.
 
-What is left is in this file. Board rows are `surogate/serve/BENCHMARKS.md`;
-the history of what was tried is `design/INFERENCE.md`.
+**What is left is not the engine.** One roadmap item remains and it is a product
+decision. The backlog that matters now is architectures: the trainer declares
+seventeen and the engine serves six, so `deepseek_v4`, `gemma4`, `glm5_next`,
+`gpt_oss`, `laguna`, `lfm2`, `lfm2_moe`, `lfm2_vl`, `nemotron_h`, `qwen3_moe` and
+`qwen3_vl` have no serve target. A new dense family costs roughly 950 lines of C++
+across seven files and 1,000 of Python, and that was measured rather than guessed:
+requiring a block to be identical across the existing targets, only ~86 lines are
+shared, so what a family costs is its own specifics, not boilerplate waiting to be
+extracted.
+
+Board rows are `surogate/serve/BENCHMARKS.md`; the history of what was tried is
+`design/INFERENCE.md`.
 
 ---
 
 ## Roadmap
 
-One open, and it is a decision about product scope rather than blocked work. Every GGML weight type
-llama.cpp stores is read where it lies, F16 included; the engine's own suite builds
-and runs; and what a checkpoint declares about its quantisation is honoured or
-refused. The Flash-Next levers were measured and written off — see "Measured and
-rejected" — so nothing on this list is waiting on someone to find time.
+One open, and it is a decision about product scope rather than blocked work.
+Nothing here is waiting on someone to find time.
 
-1. **[x] Keep Q4G64/Q5G64/Q6G64 — measured 2026-09-05, they are not spare.**
-   Retiring them was never the objective; performance is, and a GGUF is already
-   served directly rather than quantised at runtime. So the only question was
-   whether anything still needs them. It does.
-   **Where they are actually used**, from `build_tensor_specs`:
-   - 0.8B/2B-class: the **vision tower only** — 48 Q4G64, 48 Q5G64, 1 Q6G64. The
-     text stack at these sizes is W8 throughout, so the formats are not in that
-     comparison at all.
-   - 27B-class: the **text stack** — 129 Q4G64, 192 Q5G64, 2 Q6G64 — plus its tower.
-     Reached when converting a BF16 safetensors 27B; a 27B GGUF is served in place.
-   Nothing else stores the tower, at any size. Removing them would mean giving the
-   tower another format, not deleting dead code.
-   **On bytes, which is what decode is bound by**, Q4G64 is 0.531 B/value against
-   GGML Q4_K's 0.5625 and W8's 1.062 — denser than both. Measured on the 0.8B
-   (GPU 1, three 256-token generations each), where the group-wise text stack is W8:
-   group-wise **734.9 tok/s** decode against a native Q4_K_M GGUF's **771.5**, which
-   is the 2x in bytes showing up as 5 % of decode. That is a W8-versus-K-quant
-   result, not a verdict on Q4G64, and it is an argument for the *denser* format
-   rather than against it. (Prefill was measured too but is not comparable here:
-   the repeated prompt hits the prefix cache.)
-   **Closed as keep.** Reopen only if the tower gains a K-quant route and a 27B
-   safetensors conversion measures worse than one through `surogate quantize`.
-
-2. **[ ] `surogate quantize` as a product — the engine blocker is gone (2026-09-05).**
+1. **[ ] `surogate quantize` as a product — the engine blocker is gone (2026-09-05).**
    The recorded blocker was ours: every MTP binding demanded `W8G32_F16S` or BF16, so
    an export that quantised its own nextn block was refused at
    `mtp/input_projection`. The MTP matrices bind at whatever format the artifact
@@ -74,9 +58,10 @@ rejected" — so nothing on this list is waiting on someone to find time.
    serves it, and it scores **14.9559** against llama-perplexity's 14.9713 on the
    same file — better than the *published* Q4_K_M of the same model (15.031/15.025),
    which is what a full-precision source and llama.cpp's own mixture buy.
-   So nothing here is engine work any more. What is left is product scope, listed
-   below: no importance matrix, no mixture of our own, llama.cpp is a checkout
-   rather than a dependency, and it is untested beyond the 0.8B and on anything we
+   So nothing here is engine work any more, and the toolchain is no longer a
+   checkout on somebody's disk: llama.cpp is fetched at a pinned commit and built
+   into the wheel. What is left is product scope, listed below — no importance
+   matrix, no mixture of our own, untested beyond the 0.8B and on anything we
    trained ourselves. **This is a decision about what to build, not a blocked task.**
 
 ---
@@ -115,8 +100,8 @@ per-architecture tensor mapping and the tokenizer; `llama-quantize` then reads
 that and applies the mixture. The converter is now a `conversion/` package,
 ~21,000 lines with a module per architecture, and it registers
 `Qwen3_5MoeForConditionalGeneration` — the architecture of the 35B we serve and
-train — alongside Qwen3, Qwen3Moe and Gemma3. `llama-quantize` builds clean in
-the vendored tree with one `cmake --build build --target llama-quantize`.
+train — alongside Qwen3, Qwen3Moe and Gemma3. Both halves are fetched at a pinned
+commit and built by our own CMake (`csrc/cmake/llama_cpp_quantizer.cmake`).
 
 **Measured end to end.** `Qwen3-0.6B`: 311 tensors to a 1.51 GB BF16 GGUF, then
 Q4_K_M at 456 MiB (5.09 bits a weight) in 5.1 s of quantiser time. Qwen3.5-0.8B:
@@ -148,20 +133,6 @@ llama-perplexity's 14.9713 on the same file, and against the published Q4_K_M's
   Whether a Surogate preset should exist — the "UD" mixes are exactly this — is
   a quality question that wants perplexity evidence per candidate, which the
   gate in `tools/eval/perplexity.py` can now supply.
-- ~~**The llama.cpp dependency is a checkout, not a dependency.**~~ **Done
-  2026-09-05.** Fetched at a pinned commit
-  (`csrc/cmake/llama_cpp_quantizer.cmake`, 163a4079) and built CPU-only, and the
-  build installs the binary, the converter, its `conversion` package and the
-  `gguf` library that converter needs into `surogate/serve/_llama_cpp` — inside
-  the package, so an installed wheel has a command with something to run.
-  Automatic everywhere: `pyproject.toml` turns the option on and names
-  `llama-quantize` a wheel target, so the wheel and the Docker image build it;
-  `make quantizer` does the same two steps in a source tree; and a workflow builds
-  it on every push and checks all four pieces land and that the binary reports the
-  pinned revision. Vendoring the sources was tried first and reverted: 460 files
-  and four patches, every one of them caused by pruning the tree rather than by
-  llama.cpp. Quantising the 0.8B through the fetched toolchain produces a file
-  **byte-identical** to the checkout's.
 - **No MoE-specific handling, no vision towers, no sharded output**
   (`--keep-split`), and no LoRA-adapter GGUF path (`convert_lora_to_gguf.py`
   exists upstream).
@@ -179,18 +150,19 @@ IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS, TQ1_0/TQ2_0, MXFP4, NVFP4_GGML, Q1_0/Q2_0, F16 -- o
 embedding and MoE decode/small-T/prefill (Q4_K/Q5_K/Q6_K on the int8 tensor-core
 route, the rest on the BF16 route), read from the GGUF; **BF16** at any 8-aligned
 shape, **W8G32_F16S**, and **NVFP4 compressed-tensors** (TRT-LLM cutlass for routed
-MoE). What is not:
+MoE); **NVFP4 ModelOpt** at every published size; **FP8** per-row, per-channel and
+[128,128] block; and a declared `kv_cache_scheme`, honoured where the engine's `auto`
+already satisfies it and refused, naming the flag, where it does not.
+
+What is not:
 
 | Format | Status |
 |---|---|
-| NVFP4 (ModelOpt) | **[x]** 0.8B, 2B and 4B all serve; the quality is the checkpoints' (see below) |
-| FP8 | **[~]** per-row, per-channel and [128,128] block all serve; per-*tensor* (one scalar scale) is unsupported |
-| W4A16 / W4A16_ASYM | **[ ]** `Q4G64_F16S` is symmetric with no zero point and no actorder |
-| MXFP4 / MXFP8 | **[ ]** nothing in serve; the trainer decodes MXFP4 |
-| GPTQ / AWQ | **[ ]** off the roadmap by owner decision |
-| `kv_cache_scheme` | **[x]** honoured where the engine's `auto` already satisfies it, refused with the flag to pass where it does not, refused outright for an integer cache (2026-09-05) |
-| F16 (GGUF) | **[x]** read where it lies (2026-09-05), as 32-value windows onto the dense bytes |
-| F32 (GGUF) | **[~]** bridged, and correctly so: every F32 tensor in a real file is a norm, an `A_log` or a conv1d, each of which needs a value or shape transform. 0.07 % of the elements. |
+| FP8 per-*tensor* | one scalar scale for a whole weight; the route takes a scale grid, so this is its degenerate cell |
+| W4A16 / W4A16_ASYM | `Q4G64_F16S` is symmetric with no zero point and no actorder |
+| MXFP4 / MXFP8 (compressed-tensors) | nothing in serve; the GGUF MXFP4 block type is read, and the trainer decodes MXFP4 |
+| GPTQ / AWQ | off the roadmap by owner decision |
+| F32 (GGUF) | bridged, and correctly so: every F32 tensor in a real file is a norm, an `A_log` or a conv1d, each of which needs a value or shape transform. 0.07 % of the elements. |
 
 Known runtime constraints: NVFP4 needs `n % 128 == 0 && k % 64 == 0` with no
 padding path; `embedding` has no NVFP4 or Q4/Q5; `linear_pair` is W8 only.
@@ -236,7 +208,7 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
   `surogate quantize` stays, it takes a trained checkpoint to a GGUF, and the
   quantisation arithmetic is llama.cpp's rather than ours. **It is a separate
   product and not on the critical path** (owner, 2026-09-03): the serving engine
-  comes first, and the export command is revisited after. See item 4 for what
+  comes first, and the export command is revisited after. See item 1 for what
   exists and what does not.
 - **`.sinfer` is a transparent cache, never an interchange format** (owner,
   2026-08-24). Never published, never required. The eight-entry hardcoded
@@ -251,37 +223,6 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
 - **Format is data, read per tensor.** Structure stays compiled in; the binder
   checks shape and "can an op route this format", not "is this the format I was
   compiled for".
-- **Dequantise-and-requantise is not free.** Measured on Qwen3.5-0.8B-Q4_K_M:
-  K-quant → BF16 → W8 adds 5.7e-3 relative error and *doubles* the bytes. That is
-  why the native path exists.
-- **A checkpoint's `quantization_config` states more than its format, and the rest is
-  read now (2026-09-05).** `kv_cache_scheme` is honoured where `auto` already resolves to
-  what it asks and refused, naming the flag, where it does not; `sparsity_config` and
-  `transform_config` are refused. And the declaration is cross-checked against the
-  checkpoint's own tensors, because it is a claim rather than a fact: a weight is quantised
-  exactly when a scale sits beside it. Two published NVFP4 exports of the same 27B declare
-  `ignore` lists of 2 and 303 entries while quantising identical tensors, and one of them
-  omits 27 unquantised vision projections it never mentions. **Where the two differ, the
-  tensors win and the disagreement is printed.**
-- **A measurement written down goes stale silently.** The `nvfp4-mixed-bf16` export table
-  names six attention layers left in BF16, measured from a published file. Neither
-  `nvidia/Qwen3.6-27B-NVFP4` nor `unsloth/Qwen3.6-27B-NVFP4` has any: both quantise every
-  attention and MLP layer. Whatever file the table describes, it is not either of the ones
-  published today, so converting one now refuses instead of building an artifact that claims
-  formats its own weights do not have. The tables stay until a checkpoint proves what should
-  replace them; the check is what makes that visible.
-- **A format the index cannot hold is a format we quietly re-quantise**
-  (2026-09-05). F16 was the last one, and the breach was invisible because the
-  numbers looked fine: `Qwen3.5-0.8B-UD-Q8_K_XL` scored 14.6946 against
-  llama.cpp's 14.7129 while 53 % of its elements were being re-encoded to eight
-  bits. Being *below* the reference was the tell — we were not serving the same
-  model. Reading the file faithfully moved us to 14.7167, which is what agreement
-  looks like. **Check what the artifact stores, not only what it scores:**
-  `formats` and `indexed vs stored` over the objects say in one line what a
-  perplexity number can hide.
-
----
-
 - **The KV cache default is `auto` (2026-09-04): BF16 where every layer is
   attention, e4m3 where linear-attention layers carry the stack.** e4m3 halves
   the cache and costs a 3:1 GDN stack 0-0.4 % of perplexity; it costs a
@@ -319,6 +260,47 @@ plus-one norm's subtraction. Which tensor needs which is family knowledge
   per-channel **15.11** (`mahadev9/Qwen3.5-0.8B-fp8`, torch reference over the
   same weights 15.01), against the BF16 model's 14.60 and llama.cpp's IQ4_XS
   15.15; 2B block 10.12 vs Q4_K_M 10.29, 4B block 8.15 vs 8.24.
+
+- **Q4G64/Q5G64/Q6G64 stay** (measured 2026-09-05). Removing them was never the
+  objective; performance is, and a GGUF is already served in place rather than
+  quantised at runtime — so the only question was whether anything still needs
+  them. It does: at 0.8B/2B they are the **vision tower's storage and nothing
+  else** (the text stack there is W8 throughout), and at 27B they are the text
+  stack of a BF16 safetensors conversion. Nothing else stores the tower at any
+  size. On bytes, which is what decode is bound by, Q4G64 is **0.531 per value
+  against GGML Q4_K's 0.5625 and W8's 1.062** — denser than both. Reopen only if
+  the tower gains a K-quant route and a 27B safetensors conversion measures worse
+  than one through `surogate quantize`.
+- **Dequantise-and-requantise is not free.** Measured on Qwen3.5-0.8B-Q4_K_M:
+  K-quant → BF16 → W8 adds 5.7e-3 relative error and *doubles* the bytes. That is
+  why the native path exists.
+- **A checkpoint's `quantization_config` states more than its format, and the rest is
+  read now (2026-09-05).** `kv_cache_scheme` is honoured where `auto` already resolves to
+  what it asks and refused, naming the flag, where it does not; `sparsity_config` and
+  `transform_config` are refused. And the declaration is cross-checked against the
+  checkpoint's own tensors, because it is a claim rather than a fact: a weight is quantised
+  exactly when a scale sits beside it. Two published NVFP4 exports of the same 27B declare
+  `ignore` lists of 2 and 303 entries while quantising identical tensors, and one of them
+  omits 27 unquantised vision projections it never mentions. **Where the two differ, the
+  tensors win and the disagreement is printed.**
+- **A measurement written down goes stale silently.** The `nvfp4-mixed-bf16` export table
+  names six attention layers left in BF16, measured from a published file. Neither
+  `nvidia/Qwen3.6-27B-NVFP4` nor `unsloth/Qwen3.6-27B-NVFP4` has any: both quantise every
+  attention and MLP layer. Whatever file the table describes, it is not either of the ones
+  published today, so converting one now refuses instead of building an artifact that claims
+  formats its own weights do not have. The tables stay until a checkpoint proves what should
+  replace them; the check is what makes that visible.
+- **A format the index cannot hold is a format we quietly re-quantise**
+  (2026-09-05). F16 was the last one, and the breach was invisible because the
+  numbers looked fine: `Qwen3.5-0.8B-UD-Q8_K_XL` scored 14.6946 against
+  llama.cpp's 14.7129 while 53 % of its elements were being re-encoded to eight
+  bits. Being *below* the reference was the tell — we were not serving the same
+  model. Reading the file faithfully moved us to 14.7167, which is what agreement
+  looks like. **Check what the artifact stores, not only what it scores:**
+  `formats` and `indexed vs stored` over the objects say in one line what a
+  perplexity number can hide.
+
+---
 
 ## Traps
 
