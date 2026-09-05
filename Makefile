@@ -104,11 +104,32 @@ serve-test: serve-test-build
 serve-test-py:
 	$(PYTEST) -q tests/serve tests/test_serve_contract.py
 
+# The rollout contract, driven by the client GRPO actually uses, and the GRPO loop
+# end to end. Both need a checkpoint and a GPU, so they are separate from the suites
+# above and skip without one:
+#
+#   make grpo-test SUROGATE_TEST_MODEL=/path/to/Qwen3-0.6B
+#
+# The end-to-end one takes about a minute and is the gate a change to the rollout
+# path should pass: it is the only test that would catch a refused adapter reload, a
+# reward that is always zero, or a run that finishes and then exits non-zero.
+SUROGATE_TEST_MODEL ?=
+SUROGATE_TEST_GRPO_GPUS ?= 0,1
+# Which card the single-engine contract test serves on; the end-to-end one uses the
+# pair above.
+SUROGATE_TEST_DEVICE ?= 0
+
+grpo-test:
+	SUROGATE_TEST_MODEL="$(SUROGATE_TEST_MODEL)" \
+	SUROGATE_TEST_DEVICE="$(SUROGATE_TEST_DEVICE)" \
+	SUROGATE_TEST_GRPO_GPUS="$(SUROGATE_TEST_GRPO_GPUS)" \
+	$(PYTEST) -q tests/serve/test_grpo_rollout_contract.py tests/grpo/test_grpo_run_smoke.py
+
 # Everything the serving engine has. This is the command a change to `csrc/src/serve` or
 # `surogate/serve` has to pass.
 serve-check: serve-test-py serve-test
 
-.PHONY: serve-configure serve-build serve-test-build serve-test serve-test-py serve-check quantizer
+.PHONY: grpo-test serve-configure serve-build serve-test-build serve-test serve-test-py serve-check quantizer
 
 # Internal helper: build + repair wheel for a given CUDA tag
 # Usage: $(call build_wheel,cu128)
