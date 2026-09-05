@@ -630,20 +630,35 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
                                     "' carries no layer index, so it cannot be bound");
     }
 
-    std::int32_t slot = -1;
+    // Loading a name that is already loaded replaces it, in its own slot.
+    //
+    // This is the operation a training loop performs, once per step: the trainer
+    // writes the adapter it just produced and the sampler is told to load it under
+    // the same name. Refusing the second load as a duplicate -- which is what this
+    // did -- stops the run at its first policy update. The slot is scrubbed before
+    // the new modules land so an adapter that names fewer of them cannot leave the
+    // old one's deltas behind, which means a request in flight sees the base model
+    // for the moment in between rather than a mixture of two adapters.
+    std::int32_t slot     = -1;
+    bool replacing        = false;
     {
         const std::lock_guard<std::mutex> lock(lora_mutex_);
-        if (lora_slot_of_.count(name) != 0) {
-            throw std::invalid_argument("adapter '" + name + "' is already loaded");
+        const auto existing = lora_slot_of_.find(name);
+        if (existing != lora_slot_of_.end()) {
+            slot      = existing->second;
+            replacing = true;
+        } else {
+            if (lora_free_slots_.empty()) {
+                throw std::invalid_argument(
+                    "all " + std::to_string(options_.max_loras) +
+                    " adapter slots are in use -- unload one, or restart with a larger "
+                    "--max-loras");
+            }
+            slot = lora_free_slots_.front();
+            lora_free_slots_.erase(lora_free_slots_.begin());
         }
-        if (lora_free_slots_.empty()) {
-            throw std::invalid_argument(
-                "all " + std::to_string(options_.max_loras) +
-                " adapter slots are in use -- unload one, or restart with a larger --max-loras");
-        }
-        slot = lora_free_slots_.front();
-        lora_free_slots_.erase(lora_free_slots_.begin());
     }
+    if (replacing) { clear_lora_slot_everywhere(slot); }
 
     // The uploads write only this slot's regions, which no request can select yet
     // -- the name becomes routable below, after every module landed. On failure
@@ -673,8 +688,12 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
             }
         }
     } catch (...) {
+        // A half-written adapter is never servable, so the slot is scrubbed and the
+        // name stops resolving -- including a name that resolved a moment ago,
+        // because what it named is gone.
         clear_lora_slot_everywhere(slot);
         const std::lock_guard<std::mutex> lock(lora_mutex_);
+        lora_slot_of_.erase(name);
         lora_free_slots_.push_back(slot);
         throw;
     }
@@ -682,6 +701,12 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
         if (ops::LoraStore* store = stores.peek(device); store != nullptr) {
             store->set_active(true);
         }
+    }
+    if (replacing) {
+        // Cached prefixes were computed under the adapter that just went away.
+        // Reusing them would answer with a mixture of two policies, which in a
+        // training loop is off-policy data that nothing downstream can detect.
+        engine_->shrink_kv();
     }
     const std::lock_guard<std::mutex> lock(lora_mutex_);
     lora_slot_of_[name] = slot;

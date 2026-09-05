@@ -14,6 +14,22 @@ namespace {
 
 using Json = nlohmann::json;
 
+namespace {
+/// Serialize a response body, substituting U+FFFD for any byte sequence that is
+/// not valid UTF-8.
+///
+/// A token is a sequence of bytes, not a character: a Chinese character or an
+/// emoji is spread over several, and generation stops on a token boundary rather
+/// than a character one. So a completion truncated at max_tokens, and every
+/// per-token string in a `logprobs` list, can end mid-character. nlohmann::json
+/// throws on that, which turned a rollout into a 500 and lost the whole request --
+/// 281 of them in one training run. The bytes themselves are not lost: a logprobs
+/// entry carries them separately in `bytes`, which is what that field is for.
+[[nodiscard]] std::string dump_lossy(const Json& payload) {
+    return payload.dump(-1, ' ', false, Json::error_handler_t::replace);
+}
+} // namespace
+
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
     ApiError error;
     error.status  = 400;
@@ -534,7 +550,7 @@ Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index
     return out;
 }
 
-std::string sse_event(const Json& payload) { return "data: " + payload.dump() + "\n\n"; }
+std::string sse_event(const Json& payload) { return "data: " + dump_lossy(payload) + "\n\n"; }
 
 } // namespace
 
@@ -688,11 +704,17 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
         // array is what the schema says when none were requested.
         Json entries = Json::array();
         for (std::size_t i = 0; i < detail.logprobs.size(); ++i) {
-            entries.push_back(Json{
-                {"token", i < detail.texts.size() ? detail.texts[i] : std::string{}},
-                {"logprob", detail.logprobs[i]},
-                {"bytes", nullptr},
-                {"top_logprobs", Json::array()}});
+            const std::string& text = i < detail.texts.size() ? detail.texts[i] : std::string{};
+            // `bytes` carries the token exactly as the model emitted it. `token` is
+            // the same bytes as a string and may not be valid UTF-8 on its own -- a
+            // character wider than one byte is split across tokens -- so the dump
+            // substitutes U+FFFD there while these stay exact.
+            Json raw = Json::array();
+            for (const unsigned char byte : text) { raw.push_back(static_cast<int>(byte)); }
+            entries.push_back(Json{{"token", text},
+                                   {"logprob", detail.logprobs[i]},
+                                   {"bytes", std::move(raw)},
+                                   {"top_logprobs", Json::array()}});
         }
         choice["logprobs"] = Json{{"content", std::move(entries)}};
     }
@@ -709,7 +731,7 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
     // The prompt's ids sit at the top level, where vLLM puts them, because they
     // belong to the request rather than to any one choice.
     if (detail.include_token_ids) { payload["prompt_token_ids"] = detail.prompt_token_ids; }
-    return payload.dump();
+    return dump_lossy(payload);
 }
 
 std::string make_chat_completion_tool_response(const std::string& id, const std::string& model,
@@ -732,7 +754,7 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
-    return payload.dump();
+    return dump_lossy(payload);
 }
 
 std::string make_chat_chunk_role(const std::string& id, const std::string& model,
@@ -818,13 +840,13 @@ std::string make_models_list(const std::string& model_id, std::int64_t created,
                             {"parent", model_id}});
     }
     const Json payload = {{"object", "list"}, {"data", std::move(data)}};
-    return payload.dump();
+    return dump_lossy(payload);
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created) {
     const Json payload = {
         {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "sinfer"}};
-    return payload.dump();
+    return dump_lossy(payload);
 }
 
 std::string make_error_body(const ApiError& error) {
@@ -881,7 +903,7 @@ std::string make_completion_response(const std::string& id, const std::string& m
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
-    return payload.dump();
+    return dump_lossy(payload);
 }
 
 std::string make_completion_chunk_text(const std::string& id, const std::string& model,

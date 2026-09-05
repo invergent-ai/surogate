@@ -15,6 +15,14 @@ def setup_vllm_env(config: GRPOInferenceConfig):
 
 
 def grpo_infer(config: GRPOInferenceConfig):
+    if config.backend == "surogate":
+        # Our own engine: a separate process that speaks the same HTTP surface, so
+        # nothing above this line changes. It replaces this process (see the module).
+        from surogate.grpo.inference.surogate_engine import server as surogate_server
+
+        surogate_server(config)
+        return
+
     setup_vllm_env(config)
 
     # We import here to be able to set environment variables before importing vLLM

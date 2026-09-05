@@ -89,11 +89,16 @@ quantizer:
 	cmake --install $(QUANTIZER_BUILD_DIR) --prefix . --component quantizer
 	@echo "==> surogate/serve/_llama_cpp/bin/llama-quantize"
 
-# The engine's own suite: 107 tests, ~3 minutes on one GPU. A test whose fixture is absent
-# exits 77 and ctest reports it skipped, so a machine without the real weights still gets a
-# meaningful pass.
+# The engine's own suite. A test whose fixture is absent exits 77 and ctest reports it
+# skipped, so a machine without the real weights still gets a meaningful pass.
+#
+# Run in parallel on one card. Most of these are op tests that allocate little and spend
+# their time on the host, so serialising them left the GPU idle and the suite took minutes.
+# Lower CTEST_PARALLEL if a card is small or busy; 1 restores the old serial behaviour.
+CTEST_PARALLEL ?= 8
+
 serve-test: serve-test-build
-	cd $(SERVE_BUILD_DIR) && ctest --output-on-failure $(CTEST_FLAGS)
+	cd $(SERVE_BUILD_DIR) && ctest --output-on-failure -j $(CTEST_PARALLEL) $(CTEST_FLAGS)
 
 # The Python half: converters, artifact container, declaration contract. No GPU, seconds.
 serve-test-py:

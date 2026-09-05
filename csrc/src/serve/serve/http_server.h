@@ -38,6 +38,10 @@ public:
     /// Overcommit mode: the scheduler wakes and evicts models per request.
     void attach_scheduler(class ModelScheduler& scheduler);
     bool listen();
+    /// Stop serving. In-flight generations are cancelled rather than waited on:
+    /// a request may have a thousand tokens left to produce, and the supervisor
+    /// that sent the signal escalates to SIGKILL long before that finishes --
+    /// which is a process killed mid-flight rather than one that shut down.
     void stop();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
@@ -100,6 +104,8 @@ private:
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
+    /// Set by stop(); every in-flight request's cancellation predicate reads it.
+    std::atomic<bool> stopping_{false};
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;

@@ -766,7 +766,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     PreparedRequest prepared;
     try {
         prepared = svc().prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [this, &req] {
+                return stopping_.load(std::memory_order_relaxed) ||
+                       (req.is_connection_alive && !req.is_connection_alive());
+            });
     } catch (const ApiException& e) {
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
                                                                 request, e.error()));
@@ -793,8 +796,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = svc().run(prepared, nullptr, [&req] {
-                return req.is_connection_alive && !req.is_connection_alive();
+            const GenerationOutcome outcome = svc().run(prepared, nullptr, [this, &req] {
+                return stopping_.load(std::memory_order_relaxed) ||
+                       (req.is_connection_alive && !req.is_connection_alive());
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
@@ -970,7 +974,10 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
     PreparedRequest prepared;
     try {
         prepared = svc().prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [this, &req] {
+                return stopping_.load(std::memory_order_relaxed) ||
+                       (req.is_connection_alive && !req.is_connection_alive());
+            });
     } catch (const ApiException& e) {
         log_request_rejected(
             make_request_rejection_log_context(req_id, "openai_completions", request, e.error()));
@@ -997,8 +1004,9 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = svc().run(prepared, nullptr, [&req] {
-                return req.is_connection_alive && !req.is_connection_alive();
+            const GenerationOutcome outcome = svc().run(prepared, nullptr, [this, &req] {
+                return stopping_.load(std::memory_order_relaxed) ||
+                       (req.is_connection_alive && !req.is_connection_alive());
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
@@ -1101,7 +1109,10 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         limits.default_max_tokens       = options_.default_max_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
         const int input_tokens          = svc().count_prompt_tokens(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [this, &req] {
+                return stopping_.load(std::memory_order_relaxed) ||
+                       (req.is_connection_alive && !req.is_connection_alive());
+            });
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
@@ -1155,7 +1166,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     PreparedRequest prepared;
     try {
         prepared = svc().prepare(
-            request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
+            request, [this, &req] {
+                return stopping_.load(std::memory_order_relaxed) ||
+                       (req.is_connection_alive && !req.is_connection_alive());
+            });
     } catch (const ApiException& e) {
         log_request_rejected(
             make_request_rejection_log_context(req_id, "anthropic_messages", request, e.error()));
@@ -1182,8 +1196,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = svc().run(prepared, nullptr, [&req] {
-                return req.is_connection_alive && !req.is_connection_alive();
+            const GenerationOutcome outcome = svc().run(prepared, nullptr, [this, &req] {
+                return stopping_.load(std::memory_order_relaxed) ||
+                       (req.is_connection_alive && !req.is_connection_alive());
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
@@ -1423,6 +1438,12 @@ bool HttpServer::listen() {
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop() {
+    // Order matters: raise the flag before closing the listener, so a generation
+    // already running sees it on its next token rather than after cpp-httplib has
+    // begun waiting for that handler to return.
+    stopping_.store(true, std::memory_order_relaxed);
+    server_.stop();
+}
 
 } // namespace sinfer::serve
