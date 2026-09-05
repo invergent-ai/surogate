@@ -209,9 +209,10 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
             "surogate serve: this GGUF is not yet supported by the native engine.\n"
             f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
             f"layers={s['num_hidden_layers']} quants={s['quant_types']}\n"
-            "  Registered today: Qwen3.5-0.8B/2B/4B, Qwen3.6-27B, Qwen3.8-27B, Qwen3.6-35B-A3B,\n"
-            "  Qwen3.8-Flash-Next, Qwen3 (any size), TinyLlama-1.1B. Each is one compiled geometry;\n"
-            "  a different size of the same family needs its own target."
+            "  Registered today: Qwen3.5/3.6/3.8 (dense and MoE), Qwen3.8-Flash-Next,\n"
+            "  Qwen3 (any size), Gemma 3, Llama/TinyLlama and LFM2. A target reads its\n"
+            "  dimensions from the artifact, so what has to match is the architecture rather\n"
+            "  than the size -- a family with no target here has none yet."
         )
 
     out = cache_dir() / f"{target_key}-gguf-{fp}.sinfer"

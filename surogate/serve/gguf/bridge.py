@@ -607,7 +607,13 @@ def gguf_target_key(gguf_path: Path, reader=None):
     # Qwen3.5, 3.6 and 3.8 are one interleaved gated-delta architecture at different sizes, so
     # they are one target and one converter; the artifact declares the dimensions it binds
     # against, and the architecture string tells 3.8 apart where the dimensions cannot.
-    if arch in ("qwen35moe", "qwen3moe", "qwen3_6_moe", "qwen3_5_moe") and hidden > 0:
+    # `qwen3moe` is deliberately not in this list. It is llama.cpp's name for Qwen3-30B-A3B --
+    # plain attention with a routed mixture and no always-on expert -- and it was accepted here
+    # as a defensive spelling of the interleaved gated-delta family, which would have bound a
+    # 48-layer dense-attention checkpoint against a target that expects a linear mixer at three
+    # layers in four. Nothing spells the 3.5 family that way; the collision was the whole of the
+    # reason it was listed.
+    if arch in ("qwen35moe", "qwen3_6_moe", "qwen3_5_moe") and hidden > 0:
         return "qwen3_5_moe"
     if arch in ("qwen35", "qwen3_5", "qwen3_6", "qwen38", "qwen3_8") and hidden > 0 and layers > 0:
         return "qwen3_5"
