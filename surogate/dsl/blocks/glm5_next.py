@@ -197,7 +197,10 @@ _HC_SERVE_OBJECTS: tuple[ServeObject, ...] = tuple(
     obj
     for site in ("attn", "ffn")
     for obj in (
-        ServeObject(f"hc/{site}_mix", "quantised", ("HcMix", "HcWidth"), (f"hc_{site}_fn",)),
+        # BF16, not quantised: these 24 rows produce every mixing weight the residual is
+        # recombined with, at both sites of all 45 layers, and a coarse width there is paid on
+        # the whole stream rather than on one projection's output. It is 71 MB.
+        ServeObject(f"hc/{site}_mix", "bf16", ("HcMix", "HcWidth"), (f"hc_{site}_fn",)),
         ServeObject(f"hc/{site}_base", "fp32", ("HcMix",), (f"hc_{site}_base",)),
         ServeObject(f"hc/{site}_scale", "fp32", (3,), (f"hc_{site}_scale",)),
     )
@@ -236,7 +239,15 @@ _MLA_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("mla/query_b", "quantised", ("QDim", "QRank"), ("mla_q_b_weight",)),
     ServeObject("mla/kv_a", "quantised", ("KVRank", "C"), ("mla_kv_a_weight",)),
     ServeObject("mla/kv_a_norm", "bf16", ("KVRank",), ("mla_kv_a_norm_weight",)),
-    ServeObject("mla/kv_b", "quantised", ("KVBDim", "KVRank"), ("mla_kv_b_weight",)),
+    # The latent expansion, held as its two halves. They are one parameter in training and one
+    # tensor in HuggingFace, and a serving artifact splits them because a checkpoint may store
+    # them differently from each other: llama.cpp keeps the key half in the orientation it
+    # applies to the *query* (the absorbed form), so it cannot be read where it lies, while the
+    # value half is already the projection. Splitting is what lets the value half stay in the
+    # file; the key half is BF16 because materialising it into a quantised object would mean
+    # re-quantising weights the file had already quantised.
+    ServeObject("mla/k_b", "bf16", ("KDim", "KVRank"), ("mla_kv_b_weight",)),
+    ServeObject("mla/v_b", "quantised", ("VDim", "KVRank"), ("mla_kv_b_weight",)),
     ServeObject("mla/output", "quantised", ("C", "VDim"), ("mla_out_weight",)),
 )
 

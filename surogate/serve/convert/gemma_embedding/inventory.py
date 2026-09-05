@@ -24,7 +24,7 @@ from surogate.serve.convert.common.inventory import (
 )
 
 if TYPE_CHECKING:  # a converter's GGUF reader, needed only for the annotation
-    from surogate.serve.convert.qwen4exp.convert import GgufSource
+    from surogate.serve.convert.common.gguf_source import GgufSource
 
 
 MODEL_ID = "embeddinggemma-300m"

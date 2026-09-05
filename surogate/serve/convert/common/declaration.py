@@ -174,6 +174,11 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "VDim": config["num_query_heads"] * config.get("v_head_dim", 0),
         "KVBDim": config["num_query_heads"] * (config.get("qk_nope_head_dim", 0)
                                                + config.get("v_head_dim", 0)),
+        # The two halves of that expansion on their own. A serving artifact holds them apart
+        # because a checkpoint may store one of them transposed: llama.cpp keeps the key half
+        # in the orientation it applies to the *query*, so only the value half can be read
+        # where it lies.
+        "KDim": config["num_query_heads"] * config.get("qk_nope_head_dim", 0),
         "Hv": heads_v,
         "TwoHv": 2 * heads_v,
         "Vd": dim_v,

@@ -1,270 +1,178 @@
-"""Build a GLM-5.3-Flash serving artifact.
+"""Convert the GLM-5.3-Flash GGUF (`glm5next`) into a `.sinfer` artifact.
 
-Safetensors in, artifact out -- and, where a GGUF is the source, most of the weights are not
-copied at all: `--gguf-repack` names the file, and every object whose rows the file already
-holds in a K-quant the engine reads is served from it in place. The bridged checkpoint is then
-only needed for what is left, which for a Q4_K_M is the norms, the router and the endpoints.
+GGUF-native, and read in place. gguf-py carries no `glm5next` name map, so there is no bridge
+to route through; the six shards are the only weight source and `recipe.py` says where every
+object's rows come from. The shared planners in `common/gguf_repack.py` turn those row programs
+into *runs* -- stretches of a shard the engine maps and reads directly -- so 288 experts a
+layer stay in the file and the artifact carries an index to them.
 
-What is worth saying about the shape is said in `inventory.py`, which derives it from the
-declaration rather than restating it. This module is the driver: read the config, plan what the
-GGUF can serve as it stores it, check the checkpoint has the rest, then write each object in
-plan order.
+The mixture is 185 of the checkpoint's 200 GB and keeps the formats llama.cpp chose for it;
+every Q8_0 projection is a run too, because Q8_0 and W8G32_F16S hold the same numbers and the
+loader rearranges the blocks into row-split planes on the device. What the artifact stores is
+what the row algebra cannot say: the norms, the hyper-connection projections, the router, the
+convolution taps and the latent attention's expansion -- about 2 GB.
+
+The frontend (tokenizer, chat template, generation config) comes from the model's own Hub
+repository: a GGUF holds a token table, and the engine's frontend reads a `tokenizer.json`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
-from collections.abc import Mapping, Sequence
 from pathlib import Path
-
-import torch
+from typing import Sequence
 
 from surogate.serve.artifact.container import ArtifactIdentity, ArtifactWriter
 from surogate.serve.convert.common import conversion as family_conversion
-from surogate.serve.convert.common.gguf_repack import GgufRepackSource, RepackError, half_names
-from surogate.serve.convert.common.quantize import pick_device
-from surogate.serve.convert.common.recipe import expression_sources, materialize_recipe
-
-from . import inventory, recipe
-
-RECIPE_ID = "glm5-next-v1"
-
-#: What the config must state for the artifact to be shaped at all.
-_REQUIRED_CONFIG = (
-    "hidden_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "vocab_size",
-    "num_experts",
-    "num_experts_per_tok",
-    "moe_intermediate_size",
+from surogate.serve.convert.common.gguf_repack import GgufRepackSource
+from surogate.serve.convert.common.gguf_source import (
+    GgufRecipeReader,
+    GgufSource,
+    candidate_sources,
+    check_every_quantised_object_is_planned,
+    encode_tensor,
 )
 
+from . import inventory as inv
+from . import recipe as rcp
 
-def validate_config(config: Mapping[str, object]) -> inventory.Geometry:
-    absent = [name for name in _REQUIRED_CONFIG if config.get(name) is None]
-    if absent:
-        raise ValueError(
-            "this checkpoint's config.json does not state "
-            + ", ".join(absent)
-            + "; a GLM-5.3-Flash artifact cannot be shaped without them"
-        )
-    return inventory.geometry_from_config(config)
+RECIPE_ID = rcp.RECIPE_ID
 
 
-def _plan_repack(repack, recipes_by_name, tensor_specs, native) -> tuple[str, ...]:
-    """Objects a bit-exact plane repack covers, and a check that the map is not over-broad.
+def _refuse_what_is_not_bound(source: GgufSource, geometry: inv.Geometry) -> None:
+    """What the file carries that this artifact does not, said out loud.
 
-    Every recipe left on the materialize path must find its sources in the bridged checkpoint,
-    so a mapped source that an un-planned recipe still consumes is a hard error rather than a
-    tensor read from two places.
+    Both are real parts of the published model, and serving without either changes what the
+    engine computes -- for the indexer only past a bound, which the artifact records so the
+    engine can refuse rather than quietly attend to more than the model was trained to.
     """
-    if repack is None:
-        return ()
-    planned = repack.plan(recipes_by_name, tensor_specs)
-    covered = set(planned) | set(native or ())
-    stray = {
-        source.name
-        for name, tensor_recipe in recipes_by_name.items()
-        if name not in covered
-        for source in expression_sources(tensor_recipe.expression)
-        if source.name in repack.sources
-    }
-    if stray:
-        raise RepackError(
-            "repack map names sources still needed by materialized recipes: "
-            + ", ".join(sorted(stray))
+    if any(name.startswith(("v.", "mm.")) or "vision" in name for name in source.tensors):
+        raise NotImplementedError(
+            "this GGUF carries a vision tower; the glm5_next recipes cover the text stack only"
         )
-    return planned
+    head = f"blk.{geometry.layers}.nextn.eh_proj.weight"
+    if head in source.tensors:
+        print("note: the NextN draft head is present and is not bound; the trunk answers "
+              "without it, at the cost of speculative decoding", flush=True)
+    if any(".indexer." in name for name in source.tensors):
+        print(f"note: the sparse indexer is present and is not bound. It selects "
+              f"{geometry.index_topk} tokens, so up to that context every visible token is "
+              f"selected and full attention is exactly what it would have asked for; the "
+              f"artifact records the bound and the engine refuses beyond it", flush=True)
 
 
-def convert(
-    model_dir: str | Path,
-    out_path: str | Path,
-    *,
-    device: str | torch.device = "cuda",
-    gguf_repack: str | Path | None = None,
-) -> Path:
-    """Run the conversion and return the path of its report."""
+def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
+            *, device: str = "cuda") -> Path:
+    """Write the artifact. `device` is accepted so the ingest path can call every converter the
+    same way; nothing here needs a GPU, because nothing here quantises."""
     started = time.perf_counter()
-    model = Path(model_dir)
+    del device
+    source = GgufSource(Path(gguf))
     output = Path(out_path)
-    requested_device = str(device)
-    resolved_device = pick_device(device)
-    repack = GgufRepackSource(gguf_repack) if gguf_repack else None
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    config = family_conversion.load_json(model / "config.json")
-    geometry = validate_config(config)
-    scope = family_conversion.honour_declared_scope(
-        config, geometry, model, what=family_conversion.checkpoint_label(model)
+    geometry = inv.geometry_from_gguf(source.kv)
+    _refuse_what_is_not_bound(source, geometry)
+    tensor_specs = inv.build_tensor_specs(geometry)
+    object_specs: tuple = inv.RESOURCE_SPECS + tensor_specs
+    recipes = rcp.build_recipes(geometry)
+
+    repack = GgufRepackSource.from_sources(source.shards, candidate_sources(source))
+    # Two ways to read a weight where it lies. A K-quant the kernels already decode is served
+    # in the file's own format; a Q8_0 whose op wants the row-split W8 planes is read just the
+    # same and rearranged on the device, which is why the exclude list and the in-place list
+    # are one list.
+    native = repack.plan_native(recipes, tensor_specs,
+                                exclude_suffixes=rcp.NATIVE_EXCLUDE_SUFFIXES)
+    in_place = repack.plan_repack_in_place(recipes, tensor_specs, rcp.NATIVE_EXCLUDE_SUFFIXES)
+    check_every_quantised_object_is_planned(tensor_specs, set(native) | set(in_place), inv.W8)
+
+    native_specs = {spec.name: spec
+                    for spec in GgufRepackSource.native_specs(tensor_specs, native)}
+    native_runs = {name: repack.runs_for_native(native_specs[name], recipes[name], None)
+                   for name in native}
+    object_specs = GgufRepackSource.in_place_specs(object_specs, in_place)
+    object_specs = GgufRepackSource.native_specs(object_specs, native, native_runs)
+    external = tuple((str(path.resolve()), path.stat().st_size) for path in source.shards)
+
+    read_in_place = sum(
+        sum(run[2] for run in getattr(spec, "runs", ())) for spec in object_specs
     )
-    if scope:
-        print(scope, flush=True)
+    run_count = sum(len(getattr(spec, "runs", ())) for spec in object_specs)
+    print(f"read in place: {len(native_runs) + len(in_place)} objects, {run_count} runs, "
+          f"{read_in_place / 1e9:.1f} GB never copied", flush=True)
 
-    objects = inventory.declared_objects(config)
-    tensor_specs = inventory.tensor_specs(objects)
-    object_specs = tensor_specs
-    recipes = recipe.build_recipes_by_name(config)
+    frontend = family_conversion.load_resources(frontend_dir, inv.RESOURCE_SPECS)
+    resources = {item.name: item.data for item in frontend}
+    plan = family_conversion.build_object_plan(object_specs, resources)
+    reader = GgufRecipeReader(source)
 
-    # What the GGUF can serve as it stores it. `native` is a whole object read verbatim,
-    # `halves` a fused parent whose two halves carry different K-quant types, `planned` the
-    # objects a bit-exact plane repack covers. Everything else is materialised.
-    native = repack.plan_native(recipes, tensor_specs) if repack is not None else {}
-    halves = repack.plan_native_halves(recipes, tensor_specs) if repack is not None else {}
-    planned = _plan_repack(repack, recipes, tensor_specs, set(native) | set(halves))
-    repacked_names = frozenset(planned)
-    if halves:
-        tensor_specs = GgufRepackSource.native_half_specs(tensor_specs, halves)
-        object_specs = GgufRepackSource.native_half_specs(object_specs, halves)
-        print(f"native K-quant halves: {len(halves)} fused parents stored as typed pairs",
-              flush=True)
-    external: tuple = ()
-    native_runs: dict = {}
-    if native and repack is not None and os.environ.get("SUROGATE_GGUF_COPY", "0") == "0":
-        native_runs = {
-            spec.name: repack.runs_for_native(spec, recipes[spec.name], None)
-            for spec in GgufRepackSource.native_specs(tensor_specs, native)
-            if spec.name in native
-        }
-        external = ((str(Path(repack.gguf_path).resolve()),
-                     Path(repack.gguf_path).stat().st_size),)
-        not_copied = sum(sum(r[2] for r in runs) for runs in native_runs.values())
-        print(f"native K-quants: {len(native_runs)} objects read from the GGUF in place "
-              f"({not_copied / 1e9:.2f} GB not copied)", flush=True)
-    if native:
-        tensor_specs = GgufRepackSource.native_specs(tensor_specs, native, native_runs)
-        object_specs = GgufRepackSource.native_specs(object_specs, native, native_runs)
-
-    resources = family_conversion.load_resources(model, inventory.RESOURCE_SPECS)
-    resource_payloads = {item.name: item.data for item in resources}
-    plan = family_conversion.build_object_plan(
-        tuple(object_specs) + tuple(inventory.RESOURCE_SPECS), resource_payloads
-    )
-
-    # Repacked objects read the GGUF directly; only what remains needs a bridged source.
-    remaining = tuple(r for name, r in recipes.items()
-                      if name not in repacked_names and name not in native and name not in halves)
-
-    # object name -> (fused parent recipe, the rows of that parent it holds)
-    half_lookup: dict[str, tuple[str, slice]] = {}
-    for parent, runs in halves.items():
-        first = 0
-        for name, (_, rows) in zip(half_names(parent), runs):
-            half_lookup[name] = (parent, slice(first, first + rows))
-            first += rows
-
-    with recipe.open_reader(model) as reader:
-        source = recipe.preflight_sources(reader, remaining)
-        print(
-            f"preflight complete: {len(plan.objects)} objects, "
-            f"{source.source_tensor_count} source tensors, device={resolved_device}",
-            flush=True,
-        )
-
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with ArtifactWriter(
-            output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
-            plan.specs,
-            geometry=_geometry_block(geometry),
-            external=external,
-        ) as writer:
-            total = len(plan.specs)
-            for index, spec in enumerate(plan.specs, start=1):
-                note = ""
-                if spec.name in resource_payloads:
-                    payload = resource_payloads[spec.name]
-                elif repack is not None and spec.name in half_lookup:
-                    parent, row_slice = half_lookup[spec.name]
-                    payload = repack.payload_for_native(spec, recipes[parent], None,
-                                                        row_slice=row_slice)
-                    note = " (repacked)"
-                elif repack is not None and spec.name in native_runs:
-                    # Read from the GGUF where it lies: the index names the runs and the
-                    # artifact carries no bytes for it, so there is nothing to write.
-                    print(f"[{index}/{total}] {spec.name} (in place)", flush=True)
+    specs = list(object_specs)
+    total = len(specs)
+    print(f"converting {total} objects from {len(source.shards)} shards", flush=True)
+    with ArtifactWriter(
+        output,
+        ArtifactIdentity(inv.MODEL_ID, inv.WEIGHTS_ID),
+        plan.specs,
+        external=external,
+    ) as writer:
+        for index, spec in enumerate(specs, start=1):
+            t0 = time.perf_counter()
+            if getattr(spec, "runs", ()):
+                continue  # served from the GGUF; the artifact carries no bytes for it
+            if isinstance(spec, inv.ResourceSpec):
+                # A text-only release ships no image or video processor config. `load_resources`
+                # leaves them out and the plan drops them; the artifact then carries no such
+                # object and the engine reads that as "never asked for a pixel".
+                if spec.name not in resources:
                     continue
-                elif repack is not None and spec.name in native:
-                    payload = repack.payload_for_native(spec, recipes[spec.name], None)
-                    note = " (repacked)"
-                elif repack is not None and spec.name in repacked_names:
-                    payload = repack.payload_for(spec, recipes[spec.name], None)
-                    note = " (repacked)"
-                else:
-                    tensor = materialize_recipe(recipes[spec.name], reader)
-                    payload = family_conversion.encode_tensor_payload(
-                        tensor, spec, resolved_device
-                    )
-                    del tensor
-                writer.write(spec.name, payload)
-                del payload
-                print(f"[{index}/{total}] {spec.name}{note}", flush=True)
+                payload: bytes = resources[spec.name]
+            else:
+                tensor = rcp.materialize_recipe(recipes[spec.name], reader)
+                payload = encode_tensor(tensor, spec)
+                del tensor
+            writer.write(spec.name, payload)
+            del payload
+            if index % 100 == 0 or index == total:
+                print(f"[{index}/{total}] {spec.name} ({time.perf_counter() - t0:.1f}s)",
+                      flush=True)
 
-    elapsed = time.perf_counter() - started
-    final_bytes = output.stat().st_size
-    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
-    report = family_conversion.build_conversion_report(
-        identity=identity,
-        target_key=inventory.TARGET_KEY,
-        recipe_id=RECIPE_ID,
-        repo_root=Path(__file__).resolve().parents[4],
-        ranking_path=model,
-        model_dir=model,
-        out_path=output,
-        arguments={"model": str(model_dir), "out": str(out_path), "device": requested_device,
-                   "gguf_repack": str(gguf_repack) if gguf_repack else None},
-        config_summary={
-            "architecture": inventory.ARCHITECTURE,
-            "hidden": geometry.hidden,
-            "layers": geometry.layers,
-            "intermediate": geometry.intermediate,
-            "experts": geometry.experts,
-            "experts_per_token": geometry.experts_per_token,
-        },
-        source_preflight=source,
-        objects=plan.objects,
-        elapsed_seconds=elapsed,
-        final_bytes=final_bytes,
-        device=resolved_device,
-    )
-    report_path = Path(str(output) + ".conversion.json")
-    with report_path.open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    print(f"complete: {final_bytes} bytes in {elapsed:.1f}s; report={report_path}", flush=True)
-    return report_path
-
-
-def _geometry_block(geometry: inventory.Geometry) -> dict[str, float]:
-    """The dimensions the artifact states about itself, which the engine's binder validates its
-    compiled constants against."""
-    return {
-        "hidden": float(geometry.hidden),
-        "layers": float(geometry.layers),
-        "query_heads": float(geometry.query_heads),
-        "kv_heads": float(geometry.kv_heads),
-        "head_dim": float(geometry.head_dim),
-        "intermediate": float(geometry.intermediate),
-        "vocab": float(geometry.vocab),
-        "experts": float(geometry.experts),
-        "experts_per_token": float(geometry.experts_per_token),
+    report = {
+        "recipe_id": RECIPE_ID,
+        "model_id": inv.MODEL_ID,
+        "weights_id": inv.WEIGHTS_ID,
+        "gguf": [str(path) for path in source.shards],
+        "frontend": str(frontend_dir),
+        "elapsed_seconds": time.perf_counter() - started,
+        "bytes": output.stat().st_size,
+        "read_in_place_bytes": int(read_in_place),
+        "runs": int(run_count),
+        "objects_read_in_place": len(native_runs) + len(in_place),
+        "objects_materialized": total - len(native_runs) - len(in_place),
+        "index_topk": geometry.index_topk,
     }
+    Path(str(output) + ".conversion.json").write_text(json.dumps(report, indent=2))
+    source.close()
+    print(f"conversion finished in {report['elapsed_seconds']:.0f} s -> {output} "
+          f"({report['bytes'] / 1e9:.2f} GB written, {read_in_place / 1e9:.1f} GB read in place)",
+          flush=True)
+    return output
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--gguf-repack", type=Path, default=None,
-                        help="serve this GGUF's K-quants in place instead of copying them")
+    parser.add_argument("--gguf", required=True, help="first shard of the split GGUF")
+    parser.add_argument("--frontend", required=True,
+                        help="directory with tokenizer/chat template/configs")
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--device", default="cuda",
+                        help="accepted for a uniform call across the converters; unused")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack)
+    convert(args.gguf, args.frontend, args.out, device=args.device)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

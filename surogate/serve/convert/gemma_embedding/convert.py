@@ -43,7 +43,7 @@ from surogate.serve.artifact.container import (
 from surogate.serve.artifact.layouts import encode_direct, encode_row_split
 from surogate.serve.artifact.numeric import get_format
 from surogate.serve.convert.common.gguf_repack import REPACKABLE_TYPES
-from surogate.serve.convert.qwen4exp.convert import GgufSource
+from surogate.serve.convert.common.gguf_source import GgufSource
 
 from . import inventory, recipe
 from .inventory import BF16, MODEL_ID, W8, WEIGHTS_ID
