@@ -1,3 +1,4 @@
+#include "core/device.h"
 #include "serve/generation_service.h"
 
 #include "product/media_acquire/acquire.h"
@@ -309,7 +310,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     // by the base model on those targets -- served confidently, and wrong. The
     // directory is registered during load, so an empty one here means nothing can
     // bind, at startup or from the runtime endpoints.
-    if (lora_requested && !engine_->lora_store().has_bindings()) {
+    if (lora_requested && !any_lora_bindings()) {
         throw std::invalid_argument(
             "--enable-lora: this target does not apply adapters, so one would be loaded and "
             "silently ignored. Merge it into the checkpoint before conversion (`surogate merge`) "
@@ -523,12 +524,36 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     return outcome;
 }
 
+bool GenerationService::any_lora_bindings() const {
+    ops::LoraStoreSet& stores = engine_->lora_stores();
+    for (int device : stores.devices()) {
+        const ops::LoraStore* store = stores.peek(device);
+        if (store != nullptr && store->has_bindings()) { return true; }
+    }
+    return false;
+}
+
+void GenerationService::clear_lora_slot_everywhere(std::int32_t slot) {
+    ops::LoraStoreSet& stores = engine_->lora_stores();
+    for (int device : stores.devices()) {
+        if (ops::LoraStore* store = stores.peek(device); store != nullptr) {
+            store->clear_slot(slot);
+        }
+    }
+}
+
 void GenerationService::load_lora_adapter(const std::string& name, const std::string& path) {
     if (!options_.enable_lora) {
         throw std::invalid_argument("the server was started without --enable-lora");
     }
-    ops::LoraStore& store = engine_->lora_store();
-    if (!store.has_bindings()) {
+    // Every upload below writes this engine's device memory from the caller's
+    // thread, which is an HTTP handler and has bound no device of its own. Without
+    // this the copies and the scrub resolve against whatever device that thread
+    // was on, and an engine on any device but the first dies on the first load.
+    const ScopedDevice on_engine_device(engine_->device());
+    ops::LoraStoreSet& stores      = engine_->lora_stores();
+    const std::vector<int> devices = stores.devices();
+    if (!any_lora_bindings()) {
         throw std::invalid_argument("this target does not apply adapters");
     }
     // The banks live in the engine's sleepable estate now, so uploading into a
@@ -573,18 +598,40 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
     // -- the name becomes routable below, after every module landed. On failure
     // the slot is scrubbed and returned, so a half-written adapter is never
     // servable.
+    // Under a pipeline the adapter's layers are spread over the stages, one store
+    // each, so every module goes to the store that holds its layer. A module no
+    // store claims is the adapter naming a layer this model does not have, which
+    // is worth saying rather than dropping.
     try {
         for (const auto& payload : payloads) {
-            store.set_module_slot(payload.layer, payload.module, slot, payload.a, payload.b,
-                                  payload.rank, payload.in_dim, payload.out_dim, payload.scale);
+            bool applied = false;
+            for (int device : devices) {
+                ops::LoraStore* store = stores.peek(device);
+                if (store == nullptr || !store->covers_layer(payload.layer)) { continue; }
+                store->set_module_slot(payload.layer, payload.module, slot, payload.a, payload.b,
+                                       payload.rank, payload.in_dim, payload.out_dim,
+                                       payload.scale);
+                applied = true;
+            }
+            if (!applied) {
+                throw std::invalid_argument(
+                    "adapter module '" + payload.module + "' names layer " +
+                    std::to_string(payload.layer) +
+                    ", which this model does not have -- the adapter was trained against a "
+                    "different architecture");
+            }
         }
     } catch (...) {
-        store.clear_slot(slot);
+        clear_lora_slot_everywhere(slot);
         const std::lock_guard<std::mutex> lock(lora_mutex_);
         lora_free_slots_.push_back(slot);
         throw;
     }
-    store.set_active(true);
+    for (int device : devices) {
+        if (ops::LoraStore* store = stores.peek(device); store != nullptr) {
+            store->set_active(true);
+        }
+    }
     const std::lock_guard<std::mutex> lock(lora_mutex_);
     lora_slot_of_[name] = slot;
 }
@@ -612,7 +659,7 @@ void GenerationService::unload_lora_adapter(const std::string& name) {
     // nothing from here on -- it degrades to the base model instead of reading
     // another adapter's weights. The slot goes to the back of the free list so it
     // is the last one a later load reuses.
-    engine_->lora_store().clear_slot(slot);
+    clear_lora_slot_everywhere(slot);
     const std::lock_guard<std::mutex> lock(lora_mutex_);
     lora_free_slots_.push_back(slot);
 }

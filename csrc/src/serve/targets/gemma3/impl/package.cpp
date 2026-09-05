@@ -101,6 +101,9 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {
+        // A pipeline hands every stage the whole list; each applies the layers it
+        // holds and leaves the rest to the stage that does.
+        if (!store.covers_layer(payload.layer)) { continue; }
         store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
                               payload.rank, payload.in_dim, payload.out_dim, payload.scale);
     }

@@ -145,6 +145,10 @@ set_tests_properties(sinfer_qwen3_5_prefix_real_test PROPERTIES SKIP_RETURN_CODE
 # SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT on (PATCHES.md #24).
 # surogate: byte-exact host verification of the derived FP8/NVFP4 planes
 # (PATCHES.md #20/#21/#25) incl the cutlass atom SF layout.
+sinfer_add_test(sinfer_lora_store_test
+  SOURCES ops/test_lora_store.cpp
+  LIBRARIES sinfer_ops)
+set_tests_properties(sinfer_lora_store_test PROPERTIES SKIP_RETURN_CODE 77)
 sinfer_add_test(sinfer_w8_quant_planes_test
   SOURCES ops/test_w8_quant_planes.cpp
   LIBRARIES sinfer_ops)

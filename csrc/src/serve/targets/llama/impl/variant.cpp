@@ -6,6 +6,7 @@
 
 #include "core/device.h"
 #include "family/impl/lora_hook.h"
+#include "family/impl/mlp_swiglu.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -58,11 +59,8 @@ std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType gate
                                        std::int32_t last) {
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {g.intermediate, last});
-    {
-        auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
-            gate_up_qtype, 2 * g.intermediate, g.hidden, policy, first, last));
-    }
+    family::swiglu_mlp_layout(layout, g.intermediate, g.hidden, gate_up_qtype,
+                              policy, first, last);
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
@@ -145,7 +143,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
-    ops::linear_swiglu(hidden, weights.gate_up, activation, kTextPolicy, workspace, stream);
+    family::swiglu_mlp(hidden, weights.gate_up, activation, kTextPolicy, workspace, stream);
     ops::linear_add(activation, weights.down, residual, kTextPolicy, workspace, stream);
     // down reads the SwiGLU activation, which is exactly the input its adapter
     // was trained against.

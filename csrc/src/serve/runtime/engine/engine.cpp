@@ -476,7 +476,9 @@ void Engine::prepare_sleep_backup() {
 
 std::size_t Engine::sleepable_bytes() const { return sleep_owned_bytes(&impl_->ops_context); }
 
-ops::LoraStore& Engine::lora_store() { return impl_->ops_context.slot<ops::LoraStore>(); }
+ops::LoraStoreSet& Engine::lora_stores() { return impl_->ops_context.slot<ops::LoraStoreSet>(); }
+
+int Engine::device() const { return impl_->device.device; }
 
 void Engine::shrink_kv() {
     std::visit(

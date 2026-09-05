@@ -1758,6 +1758,7 @@ void ProgramImplCore::prepare_graphs() {
                 round.scratch = ops::lora_store_for_current_device().scratch(columns);
                 if (round.scratch.data == nullptr) { return; }
                 ops::lora_store_for_current_device().write_uniform_slot(-1, stream);
+                round.uniform_cell = ops::lora_store_for_current_device().uniform_cell();
                 ops::lora_set_round(round);
                 held = true;
             }

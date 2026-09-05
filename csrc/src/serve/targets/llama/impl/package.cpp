@@ -4,6 +4,7 @@
 
 #include "api/ops/lora.h"
 #include "api/ops/lora_store.h"
+#include "family/impl/mlp_swiglu.h"
 #include "artifact/reader.h"
 #include "targets/llama/impl/load/bindings.h"
 #include "targets/llama/impl/variant.h"
@@ -70,30 +71,50 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         const void* qkv       = attention.projection.query_key_value.qdata;
         store.register_module(
             index, "q_proj",
-            Binding{qkv, 0, g.hidden, TextConfig::query_heads * TextConfig::head_dim});
+            Binding{qkv, family::kQueryPort, g.hidden, TextConfig::query_heads * TextConfig::head_dim});
         store.register_module(
             index, "k_proj",
-            Binding{qkv, 1, g.hidden, TextConfig::kv_heads * TextConfig::head_dim});
+            Binding{qkv, family::kKeyPort, g.hidden, TextConfig::kv_heads * TextConfig::head_dim});
         store.register_module(
             index, "v_proj",
-            Binding{qkv, 2, g.hidden, TextConfig::kv_heads * TextConfig::head_dim});
+            Binding{qkv, family::kValuePort, g.hidden, TextConfig::kv_heads * TextConfig::head_dim});
         store.register_module(index, "o_proj",
-                              Binding{attention.output.qdata, 3,
+                              Binding{attention.output.qdata, family::kOutputPort,
                                       TextConfig::query_heads * TextConfig::head_dim,
                                       g.hidden});
         store.register_module(
             index, "down_proj",
-            Binding{attention.post_mixer.down.qdata, 4, g.intermediate,
+            Binding{attention.post_mixer.down.qdata, family::kDownPort, g.intermediate,
                     g.hidden});
-    }
-    for (const char* module : {"gate_proj", "up_proj"}) {
-        store.register_refusal(module,
-                               "gate and up are fused and consumed by SwiGLU inside the "
-                               "projection, so there is no intermediate tensor to add a delta to");
+        // Gate and up share one fused parent, so they bind the way q/k/v do: one
+        // pointer, told apart by port. `swiglu_mlp` takes the parent apart on a
+        // round that has either of them bound. A format whose halves cannot be
+        // projected on their own is refused here, once, rather than throwing on
+        // every forward pass.
+        const Weight& gate_up = attention.post_mixer.gate_up;
+        if (family::swiglu_halves_addressable(gate_up)) {
+            store.register_module(
+                index, "gate_proj",
+                Binding{gate_up.qdata, family::kGatePort, g.hidden, g.intermediate});
+            store.register_module(
+                index, "up_proj",
+                Binding{gate_up.qdata, family::kUpPort, g.hidden, g.intermediate});
+        } else {
+            for (const char* module : {"gate_proj", "up_proj"}) {
+                store.register_layer_refusal(
+                    index, module,
+                    "this layer stores gate and up in a format whose halves are not "
+                    "independently addressable, so the fused projection cannot be taken apart "
+                    "to add their deltas");
+            }
+        }
     }
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {
+        // A pipeline hands every stage the whole list; each applies the layers it
+        // holds and leaves the rest to the stage that does.
+        if (!store.covers_layer(payload.layer)) { continue; }
         store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
                               payload.rank, payload.in_dim, payload.out_dim, payload.scale);
     }

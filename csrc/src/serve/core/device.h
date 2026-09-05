@@ -29,6 +29,30 @@ struct DeviceContext {
     void synchronize() const;
 };
 
+/// Binds the calling thread to a CUDA device for a scope, restoring whatever it
+/// was bound to before.
+///
+/// The current device is a property of the thread, and the runtime resolves every
+/// pointer against it. A thread that never bound the engine's device -- an HTTP
+/// handler thread, say -- fails every copy and every set against that engine's
+/// memory, and fails with an error about an invalid argument rather than one
+/// about the device, which is a long way from the cause. Any thread that touches
+/// an engine's memory outside its executor needs one of these.
+class ScopedDevice {
+public:
+    explicit ScopedDevice(int device);
+    ~ScopedDevice();
+
+    ScopedDevice(const ScopedDevice&)            = delete;
+    ScopedDevice& operator=(const ScopedDevice&) = delete;
+    ScopedDevice(ScopedDevice&&)                 = delete;
+    ScopedDevice& operator=(ScopedDevice&&)      = delete;
+
+private:
+    int previous_ = 0;
+    bool restore_ = false;
+};
+
 class CudaEventTimer {
 public:
     explicit CudaEventTimer(const DeviceContext& ctx);

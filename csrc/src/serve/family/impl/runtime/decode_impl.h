@@ -46,7 +46,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         if (lora_round) {
             ops::LoraRound round;
             round.slots   = &lora_slots;
-            round.scratch = ops::lora_store_for_current_device().scratch(batch_size);
+            round.scratch      = ops::lora_store_for_current_device().scratch(batch_size);
+            round.uniform_cell = ops::lora_store_for_current_device().uniform_cell();
             ops::lora_set_round(round);
         }
         Tensor hidden          = ordinary.hidden.slice(1, 0, batch_size);
@@ -103,7 +104,8 @@ auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch
         if (lora_round) {
             ops::LoraRound round;
             round.slots   = &lora_slots;
-            round.scratch = ops::lora_store_for_current_device().scratch(batch_size);
+            round.scratch      = ops::lora_store_for_current_device().scratch(batch_size);
+            round.uniform_cell = ops::lora_store_for_current_device().uniform_cell();
             ops::lora_set_round(round);
         }
         Tensor hidden          = ordinary.hidden.slice(1, 0, batch_size);

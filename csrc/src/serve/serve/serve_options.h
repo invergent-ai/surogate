@@ -120,7 +120,12 @@ struct ServeOptions {
     bool enable_sleep_mode = false;
     std::vector<LoraModule> lora_modules;
     std::uint32_t max_loras     = 1;
-    std::uint32_t max_lora_rank = 16;
+    /// Banks are padded to this, so it is the rank an adapter may have and not the
+    /// rank it must have. 32 rather than 16 because that is what the trainers
+    /// around this engine produce -- a 16 here refused most real adapters with a
+    /// flag the caller had no reason to expect. Raising it costs bank memory in
+    /// proportion, and only for an engine started with --enable-lora.
+    std::uint32_t max_lora_rank = 32;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

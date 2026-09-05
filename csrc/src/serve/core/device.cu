@@ -80,6 +80,19 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
     load_stream = load;
 }
 
+ScopedDevice::ScopedDevice(int device) {
+    int current = 0;
+    CUDA_CHECK(cudaGetDevice(&current));
+    if (current == device) { return; }
+    CUDA_CHECK(cudaSetDevice(device));
+    previous_ = current;
+    restore_  = true;
+}
+
+ScopedDevice::~ScopedDevice() {
+    if (restore_) { log_cuda_error("cudaSetDevice", cudaSetDevice(previous_)); }
+}
+
 DeviceContext::~DeviceContext() {
     if (stream != nullptr || load_stream != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));

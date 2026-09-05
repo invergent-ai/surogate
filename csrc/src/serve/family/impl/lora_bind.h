@@ -11,6 +11,7 @@
 // identically at startup and from the runtime endpoints.
 
 #include "api/ops/lora_store.h"
+#include "family/impl/mlp_swiglu.h"
 #include "api/types.h"
 
 #include <algorithm>
@@ -50,22 +51,24 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < TextConfig::layers; ++layer) {
-        const auto index      = static_cast<std::int32_t>(layer);
-        const void* mlp_down  = nullptr;
+        const auto index          = static_cast<std::int32_t>(layer);
+        const void* mlp_down      = nullptr;
+        const Weight* mlp_gate_up = nullptr;
         if (is_full(layer)) {
             const auto& full = runtime.full_layers.at(full_index++);
             mlp_down         = full.post_mixer.down.qdata;
+            mlp_gate_up      = &full.post_mixer.gate_up;
             const auto* fused = std::get_if<FusedPayload>(&full.projection);
             if (fused != nullptr) {
                 const void* qkv = fused->query_key_gate_value.qdata;
                 store.register_module(index, "q_proj",
-                                      Binding{qkv, 0, TextConfig::hidden,
+                                      Binding{qkv, kQueryPort, TextConfig::hidden,
                                               TextConfig::query_heads * TextConfig::head_dim});
                 store.register_module(index, "k_proj",
-                                      Binding{qkv, 1, TextConfig::hidden,
+                                      Binding{qkv, kKeyPort, TextConfig::hidden,
                                               TextConfig::kv_heads * TextConfig::head_dim});
                 store.register_module(index, "v_proj",
-                                      Binding{qkv, 2, TextConfig::hidden,
+                                      Binding{qkv, kValuePort, TextConfig::hidden,
                                               TextConfig::kv_heads * TextConfig::head_dim});
             } else {
                 store.register_layer_refusal(
@@ -74,11 +77,13 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
                     "path does not bind");
             }
             store.register_module(index, "o_proj",
-                                  Binding{full.output.qdata, 3,
+                                  Binding{full.output.qdata, kOutputPort,
                                           TextConfig::query_heads * TextConfig::head_dim,
                                           TextConfig::hidden});
         } else {
-            mlp_down = runtime.gdn_layers.at(gdn_index++).post_mixer.down.qdata;
+            const auto& linear = runtime.gdn_layers.at(gdn_index++);
+            mlp_down           = linear.post_mixer.down.qdata;
+            mlp_gate_up        = &linear.post_mixer.gate_up;
             for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
                 store.register_layer_refusal(
                     index, module,
@@ -86,17 +91,37 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
                     "adapter naming them here was trained against a different architecture");
             }
         }
-        store.register_module(index, "down_proj",
-                              Binding{mlp_down, 4, TextConfig::intermediate, TextConfig::hidden});
-    }
-    for (const char* module : {"gate_proj", "up_proj"}) {
-        store.register_refusal(module,
-                               "gate and up are fused and consumed by SwiGLU inside the "
-                               "projection, so there is no intermediate tensor to add a delta to");
+        store.register_module(
+            index, "down_proj",
+            Binding{mlp_down, kDownPort, TextConfig::intermediate, TextConfig::hidden});
+        // Gate and up share one fused parent, so they bind the way q/k/v do: one
+        // pointer, told apart by port. `swiglu_mlp` takes the parent apart on a
+        // round that has either of them bound. A format whose halves cannot be
+        // projected on their own is refused here, once, rather than throwing on
+        // every forward pass.
+        if (swiglu_halves_addressable(*mlp_gate_up)) {
+            store.register_module(index, "gate_proj",
+                                  Binding{mlp_gate_up->qdata, kGatePort, TextConfig::hidden,
+                                          TextConfig::intermediate});
+            store.register_module(index, "up_proj",
+                                  Binding{mlp_gate_up->qdata, kUpPort, TextConfig::hidden,
+                                          TextConfig::intermediate});
+        } else {
+            for (const char* module : {"gate_proj", "up_proj"}) {
+                store.register_layer_refusal(
+                    index, module,
+                    "this layer stores gate and up in a format whose halves are not "
+                    "independently addressable, so the fused projection cannot be taken apart "
+                    "to add their deltas");
+            }
+        }
     }
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {
+        // A pipeline hands every stage the whole list; each applies the layers it
+        // holds and leaves the rest to the stage that does.
+        if (!store.covers_layer(payload.layer)) { continue; }
         store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
                               payload.rank, payload.in_dim, payload.out_dim, payload.scale);
     }
@@ -131,16 +156,16 @@ void bind_lora_moe_hybrid(const Runtime& runtime, const EngineOptions& options, 
             const auto& full = runtime.full_layers.at(full_index++);
             const void* qkv  = full.projection.query_key_gate_value.qdata;
             store.register_module(index, "q_proj",
-                                  Binding{qkv, 0, TextConfig::hidden,
+                                  Binding{qkv, kQueryPort, TextConfig::hidden,
                                           TextConfig::query_heads * TextConfig::head_dim});
             store.register_module(index, "k_proj",
-                                  Binding{qkv, 1, TextConfig::hidden,
+                                  Binding{qkv, kKeyPort, TextConfig::hidden,
                                           TextConfig::kv_heads * TextConfig::head_dim});
             store.register_module(index, "v_proj",
-                                  Binding{qkv, 2, TextConfig::hidden,
+                                  Binding{qkv, kValuePort, TextConfig::hidden,
                                           TextConfig::kv_heads * TextConfig::head_dim});
             store.register_module(index, "o_proj",
-                                  Binding{full.output.qdata, 3,
+                                  Binding{full.output.qdata, kOutputPort,
                                           TextConfig::query_heads * TextConfig::head_dim,
                                           TextConfig::hidden});
         } else {
@@ -162,6 +187,9 @@ void bind_lora_moe_hybrid(const Runtime& runtime, const EngineOptions& options, 
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {
+        // A pipeline hands every stage the whole list; each applies the layers it
+        // holds and leaves the rest to the stage that does.
+        if (!store.covers_layer(payload.layer)) { continue; }
         store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
                               payload.rank, payload.in_dim, payload.out_dim, payload.scale);
     }

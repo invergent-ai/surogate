@@ -104,6 +104,12 @@ public:
     /// Loads a PEFT adapter directory into a free slot, addressable by `name`
     /// from the next request on. Throws std::invalid_argument with the reason on
     /// refusal -- bad adapter, name taken, no free slot, module not applicable.
+    /// Whether any of this engine's stores adapts anything. Under a pipeline the
+    /// stores are per stage, so the question is asked of all of them.
+    [[nodiscard]] bool any_lora_bindings() const;
+    /// Scrub one adapter slot on every store, so nothing in flight reads it.
+    void clear_lora_slot_everywhere(std::int32_t slot);
+
     void load_lora_adapter(const std::string& name, const std::string& path);
     /// Unloads by name. The slot is zeroed, so a request already in flight that
     /// selected it degrades to the base model rather than reading freed weights;

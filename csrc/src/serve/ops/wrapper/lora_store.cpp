@@ -43,17 +43,29 @@ void* upload_zeroed(std::size_t elements) {
 
 } // namespace
 
+int LoraStore::current_device() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    return device;
+}
+
 LoraStore::~LoraStore() {
+    // A destructor cannot throw, so the device is bound bare here rather than
+    // through ScopedDevice. Freeing an allocation while another device is current
+    // is what would leak it.
+    int previous             = 0;
+    const bool have_previous = cudaGetDevice(&previous) == cudaSuccess;
+    if (device_ >= 0) { (void)cudaSetDevice(device_); }
     for (auto& [key, bank] : banks_) {
-        if (bank.raw) {
-            cudaFree(bank.a);
-            cudaFree(bank.b);
-        }
+        if (!bank.raw) { continue; }
+        cudaFree(bank.a);
+        cudaFree(bank.b);
     }
     if (raw_round_state_) {
         cudaFree(scratch_);
         cudaFree(uniform_cell_);
     }
+    if (have_previous) { (void)cudaSetDevice(previous); }
 }
 
 void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_t max_tokens) {
@@ -74,6 +86,7 @@ void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_
 
 void LoraStore::ensure_raw_round_state() {
     if (scratch_ != nullptr) { return; }
+    if (device_ < 0) { device_ = current_device(); }
     // Wide enough for a split site's low vectors: up to three pairs share one
     // launch, each padded to max_rank.
     scratch_ = upload_zeroed(static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank_ *
@@ -110,9 +123,9 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
     const Key key{base_key, port};
     auto found = banks_.find(key);
     if (found == banks_.end()) {
-        if (frozen_) {
+        if (banks_built_) {
             throw std::logic_error(
-                "lora_store: this projection has no bank and the store is frozen -- banks are "
+                "lora_store: this projection has no bank and the banks are built -- banks are "
                 "created by ensure_banks before serving so captured graphs and the lock-free "
                 "find() stay valid; register the module in the target's directory");
         }
@@ -157,6 +170,11 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
         }
     }
 
+    // The caller may be on another device -- an adapter upload runs on an HTTP
+    // handler thread, and under a pipeline this store is one stage's of several.
+    // A copy resolves its destination against the current device, not against the
+    // pointer, so bind this store's device for the duration.
+    const ScopedDevice on_store(device_);
     CUDA_CHECK(cudaMemcpy(static_cast<std::uint16_t*>(bank.a) + static_cast<std::size_t>(slot) *
                                                                     bank.view.a_stride,
                           a_padded.data(), a_padded.size() * sizeof(std::uint16_t),
@@ -178,33 +196,57 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
     }
 }
 
+// The directory stays open across ensure_banks calls: a pipeline registers one
+// stage's layers, builds their banks on that stage's device, and then registers
+// the next stage's. What must not happen is a bank appearing once the engine
+// serves -- `set_slot` refuses that, and every registration here runs inside the
+// engine's construction window.
 void LoraStore::register_module(std::int32_t layer, std::string module, ModuleBinding binding) {
-    if (frozen_) { throw std::logic_error("lora_store: the directory is frozen after ensure_banks"); }
     if (binding.key == nullptr || binding.in <= 0 || binding.out <= 0) {
         throw std::invalid_argument("lora_store: a module binding needs a key and positive shapes");
     }
     directory_.emplace(std::make_pair(layer, std::move(module)), binding);
 }
 
+bool LoraStore::covers_layer(std::int32_t layer) const {
+    const auto bound = directory_.lower_bound(std::make_pair(layer, std::string{}));
+    if (bound != directory_.end() && bound->first.first == layer) { return true; }
+    // A layer this store holds but adapts nowhere -- a linear-attention layer
+    // whose attention names are refused -- still belongs to it. Saying so is what
+    // lets the refusal explain itself instead of the layer looking absent.
+    const auto refused = layer_refusals_.lower_bound(std::make_pair(layer, std::string{}));
+    return refused != layer_refusals_.end() && refused->first.first == layer;
+}
+
 void LoraStore::register_refusal(std::string module, std::string reason) {
-    if (frozen_) { throw std::logic_error("lora_store: the directory is frozen after ensure_banks"); }
     refusals_.emplace(std::move(module), std::move(reason));
 }
 
 void LoraStore::register_layer_refusal(std::int32_t layer, std::string module, std::string reason) {
-    if (frozen_) { throw std::logic_error("lora_store: the directory is frozen after ensure_banks"); }
     layer_refusals_.emplace(std::make_pair(layer, std::move(module)), std::move(reason));
 }
 
 void LoraStore::ensure_banks() {
     if (slots_ == 0) { throw std::logic_error("lora_store: configure() first"); }
-    // Everything in one owning arena: bank pairs for every registered module,
-    // the round scratch, the uniform slot cell. Allocated here -- inside the
-    // engine's construction window -- so under sleep mode it registers as one
-    // sleepable Offload region and a slept model's adapters leave VRAM with it.
-    std::size_t total = static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank_ *
-                            scratch_tokens_ * sizeof(std::uint16_t) +
-                        256; // cell + alignment slack
+    // Everything this call creates goes into one owning arena: the banks of the
+    // modules registered since the last call, and this device's round state if it
+    // has none yet. Allocated here -- inside the engine's construction window --
+    // so under sleep mode it registers as one sleepable Offload region of that
+    // engine, and a slept model's adapters leave VRAM with it.
+    //
+    // A pipeline calls this once per stage, with that stage's device current and
+    // that stage's layers just registered, so a layer's banks land on the device
+    // that holds the layer. Earlier arenas are kept rather than replaced: their
+    // banks are already pointed at by the directory and by captured graphs.
+    if (device_ < 0) { device_ = current_device(); }
+    const bool need_round_state = scratch_ == nullptr;
+
+    std::size_t total = 0;
+    if (need_round_state) {
+        total += static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank_ * scratch_tokens_ *
+                     sizeof(std::uint16_t) +
+                 512; // the cell, and the alignment each of the two allocations may waste
+    }
     struct Planned {
         Key key;
         std::size_t a_bytes;
@@ -227,20 +269,23 @@ void LoraStore::ensure_banks() {
         planned.push_back({key, a_bytes, b_bytes, &binding});
         total += a_bytes + b_bytes + 512;
     }
-    storage_ = std::make_unique<DeviceArena>(total);
-    CUDA_CHECK(cudaMemset(storage_->base(), 0, storage_->capacity()));
-    scratch_ = storage_
-                   ->alloc_bytes(static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank_ *
-                                 scratch_tokens_ * sizeof(std::uint16_t))
-                   .data;
-    uniform_cell_ = static_cast<std::int32_t*>(storage_->alloc_bytes(sizeof(std::int32_t)).data);
-    const std::int32_t none = -1;
-    CUDA_CHECK(cudaMemcpy(uniform_cell_, &none, sizeof(none), cudaMemcpyHostToDevice));
+    if (planned.empty() && !need_round_state) { return; }
+
+    auto arena = std::make_unique<DeviceArena>(total);
+    CUDA_CHECK(cudaMemset(arena->base(), 0, arena->capacity()));
+    if (need_round_state) {
+        scratch_      = arena->alloc_bytes(static_cast<std::size_t>(kLoraFusedPairLimit) *
+                                     max_rank_ * scratch_tokens_ * sizeof(std::uint16_t))
+                       .data;
+        uniform_cell_ = static_cast<std::int32_t*>(arena->alloc_bytes(sizeof(std::int32_t)).data);
+        const std::int32_t none = -1;
+        CUDA_CHECK(cudaMemcpy(uniform_cell_, &none, sizeof(none), cudaMemcpyHostToDevice));
+    }
     for (const Planned& item : planned) {
         const ModuleBinding& binding = *item.binding;
         Bank bank;
-        bank.a             = storage_->alloc_bytes(item.a_bytes).data;
-        bank.b             = storage_->alloc_bytes(item.b_bytes).data;
+        bank.a             = arena->alloc_bytes(item.a_bytes).data;
+        bank.b             = arena->alloc_bytes(item.b_bytes).data;
         bank.view.a        = bank.a;
         bank.view.b        = bank.b;
         bank.view.a_stride = static_cast<std::int64_t>(max_rank_) * binding.in;
@@ -250,7 +295,8 @@ void LoraStore::ensure_banks() {
         bank.view.k        = binding.in;
         banks_.emplace(item.key, bank);
     }
-    frozen_ = true;
+    storage_.push_back(std::move(arena));
+    banks_built_ = true;
 }
 
 void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
@@ -286,6 +332,7 @@ void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, s
 
 void LoraStore::clear_slot(std::int32_t slot) {
     if (slot < 0 || slot >= slots_) { return; }
+    const ScopedDevice on_store(device_);
     for (auto& [key, bank] : banks_) {
         CUDA_CHECK(cudaMemset(static_cast<std::uint16_t*>(bank.a) +
                                   static_cast<std::size_t>(slot) * bank.view.a_stride,
@@ -297,20 +344,59 @@ void LoraStore::clear_slot(std::int32_t slot) {
 }
 
 void LoraStore::write_uniform_slot(std::int32_t slot, cudaStream_t stream) const {
-    if (uniform_cell_ == nullptr) { return; }
+    std::int32_t* cell = uniform_cell_;
+    if (cell == nullptr) { return; }
     // Stream-ordered so it lands before the round that reads it, and captured as a
     // node when the round is being recorded.
-    CUDA_CHECK(cudaMemcpyAsync(uniform_cell_, &slot, sizeof(slot), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(cell, &slot, sizeof(slot), cudaMemcpyHostToDevice, stream));
 }
 
-LoraStore& lora_store_for_current_device() { return engine_slot<LoraStore>(); }
+LoraStore& LoraStoreSet::for_device(int device) {
+    if (device < 0 || device >= kMaxDevices) {
+        throw std::invalid_argument("lora_store: device ordinal " + std::to_string(device) +
+                                    " is outside the " + std::to_string(kMaxDevices) +
+                                    " this engine indexes");
+    }
+    // The common case by far: the store exists and this is one acquire load.
+    LoraStore* existing = stores_[static_cast<std::size_t>(device)].load(std::memory_order_acquire);
+    if (existing != nullptr) { return *existing; }
+    const std::lock_guard<std::mutex> lock(mutex_);
+    existing = stores_[static_cast<std::size_t>(device)].load(std::memory_order_relaxed);
+    if (existing != nullptr) { return *existing; }
+    owned_.push_back(std::make_unique<LoraStore>());
+    LoraStore* created = owned_.back().get();
+    stores_[static_cast<std::size_t>(device)].store(created, std::memory_order_release);
+    return *created;
+}
+
+LoraStore* LoraStoreSet::peek(int device) const noexcept {
+    if (device < 0 || device >= kMaxDevices) { return nullptr; }
+    return stores_[static_cast<std::size_t>(device)].load(std::memory_order_acquire);
+}
+
+std::vector<int> LoraStoreSet::devices() const {
+    std::vector<int> out;
+    for (int device = 0; device < kMaxDevices; ++device) {
+        if (stores_[static_cast<std::size_t>(device)].load(std::memory_order_acquire) != nullptr) {
+            out.push_back(device);
+        }
+    }
+    return out;
+}
+
+LoraStore& lora_store_for_current_device() {
+    return engine_slot<LoraStoreSet>().for_device(LoraStore::current_device());
+}
 
 namespace {
 thread_local LoraRound t_round;
 } // namespace
 
-bool lora_active() { return engine_slot<LoraStore>().active(); }
-void lora_set_active(bool active) { engine_slot<LoraStore>().set_active(active); }
+bool lora_active() {
+    const LoraStore* store = engine_slot<LoraStoreSet>().peek(LoraStore::current_device());
+    return store != nullptr && store->active();
+}
+void lora_set_active(bool active) { lora_store_for_current_device().set_active(active); }
 
 void lora_set_round(const LoraRound& round) { t_round = round; }
 void lora_clear_round() { t_round = LoraRound{}; }

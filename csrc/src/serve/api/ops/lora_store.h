@@ -18,9 +18,12 @@
 #include "api/ops/lora.h"
 #include "core/arena.h"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -64,7 +67,13 @@ public:
     /// A module refused on one layer (e.g. attention names on a linear-attention layer).
     void register_layer_refusal(std::int32_t layer, std::string module, std::string reason);
 
-    /// Creates every registered bank, zero-filled, then freezes the directory.
+    /// Creates the banks of every registered module that has none yet, zero-filled,
+    /// on the device that is current when it is called.
+    ///
+    /// A pipeline calls this once per stage, with that stage's device current and
+    /// that stage's layers freshly registered, so the banks of a layer land on the
+    /// device that holds it. A single-device engine calls it once and nothing
+    /// changes for it.
     ///
     /// Banks must all exist before the first round is captured, for two reasons
     /// with the same root. A captured graph records only the launches it sees, and
@@ -83,6 +92,15 @@ public:
                          std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale);
 
     [[nodiscard]] bool has_bindings() const noexcept { return !directory_.empty(); }
+
+    /// Whether the directory holds any module for this layer.
+    ///
+    /// Under pipeline parallelism a stage registers only the layers it holds, so
+    /// this is how a startup payload is matched to the stage that can apply it:
+    /// every stage is handed the whole `--lora-modules` list and each takes its
+    /// own layers. A module name that is wrong on a layer this stage does hold
+    /// still throws, which is the error worth keeping.
+    [[nodiscard]] bool covers_layer(std::int32_t layer) const;
 
     /// Zeroes a slot across every bank, so a token selecting it adds nothing.
     /// This is what unloading an adapter does: the memory stays, the contribution
@@ -106,6 +124,9 @@ public:
     /// Device cell holding the slot a uniform (prefill) round uses. It is memory
     /// rather than a launch argument so a captured prefill graph re-reads it on
     /// every replay instead of freezing the slot it was captured with.
+    /// Read once per round by the schedule that publishes `LoraRound`, never per
+    /// projection: the hook takes it from the round, so the store is off the hot
+    /// path once the round is published.
     [[nodiscard]] const std::int32_t* uniform_cell() const noexcept { return uniform_cell_; }
     void write_uniform_slot(std::int32_t slot, cudaStream_t stream) const;
 
@@ -116,6 +137,10 @@ public:
     void set_active(bool active) noexcept { active_ = active; }
     [[nodiscard]] std::int32_t slots() const noexcept { return slots_; }
     [[nodiscard]] std::int32_t max_rank() const noexcept { return max_rank_; }
+    /// The device this store's memory lives on, or -1 before anything is built.
+    [[nodiscard]] int device() const noexcept { return device_; }
+    /// The calling thread's current CUDA device.
+    [[nodiscard]] static int current_device();
 
     ~LoraStore();
     LoraStore()                            = default;
@@ -127,7 +152,7 @@ private:
         LoraBank view;
         void* a  = nullptr;
         void* b  = nullptr;
-        bool raw = false; ///< individually cudaMalloc'd (pre-freeze path); arena otherwise
+        bool raw = false; ///< individually cudaMalloc'd (directory-less path); arena otherwise
     };
     struct Key {
         const void* weight = nullptr;
@@ -142,28 +167,73 @@ private:
         }
     };
     std::unordered_map<Key, Bank, KeyHash> banks_;
-    /// One arena for every registered bank plus the scratch and the slot cell,
-    /// allocated by ensure_banks. It is an owning DeviceArena, so under sleep
-    /// mode it joins the engine's sleepable estate as an Offload region: a
-    /// slept model's adapters leave VRAM with it and come back byte-identical.
-    std::unique_ptr<DeviceArena> storage_;
+    /// The arenas holding every bank plus the round state, allocated by
+    /// ensure_banks. Each is an owning DeviceArena, so under sleep mode it joins
+    /// the engine's sleepable estate as an Offload region: a slept model's
+    /// adapters leave VRAM with it and come back byte-identical. There is one per
+    /// ensure_banks call, and earlier ones are kept rather than replaced, so a
+    /// second call cannot free the banks the first one handed out.
+    std::vector<std::unique_ptr<DeviceArena>> storage_;
+
+    /// The device every bank, the scratch and the cell of this store live on,
+    /// learned from the thread that built them. Writes from another thread -- an
+    /// adapter upload from an HTTP handler -- bind it first, because a copy
+    /// resolves its destination against the current device, not against the
+    /// pointer.
+    int device_ = -1;
+    void* scratch_              = nullptr;
+    std::int32_t* uniform_cell_ = nullptr;
+    bool raw_round_state_       = false; ///< scratch/cell cudaMalloc'd (directory-less use)
     std::map<std::pair<std::int32_t, std::string>, ModuleBinding> directory_;
     std::map<std::string, std::string> refusals_;
     std::map<std::pair<std::int32_t, std::string>, std::string> layer_refusals_;
-    bool frozen_ = false;
-    void* scratch_          = nullptr;
-    std::int32_t* uniform_cell_ = nullptr;
+    /// True once ensure_banks has created any bank. It stops `set_slot` making
+    /// one lazily afterwards, which would insert into the map the hot-path
+    /// `find()` reads without a lock, and would leave already-captured graphs
+    /// without the kernels for it.
+    bool banks_built_ = false;
     std::int32_t scratch_tokens_ = 0;
     std::int32_t slots_    = 0;
     std::int32_t max_rank_ = 0;
     bool active_           = false;
-    bool raw_round_state_  = false; ///< scratch/cell cudaMalloc'd (directory-less use)
     void ensure_raw_round_state();
 };
 
-/// The engine-bound store (via the thread's ops context; the process default
-/// serves single-engine paths and tools). The name is historical -- an engine
-/// serves one device, so per-engine and per-device coincide.
+/// An engine's adapter stores, one per device.
+///
+/// A single-device engine has exactly one and nothing about it changes. A
+/// pipeline has one per stage's device, and that separation is not a
+/// convenience: the stages construct concurrently, one thread per card, and each
+/// one registers its modules and builds its banks as it goes. Sharing a store
+/// would put those inserts next to the lock-free `find()` another stage's graph
+/// capture is already calling.
+///
+/// Lookup is a relaxed atomic load off a small array, because it happens once per
+/// adapted projection. Only creation takes the lock, and only during construction.
+class LoraStoreSet {
+public:
+    /// More than any single host holds, and the index is the CUDA ordinal.
+    static constexpr int kMaxDevices = 16;
+
+    /// The store for `device`, created on first use.
+    [[nodiscard]] LoraStore& for_device(int device);
+    /// The store for `device`, or nullptr if it has none. Never creates.
+    [[nodiscard]] LoraStore* peek(int device) const noexcept;
+    /// Every device that has a store, in ordinal order.
+    [[nodiscard]] std::vector<int> devices() const;
+
+    LoraStoreSet() = default;
+    LoraStoreSet(const LoraStoreSet&)            = delete;
+    LoraStoreSet& operator=(const LoraStoreSet&) = delete;
+
+private:
+    std::array<std::atomic<LoraStore*>, kMaxDevices> stores_{};
+    std::vector<std::unique_ptr<LoraStore>> owned_;
+    mutable std::mutex mutex_;
+};
+
+/// The store for the calling thread's current CUDA device, from the engine bound
+/// to this thread (the process default serves single-engine paths and tools).
 [[nodiscard]] LoraStore& lora_store_for_current_device();
 
 /// True when any adapter is resident, so the projection hooks skip the lookup in
@@ -187,6 +257,11 @@ struct LoraRound {
     /// Set when the round is uniform; the value lives in the store's device cell.
     bool uniform = false;
     Tensor scratch;                ///< BF16, at least max_rank * tokens
+    /// The device cell holding the uniform round's slot, on the device this round
+    /// runs on. Carried here rather than looked up per projection so that a
+    /// pipeline stage reads its own device's cell without the hook asking which
+    /// device it is on.
+    const std::int32_t* uniform_cell = nullptr;
     bool valid() const noexcept {
         return scratch.data != nullptr && (slots != nullptr || uniform);
     }

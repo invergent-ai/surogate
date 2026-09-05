@@ -9,6 +9,7 @@ namespace sinfer {
 
 namespace ops {
 class LoraStore;
+class LoraStoreSet;
 } // namespace ops
 
 class PreparedPrompt {
@@ -133,7 +134,16 @@ public:
     [[nodiscard]] std::size_t sleepable_bytes() const;
 
     /// This engine's adapter store (runtime load/unload operates on it).
-    [[nodiscard]] ops::LoraStore& lora_store();
+    /// The CUDA device this engine's memory lives on. A thread that touches that
+    /// memory itself -- an adapter upload from an HTTP handler, say -- must bind
+    /// this device first (`ScopedDevice`), or the runtime resolves the pointers
+    /// against whatever device that thread happened to be on.
+    [[nodiscard]] int device() const;
+
+    /// This engine's adapter stores, one per device it spans. A single-device
+    /// engine has one; a pipeline has one per stage's device, and an adapter's
+    /// modules are spread across them by layer.
+    [[nodiscard]] ops::LoraStoreSet& lora_stores();
 
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;

@@ -46,8 +46,7 @@ inline void apply_lora(const Weight& base, std::int32_t port, const Tensor& hidd
     Tensor* outs[1]               = {&out};
     ops::lora_delta_fused(hidden, banks, outs, 1,
                           round.slots != nullptr ? *round.slots : kNoIds,
-                          round.uniform ? ops::lora_store_for_current_device().uniform_cell()
-                                        : nullptr,
+                          round.uniform ? round.uniform_cell : nullptr,
                           const_cast<Tensor&>(round.scratch), stream);
 }
 
@@ -77,7 +76,65 @@ inline void apply_lora_qkv(const Weight& base, const Tensor& hidden, Tensor& que
     static const Tensor kNoIds{};
     ops::lora_delta_fused(hidden, live, outs, pairs,
                           round.slots != nullptr ? *round.slots : kNoIds,
-                          round.uniform ? store.uniform_cell() : nullptr,
+                          round.uniform ? round.uniform_cell : nullptr,
+                          const_cast<Tensor&>(round.scratch), stream);
+}
+
+
+/// Which output of a possibly-fused parent an adapter module adapts.
+///
+/// A fused parent stores several logical projections in one object, so its
+/// device pointer alone cannot say which of them an adapter belongs to; the
+/// (pointer, port) pair can. This is the family's numbering and every target
+/// shares it, so a directory built by one target reads the same in another.
+inline constexpr std::int32_t kQueryPort  = 0;
+inline constexpr std::int32_t kKeyPort    = 1;
+inline constexpr std::int32_t kValuePort  = 2;
+inline constexpr std::int32_t kOutputPort = 3;
+inline constexpr std::int32_t kDownPort   = 4;
+inline constexpr std::int32_t kGatePort   = 5;
+inline constexpr std::int32_t kUpPort     = 6;
+
+/// Whether a bank exists for this projection's port.
+///
+/// The answer is fixed when `ensure_banks` freezes the directory, which happens
+/// in the engine's construction window -- before the first graph capture. That
+/// is what makes it safe to branch a projection on: capture and replay see the
+/// same answer, so a graph cannot record one route and replay the other.
+[[nodiscard]] inline bool lora_bound(const Weight& base, std::int32_t port) {
+    if (!ops::lora_active()) { return false; }
+    return ops::lora_store_for_current_device().find(base.qdata, port) != nullptr;
+}
+
+/// The gate/up site: two projections out of one fused parent, one launch.
+///
+/// The twin of `apply_lora_qkv`, and it exists for the same reason -- both halves
+/// read the same hidden column, which is what makes the shared-input fusion
+/// legal. A half whose bank is absent contributes nothing.
+inline void apply_lora_gate_up(const Weight& base, const Tensor& hidden, Tensor& gate, Tensor& up,
+                               cudaStream_t stream) {
+    if (!ops::lora_active()) { return; }
+    ops::LoraStore& store         = ops::lora_store_for_current_device();
+    const ops::LoraBank* banks[2] = {store.find(base.qdata, kGatePort),
+                                     store.find(base.qdata, kUpPort)};
+    Tensor* candidates[2]         = {&gate, &up};
+    const ops::LoraBank* live[2]  = {};
+    Tensor* outs[2]               = {};
+    std::int32_t pairs            = 0;
+    for (int p = 0; p < 2; ++p) {
+        if (banks[p] != nullptr) {
+            live[pairs] = banks[p];
+            outs[pairs] = candidates[p];
+            ++pairs;
+        }
+    }
+    if (pairs == 0) { return; }
+    const ops::LoraRound& round = ops::lora_current_round();
+    if (!round.valid()) { return; }
+    static const Tensor kNoIds{};
+    ops::lora_delta_fused(hidden, live, outs, pairs,
+                          round.slots != nullptr ? *round.slots : kNoIds,
+                          round.uniform ? round.uniform_cell : nullptr,
                           const_cast<Tensor&>(round.scratch), stream);
 }
 
