@@ -1,0 +1,179 @@
+#pragma once
+
+// GLM-5.3-Flash (`glm5next`). Every dimension here is the released 45-layer checkpoint's; the
+// artifact declares its own and the runtime binds against those, so this is the default and the
+// subject of the static assertions below rather than the schedule.
+
+#include <api/family/frontend.h>
+#include <api/family/runtime.h>
+#include <api/family/vision.h>
+
+#include <cstdint>
+
+namespace sinfer::targets::glm5_next::detail {
+
+struct TextConfig {
+    static constexpr int hidden = 4096;
+    static constexpr int layers = 45;
+    /// The routed experts' FFN width, which is what the family's post-mixer is sized from.
+    static constexpr int intermediate = 2048;
+    static constexpr int dense_intermediate = 12288;
+
+    static constexpr int output_rows  = 154880;
+    static constexpr int token_domain = output_rows;
+
+    // Manifold-constrained hyper-connections: the residual is `hc_streams` copies of the model
+    // width, collapsed to one before every block and recombined after it by a stream x stream
+    // matrix on the doubly-stochastic manifold.
+    static constexpr int hc_streams = 4;
+    static constexpr int hc_width   = hc_streams * hidden;              // 16384
+    static constexpr int hc_mix     = (2 + hc_streams) * hc_streams;    // 24
+    static constexpr int hc_sinkhorn_iterations = 20;
+    static constexpr float hc_epsilon           = 1.0e-6F;
+    /// The family sizes its residual planes from this.
+    static constexpr int residual = hc_width;
+
+    // Kimi Delta Attention. Its q, k and v are all 64 heads of 128, so llama.cpp stores no
+    // permutation and the engine reads the heads as they lie.
+    static constexpr int gdn_conv_kernel      = 4;
+    static constexpr int gdn_conv_state_width = gdn_conv_kernel - 1;
+    static constexpr int gdn_key_heads        = 64;
+    static constexpr int gdn_key_head_dim     = 128;
+    static constexpr int gdn_value_heads      = 64;
+    static constexpr int gdn_value_head_dim   = 128;
+    /// The forget and output gates are low-rank: hidden -> this -> the full width.
+    static constexpr int kda_gate_rank = 128;
+
+    // Multi-head latent attention, NoPE: the query and key/value low ranks, and the per-head
+    // widths they expand to. 64 query heads and 64 key/value heads -- this is MHA over an
+    // expanded latent, not GQA.
+    static constexpr int query_heads   = 64;
+    static constexpr int kv_heads      = 64;
+    static constexpr int head_dim      = 256;
+    static constexpr int rotary_dim    = 0;
+    static constexpr int q_lora_rank   = 1536;
+    static constexpr int kv_lora_rank  = 512;
+
+    // The sparse indexer, which this target does not run. Below this many cached tokens it
+    // selects every visible one, so dense attention is exactly what it would have asked for;
+    // above it the two differ and the engine refuses rather than attending to more than the
+    // model was trained to.
+    static constexpr int index_top_k     = 2048;
+    static constexpr int index_pool       = 4;
+    static constexpr int dense_exact_context = index_top_k;
+
+    // The mixture: a sigmoid-plus-bias router over 288 experts, top-8 renormalised and scaled,
+    // plus an always-on expert added with weight one. Its router therefore has one row per
+    // expert and no gate row.
+    static constexpr int experts             = 288;
+    static constexpr int experts_per_token   = 8;
+    static constexpr int shared_intermediate = 2048;
+    static constexpr int router_rows         = experts;
+    static constexpr float routed_scale      = 2.5F;
+    static constexpr float swiglu_limit      = 10.0F;
+    static constexpr int leading_dense_layers = 3;
+
+    static constexpr float rms_epsilon = 1.0e-5F;
+    /// NoPE: no rotary at all. Declared because the family's geometry names it.
+    static constexpr float rope_theta = 1.0e4F;
+
+    static constexpr int key_dim   = gdn_key_heads * gdn_key_head_dim;     // 8192
+    static constexpr int value_dim = gdn_value_heads * gdn_value_head_dim; // 8192
+    /// The mixer convolves a fused q|k|v, so this is its width.
+    static constexpr int convolution_dim = 2 * key_dim + value_dim;        // 24576
+
+    static constexpr int query_size = query_heads * head_dim;              // 16384
+    static constexpr int kv_size    = kv_heads * head_dim;                 // 16384
+    /// Ungated: the projection carries query rows only.
+    static constexpr int query_projection_rows = query_size;
+
+    static constexpr int mtp_layers               = 0;
+    static constexpr int mtp_input_rows           = 0;
+    static constexpr int mtp_attention_input_rows = 0;
+    static constexpr int mtp_mlp_gate_up_rows     = 0;
+
+    /// Which layers attend, compiled for the released checkpoint. Every fourth from the third,
+    /// which is what `attention.head_count_kv` says layer by layer; an artifact declares its
+    /// own schedule and the runtime reads that instead.
+    static constexpr int full_attention_interval = 4;
+
+    [[nodiscard]] static constexpr bool is_full_attention(int layer) {
+        return layer % full_attention_interval == full_attention_interval - 1;
+    }
+    [[nodiscard]] static constexpr int full_attention_layers() {
+        int count = 0;
+        for (int layer = 0; layer < layers; ++layer) { count += is_full_attention(layer) ? 1 : 0; }
+        return count;
+    }
+    [[nodiscard]] static constexpr int gdn_layers() { return layers - full_attention_layers(); }
+    [[nodiscard]] static constexpr int full_attention_index(int layer) {
+        int index = 0;
+        for (int earlier = 0; earlier < layer; ++earlier) {
+            index += is_full_attention(earlier) ? 1 : 0;
+        }
+        return index;
+    }
+    [[nodiscard]] static constexpr int gdn_index(int layer) {
+        int index = 0;
+        for (int earlier = 0; earlier < layer; ++earlier) {
+            index += is_full_attention(earlier) ? 0 : 1;
+        }
+        return index;
+    }
+    /// Whether this layer's feed-forward is the mixture. The first few are dense.
+    [[nodiscard]] static constexpr bool is_sparse(int layer) { return layer >= leading_dense_layers; }
+};
+
+static_assert(TextConfig::full_attention_layers() == 11);
+static_assert(TextConfig::gdn_layers() == 34);
+static_assert(TextConfig::is_full_attention(3) && !TextConfig::is_full_attention(2));
+static_assert(TextConfig::full_attention_index(3) == 0 &&
+              TextConfig::full_attention_index(43) == 10);
+static_assert(TextConfig::gdn_index(0) == 0 && TextConfig::gdn_index(44) == 33);
+static_assert(TextConfig::hc_mix == 24 && TextConfig::hc_width == 16384);
+static_assert(TextConfig::query_size == TextConfig::kv_size,
+              "MLA expands the latent to one key/value head per query head");
+
+/// No vision tower. Declared because the shared ModelView names one; never bound.
+struct VisionConfig {
+    static constexpr int layers              = 0;
+    static constexpr int hidden              = 0;
+    static constexpr int intermediate        = 0;
+    static constexpr int heads               = 0;
+    static constexpr int head_dim            = 0;
+    static constexpr int patch_dim           = 0;
+    static constexpr int merge               = 1;
+    static constexpr int merge_unit          = 1;
+    static constexpr int merger_hidden       = 0;
+    static constexpr int position_embeddings = 0;
+    static constexpr int rotary_dim          = 0;
+    static constexpr float rope_theta        = 0.0F;
+    static constexpr float norm_epsilon      = 0.0F;
+    static constexpr int output_hidden       = TextConfig::hidden;
+};
+
+struct DFlashConfig {
+    static constexpr bool supported     = false;
+    static constexpr int local_layers   = 0;
+    static constexpr int local_capacity = 0;
+    static constexpr int kv_heads       = 0;
+    static constexpr int head_dim       = 0;
+    static constexpr int feature_rows   = 0;
+    static constexpr int hidden         = 0;
+    static constexpr int intermediate   = 0;
+    static constexpr int query_size     = 0;
+    static constexpr int kv_size        = 0;
+};
+
+/// 1/sqrt(256) for the latent attention, 1/sqrt(128) for the delta recurrence.
+inline constexpr float kAttentionScale                   = 0.0625F;
+inline constexpr float kGdnScale                         = 0.08838834764831845F;
+inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 0;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+/// What this target serves, not what the checkpoint was trained for (1,048,576). The sparse
+/// indexer is not bound, and below its budget full attention is exactly what it would have
+/// selected; above it they are different models.
+inline constexpr std::uint32_t kNativeContext            = TextConfig::dense_exact_context;
+
+} // namespace sinfer::targets::glm5_next::detail

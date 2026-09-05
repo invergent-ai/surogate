@@ -63,6 +63,38 @@ def _refuse_what_is_not_bound(source: GgufSource, geometry: inv.Geometry) -> Non
               f"artifact records the bound and the engine refuses beyond it", flush=True)
 
 
+def _geometry_block(geometry: inv.Geometry) -> dict[str, float]:
+    """The dimensions the artifact states about itself, which the engine lays over its compiled
+    constants. Everything a target derives -- the fused row counts, the convolution width, the
+    mixing-matrix size -- is a function of these, so none of them is restated."""
+    return {
+        "hidden": float(geometry.hidden),
+        "residual": float(geometry.residual),
+        "hc_streams": float(geometry.hc_streams),
+        "layers": float(geometry.layers),
+        "intermediate": float(geometry.expert_intermediate),
+        "dense_intermediate": float(geometry.dense_intermediate),
+        "output_rows": float(geometry.vocab),
+        "token_domain": float(geometry.vocab),
+        "query_heads": float(geometry.query_heads),
+        "kv_heads": float(geometry.query_heads),
+        "head_dim": float(geometry.qk_head_dim),
+        # NoPE: the checkpoint states `rope.dimension_count` 0 and the served attention applies
+        # no rotary at all.
+        "rotary_dim": 0.0,
+        "q_lora_rank": float(geometry.q_lora_rank),
+        "kv_lora_rank": float(geometry.kv_lora_rank),
+        "gdn_conv_kernel": float(geometry.kda_conv_kernel),
+        "gdn_key_heads": float(geometry.kda_heads),
+        "gdn_key_head_dim": float(geometry.kda_head_dim),
+        "gdn_value_heads": float(geometry.kda_heads),
+        "gdn_value_head_dim": float(geometry.kda_head_dim),
+        "kda_gate_rank": float(geometry.kda_head_dim),
+        "mtp_layers": 0.0,
+        "rms_epsilon": float(geometry.rms_epsilon),
+    }
+
+
 def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
             *, device: str = "cuda") -> Path:
     """Write the artifact. `device` is accepted so the ingest path can call every converter the
@@ -117,6 +149,7 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
         ArtifactIdentity(inv.MODEL_ID, inv.WEIGHTS_ID),
         plan.specs,
         external=external,
+        geometry=_geometry_block(geometry),
     ) as writer:
         for index, spec in enumerate(specs, start=1):
             t0 = time.perf_counter()

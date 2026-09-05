@@ -98,4 +98,40 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     detail::gdn_gating_launch(a, b, A_log, dt_bias, g, beta, stream);
 }
 
+void kda_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
+                float lower_bound, Tensor& g, Tensor& beta, cudaStream_t stream) {
+    const auto fail = [](const char* what) {
+        throw std::invalid_argument(std::string("kda_gating: ") + what);
+    };
+    if (a.dtype != DType::BF16 || b.dtype != DType::BF16) { fail("a/b must be BF16"); }
+    if (A_log.dtype != DType::FP32 || dt_bias.dtype != DType::FP32) {
+        fail("A_log/dt_bias must be FP32");
+    }
+    if (g.dtype != DType::FP32 || beta.dtype != DType::FP32) { fail("g/beta must be FP32"); }
+    const std::int32_t heads  = A_log.ne[0];
+    const std::int32_t tokens = b.ne[1];
+    if (heads <= 0 || A_log.ne[1] != 1 || A_log.ne[2] != 1 || A_log.ne[3] != 1) {
+        fail("A_log must have shape [H]");
+    }
+    if (dt_bias.ne[0] <= 0 || dt_bias.ne[0] % heads != 0 || dt_bias.ne[1] != 1 ||
+        dt_bias.ne[2] != 1 || dt_bias.ne[3] != 1) {
+        fail("dt_bias must have shape [H*D]");
+    }
+    const std::int32_t width = dt_bias.ne[0];
+    if (tokens <= 0) { return; }
+    const auto shaped = [&](const Tensor& t, std::int32_t rows) {
+        return t.ne[0] == rows && t.ne[1] == tokens && t.ne[2] == 1 && t.ne[3] == 1 &&
+               t.is_contiguous() && t.data != nullptr;
+    };
+    if (!shaped(a, width)) { fail("a must be contiguous BF16 [H*D, T]"); }
+    if (!shaped(g, width)) { fail("g must be contiguous FP32 [H*D, T]"); }
+    if (!shaped(b, heads)) { fail("b must be contiguous BF16 [H, T]"); }
+    if (!shaped(beta, heads)) { fail("beta must be contiguous FP32 [H, T]"); }
+    if (!A_log.is_contiguous() || !dt_bias.is_contiguous() || A_log.data == nullptr ||
+        dt_bias.data == nullptr) {
+        fail("A_log and dt_bias must be contiguous and non-null");
+    }
+    detail::kda_gating_launch(a, b, A_log, dt_bias, lower_bound, g, beta, stream);
+}
+
 } // namespace sinfer::ops

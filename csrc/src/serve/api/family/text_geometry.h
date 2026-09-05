@@ -45,6 +45,19 @@ struct TextGeometry {
     std::int32_t gdn_value_head_dim = 0;
     std::int32_t mtp_layers         = 0;
     std::int32_t sliding_window     = 0;
+    /// Multi-head latent attention: the ranks the query and the key/value are compressed to
+    /// before being expanded per head. Zero for an attention that projects q, k and v directly.
+    std::int32_t q_lora_rank        = 0;
+    std::int32_t kv_lora_rank       = 0;
+    /// The rank the linear mixer's forget and output gates pass through, zero for a mixer
+    /// whose gates are full-rank projections.
+    std::int32_t kda_gate_rank      = 0;
+    /// How many copies of the model width the residual carries, for a hyper-connected stack.
+    /// One for every other family, and `residual` is then `hidden`.
+    std::int32_t hc_streams         = 1;
+    /// The feed-forward width of the layers that are dense, where a mixture model has some.
+    /// `intermediate` is the routed experts' width, which is what the post-mixer is sized from.
+    std::int32_t dense_intermediate = 0;
     float rms_epsilon               = 0.0F;
     float rope_theta                = 0.0F;
 
@@ -94,6 +107,13 @@ struct TextGeometry {
         return 2 * query_size() + 2 * kv_size();
     }
     [[nodiscard]] constexpr std::int32_t mtp_mlp_gate_up_rows() const noexcept { return 2 * intermediate; }
+    /// The latent expansion's per-head halves, for an attention that compresses its key/value.
+    [[nodiscard]] constexpr std::int32_t latent_key_rows() const noexcept {
+        return query_heads * head_dim;
+    }
+    [[nodiscard]] constexpr std::int32_t hyper_connection_mix_rows() const noexcept {
+        return (2 + hc_streams) * hc_streams;
+    }
 
     /// The compiled config as a value: every primary member the target's `TextConfig` declares.
     /// A config without GDN, MTP or a window leaves those at zero, which is what "none" means.
@@ -123,6 +143,11 @@ struct TextGeometry {
         SINFER_TEXT_GEOMETRY_TAKE(gdn_value_head_dim)
         SINFER_TEXT_GEOMETRY_TAKE(mtp_layers)
         SINFER_TEXT_GEOMETRY_TAKE(sliding_window)
+        SINFER_TEXT_GEOMETRY_TAKE(q_lora_rank)
+        SINFER_TEXT_GEOMETRY_TAKE(kv_lora_rank)
+        SINFER_TEXT_GEOMETRY_TAKE(kda_gate_rank)
+        SINFER_TEXT_GEOMETRY_TAKE(hc_streams)
+        SINFER_TEXT_GEOMETRY_TAKE(dense_intermediate)
         SINFER_TEXT_GEOMETRY_TAKE(rms_epsilon)
         SINFER_TEXT_GEOMETRY_TAKE(rope_theta)
 #undef SINFER_TEXT_GEOMETRY_TAKE
@@ -163,6 +188,11 @@ struct TextGeometry {
             {"gdn_value_head_dim", &TextGeometry::gdn_value_head_dim},
             {"mtp_layers", &TextGeometry::mtp_layers},
             {"sliding_window", &TextGeometry::sliding_window},
+            {"q_lora_rank", &TextGeometry::q_lora_rank},
+            {"kv_lora_rank", &TextGeometry::kv_lora_rank},
+            {"kda_gate_rank", &TextGeometry::kda_gate_rank},
+            {"hc_streams", &TextGeometry::hc_streams},
+            {"dense_intermediate", &TextGeometry::dense_intermediate},
         };
         struct FloatMember { std::string_view name; float TextGeometry::* value; };
         static constexpr FloatMember kFloats[] = {
