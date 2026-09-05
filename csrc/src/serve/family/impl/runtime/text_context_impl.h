@@ -253,6 +253,13 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
 
 TextContext::~TextContext() = default;
 
+namespace {
+[[nodiscard]] bool stage_trace_enabled() {
+    static const bool enabled = std::getenv("SUROGATE_SERVE_TRACE_STAGE") != nullptr;
+    return enabled;
+}
+} // namespace
+
 void TextContext::set_linear_state_slots(std::int32_t current_slot,
                                          std::int32_t rewrite_checkpoint_slot) {
     // kNoRewriteCheckpointSlot (-1) means the pool holds no checkpoint slots
@@ -1643,6 +1650,12 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         cudaEventElapsedTime(&ms, from, to);
         into += ms;
     };
+    // Pipeline work asks the same question of every failure: which layers did this round
+    // actually run. `SUROGATE_SERVE_TRACE_STAGE=1` answers it once per round.
+    if (stage_trace_enabled()) {
+        std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
+                     stage_last_, cfg_.n_layers, x.ne[1]);
+    }
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
@@ -1967,6 +1980,12 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         cudaEventElapsedTime(&ms, from, to);
         into += ms;
     };
+    // Pipeline work asks the same question of every failure: which layers did this round
+    // actually run. `SUROGATE_SERVE_TRACE_STAGE=1` answers it once per round.
+    if (stage_trace_enabled()) {
+        std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
+                     stage_last_, cfg_.n_layers, x.ne[1]);
+    }
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
@@ -2438,6 +2457,12 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
     Tensor x = roots.residual;
     if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
 
+    // Pipeline work asks the same question of every failure: which layers did this round
+    // actually run. `SUROGATE_SERVE_TRACE_STAGE=1` answers it once per round.
+    if (stage_trace_enabled()) {
+        std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
+                     stage_last_, cfg_.n_layers, x.ne[1]);
+    }
     for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {

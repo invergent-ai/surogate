@@ -5,6 +5,8 @@
 #include "api/ops/position.h"
 #include "api/ops/scatter.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "api/ops/lora_store.h"
@@ -30,6 +32,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_ple_state(state.execution.ple);
+        if (std::getenv("SUROGATE_SERVE_TRACE_STAGE") != nullptr) {
+            std::fprintf(stderr, "stage-trace: a decode round carries stage [%d, %d)\n",
+                         state.execution.stage.first, state.execution.stage.last);
+        }
         card.set_stage(state.execution.stage);
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
@@ -97,6 +103,10 @@ auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_ple_state(state.execution.ple);
+        if (std::getenv("SUROGATE_SERVE_TRACE_STAGE") != nullptr) {
+            std::fprintf(stderr, "stage-trace: a decode round carries stage [%d, %d)\n",
+                         state.execution.stage.first, state.execution.stage.last);
+        }
         card.set_stage(state.execution.stage);
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
