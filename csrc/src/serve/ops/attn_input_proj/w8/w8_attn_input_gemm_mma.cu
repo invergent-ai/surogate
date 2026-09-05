@@ -1,6 +1,9 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 
 #include "core/device.h"
+
+#include <stdexcept>
+#include <string>
 #include "ops/common/math.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
@@ -131,6 +134,24 @@ void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
         launch_route<Schedule, 2560, 2048>(x, weight, output, stream);
         return;
     }
+    // LFM2-1.2B ungated fused qkv (rows 3072 = q2048 | k512 | v512, hidden 2048): 32 query
+    // heads and 8 KV heads at head dim 64.
+    if (weight.n == 3072) {
+        using OutputLfm2 = W8SplitOutput3<2048, 512, 512>;
+        static_assert((2048 % Schedule::BM) == 0 && (512 % Schedule::BM) == 0);
+        const OutputLfm2 output{static_cast<__nv_bfloat16*>(q.data),
+                                static_cast<__nv_bfloat16*>(k.data),
+                                static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 3072, 2048>(x, weight, output, stream);
+        return;
+    }
+    // Only the companion is left. Falling through to it for any parent that reached here is how
+    // a 3072-row weight came to be read by a kernel baked for 6144 rows.
+    if (weight.n != kCompanionRows || weight.k != kHidden) {
+        throw std::invalid_argument(
+            "W8 attention input MMA: unregistered ungated geometry (n=" +
+            std::to_string(weight.n) + ", k=" + std::to_string(weight.k) + ")");
+    }
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
@@ -168,6 +189,24 @@ void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Te
                                 static_cast<__nv_bfloat16*>(v.data)};
         launch_route<Schedule, 2560, 2048>(x, weight, output, stream);
         return;
+    }
+    // LFM2-1.2B ungated fused qkv (rows 3072 = q2048 | k512 | v512, hidden 2048): 32 query
+    // heads and 8 KV heads at head dim 64.
+    if (weight.n == 3072) {
+        using OutputLfm2 = W8SplitOutput3<2048, 512, 512>;
+        static_assert((2048 % Schedule::BM) == 0 && (512 % Schedule::BM) == 0);
+        const OutputLfm2 output{static_cast<__nv_bfloat16*>(q.data),
+                                static_cast<__nv_bfloat16*>(k.data),
+                                static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 3072, 2048>(x, weight, output, stream);
+        return;
+    }
+    // Only the companion is left. Falling through to it for any parent that reached here is how
+    // a 3072-row weight came to be read by a kernel baked for 6144 rows.
+    if (weight.n != kCompanionRows || weight.k != kHidden) {
+        throw std::invalid_argument(
+            "W8 attention input MMA: unregistered ungated geometry (n=" +
+            std::to_string(weight.n) + ", k=" + std::to_string(weight.k) + ")");
     }
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),

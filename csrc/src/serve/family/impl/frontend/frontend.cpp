@@ -247,10 +247,17 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     // behave: a transformers-5 `TokenizersBackend` config carries add_prefix_space but no
     // add_bos_token key at all, and defaulting the missing key to true rejected an export
     // whose tokenizer does exactly what this check wants.
-    if (!sentencepiece && (tokenizer_config.value("add_bos_token", false) ||
-                           tokenizer_config.value("add_prefix_space", false))) {
+    //
+    // Only `add_prefix_space` is refused. A byte-level checkpoint that asks for a BOS gets one:
+    // the tokenizer reads `add_bos_token` and prepends it, exactly as it already does for the
+    // SentencePiece checkpoints that state the same thing in their post-processor instead. LFM2
+    // is byte-level BPE *and* prepends <|startoftext|>, which is a combination this check
+    // refused although nothing about it goes unimplemented -- and refusing a checkpoint the
+    // engine tokenizes correctly is the failure this check was meant to prevent, not cause.
+    if (!sentencepiece && tokenizer_config.value("add_prefix_space", false)) {
         throw std::invalid_argument(
-            "tokenizer_config.json does not match Qwen3.6 tokenizer prefix semantics");
+            "tokenizer_config.json asks for add_prefix_space, which this frontend's byte-level "
+            "path does not apply");
     }
     // A pad token must be stated, and that is all that can be asked of it. Which one it
     // is says nothing about the text a checkpoint tokenizes -- the frontend resolves it

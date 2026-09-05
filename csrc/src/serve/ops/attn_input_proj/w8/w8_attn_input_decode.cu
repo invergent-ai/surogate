@@ -164,6 +164,25 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+    // lfm2-1.2b's ungated fused qkv: 3072 rows = q2048 | k512 | v512 at k 2048. 32 query heads
+    // and 8 KV heads at head dim 64.
+    if (weight.n == 3072) {
+        if (weight.k != 2048) { refuse_shape(weight, "ungated 3072-row"); }
+        constexpr int kRowsLfm2       = 3072;
+        constexpr int kRowsPerCtaLfm2 = 8;
+        static_assert((2048 % kRowsPerCtaLfm2) == 0 && (512 % kRowsPerCtaLfm2) == 0);
+        using OutputLfm2 = W8SplitOutput3<2048, 512, 512>;
+        const OutputLfm2 output{static_cast<__nv_bfloat16*>(q.data),
+                                static_cast<__nv_bfloat16*>(k.data),
+                                static_cast<__nv_bfloat16*>(v.data)};
+        w8_k2048_decode_kernel<kRowsLfm2, kRowsPerCtaLfm2, OutputLfm2, W8DecodeStoreEpilogue, 2048>
+            <<<kRowsLfm2 / kRowsPerCtaLfm2, kRowsPerCtaLfm2 * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), output);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     launch_companion_decode<8>(x, weight, q, k, v, stream);
 }
 

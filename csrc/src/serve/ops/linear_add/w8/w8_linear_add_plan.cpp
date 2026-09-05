@@ -256,6 +256,9 @@ constexpr auto kRegisteredShapes = std::to_array<W8LinearAddShape>({
     // hidden is narrower than anything else registered here, so both are new.
     {640, 1024},
     {640, 2048},
+    // lfm2-1.2b: its attention output and the short-convolution mixer's output are both
+    // {2048, 2048}, already the 2b shape above; only the mlp down {2048, 8192} is new.
+    {2048, 8192},
 });
 
 constexpr bool registered_shapes_are_sound() {

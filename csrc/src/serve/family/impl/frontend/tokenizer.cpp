@@ -176,14 +176,23 @@ AddedToken parse_added_token_decoder_entry(int id, const Json& item, std::string
     return token;
 }
 
-void validate_supported_added_token(const AddedToken& token, std::string_view label) {
+void validate_supported_added_token(const AddedToken& token, bool normalizer_is_identity,
+                                    std::string_view label) {
     if (token.content.empty()) {
         throw std::invalid_argument("added token content must not be empty in " +
                                     std::string(label));
     }
-    if (token.single_word || token.lstrip || token.rstrip || token.normalized) {
+    // `normalized` says the token is normalised before it is matched. Where the tokenizer
+    // declares no normalizer at all, normalising is the identity and the flag distinguishes
+    // nothing -- so it is accepted there and refused everywhere else. LFM2 marks two ordinary
+    // words this way (`Mathias`, `python`, both already in the base vocabulary at the same ids)
+    // and declares a null normalizer, so refusing it turned a flag that changes no byte into a
+    // checkpoint this engine would not load.
+    if (token.single_word || token.lstrip || token.rstrip ||
+        (token.normalized && !normalizer_is_identity)) {
         throw std::invalid_argument("Tokenizer only supports added tokens with single_word=false, "
-                                    "lstrip=false, rstrip=false, and normalized=false in " +
+                                    "lstrip=false, rstrip=false, and normalized=false (or a "
+                                    "tokenizer that declares no normalizer) in " +
                                     std::string(label));
     }
 }
@@ -206,7 +215,8 @@ int parse_added_token_decoder_id(std::string_view key, std::string_view label) {
 }
 
 std::vector<AddedToken>
-load_added_tokens(const Json& root, std::string_view label, std::vector<std::string>& id_to_token,
+load_added_tokens(const Json& root, bool normalizer_is_identity, std::string_view label,
+                  std::vector<std::string>& id_to_token,
                   const std::unordered_set<int>& occupied_vocab_ids,
                   const std::unordered_map<std::string, int>& occupied_vocab_tokens) {
     const Json& added = require_array_field(root, "added_tokens", label);
@@ -216,7 +226,7 @@ load_added_tokens(const Json& root, std::string_view label, std::vector<std::str
     std::unordered_map<std::string, int> seen_added_contents;
     for (const Json& item : added) {
         AddedToken token = parse_added_token(item, label);
-        validate_supported_added_token(token, label);
+        validate_supported_added_token(token, normalizer_is_identity, label);
         const auto index = static_cast<std::size_t>(token.id);
         // A SentencePiece conversion states its specials twice: once in
         // model.vocab, where they hold real ids, and again in added_tokens so the
@@ -247,7 +257,8 @@ load_added_tokens(const Json& root, std::string_view label, std::vector<std::str
     return tokens;
 }
 
-void merge_added_tokens_decoder(const Json& root, std::string_view label,
+void merge_added_tokens_decoder(const Json& root, bool normalizer_is_identity,
+                                std::string_view label,
                                 std::vector<std::string>& id_to_token,
                                 const std::unordered_set<int>& occupied_vocab_ids,
                                 const std::unordered_map<std::string, int>& occupied_vocab_tokens,
@@ -280,7 +291,7 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
                                         std::string(label));
         }
         AddedToken token = parse_added_token_decoder_entry(id, item.value(), label);
-        validate_supported_added_token(token, label);
+        validate_supported_added_token(token, normalizer_is_identity, label);
 
         const auto existing_id = token_by_id.find(id);
         if (existing_id != token_by_id.end()) {
@@ -684,10 +695,16 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     for (const int id : vocab_metadata.occupied_ids) {
         valid_token_ids_.at(static_cast<std::size_t>(id)) = true;
     }
-    added_tokens_ = load_added_tokens(root, tokenizer_label, id_to_token_,
+    // Whether normalising is the identity, which is what decides if an added token's
+    // `normalized` flag can change anything. Both files' added tokens are the same tokens, so
+    // both are judged against the tokenizer.json that declares the normalizer.
+    const bool normalizer_is_identity =
+        !root.contains("normalizer") || root.at("normalizer").is_null();
+    added_tokens_ = load_added_tokens(root, normalizer_is_identity, tokenizer_label, id_to_token_,
                                       vocab_metadata.occupied_ids, vocab_token_to_id_);
-    merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, id_to_token_,
-                               vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
+    merge_added_tokens_decoder(tokenizer_config, normalizer_is_identity, tokenizer_config_label,
+                               id_to_token_, vocab_metadata.occupied_ids, vocab_token_to_id_,
+                               added_tokens_);
     for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
         const std::string& content = added_tokens_[index].content;
         if (!content.empty()) {

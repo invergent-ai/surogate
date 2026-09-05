@@ -20,7 +20,7 @@
 #include "family/impl/runtime/target_support.h"
 
 // clang-format off
-#define SINFER_FAMILY_UNRUNNABLE_LEAVES(NO_LINEAR, NO_SPEC) \
+#define SINFER_FAMILY_UNRUNNABLE_GDN_LEAVES(NO_LINEAR) \
     void Variant::gdn_input_projection(const Tensor&, const GdnProjectionWeights&, Tensor&, Tensor&, \
                                        family::TextPhase, WorkspaceArena&, cudaStream_t) { \
         NO_LINEAR("gdn_input_projection"); \
@@ -38,11 +38,6 @@
                                               Tensor&, Tensor&, Tensor&, Tensor&, family::TextPhase, \
                                               WorkspaceArena&, cudaStream_t) { \
         NO_LINEAR("gdn_input_projection_record"); \
-    } \
- \
-    void Variant::gdn_output_projection(const Tensor&, const Weight&, Tensor&, family::TextPhase, \
-                                        WorkspaceArena&, cudaStream_t) { \
-        NO_LINEAR("gdn_output_projection"); \
     } \
  \
     void Variant::gdn_norm_control_projection(const Tensor&, const Tensor&, float, \
@@ -73,17 +68,29 @@
         return 0; \
     } \
  \
-    std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile, \
-                                                                        family::TextPhase, \
-                                                                        std::int32_t, std::int32_t) { \
-        return 0; \
-    } \
- \
     std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, \
                                                                               std::int32_t) { \
         return 0; \
     } \
  \
+
+// The mixer's output projection, which both mixers reach by this one name because an output
+// projection is the same leaf whichever mixer produced the value it reads. A target that runs
+// either mixer defines it; only a target with no linear layer at all refuses it.
+#define SINFER_FAMILY_UNRUNNABLE_MIXER_OUTPUT_LEAF(NO_LINEAR) \
+    void Variant::gdn_output_projection(const Tensor&, const Weight&, Tensor&, family::TextPhase, \
+                                        WorkspaceArena&, cudaStream_t) { \
+        NO_LINEAR("gdn_output_projection"); \
+    } \
+ \
+    std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family::TextGeometry&, \
+                                                                        WeightsProfile, \
+                                                                        family::TextPhase, \
+                                                                        std::int32_t, std::int32_t) { \
+        return 0; \
+    }
+
+#define SINFER_FAMILY_UNRUNNABLE_SHORT_CONV_LEAVES(NO_LINEAR) \
     void Variant::short_conv_projection(const Tensor&, const Tensor&, float, \
                                         const GdnProjectionWeights&, Tensor&, family::TextPhase, \
                                         WorkspaceArena&, cudaStream_t) { \
@@ -95,8 +102,9 @@
                                                                         family::TextPhase, \
                                                                         std::int32_t, std::int32_t) { \
         return 0; \
-    } \
- \
+    }
+
+#define SINFER_FAMILY_UNRUNNABLE_MTP_LEAVES(NO_SPEC) \
     void Variant::mtp_attention_projection(const Tensor&, const MtpAttentionProjectionWeights&, Tensor&, \
                                            Tensor&, Tensor&, Tensor&, WorkspaceArena&, cudaStream_t) { \
         NO_SPEC("mtp_attention_projection"); \
@@ -137,6 +145,15 @@
         return 0; \
     } \
  \
+ \
+
+// Every half together, which is what a text-only, unspeculated target with no linear mixer at
+// all wants -- and what this macro always meant.
+#define SINFER_FAMILY_UNRUNNABLE_LEAVES(NO_LINEAR, NO_SPEC) \
+    SINFER_FAMILY_UNRUNNABLE_GDN_LEAVES(NO_LINEAR) \
+    SINFER_FAMILY_UNRUNNABLE_MIXER_OUTPUT_LEAF(NO_LINEAR) \
+    SINFER_FAMILY_UNRUNNABLE_SHORT_CONV_LEAVES(NO_LINEAR) \
+    SINFER_FAMILY_UNRUNNABLE_MTP_LEAVES(NO_SPEC) \
  \
     // Parity probe. SUROGATE_SERVE_DUMP_RESIDUAL=<dir> writes each tagged attention \
     // intermediate of the first forward as raw BF16 behind a 16-byte header \

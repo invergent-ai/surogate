@@ -30,12 +30,19 @@
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 namespace {
 
-/// How many of a checkpoint's layers attend, and how many are linear. Which kind a layer is
-/// stays the family's compiled schedule; how many there are follows the layer count.
+/// How many of a checkpoint's layers attend, and how many are linear.
+///
+/// The same question `ModelConfig` answers, and it has to be answered the same way: from the
+/// artifact's schedule where it declares one, and from the target's compiled period otherwise.
+/// Counting these two differently is how a state pool comes to be sized for a layer inventory
+/// the runtime does not have.
 [[nodiscard]] inline std::int32_t geometry_full_attention_layers(const family::TextGeometry& g) {
     std::int32_t count = 0;
     for (std::int32_t layer = 0; layer < g.layers; ++layer) {
-        count += TextConfig::is_full_attention(static_cast<int>(layer)) ? 1 : 0;
+        count += (g.attention_schedule_declared ? g.layer_attends(layer)
+                                                : TextConfig::is_full_attention(static_cast<int>(layer)))
+                     ? 1
+                     : 0;
     }
     return count;
 }
@@ -217,11 +224,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .linear_attention =
                          {
                              .layers         = geometry_gdn_layers(plan.geometry),
-                             .conv_channels  = plan.geometry.convolution_dim(),
+                             // A short convolution runs over the residual width itself and
+                             // carries no recurrent image; a delta net convolves its own fused
+                             // q|k|v and the recurrent matrix is the mixer. One pool, two
+                             // shapes, and the mixer kind is what tells them apart.
+                             .conv_channels  = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                   ? plan.geometry.hidden
+                                                   : plan.geometry.convolution_dim(),
                              .conv_width     = plan.geometry.gdn_conv_state_width(),
-                             .value_heads    = plan.geometry.gdn_value_heads,
-                             .value_head_dim = plan.geometry.gdn_value_head_dim,
-                             .key_head_dim   = plan.geometry.gdn_key_head_dim,
+                             .value_heads    = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                   ? 0
+                                                   : plan.geometry.gdn_value_heads,
+                             .value_head_dim = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                   ? 0
+                                                   : plan.geometry.gdn_value_head_dim,
+                             .key_head_dim   = schedule::kLinearMixer == family::LinearMixer::ShortConv
+                                                   ? 0
+                                                   : plan.geometry.gdn_key_head_dim,
                              .slot_count     = linear_state_slots,
                              .conv_dtype     = DType::BF16,
                          },
@@ -394,6 +413,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                std::int32_t batch_size, std::int32_t min_width,
                                std::int32_t max_width) {
         auto stage = layout.scope();
+        if constexpr (schedule::kLinearMixer == family::LinearMixer::ShortConv) {
+            // The short-convolution mixer's whole round: the projection's three stacked parts,
+            // the convolved value, and the two linears at either end. None of the delta net's
+            // roots exist here -- their widths are the recurrent state's, which is zero.
+            (void)workspace_recipe::short_conv(layout, plan.geometry, last);
+            scratch(layout, Variant::short_conv_projection_workspace_capacity_bytes(
+                                plan.geometry, plan.weights_profile, phase, first, last));
+            scratch(layout, Variant::gdn_output_projection_workspace_capacity_bytes(
+                                plan.geometry, plan.weights_profile, phase, first, last));
+            return;
+        }
         (void)workspace_recipe::gdn_control(layout, plan.geometry, last);
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(plan.geometry, first, last));
         (void)workspace_recipe::gdn_projection(layout, plan.geometry, last);

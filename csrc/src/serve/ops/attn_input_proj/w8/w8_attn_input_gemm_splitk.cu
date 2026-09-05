@@ -211,6 +211,43 @@ constexpr auto make_tiny_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kTinyLaunchers = make_tiny_launchers(
     std::make_index_sequence<kLastCompanionExactCols - kFirstExactCols + 1>{});
 
+// LFM2-1.2B ungated fused qkv exact-T split path (rows 3072 = q2048 | k512 | v512, hidden
+// 2048). Same structure as the two tables above; the bands are Qwen3-0.6B's, the closest
+// registered parent, and were not measured for this shape.
+using Lfm2Output = W8SplitOutput3<2048, 512, 512>;
+
+template <int ActiveCols>
+void launch_lfm2_active_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                             cudaStream_t stream) {
+    static_assert((2048 % kRowsPerCta) == 0 && (512 % kRowsPerCta) == 0);
+    const Lfm2Output output{static_cast<__nv_bfloat16*>(q.data),
+                            static_cast<__nv_bfloat16*>(k.data),
+                            static_cast<__nv_bfloat16*>(v.data)};
+    launch_output<ActiveCols, 3072, 2048>(x, weight, output, stream);
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_lfm2_launchers(std::index_sequence<Offsets...>) {
+    return std::array<CompanionLauncher, sizeof...(Offsets)>{
+        &launch_lfm2_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kLfm2Launchers = make_lfm2_launchers(
+    std::make_index_sequence<kLastCompanionExactCols - kFirstExactCols + 1>{});
+
+template <int TileCols, int KSplits, int NGroups, int MinBlocks>
+void launch_lfm2_medium_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                             Tensor& v, cudaStream_t stream) {
+    const Lfm2Output output{static_cast<__nv_bfloat16*>(q.data),
+                            static_cast<__nv_bfloat16*>(k.data),
+                            static_cast<__nv_bfloat16*>(v.data)};
+    w8_rowsplit_medium_t_splitk_kernel<2048, TileCols, KSplits, NGroups, MinBlocks>
+        <<<3072 / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+}
+
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_tiny_medium_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                              cudaStream_t stream) {
@@ -366,6 +403,30 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
         }
         CUDA_CHECK(cudaGetLastError());
         return;
+    }
+    // LFM2's ungated parent. Its route table hands this schedule T=2..64.
+    if (weight.n == 3072) {
+        if (x.ne[1] < kFirstExactCols || x.ne[1] > 64) {
+            throw std::invalid_argument("W8 lfm2 attention input split-K MMA requires T=2..64");
+        }
+        if (x.ne[1] <= kLastCompanionExactCols) {
+            kLfm2Launchers[x.ne[1] - kFirstExactCols](x, weight, q, k, v, stream);
+        } else if (x.ne[1] <= 48) {
+            launch_lfm2_medium_cols<48, 4, 2, 3>(x, weight, q, k, v, stream);
+        } else {
+            launch_lfm2_medium_cols<64, 4, 2, 2>(x, weight, q, k, v, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // What is left must be the companion, and only the companion. Falling through to it for
+    // any parent that reached here is how a 3072-row weight came to be read by a kernel baked
+    // for 6144 rows: every value past the weight was whatever followed it in the arena, and the
+    // projection came out NaN two layers later with nothing naming the shape that caused it.
+    if (weight.n != kCompanionRows || weight.k != 2048) {
+        throw std::invalid_argument(
+            "W8 attention input split-K MMA: unregistered ungated geometry (n=" +
+            std::to_string(weight.n) + ", k=" + std::to_string(weight.k) + ")");
     }
     if (x.ne[1] < kFirstExactCols || x.ne[1] > 96) {
         throw std::invalid_argument("W8 companion attention input split-K MMA requires T=2..96");

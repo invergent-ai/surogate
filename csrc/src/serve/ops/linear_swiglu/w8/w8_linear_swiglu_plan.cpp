@@ -113,6 +113,17 @@ constexpr std::array<RouteSpec, 3> kTinyLlamaRoutes{{
 static_assert(routes_are_closed(kTinyLlamaRoutes),
               "W8 LinearSwiGLU tinyllama routes must be exact and closed");
 
+// lfm2-1.2b mlp {16384->8192, k=2048}. Same reasoning as the two above: it shares k with the
+// base shape, whose exact-T instantiations are baked 12288 wide, so it takes only the kernels
+// that read their extents from the weight -- the SIMT decode and the runtime-shaped MMA tiles.
+constexpr std::array<RouteSpec, 3> kLfm2Routes{{
+    {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
+    {2, 1024, W8LinearSwiGluScheduleId::MmaR32C128},
+    {1025, kAnyCols, W8LinearSwiGluScheduleId::MmaR64C128},
+}};
+static_assert(routes_are_closed(kLfm2Routes),
+              "W8 LinearSwiGLU lfm2 routes must be exact and closed");
+
 // The one list of (gate_up_rows, output_rows, k) geometries this op serves in
 // W8. The wrapper's shape gate is wider, because it also covers the codecs this
 // plan does not (the 27B's {34816 -> 17408, k=5120} is Q4/Q5), so the two are
@@ -130,6 +141,8 @@ constexpr auto kRegisteredShapes = std::to_array<W8LinearSwiGluShape>({
     {6144, 3072, 1024},
     // tinyllama-1.1b mlp.
     {11264, 5632, 2048},
+    // lfm2-1.2b mlp. Shares k with the base shape and tinyllama; the row counts differ.
+    {16384, 8192, 2048},
 });
 
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
@@ -223,6 +236,9 @@ W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& pr
     // wide and would run tinyllama's weight at the wrong row count.
     if (problem.k == 2048 && problem.gate_up_rows == 11264) {
         return resolve_from(kTinyLlamaRoutes);
+    }
+    if (problem.k == 2048 && problem.gate_up_rows == 16384) {
+        return resolve_from(kLfm2Routes);
     }
     return resolve_from(kRoutes);
 }

@@ -64,6 +64,10 @@ using Gqa128_16q8  = GqaGeometry<128, 16, 8, 1>; // qwen3-0.6b (the first 128-wi
 // modal KVHeads*DecodeSplits is about 340, which four KV heads reach at scale 1 --
 // the same reasoning, and the same answer, as the other four-KV-head shape above.
 using Gqa64_32q4   = GqaGeometry<64, 32, 4, 1>;  // tinyllama-1.1b (the first 64-wide head)
+// DecodeSplitScale 1 for the same reason as the shape above: eight KV heads reach the
+// registry's modal KVHeads*DecodeSplits on their own, and the grid takes its parallelism from
+// that dimension before it needs to take any from the keys.
+using Gqa64_32q8   = GqaGeometry<64, 32, 8, 1>;  // lfm2-1.2b
 // DecodeSplitScale 4: one KV head is the narrowest plane registered, and the grid
 // takes its parallelism from that dimension. At scale 1 it would ask for 85 CTAs,
 // a half-empty wave; 4 restores the registry's modal 340 by splitting the keys
@@ -92,6 +96,7 @@ using Gqa256_4q1   = GqaGeometry<256, 4, 1, 4>;  // gemma-3-270m (the first MQA 
     X(Gqa256_24q2)                                                                                 \
     X(Gqa128_16q8)                                                                                 \
     X(Gqa64_32q4)                                                                                 \
+    X(Gqa64_32q8)                                                                                 \
     X(Gqa256_4q1)
 
 namespace detail {

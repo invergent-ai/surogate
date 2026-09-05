@@ -108,9 +108,13 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
 
     const Tensor conv_shape(nullptr, spec.conv_dtype,
                             {spec.conv_channels, spec.conv_width, spec.slot_count});
-    const Tensor recurrent_shape(
-        nullptr, DType::BF16,
-        {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
+    // Built only where there is one to build: a Tensor of zero extents is not a description of
+    // an empty region, it is a shape that does not exist, and constructing one throws.
+    const Tensor recurrent_shape =
+        spec.has_recurrent() ? Tensor(nullptr, DType::BF16,
+                                      {spec.key_head_dim, spec.value_head_dim, spec.value_heads,
+                                       spec.slot_count})
+                             : Tensor{};
 
     LinearAttentionStatePoolLayout layout;
     layout.spec = spec;
@@ -146,9 +150,11 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
 
     const Tensor conv_shape(nullptr, spec.conv_dtype,
                             {spec.conv_channels, spec.conv_width, spec.slot_count});
-    const Tensor recurrent_shape(
-        nullptr, DType::BF16,
-        {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
+    const Tensor recurrent_shape =
+        spec.has_recurrent() ? Tensor(nullptr, DType::BF16,
+                                      {spec.key_head_dim, spec.value_head_dim, spec.value_heads,
+                                       spec.slot_count})
+                             : Tensor{};
     conv.reserve(layout.conv.size());
     recurrent.reserve(layout.recurrent.size());
     for (std::size_t layer = 0; layer < layout.conv.size(); ++layer) {
