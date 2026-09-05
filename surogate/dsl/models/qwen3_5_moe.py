@@ -58,18 +58,31 @@ QWEN3_5_MOE_MTP_SERVE_SECTION = ServeSection(
 
 #: DFlash: a small dense stack that scores draft continuations. It comes from its
 #: own checkpoint rather than this model's config, so its geometry is declared as
-#: constants on the model below.
+#: constants on the model below. That checkpoint keeps its tensors at the root and
+#: the training graph has no scorer, so the section names them directly rather than
+#: through parameters that do not exist.
 QWEN3_5_MOE_DFLASH_SERVE_SECTION = ServeSection(
     prefix="dflash/layers/",
+    hf_prefix="layers.{index}.",
     objects=(
-        ServeObject("input_norm", "bf16", ("C",)),
-        ServeObject("attention/query_key_value", "quantised", ("DflashQkvRows", "C")),
-        ServeObject("attention/query_norm", "bf16", ("DflashHeadDim",)),
-        ServeObject("attention/key_norm", "bf16", ("DflashHeadDim",)),
-        ServeObject("attention/output", "quantised", ("C", "DflashAttnCols")),
-        ServeObject("post_attention_norm", "bf16", ("C",)),
-        ServeObject("mlp/gate_up", "quantised", ("DflashGateUpRows", "C")),
-        ServeObject("mlp/down", "quantised", ("C", "DflashFfn")),
+        ServeObject("input_norm", "bf16", ("C",), source="input_layernorm.weight"),
+        ServeObject("attention/query_key_value", "quantised", ("DflashQkvRows", "C"),
+                    source=(("self_attn.q_proj.weight", ("DflashAttnCols", "C")),
+                            ("self_attn.k_proj.weight", ("DflashKvRows", "C")),
+                            ("self_attn.v_proj.weight", ("DflashKvRows", "C")))),
+        ServeObject("attention/query_norm", "bf16", ("DflashHeadDim",),
+                    source="self_attn.q_norm.weight"),
+        ServeObject("attention/key_norm", "bf16", ("DflashHeadDim",),
+                    source="self_attn.k_norm.weight"),
+        ServeObject("attention/output", "quantised", ("C", "DflashAttnCols"),
+                    source="self_attn.o_proj.weight"),
+        ServeObject("post_attention_norm", "bf16", ("C",),
+                    source="post_attention_layernorm.weight"),
+        ServeObject("mlp/gate_up", "quantised", ("DflashGateUpRows", "C"),
+                    source=(("mlp.gate_proj.weight", ("DflashFfn", "C")),
+                            ("mlp.up_proj.weight", ("DflashFfn", "C")))),
+        ServeObject("mlp/down", "quantised", ("C", "DflashFfn"),
+                    source="mlp.down_proj.weight"),
     ),
     repeat="dflash_layers",
     capability="dflash",
@@ -77,12 +90,14 @@ QWEN3_5_MOE_DFLASH_SERVE_SECTION = ServeSection(
 
 QWEN3_5_MOE_DFLASH_HEAD_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("dflash/feature_projection", "quantised", ("C", "DflashFeatureRows"), scope="model",
-                capability="dflash"),
-    ServeObject("dflash/context_norm", "bf16", ("C",), scope="model", capability="dflash"),
+                capability="dflash", source="fc.weight"),
+    ServeObject("dflash/context_norm", "bf16", ("C",), scope="model", capability="dflash",
+                source="hidden_norm.weight"),
 )
 
 QWEN3_5_MOE_DFLASH_TAIL_OBJECTS: tuple[ServeObject, ...] = (
-    ServeObject("dflash/final_norm", "bf16", ("C",), scope="model", capability="dflash"),
+    ServeObject("dflash/final_norm", "bf16", ("C",), scope="model", capability="dflash",
+                source="norm.weight"),
 )
 
 def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
@@ -203,6 +218,7 @@ class Qwen3_5MoECausalModel(nn.Model):
     dflash_head_dim = 128
     dflash_qkv_rows = 6144
     dflash_attn_cols = 4096
+    dflash_kv_rows = 1024
     dflash_gate_up_rows = 12288
     dflash_ffn = 6144
     dflash_feature_rows = 16384
@@ -465,6 +481,7 @@ class Qwen3_5MoEConditionalModel(nn.Model):
     dflash_head_dim = 128
     dflash_qkv_rows = 6144
     dflash_attn_cols = 4096
+    dflash_kv_rows = 1024
     dflash_gate_up_rows = 12288
     dflash_ffn = 6144
     dflash_feature_rows = 16384

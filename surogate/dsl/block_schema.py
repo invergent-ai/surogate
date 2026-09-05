@@ -66,7 +66,12 @@ class ServeObject:
     #: The checkpoint tensor, relative to the section's `hf_prefix`, for an object the
     #: training graph has no parameter for (a draft head's own norms and projection).
     #: An object names either components or a source, never both.
-    source: str | None = None
+    #:
+    #: Several tensors, row-concatenated in the order given, when the object fuses what
+    #: the checkpoint keeps apart — a scorer's `q | k | v`. Each is then a
+    #: `(name, shape)` pair, because only the object's total rows are declared above and
+    #: the split between the parts is not derivable from it.
+    source: str | tuple[str, ...] | tuple[tuple[str, tuple[str | int, ...]], ...] | None = None
 
 
 @dataclass(frozen=True)

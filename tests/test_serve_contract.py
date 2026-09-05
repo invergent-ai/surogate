@@ -607,3 +607,60 @@ def test_row_cut_names_the_parts_it_falls_on():
     ]
     with pytest.raises(ValueError):
         cut_rows((TensorRecipe("x/attention/qkgv", fused),), {"attention/qkgv": (("attention/qk", 6),)})
+
+
+def test_a_substack_names_its_own_checkpoint_tensors():
+    """A sub-stack the training graph does not compute — a draft scorer that ships as its
+    own checkpoint — declares the tensors it reads rather than leaving a converter to know
+    them. Several tensors row-concatenate into one fused object, each stating its shape,
+    because the object declares only their total."""
+    from surogate.serve.convert.common.declaration import declare, derive_recipes
+    from surogate.serve.convert.common.recipe import Concat, SourceTensor, expression_shape
+    from surogate.serve.convert.qwen3_5_moe import inventory
+    from surogate.dsl.ir_builder import resolve_architecture
+
+    config = inventory.hf_config_for()
+    declaration = declare(resolve_architecture(config), config, flat_sources=False)
+    derived = {
+        r.object_name: r.expression
+        for r in derive_recipes(declaration, capabilities={"text", "dflash"})
+        if r.object_name.startswith("dflash/")
+    }
+    assert len(derived) == len(inventory.DFLASH_TENSOR_SPECS)
+    assert set(derived) == {spec.name for spec in inventory.DFLASH_TENSOR_SPECS}
+
+    # Its tensors sit at the root of that checkpoint, indexed per layer.
+    assert derived["dflash/feature_projection"] == SourceTensor(
+        "fc.weight", (2048, 16384)
+    )
+    fused = derived["dflash/layers/3/attention/query_key_value"]
+    assert isinstance(fused, Concat) and fused.axis == 0
+    assert [part.name for part in fused.sources] == [
+        "layers.3.self_attn.q_proj.weight",
+        "layers.3.self_attn.k_proj.weight",
+        "layers.3.self_attn.v_proj.weight",
+    ]
+    spec = next(s for s in inventory.DFLASH_TENSOR_SPECS
+                if s.name == "dflash/layers/3/attention/query_key_value")
+    assert expression_shape(fused) == tuple(spec.shape)
+
+
+def test_a_multi_tensor_source_must_state_each_shape():
+    """The object declares its total rows; where the split falls is not derivable from it,
+    so a bare tuple of names is refused rather than guessed at."""
+    from surogate.dsl.block_schema import ServeObject
+    from surogate.serve.convert.common.declaration import DeclaredObject, _sources_of
+
+    named = DeclaredObject(name="x", shape=(8, 4), format="bf16", source=("a.weight", "b.weight"))
+    with pytest.raises(ValueError, match="states each one's shape"):
+        _sources_of(named)
+    paired = DeclaredObject(
+        name="x", shape=(8, 4), format="bf16",
+        source=(("a.weight", ("C",)), ("b.weight", ("C",))),
+    )
+    assert _sources_of(paired) == (("a.weight", ("C",)), ("b.weight", ("C",)))
+    assert _sources_of(DeclaredObject(name="x", shape=(4,), format="bf16", source="a.weight")) == (
+        ("a.weight", None),
+    )
+    # The schema accepts every one of these spellings.
+    assert ServeObject("y", "bf16", ("C",), source="a.weight").source == "a.weight"

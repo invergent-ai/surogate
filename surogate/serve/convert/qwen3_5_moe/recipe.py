@@ -64,14 +64,18 @@ def _build_declared_recipes() -> tuple[TensorRecipe, ...]:
     the rows the artifact stores — and, where the checkpoint fuses gate and up, also
     accepts the stacked spelling a GGUF of the same model keeps them in.
 
+    The DFlash scorer comes along: it ships as its own checkpoint with its tensors at
+    the root and the training graph has no scorer, so its section names those tensors
+    directly (`ServeObject.source`) instead of naming parameters that do not exist.
+
     `flat_sources=False` keeps the source names in the nested `model.language_model.`
     dialect this converter's recipes, its preflight and its GGUF repack plan are all
     written against; the reader canonicalises both spellings, so this is a convention,
-    not a constraint.
+    not a constraint. It does not reach the scorer, whose names are already at the root.
     """
     config = inventory.hf_config_for()
     declaration = declare(resolve_architecture(config), config, flat_sources=False)
-    return derive_recipes(declaration, capabilities={"text"})
+    return derive_recipes(declaration, capabilities={"text", "dflash"})
 
 
 def _build_draft_head_recipes() -> tuple[TensorRecipe, ...]:
@@ -151,111 +155,29 @@ def _build_mtp_recipes() -> tuple[TensorRecipe, ...]:
     return tuple(recipes)
 
 
-def _build_dflash_recipes() -> tuple[TensorRecipe, ...]:
-    recipes: list[TensorRecipe] = [
-        TensorRecipe(
-            "dflash/feature_projection",
-            source("fc.weight", (2048, 16384)),
-        ),
-        TensorRecipe(
-            "dflash/context_norm",
-            source("hidden_norm.weight", (2048,)),
-        ),
-    ]
-    for layer in inventory.DFLASH_LAYERS:
-        source_prefix = f"layers.{layer}."
-        object_prefix = f"dflash/layers/{layer}/"
-        recipes.extend(
-            (
-                TensorRecipe(
-                    object_prefix + "input_norm",
-                    source(source_prefix + "input_layernorm.weight", (2048,)),
-                ),
-                TensorRecipe(
-                    object_prefix + "attention/query_key_value",
-                    Concat(
-                        (
-                            source(
-                                source_prefix + "self_attn.q_proj.weight",
-                                (4096, 2048),
-                            ),
-                            source(
-                                source_prefix + "self_attn.k_proj.weight",
-                                (1024, 2048),
-                            ),
-                            source(
-                                source_prefix + "self_attn.v_proj.weight",
-                                (1024, 2048),
-                            ),
-                        ),
-                        0,
-                    ),
-                ),
-                TensorRecipe(
-                    object_prefix + "attention/query_norm",
-                    source(source_prefix + "self_attn.q_norm.weight", (128,)),
-                ),
-                TensorRecipe(
-                    object_prefix + "attention/key_norm",
-                    source(source_prefix + "self_attn.k_norm.weight", (128,)),
-                ),
-                TensorRecipe(
-                    object_prefix + "attention/output",
-                    source(
-                        source_prefix + "self_attn.o_proj.weight",
-                        (2048, 4096),
-                    ),
-                ),
-                TensorRecipe(
-                    object_prefix + "post_attention_norm",
-                    source(
-                        source_prefix + "post_attention_layernorm.weight",
-                        (2048,),
-                    ),
-                ),
-                TensorRecipe(
-                    object_prefix + "mlp/gate_up",
-                    Concat(
-                        (
-                            source(
-                                source_prefix + "mlp.gate_proj.weight",
-                                (6144, 2048),
-                            ),
-                            source(
-                                source_prefix + "mlp.up_proj.weight",
-                                (6144, 2048),
-                            ),
-                        ),
-                        0,
-                    ),
-                ),
-                TensorRecipe(
-                    object_prefix + "mlp/down",
-                    source(
-                        source_prefix + "mlp.down_proj.weight",
-                        (2048, 6144),
-                    ),
-                ),
-            )
-        )
-    recipes.append(
-        TensorRecipe("dflash/final_norm", source("norm.weight", (2048,)))
-    )
-    return tuple(recipes)
+def _in_inventory_order(recipes, specs) -> tuple[TensorRecipe, ...]:
+    """`recipes` as the inventory lists them. The declaration emits its objects in the
+    order it declares them, which is not the order the container writes them, and
+    `validate_recipe_coverage` compares the two lists position by position."""
+    by_name = {item.object_name: item for item in recipes}
+    ordered = tuple(by_name.pop(spec.name) for spec in specs)
+    if by_name:
+        raise ValueError(f"recipes for objects the inventory does not list: {sorted(by_name)[:6]}")
+    return ordered
 
 
-_DECLARED_RECIPE_SPECS = _build_declared_recipes()
-_TEXT_RECIPE_SPECS = tuple(r for r in _DECLARED_RECIPE_SPECS if not r.object_name.startswith("mtp/"))
-_MTP_RECIPE_SPECS = tuple(r for r in _DECLARED_RECIPE_SPECS if r.object_name.startswith("mtp/"))
+_DECLARED_RECIPE_SPECS = _build_declared_recipes() + _build_draft_head_recipes() + build_vision_recipes(2048)
 
-#: The inventory's order: the text stack, the draft head, the MTP head, then the tower.
-BASE_RECIPE_SPECS = (
-    _TEXT_RECIPE_SPECS
-    + _build_draft_head_recipes()
-    + _MTP_RECIPE_SPECS
-    + build_vision_recipes(2048)
+#: The two source checkpoints this target reads, kept apart because they are opened by
+#: two readers and preflighted separately: the model, and the DFlash scorer beside it.
+BASE_RECIPE_SPECS = _in_inventory_order(
+    (r for r in _DECLARED_RECIPE_SPECS if not r.object_name.startswith("dflash/")),
+    inventory.TENSOR_SPECS[: -len(inventory.DFLASH_TENSOR_SPECS)],
 )
-DFLASH_RECIPE_SPECS = _build_dflash_recipes()
+DFLASH_RECIPE_SPECS = _in_inventory_order(
+    (r for r in _DECLARED_RECIPE_SPECS if r.object_name.startswith("dflash/")),
+    inventory.DFLASH_TENSOR_SPECS,
+)
 
 
 def build_recipes(geometry=None) -> tuple[TensorRecipe, ...]:

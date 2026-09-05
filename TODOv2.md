@@ -119,32 +119,54 @@ product rather than tasks (1 and 6); the rest are work.
    of the int8 tile itself, fixed here: its activation planes carried the raw Σx and now
    carry d·Σq, matching the GEMV route (real-tensor error 1.25e-2 -> 1.77e-3 relative).
 
-3. **[~] Unify weight loading with the trainer: the mapping is derived now, for
-   the first family (2026-09-05).** The recipes no longer restate *dimensions*
-   (the artifact carries them) and, for Qwen3.5, no longer restate the *mapping*
-   either: `surogate/serve/convert/common/declaration.py` reads the declaration —
-   `hf_mapping` for where every parameter lives in the checkpoint,
-   `ServeObject.components` for which parameters each artifact object is built
-   from, in row order — and derives the recipe. A component is a parameter or
-   `param.slice`, a LoRA target name, which is how `mlp/gate_up` is spelled
-   `gate | up` where the trainer's fused parameter is `up | gate` (that "straight
-   pass-through" was never one). The MTP section says where the checkpoint keeps
-   it (`hf_prefix`, `hf_layer`) and replays the attention block's objects through
-   the same mapping. What the converter still states is exactly what the
-   declaration does not describe: the 27B storage cut (a row cut on the derived
-   fused object, `cut_rows`, folded so it names the parts), the draft head's
-   ranking policy, and the vision tower. `qwen3_5/recipe.py`: 358 → 160 lines.
-   - Proven by regeneration: derived recipes equal the committed hand-written ones
-     expression for expression, in inventory order, for the 0.8B/2B/4B configs (with
-     and without the checkpoint config in hand), the registered 2B, the 27B and the
-     3.8. Then gated: 0.8B Q4_K_M through the re-derived repack plan 15.031 vs
-     llama.cpp 15.025; 0.8B HF→W8 artifact 14.78 (BF16 torch reference 14.60).
-   - The next targets, and why each is not a mechanical repeat: `qwen3` declares no
-     serve objects yet; `gemma3`'s declared `attention/query` does not assemble to
-     its own shape from its components (the derivation is the check that found it);
-     the MoE families map experts with `stack_experts`, which the derivation refuses
-     rather than guesses at; `qwen4exp`'s recipes are written against GGUF names, a
-     different dialect from `hf_mapping`.
+3. **[x] Unify weight loading with the trainer — done (2026-09-05).** Every target
+   that reads a checkpoint the trainer can also read now derives its mapping from
+   the declaration instead of restating it.
+   `surogate/serve/convert/common/declaration.py` reads `hf_mapping` for where each
+   parameter lives and `ServeObject.components` for which parameters build each
+   artifact object, in row order, and emits the recipe. A component may name a LoRA
+   slice of a fused parameter (`mlp_up_weight.gate`), which is how the artifact's
+   `gate | up` is spelled against the trainer's `up | gate`. A sub-stack the training
+   graph does not compute — a draft head, a scorer that ships as its own checkpoint —
+   names its tensors directly through `ServeObject.source` and `ServeSection`'s
+   `hf_prefix`/`hf_layer`.
+
+   | target | recipe lines | what it derives |
+   |---|---|---|
+   | qwen3_5 | 358 → 158 | text stack + MTP head |
+   | qwen3_5_moe | 620 → 323 | text stack + MTP head + DFlash scorer |
+   | gemma3 | 215 → 163 | whole artifact |
+   | llama | 187 → 130 | whole artifact |
+   | qwen3 | 188 → 126 | whole artifact |
+
+   Qwen3 and Llama had no serve declaration at all and gained one. Gemma 3 had one
+   that was wrong in a way only derivation could catch: its three attention objects
+   each named the whole fused `qkv` parameter rather than their own slice of it.
+
+   What the converters still state is what the declaration does not describe: a
+   storage decision that cuts a fused object into typed halves (the 27B, applied as a
+   row cut), the draft head's ranking policy over the vocabulary, the vision tower,
+   and the per-profile format tables.
+
+   Correctness is by regeneration: every derived recipe equals the committed
+   hand-written one, expression for expression and in inventory order, at every size
+   and both tie settings, with the MoE's source-count typo guards unchanged (1,127
+   and 69). Gated: 35B-A3B Q4_K_M 5.5752 against llama.cpp 5.5776 on the same
+   40 windows; 0.8B Q4_K_M 15.031 against 15.025; 0.8B HF→W8 14.78 against a BF16
+   torch reference of 14.60; Qwen3-0.6B, TinyLlama-1.1B and Gemma 3 270M each
+   converted from their checkpoints and answered coherently.
+
+   **Not unified, and not a restatement:** `qwen4exp` and `gemma_embedding` read
+   GGUFs and nothing else — Flash-Next's draft head is a GGUF too. Their recipes name
+   llama.cpp tensors (`blk.N.attn_q.weight`) and carry llama.cpp's own value
+   inversions: the tiled GDN value-head order and the column-tiled `ssm_out`. None of
+   that is in `hf_mapping`, because the trainer cannot read those files. Unifying them
+   would mean putting llama.cpp's naming into the training declaration, where nineteen
+   architectures would inherit it, rather than leaving it in `serve/gguf/` and the
+   converters, which is where GGUF naming already lives. `gemma_embedding` is already
+   joined to the declaration as far as that allows: it derives its object list, keys
+   its sources by the declaration's own object names, and validates both directions.
+
 4. **[~] Flash-Next: the offload path's remaining levers (2026-09-04).** The
    board rows are met on defaults (33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
    users); what is left is above them.

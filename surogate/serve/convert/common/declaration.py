@@ -168,6 +168,7 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "DflashHeadDim": config.get("dflash_head_dim", 0),
         "DflashQkvRows": config.get("dflash_qkv_rows", 0),
         "DflashAttnCols": config.get("dflash_attn_cols", 0),
+        "DflashKvRows": config.get("dflash_kv_rows", 0),
         "DflashGateUpRows": config.get("dflash_gate_up_rows", 0),
         "DflashFfn": config.get("dflash_ffn", 0),
         "DflashFeatureRows": config.get("dflash_feature_rows", 0),
@@ -573,6 +574,21 @@ def text_config(
     }
 
 
+def _sources_of(obj: DeclaredObject) -> tuple[tuple[str, tuple[str | int, ...] | None], ...]:
+    """One object's checkpoint tensors, each with its own shape or `None` for the whole
+    object. One name is the object itself; several are row-concatenated in the order
+    given, and each then states its shape because the object declares only their total."""
+    source = obj.source
+    if isinstance(source, str):
+        return ((source, None),)
+    if all(isinstance(entry, str) for entry in source):
+        raise ValueError(
+            f"{obj.name}: an object built from several checkpoint tensors states each one's "
+            f"shape, as (name, shape) pairs — only their total rows are declared"
+        )
+    return tuple((name, shape) for name, shape in source)
+
+
 def declare(architecture: str, hf_config: dict[str, Any], *,
             flat_sources: bool = True) -> Declaration:
     return Declaration(
@@ -747,9 +763,16 @@ def derive_recipes(
     for obj in declaration.objects(capabilities=capabilities):
         if obj.source is not None:
             prefix = getattr(obj.section, "hf_prefix", "") if obj.section is not None else ""
-            expression: Expression = SourceTensor(
-                declaration.source_name(prefix + obj.source), obj.shape
-            )
+            if obj.index is not None:
+                prefix = prefix.replace("{index}", str(obj.index))
+            parts = [
+                SourceTensor(
+                    declaration.source_name(prefix + name),
+                    obj.shape if shape is None else resolve(shape, declaration.symbols),
+                )
+                for name, shape in _sources_of(obj)
+            ]
+            expression: Expression = _concat_rows(parts, obj, declaration)
         elif obj.components:
             hf_layer = getattr(obj.section, "hf_layer", None) if obj.section is not None else None
             if hf_layer is not None and obj.index is not None:
