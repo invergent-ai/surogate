@@ -85,6 +85,12 @@ using Gqa64_32q8   = GqaGeometry<64, 32, 8, 1>;  // lfm2-1.2b
 // interleaved twice. The scale is buying grid width, and that is worth more
 // here than tile-sized splits.
 using Gqa256_4q1   = GqaGeometry<256, 4, 1, 4>;  // gemma-3-270m (the first MQA shape)
+// GLM-5.3-Flash's latent attention, expanded. Its `kv_b` gives every query head its own key and
+// value, so the served shape is plain multi-head attention -- 64 over 64 -- rather than a
+// grouped one; the compression lives in the projections before it, not in the head counts.
+// DecodeSplitScale 1: sixty-four KV heads are already far past the registry's modal
+// KVHeads*DecodeSplits, and the grid takes its parallelism from that dimension first.
+using Gqa256_64q64 = GqaGeometry<256, 64, 64, 1>; // glm-5.3-flash
 
 // The registry. Every dispatcher below and in the launchers is generated from
 // this list, so a registration line is the whole of adding a shape — with the
@@ -102,7 +108,8 @@ using Gqa256_4q1   = GqaGeometry<256, 4, 1, 4>;  // gemma-3-270m (the first MQA 
     X(Gqa128_32q4)                                                                                 \
     X(Gqa64_32q4)                                                                                 \
     X(Gqa64_32q8)                                                                                 \
-    X(Gqa256_4q1)
+    X(Gqa256_4q1)                                                                                  \
+    X(Gqa256_64q64)
 
 namespace detail {
 
