@@ -22,6 +22,9 @@
 // always available and numerically authoritative.
 
 #include "core/decode_graph.h"
+#include "ops/linear/bf16/bf16_cublaslt.h"
+#include "ops/linear/fp8/fp8_cublaslt.h"
+#include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 #include "api/types.h"
 #include "core/device.h"
 #include "core/device_footprint.h"
@@ -175,6 +178,16 @@ public:
         }
         try {
             const DeviceFootprint footprint_before = sample_device_footprint();
+
+            // A prefill bucket is captured lazily, under a live request, on whichever thread
+            // and device the round is running -- not on the one that built the program. Every
+            // cuBLASLt plane creates its handle and workspace on first use, and creating them
+            // allocates, which a capture forbids. Prewarming here is what makes "the first
+            // request on a device captures" a legal thing to do; the program constructor's
+            // prewarm only covers the device and context it was built in.
+            ops::detail::bf16_cublaslt_prewarm();
+            ops::detail::fp8_cublaslt_prewarm();
+            ops::detail::nvfp4_cublaslt_prewarm();
 
             DecodeGraphDefinition definition;
             definition.capture(device_.stream, body);

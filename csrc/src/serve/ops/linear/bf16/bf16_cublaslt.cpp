@@ -86,9 +86,27 @@ DeviceState& state_for_current_device() {
     const std::lock_guard<std::mutex> lock(plane.mutex);
     auto& slot = plane.by_device[device];
     if (slot == nullptr) {
+        // The handle and its workspace are per device *and* per engine context, and creating
+        // them allocates -- which a stream capture forbids. A capture in thread-local mode is
+        // not visible on the legacy stream, so the allocation is what reports it, and the
+        // driver's own message says only "unsupported". Name the subject instead: reaching
+        // here under capture means this engine never prewarmed this device.
         auto state = std::make_unique<DeviceState>();
         check(cublasLtCreate(&state->handle), "create");
-        CUDA_CHECK(cudaMalloc(&state->workspace, kWorkspaceBytes));
+        if (const cudaError_t status = cudaMalloc(&state->workspace, kWorkspaceBytes);
+            status != cudaSuccess) {
+            (void)cublasLtDestroy(state->handle);
+            if (status == cudaErrorStreamCaptureUnsupported) {
+                throw std::runtime_error(
+                    "bf16 cuBLASLt: device " + std::to_string(device) +
+                    " has no handle in this engine's context and a graph capture is active, so "
+                    "one cannot be created. Call bf16_cublaslt_prewarm() on this device, in "
+                    "this context, before any capture.");
+            }
+            throw std::runtime_error("bf16 cuBLASLt: could not allocate the workspace on device " +
+                                     std::to_string(device) + ": " +
+                                     cudaGetErrorString(status));
+        }
         slot = std::move(state);
     }
     return *slot;
