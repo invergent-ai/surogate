@@ -393,6 +393,10 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     if (body.contains("return_token_ids") && body.at("return_token_ids").is_boolean()) {
         out.return_token_ids = body.at("return_token_ids").get<bool>();
     }
+    if (body.contains("add_generation_prompt") &&
+        body.at("add_generation_prompt").is_boolean()) {
+        out.add_generation_prompt = body.at("add_generation_prompt").get<bool>();
+    }
     if (body.contains("tokens") && !body.at("tokens").is_null()) {
         const Json& tokens = body.at("tokens");
         if (!tokens.is_array()) { bad_request("tokens must be an array of integers", "tokens"); }

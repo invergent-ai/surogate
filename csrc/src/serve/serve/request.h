@@ -203,6 +203,16 @@ struct GenerationRequest {
     /// the trajectory into separate training samples. `messages` is still parsed
     /// and still carries the tools and the parser state; only the ids change.
     std::vector<sinfer::TokenId> prompt_token_ids;
+    /// Whether to append the template's generation prompt. Unset means yes, which
+    /// is what generating needs.
+    ///
+    /// A turn-stitching client asks for it to be off when it tokenises a fragment
+    /// it means to place *before* something else: it renders one message with the
+    /// prompt and once without, and the difference is the separator the template
+    /// inserts between turns. Ignoring the flag made both renders identical, the
+    /// client's prefix check failed, and it silently fell back to re-rendering
+    /// every turn -- which is the thing the token endpoint exists to avoid.
+    std::optional<bool> add_generation_prompt;
     SamplingParams sampling;
 
     /// The adapter this request selected by naming it in `model`, empty for the

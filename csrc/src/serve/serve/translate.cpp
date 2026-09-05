@@ -214,7 +214,7 @@ sinfer::PromptInput to_prompt_input(const GenerationRequest& request,
         input.messages.push_back(std::move(message));
     }
 
-    input.options.add_generation_prompt = true;
+    input.options.add_generation_prompt = request.add_generation_prompt.value_or(true);
     input.options.enable_thinking       = semantics.enable_thinking;
     input.options.reasoning_effort      = semantics.reasoning_effort;
     input.options.preserve_thinking     = semantics.preserve_thinking;
