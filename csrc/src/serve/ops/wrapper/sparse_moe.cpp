@@ -168,9 +168,17 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
         throw std::invalid_argument(
             "sparse_moe: routed_down must be Q5, Q6, W8, NVFP4, or a GGML K-quant");
     }
-    if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
-        weights.shared_down.qtype != QType::W8G32_F16S) {
-        throw std::invalid_argument("sparse_moe: shared weights must be W8");
+    if (geometry.has_shared()) {
+        if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
+            weights.shared_down.qtype != QType::W8G32_F16S) {
+            throw std::invalid_argument("sparse_moe: shared weights must be W8");
+        }
+    } else if (weights.shared_gate_up.qdata != nullptr || weights.shared_down.qdata != nullptr) {
+        // A routed-only geometry with shared weights attached is a caller that thinks this
+        // mixture has an always-on expert. Nothing downstream would read them, so the round
+        // would come out missing a path and say nothing.
+        throw std::invalid_argument(
+            "sparse_moe: this geometry routes every token, so it must carry no shared weights");
     }
     // NVFP4's second level is not optional: the checkpoint's per-expert global scale spans 3-7x
     // across the experts of one layer, so a missing array is not a small error but a per-expert
@@ -228,21 +236,24 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
         require_quantized(weights.routed_down, weights.routed_down.n, geometry.intermediate,
                           "routed_down", ranges);
     }
-    require_quantized(weights.shared_gate_up, geometry.expert_rows(), geometry.hidden,
-                      "shared_gate_up", ranges);
-    require_quantized(weights.shared_down, geometry.hidden, geometry.intermediate, "shared_down",
-                      ranges);
+    if (geometry.has_shared()) {
+        require_quantized(weights.shared_gate_up, geometry.shared_rows(), geometry.hidden,
+                          "shared_gate_up", ranges);
+        require_quantized(weights.shared_down, geometry.hidden, geometry.shared_intermediate,
+                          "shared_down", ranges);
+    }
 }
 
 void require_registered(const SparseMoeGeometry& geometry) {
-    if (geometry != kSparseMoeQwen36Geometry && geometry != kSparseMoeFlashNextGeometry) {
-        throw std::invalid_argument("sparse_moe: geometry {hidden " +
-                                    std::to_string(geometry.hidden) + ", experts " +
-                                    std::to_string(geometry.experts) + ", top-k " +
-                                    std::to_string(geometry.experts_per_token) +
-                                    ", intermediate " + std::to_string(geometry.intermediate) +
-                                    "} is not registered");
+    for (const SparseMoeGeometry& registered : kSparseMoeGeometries) {
+        if (geometry == registered) { return; }
     }
+    throw std::invalid_argument(
+        "sparse_moe: geometry {hidden " + std::to_string(geometry.hidden) + ", experts " +
+        std::to_string(geometry.experts) + ", top-k " +
+        std::to_string(geometry.experts_per_token) + ", intermediate " +
+        std::to_string(geometry.intermediate) + ", shared " +
+        std::to_string(geometry.shared_intermediate) + "} is not registered");
 }
 
 } // namespace
@@ -273,11 +284,19 @@ void sparse_moe_prepare(const SparseMoeWeights& weights, std::int32_t max_tokens
 }
 
 SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights) {
+    // Every dimension comes from the weight that carries it. The routed experts' width used to
+    // be read off the *shared* expert's down projection, which is right only where the two are
+    // equal and meaningless where there is no shared expert at all; `routed_down` is [E*hidden,
+    // intermediate] and states it directly.
+    const bool shared = weights.shared_down.qdata != nullptr;
     const SparseMoeGeometry geometry{
-        .hidden            = weights.router_shared_gate.k,
-        .experts           = weights.router_shared_gate.n - 1,
-        .experts_per_token = weights.experts_per_token,
-        .intermediate      = weights.shared_down.k,
+        .hidden              = weights.router_shared_gate.k,
+        // The router's extra row is the shared expert's gate, so it is there exactly when the
+        // shared expert is.
+        .experts             = weights.router_shared_gate.n - (shared ? 1 : 0),
+        .experts_per_token   = weights.experts_per_token,
+        .intermediate        = weights.routed_down.k,
+        .shared_intermediate = shared ? weights.shared_down.k : 0,
     };
     require_registered(geometry);
     return geometry;

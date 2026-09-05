@@ -35,8 +35,10 @@ __device__ __forceinline__ SparseMoeRankedValue sparse_moe_warp_best(SparseMoeRa
 }
 
 // One warp selects the top-k of `Experts` router logits (each lane owns Experts/32 of them),
-// renormalises them with a softmax, and reads the shared-expert gate from logit `Experts`.
-template <int Experts, int TopK>
+// renormalises them with a softmax, and -- where the mixture has an always-on expert -- reads
+// its gate from logit `Experts`. A routed-only router has exactly `Experts` rows, so there is no
+// such logit to read and `HasShared` is what says so; `shared_scale` is then untouched.
+template <int Experts, int TopK, bool HasShared = true>
 __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores, int* ids,
                                                              float* alpha, float* shared_scale,
                                                              float* selected_logits) {
@@ -80,7 +82,9 @@ __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores
     float denominator = warp_reduce_sum(exponential);
     denominator       = __shfl_sync(kFullWarpMask, denominator, 0);
     if (lane < TopK) { alpha[lane] = exponential / denominator; }
-    if (lane == 0) { *shared_scale = sigmoid(scores[Experts]); }
+    if constexpr (HasShared) {
+        if (lane == 0) { *shared_scale = sigmoid(scores[Experts]); }
+    }
 }
 
 } // namespace sinfer::ops::detail

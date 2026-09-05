@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 
 namespace sinfer::ops {
@@ -20,24 +21,53 @@ struct SparseMoeGeometry {
     std::int32_t experts           = 0;
     std::int32_t experts_per_token = 0;
     std::int32_t intermediate      = 0;
+    /// The always-on expert's FFN width, or zero where there is no always-on expert.
+    ///
+    /// Not every mixture has one. Qwen3-30B-A3B, LFM2-MoE, GPT-OSS and Gemma 4 route every
+    /// token entirely, and this op assumed the opposite so thoroughly that it read the routed
+    /// experts' width off the shared expert's `down` projection -- so a checkpoint without one
+    /// had no width at all, not merely a missing path. Zero here means the mixture is routed
+    /// and nothing else: no extra router row, one fewer path per token, no shared weights.
+    std::int32_t shared_intermediate = 0;
 
-    [[nodiscard]] constexpr std::int32_t router_rows() const noexcept { return experts + 1; }
+    [[nodiscard]] constexpr bool has_shared() const noexcept { return shared_intermediate > 0; }
+    /// The router carries one row per expert, plus the shared expert's gate where there is one.
+    [[nodiscard]] constexpr std::int32_t router_rows() const noexcept {
+        return experts + (has_shared() ? 1 : 0);
+    }
     [[nodiscard]] constexpr std::int32_t expert_rows() const noexcept { return 2 * intermediate; }
+    [[nodiscard]] constexpr std::int32_t shared_rows() const noexcept {
+        return 2 * shared_intermediate;
+    }
     [[nodiscard]] constexpr std::int32_t routed_gate_rows() const noexcept {
         return experts * expert_rows();
     }
     [[nodiscard]] constexpr std::int32_t routed_down_rows() const noexcept {
         return experts * hidden;
     }
-    [[nodiscard]] constexpr std::int32_t paths() const noexcept { return experts_per_token + 1; }
+    /// How many expert outputs a token's result sums: its selected experts, and the shared one
+    /// where there is one.
+    [[nodiscard]] constexpr std::int32_t paths() const noexcept {
+        return experts_per_token + (has_shared() ? 1 : 0);
+    }
 
     friend constexpr bool operator==(const SparseMoeGeometry&, const SparseMoeGeometry&) = default;
 };
 
-/// Qwen3.5/3.6 MoE (35B-A3B and the 4B/2B MTP heads): 256 experts, top-8, FFN 512, hidden 2048.
-inline constexpr SparseMoeGeometry kSparseMoeQwen36Geometry{2048, 256, 8, 512};
-/// Qwen3.8-Flash-Next: 512 experts, top-10, FFN 640, hidden 2560.
-inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{2560, 512, 10, 640};
+/// Qwen3.5/3.6 MoE (35B-A3B and the 4B/2B MTP heads): 256 experts, top-8, FFN 512, hidden 2048,
+/// plus a shared expert of the same width.
+inline constexpr SparseMoeGeometry kSparseMoeQwen36Geometry{2048, 256, 8, 512, 512};
+/// Qwen3.8-Flash-Next: 512 experts, top-10, FFN 640, hidden 2560, shared expert of the same
+/// width.
+inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{2560, 512, 10, 640, 640};
+/// Qwen3-30B-A3B: 128 experts, top-8, FFN 768, hidden 2048, and no shared expert at all -- the
+/// first registered mixture that routes every token entirely.
+inline constexpr SparseMoeGeometry kSparseMoeQwen3MoeGeometry{2048, 128, 8, 768, 0};
+
+/// Every mixture this op serves. One list, so registering a geometry is one line here and one
+/// kernel-body instantiation per route rather than a predicate repeated in five places.
+inline constexpr std::array<SparseMoeGeometry, 3> kSparseMoeGeometries{
+    kSparseMoeQwen36Geometry, kSparseMoeFlashNextGeometry, kSparseMoeQwen3MoeGeometry};
 
 struct SparseMoeWeights {
     Weight router_shared_gate;

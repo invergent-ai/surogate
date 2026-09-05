@@ -116,17 +116,27 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     out.route_job_count               = arena.alloc(DType::I32, {1}, 256);
 
     // Lifetime unions must hold both tenants; the per-token byte counts are checked here so a
-    // new geometry cannot silently overrun them.
+    // new geometry cannot silently overrun them. The score storage's second tenant is the
+    // shared expert's activation, so a mixture without one has only a single tenant there and
+    // nothing to check -- and nothing to hold: 128 experts of FP32 scores are narrower than a
+    // 768-wide BF16 activation, which is a union that would have to grow for an activation that
+    // is never written.
     const std::int32_t score_rows = sparse_moe_router_score_rows(geometry);
-    if (static_cast<std::int64_t>(score_rows) * 4 < static_cast<std::int64_t>(inter) * 2 ||
+    const bool score_union_holds =
+        !geometry.has_shared() ||
+        static_cast<std::int64_t>(score_rows) * 4 >= static_cast<std::int64_t>(inter) * 2;
+    if (!score_union_holds ||
         static_cast<std::int64_t>(inter) * geometry.experts_per_token * 2 <
             static_cast<std::int64_t>(hidden) * 4 ||
         static_cast<std::int64_t>(hidden) * geometry.experts_per_token * 2 <
             static_cast<std::int64_t>(geometry.paths()) * inter * 4) {
         throw std::invalid_argument("sparse_moe prefill: geometry breaks a workspace union");
     }
-    out.score_storage     = arena.alloc(DType::FP32, {score_rows, capacity_tokens}, 256);
-    out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {inter, capacity_tokens});
+    out.score_storage = arena.alloc(DType::FP32, {score_rows, capacity_tokens}, 256);
+    out.shared_activation =
+        geometry.has_shared()
+            ? Tensor(out.score_storage.data, DType::BF16, {inter, capacity_tokens})
+            : Tensor{};
 
     out.grouped_io = arena.alloc(DType::BF16, {hidden, assignments}, 256);
 

@@ -22,23 +22,33 @@
 
 namespace sinfer::ops::detail {
 
+// One block per registered mixture. Every constant is read off the geometry rather than
+// restated, so a mixture without an always-on expert is described by its own numbers -- one
+// fewer router row, one fewer path per token -- and not by a comment saying so.
+#define SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(Registered)                                           \
+    constexpr SparseMoeGeometry kGeometry = (Registered);                                          \
+    constexpr int kHidden                 = kGeometry.hidden;                                      \
+    constexpr int kExperts                = kGeometry.experts;                                     \
+    constexpr int kRouterRows             = kGeometry.router_rows();                               \
+    constexpr int kTopK                   = kGeometry.experts_per_token;                           \
+    constexpr int kIntermediate           = kGeometry.intermediate;                                \
+    constexpr bool kHasShared             = kGeometry.has_shared();                                \
+    constexpr int kPaths                  = kGeometry.paths();
+
 namespace geometry_qwen36 {
-constexpr int kHidden       = 2048;
-constexpr int kExperts      = 256;
-constexpr int kRouterRows   = kExperts + 1;
-constexpr int kTopK         = 8;
-constexpr int kIntermediate = 512;
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen36Geometry)
 #include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
 } // namespace geometry_qwen36
 
 namespace geometry_flash_next {
-constexpr int kHidden       = 2560;
-constexpr int kExperts      = 512;
-constexpr int kRouterRows   = kExperts + 1;
-constexpr int kTopK         = 10;
-constexpr int kIntermediate = 640;
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeFlashNextGeometry)
 #include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
 } // namespace geometry_flash_next
+
+namespace geometry_qwen3_moe {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen3MoeGeometry)
+#include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
+} // namespace geometry_qwen3_moe
 
 void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, const Tensor& x,
                                          const SparseMoeWeights& weights, const int* token_ids,
@@ -54,6 +64,12 @@ void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, cons
         geometry_flash_next::decode_launch_d3_small_t(x, weights, token_ids, token_activations,
                                                       tokens, schedule, stream,
                                                       adaptive_route_jobs);
+        return;
+    }
+    if (geometry == kSparseMoeQwen3MoeGeometry) {
+        geometry_qwen3_moe::decode_launch_d3_small_t(x, weights, token_ids, token_activations,
+                                                     tokens, schedule, stream,
+                                                     adaptive_route_jobs);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled decode kernels");
@@ -78,6 +94,12 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
                                                       stream, adaptive_route_jobs);
         return;
     }
+    if (geometry == kSparseMoeQwen3MoeGeometry) {
+        geometry_qwen3_moe::decode_launch_d4_small_t(weights, destination, token_ids, token_alpha,
+                                                     shared_scale, token_activations, tokens,
+                                                     schedule, stream, adaptive_route_jobs);
+        return;
+    }
     throw std::invalid_argument("sparse_moe: geometry has no compiled decode kernels");
 }
 
@@ -91,6 +113,10 @@ void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x
     }
     if (geometry == kSparseMoeFlashNextGeometry) {
         geometry_flash_next::decode_launch(x, weights, destination, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeQwen3MoeGeometry) {
+        geometry_qwen3_moe::decode_launch(x, weights, destination, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled decode kernels");

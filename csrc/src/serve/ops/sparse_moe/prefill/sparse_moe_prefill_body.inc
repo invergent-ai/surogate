@@ -125,7 +125,7 @@ __global__ void sparse_moe_prefill_select_count_kernel(const float* __restrict__
 
     const int token = static_cast<int>(blockIdx.x) * kSparseMoeRouteTileTokens + warp;
     if (token < tokens) {
-        sparse_moe_select_top_k_warp<kExperts, kTopK>(
+        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared>(
             scores + static_cast<std::int64_t>(token) * kSparseMoeRouterScoreRows,
             ids + token * kTopK, alpha + token * kTopK, shared_scale + token,
             selected_logits[warp]);
@@ -1471,6 +1471,25 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
     }
 }
 
+/// `destination += routed_sum`, for a mixture with no always-on expert.
+///
+/// Where there is one, its down projection is what writes the output: it merges the
+/// destination, the routed sum and its own gated value in a single epilogue. A routed-only
+/// mixture never launches that kernel, so the routed sum would otherwise be computed and left
+/// in the workspace -- every token's answer, discarded one step before it was written.
+__global__ void sparse_moe_prefill_combine_routed_kernel(const float* __restrict__ routed_sum,
+                                                         __nv_bfloat16* __restrict__ destination,
+                                                         int tokens) {
+    const int token = static_cast<int>(blockIdx.x);
+    if (token >= tokens) { return; }
+    const std::int64_t base = static_cast<std::int64_t>(token) * kHidden;
+    for (int row = static_cast<int>(threadIdx.x); row < kHidden;
+         row += static_cast<int>(blockDim.x)) {
+        destination[base + row] = __float2bfloat16_rn(
+            __bfloat162float(destination[base + row]) + routed_sum[base + row]);
+    }
+}
+
 template <bool Routed, bool Adaptive = false>
 __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
@@ -1833,23 +1852,31 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
             // route scan, the gather and this family's four routed kernels would produce is
             // internal to it, so the slice goes straight from selection to the shared expert and
             // the combine.
-            const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
-                                        (tokens + kExpertBN - 1) / kExpertBN);
-            sparse_moe_prefill_w8_gate_up_kernel<false, false>
-                <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
-                    input, nullptr, nullptr, shared_gate_codes, shared_gate_scales,
-                    shared_activation, tokens, nullptr);
-            CUDA_CHECK(cudaGetLastError());
+            if constexpr (kHasShared) {
+                const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
+                                            (tokens + kExpertBN - 1) / kExpertBN);
+                sparse_moe_prefill_w8_gate_up_kernel<false, false>
+                    <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
+                        input, nullptr, nullptr, shared_gate_codes, shared_gate_scales,
+                        shared_activation, tokens, nullptr);
+                CUDA_CHECK(cudaGetLastError());
+            }
 
             trtllm_moe::run(trtllm_geometry, input, tokens, ids, alpha,
                             trtllm_experts(weights), workspace.trtllm_workspace.data,
                             workspace.trtllm_workspace.bytes, routed_sum, stream);
 
-            const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
-            sparse_moe_prefill_w8_down_kernel<false, false>
-                <<<shared_down_grid, kExpertThreads, 0, stream>>>(
-                    shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales,
-                    nullptr, routed_sum, shared_scale, output, tokens, nullptr);
+            if constexpr (kHasShared) {
+                const dim3 shared_down_grid(kHidden / kExpertBM,
+                                            (tokens + kExpertBN - 1) / kExpertBN);
+                sparse_moe_prefill_w8_down_kernel<false, false>
+                    <<<shared_down_grid, kExpertThreads, 0, stream>>>(
+                        shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales,
+                        nullptr, routed_sum, shared_scale, output, tokens, nullptr);
+            } else {
+                sparse_moe_prefill_combine_routed_kernel<<<tokens, 256, 0, stream>>>(
+                    routed_sum, output, tokens);
+            }
             CUDA_CHECK(cudaGetLastError());
             continue;
         }
@@ -1995,20 +2022,22 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                                               mid_codes, mid_ds, stream);
         }
 
-        const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
-                                    (tokens + kExpertBN - 1) / kExpertBN);
-        if (adaptive) {
-            sparse_moe_prefill_w8_gate_up_kernel<false, true>
-                <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
-                    input, nullptr, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
-                    tokens, route_job_count);
-        } else {
-            sparse_moe_prefill_w8_gate_up_kernel<false, false>
-                <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
-                    input, nullptr, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
-                    tokens, nullptr);
+if constexpr (kHasShared) {
+            const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
+                                        (tokens + kExpertBN - 1) / kExpertBN);
+            if (adaptive) {
+                sparse_moe_prefill_w8_gate_up_kernel<false, true>
+                    <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
+                        input, nullptr, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
+                        tokens, route_job_count);
+            } else {
+                sparse_moe_prefill_w8_gate_up_kernel<false, false>
+                    <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
+                        input, nullptr, nullptr, shared_gate_codes, shared_gate_scales, shared_activation,
+                        tokens, nullptr);
+            }
+            CUDA_CHECK(cudaGetLastError());
         }
-        CUDA_CHECK(cudaGetLastError());
 
         const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
         if constexpr (kIntermediate / 64 != 8) {
@@ -2129,17 +2158,23 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
         }
         CUDA_CHECK(cudaGetLastError());
 
-        const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
-        if (adaptive) {
-            sparse_moe_prefill_w8_down_kernel<false, true>
-                <<<shared_down_grid, kExpertThreads, 0, stream>>>(
-                    shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales, nullptr,
-                    routed_sum, shared_scale, output, tokens, route_job_count);
+        if constexpr (kHasShared) {
+            const dim3 shared_down_grid(kHidden / kExpertBM,
+                                        (tokens + kExpertBN - 1) / kExpertBN);
+            if (adaptive) {
+                sparse_moe_prefill_w8_down_kernel<false, true>
+                    <<<shared_down_grid, kExpertThreads, 0, stream>>>(
+                        shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales,
+                        nullptr, routed_sum, shared_scale, output, tokens, route_job_count);
+            } else {
+                sparse_moe_prefill_w8_down_kernel<false, false>
+                    <<<shared_down_grid, kExpertThreads, 0, stream>>>(
+                        shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales,
+                        nullptr, routed_sum, shared_scale, output, tokens, nullptr);
+            }
         } else {
-            sparse_moe_prefill_w8_down_kernel<false, false>
-                <<<shared_down_grid, kExpertThreads, 0, stream>>>(
-                    shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales, nullptr,
-                    routed_sum, shared_scale, output, tokens, nullptr);
+            sparse_moe_prefill_combine_routed_kernel<<<tokens, 256, 0, stream>>>(routed_sum,
+                                                                                 output, tokens);
         }
         CUDA_CHECK(cudaGetLastError());
     }

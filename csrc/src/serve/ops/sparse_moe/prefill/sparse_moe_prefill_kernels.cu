@@ -32,25 +32,32 @@
 
 namespace sinfer::ops::detail {
 
+// One block per registered mixture; every constant is read off the geometry rather than
+// restated, so a mixture without an always-on expert is described by its own numbers.
+#define SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(Registered)                                           \
+    constexpr SparseMoeGeometry kGeometry = (Registered);                                          \
+    constexpr int kHidden                 = kGeometry.hidden;                                      \
+    constexpr int kExperts                = kGeometry.experts;                                     \
+    constexpr int kRouterRows             = kGeometry.router_rows();                               \
+    constexpr int kTopK                   = kGeometry.experts_per_token;                           \
+    constexpr bool kHasShared             = kGeometry.has_shared();                                \
+    constexpr int kIntermediate           = kGeometry.intermediate;             \
+    constexpr int kPaths                  = kGeometry.paths();
+
 namespace geometry_qwen36 {
-constexpr SparseMoeGeometry kGeometry = kSparseMoeQwen36Geometry;
-constexpr int kHidden                 = kGeometry.hidden;
-constexpr int kExperts                = kGeometry.experts;
-constexpr int kRouterRows             = kExperts + 1;
-constexpr int kTopK                   = kGeometry.experts_per_token;
-constexpr int kIntermediate           = kGeometry.intermediate;
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen36Geometry)
 #include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
 } // namespace geometry_qwen36
 
 namespace geometry_flash_next {
-constexpr SparseMoeGeometry kGeometry = kSparseMoeFlashNextGeometry;
-constexpr int kHidden                 = kGeometry.hidden;
-constexpr int kExperts                = kGeometry.experts;
-constexpr int kRouterRows             = kExperts + 1;
-constexpr int kTopK                   = kGeometry.experts_per_token;
-constexpr int kIntermediate           = kGeometry.intermediate;
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeFlashNextGeometry)
 #include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
 } // namespace geometry_flash_next
+
+namespace geometry_qwen3_moe {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen3MoeGeometry)
+#include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
+} // namespace geometry_qwen3_moe
 
 void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                                const SparseMoeWeights& weights, Tensor& destination,
@@ -63,6 +70,10 @@ void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& 
     }
     if (geometry == kSparseMoeFlashNextGeometry) {
         geometry_flash_next::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeQwen3MoeGeometry) {
+        geometry_qwen3_moe::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled prefill kernels");
