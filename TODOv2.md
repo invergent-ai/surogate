@@ -31,8 +31,8 @@ the serving path re-encodes a weight.
 nothing, and one had been failing to compile against a rename for long enough that
 nobody remembered it.
 
-**What is left is not the engine.** One roadmap item remains and it is a product
-decision. The backlog that matters now is architectures: the trainer declares
+**What is left is not the engine.** The roadmap is empty. The backlog that matters
+now is architectures: the trainer declares
 seventeen and the engine serves six, so `deepseek_v4`, `gemma4`, `glm5_next`,
 `gpt_oss`, `laguna`, `lfm2`, `lfm2_moe`, `lfm2_vl`, `nemotron_h`, `qwen3_moe` and
 `qwen3_vl` have no serve target. A new dense family costs roughly 950 lines of C++
