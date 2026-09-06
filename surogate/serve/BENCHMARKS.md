@@ -243,11 +243,24 @@ architecture.
 | **surogate** | 8 | 16 | **1,212.7** | **292.9** | **1,505.6** | **1.59 s** | `--kv-capacity 11264`, **everything resident**: the absorbed attention caches one 512-wide head per token, so sixteen lanes fit where the expanded form needed 10.4 GiB on a 3.5 GiB stage. 176 requests, 0 errors. **7.0× llama.cpp's decode and prefill at 1/35 of its TTFT** |
 | llama.cpp | 8 | 64 | 44.4 | 10.7 | 55.1 | 729.58 s | `-np 64` |
 | **surogate** | 8 | 64 | **99.0** | **23.9** | **122.9** | **31.94 s** | `--kv-capacity auto --host-moe-layers auto`, which moved 1–2 mixture layers per stage to host memory to hold 45,056 KV tokens; those layers cross PCIe on every token and are the ceiling here. **2.2× llama.cpp's decode and prefill at 1/23 of its TTFT**; 108 of 150 requests still timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
-| surogate | **1** | 1 | 7.5 | 1.8 | 9.3 | 28.71 s | `--host-moe-layers all`: 8.91 GiB on the card, 172.74 GiB pinned. A capacity result, not a speed one — every routed expert crosses PCIe on every token. Measured before the hyper-connection fixes. **llama.cpp does not serve this model on one card at all** |
-| surogate | **1** | 16 | 7.4 | 1.8 | 9.2 | 89.88 s | same; concurrency buys nothing once the bus is the bottleneck |
+| surogate | **1** | 1 | 7.5 | 1.8 | 9.3 | 29.54 s | `--host-moe-layers all`: 8.91 GiB on the card, 172.74 GiB pinned. Every routed expert crosses PCIe on every token and that link is the whole row — 4.76 GB of expert weights a token at the ~15 GB/s it sustains for a gather is 3.2 tok/s, which is what the engine reports. Re-measured on the current binary and identical to the pre-fix figure, because no kernel fix reaches a bus |
+| **llama.cpp** | **1** | 1 | **42.4** | **10.2** | **52.6** | **5.64 s** | `-cmoe -t 32`: the same 172 GB off the card, but the expert matmuls run on 32 EPYC cores instead of crossing the link, and host DRAM carries those bytes about ten times faster. **5.7× our decode and prefill, and a fifth of our TTFT** |
+| surogate | **1** | 16 | 7.4 | 1.8 | 9.2 | 91.35 s | concurrency buys nothing once the bus is the bottleneck, and it costs: a 16-lane round routes to many more distinct experts, so 22 of 28 requests expired at the admission window |
+| **llama.cpp** | **1** | 16 | **57.4** | **13.9** | **71.3** | **90.73 s** | `-cmoe -t 32 --kv-unified`, 16 of 16 served |
 
-**Reading it.** llama.cpp's 16-user decode is identical to its one-user decode, so it serves
-sixteen streams one after another and its rate never grows with users; ours grows with lanes,
+**The single-card rows are llama.cpp's, and by a factor of six.** Both engines keep the same
+172 GB of experts off the card; we pin them and let the GPU read them over PCIe, llama.cpp
+leaves them in ordinary RAM and computes the expert matmuls on the CPU. The arithmetic settles
+it: eight routed experts over 42 mixture layers, three matrices of 4096×2048 each at Q4_K, is
+**4.76 GB of weights per token**, and at the ~15 GB/s an x16 link sustains for a gather that is
+317 ms a token — 3.2 tok/s predicted against 3.1 measured. Our figure is the ceiling of the
+strategy, not a defect in it, and the strategy is the wrong one on a box with 32 cores a
+socket. What this row wants is expert compute on the host rather than expert bytes across the
+bus; the CPU kernels that would do it already beat llama.cpp's on the encoder path.
+
+**Reading the eight-card rows.** llama.cpp's 16-user decode is close to its one-user decode, so
+it serves sixteen streams nearly one after another and its rate barely grows with users; ours
+grows with lanes,
 and the only question was whether the lanes fit. They did not, at first: the expanded latent
 attention cached 64 heads of 256 for every token -- 902 KB a token, measured at three lane
 counts and exactly linear -- and sixteen lanes needed 10.4 GiB on a stage that had 3.5. Served
@@ -276,23 +289,73 @@ cache row never appended. Neither had a registered shape to show on.
 Parity, 40,880 scored positions; the absorbed and expanded forms differ by the rounding of
 the folded sqrt(2) and a 16-key tile order, well inside the error bar. The gate script is `scratchpad/ppl_gate_glm.sh`.
 
-**The draft head (2026-09-06).** The checkpoint's NextN block is bound under `mtp/` and
-`--spec mtp` runs it. The rows below are the one place it can run today -- a single card with
-the experts in host memory -- because a pipeline runs no speculative round: a verify is accepted
-on the stage that holds the head, and the other stages would fold their recurrent state on a
-decision they never see, so `--devices A,B` refuses `--spec`. Same prompt, greedy, 160 tokens,
-the second of two requests:
+### The NextN draft head, against llama.cpp's own (2026-09-06)
 
-| GLM-5.3-Flash, one 5090, `--host-moe-layers all` | decode tok/s | tokens / round | drafts accepted |
-|---|---:|---:|---:|
-| ordinary decode | 3.1 | 1.00 | -- |
-| `--spec mtp --draft-tokens 3` | 1.5 | 2.94 | 64.8 % |
+Both engines serve the checkpoint's NextN block as a draft head: ours under `--spec mtp`,
+llama.cpp's under `--spec-type draft-mtp` (ggml-org PR 27917, built at `study/llama.cpp-mtp`;
+its architecture string is `glm5-next` where the file says `glm5next`, one line to patch).
+Neither loads a second model -- both draft against the trunk's own weights. One 30-token
+prompt, 160 greedy tokens, two requests, the second reported; wall is the client's clock and
+the engine column is the server's own decode timing.
 
-The head drafts well -- 2.94 tokens a round of a possible four, and the text is the trunk's own
--- and the row is slower anyway. On this configuration a token's cost is its experts crossing
-PCIe, and a verify of four columns fetches roughly four tokens' worth of them for the 2.94 it
-keeps. Speculation pays where a round is latency-bound, which on this model is the eight-card
-pipeline (40 tok/s at 14 % GPU busy); that row waits on the pipeline learning to verify.
+| placement | engine | draft | decode tok/s (wall) | engine decode | tokens / round | accepted |
+|---|---|---|---:|---:|---:|---:|
+| one card, experts off the GPU | llama.cpp `-cmoe -t 32` | -- | 18.2 | 19.4 | 1.00 | -- |
+| | llama.cpp `-cmoe` | `draft-mtp`, 3 | **20.7** | **22.4** | 2.87 | 63.2 % |
+| | surogate `--host-moe-layers all` | -- | 2.6 | 3.1 | 1.00 | -- |
+| | surogate | `mtp`, 3 | 1.3 | 1.5 | **2.94** | **64.8 %** |
+| eight cards, one user | llama.cpp `--split-mode layer` | -- | 50.4 | 57.4 | 1.00 | -- |
+| | llama.cpp | `draft-mtp`, 3 | **63.3** | **74.7** | 2.77 | 59.4 % |
+| | surogate, 8 stages | -- | 46.1 | 49.1 | 1.00 | -- |
+| | surogate | `mtp`, 3 | refused | | | |
+
+**The head drafts as well as theirs.** 2.94 tokens a round at 64.8 % acceptance against
+llama.cpp's 2.87 at 63.2 %, same block, same window, same greedy decode: the two
+implementations of the same head agree on what it proposes. What differs is what a round
+costs, and there speculation goes opposite ways.
+
+**A verify multiplies an offloaded mixture's traffic.** One token routes to 8 of 288 experts a
+layer; a four-column verify routes to as many as 32 distinct ones. Where the experts are
+fetched per round, that is up to 4× the bytes for the 2.94 tokens it returns, and our
+single-card row loses half its rate. llama.cpp reads the same multiplied set from host RAM at
+an order of magnitude more bandwidth than the PCIe link, so the round it saves outweighs the
+bytes it adds and it gains 15 %. On the eight-card split, where nothing is offloaded and a
+round is latency-bound, it gains 30 %.
+
+**That last row is the one to want.** Our eight-card pipeline at one user runs 46.1 tok/s with
+the GPUs 14 % busy, so ~2.9 tokens a round is most of a 3× -- and the pipeline refuses `--spec`
+today, because a verify is accepted on the stage holding the head and the other seven would
+fold their recurrent state on a decision they never see. llama.cpp, whose layer split shares
+one process and one scheduler, has no such boundary and collects the win: 63.3 tok/s against
+our 46.1. The engineering that closes it is in `design/INFERENCE.md`.
+
+Read the two one-user numbers together rather than against each other. On this client -- a
+30-token prompt, so almost no prefill -- llama.cpp's steady-state decode is ahead of ours
+before it drafts at all (57.4 against 49.1), while on the cold first request our first token
+arrives in 0.21 s against its 0.54 s of prompt evaluation: a pipeline pays a handoff every
+round and a layer split does not. On the board's own client above, whose prompts are 512
+tokens, the prefill we are much faster at carries the throughput metric and the one-user row is
+ours. Neither client is wrong; they weight prefill and decode differently, and the draft head
+moves only the second.
+
+One asymmetry in that client, in llama.cpp's favour and worth naming: on the repeat of an
+identical request its slot cache found 26 of the 30 prompt tokens, while we re-prefilled all
+thirty. Our prefix reuse appends to a conversation that grows; re-asking a turn the lane has
+already answered past is a reset unless `--rewrite-checkpoints` keeps the checkpoint to restore.
+The cold-request figures above are unaffected.
+
+The board's own client says the same thing about the draft head on a 512-token prompt, where
+prefill dominates and both engines' gains shrink toward it:
+
+| one card, board client 512/128, 1 user | prefill tok/s | decode tok/s | tokens / round | accepted |
+|---|---:|---:|---:|---:|
+| llama.cpp `-cmoe -t 32` | 42.4 | 10.2 | 1.00 | -- |
+| llama.cpp, `draft-mtp` 3 | 43.4 | 10.5 | 2.93 | 64.3 % |
+| surogate `--host-moe-layers all` | 7.5 | 1.8 | 1.00 | -- |
+| surogate, `mtp` 3 | 4.7 | 1.1 | **3.02** | **67.5 %** |
+
+Our acceptance is the higher of the two on both clients, and our throughput the lower on both:
+the head is not what this placement is short of.
 
 ## Prefill on the 27B GGUF, and where it goes (2026-09-04)
 
