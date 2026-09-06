@@ -137,13 +137,21 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
 }
 
 MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFormat routed_gate_up,
-                 NumericFormat routed_down, artifact::TensorPlacement placement, const family::TextGeometry& g) {
+                 NumericFormat routed_down, artifact::TensorPlacement placement,
+                 const family::TextGeometry& g,
+                 artifact::TensorPlacement routed_placement = artifact::TensorPlacement::Device) {
     const auto bind = [&](std::string_view name, NumericFormat format,
                           std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, placement);
     };
+    // The routed experts may live elsewhere than the rest of the mixture: they are almost all
+    // of its bytes and a token reaches a handful of them, which is what makes the host bank
+    // worth the PCIe crossing here and nowhere else in the layer.
+    const auto routed_of = [&](artifact::TensorPlacement wanted) {
+        return placement == artifact::TensorPlacement::Device ? wanted : placement;
+    };
     const auto bind_stored = [&](std::string_view name, std::int32_t rows, std::int32_t columns) {
-        return artifact::bind_linear(binder, name, rows, columns, placement);
+        return artifact::bind_linear(binder, name, rows, columns, routed_of(routed_placement));
     };
     MoePlan plan{
         .router_shared_gate = bind(prefix + "router_shared_gate", NumericFormat::BF16,
@@ -261,7 +269,8 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
-                               WeightsProfile weights) {
+                               WeightsProfile weights, std::uint32_t host_moe_layers,
+                               std::uint32_t gpu_layers, LoadProgress progress) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     // The checkpoint's own dimensions, where it states them: absent members keep the
@@ -277,6 +286,11 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+        // Past `gpu_layers` the whole layer is read from pinned host memory; below it, only the
+        // routed experts, and only if `host_moe_layers` asked. Both counts are whole-model.
+        const artifact::ScopedPlacement placed(
+            gpu_layers != 0 && layer >= gpu_layers ? artifact::TensorPlacement::HostBank
+                                                   : artifact::TensorPlacement::Device);
         target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
                                                                 NumericFormat::BF16, {g.hidden});
         target.is_full_attention = is_full_layer(layer);
@@ -330,7 +344,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
         const RoutedFormats routed = routed_formats(weights, layer);
         target.moe = bind_moe(binder, prefix + "moe/", routed.gate_up, routed.down,
-                              artifact::TensorPlacement::Device, g);
+                              artifact::ScopedPlacement::current(), g,
+                              layer < host_moe_layers ? artifact::TensorPlacement::HostBank
+                                                      : artifact::TensorPlacement::Device);
     }
 
     out.final_norm =
@@ -452,11 +468,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     }
 
     load_plan.materialization = binder.finish();
+    out.host_bank = family::collect_host_bank(binder, load_plan.materialization,
+                                              std::move(progress));
     return load_plan;
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+    : backing(std::move(materialized)),
+      host_bank(plan.host_bank.objects.empty() ? nullptr
+                                               : family::HostBank::shared(plan.host_bank)) {
+    if (host_bank) { host_bank->attach(backing); }
     // The layer storage is sized here, not by the type: the counts come from the
     // geometry these weights were bound against.
     runtime.geometry              = plan.geometry;

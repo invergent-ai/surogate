@@ -289,9 +289,21 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
     return handle;
 }
 
+namespace {
+thread_local TensorPlacement g_placement = TensorPlacement::Device;
+} // namespace
+
+ScopedPlacement::ScopedPlacement(TensorPlacement placement) noexcept : previous_(g_placement) {
+    g_placement = placement;
+}
+
+ScopedPlacement::~ScopedPlacement() { g_placement = previous_; }
+
+TensorPlacement ScopedPlacement::current() noexcept { return g_placement; }
+
 ObjectHandle bind_device_tensor(Binder& binder, std::string_view name, NumericFormat format,
                                 std::initializer_list<std::uint64_t> shape) {
-    return bind_tensor(binder, name, format, shape, TensorPlacement::Device);
+    return bind_tensor(binder, name, format, shape, g_placement);
 }
 
 ObjectHandle bind_raw_resource(Binder& binder, std::string_view name) {
@@ -443,6 +455,11 @@ bool is_linear_format(NumericFormat format) noexcept {
         return false;
     }
     return false;
+}
+
+LinearBinding bind_linear(Binder& binder, std::string_view name, std::int32_t rows,
+                          std::int32_t columns) {
+    return bind_linear(binder, name, rows, columns, ScopedPlacement::current());
 }
 
 LinearBinding bind_linear(Binder& binder, std::string_view name, std::int32_t rows,

@@ -11,6 +11,9 @@
 #include "artifact/binder.h"
 #include "artifact/typed_binding.h"
 #include "artifact/materializer.h"
+#include "family/impl/load/host_bank.h"
+
+#include <memory>
 #include "core/tensor.h"
 #include "api/ops/sparse_moe.h"
 
@@ -148,6 +151,9 @@ struct BindingPlan {
     // Artifacts converted without the DFlash drafter checkpoint omit the
     // dflash/* objects; the DFlash backend requires has_dflash.
     bool has_dflash = false;
+
+    /// Objects this stage put in pinned host memory instead of on the card.
+    family::HostBankPlan host_bank;
 };
 
 struct ArtifactLoadPlan {
@@ -156,7 +162,8 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
-                               WeightsProfile weights);
+                               WeightsProfile weights, std::uint32_t host_moe_layers = 0,
+                               std::uint32_t gpu_layers = 0, LoadProgress progress = {});
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
@@ -209,6 +216,8 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    /// Weights this stage kept in pinned host memory rather than on the card.
+    std::shared_ptr<family::HostBank> host_bank;
     family::FrontendResources frontend;
     RuntimeModelView runtime;
 };

@@ -10,6 +10,9 @@
 #include "targets/qwen3_moe/impl/config.h"
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
+#include "family/impl/load/host_bank.h"
+
+#include <memory>
 #include "api/ops/sparse_moe.h"
 #include "core/tensor.h"
 
@@ -80,6 +83,9 @@ struct BindingPlan {
     /// The released Qwen3-MoE checkpoints ship their own head; where a checkpoint ties it, the
     /// converter resolves that and stores the head as its own object either way.
     WeightPlan output_head;
+
+    /// Objects this stage put in pinned host memory instead of on the card.
+    family::HostBankPlan host_bank;
 };
 
 struct ArtifactLoadPlan {
@@ -88,7 +94,9 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               family::StartupFeatures features);
+                               family::StartupFeatures features,
+                               std::uint32_t host_moe_layers = 0, std::uint32_t gpu_layers = 0,
+                               LoadProgress progress = {});
 
 /// The post-mixer is the mixture: one closed op over the registered geometry.
 struct SparseMoePayload {
@@ -134,6 +142,8 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    /// Weights this stage kept in pinned host memory rather than on the card.
+    std::shared_ptr<family::HostBank> host_bank;
     family::FrontendResources frontend;
     RuntimeModelView runtime;
 };

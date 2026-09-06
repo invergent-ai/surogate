@@ -15,6 +15,31 @@ class MaterializedArtifact;
                                        std::initializer_list<std::uint64_t> shape,
                                        TensorPlacement placement);
 
+/// The placement `bind_device_tensor` and a default-placement `bind_linear` use, for the scope
+/// of this object. Device unless something says otherwise, which is what makes host residency
+/// available to every target that binds weights the ordinary way -- including one written after
+/// this -- rather than a feature each has to grow.
+///
+/// Thread-scoped, because a pipeline builds its stages on one thread each.
+class ScopedPlacement {
+public:
+    explicit ScopedPlacement(TensorPlacement placement) noexcept;
+    ~ScopedPlacement();
+    ScopedPlacement(const ScopedPlacement&)            = delete;
+    ScopedPlacement& operator=(const ScopedPlacement&) = delete;
+    ScopedPlacement(ScopedPlacement&&)                 = delete;
+    ScopedPlacement& operator=(ScopedPlacement&&)      = delete;
+
+    /// What is in force now.
+    [[nodiscard]] static TensorPlacement current() noexcept;
+
+private:
+    TensorPlacement previous_;
+};
+
+/// Bind at the placement in force (`ScopedPlacement`), which is Device unless a scope changed
+/// it. The name is the common case, not a promise: a target that offloads a layer wraps its
+/// binding and every call below follows.
 [[nodiscard]] ObjectHandle bind_device_tensor(Binder& binder, std::string_view name,
                                               NumericFormat format,
                                               std::initializer_list<std::uint64_t> shape);
@@ -49,9 +74,12 @@ struct LinearBinding {
 /// The runtime quantisation type a stored format is read as.
 [[nodiscard]] QType qtype_for(NumericFormat format);
 
+/// Omitting the placement takes the one in force (`ScopedPlacement`), which is Device unless a
+/// scope changed it -- so a target that offloads a layer needs no change at the call site.
 [[nodiscard]] LinearBinding bind_linear(Binder& binder, std::string_view name, std::int32_t rows,
-                                        std::int32_t columns,
-                                        TensorPlacement placement = TensorPlacement::Device);
+                                        std::int32_t columns);
+[[nodiscard]] LinearBinding bind_linear(Binder& binder, std::string_view name, std::int32_t rows,
+                                        std::int32_t columns, TensorPlacement placement);
 
 /// The Weight for a LinearBinding: the existing constructors for every format
 /// but NVFP4, and the NVFP4 one -- previously re-implemented in each target

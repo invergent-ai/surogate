@@ -63,7 +63,9 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, family::startup_features(options), weights_profile)));
+        detail::bind_artifact(binder, family::startup_features(options), weights_profile,
+                              options.host_moe_layers, options.gpu_layers,
+                              options.load_progress)));
 }
 
 SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
