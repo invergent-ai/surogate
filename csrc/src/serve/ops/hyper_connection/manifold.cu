@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace sinfer::ops {
 namespace {
@@ -464,22 +465,32 @@ void manifold_hyper_connection_mix(const Tensor& residual,
         static_cast<const __nv_bfloat16*>(weights.mix.qdata), width, rows, slices, partials);
     CUDA_CHECK(cudaGetLastError());
 
-    // A thread per token, and the stream count compiled in: the four-stream form is the one
-    // every released mHC checkpoint has, and a wider one would need its own instantiation here
-    // rather than silently taking a slower path.
+    // A thread per token, and the stream count compiled in: one instantiation per count the
+    // op admits, so the small arrays stay in registers at every one of them. The four-stream
+    // form is the one every released mHC checkpoint has; the smaller ones are what the
+    // oracle checks the arithmetic at, and a wider one would need its own line here rather
+    // than silently taking a slower path.
     {
         constexpr int kReduceThreads = 128;
         const unsigned grid = (static_cast<unsigned>(tokens) + kReduceThreads - 1) / kReduceThreads;
-        if (streams != 4) {
+        const auto launch = [&](auto tag) {
+            constexpr int kStreams = decltype(tag)::value;
+            manifold_reduce_kernel<kStreams><<<grid, kReduceThreads, 0, stream>>>(
+                partials, static_cast<const float*>(weights.base.data),
+                static_cast<const float*>(weights.scale.data), width, tokens, rows, rms_eps,
+                hc_eps, sinkhorn_iterations, pre, static_cast<float*>(post.data),
+                static_cast<float*>(comb.data));
+        };
+        switch (streams) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        default:
             throw std::invalid_argument(
-                "manifold_hyper_connection: only a four-stream residual is compiled; got " +
+                "manifold_hyper_connection: residuals of one to four streams are compiled; got " +
                 std::to_string(streams));
         }
-        manifold_reduce_kernel<4><<<grid, kReduceThreads, 0, stream>>>(
-            partials, static_cast<const float*>(weights.base.data),
-            static_cast<const float*>(weights.scale.data), width, tokens, rows, rms_eps, hc_eps,
-            sinkhorn_iterations, pre, static_cast<float*>(post.data),
-            static_cast<float*>(comb.data));
     }
     CUDA_CHECK(cudaGetLastError());
 

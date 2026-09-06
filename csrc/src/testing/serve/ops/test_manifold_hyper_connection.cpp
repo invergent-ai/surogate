@@ -265,7 +265,9 @@ int run_case(const Case& item) {
     Tensor comb(device_comb.data(), DType::FP32, {item.streams, item.streams, item.tokens});
     Tensor block_tensor(device_block.data(), DType::BF16, {item.hidden, item.tokens});
 
-    WorkspaceArena arena(256);
+    // Sized by the op's own answer: the split projection lands its partial sums in the arena.
+    WorkspaceArena arena(ops::manifold_hyper_connection_mix_workspace_capacity_bytes(
+        item.streams, item.hidden, item.tokens, item.tokens));
     ops::manifold_hyper_connection_mix(residual_tensor, weights, item.streams,
                                        static_cast<float>(kRmsEps), static_cast<float>(kHcEps),
                                        item.iterations, collapsed, post, comb, arena, nullptr);
@@ -403,7 +405,8 @@ int run_mass_conservation() {
     Tensor post(device_post.data(), DType::FP32, {kStreams, kTokens});
     Tensor comb(device_comb.data(), DType::FP32, {kStreams, kStreams, kTokens});
     Tensor block_tensor(device_block.data(), DType::BF16, {kHidden, kTokens});
-    WorkspaceArena arena(256);
+    WorkspaceArena arena(ops::manifold_hyper_connection_mix_workspace_capacity_bytes(
+        kStreams, kHidden, kTokens, kTokens));
     ops::manifold_hyper_connection_mix(residual_tensor, weights, kStreams, 1.0e-5f, 1.0e-6f, 20,
                                        collapsed, post, comb, arena, nullptr);
     // Zero placement: nothing of the block output enters the streams.

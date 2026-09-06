@@ -56,8 +56,10 @@ struct ManifoldHyperConnectionWeights {
 };
 
 /// Transient capacity `manifold_hyper_connection_mix` needs for every T in [min_tokens,
-/// max_tokens]. Zero -- the op stages in shared memory and allocates nothing -- but every other
-/// mixer answers this question and a caller should not have to know which ones mean it.
+/// max_tokens]: the projection is split across the width into (token, slice) blocks whose
+/// partial sums land in an FP32 workspace -- one sum of squares and one dot per mixing row,
+/// plus the `pre` gate, per token -- which the reduce then finishes. Sized for `max_tokens`,
+/// rounded the way the arena rounds an allocation.
 [[nodiscard]] std::size_t manifold_hyper_connection_mix_workspace_capacity_bytes(
     std::int32_t streams, std::int32_t hidden, std::int32_t min_tokens, std::int32_t max_tokens);
 
