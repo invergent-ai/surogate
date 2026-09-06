@@ -622,64 +622,90 @@ void expert_slot_directory_reset(ExpertSlotDirectory& directory, cudaStream_t st
     CUDA_CHECK(cudaMemsetAsync(directory.cpu_round.data, 0, directory.cpu_round.bytes(), stream));
 }
 
-ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry, const Weight& routed_gate_up,
-                                const Weight& routed_down) {
-    require_geometry(geometry);
-    // Two shapes of bank. W8 row-split is the pool's own layout, copied straight through. GGML
-    // blocks are the GGUF's bytes, so the artifact stores no requantised copy of the experts at
-    // all and the gather decodes each 32-value group on its way into the pool.
-    const bool ggml_bank = detail::ggml::is_ggml_qtype(routed_gate_up.qtype) &&
-                           detail::ggml::is_ggml_qtype(routed_down.qtype) &&
-                           routed_gate_up.layout == QuantLayout::GgmlBlocks &&
-                           routed_down.layout == QuantLayout::GgmlBlocks;
-    const bool w8_bank = routed_gate_up.qtype == QType::W8G32_F16S &&
-                         routed_down.qtype == QType::W8G32_F16S &&
-                         routed_gate_up.layout == QuantLayout::RowSplit &&
-                         routed_down.layout == QuantLayout::RowSplit;
-    if (!ggml_bank && !w8_bank) {
-        throw std::invalid_argument(
-            "expert_slot_cache: the host bank holds W8 row-split experts or GGML blocks, and "
-            "both routed halves must agree");
+namespace {
+
+/// Fills one half of the bank from its source. Three shapes: W8 row-split is the pool's own
+/// layout, copied straight through; GGML blocks are the GGUF's bytes, decoded a group at a time
+/// on the way into the pool; Q4G32AM planes are the requantised bank, decoded the same way.
+void fill_bank_half(const SparseMoeGeometry& geometry, const ExpertBankHalfSource& source,
+                    bool gate_up, ExpertHostBank& bank) {
+    const std::int64_t rows_per_expert = gate_up ? geometry.expert_rows() : geometry.hidden;
+    const std::int32_t k               = gate_up ? geometry.hidden : geometry.intermediate;
+    ExpertBankFormat& format          = gate_up ? bank.gate_up_format : bank.down_format;
+    const std::byte*& codes           = gate_up ? bank.gate_up_codes : bank.down_codes;
+    const std::byte*& scales          = gate_up ? bank.gate_up_scales : bank.down_scales;
+    const std::byte*& mins            = gate_up ? bank.gate_up_mins : bank.down_mins;
+    std::uint64_t& codes_bytes        = gate_up ? bank.gate_up_codes_bytes_per_expert
+                                                : bank.down_codes_bytes_per_expert;
+    std::uint64_t& scales_bytes       = gate_up ? bank.gate_up_scales_bytes_per_expert
+                                                : bank.down_scales_bytes_per_expert;
+    QType& ggml                       = gate_up ? bank.gate_up_ggml : bank.down_ggml;
+    const char* half                  = gate_up ? "gate/up" : "down";
+    if (source.q4_base != nullptr) {
+        const Q4BankPlanes planes =
+            q4_bank_planes(static_cast<std::int64_t>(geometry.experts) * rows_per_expert, k);
+        const auto experts = static_cast<std::uint64_t>(geometry.experts);
+        format       = ExpertBankFormat::Q4G32AM;
+        codes        = static_cast<const std::byte*>(source.q4_base);
+        scales       = static_cast<const std::byte*>(source.q4_base) + planes.scales_offset;
+        mins         = static_cast<const std::byte*>(source.q4_base) + planes.mins_offset;
+        codes_bytes  = planes.codes_bytes / experts;
+        scales_bytes = planes.groups / experts * 2;
+        return;
     }
-    if (routed_gate_up.n != geometry.routed_gate_rows() || routed_gate_up.k != geometry.hidden ||
-        routed_down.n != geometry.routed_down_rows() || routed_down.k != geometry.intermediate) {
-        throw std::invalid_argument("expert_slot_cache: host bank shapes do not match the geometry");
+    if (source.weight == nullptr) {
+        throw std::invalid_argument(std::string("expert_slot_cache: the bank's ") + half +
+                                    " half has no source");
     }
-    if (ggml_bank) {
+    const Weight& w = *source.weight;
+    if (w.n != static_cast<std::int32_t>(geometry.experts * rows_per_expert) || w.k != k) {
+        throw std::invalid_argument(std::string("expert_slot_cache: host bank ") + half +
+                                    " shape does not match the geometry");
+    }
+    if (detail::ggml::is_ggml_qtype(w.qtype) && w.layout == QuantLayout::GgmlBlocks) {
         // A GGML block carries its own scale, so there is no scales plane: the per-expert
         // stride is the block bytes of one expert's rows, and the "scales bytes" the gather
         // reads is only how it derives the group count.
-        const auto blocks_bytes = [](const Weight& w, std::int64_t rows) {
-            const auto values = detail::ggml::block_values(detail::ggml::ggml_type_for(w.qtype));
-            const auto bytes  = detail::ggml::block_bytes(detail::ggml::ggml_type_for(w.qtype));
-            return static_cast<std::uint64_t>(rows) * (w.k / values) * bytes;
-        };
-        ExpertHostBank bank;
-        bank.format         = ExpertBankFormat::GgmlBlocks;
-        bank.gate_up_ggml   = routed_gate_up.qtype;
-        bank.down_ggml      = routed_down.qtype;
-        bank.gate_up_codes  = static_cast<const std::byte*>(routed_gate_up.qdata);
-        bank.down_codes     = static_cast<const std::byte*>(routed_down.qdata);
-        bank.gate_up_codes_bytes_per_expert = blocks_bytes(routed_gate_up, geometry.expert_rows());
-        bank.down_codes_bytes_per_expert    = blocks_bytes(routed_down, geometry.hidden);
-        bank.gate_up_scales_bytes_per_expert =
-            static_cast<std::uint64_t>(geometry.expert_rows()) * (geometry.hidden / 32) * 2;
-        bank.down_scales_bytes_per_expert =
-            static_cast<std::uint64_t>(geometry.hidden) * (geometry.intermediate / 32) * 2;
-        return bank;
+        const auto values = detail::ggml::block_values(detail::ggml::ggml_type_for(w.qtype));
+        const auto bytes  = detail::ggml::block_bytes(detail::ggml::ggml_type_for(w.qtype));
+        format       = ExpertBankFormat::GgmlBlocks;
+        ggml         = w.qtype;
+        codes        = static_cast<const std::byte*>(w.qdata);
+        scales       = nullptr;
+        mins         = nullptr;
+        codes_bytes  = static_cast<std::uint64_t>(rows_per_expert) * (w.k / values) * bytes;
+        scales_bytes = static_cast<std::uint64_t>(rows_per_expert) * (k / 32) * 2;
+        return;
     }
-    const W8Planes gate = w8_planes(geometry.expert_rows(), geometry.hidden);
-    const W8Planes down = w8_planes(geometry.hidden, geometry.intermediate);
+    if (w.qtype == QType::W8G32_F16S && w.layout == QuantLayout::RowSplit) {
+        const W8Planes planes = w8_planes(rows_per_expert, k);
+        format       = ExpertBankFormat::W8G32;
+        codes        = static_cast<const std::byte*>(w.qdata);
+        scales       = static_cast<const std::byte*>(w.scales);
+        mins         = nullptr;
+        codes_bytes  = planes.codes_plane_bytes;
+        scales_bytes = planes.scales_plane_bytes;
+        return;
+    }
+    throw std::invalid_argument(std::string("expert_slot_cache: the host bank's ") + half +
+                                " half is neither W8 row-split planes nor GGML blocks");
+}
+
+} // namespace
+
+ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry, ExpertBankHalfSource gate_up,
+                                ExpertBankHalfSource down) {
+    require_geometry(geometry);
     ExpertHostBank bank;
-    bank.gate_up_codes                  = static_cast<const std::byte*>(routed_gate_up.qdata);
-    bank.gate_up_scales                 = static_cast<const std::byte*>(routed_gate_up.scales);
-    bank.down_codes                     = static_cast<const std::byte*>(routed_down.qdata);
-    bank.down_scales                    = static_cast<const std::byte*>(routed_down.scales);
-    bank.gate_up_codes_bytes_per_expert  = gate.codes_plane_bytes;
-    bank.gate_up_scales_bytes_per_expert = gate.scales_plane_bytes;
-    bank.down_codes_bytes_per_expert     = down.codes_plane_bytes;
-    bank.down_scales_bytes_per_expert    = down.scales_plane_bytes;
+    fill_bank_half(geometry, gate_up, true, bank);
+    fill_bank_half(geometry, down, false, bank);
     return bank;
+}
+
+ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry, const Weight& routed_gate_up,
+                                const Weight& routed_down) {
+    return expert_host_bank(geometry, ExpertBankHalfSource{&routed_gate_up, nullptr},
+                            ExpertBankHalfSource{&routed_down, nullptr});
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -759,109 +785,87 @@ Q4BankPlanes q4_bank_planes(std::int64_t rows_total, std::int32_t k) {
 
 ExpertHostBank expert_host_bank_q4(const SparseMoeGeometry& geometry, const void* gate_up_base,
                                    const void* down_base) {
-    require_geometry(geometry);
     if (gate_up_base == nullptr || down_base == nullptr) {
         throw std::invalid_argument("expert_slot_cache: q4 bank needs both object base pointers");
     }
-    const Q4BankPlanes gate =
-        q4_bank_planes(static_cast<std::int64_t>(geometry.experts) * geometry.expert_rows(),
-                       geometry.hidden);
-    const Q4BankPlanes down =
-        q4_bank_planes(static_cast<std::int64_t>(geometry.experts) * geometry.hidden,
-                       geometry.intermediate);
-    const std::uint64_t experts = static_cast<std::uint64_t>(geometry.experts);
-    ExpertHostBank bank;
-    bank.format         = ExpertBankFormat::Q4G32AM;
-    bank.gate_up_codes  = static_cast<const std::byte*>(gate_up_base);
-    bank.gate_up_scales = static_cast<const std::byte*>(gate_up_base) + gate.scales_offset;
-    bank.gate_up_mins   = static_cast<const std::byte*>(gate_up_base) + gate.mins_offset;
-    bank.down_codes     = static_cast<const std::byte*>(down_base);
-    bank.down_scales    = static_cast<const std::byte*>(down_base) + down.scales_offset;
-    bank.down_mins      = static_cast<const std::byte*>(down_base) + down.mins_offset;
-    bank.gate_up_codes_bytes_per_expert  = gate.codes_bytes / experts;
-    bank.gate_up_scales_bytes_per_expert = gate.groups / experts * 2;
-    bank.down_codes_bytes_per_expert     = down.codes_bytes / experts;
-    bank.down_scales_bytes_per_expert    = down.groups / experts * 2;
-    return bank;
+    return expert_host_bank(geometry, ExpertBankHalfSource{nullptr, gate_up_base},
+                            ExpertBankHalfSource{nullptr, down_base});
 }
 
-void expert_slot_gather(const ExpertHostBank& bank, const ExpertMissList& misses,
-                        ExpertSlotPool& pool, cudaStream_t stream) {
-    if (bank.gate_up_codes == nullptr || pool.gate_up_codes == nullptr) {
-        throw std::invalid_argument("expert_slot_cache: gather needs a bank and a pool");
-    }
-    if (bank.format == ExpertBankFormat::GgmlBlocks) {
-        const GatherGgmlIds ids{static_cast<const int*>(misses.slots.data),
-                                static_cast<const int*>(misses.experts.data),
-                                static_cast<const long long*>(misses.count.data)};
-        // The destination strides are the pool's, not the bank's: the pool always holds W8, so
-        // one group is 32 code bytes and one f16 scale however many bytes the block took.
-        const std::uint64_t gate_groups = bank.gate_up_scales_bytes_per_expert / 2;
-        const std::uint64_t down_groups = bank.down_scales_bytes_per_expert / 2;
-        const GatherGgmlBank gate{reinterpret_cast<const std::uint8_t*>(bank.gate_up_codes),
-                                  pool.gate_up_codes,
-                                  pool.gate_up_scales,
-                                  gate_groups,
-                                  bank.gate_up_codes_bytes_per_expert,
-                                  gate_groups * 32,
-                                  gate_groups * 2};
-        const GatherGgmlBank down{reinterpret_cast<const std::uint8_t*>(bank.down_codes),
-                                  pool.down_codes,
-                                  pool.down_scales,
-                                  down_groups,
-                                  bank.down_codes_bytes_per_expert,
-                                  down_groups * 32,
-                                  down_groups * 2};
-        launch_ggml_gather(bank.gate_up_ggml, gate, ids, stream);
-        launch_ggml_gather(bank.down_ggml, down, ids, stream);
+namespace {
+
+/// Gathers one half of the missed experts into the pool by that half's format. The pool
+/// always holds W8, so a W8 half is a copy and the other two decode a 32-group at a time.
+void gather_half(const ExpertHostBank& bank, bool gate_up, const ExpertMissList& misses,
+                 ExpertSlotPool& pool, cudaStream_t stream) {
+    const ExpertBankFormat format = gate_up ? bank.gate_up_format : bank.down_format;
+    const std::byte* codes        = gate_up ? bank.gate_up_codes : bank.down_codes;
+    const std::byte* scales       = gate_up ? bank.gate_up_scales : bank.down_scales;
+    const std::byte* mins         = gate_up ? bank.gate_up_mins : bank.down_mins;
+    const std::uint64_t codes_bytes =
+        gate_up ? bank.gate_up_codes_bytes_per_expert : bank.down_codes_bytes_per_expert;
+    const std::uint64_t scales_bytes =
+        gate_up ? bank.gate_up_scales_bytes_per_expert : bank.down_scales_bytes_per_expert;
+    std::byte* dst_codes        = gate_up ? pool.gate_up_codes : pool.down_codes;
+    std::byte* dst_scales       = gate_up ? pool.gate_up_scales : pool.down_scales;
+    const int* miss_slots       = static_cast<const int*>(misses.slots.data);
+    const int* miss_experts     = static_cast<const int*>(misses.experts.data);
+    const long long* miss_count = static_cast<const long long*>(misses.count.data);
+    // The destination strides are the pool's, not the bank's: one group is 32 code bytes and
+    // one f16 scale however many bytes the bank's form of it took.
+    const std::uint64_t groups = scales_bytes / 2;
+    if (format == ExpertBankFormat::GgmlBlocks) {
+        const GatherGgmlIds ids{miss_slots, miss_experts, miss_count};
+        const GatherGgmlBank half{reinterpret_cast<const std::uint8_t*>(codes), dst_codes,
+                                  dst_scales, groups, codes_bytes, groups * 32, groups * 2};
+        launch_ggml_gather(gate_up ? bank.gate_up_ggml : bank.down_ggml, half, ids, stream);
         return;
     }
-    if (bank.format == ExpertBankFormat::Q4G32AM) {
-        if (bank.gate_up_mins == nullptr || bank.down_mins == nullptr) {
-            throw std::invalid_argument("expert_slot_cache: q4 bank has no min planes");
+    if (format == ExpertBankFormat::Q4G32AM) {
+        if (mins == nullptr) {
+            throw std::invalid_argument("expert_slot_cache: q4 bank half has no min plane");
         }
         GatherQ4Params p{};
-        p.banks[0] = {reinterpret_cast<const std::uint8_t*>(bank.gate_up_codes),
-                      reinterpret_cast<const std::uint16_t*>(bank.gate_up_scales),
-                      reinterpret_cast<const std::uint16_t*>(bank.gate_up_mins),
-                      pool.gate_up_codes,
-                      pool.gate_up_scales,
-                      bank.gate_up_scales_bytes_per_expert / 2,
-                      bank.gate_up_codes_bytes_per_expert * 2,
-                      bank.gate_up_scales_bytes_per_expert};
-        p.banks[1] = {reinterpret_cast<const std::uint8_t*>(bank.down_codes),
-                      reinterpret_cast<const std::uint16_t*>(bank.down_scales),
-                      reinterpret_cast<const std::uint16_t*>(bank.down_mins),
-                      pool.down_codes,
-                      pool.down_scales,
-                      bank.down_scales_bytes_per_expert / 2,
-                      bank.down_codes_bytes_per_expert * 2,
-                      bank.down_scales_bytes_per_expert};
-        p.miss_slots   = static_cast<const int*>(misses.slots.data);
-        p.miss_experts = static_cast<const int*>(misses.experts.data);
-        p.miss_count   = static_cast<const long long*>(misses.count.data);
-        gather_unpack_q4_kernel<<<2 * kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
+        p.banks[0] = {reinterpret_cast<const std::uint8_t*>(codes),
+                      reinterpret_cast<const std::uint16_t*>(scales),
+                      reinterpret_cast<const std::uint16_t*>(mins),
+                      dst_codes,
+                      dst_scales,
+                      groups,
+                      codes_bytes * 2,
+                      scales_bytes};
+        p.miss_slots   = miss_slots;
+        p.miss_experts = miss_experts;
+        p.miss_count   = miss_count;
+        gather_unpack_q4_kernel<<<kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const std::uint64_t per_expert[4] = {
-        bank.gate_up_codes_bytes_per_expert, bank.gate_up_scales_bytes_per_expert,
-        bank.down_codes_bytes_per_expert, bank.down_scales_bytes_per_expert};
-    for (const std::uint64_t bytes : per_expert) {
+    for (const std::uint64_t bytes : {codes_bytes, scales_bytes}) {
         if (bytes == 0 || bytes % 16 != 0) {
             throw std::invalid_argument("expert_slot_cache: expert planes must be 16-byte multiples");
         }
     }
     GatherParams p{};
-    p.banks[0] = {bank.gate_up_codes, pool.gate_up_codes, per_expert[0]};
-    p.banks[1] = {bank.gate_up_scales, pool.gate_up_scales, per_expert[1]};
-    p.banks[2] = {bank.down_codes, pool.down_codes, per_expert[2]};
-    p.banks[3] = {bank.down_scales, pool.down_scales, per_expert[3]};
-    p.miss_slots   = static_cast<const int*>(misses.slots.data);
-    p.miss_experts = static_cast<const int*>(misses.experts.data);
-    p.miss_count   = static_cast<const long long*>(misses.count.data);
-    gather_kernel<<<4 * kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
+    p.banks[0]     = {codes, dst_codes, codes_bytes};
+    p.banks[1]     = {scales, dst_scales, scales_bytes};
+    p.miss_slots   = miss_slots;
+    p.miss_experts = miss_experts;
+    p.miss_count   = miss_count;
+    gather_kernel<<<2 * kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void expert_slot_gather(const ExpertHostBank& bank, const ExpertMissList& misses,
+                        ExpertSlotPool& pool, cudaStream_t stream) {
+    if (bank.gate_up_codes == nullptr || bank.down_codes == nullptr ||
+        pool.gate_up_codes == nullptr) {
+        throw std::invalid_argument("expert_slot_cache: gather needs a bank and a pool");
+    }
+    gather_half(bank, true, misses, pool, stream);
+    gather_half(bank, false, misses, pool, stream);
 }
 
 SparseMoeWeights expert_slot_weights(const ExpertSlotPool& pool,

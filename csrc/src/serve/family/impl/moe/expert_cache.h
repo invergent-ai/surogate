@@ -39,8 +39,12 @@ struct BankedMixture {
     /// The kernels' view: router and shared expert on the device, the routed pair over the
     /// bank's device-mapped alias. The cache swaps the routed pair for the pool's.
     const ops::SparseMoeWeights* op = nullptr;
-    /// The routed objects are Q4G32AM (requantised into the bank); the pool decodes them.
-    bool host_bank_q4 = false;
+    /// Which routed halves the bank holds as Q4G32AM planes (requantised on the way in; the
+    /// pool decodes them). A half that is not is W8 planes or the file's blocks, as its
+    /// `Weight` says. The halves are independent: a K_XL mixture keeps its 4-bit gate/up as
+    /// 4-bit planes and its wider down as W8.
+    bool host_gate_up_q4 = false;
+    bool host_down_q4    = false;
     /// Host virtual addresses of the routed expert objects (the Weights above hold the mapped
     /// aliases); the CPU expert path reads the planes -- or the file's blocks -- through these.
     const std::byte* host_gate_up = nullptr;

@@ -27,7 +27,9 @@ namespace sinfer::ops {
 /// kernels read them, in pinned, device-mapped host memory. Byte offsets are per plane
 /// (codes, scales) so an expert is one contiguous slice per plane.
 struct ExpertHostBank {
-    ExpertBankFormat format         = ExpertBankFormat::W8G32;
+    /// One format per half (see `CpuExpertBank`): the gather decodes each half by its own.
+    ExpertBankFormat gate_up_format = ExpertBankFormat::W8G32;
+    ExpertBankFormat down_format    = ExpertBankFormat::W8G32;
     const std::byte* gate_up_codes  = nullptr; // [experts * 2 * intermediate rows] codes plane
     const std::byte* gate_up_scales = nullptr; // scales plane, same row order
     const std::byte* gate_up_mins   = nullptr; // Q4G32AM only: FP16 group minima
@@ -154,6 +156,22 @@ void expert_slot_directory_reset(ExpertSlotDirectory& directory, cudaStream_t st
 [[nodiscard]] ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry,
                                               const Weight& routed_gate_up,
                                               const Weight& routed_down);
+
+/// One half of a bank as its source presents it: a `Weight` over the bank's mapped alias for
+/// W8 row-split planes or GGML blocks, or the base pointer of a Q4G32AM object, which no
+/// `Weight` describes (its planes follow from the geometry, `q4_bank_planes`). A set `q4_base`
+/// wins.
+struct ExpertBankHalfSource {
+    const Weight* weight = nullptr;
+    const void* q4_base  = nullptr;
+};
+
+/// A bank whose halves are described independently: each is W8 planes, GGML blocks or Q4G32AM
+/// planes by its own source, and the gather and the host kernels read each by its own format.
+/// The two constructors above and below are the same-format special cases of this one.
+[[nodiscard]] ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry,
+                                              ExpertBankHalfSource gate_up,
+                                              ExpertBankHalfSource down);
 
 /// The Q4G32AM flavour: `gate_up_base` / `down_base` are the objects' device-mapped base
 /// pointers laid out per `q4_bank_planes` (per-expert strides derive from the geometry).

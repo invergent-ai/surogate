@@ -28,7 +28,109 @@ void decode_row(const void* blocks, std::int64_t k, std::int8_t* codes, std::uin
     }
 }
 
+template <detail::ggml::GgmlType type>
+void decode_row_float(const void* blocks, std::int64_t k, float* out) {
+    const std::int64_t groups = k / 32;
+    for (std::int64_t g = 0; g < groups; ++g) {
+        float value[32];
+        detail::ggml::decode_group_32<type>(blocks, g, value);
+        for (int i = 0; i < 32; ++i) { out[g * 32 + i] = value[i]; }
+    }
+}
+
+std::uint16_t half_bits(float v) { return __half_as_ushort(__float2half_rn(v)); }
+
+/// Sixteen code bytes of one Q4G32AM group from a 32-value nibble source: value v is the
+/// nibble `pick(v)`, and the group packs values 2i and 2i+1 into byte i.
+template <class Pick>
+void pack_group(std::uint8_t* out, Pick pick) {
+    for (int i = 0; i < 16; ++i) {
+        out[i] = static_cast<std::uint8_t>((pick(2 * i) & 0xF) | ((pick(2 * i + 1) & 0xF) << 4));
+    }
+}
+
+void q4_K_row_to_q4g32am(const void* blocks, std::int64_t k, std::uint8_t* codes,
+                         std::uint16_t* scales, std::uint16_t* mins) {
+    const auto* x = static_cast<const detail::ggml::block_q4_K*>(blocks);
+    for (std::int64_t b = 0; b < k / detail::ggml::QK_K; ++b) {
+        const float d    = __half2float(__low2half(x[b].dm));
+        const float dmin = __half2float(__high2half(x[b].dm));
+        for (int is = 0; is < 8; ++is) {
+            std::uint8_t sc = 0, m = 0;
+            detail::ggml::get_scale_min_k4(is, x[b].scales, sc, m);
+            const std::int64_t g  = b * 8 + is;
+            scales[g]             = half_bits(d * static_cast<float>(sc));
+            mins[g]               = half_bits(-(dmin * static_cast<float>(m)));
+            // Sub-blocks come in pairs of 32 bytes: the even one in the low nibbles, the odd
+            // one in the high nibbles, value v in byte v of the pair.
+            const std::uint8_t* q = x[b].qs + 32 * (is / 2);
+            const int shift       = (is & 1) != 0 ? 4 : 0;
+            pack_group(codes + g * 16, [&](int v) { return q[v] >> shift; });
+        }
+    }
+}
+
+void q4_0_row_to_q4g32am(const void* blocks, std::int64_t k, std::uint8_t* codes,
+                         std::uint16_t* scales, std::uint16_t* mins) {
+    const auto* x = static_cast<const detail::ggml::block_q4_0*>(blocks);
+    for (std::int64_t g = 0; g < k / 32; ++g) {
+        const float d = __half2float(x[g].d);
+        scales[g]     = half_bits(d);
+        mins[g]       = half_bits(-8.0F * d); // value = d * (q - 8)
+        const std::uint8_t* q = x[g].qs;
+        pack_group(codes + g * 16, [&](int v) { return v < 16 ? q[v] : q[v - 16] >> 4; });
+    }
+}
+
+void q4_1_row_to_q4g32am(const void* blocks, std::int64_t k, std::uint8_t* codes,
+                         std::uint16_t* scales, std::uint16_t* mins) {
+    const auto* x = static_cast<const detail::ggml::block_q4_1*>(blocks);
+    for (std::int64_t g = 0; g < k / 32; ++g) {
+        scales[g] = half_bits(__half2float(__low2half(x[g].dm)));
+        mins[g]   = half_bits(__half2float(__high2half(x[g].dm))); // value = d * q + m
+        const std::uint8_t* q = x[g].qs;
+        pack_group(codes + g * 16, [&](int v) { return v < 16 ? q[v] : q[v - 16] >> 4; });
+    }
+}
+
 } // namespace
+
+bool ggml_row_to_q4g32am(QType type, const void* blocks, std::int64_t k, std::uint8_t* codes,
+                         std::uint16_t* scales, std::uint16_t* mins) noexcept {
+    if (blocks == nullptr || codes == nullptr || scales == nullptr || mins == nullptr || k <= 0 ||
+        k % 32 != 0) {
+        return false;
+    }
+    switch (type) {
+    case QType::Q4_K:
+        if (k % detail::ggml::QK_K != 0) { return false; }
+        q4_K_row_to_q4g32am(blocks, k, codes, scales, mins);
+        return true;
+    case QType::Q4_0:
+        q4_0_row_to_q4g32am(blocks, k, codes, scales, mins);
+        return true;
+    case QType::Q4_1:
+        q4_1_row_to_q4g32am(blocks, k, codes, scales, mins);
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool ggml_decode_row_float(QType type, const void* blocks, std::int64_t k, float* out) noexcept {
+    using T = detail::ggml::GgmlType;
+    if (blocks == nullptr || out == nullptr || k <= 0 || k % 32 != 0) { return false; }
+    switch (type) {
+#define SINFER_HOST_DECODE_FLOAT_CASE(NAME)                                                        \
+    case QType::NAME:                                                                              \
+        decode_row_float<T::NAME>(blocks, k, out);                                                 \
+        return true;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_HOST_DECODE_FLOAT_CASE)
+#undef SINFER_HOST_DECODE_FLOAT_CASE
+    default:
+        return false;
+    }
+}
 
 bool ggml_decode_row_w8(QType type, const void* blocks, std::int64_t k, std::int8_t* codes,
                         std::uint16_t* scales) noexcept {

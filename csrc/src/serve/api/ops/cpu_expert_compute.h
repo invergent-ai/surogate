@@ -38,7 +38,12 @@ namespace sinfer::ops {
 enum class ExpertBankFormat : std::uint8_t { W8G32 = 0, Q4G32AM = 1, GgmlBlocks = 2 };
 
 struct CpuExpertBank {
-    ExpertBankFormat format         = ExpertBankFormat::W8G32;
+    /// One format per half. A K_XL mixture's gate/up and down halves are routinely stored at
+    /// different widths (GLM-5.3-Flash: Q4_K gate/up, Q5_K/Q6_K down), and the bank keeps
+    /// whichever planes each half's source allows without loss -- so the two are decided, and
+    /// read, independently.
+    ExpertBankFormat gate_up_format = ExpertBankFormat::W8G32;
+    ExpertBankFormat down_format    = ExpertBankFormat::W8G32;
     /// GgmlBlocks only: which block format each half holds. The codes pointer addresses the
     /// blocks and the scales pointer is unused, because a GGML block carries its own. Left
     /// without a default for the same reason `ExpertHostBank` does -- QType(0) is not a GGML

@@ -179,19 +179,24 @@ bool banks_experts(const EngineOptions& options) noexcept {
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    // The banked experts become planes as the bank fills: W8 unless asked otherwise. This
-    // file's gate and up experts are Q4_K but its down experts are Q5_K and Q6_K, and the Q4
-    // bank would requantise those to four bits; W8 is lossless to what the pool holds anyway,
-    // at 1.7x the pinned bytes. `--host-expert-bank q4` is the denser, faster opt-in.
-    const family::BankPlanes planes = options.host_expert_bank == EngineOptions::HostExpertBank::Q4
-                                          ? family::BankPlanes::Q4
-                                          : family::BankPlanes::W8;
+    // The banked experts become planes as the bank fills. By default each object keeps the
+    // narrowest planes that lose nothing: Q4G32AM where the file stores it 4-bit affine (this
+    // file's gate and up experts, Q4_K), W8 where it is wider (its down experts, Q5_K/Q6_K,
+    // which a Q4 bank would requantise to four bits). `--host-expert-bank w8` keeps everything
+    // W8; `q4` requantises everything, the denser, faster, lossy opt-in.
+    const family::BankPlanes planes =
+        options.host_expert_bank == EngineOptions::HostExpertBank::Q4   ? family::BankPlanes::Q4
+        : options.host_expert_bank == EngineOptions::HostExpertBank::W8 ? family::BankPlanes::W8
+                                                                         : family::BankPlanes::Auto;
     if (banks_experts(options)) {
-        std::fprintf(stderr, "glm5_next: host expert bank %s planes%s\n",
-                     planes == family::BankPlanes::Q4 ? "Q4G32AM" : "W8",
+        std::fprintf(stderr, "glm5_next: host expert bank %s\n",
                      planes == family::BankPlanes::Q4
-                         ? " (requantised while loading; this file's down experts are Q5_K/Q6_K)"
-                         : " (decoded while loading; --host-expert-bank q4 halves the bytes)");
+                         ? "Q4G32AM planes throughout (requantised while loading; this file's "
+                           "down experts are Q5_K/Q6_K and lose precision here)"
+                     : planes == family::BankPlanes::W8
+                         ? "W8 planes throughout (decoded while loading)"
+                         : "Q4G32AM planes for the 4-bit halves, W8 for the wider ones (decoded "
+                           "while loading; --host-expert-bank w8|q4 forces one)");
     }
     auto plan = detail::bind_artifact(binder, weights_profile, family::startup_features(options),
                                       options.pipeline_stage_first, options.pipeline_stage_last,
@@ -309,7 +314,8 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
             cache.prepare_split(banked == nullptr
                                     ? family::BankedMixture{}
                                     : family::BankedMixture{banked->layer, banked->layers,
-                                                            &banked->moe, false,
+                                                            &banked->moe, banked->host_gate_up_q4,
+                                                            banked->host_down_q4,
                                                             banked->host_gate_up,
                                                             banked->host_down});
         }

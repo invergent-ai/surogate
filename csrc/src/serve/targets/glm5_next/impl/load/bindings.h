@@ -148,7 +148,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                family::StartupFeatures features, int stage_first = 0,
                                int stage_last = 0, std::uint32_t host_moe_layers = 0,
                                std::uint32_t gpu_layers = 0,
-                               family::BankPlanes bank_planes = family::BankPlanes::W8,
+                               family::BankPlanes bank_planes = family::BankPlanes::Auto,
                                LoadProgress progress = {});
 
 /// Which layers of this artifact attend, read from the objects it holds rather than from a
@@ -220,9 +220,11 @@ struct FeedForwardPayload {
     /// reads the bank's planes through these on the host instead of fetching them over PCIe.
     const std::byte* host_gate_up = nullptr;
     const std::byte* host_down    = nullptr;
-    /// The banked objects are Q4G32AM planes (`--host-expert-bank q4`): the routed Weights are
-    /// then a base pointer and a shape, readable by the expert cache alone.
-    bool host_bank_q4 = false;
+    /// Which banked halves are Q4G32AM planes: such a routed Weight is a base pointer and a
+    /// shape, readable by the expert cache alone. Under the default the bank keeps a half as
+    /// 4-bit planes only where the file stores it 4-bit (this file: gate/up), W8 otherwise.
+    bool host_gate_up_q4 = false;
+    bool host_down_q4    = false;
 };
 
 /// The draft head's attention: the trunk's latent projections without the hyper-connection,

@@ -246,10 +246,10 @@ architecture.
 | **surogate** | 8 | 16 | **1,212.7** | **292.9** | **1,505.6** | **1.59 s** | `--kv-capacity 11264`, **everything resident**: the absorbed attention caches one 512-wide head per token, so sixteen lanes fit where the expanded form needed 10.4 GiB on a 3.5 GiB stage. 176 requests, 0 errors. **7.0× llama.cpp's decode and prefill at 1/35 of its TTFT** |
 | llama.cpp | 8 | 64 | 44.4 | 10.7 | 55.1 | 729.58 s | `-np 64` |
 | **surogate** | 8 | 64 | **99.0** | **23.9** | **122.9** | **31.94 s** | `--kv-capacity auto --host-moe-layers auto`, which moved 1–2 mixture layers per stage to host memory to hold 45,056 KV tokens; those layers cross PCIe on every token and are the ceiling here. **2.2× llama.cpp's decode and prefill at 1/23 of its TTFT**; 108 of 150 requests still timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
-| **surogate** | **1** | 1 | 36.7 | 8.9 | 45.6 | 6.12 s | `--host-moe-layers all --cpu-moe-share auto` (2026-09-06, the expert cache lifted into the family; two passes read 8.7 and 8.9): the routed experts are decoded into a 301 GiB pinned W8 bank at load, and 83 % of every round's misses are computed on the 32 host cores (host 266 GB/s against 52 over PCIe, measured overlapped) with the rest gathered into a 456-slot pool that hits 17 % of the routed experts. The server times each request at 15.2 tok/s of decode after a 6.11 s prompt; the prompt is the gather of every expert of every layer as W8 over the link, and the decode round waits 35 of its 68 ms on the host round (the probes' figure) -- host bytes per expert are the next lever. 4.9× the previous row (7.5 / 1.8 / 29.54 s), 87 % of llama.cpp's on both columns |
-| **llama.cpp** | **1** | 1 | **42.4** | **10.2** | **52.6** | **5.64 s** | `-cmoe -t 32`: the same 172 GB off the card, the expert matmuls on 32 EPYC cores, the bytes from ordinary RAM. Ahead of our row by 15 % on prefill and decode and 8 % on TTFT; on the morning's binary, which streamed the experts over PCIe, it was 5.7× and a fifth of our TTFT |
-| **surogate** | **1** | 16 | **57.4** | **13.9** | **71.3** | **38.23 s** | the same cache, `--max-num-seqs 16 --kv-capacity 11264` (2026-09-06): a 496-slot pool (12.4 GiB, sized automatically), 83 % of every round's misses on the host. Level with llama.cpp on prefill and decode to the decimal, at 42 % of its TTFT -- and 4 of 20 requests expired at our 30 s admission window where llama.cpp queues indefinitely and served 16 of 16. A 16-lane round routes to most of a layer's experts, so the split carries ~13 GB of W8 a round; the prompt rounds, which gather every expert over the link, are what queue. The previous row read 7.4 / 1.8 / 9.2 / 91.35 s with 22 of 28 expired |
-| **llama.cpp** | **1** | 16 | **57.4** | **13.9** | **71.3** | 90.73 s | `-cmoe -t 32 --kv-unified`, 16 of 16 served: the tie on throughput is exact, and the row it keeps is completion, since it queues where we expire |
+| **surogate** | **1** | 1 | **51.3** | **12.4** | **63.7** | **3.62 s** | `--host-moe-layers all --cpu-moe-share auto --max-num-batched-tokens 1024` (2026-09-06, the expert cache lifted into the family, on the mixed bank; two passes read 3.64 and 3.62 s): the routed experts are repacked into a 220.5 GiB pinned bank in 68 s at load -- Q4G32AM planes for the Q4_K gate/up halves (an exact repack), W8 for the Q5_K/Q6_K down halves, each read by its own format -- and 83 % of every round's misses are computed on the 32 host cores (host 244 GB/s against 49 over PCIe, measured overlapped) with the rest gathered into a 456-slot pool. The server times each request at 19.0 tok/s of decode after a 3.59 s prompt; the prompt is one gather of every expert of every layer over the link. **+22 % decode, +21 % prefill over llama.cpp at 64 % of its TTFT**, at parity on the perplexity gate below. The all-W8 bank read 9.9 / 40.9 / 4.64 s on this configuration, and 8.9 / 36.7 / 6.12 s at chunk 512; the row before the cache 1.8 / 7.5 / 29.54 s |
+| llama.cpp | **1** | 1 | 42.4 | 10.2 | 52.6 | 5.64 s | `-cmoe -t 32`: the same 172 GB off the card, the expert matmuls on 32 EPYC cores, the bytes from ordinary RAM. On the morning's binary, which streamed the experts over PCIe, it was ahead 5.7× with a fifth of our TTFT; by evening it is behind on all three columns |
+| **surogate** | **1** | 16 | **80.3** | **19.4** | **99.7** | **28.50 s** | the same cache on the mixed bank, `--max-num-seqs 16 --kv-capacity 11264 --max-num-batched-tokens 2048` (2026-09-06): a 456-slot pool sized automatically, 83 % of every round's misses on the host, **16 of 16 served, 0 expired**. **+40 % decode and +40 % prefill over llama.cpp at 31 % of its TTFT.** A 16-lane round routes to most of a layer's experts, so the split carries ~9 GB of bank bytes a round; the prompt rounds, which gather every expert over the link, are what queue, and a 2,048-token chunk lets several prompts share one gather. On the all-W8 bank this configuration read 66.4 / 16.0 / 31.82 s with 1 of 17 expired, and at chunk 512 57.4 / 13.9 / 38.23 s with 4 of 20 expired, a tie. The row before the cache read 7.4 / 1.8 / 9.2 / 91.35 s with 22 of 28 expired |
+| llama.cpp | **1** | 16 | 57.4 | 13.9 | 71.3 | 90.73 s | `-cmoe -t 32 --kv-unified`, 16 of 16 served |
 
 **The single-card rows, and what changed between morning and afternoon.** Both engines keep
 the same 172 GB of experts off the card. In the morning we pinned them and let the GPU read
@@ -296,15 +296,22 @@ cache row never appended. Neither had a registered shape to show on.
 | surogate, 8 stages, BF16 KV, eager, absorbed attention | 2.8574 ± 0.0264 |
 | surogate, the same with the attention expanded | 2.8548 ± 0.0263 |
 | surogate, **one card**, every expert in the W8 host bank, half of each prompt round's expert jobs computed by the host kernels (`--host-moe-layers all --cpu-moe-share auto --cpu-moe-prefill-share 0.5`, 2026-09-06) | 2.8600 ± 0.0264 |
-| surogate, one card, the same bank with every prompt-round miss gathered into the device pool instead (`--host-moe-layers all --cpu-moe-share auto`, the default) | 2.8567 ± 0.0263 |
+| surogate, one card, the same bank with every prompt-round miss gathered into the device pool instead (`--host-moe-layers all --cpu-moe-share auto`) | 2.8567 ± 0.0263 |
+| surogate, **one card, the mixed bank** (the default: Q4G32AM planes for the Q4_K gate/up halves by an exact repack, W8 for the Q5_K/Q6_K down halves), default route | 2.8614 ± 0.0264 |
+| surogate, the same mixed bank when its Q4 planes were reached through a W8 row and an affine refit (the first cut; replaced) | 2.8695 ± 0.0265 |
 | llama.cpp (PR 27754) | 2.8541 ± 0.0263 |
 
 Parity, 40,880 scored positions; the absorbed and expanded forms differ by the rounding of
-the folded sqrt(2) and a 16-key tile order, well inside the error bar. The one-card row is the
-expert cache's accuracy gate: the routed experts decoded into W8 planes at load (the file's
-Q5_K/Q6_K down experts included), read by the host's AVX-512 kernels with the SwiGLU clamp for
-half of every prompt round and by the device pool for the rest -- and it lands where the
-all-GPU eight-stage number does. The gate script is `scratchpad/ppl_gate_glm.sh`.
+the folded sqrt(2) and a 16-key tile order, well inside the error bar. The one-card rows are
+the expert cache's accuracy gate: the routed experts decoded into planes at load, read by the
+host's AVX-512 kernels with the SwiGLU clamp for most of every decode round (and half of every
+prompt round in the host-scored row) and by the device pool for the rest. The W8 bank lands
+where the all-GPU eight-stage number does, and the mixed bank the board rows run on lands
+0.16 % above it -- inside the 0.12 % the W8 bank's own two routes span, and a quarter of the
+error bar. The first cut of the mixed bank read 0.45 % above, a systematic loss: it reached
+Q4G32AM through a W8 row and an affine refit, and an int8 grid is not where a Q4_K sub-block's
+sixteen levels sit. The repack that replaced it is exact to FP16 rounding of the endpoints
+(0.035 % of the range on random blocks, tested). The gate script is `scratchpad/ppl_gate_glm.sh`.
 
 ### The NextN draft head, against llama.cpp's own (2026-09-06)
 
@@ -319,7 +326,9 @@ the engine column is the server's own decode timing.
 |---|---|---|---:|---:|---:|---:|
 | one card, experts off the GPU | llama.cpp `-cmoe -t 32` | -- | 18.2 | 19.4 | 1.00 | -- |
 | | llama.cpp `-cmoe` | `draft-mtp`, 3 | **20.7** | **22.4** | 2.87 | 63.2 % |
-| | surogate `--host-moe-layers all --cpu-moe-share auto` (the expert cache, 2026-09-06) | -- | 12.2 | 15.1 | 1.00 | -- |
+| | surogate `--host-moe-layers all --cpu-moe-share auto`, the mixed bank (the expert cache, 2026-09-06 evening) | -- | 15.1 | 18.6 | 1.00 | -- |
+| | surogate, the same | `mtp`, 3 | 18.9 | 20.4 | 2.98 | 66.0 % |
+| | surogate, the W8 bank (afternoon) | -- | 12.2 | 15.1 | 1.00 | -- |
 | | surogate, the same | `mtp`, 3 | 15.7 | 17.1 | **3.06** | **69.0 %** |
 | | surogate `--host-moe-layers all`, before the cache | -- | 2.6 | 3.1 | 1.00 | -- |
 | | surogate, the same | `mtp`, 3 | 1.3 | 1.5 | 2.94 | 64.8 % |
@@ -332,8 +341,13 @@ the engine column is the server's own decode timing.
 against llama.cpp's 2.87 at 63.2 %, same block, same window, same greedy decode: the two
 implementations of the same head agree on what it proposes. What differs is what a round
 costs, and there speculation went opposite ways until the experts were computed on the host:
-through the expert cache the head gains 13 % on our side too (15.1 → 17.1 engine decode), and
-the one-card gap to llama.cpp is 76 % of its rate with the head, 78 % without.
+through the expert cache the head gains 10 % on our side too (18.6 → 20.4 engine decode). On
+this client the one-card gap to llama.cpp's engine decode is 96 % without the head and 91 %
+with it, and the wall-clock gap is wider for a reason that is not the decode: our 30-token
+prompt takes 2.0 s under graphs (0.7 s eager, 0.7 s under `--spec mtp`), a round of 2..64
+columns taking the decode share of the split onto the host's compute-bound grouped path. The
+512-token board rows above, which are the rows of record, are unaffected and ours on every
+column; the width-aware share that fixes this client's prompt is named in `design/INFERENCE.md`.
 
 **A verify multiplies an offloaded mixture's traffic.** One token routes to 8 of 288 experts a
 layer; a four-column verify routes to as many as 32 distinct ones. Where the experts are
@@ -372,14 +386,19 @@ prefill dominates and both engines' gains shrink toward it:
 |---|---:|---:|---:|---:|
 | llama.cpp `-cmoe -t 32` | 42.4 | 10.2 | 1.00 | -- |
 | llama.cpp, `draft-mtp` 3 | 43.4 | 10.5 | 2.93 | 64.3 % |
-| surogate `--host-moe-layers all --cpu-moe-share auto` (the expert cache, 2026-09-06) | 36.1 | 8.7 | 1.00 | -- |
+| surogate `--host-moe-layers all --cpu-moe-share auto`, mixed bank, chunk 1,024 (the expert cache, 2026-09-06 evening) | **51.3** | **12.4** | 1.00 | -- |
+| surogate, the same with `mtp` 3 (the pool sized automatically to one layer's experts) | **50.3** | **12.2** | 2.82 | 60.7 % |
+| surogate, the W8 bank at chunk 512 (afternoon) | 36.1 | 8.7 | 1.00 | -- |
 | surogate, the same with `mtp` 3 | 41.1 | 9.9 | 2.95 | 65.1 % |
 | surogate `--host-moe-layers all`, before the cache | 7.5 | 1.8 | 1.00 | -- |
 | surogate, the same with `mtp` 3 | 4.7 | 1.1 | **3.02** | **67.5 %** |
 
-Our acceptance is the higher of the two on both clients. Through the expert cache the head
-now pays for itself on this placement too -- +14 % decode and a shorter first token -- and the
-row sits at 94 % of llama.cpp's draft-head decode where it sat at 10 % before.
+Through the expert cache both of our rows are ahead of llama.cpp's draft-head row (43.4 /
+10.5) on this client, with or without the head: on the mixed bank the head no longer pays for
+itself at 512/128 (12.2 against 12.4), because a four-column verify routes to up to four times
+the experts and the round is bytes-bound again once the base round is fast; on the slower W8
+bank it still gained 14 %. The head is worth keeping for short-prompt, long-generation
+requests, where the single-request table above shows it ahead.
 
 ## Prefill on the 27B GGUF, and where it goes (2026-09-04)
 

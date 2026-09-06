@@ -252,6 +252,15 @@ HostBank::HostBank(const HostBankPlan& plan) {
                         const std::byte* blocks =
                             stretches[part].data() +
                             static_cast<std::size_t>(r - first_row[part]) * static_cast<std::size_t>(row_in);
+                        const std::int64_t group0 = r * (k / 32);
+                        // A 4-bit affine source goes to Q4G32AM directly and exactly; anything
+                        // wider takes the W8 row and the affine refit (a requantisation).
+                        if (q4 && ops::ggml_row_to_q4g32am(source.decode_type, blocks, k,
+                                                           q4_dst_codes + group0 * 16,
+                                                           q4_dst_scales + group0,
+                                                           q4_dst_mins + group0)) {
+                            continue;
+                        }
                         std::int8_t* out_codes    = q4 ? row_codes.data() : codes + r * k;
                         std::uint16_t* out_scales = q4 ? row_scales.data() : scales + r * (k / 32);
                         if (!ops::ggml_decode_row_w8(source.decode_type, blocks, k, out_codes,
@@ -260,7 +269,6 @@ HostBank::HostBank(const HostBankPlan& plan) {
                                                      " failed to decode a row");
                         }
                         if (q4) {
-                            const std::int64_t group0 = r * (k / 32);
                             ops::requantise_w8_expert_groups_to_q4(
                                 out_codes, out_scales, k / 32, q4_dst_codes + group0 * 16,
                                 q4_dst_scales + group0, q4_dst_mins + group0);
@@ -573,6 +581,10 @@ BankPlanes bank_as_planes(HostObjectPlan& plan, std::int64_t rows, std::int32_t 
                           QType stored, BankPlanes planes) {
     if (planes == BankPlanes::Native || !ops::detail::ggml::is_ggml_qtype(stored)) {
         return BankPlanes::Native;
+    }
+    if (planes == BankPlanes::Auto) {
+        const bool affine4 = stored == QType::Q4_K || stored == QType::Q4_0 || stored == QType::Q4_1;
+        planes             = affine4 ? BankPlanes::Q4 : BankPlanes::W8;
     }
     plan.decode_rows = rows;
     plan.decode_k    = columns;

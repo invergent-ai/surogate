@@ -443,58 +443,67 @@ struct ExpertCache::Impl {
         }
         Layer& entry = layer_entries[static_cast<std::size_t>(mixture.layer)];
         if (entry.owner == nullptr) {
-            entry.owner                       = this;
-            entry.index                       = mixture.layer;
-            const ops::SparseMoeWeights& op   = *mixture.op;
-            if (mixture.host_bank_q4) {
-                entry.bank = ops::expert_host_bank_q4(geometry, op.routed_gate_up.qdata,
-                                                      op.routed_down.qdata);
-                if (mixture.host_gate_up != nullptr && mixture.host_down != nullptr) {
-                    const ops::Q4BankPlanes gate = ops::q4_bank_planes(
-                        static_cast<std::int64_t>(geometry.experts) * geometry.expert_rows(),
-                        geometry.hidden);
-                    const ops::Q4BankPlanes down = ops::q4_bank_planes(
-                        static_cast<std::int64_t>(geometry.experts) * geometry.hidden,
-                        geometry.intermediate);
-                    entry.cpu_bank.format         = ops::ExpertBankFormat::Q4G32AM;
-                    entry.cpu_bank.gate_up_codes  = mixture.host_gate_up;
-                    entry.cpu_bank.gate_up_scales = mixture.host_gate_up + gate.scales_offset;
-                    entry.cpu_bank.gate_up_mins   = mixture.host_gate_up + gate.mins_offset;
-                    entry.cpu_bank.down_codes     = mixture.host_down;
-                    entry.cpu_bank.down_scales    = mixture.host_down + down.scales_offset;
-                    entry.cpu_bank.down_mins      = mixture.host_down + down.mins_offset;
+            entry.owner                     = this;
+            entry.index                     = mixture.layer;
+            const ops::SparseMoeWeights& op = *mixture.op;
+            // The device view: each half by its own source -- the Q4 planes' base where the
+            // bank requantised it, the Weight (W8 planes or the file's blocks) otherwise.
+            entry.bank = ops::expert_host_bank(
+                geometry,
+                ops::ExpertBankHalfSource{&op.routed_gate_up,
+                                          mixture.host_gate_up_q4 ? op.routed_gate_up.qdata : nullptr},
+                ops::ExpertBankHalfSource{&op.routed_down,
+                                          mixture.host_down_q4 ? op.routed_down.qdata : nullptr});
+            // The host view of the same planes, for the CPU expert path: nothing unless the
+            // caller gave the host addresses (an object that is device resident has none, and
+            // the layer then runs its misses through the pool alone).
+            if (mixture.host_gate_up == nullptr || mixture.host_down == nullptr) { return entry; }
+            const auto host_half = [&](bool gate_up) {
+                const std::byte* host       = gate_up ? mixture.host_gate_up : mixture.host_down;
+                const bool q4               = gate_up ? mixture.host_gate_up_q4 : mixture.host_down_q4;
+                const Weight& weight        = gate_up ? op.routed_gate_up : op.routed_down;
+                ops::ExpertBankFormat& fmt  = gate_up ? entry.cpu_bank.gate_up_format
+                                                      : entry.cpu_bank.down_format;
+                const std::byte*& codes     = gate_up ? entry.cpu_bank.gate_up_codes
+                                                      : entry.cpu_bank.down_codes;
+                const std::byte*& scales    = gate_up ? entry.cpu_bank.gate_up_scales
+                                                      : entry.cpu_bank.down_scales;
+                const std::byte*& mins      = gate_up ? entry.cpu_bank.gate_up_mins
+                                                      : entry.cpu_bank.down_mins;
+                if (q4) {
+                    const ops::Q4BankPlanes planes = ops::q4_bank_planes(
+                        static_cast<std::int64_t>(geometry.experts) *
+                            (gate_up ? geometry.expert_rows() : geometry.hidden),
+                        gate_up ? geometry.hidden : geometry.intermediate);
+                    fmt    = ops::ExpertBankFormat::Q4G32AM;
+                    codes  = host;
+                    scales = host + planes.scales_offset;
+                    mins   = host + planes.mins_offset;
+                    return;
                 }
-                return entry;
-            }
-            entry.bank = ops::expert_host_bank(geometry, op.routed_gate_up, op.routed_down);
-            if (entry.bank.format == ops::ExpertBankFormat::GgmlBlocks) {
-                // The blocks are the bank: the CPU path decodes a row at a time with the same
-                // codec the gather uses, so the host reads exactly the bytes the GGUF holds and
-                // the artifact still stores no second copy of the experts.
-                entry.cpu_bank.format        = ops::ExpertBankFormat::GgmlBlocks;
-                entry.cpu_bank.gate_up_ggml  = entry.bank.gate_up_ggml;
-                entry.cpu_bank.down_ggml     = entry.bank.down_ggml;
-                entry.cpu_bank.gate_up_codes = mixture.host_gate_up != nullptr
-                                                   ? mixture.host_gate_up
-                                                   : entry.bank.gate_up_codes;
-                entry.cpu_bank.down_codes = mixture.host_down != nullptr
-                                                ? mixture.host_down
-                                                : entry.bank.down_codes;
-                return entry;
-            }
-            if (mixture.host_gate_up != nullptr && mixture.host_down != nullptr) {
-                // Plane offsets are the same in the host and device views of the object.
-                const auto gate_scale_offset =
-                    static_cast<const std::byte*>(op.routed_gate_up.scales) -
-                    static_cast<const std::byte*>(op.routed_gate_up.qdata);
-                const auto down_scale_offset =
-                    static_cast<const std::byte*>(op.routed_down.scales) -
-                    static_cast<const std::byte*>(op.routed_down.qdata);
-                entry.cpu_bank.gate_up_codes  = mixture.host_gate_up;
-                entry.cpu_bank.gate_up_scales = mixture.host_gate_up + gate_scale_offset;
-                entry.cpu_bank.down_codes     = mixture.host_down;
-                entry.cpu_bank.down_scales    = mixture.host_down + down_scale_offset;
-            }
+                const ops::ExpertBankFormat device_format =
+                    gate_up ? entry.bank.gate_up_format : entry.bank.down_format;
+                if (device_format == ops::ExpertBankFormat::GgmlBlocks) {
+                    // The blocks are the bank: the CPU path decodes a row at a time with the
+                    // same codec the gather uses, so the host reads exactly the bytes the GGUF
+                    // holds and the artifact still stores no second copy of the experts.
+                    fmt    = ops::ExpertBankFormat::GgmlBlocks;
+                    codes  = host;
+                    scales = nullptr;
+                    mins   = nullptr;
+                    (gate_up ? entry.cpu_bank.gate_up_ggml : entry.cpu_bank.down_ggml) =
+                        gate_up ? entry.bank.gate_up_ggml : entry.bank.down_ggml;
+                    return;
+                }
+                // W8 planes: the plane offsets are the same in the host and device views.
+                fmt    = ops::ExpertBankFormat::W8G32;
+                codes  = host;
+                scales = host + (static_cast<const std::byte*>(weight.scales) -
+                                 static_cast<const std::byte*>(weight.qdata));
+                mins   = nullptr;
+            };
+            host_half(true);
+            host_half(false);
         }
         return entry;
     }
@@ -1158,6 +1167,26 @@ struct ExpertCache::Impl {
                 static_cast<long>(layers) * static_cast<long>(geometry.experts);
             requested = per_slot == 0 ? 0 : static_cast<long>(budget / per_slot);
             requested = std::min(requested, whole_model);
+            if (requested < geometry.experts && per_slot != 0) {
+                // The margin exists for what the load and the runtime carve beyond their
+                // projections; a pool of one layer's experts is the difference between the
+                // split running and every miss crossing PCIe -- or, with a Q4 bank, between
+                // running and refusing. When the minimum pool fits inside half the margin,
+                // it is worth more than that half.
+                const std::size_t minimum = per_slot * static_cast<std::size_t>(geometry.experts);
+                const std::size_t within_margin =
+                    free > floor + kMargin / 2 ? free - floor - kMargin / 2 : 0;
+                if (within_margin >= minimum) {
+                    requested = geometry.experts;
+                    std::fprintf(stderr,
+                                 "expert cache: the automatic pool takes one layer's %d experts "
+                                 "(%.1f GiB) out of its margin; %.1f GiB free, %.1f GiB floor\n",
+                                 geometry.experts,
+                                 static_cast<double>(minimum) / (1024.0 * 1024.0 * 1024.0),
+                                 static_cast<double>(free) / (1024.0 * 1024.0 * 1024.0),
+                                 static_cast<double>(floor) / (1024.0 * 1024.0 * 1024.0));
+                }
+            }
             if (requested < geometry.experts) {
                 // Said out loud: without a pool every banked expert crosses PCIe on the token
                 // that wants it, and a run that expected the split would otherwise only see

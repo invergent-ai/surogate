@@ -170,7 +170,12 @@ artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank
 /// pool's own requantisation; `Q4` goes on to Q4G32AM through a row of W8 -- 59 % of the W8
 /// bytes and the fastest host path, exact for a Q4_K source and a requantisation for anything
 /// wider.
-enum class BankPlanes : std::uint8_t { Native, W8, Q4 };
+/// `Auto` keeps the narrowest planes that lose nothing: Q4G32AM for a 4-bit affine source
+/// (Q4_K, Q4_0, Q4_1 -- a 16-level grid with a scale and a minimum per 32, which Q4G32AM holds
+/// to FP16 rounding of the endpoints), W8 for anything wider. A K_XL mixture's bank then holds
+/// its gate/up as 4-bit planes and its Q5_K/Q6_K down as W8: 27 % fewer bytes than all-W8 and
+/// the same numbers.
+enum class BankPlanes : std::uint8_t { Native, W8, Q4, Auto };
 
 /// Marks a banked object stored as GGML blocks for `planes` as the bank is filled. `rows x
 /// columns` is the weight's shape and `stored` the file's type. A format the bank does not
