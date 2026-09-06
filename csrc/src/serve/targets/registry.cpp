@@ -24,6 +24,7 @@
 #include <thread>
 #include <variant>
 #include <utility>
+#include <vector>
 
 namespace sinfer::targets {
 namespace {
@@ -331,20 +332,164 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 }
 
 // A pipeline stage holds only its own layers, so its free memory differs from a whole-model
-// run; the ceiling is resolved on the first stage and shared, which is what keeps every stage's
+// run; the ceiling and the pool are shared across the stages, which is what keeps every stage's
 // block tables and KV floor identical.
+//
+// They are resolved against the *tightest* stage, not the first. Every stage holds the same
+// number of KV tokens but only its own layers' cache, and a split by layer count does not split
+// the bytes evenly: GLM-5.3-Flash's first stage carries the three leading dense layers and the
+// embedding where its last carries six mixture layers and the LM head -- 10.6 GiB against
+// 26.1 GiB. Sizing the pool to what stage 0 has spare hands the heaviest stage one it cannot
+// afford, and the refusal lands after every stage has already uploaded its weights.
+//
+// The preflight uploads nothing: planning reads the artifact's directory and asks the driver
+// for free memory.
+// Layers are not the same size. GLM-5.3-Flash's first three are dense (a 12,288-wide FFN) and
+// its other forty-two carry a 288-expert mixture, so splitting 45 layers eight ways by *count*
+// puts 10.6 GiB on the first card and 26.4 GiB on the last -- and since every stage must hold
+// the same number of KV tokens, the pool the whole pipeline gets is what that last card can
+// afford. Balancing the bytes instead is worth several GiB of pool on exactly the stage that
+// decides it.
+//
+// What a layer weighs comes from the target itself: planning the range [0, k) for every k and
+// differencing gives each layer's marginal bytes, with the per-stage constants (the embedding,
+// the LM head) cancelling out. Planning reads the artifact's directory and uploads nothing.
+// The boundaries then minimise the heaviest stage, which is the quantity that binds.
 template <class Target>
-std::uint32_t resolve_automatic_context_for_pipeline(DeviceContext& device,
-                                                     const EngineOptions& stage_options,
-                                                     artifact::Reader& reader) {
+std::vector<int> balanced_stage_bounds(const EngineOptions& options, artifact::Reader& reader,
+                                       int layers, int stage_count) {
     const auto weights_profile = Target::resolve_weights(reader.identity());
-    artifact::Binder binder(reader);
-    auto plan = Target::plan_load(binder, stage_options, weights_profile);
-    const std::size_t budget = subtract_saturating(
-        runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
-        projected_derived_residency_bytes(binder, plan.materialization()));
-    return resolve_automatic_context<Target>(device, stage_options, weights_profile,
-                                            Target::declared_geometry(reader), budget);
+    const auto planned_through = [&](int last) {
+        EngineOptions probe        = options;
+        probe.pipeline_stage_first = 0;
+        probe.pipeline_stage_last  = last;
+        artifact::Binder binder(reader);
+        return Target::plan_load(binder, probe, weights_profile)
+            .materialization()
+            .device_capacity_bytes;
+    };
+
+    std::vector<std::uint64_t> marginal(static_cast<std::size_t>(layers), 0);
+    std::uint64_t previous = planned_through(1);
+    marginal[0]            = previous;
+    for (int l = 1; l < layers; ++l) {
+        const std::uint64_t through = planned_through(l + 1);
+        // A layer cannot weigh less than nothing; if a target's planning is not monotone in the
+        // range, fall back to an even share rather than inventing a negative.
+        marginal[static_cast<std::size_t>(l)] = through > previous ? through - previous : 0;
+        previous                              = through;
+    }
+    if (std::all_of(marginal.begin(), marginal.end(), [](std::uint64_t b) { return b == 0; })) {
+        std::vector<int> even(static_cast<std::size_t>(stage_count) + 1, 0);
+        for (int s = 0; s <= stage_count; ++s) {
+            even[static_cast<std::size_t>(s)] = layers * s / stage_count;
+        }
+        return even;
+    }
+
+    // Minimise the heaviest stage: the smallest ceiling for which a left-to-right greedy fit
+    // uses no more than `stage_count` stages, binary-searched over the byte range. Every stage
+    // takes at least one layer, which the feasibility test enforces by construction.
+    const std::uint64_t heaviest = *std::max_element(marginal.begin(), marginal.end());
+    std::uint64_t total          = 0;
+    for (const std::uint64_t bytes : marginal) { total += bytes; }
+    const auto stages_needed = [&](std::uint64_t ceiling) {
+        int used             = 1;
+        std::uint64_t filled = 0;
+        for (const std::uint64_t bytes : marginal) {
+            if (filled + bytes > ceiling && filled > 0) {
+                ++used;
+                filled = 0;
+            }
+            filled += bytes;
+        }
+        return used;
+    };
+    std::uint64_t low  = heaviest;
+    std::uint64_t high = total;
+    while (low < high) {
+        const std::uint64_t mid = low + (high - low) / 2;
+        if (stages_needed(mid) <= stage_count) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    // Lay the layers out under that ceiling, leaving every remaining stage at least one layer.
+    std::vector<int> bounds(static_cast<std::size_t>(stage_count) + 1, 0);
+    int stage            = 0;
+    std::uint64_t filled = 0;
+    for (int l = 0; l < layers; ++l) {
+        const int remaining_stages = stage_count - stage - 1;
+        const int remaining_layers = layers - l;
+        const bool must_close      = remaining_layers <= remaining_stages;
+        if (stage + 1 < stage_count && filled > 0 &&
+            (must_close || filled + marginal[static_cast<std::size_t>(l)] > low)) {
+            ++stage;
+            bounds[static_cast<std::size_t>(stage)] = l;
+            filled                                  = 0;
+        }
+        filled += marginal[static_cast<std::size_t>(l)];
+    }
+    for (int s = stage + 1; s <= stage_count; ++s) {
+        bounds[static_cast<std::size_t>(s)] = layers;
+    }
+    return bounds;
+}
+
+template <class Target>
+struct StagePreflight {
+    std::uint32_t max_context = 0;
+    std::uint32_t kv_tokens   = 0;
+};
+
+template <class Target>
+StagePreflight<Target>
+preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
+                   const std::vector<EngineOptions>& stage_options) {
+    const auto weights_profile          = Target::resolve_weights(reader.identity());
+    const family::TextGeometry geometry = Target::declared_geometry(reader);
+    const auto count                    = stage_options.size();
+
+    std::vector<std::size_t> budgets(count, 0);
+    StagePreflight<Target> out{};
+    for (std::size_t s = 0; s < count; ++s) {
+        DeviceContext probe(stage_options[s].device);
+        artifact::Binder binder(reader);
+        auto plan  = Target::plan_load(binder, stage_options[s], weights_profile);
+        budgets[s] = subtract_saturating(
+            runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
+            projected_derived_residency_bytes(binder, plan.materialization()));
+        if (options.max_context != 0) { continue; }
+        const std::uint32_t resolved = resolve_automatic_context<Target>(
+            probe, stage_options[s], weights_profile, geometry, budgets[s]);
+        out.max_context = out.max_context == 0 ? resolved : std::min(out.max_context, resolved);
+    }
+    if (options.max_context != 0) { out.max_context = options.max_context; }
+
+    // The ceiling is shared, so every stage plans the same curve shape; what differs is what a
+    // token costs on each (its own layers) and what each has spare.
+    for (std::size_t s = 0; s < count; ++s) {
+        DeviceContext probe(stage_options[s].device);
+        EngineOptions stage = stage_options[s];
+        stage.max_context   = out.max_context;
+        stage.prefill_chunk = std::min(options.prefill_chunk, out.max_context);
+        if (stage.elastic_kv_overcommit) { stage.elastic_kv = true; }
+        const runtime::SequenceCapacityCurve curve =
+            Target::make_sequence_planner(probe, stage, weights_profile, geometry).capacity_curve();
+        const KvCapacityPolicy policy =
+            stage.elastic_kv_overcommit && stage.kv_capacity.mode == KvCapacityMode::Automatic
+                ? KvCapacityPolicy::explicit_capacity(stage.max_context)
+                : stage.kv_capacity;
+        const std::uint32_t tokens =
+            runtime::resolve_kv_capacity(
+                policy, curve,
+                subtract_saturating(budgets[s], elastic_kv_unmapped_commitment(probe.device)))
+                .resolved_tokens;
+        out.kv_tokens = out.kv_tokens == 0 ? tokens : std::min(out.kv_tokens, tokens);
+    }
+    return out;
 }
 
 template <class Target, class Loaded, class Instance>
@@ -359,41 +504,50 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
     ModelSamplingDefaults sampling_defaults{};
     std::uint32_t resolved_kv      = 0;
     std::uint32_t resolved_context = 0;
+    const std::vector<int> bounds =
+        balanced_stage_bounds<Target>(options, reader, layers, stage_count);
     const auto stage_options_for = [&](int s) {
         EngineOptions stage_options             = options;
         stage_options.device                    = options.devices[static_cast<std::size_t>(s)];
-        stage_options.pipeline_stage_first      = layers * s / stage_count;
-        stage_options.pipeline_stage_last       = layers * (s + 1) / stage_count;
+        stage_options.pipeline_stage_first      = bounds[static_cast<std::size_t>(s)];
+        stage_options.pipeline_stage_last       = bounds[static_cast<std::size_t>(s) + 1];
         stage_options.pipeline_import_pinned    = nullptr; // each stage owns its import buffer
         stage_options.cpu_moe_pool_per_socket   = std::getenv("SUROGATE_SERVE_CPU_MOE_POOL_SHARED") == nullptr;
         stage_options.pipeline_boundary_columns = options.prefill_chunk + options.max_concurrency + 128;
-        if (s > 0) {
-            stage_options.kv_capacity = KvCapacityPolicy::explicit_capacity(resolved_kv);
-            if (resolved_context != 0) {
-                stage_options.max_context   = resolved_context; // stage 0 resolved it
-                stage_options.prefill_chunk = std::min(options.prefill_chunk, resolved_context);
-            }
+        // Zero until the preflight below has run, and then the shared values every stage --
+        // stage 0 included -- is built with.
+        if (resolved_kv != 0) {
+            stage_options.kv_capacity   = KvCapacityPolicy::explicit_capacity(resolved_kv);
+            stage_options.max_context   = resolved_context;
+            stage_options.prefill_chunk = std::min(options.prefill_chunk, resolved_context);
         }
         return stage_options;
     };
 
-    // Stage 0 first, alone: it resolves the shared per-request context ceiling and the KV
-    // capacity every later stage plans with.
+    {
+        std::vector<EngineOptions> probe_options;
+        probe_options.reserve(static_cast<std::size_t>(stage_count));
+        for (int s = 0; s < stage_count; ++s) { probe_options.push_back(stage_options_for(s)); }
+        const StagePreflight<Target> shared =
+            preflight_pipeline<Target>(options, reader, probe_options);
+        resolved_context = shared.max_context;
+        resolved_kv      = shared.kv_tokens;
+        std::fprintf(stderr,
+                     "pipeline: %d stages, max context %u tokens, KV pool %u tokens "
+                     "(the tightest stage's)\n",
+                     stage_count, resolved_context, resolved_kv);
+    }
+
+    // Stage 0 first, alone: the concurrent constructions below inherit whatever globals it
+    // configures.
     devices.resize(static_cast<std::size_t>(stage_count));
     stages.resize(static_cast<std::size_t>(stage_count));
     {
         devices[0] = std::make_unique<DeviceContext>(options.devices[0]);
-        EngineOptions stage_options = stage_options_for(0);
-        if (stage_options.max_context == 0) {
-            resolved_context            = resolve_automatic_context_for_pipeline<Target>(
-                *devices[0], stage_options, reader);
-            stage_options.max_context   = resolved_context;
-            stage_options.prefill_chunk = std::min(options.prefill_chunk, resolved_context);
-        }
+        const EngineOptions stage_options = stage_options_for(0);
         ConstructedTarget stage = construct_registered<Target, Loaded, Instance>(
             stage_options, *devices[0], reader, load_start, target_key);
         stages[0].reset(std::get<std::unique_ptr<Instance>>(stage.active).release());
-        resolved_kv       = stages[0]->kv_capacity_resolution.resolved_tokens;
         sampling_defaults = stage.sampling_defaults;
         summary           = std::move(stage.load);
         std::fprintf(stderr, "pipeline: stage 0 on device %d, layers [%d, %d)\n",
@@ -441,8 +595,9 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
             summary.artifact_bytes_read += stage.load.artifact_bytes_read;
             summary.host_to_device_bytes += stage.load.host_to_device_bytes;
             std::fprintf(stderr, "pipeline: stage %d on device %d, layers [%d, %d)\n", s,
-                         options.devices[static_cast<std::size_t>(s)], layers * s / stage_count,
-                         layers * (s + 1) / stage_count);
+                         options.devices[static_cast<std::size_t>(s)],
+                         bounds[static_cast<std::size_t>(s)],
+                         bounds[static_cast<std::size_t>(s) + 1]);
         }
         // The serial loop left the last stage's device current; keep that post-condition.
         CUDA_CHECK(cudaSetDevice(devices.back()->device));

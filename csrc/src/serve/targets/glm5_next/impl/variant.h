@@ -72,7 +72,7 @@ struct Variant {
     /// Device memory reserved per decode lane for the ordinary graphs. The family's 12 MiB is
     /// sized for a residual as wide as the model; this one carries four streams of it, and the
     /// buffers a captured round bakes scale with that, so the measured requirement is 14 MiB.
-    static constexpr std::size_t ordinary_graph_allowance_per_lane_bytes = 24ULL * 1024 * 1024;
+    static constexpr std::size_t ordinary_graph_allowance_per_lane_bytes = 48ULL * 1024 * 1024;
 
     /// GLM-5.3 stores RMSNorm scales directly, not zero-centred: the scale is `w`, not `1 + w`.
     static constexpr bool norm_unit_offset = false;
