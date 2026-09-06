@@ -91,6 +91,12 @@ using Gqa256_4q1   = GqaGeometry<256, 4, 1, 4>;  // gemma-3-270m (the first MQA 
 // DecodeSplitScale 1: sixty-four KV heads are already far past the registry's modal
 // KVHeads*DecodeSplits, and the grid takes its parallelism from that dimension first.
 using Gqa256_64q64 = GqaGeometry<256, 64, 64, 1>; // glm-5.3-flash
+// GLM-5.3-Flash's latent attention, absorbed: the query is folded through `k_b` into the
+// 512-wide latent and attends over that latent directly, so the cache holds one 512-wide head
+// per token where the expanded form above holds sixty-four of 256 -- sixty-four times less.
+// DecodeSplitScale 4 for the reason the other single-KV-head shape gives: the grid takes its
+// parallelism from the keys, because the heads offer none.
+using Gqa512_64q1  = GqaGeometry<512, 64, 1, 4>;  // glm-5.3-flash, absorbed
 
 // The registry. Every dispatcher below and in the launchers is generated from
 // this list, so a registration line is the whole of adding a shape — with the
@@ -109,7 +115,8 @@ using Gqa256_64q64 = GqaGeometry<256, 64, 64, 1>; // glm-5.3-flash
     X(Gqa64_32q4)                                                                                 \
     X(Gqa64_32q8)                                                                                 \
     X(Gqa256_4q1)                                                                                  \
-    X(Gqa256_64q64)
+    X(Gqa256_64q64)                                                                                \
+    X(Gqa512_64q1)
 
 namespace detail {
 

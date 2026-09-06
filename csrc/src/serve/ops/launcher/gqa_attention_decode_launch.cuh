@@ -205,6 +205,9 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
+    // The dynamic-arena tier stages 4 * 64 * HeadDim bytes: 64 KiB at 256, 128 KiB at 512,
+    // which is past the card's opt-in limit. A wide head takes the static tier instead.
+    constexpr bool kWideHead = Geometry::HeadDim > 256;
     if constexpr (TokenTile == 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
@@ -215,7 +218,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 launch.template operator()<32, 1, 32, false>();
             } else if (implementation_window <= 2054) {
                 launch.template operator()<16, 1, 32, false>();
-            } else if (implementation_window <= 8198) {
+            } else if (implementation_window <= 8198 && !kWideHead) {
                 launch.template operator()<16, 1, 64, true>();
             } else {
                 launch.template operator()<8, 2, 32, false>();
@@ -224,7 +227,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             launch.template operator()<24, 1, 32, false>();
         } else if (implementation_window <= 2054) {
             launch.template operator()<12, 1, 32, false>();
-        } else if (implementation_window <= 8198) {
+        } else if (implementation_window <= 8198 && !kWideHead) {
             launch.template operator()<12, 1, 64, true>();
         } else {
             launch.template operator()<6, 2, 32, false>();
@@ -388,9 +391,15 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             std::to_string(invocation.full_width) + ", column begin " +
             std::to_string(invocation.column_begin) + ")");
     }
+    // Two warps cover 32 rows, enough for a single token of any group up to 32; a group of
+    // sixty-four -- a latent attention served absorbed -- needs the four-warp tile for one token,
+    // and is refused above one token by the check just above.
+    constexpr int kWidthOneWarps =
+        (Geometry::GroupSize + 15) / 16 > 2 ? (Geometry::GroupSize + 15) / 16 : 2;
+    static_assert(kWidthOneWarps <= 4, "a group wider than 64 has no lane step");
     switch (invocation.width) {
     case 1:
-        SINFER_GQA_SMALL_T_DISPATCH(1, 2);
+        SINFER_GQA_SMALL_T_DISPATCH(1, kWidthOneWarps);
         break;
     case 2:
         SINFER_GQA_SMALL_T_DISPATCH(2, 4);

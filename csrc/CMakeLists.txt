@@ -994,6 +994,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa64_32q8.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_4q1.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_64q64.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_64q1.cu
   ${SERVE_ROOT}/ops/launcher/gelu.cu
   ${SERVE_ROOT}/ops/launcher/lora_batched.cu
   ${SERVE_ROOT}/ops/launcher/lora_fused.cu
@@ -1025,6 +1026,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/mean_pool.cu
   ${SERVE_ROOT}/ops/launcher/scale.cu
   ${SERVE_ROOT}/ops/launcher/silu_and_mul.cu
+${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/launcher/vision_attention.cu
   ${SERVE_ROOT}/ops/launcher/vision_pos_embed.cu
   # Gated DeltaNet Linear Attention core.
@@ -1238,6 +1240,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/mean_pool.cpp
   ${SERVE_ROOT}/ops/wrapper/scale.cpp
   ${SERVE_ROOT}/ops/wrapper/silu_mul.cpp
+${SERVE_ROOT}/ops/wrapper/head_linear.cpp
   ${SERVE_ROOT}/ops/wrapper/sparse_moe.cpp
   ${SERVE_ROOT}/ops/wrapper/vision_attention.cpp
   ${SERVE_ROOT}/ops/wrapper/vision_pos_embed.cpp)

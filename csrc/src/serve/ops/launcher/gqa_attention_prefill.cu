@@ -23,6 +23,9 @@ namespace {
 // blocking the build; their bf16 and e4m3 caches are unaffected.
 template <typename Geometry>
 inline constexpr bool kGqaI8PrefillRegistered =
+    // Its arena is sized for a head of at most 256; at 512 it is past what the card opts
+    // in to, so a wider head refuses an INT8 cache by name rather than failing at load.
+    Geometry::HeadDim <= 256 &&
     (Geometry::HeadDim / kGqaKvQuantGroup) * static_cast<int>(sizeof(__half)) >= 4;
 
 template <typename Geometry>

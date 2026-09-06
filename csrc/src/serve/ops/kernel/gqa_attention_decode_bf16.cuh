@@ -155,8 +155,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         }
     };
 
-    if (kv_head < 0 || kv_head >= Geometry::KVHeads || tokens < 1 || tokens > TokenTile ||
-        row_count > Br || split_count <= 0) {
+    // A lane step is `tokens` of GroupSize query rows each, and every one has to land in this
+    // CTA's Br-row tile: the launcher's warp count is what makes that so. When it does not, the
+    // CTA used to return without writing anything, and a group of sixty-four over two warps
+    // found that the silent way -- zeros for output and a cache row never appended. An
+    // impossible state is reported as one instead of read as an answer.
+    if (tokens > TokenTile || row_count > Br) { __trap(); }
+    if (kv_head < 0 || kv_head >= Geometry::KVHeads || tokens < 1 || split_count <= 0) {
         return;
     }
     if (valid_tokens == 0) {

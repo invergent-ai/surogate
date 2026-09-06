@@ -47,15 +47,25 @@ struct TextConfig {
     /// exp(g) then lies in [exp(-5), 1): the state neither grows nor is erased outright.
     static constexpr float kda_gate_lower_bound = -5.0F;
 
-    // Multi-head latent attention, NoPE: the query and key/value low ranks, and the per-head
-    // widths they expand to. 64 query heads and 64 key/value heads -- this is MHA over an
-    // expanded latent, not GQA.
+    // Multi-head latent attention, NoPE, served in its absorbed form. The query is folded
+    // through the key half of the expansion into the 512-wide latent and attends over the
+    // latent itself: one key/value head as wide as the latent, sixty-four query heads over it,
+    // and the value half unfolds the attended latent per head afterwards. The cache then holds
+    // 1 KB per layer per token where the expanded form -- sixty-four heads of 256, each its own
+    // key and value -- held 64 KB; on a 200 GB checkpoint split over eight cards that is the
+    // difference between sixteen lanes fitting and not.
     static constexpr int query_heads   = 64;
-    static constexpr int kv_heads      = 64;
-    static constexpr int head_dim      = 256;
-    static constexpr int rotary_dim    = 0;
+    static constexpr int kv_heads      = 1;
     static constexpr int q_lora_rank   = 1536;
     static constexpr int kv_lora_rank  = 512;
+    /// The head the attention kernels see: the latent.
+    static constexpr int head_dim      = kv_lora_rank;
+    static constexpr int rotary_dim    = 0;
+    /// The per-head widths of the query and value projections -- what the checkpoint was
+    /// trained with, and what its softmax scale is over. The artifact does not declare these;
+    /// a checkpoint with others fails the shape check at bind, which is the honest failure.
+    static constexpr int qk_head_dim   = 256;
+    static constexpr int v_head_dim    = 256;
 
     // The sparse indexer, which this target does not run. It selects `index_top_k / index_pool`
     // pools of `index_pool` tokens and, because `index_kpool_always_select_tail` is set, the up
@@ -88,8 +98,12 @@ struct TextConfig {
     /// The mixer convolves a fused q|k|v, so this is its width.
     static constexpr int convolution_dim = 2 * key_dim + value_dim;        // 24576
 
-    static constexpr int query_size = query_heads * head_dim;              // 16384
-    static constexpr int kv_size    = kv_heads * head_dim;                 // 16384
+    static constexpr int query_size = query_heads * head_dim;              // 32768: the absorbed query
+    static constexpr int kv_size    = kv_heads * head_dim;                 // 512: the latent
+    /// What `query_b` produces and what the output projection reads: the heads at their own
+    /// widths, on either side of the absorbed attention.
+    static constexpr int query_rows = query_heads * qk_head_dim;           // 16384
+    static constexpr int value_rows = query_heads * v_head_dim;            // 16384
     /// Ungated: the projection carries query rows only.
     static constexpr int query_projection_rows = query_size;
 
@@ -138,8 +152,8 @@ static_assert(TextConfig::full_attention_index(3) == 0 &&
 static_assert(TextConfig::gdn_index(0) == 0 && TextConfig::gdn_index(44) == 33);
 static_assert(TextConfig::hc_mix == 24 && TextConfig::hc_width == 16384);
 static_assert(TextConfig::dense_exact_context == 2051);
-static_assert(TextConfig::query_size == TextConfig::kv_size,
-              "MLA expands the latent to one key/value head per query head");
+static_assert(TextConfig::head_dim == TextConfig::kv_lora_rank && TextConfig::kv_heads == 1,
+              "absorbed MLA attends over the latent itself");
 
 /// No vision tower. Declared because the shared ModelView names one; never bound.
 struct VisionConfig {
@@ -172,8 +186,12 @@ struct DFlashConfig {
     static constexpr int kv_size        = 0;
 };
 
-/// 1/sqrt(256) for the latent attention, 1/sqrt(128) for the delta recurrence.
-inline constexpr float kAttentionScale                   = 0.0625F;
+/// The attention kernels apply 1/sqrt(head_dim), and the head they see is the 512-wide latent,
+/// so this is 1/sqrt(512). The model's scale is 1/sqrt(256), over the 256-wide query head it
+/// was trained with; the ratio, sqrt 2, is folded into the absorbed query by `kAbsorbScale`.
+inline constexpr float kAttentionScale                   = 0.044194173824159216F;
+inline constexpr float kAbsorbScale                      = 1.4142135623730951F;
+/// 1/sqrt(128) for the delta recurrence.
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 0;

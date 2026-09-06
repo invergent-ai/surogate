@@ -6,17 +6,15 @@ the GGUF's logical ones (reversed `ne`). The expression language, the row algebr
 it and the planners that turn it into runs are the shared ones.
 
 Almost everything is a row program over one or three sources, which is what lets the 185 GB of
-experts stay in the file. Four objects are not, and each is not for its own reason:
+experts stay in the file. Three objects are not, and each is not for its own reason:
 
 - **the convolution taps.** The file holds one `[channels, K]` tensor per projection, ggml's
   channel-major order; the op reads `weight[tap * C + c]`. Concatenating the three and
   transposing is a reorder inside a row.
-- **the key half of the latent expansion.** llama.cpp stores the absorbed pair -- `attn_k_b` is
-  `[nope, latent]` per head, which is the *transpose* of the projection, because it is applied
-  to the query rather than to the latent. The engine expands the latent instead, so this half
-  has to come back the other way round, and the artifact declares it BF16 because materialising
-  it into a quantised object would mean re-quantising weights the file had already quantised.
-  The value half is already stored as the projection and stays in the file.
+- ~~the key half of the latent expansion~~ -- no longer. llama.cpp stores `attn_k_b` as
+  `[latent, nope]` per head, the orientation it is applied to the *query* in, and since the
+  engine serves the attention absorbed it applies it to the query too. What once had to be
+  transposed into BF16 is now read where it lies, like the value half always was.
 - **the router**, which the file keeps in F32 and the artifact holds in BF16.
 - **the decay's `A_log`.** llama.cpp stores `ssm_a = -exp(A_log)` so that its own graph
   multiplies by the tensor as it lies; the engine's gate, like the checkpoint's, is written in
@@ -49,7 +47,7 @@ from surogate.serve.convert.common.recipe import (
 
 from . import inventory as inv
 
-RECIPE_ID = "glm5-next-v2"
+RECIPE_ID = "glm5-next-v3"
 
 #: Objects whose op reads the row-split W8 planes rather than the file's own block format.
 #: Their weights are still read from the GGUF where they lie -- Q8_0 and W8G32_F16S hold the
@@ -70,6 +68,7 @@ NATIVE_EXCLUDE_SUFFIXES = (
     "mla/query_b",
     "mla/kv_a",
     "mla/k_b",
+    "mla/v_b",
     "mla/output",
     "mlp/gate_up",
     "mlp/down",
@@ -175,13 +174,12 @@ def _mla(layer: int, prefix: str, geometry: inv.Geometry) -> list[TensorRecipe]:
     latent = geometry.kv_lora_rank
     nope = geometry.qk_head_dim
     value = geometry.v_head_dim
-    # `attn_k_b` is [nope, latent] per head: llama.cpp applies it to the *query*, so what it
-    # stores is the transpose of the projection that expands the latent. The v half is stored
-    # as the projection already. Both are then interleaved head by head, which is the order
-    # `kv_b_proj` has: one head's `nope` rows, then its `value` rows.
-    k_b = Transpose(
-        source(f"{blk}attn_k_b.weight", (heads, latent, nope)), (0, 2, 1)
-    )
+    # `attn_k_b` is [latent, nope] per head, the orientation it is applied to the *query* in;
+    # the served attention is absorbed and applies it that way, so it is read as stored. The
+    # value half is the projection, [value, latent] per head, and unfolds the attended latent.
+    # Read as stored: [latent, nope] per head is the orientation the absorbed attention applies
+    # it in, so no transpose and no materialisation.
+    k_b = source(f"{blk}attn_k_b.weight", (heads, latent, nope))
     v_b = source(f"{blk}attn_v_b.weight", (heads, value, latent))
     return [
         TensorRecipe(
@@ -198,7 +196,7 @@ def _mla(layer: int, prefix: str, geometry: inv.Geometry) -> list[TensorRecipe]:
             f"{prefix}mla/kv_a", source(f"{blk}attn_kv_a_mqa.weight", (latent, geometry.hidden))
         ),
         TensorRecipe(f"{prefix}mla/kv_a_norm", source(f"{blk}attn_kv_a_norm.weight", (latent,))),
-        TensorRecipe(f"{prefix}mla/k_b", Reshape(k_b, (heads * nope, latent))),
+        TensorRecipe(f"{prefix}mla/k_b", Reshape(k_b, (heads * latent, nope))),
         TensorRecipe(f"{prefix}mla/v_b", Reshape(v_b, (heads * value, latent))),
         TensorRecipe(
             f"{prefix}mla/output",

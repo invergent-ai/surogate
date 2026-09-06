@@ -240,13 +240,12 @@ _MLA_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("mla/kv_a", "quantised", ("KVRank", "C"), ("mla_kv_a_weight",)),
     ServeObject("mla/kv_a_norm", "bf16", ("KVRank",), ("mla_kv_a_norm_weight",)),
     # The latent expansion, held as its two halves. They are one parameter in training and one
-    # tensor in HuggingFace, and a serving artifact splits them because a checkpoint may store
-    # them differently from each other: llama.cpp keeps the key half in the orientation it
-    # applies to the *query* (the absorbed form), so it cannot be read where it lies, while the
-    # value half is already the projection. Splitting is what lets the value half stay in the
-    # file; the key half is BF16 because materialising it into a quantised object would mean
-    # re-quantising weights the file had already quantised.
-    ServeObject("mla/k_b", "bf16", ("KDim", "KVRank"), ("mla_kv_b_weight",)),
+    # tensor in HuggingFace; a serving artifact splits them because the served attention uses
+    # them on opposite sides of its scores. The key half is applied to the *query* -- the
+    # absorbed form, which is also the orientation llama.cpp stores it in, so it is read where
+    # it lies as [latent, nope] per head -- and the value half unfolds the attended latent
+    # afterwards. Both stay in the file in the file's own format.
+    ServeObject("mla/k_b", "quantised", ("KAbsorbDim", "NopeDim"), ("mla_kv_b_weight",)),
     ServeObject("mla/v_b", "quantised", ("VDim", "KVRank"), ("mla_kv_b_weight",)),
     ServeObject("mla/output", "quantised", ("C", "VDim"), ("mla_out_weight",)),
 )

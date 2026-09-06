@@ -257,6 +257,7 @@ set(sinfer_op_tests
   gelu
   gelu_mul
   silu_mul
+  head_linear
   mean_pool
   encoder_attention
   residual_add

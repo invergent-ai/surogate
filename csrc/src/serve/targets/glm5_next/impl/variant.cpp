@@ -6,6 +6,7 @@
 #include "api/ops/hyper_connection.h"
 #include "api/ops/linear.h"
 #include "api/ops/silu_mul.h"
+#include "api/ops/head_linear.h"
 #include "api/ops/manifold_hyper_connection.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/scatter.h"
@@ -81,6 +82,10 @@ MixingScratch& mixing_scratch_for_current_device() {
 thread_local Tensor t_post;
 thread_local Tensor t_comb;
 thread_local int t_mixing_device = -1;
+/// The value half of the layer's latent expansion, set by `attention_projection` for the
+/// output hook that follows it: the family hands that hook the output weight alone, and the
+/// attended latent has to be unfolded through this before the output weight can read it.
+thread_local const Weight* t_value_unfold = nullptr;
 
 void check_device_handoff(const char* what, int recorded) {
     int device = 0;
@@ -291,30 +296,45 @@ void Variant::attention_projection(const Tensor& hidden,
     (void)gate;
     const std::int32_t tokens = hidden.ne[1];
     auto scope                = workspace.scope();
-    Tensor q_low  = workspace.alloc(DType::BF16, {weights.query_a.n, tokens});
-    Tensor kv_low = workspace.alloc(DType::BF16, {weights.kv_a.n, tokens});
+    Tensor q_low   = workspace.alloc(DType::BF16, {weights.query_a.n, tokens});
+    Tensor q_heads = workspace.alloc(DType::BF16, {weights.query_b.n, tokens});
     project("mla/query_a", hidden, weights.query_a, q_low, workspace, stream);
-    project("mla/kv_a", hidden, weights.kv_a, kv_low, workspace, stream);
+    // The latent is projected straight into the key buffer: in the absorbed form it *is* this
+    // layer's key, and its value, and the cache holds it as such -- 512 wide, one head.
+    project("mla/kv_a", hidden, weights.kv_a, key, workspace, stream);
     // Each low rank is normalised whole, which is what replaces the per-head query and key
     // norms every other target in this family carries.
     ops::rmsnorm(q_low, weights.query_a_norm, weights.rms_epsilon, /*unit_offset=*/false, q_low,
                  stream);
-    ops::rmsnorm(kv_low, weights.kv_a_norm, weights.rms_epsilon, /*unit_offset=*/false, kv_low,
-                 stream);
-    project("mla/query_b", q_low, weights.query_b, query, workspace, stream);
-    // The expansion, one head at a time in the weight's own row order: the latent becomes this
-    // layer's keys and values, which the cache then holds as an ordinary attention's.
-    project("mla/k_b", kv_low, weights.k_b, key, workspace, stream);
-    project("mla/v_b", kv_low, weights.v_b, value, workspace, stream);
+    ops::rmsnorm(key, weights.kv_a_norm, weights.rms_epsilon, /*unit_offset=*/false, key, stream);
+    project("mla/query_b", q_low, weights.query_b, q_heads, workspace, stream);
+    // The absorption: every query head is folded through its own key half into the latent,
+    // carrying the sqrt 2 that turns the kernels' 1/sqrt(512) into the model's 1/sqrt(256).
+    const std::int32_t heads = weights.k_b.n / weights.kv_a.n;
+    ops::head_linear(q_heads, weights.k_b, heads, kAbsorbScale, query, stream);
+    CUDA_CHECK(cudaMemcpyAsync(value.data, key.data,
+                               static_cast<std::size_t>(key.numel()) * sizeof(__nv_bfloat16),
+                               cudaMemcpyDeviceToDevice, stream));
+    t_value_unfold = &weights.v_b;
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope = workspace.scope();
-    Tensor out = workspace.alloc(DType::BF16, {weight.n, attention.ne[1]});
-    project("mla/output", attention, weight, out, workspace, stream);
-    apply_lora(weight, 3, attention, out, stream);
+    if (t_value_unfold == nullptr) {
+        throw std::logic_error("glm5_next: attention output before its projection on this thread");
+    }
+    const Weight& value_unfold = *t_value_unfold;
+    const std::int32_t tokens  = attention.ne[1];
+    // The attended latent, per head, back through the value half: the heads at their own
+    // width, which is what the output projection was trained to read.
+    const std::int32_t heads = static_cast<std::int32_t>(attention.ne[0] / value_unfold.k);
+    auto scope      = workspace.scope();
+    Tensor unfolded = workspace.alloc(DType::BF16, {value_unfold.n, tokens});
+    ops::head_linear(attention, value_unfold, heads, 1.0F, unfolded, stream);
+    Tensor out = workspace.alloc(DType::BF16, {weight.n, tokens});
+    project("mla/output", unfolded, weight, out, workspace, stream);
+    apply_lora(weight, 3, unfolded, out, stream);
     combine_into(out, residual, stream);
 }
 
@@ -433,24 +453,28 @@ Variant::attention_projection_workspace_capacity_bytes(const family::TextGeometr
                                                        family::TextPhase, std::int32_t first,
                                                        std::int32_t last) {
     family::validate_token_interval(first, last);
+    // The query low rank and the heads `query_b` produces; the latent goes straight into the
+    // key buffer and the absorption is a per-head kernel with no transient of its own.
     return plane_bytes(geometry.q_lora_rank, last, DType::BF16) +
-           plane_bytes(geometry.kv_lora_rank, last, DType::BF16) +
+           plane_bytes(geometry.query_heads * TextConfig::qk_head_dim, last, DType::BF16) +
            std::max({linear_capacity(weights_profile, geometry.q_lora_rank, geometry.hidden, first,
                                      last),
                      linear_capacity(weights_profile, geometry.kv_lora_rank, geometry.hidden,
                                      first, last),
-                     linear_capacity(weights_profile, geometry.query_size(), geometry.q_lora_rank,
-                                     first, last),
-                     linear_capacity(weights_profile, geometry.kv_size(), geometry.kv_lora_rank,
-                                     first, last)});
+                     linear_capacity(weights_profile,
+                                     geometry.query_heads * TextConfig::qk_head_dim,
+                                     geometry.q_lora_rank, first, last)});
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase,
     std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    return plane_bytes(geometry.hidden, last, DType::BF16) +
-           linear_capacity(weights_profile, geometry.hidden, geometry.query_size(), first, last);
+    // The unfolded heads, then the output projection's transient.
+    return plane_bytes(geometry.query_heads * TextConfig::v_head_dim, last, DType::BF16) +
+           plane_bytes(geometry.hidden, last, DType::BF16) +
+           linear_capacity(weights_profile, geometry.hidden,
+                           geometry.query_heads * TextConfig::v_head_dim, first, last);
 }
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(

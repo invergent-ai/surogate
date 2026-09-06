@@ -89,7 +89,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
             }
             store.register_module(index, "o_proj",
                                   Binding{attention.output.qdata, family::kOutputPort,
-                                          g.query_size(), g.hidden});
+                                          g.query_heads * TextConfig::v_head_dim, g.hidden});
         } else {
             ++kda_index;
             for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {

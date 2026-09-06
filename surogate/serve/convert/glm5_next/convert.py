@@ -101,8 +101,11 @@ def _geometry_block(geometry: inv.Geometry) -> dict[str, float]:
         "output_rows": float(geometry.vocab),
         "token_domain": float(geometry.vocab),
         "query_heads": float(geometry.query_heads),
-        "kv_heads": float(geometry.query_heads),
-        "head_dim": float(geometry.qk_head_dim),
+        # The attention is served absorbed: one key/value head as wide as the latent, and the
+        # per-head query and value widths are the target's own constants (256), checked against
+        # every bound shape rather than declared here.
+        "kv_heads": 1.0,
+        "head_dim": float(geometry.kv_lora_rank),
         # NoPE: the checkpoint states `rope.dimension_count` 0 and the served attention applies
         # no rotary at all.
         "rotary_dim": 0.0,

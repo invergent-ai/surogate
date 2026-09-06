@@ -81,7 +81,7 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const C
                                                      int kv_head, int k0, int max_query_abs,
                                                      int physical_page, int tid) {
     constexpr int D         = Geometry::HeadDim;
-    constexpr int Bc        = kGqaPrefillBc;
+    constexpr int Bc        = kGqaPrefillBcFor<Geometry::HeadDim>;
     constexpr int Threads   = kGqaPrefillThreads;
     constexpr int VecPerRow = D / 8; // 8 bf16 per 16B cp.async
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
@@ -138,7 +138,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                                            GqaBlockMask block_mask = GqaBlockMask{}) {
     constexpr int D             = Geometry::HeadDim;
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
-    constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
+    constexpr int Bc            = kGqaPrefillBcFor<Geometry::HeadDim>;      // 64 key cols
     constexpr int Threads       = kGqaPrefillThreads; // 128
     constexpr int QKNt          = Bc / 8;             // 8  QK score n-tiles
     constexpr int QKKs          = D / 16;             // QK contraction steps over head_dim
@@ -266,7 +266,10 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     // Fold softmax_scale into the exp2 (FA-style): scores stay raw, so the
     // per-element "* scale" multiply drops out of the QK epilogue entirely.
     const float scale_l2 = scale * Log2E;
-    int physical_page    = block_table[n_block_min];
+    // A key block and a KV page were the same thing while a block was 64 keys; at 16 they are
+    // not, and the page is the one the block's first key lives in. The INT8 prompt kernel
+    // always indexed it this way.
+    int physical_page    = block_table[(n_block_min * Bc) >> kPagedKVPageShift];
 
     // Prologue: commit Q, then kick off the first key block the loop will read.
     // The loop's wait<0> below drains both.
@@ -277,7 +280,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     for (int kb = n_block_min; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
+        const int next_physical_page =
+            (kb + 1 < n_block_max) ? block_table[((kb + 1) * Bc) >> kPagedKVPageShift] : physical_page;
 
         sinfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();

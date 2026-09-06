@@ -174,7 +174,8 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
                 binder, prefix + "mla/query_a_norm", NumericFormat::BF16,
                 {static_cast<std::uint64_t>(g.q_lora_rank)});
             mla.query_b      = bind_weight(binder, prefix + "mla/query_b", weights,
-                                           {static_cast<std::uint64_t>(g.query_size()),
+                                           {static_cast<std::uint64_t>(g.query_heads) *
+                                                TextConfig::qk_head_dim,
                                             static_cast<std::uint64_t>(g.q_lora_rank)});
             mla.kv_a         = bind_weight(binder, prefix + "mla/kv_a", weights,
                                            {static_cast<std::uint64_t>(g.kv_lora_rank),
@@ -182,17 +183,21 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
             mla.kv_a_norm    = bind_layer_tensor(
                 binder, prefix + "mla/kv_a_norm", NumericFormat::BF16,
                 {static_cast<std::uint64_t>(g.kv_lora_rank)});
-            // BF16: llama.cpp stores the key half of the expansion transposed, so it is the one
-            // weight of this model that has to be materialised rather than read where it lies.
-            mla.k_b    = bind_weight(binder, prefix + "mla/k_b", NumericFormat::BF16,
-                                     {static_cast<std::uint64_t>(g.kv_size()),
-                                      static_cast<std::uint64_t>(g.kv_lora_rank)});
+            // Both halves of the expansion are read where they lie. llama.cpp stores the key
+            // half in the orientation it applies to the *query* -- [latent, nope] per head --
+            // and the absorbed form applies it to the query too, so what once had to be
+            // transposed into BF16 is now the file's own Q8_0.
+            mla.k_b    = bind_weight(binder, prefix + "mla/k_b", weights,
+                                     {static_cast<std::uint64_t>(g.latent_key_rows()),
+                                      static_cast<std::uint64_t>(TextConfig::qk_head_dim)});
             mla.v_b    = bind_weight(binder, prefix + "mla/v_b", weights,
-                                     {static_cast<std::uint64_t>(g.kv_size()),
+                                     {static_cast<std::uint64_t>(g.query_heads) *
+                                          TextConfig::v_head_dim,
                                       static_cast<std::uint64_t>(g.kv_lora_rank)});
             mla.output = bind_weight(binder, prefix + "mla/output", weights,
                                      {static_cast<std::uint64_t>(g.hidden),
-                                      static_cast<std::uint64_t>(g.query_size())});
+                                      static_cast<std::uint64_t>(g.query_heads) *
+                                          TextConfig::v_head_dim});
         } else {
             KdaPlan& kda        = target.kda;
             kda.query_key_value = bind_weight(binder, prefix + "kda/query_key_value", weights,
@@ -423,22 +428,24 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             payload.query_a_norm = artifact::materialized_tensor(
                 backing, source.attention.query_a_norm, NumericFormat::BF16,
                 {static_cast<std::uint64_t>(g.q_lora_rank)});
-            payload.query_b = materialized_weight(backing, source.attention.query_b, g.query_size(),
+            payload.query_b = materialized_weight(backing, source.attention.query_b,
+                                                  g.query_heads * TextConfig::qk_head_dim,
                                                   g.q_lora_rank);
             payload.kv_a    = materialized_weight(backing, source.attention.kv_a, g.kv_lora_rank,
                                                   g.hidden);
             payload.kv_a_norm = artifact::materialized_tensor(
                 backing, source.attention.kv_a_norm, NumericFormat::BF16,
                 {static_cast<std::uint64_t>(g.kv_lora_rank)});
-            payload.k_b = materialized_weight(backing, source.attention.k_b, g.kv_size(),
-                                              g.kv_lora_rank);
-            payload.v_b = materialized_weight(backing, source.attention.v_b, g.kv_size(),
+            payload.k_b = materialized_weight(backing, source.attention.k_b, g.latent_key_rows(),
+                                              TextConfig::qk_head_dim);
+            payload.v_b = materialized_weight(backing, source.attention.v_b,
+                                              g.query_heads * TextConfig::v_head_dim,
                                               g.kv_lora_rank);
             target.projection = std::move(payload);
             // No per-head query or key norm: this attention normalises its two low ranks
             // instead, and those live in the projection payload.
             target.output = materialized_weight(backing, source.attention.output, g.hidden,
-                                                g.query_size());
+                                                g.query_heads * TextConfig::v_head_dim);
             target.post_attention_norm = post_norm;
             target.post_mixer          = load_feed_forward(backing, source, g, post_norm, layer);
         } else {

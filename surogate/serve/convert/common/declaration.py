@@ -179,6 +179,11 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         # in the orientation it applies to the *query*, so only the value half can be read
         # where it lies.
         "KDim": config["num_query_heads"] * config.get("qk_nope_head_dim", 0),
+        # The absorbed form of that key half: applied to the query rather than to the latent,
+        # its rows are the latent per head and its columns the query head -- which is the
+        # orientation llama.cpp stores, so it is read where it lies.
+        "KAbsorbDim": config["num_query_heads"] * config.get("kv_lora_rank", 0),
+        "NopeDim": config.get("qk_nope_head_dim", 0),
         "Hv": heads_v,
         "TwoHv": 2 * heads_v,
         "Vd": dim_v,
