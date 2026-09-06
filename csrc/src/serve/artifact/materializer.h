@@ -40,6 +40,11 @@ public:
     MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
 
     void* device_data(ObjectHandle handle) const;
+    /// Give a `HostBank`-placed object the pointer its kernels will read: the device-mapped
+    /// alias of its pinned host bytes. Everything downstream is unchanged -- an object's
+    /// pointer is an object's pointer -- which is what makes host residency a placement rather
+    /// than a second way to build every weight in the engine.
+    void attach_host_object(ObjectHandle handle, const void* device_pointer);
     /// The typed row runs of a ggml-blocks tensor whose rows are not all one format, pointing
     /// into its device bytes; empty for a homogeneous object.
     std::span<const WeightSegment> segments(ObjectHandle handle) const;

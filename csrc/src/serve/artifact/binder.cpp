@@ -141,6 +141,19 @@ void Binder::retain_on_host(ObjectHandle handle) {
     planned_[handle.index] = true;
 }
 
+void Binder::bank_on_host(ObjectHandle handle) {
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr) {
+        throw ArtifactError("a resource cannot be banked in device-mapped host memory");
+    }
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(tensor->name));
+    }
+    materialization_.bank_objects.push_back(BankMaterialization{handle});
+    planned_[handle.index] = true;
+}
+
 void Binder::validate_only(ObjectHandle handle) {
     const ObjectDescriptor& object = descriptor(handle);
     if (planned_[handle.index]) {

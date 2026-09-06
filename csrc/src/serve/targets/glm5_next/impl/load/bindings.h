@@ -74,10 +74,6 @@ struct KdaPlan {
 /// to layer numbers would have to be reconstructed.
 struct FeedForwardPlan {
     bool sparse = false;
-    /// This layer's routed experts live in the pinned host bank, not on the card, and the
-    /// kernels read them over PCIe. The shared expert and the router stay resident: they are a
-    /// thousandth of the bytes and run on every token.
-    bool host_experts = false;
     WeightPlan gate_up;   ///< dense: [2 * dense_intermediate, hidden]
     WeightPlan down;      ///< dense: [hidden, dense_intermediate]
     WeightPlan router;

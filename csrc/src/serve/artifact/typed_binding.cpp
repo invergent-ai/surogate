@@ -281,10 +281,10 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
     const ObjectHandle handle =
         binder.require_tensor(name, format, storage_layout_for(format),
                               std::span<const std::uint64_t>(shape.begin(), shape.size()));
-    if (placement == TensorPlacement::Device) {
-        binder.materialize_on_device(handle);
-    } else {
-        binder.validate_only(handle);
+    switch (placement) {
+    case TensorPlacement::Device: binder.materialize_on_device(handle); break;
+    case TensorPlacement::HostBank: binder.bank_on_host(handle); break;
+    case TensorPlacement::ValidateOnly: binder.validate_only(handle); break;
     }
     return handle;
 }
@@ -458,10 +458,10 @@ LinearBinding bind_linear(Binder& binder, std::string_view name, std::int32_t ro
     if (tensor->layout != storage_layout_for(tensor->format)) {
         throw ArtifactError("stored layout does not belong to its format: " + std::string(name));
     }
-    if (placement == TensorPlacement::Device) {
-        binder.materialize_on_device(handle);
-    } else {
-        binder.validate_only(handle);
+    switch (placement) {
+    case TensorPlacement::Device: binder.materialize_on_device(handle); break;
+    case TensorPlacement::HostBank: binder.bank_on_host(handle); break;
+    case TensorPlacement::ValidateOnly: binder.validate_only(handle); break;
     }
     LinearBinding binding{handle, tensor->format};
     if (tensor->format == NumericFormat::NVFP4) {

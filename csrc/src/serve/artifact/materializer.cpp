@@ -100,6 +100,16 @@ void* MaterializedArtifact::device_data(ObjectHandle handle) const {
     return objects_[handle.index].device;
 }
 
+void MaterializedArtifact::attach_host_object(ObjectHandle handle, const void* device_pointer) {
+    if (handle.index >= objects_.size()) {
+        throw ArtifactError("host bank attachment names an object outside the artifact");
+    }
+    if (objects_[handle.index].device != nullptr) {
+        throw ArtifactError("host bank attachment would replace a device-resident object");
+    }
+    objects_[handle.index].device = const_cast<void*>(device_pointer);
+}
+
 std::span<const WeightSegment> MaterializedArtifact::segments(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
         throw ArtifactError("object handle does not name a materialized tensor");

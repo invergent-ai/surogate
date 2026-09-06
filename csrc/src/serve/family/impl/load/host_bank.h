@@ -93,6 +93,11 @@ public:
     /// and sizes, so the same artifact loaded for another stage reuses the live bank).
     [[nodiscard]] static std::shared_ptr<HostBank> shared(const HostBankPlan& plan);
 
+    /// Point every banked object at its pinned bytes. After this the artifact resolves those
+    /// objects to a mapped host pointer and every `materialized_weight`/`materialized_tensor`
+    /// in the engine reads them without knowing where they live.
+    void attach(artifact::MaterializedArtifact& backing) const;
+
 private:
     std::vector<std::pair<std::size_t, HostObject>> objects_;
     std::size_t total_bytes_ = 0;
@@ -101,6 +106,13 @@ private:
 // -------------------------------------------------------------------------------------------
 // Binding an object into the bank instead of onto the device
 // -------------------------------------------------------------------------------------------
+
+/// Everything a binder placed with `artifact::TensorPlacement::HostBank`, ready to pin. A
+/// target says only *which* objects go to the host -- at the same site where it already says
+/// Device or ValidateOnly -- and this collects them. Call after `Binder::finish()`.
+[[nodiscard]] HostBankPlan collect_host_bank(artifact::Binder& binder,
+                                             const artifact::MaterializationPlan& plan,
+                                             LoadProgress progress = {});
 
 /// How the bank will find an object's bytes. One run is a span; several are the stretches of a
 /// GGUF a fused parent is assembled from, and the bank concatenates them into pinned memory.

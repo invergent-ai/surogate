@@ -13,6 +13,13 @@ namespace sinfer::artifact {
 enum class TensorPlacement : std::uint8_t {
     Device,
     ValidateOnly,
+    /// Pinned, device-mapped host memory: the object's bytes stay in RAM and the kernels read
+    /// them over PCIe through a mapped alias. What lets a checkpoint larger than the cards run
+    /// at all. The bytes are still the artifact's -- nothing is dequantised or rewritten -- so
+    /// a target chooses this per object exactly as it chooses `Device`, and everything
+    /// downstream (`materialized_weight`, `materialized_tensor`) is unchanged: the pointer an
+    /// object resolves to simply addresses host memory.
+    HostBank,
 };
 
 struct ObjectHandle {
@@ -30,11 +37,18 @@ struct HostMaterialization {
     ObjectHandle object;
 };
 
+/// An object bound `HostBank`: pinned in host memory after materialization and attached to the
+/// artifact by its mapped device pointer.
+struct BankMaterialization {
+    ObjectHandle object;
+};
+
 struct MaterializationPlan {
     std::size_t object_count            = 0;
     std::uint64_t device_capacity_bytes = 0;
     std::vector<DeviceMaterialization> device_objects;
     std::vector<HostMaterialization> host_objects;
+    std::vector<BankMaterialization> bank_objects;
 };
 
 class Binder {
@@ -64,6 +78,9 @@ public:
     std::span<const std::byte> run_span(const PayloadRun& run) const;
     void materialize_on_device(ObjectHandle handle);
     void retain_on_host(ObjectHandle handle);
+    /// Plan this tensor into the pinned host bank instead of device memory. It is validated
+    /// like any other object and costs the device nothing.
+    void bank_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     MaterializationPlan finish();
 

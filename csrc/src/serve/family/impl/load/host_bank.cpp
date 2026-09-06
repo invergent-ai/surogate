@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <variant>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -371,6 +372,28 @@ std::shared_ptr<HostBank> HostBank::shared(const HostBankPlan& plan) {
 // -------------------------------------------------------------------------------------------
 // Binding an object into the bank instead of onto the device
 // -------------------------------------------------------------------------------------------
+
+HostBankPlan collect_host_bank(artifact::Binder& binder, const artifact::MaterializationPlan& plan,
+                               LoadProgress progress) {
+    HostBankPlan out;
+    out.progress = std::move(progress);
+    out.objects.reserve(plan.bank_objects.size());
+    for (const artifact::BankMaterialization& banked : plan.bank_objects) {
+        const auto* tensor =
+            std::get_if<artifact::TensorDescriptor>(&binder.descriptor(banked.object));
+        if (tensor == nullptr) {
+            throw artifact::ArtifactError("a resource cannot be banked in host memory");
+        }
+        out.objects.push_back(host_plan(binder, banked.object, std::string(tensor->name)));
+    }
+    return out;
+}
+
+void HostBank::attach(artifact::MaterializedArtifact& backing) const {
+    for (const auto& [index, object] : objects_) {
+        backing.attach_host_object(artifact::ObjectHandle{index}, object.device);
+    }
+}
 
 HostObjectPlan host_plan(artifact::Binder& binder, artifact::ObjectHandle handle,
                          const std::string& name) {
