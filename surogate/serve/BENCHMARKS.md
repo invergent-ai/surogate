@@ -9,7 +9,8 @@ Host: 8× RTX 5090 (32 GB, driver 590.44.01), two NUMA nodes (GPUs 0–3 / 4–7
 2× EPYC 9124 (32 cores, AVX512-VNNI), 503 GB RAM. Engines: **surogate serve**
 (this repo), **vLLM 0.27.1** (flashinfer 0.6.16.post3), **llama.cpp** CUDA
 build (0.3.0-dev @ f1357e4; Flash-Next rows use upstream master with
-`qwen4exp`, plus `ik_llama.cpp` 7cff686d for the CPU-MoE bar).
+`qwen4exp`, GLM-5.3 rows a build of ggml-org PR 27754 because no released llama.cpp knows that
+architecture, plus `ik_llama.cpp` 7cff686d for the CPU-MoE bar).
 
 ## Method
 
@@ -36,7 +37,10 @@ not all at the same point in it — see Open items.
 
 Shapes: **512/128** unless the comment says otherwise (prefill-heavy 2048/16,
 decode-heavy 128/512, single-user TTFT at a ~1.9k prompt). KV cache fp8 (e4m3) on
-surogate; int8 KV is never used on this board, because it changes the output. Weight
+surogate; int8 KV is never used on this board, because it changes the output. A model larger
+than its cards may hold some weights in pinned host memory (`--host-moe-layers`,
+`--gpu-layers`); where a row does, its comment says how much, because those bytes cross PCIe
+on every token that reads them and the row is not comparable with a resident one. Weight
 pairing: llama.cpp serves GGUF Q4_K_M (~4.5 bpw), vLLM NVFP4, surogate the native
 NVFP4 artifact (4B, 27B, and since 2026-08-30 the 35B's routed experts, read verbatim
 from the same `RedHatAI` checkpoint vLLM serves) or an artifact repacked from the same
@@ -218,6 +222,46 @@ without batch flags understated it 3.9× and are gone.
 | llama.cpp | 8 | 1 | 157 | 39.3 | 196 | 0.95 s | `--split-mode layer`, all resident |
 | llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
 | llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s |  |
+
+### GLM-5.3-Flash (200 GB MoE; 181.65 GiB of weights against 256 GiB of cards)
+
+`models/GLM-5.3-Flash-UD-Q4_K_XL-*.gguf` read in place, 2026-09-06, idle host, 512/128, one
+engine at a time. Ours: the eight-stage pipeline, eager admission defaults, BF16 KV,
+`--max-model-len 704 --max-num-batched-tokens 512 --kv-capacity auto --host-moe-layers auto`.
+llama.cpp: the same file on the same eight cards, `--split-mode layer -ngl 99 -fa 1 -np N`,
+built from ggml-org PR 27754 (`study/llama.cpp-glm`) — no released llama.cpp knows this
+architecture.
+
+| engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **llama.cpp** | 8 | 1 | **155.3** | **37.5** | **192.8** | 1.19 s | `-np 1`. Ahead of us by 30 % on decode and 30 % on prefill |
+| surogate | 8 | 1 | 119.6 | 28.9 | 148.5 | **0.66 s** | `auto` offloaded **nothing** here — one lane's KV fits, so this is the resident model. Half llama.cpp's TTFT |
+| **llama.cpp** | 8 | 16 | **155.5** | **37.6** | **193.1** | 55.81 s | `-np 16`. Identical to its one-user row: the sixteen streams are served one after another, and the queue is the TTFT |
+| surogate | 8 | 16 | 66.0 | 15.9 | 81.9 | 28.94 s | `auto` offloaded 1–3 mixture layers per stage to make sixteen lanes' KV fit. **Half llama.cpp's TTFT and 42 % of its decode**: what the lanes buy in latency the PCIe crossings take back in rate. 1 request timed out |
+| llama.cpp | 8 | 64 | 41.8 | 10.1 | 51.9 | 777.60 s | `-np 64` |
+| surogate | 8 | 64 | 28.7 | 6.9 | 35.6 | **78.90 s** | **10× llama.cpp's TTFT**, at 68 % of its rate; 160 of 176 requests timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
+| surogate | **1** | 1 | 7.5 | 1.8 | 9.3 | 28.71 s | `--host-moe-layers all`: 8.91 GiB on the card, 172.74 GiB pinned. A capacity result, not a speed one — every routed expert crosses PCIe on every token. **llama.cpp does not serve this model on one card at all** |
+| surogate | **1** | 16 | 7.4 | 1.8 | 9.2 | 89.88 s | same; concurrency buys nothing once the bus is the bottleneck |
+
+**Reading it.** At one user we lose to llama.cpp on both token columns and win on TTFT, so the
+gap is per-token work rather than scheduling. The 16-user rows are not like for like: llama.cpp
+holds all 181.65 GiB resident and serves the streams serially, while we hold sixteen lanes and
+pay PCIe for the layers `auto` had to move to find their KV. That trade is worth it for latency
+(29 s against 56 s to first token) and against it for throughput. Where it stops paying is 64
+users, and both engines are then queue-bound.
+
+Nothing here is a routed-MoE kernel result. GLM's mixture is 288 experts of which 8 route, and
+on this hardware the model is memory-bound at every concurrency the cards allow.
+
+**Accuracy.** Wikitext-2 test, the first 40 windows of 2,048 tokens, the same windows for both:
+
+| engine | PPL |
+|---|---:|
+| surogate, 8 stages, BF16 KV, eager | 2.8548 ± 0.0263 |
+| llama.cpp (PR 27754) | 2.8541 ± 0.0263 |
+
+Parity, 40,880 scored positions. The engine's own gate script is
+`scratchpad/ppl_gate_glm.sh`; the fault it caught first is in `design/INFERENCE.md`.
 
 ## Prefill on the 27B GGUF, and where it goes (2026-09-04)
 
