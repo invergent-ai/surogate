@@ -189,16 +189,19 @@ gap because llama.cpp's server does not batch these as well as its kernels run.
 
 ### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
 
-All surogate one-card rows: 2026-09-04, the native GGUF read in place (no artifact repack — the
+All surogate one-card rows: 2026-09-06, the native GGUF read in place (no artifact repack — the
 Q4G32AM host bank is decoded from the file's blocks at load), **engine defaults**: no
 `--expert-slots`, no `--host-expert-bank`, the pool and the host worker pool size themselves;
 `--cpu-moe-share auto --kv-capacity auto --max-model-len 4096`, chunk 8,192, fp8 KV, GPU 0 —
 an **x16** card (GPUs 2, 3, 5 and 7 of this host are x8 and read half the gather rate). The
-eight-card rows are still the 2026-08-30 `b4ee3216` pass on the repacked artifact. The 08-30
-one-card rows this replaces read 32.0 / 91.1 / 110.1 decode at 1 / 16 / 64 users; the day's
-recovery from 18.8 is in `design/INFERENCE.md`. llama.cpp rows: `-cmoe
--b 4096 -ub 4096`, the flags its own community benchmarks use — the earlier `-ot exps=CPU` rows
-without batch flags understated it 3.9× and are gone.
+expert cache these rows run on is family machinery since today (`family::ExpertCache`, shared
+with GLM-5.3-Flash below); the rows moved up because the registry stopped reserving 1.5× the
+card's W8 bytes for derived planes this target never makes, and the pool and the KV cache got
+the room. The eight-card rows are still the 2026-08-30 `b4ee3216` pass on the repacked
+artifact. The 09-04 one-card rows read 33.6 / 85.7 / 116.4 decode at 1 / 16 / 64 users, the
+08-30 rows before them 32.0 / 91.1 / 110.1; the recovery from 18.8 is in `design/INFERENCE.md`.
+llama.cpp rows: `-cmoe -b 4096 -ub 4096`, the flags its own community benchmarks use — the
+earlier `-ot exps=CPU` rows without batch flags understated it 3.9× and are gone.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -244,19 +247,27 @@ architecture.
 | llama.cpp | 8 | 64 | 44.4 | 10.7 | 55.1 | 729.58 s | `-np 64` |
 | **surogate** | 8 | 64 | **99.0** | **23.9** | **122.9** | **31.94 s** | `--kv-capacity auto --host-moe-layers auto`, which moved 1–2 mixture layers per stage to host memory to hold 45,056 KV tokens; those layers cross PCIe on every token and are the ceiling here. **2.2× llama.cpp's decode and prefill at 1/23 of its TTFT**; 108 of 150 requests still timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
 | **surogate** | **1** | 1 | 36.7 | 8.9 | 45.6 | 6.12 s | `--host-moe-layers all --cpu-moe-share auto` (2026-09-06, the expert cache lifted into the family; two passes read 8.7 and 8.9): the routed experts are decoded into a 301 GiB pinned W8 bank at load, and 83 % of every round's misses are computed on the 32 host cores (host 266 GB/s against 52 over PCIe, measured overlapped) with the rest gathered into a 456-slot pool that hits 17 % of the routed experts. The server times each request at 15.2 tok/s of decode after a 6.11 s prompt; the prompt is the gather of every expert of every layer as W8 over the link, and the decode round waits 35 of its 68 ms on the host round (the probes' figure) -- host bytes per expert are the next lever. 4.9× the previous row (7.5 / 1.8 / 29.54 s), 87 % of llama.cpp's on both columns |
-| **llama.cpp** | **1** | 1 | **42.4** | **10.2** | **52.6** | **5.64 s** | `-cmoe -t 32`: the same 172 GB off the card, but the expert matmuls run on 32 EPYC cores instead of crossing the link, and host DRAM carries those bytes about ten times faster. **5.7× our decode and prefill, and a fifth of our TTFT** |
-| surogate | **1** | 16 | 57.4 | 13.9 | 71.3 | 38.23 s | the same cache, `--max-num-seqs 16 --kv-capacity 11264` (2026-09-06): a 496-slot pool (12.4 GiB, sized automatically), 83 % of every round's misses on the host. Level with llama.cpp on prefill and decode to the decimal, at 42 % of its TTFT -- and 4 of 20 requests expired at our 30 s admission window where llama.cpp queues indefinitely and served 16 of 16. A 16-lane round routes to most of a layer's experts, so the split carries ~13 GB of W8 a round; the prompt rounds, which gather every expert over the link, are what queue. The previous row read 7.4 / 1.8 / 9.2 / 91.35 s with 22 of 28 expired |
-| **llama.cpp** | **1** | 16 | **57.4** | **13.9** | **71.3** | **90.73 s** | `-cmoe -t 32 --kv-unified`, 16 of 16 served |
+| **llama.cpp** | **1** | 1 | **42.4** | **10.2** | **52.6** | **5.64 s** | `-cmoe -t 32`: the same 172 GB off the card, the expert matmuls on 32 EPYC cores, the bytes from ordinary RAM. Ahead of our row by 15 % on prefill and decode and 8 % on TTFT; on the morning's binary, which streamed the experts over PCIe, it was 5.7× and a fifth of our TTFT |
+| **surogate** | **1** | 16 | **57.4** | **13.9** | **71.3** | **38.23 s** | the same cache, `--max-num-seqs 16 --kv-capacity 11264` (2026-09-06): a 496-slot pool (12.4 GiB, sized automatically), 83 % of every round's misses on the host. Level with llama.cpp on prefill and decode to the decimal, at 42 % of its TTFT -- and 4 of 20 requests expired at our 30 s admission window where llama.cpp queues indefinitely and served 16 of 16. A 16-lane round routes to most of a layer's experts, so the split carries ~13 GB of W8 a round; the prompt rounds, which gather every expert over the link, are what queue. The previous row read 7.4 / 1.8 / 9.2 / 91.35 s with 22 of 28 expired |
+| **llama.cpp** | **1** | 16 | **57.4** | **13.9** | **71.3** | 90.73 s | `-cmoe -t 32 --kv-unified`, 16 of 16 served: the tie on throughput is exact, and the row it keeps is completion, since it queues where we expire |
 
-**The single-card rows are llama.cpp's, and by a factor of six.** Both engines keep the same
-172 GB of experts off the card; we pin them and let the GPU read them over PCIe, llama.cpp
-leaves them in ordinary RAM and computes the expert matmuls on the CPU. The arithmetic settles
-it: eight routed experts over 42 mixture layers, three matrices of 4096×2048 each at Q4_K, is
-**4.76 GB of weights per token**, and at the ~15 GB/s an x16 link sustains for a gather that is
-317 ms a token — 3.2 tok/s predicted against 3.1 measured. Our figure is the ceiling of the
-strategy, not a defect in it, and the strategy is the wrong one on a box with 32 cores a
-socket. What this row wants is expert compute on the host rather than expert bytes across the
-bus; the CPU kernels that would do it already beat llama.cpp's on the encoder path.
+**The single-card rows, and what changed between morning and afternoon.** Both engines keep
+the same 172 GB of experts off the card. In the morning we pinned them and let the GPU read
+them over PCIe, and the arithmetic set the row: eight routed experts over 42 mixture layers,
+three matrices of 4096×2048 each at Q4_K, is **4.76 GB of weights per token**, which at the
+~15 GB/s an x16 link sustains for a gather is 317 ms a token — 3.2 tok/s predicted, 3.1
+measured, and llama.cpp, computing the same experts on 32 EPYC cores from ordinary RAM, was
+ahead by six. We already had that path: Flash-Next's rows above run on a device slot pool
+plus a CPU expert split that computes most of every round's misses on the host. It was
+Flash-Next's alone. By the afternoon it was family machinery (`family::ExpertCache`) and GLM
+was bound to it, with its experts decoded into W8 planes at load so the host reads them at
+~265 GB/s instead of decoding Q4_K blocks a row at a time at 3. That is the 1.8 → 8.9 tok/s
+on this row and 1.8 → 13.9 at sixteen users, within 15 % of llama.cpp at one user and level
+at sixteen, at parity on the perplexity gate below. The rest of the one-user gap is measured,
+not guessed: the decode round waits 35 of its 68 ms on the host round, and the host round is
+bytes — 26.7 MB an expert as W8, where the file's gate and up experts are Q4_K and only its
+down experts are Q5_K/Q6_K. A mixed bank (Q4G32AM planes for gate and up, W8 for down) is 27 %
+fewer host bytes at no accuracy cost, and the next row.
 
 **Reading the eight-card rows.** llama.cpp's 16-user decode is close to its one-user decode, so
 it serves sixteen streams nearly one after another and its rate barely grows with users; ours
