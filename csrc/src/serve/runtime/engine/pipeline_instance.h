@@ -260,8 +260,22 @@ public:
             stages_[s]->program->evict_retained_lane(lane);
         }
     }
+    /// A request's compute time is the sum of its stages'. Every stage runs its layers in turn
+    /// for every round, so the last stage's clock alone is a fraction of the round: on eight
+    /// stages it reported a decode rate eight times the wall clock's. The request-level fields
+    /// (preparation, first token, total) are the last stage's, which owns the request.
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept {
-        return stages_.back()->program->generation_timings_lane(lane);
+        GenerationTimings out = stages_.back()->program->generation_timings_lane(lane);
+        out.vision_seconds    = 0.0;
+        out.prefill_seconds   = 0.0;
+        out.decode_seconds    = 0.0;
+        for (const auto& stage : stages_) {
+            const GenerationTimings timings = stage->program->generation_timings_lane(lane);
+            out.vision_seconds += timings.vision_seconds;
+            out.prefill_seconds += timings.prefill_seconds;
+            out.decode_seconds += timings.decode_seconds;
+        }
+        return out;
     }
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept {
         return stages_.back()->program->speculative_stats_lane(lane);
