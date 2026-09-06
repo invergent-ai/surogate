@@ -11,17 +11,22 @@
 #include "api/ops/gated_delta_net.h"
 #include "api/ops/gated_rmsnorm.h"
 #include "api/ops/kimi_delta_net.h"
+#include "api/ops/linear.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/scale.h"
 #include "core/arena.h"
+#include "core/gdn_replay_records.h"
 #include "core/ngram_ple_state.h"
 #include "core/tensor.h"
 #include "family/impl/runtime/prologue_columns.h"
 
 #include <bit>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <utility>
 
 #include <cuda_runtime.h>
 
@@ -57,6 +62,61 @@ template <class Variant>
         return Variant::attention_qk_norm;
     } else {
         return true;
+    }
+}
+
+/// Whether the target's draft head projects its attended heads to the model width itself.
+///
+/// The family's fixed draft tail applies one output weight to the attention output. A head
+/// whose attention is absorbed -- the attended vector is a latent that has to be unfolded per
+/// head before the output projection can read it -- supplies the leaf, with the capacity it
+/// needs, and the tail hands it the payload and the output weight together. A target that says
+/// nothing keeps the one linear, which is what every Qwen3.5-shaped head is.
+template <class Variant>
+[[nodiscard]] constexpr bool mtp_attention_output_is_leaf() {
+    return requires(const Tensor& attention,
+                    const typename Variant::MtpAttentionProjectionWeights& weights,
+                    const Weight& output, Tensor& out, WorkspaceArena& workspace,
+                    cudaStream_t stream) {
+        Variant::mtp_attention_output_projection(attention, weights, output, out, workspace,
+                                                 stream);
+        {
+            Variant::mtp_attention_output_projection_workspace_capacity_bytes(
+                std::declval<const family::TextGeometry&>(), std::int32_t{1}, std::int32_t{1})
+        } -> std::same_as<std::size_t>;
+    };
+}
+
+/// The draft tail's output projection, through the target's leaf or the family's one linear.
+/// A template over the Variant so the branch not taken is discarded: the runtime's own
+/// members see a concrete Variant, where `if constexpr` would still have to compile both.
+template <class Variant>
+inline void mtp_attention_output_dispatch(
+    const Tensor& attention, const typename Variant::MtpAttentionProjectionWeights& weights,
+    const Weight& output, Tensor& out, WorkspaceArena& workspace, cudaStream_t stream) {
+    if constexpr (mtp_attention_output_is_leaf<Variant>()) {
+        Variant::mtp_attention_output_projection(attention, weights, output, out, workspace,
+                                                 stream);
+    } else {
+        (void)weights;
+        (void)workspace;
+        ops::linear(attention, output, out, stream);
+    }
+}
+
+/// The scratch that projection needs: the leaf's own, or none for the one linear.
+template <class Variant>
+[[nodiscard]] inline std::size_t
+mtp_attention_output_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
+                                    std::int32_t last) {
+    if constexpr (mtp_attention_output_is_leaf<Variant>()) {
+        return Variant::mtp_attention_output_projection_workspace_capacity_bytes(geometry, first,
+                                                                                 last);
+    } else {
+        (void)geometry;
+        (void)first;
+        (void)last;
+        return 0;
     }
 }
 
@@ -290,6 +350,34 @@ inline void linear_recurrence_snapshot(const Tensor& q, const Tensor& k, const T
         ops::gated_delta_net_snapshot(q, k, v, g, beta, scale, /*normalize_qk=*/true, states,
                                       valid_columns, initial_state_slots, snapshot_base_slots, out,
                                       stream);
+    }
+}
+
+/// The mixer's recurrence over B lanes in its replay-record form: the state is read and never
+/// written, and the raw key, value and gate of every valid column are recorded so a later fold
+/// can re-derive the state from whichever prefix the round accepted. The two delta rules have
+/// the form and differ in the gate they record; a short convolution keeps no recurrent state
+/// to replay into, so a target running one reaches here only by having been given a draft head
+/// it cannot verify, and saying so beats recording the wrong recurrence.
+template <class Variant>
+inline void linear_recurrence_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                     const Tensor& g, const Tensor& beta, float scale,
+                                     const Tensor& states, const Tensor& valid_columns,
+                                     const Tensor& initial_state_slots,
+                                     GdnReplayRecordLayer& records, Tensor& out,
+                                     cudaStream_t stream) {
+    if constexpr (linear_mixer<Variant>() == family::LinearMixer::KimiDelta) {
+        ops::kimi_delta_net_replay_record(q, k, v, g, beta, scale, states, valid_columns,
+                                          initial_state_slots, records.key, records.value,
+                                          records.gate, records.beta, out, stream);
+    } else if constexpr (linear_mixer<Variant>() == family::LinearMixer::GatedDelta) {
+        ops::gated_delta_net_replay_record(q, k, v, g, beta, scale, states, valid_columns,
+                                           initial_state_slots, records.key, records.value,
+                                           records.gate, out, stream);
+    } else {
+        throw std::logic_error(
+            "this target's linear mixer has no replay-record form, so it cannot verify a "
+            "speculative round");
     }
 }
 

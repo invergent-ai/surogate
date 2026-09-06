@@ -96,6 +96,11 @@ surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
   slower per token, because an offloaded dense layer crosses PCIe for every byte. GLM at
   `--gpu-layers 1` runs on **1.54 GiB** of VRAM.
 - Both counts are whole-model, so a pipeline split does not change which weights live where.
+- The checkpoint's NextN draft head is bound too, so `--spec mtp --draft-tokens 1..5` runs on
+  one card. It drafts well (about two of every three proposals accepted) and does not pay on
+  this configuration, where a token's cost is its experts crossing PCIe and a verify of four
+  columns fetches four tokens' worth of them. Speculation is the pipeline's row, and a pipeline
+  runs no speculative round yet: `--devices A,B` with `--spec` is refused.
 - Filling the bank runs at roughly 4 GB/s: GLM's 172.74 GiB adds 43 s to the load. Pipeline
   stages of one model in one process share the pinned bytes.
 - **Watch host memory.** The bank is pinned and cannot be swapped. Size the box for it and run

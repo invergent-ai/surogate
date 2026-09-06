@@ -3,6 +3,7 @@
 
 #include "ops/linear_attention/gated_delta_net/common.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
+#include "ops/linear_attention/kimi_delta_net/launch.h"
 
 #include <algorithm>
 #include <array>
@@ -154,6 +155,11 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
 }
 
 bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
+    if (spec.diagonal_gate) {
+        // GLM-5.3-Flash's Kimi Delta Attention: 34 layers of 64 symmetric heads.
+        return spec.layers == 34 && spec.qk_heads == 64 && spec.value_heads == 64 &&
+               spec.conv_channels == 24576;
+    }
     const bool geometry_48 = spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
                              spec.conv_channels == 10240;
     const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
@@ -185,12 +191,20 @@ void validate_fold_records(const GdnReplayRecords& records) {
                    kOp, "key records");
     require_tensor(records.value, DType::BF16, {kStateDim, spec.value_heads, spec.width, outer},
                    256, kOp, "value records");
-    require_tensor(records.gate, DType::FP32, {2, spec.value_heads, spec.width, outer}, 256, kOp,
+    require_tensor(records.gate, DType::FP32,
+                   {spec.gate_rows(), spec.value_heads, spec.width, outer}, 256, kOp,
                    "gate records");
+    if (spec.diagonal_gate) {
+        require_tensor(records.beta, DType::FP32, {spec.value_heads, spec.width, outer}, 256, kOp,
+                       "beta records");
+    } else if (records.beta.data != nullptr) {
+        throw std::invalid_argument(std::string(kOp) + ": a scalar gate carries no beta plane");
+    }
 
-    const std::array<MemoryRange, 4> record_ranges{
+    std::vector<MemoryRange> record_ranges{
         tensor_range(records.conv, kOp), tensor_range(records.key, kOp),
         tensor_range(records.value, kOp), tensor_range(records.gate, kOp)};
+    if (spec.diagonal_gate) { record_ranges.push_back(tensor_range(records.beta, kOp)); }
     require_pairwise_disjoint(record_ranges, "gdn_replay_fold: record planes overlap");
 }
 
@@ -247,11 +261,14 @@ void validate_fold_states(const GdnReplayRecords& records,
 
 void require_records_disjoint_from_states(const GdnReplayRecords& records,
                                           LinearAttentionStateAllLayersView states) {
-    const std::array<MemoryRange, 4> record_ranges{
+    std::vector<MemoryRange> record_ranges{
         tensor_range(records.conv, "gdn_replay_fold conv records"),
         tensor_range(records.key, "gdn_replay_fold key records"),
         tensor_range(records.value, "gdn_replay_fold value records"),
         tensor_range(records.gate, "gdn_replay_fold gate records")};
+    if (records.spec.diagonal_gate) {
+        record_ranges.push_back(tensor_range(records.beta, "gdn_replay_fold beta records"));
+    }
     for (const MemoryRange record : record_ranges) {
         for (std::int32_t layer = 0; layer < records.spec.layers; ++layer) {
             const MemoryRange conv = layer_range(states.conv_layer0, states.conv_layer_stride_bytes,
@@ -313,6 +330,14 @@ void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLay
     require_records_disjoint_from_states(records, states);
     const detail::gated_delta_net::GdnReplayFoldKernelRows packed =
         validate_fold_rows(records, states, rows);
+    // The records say which recurrence produced them. Both folds are the one kernel, and the
+    // gate's shape is the whole difference between them, so the dispatch is here rather than
+    // in every caller.
+    if (records.spec.diagonal_gate) {
+        detail::kimi_delta_net::launch_replay_fold(records, states, packed,
+                                                   static_cast<std::int32_t>(rows.size()), stream);
+        return;
+    }
     detail::gated_delta_net::launch_replay_fold(records, states, packed,
                                                 static_cast<std::int32_t>(rows.size()), stream);
 }

@@ -38,7 +38,9 @@ so a serve-spec generator can read them; the mechanism is not lowered):
   declared, so they are simply unused at import.
 * **MTP / next-token-prediction block** (layer 45, ``nextn_predict_layers``):
   transformers itself drops it (``_keys_to_ignore_on_load_unexpected`` skips
-  ``layers.45.`` and ``shared_head.``). No DSL precedent; not declared.
+  ``layers.45.`` and ``shared_head.``), so it is not part of the training graph.
+  A serving artifact carries it as the ``mtp/`` section below: it is the
+  checkpoint's own speculative draft head.
 * **Vision tower** (``Glm5NextVisionModel``, ``model.visual.*``): text-only
   declaration, like ``qwen4_exp``'s. Its tensors are unused at import.
 * **``swiglu_limit``** (10.0): the reference clamps SwiGLU gate/up in every MLP.
@@ -56,16 +58,43 @@ from __future__ import annotations
 
 from .. import nn
 from ..blocks.glm5_next import (
+    GLM5_NEXT_MTP_LAYER_OBJECTS,
     Glm5NextKdaDenseBlock,
     Glm5NextKdaMoEBlock,
     Glm5NextMlaDenseBlock,
     Glm5NextMlaMoEBlock,
 )
-from ..block_schema import ServeObject
+from ..block_schema import ServeObject, ServeSection
 from ..hf import fuse, stack_experts
 from ..modules import Embedding, LMHead, RMSNorm, StreamBroadcast
 from ..modules.glm5_next import Glm5NextHyperHead
 from ..specs import ActivationScope
+
+
+#: The NextN draft head, `blk.N.nextn.*` of the GGUF and `layers.N.*` of the checkpoint for N
+#: the trunk's layer count. One latent-attention layer over the mixture on a single-stream
+#: residual: the next token's embedding and the trunk's normalised hidden, each under its own
+#: norm, are concatenated and projected to the model width, the layer runs, and
+#: `shared_head.norm` reads the result out for the trunk's LM head. The embedding table and the
+#: LM head are the trunk's. Declared with a count so a trunk-only checkpoint (``nextn_predict_layers``
+#: 0) emits nothing.
+GLM5_NEXT_MTP_SERVE_SECTION = ServeSection(
+    prefix="mtp/",
+    repeat="nextn_predict_layers",
+    hf_prefix="model.language_model.layers.45.",
+    hf_layer="model.language_model.layers.45",
+    objects=(
+        ServeObject("input_projection", "quantised", ("C", "TwoC"), source="eh_proj.weight"),
+        ServeObject("embedding_norm", "bf16", ("C",), source="enorm.weight"),
+        ServeObject("hidden_norm", "bf16", ("C",), source="hnorm.weight"),
+        *(
+            ServeObject("layer/" + o.name, o.format, o.shape, o.components,
+                        transform=o.transform, residency=o.residency)
+            for o in GLM5_NEXT_MTP_LAYER_OBJECTS
+        ),
+        ServeObject("final_norm", "bf16", ("C",), source="shared_head.norm.weight"),
+    ),
+)
 
 
 GLM5_NEXT_MODEL_NAME_REMAP: dict[str, str] = {
@@ -331,6 +360,8 @@ def _resolve_glm5_next_block_types(
     hc_mult="text_config.hc_mult",
     hc_eps="text_config.hc_eps",
     hc_sinkhorn_iters="text_config.hc_sinkhorn_iters",
+    # The NextN draft head's depth: serving carries the head, training does not.
+    nextn_predict_layers="text_config.nextn_predict_layers",
     # Deferred subsystems: captured for the serve-spec generator (see docstring)
     index_topk="text_config.index_topk",
     index_head_dim="text_config.index_head_dim",
@@ -360,6 +391,7 @@ class Glm5NextConditionalModel(nn.Model):
         "mla": Glm5NextMlaDenseBlock,
         "mla_moe": Glm5NextMlaMoEBlock,
     }
+    _serve_sections_ = (GLM5_NEXT_MTP_SERVE_SECTION,)
 
     @staticmethod
     def _serve_block_schedule_(config: dict) -> list[str]:
@@ -420,6 +452,7 @@ class Glm5NextConditionalModel(nn.Model):
         hc_mult: int = 4,
         hc_eps: float = 1e-6,
         hc_sinkhorn_iters: int = 20,
+        nextn_predict_layers: int = 0,
         index_topk: int = 2048,
         index_head_dim: int = 128,
         index_n_heads: int = 32,
@@ -500,6 +533,10 @@ class Glm5NextConditionalModel(nn.Model):
         self.hc_mult = hc_mult
         self.hc_eps = hc_eps
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
+
+        # The draft head is not in the training graph; the count reaches the serve
+        # declaration, which emits the `mtp/` section that many times (0 or 1).
+        self.nextn_predict_layers = nextn_predict_layers
 
         # Deferred subsystems — config only (see module docstring).
         self.index_topk = index_topk

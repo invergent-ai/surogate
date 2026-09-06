@@ -12,11 +12,11 @@ Attention or multi-head latent attention, and its feed-forward is either dense o
 The released 45-layer checkpoint uses three of them -- three leading dense KDA layers, then KDA
 and MLA layers over the mixture.
 
-Two things the released file carries that this artifact does not:
+The NextN draft head (`blk.45.nextn.*`, one MLA layer over the mixture plus three norms and a
+fold) is carried under `mtp/` when the file has it: it is the checkpoint's own speculative
+draft head, and `--spec mtp` runs it. One thing the released file carries that this artifact
+does not:
 
-- **the NextN draft head** (`blk.45.nextn.*`). It is one MLA layer over the mixture plus three
-  norms and a fold; serving it is a speculative-decoding feature, not a requirement for the
-  model to answer, and the trunk is bound without it.
 - **the sparse indexer** (`blk.N.indexer.*`). It selects 512 pools of four tokens each, so for
   any context at or below `index_topk` every visible token is selected and full attention is
   exactly what the indexer would have asked for. Past that bound they differ, which is why the
@@ -188,9 +188,11 @@ def config_from_geometry(geometry: Geometry) -> dict[str, Any]:
     one place that translates, so the declaration stays the single statement of what an artifact
     holds and nothing downstream needs to know the file was a GGUF.
     """
-    return {
-        "architectures": [ARCHITECTURE],
-        "model_type": "glm5_next",
+    # Nested under `text_config`, which is where the declaration's bindings read every text
+    # dimension from (`d_model="text_config.hidden_size"`); a flat spelling binds nothing and
+    # the declaration falls back to its compiled defaults, which happen to be the released
+    # checkpoint's -- silently right for that one file and wrong for any other.
+    text = {
         "hidden_size": geometry.hidden,
         "num_hidden_layers": geometry.layers,
         "num_attention_heads": geometry.query_heads,
@@ -222,6 +224,7 @@ def config_from_geometry(geometry: Geometry) -> dict[str, Any]:
         "linear_conv_kernel_dim": geometry.kda_conv_kernel,
         "linear_lower_bound": geometry.kda_lower_bound,
         "index_topk": geometry.index_topk,
+        "nextn_predict_layers": geometry.nextn_layers,
         "first_k_dense_replace": len(geometry.dense_layers),
         "layer_types": [
             "deepseek_sparse_attention" if geometry.is_attention(i) else "linear_attention"
@@ -230,6 +233,12 @@ def config_from_geometry(geometry: Geometry) -> dict[str, Any]:
         "mlp_layer_types": [
             "dense" if geometry.is_dense(i) else "sparse" for i in range(geometry.layers)
         ],
+    }
+    return {
+        "architectures": [ARCHITECTURE],
+        "model_type": "glm5_next",
+        "text_config": text,
+        "tie_word_embeddings": False,
     }
 
 

@@ -1,10 +1,14 @@
 #include "api/ops/kimi_delta_net.h"
 
+#include "core/limits.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
 #include "ops/linear_attention/kimi_delta_net/launch.h"
 
+#include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace sinfer::ops {
 namespace {
@@ -96,6 +100,73 @@ void validate_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const 
     require(scale > 0.0F, "scale must be positive");
 }
 
+struct Range {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+};
+
+Range range_of(const Tensor& tensor) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(tensor.data);
+    return {begin, begin + tensor.bytes()};
+}
+
+void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                            const Tensor& beta, float scale, const Tensor& states,
+                            const Tensor& valid_columns, const Tensor& initial_state_slots,
+                            const Tensor& key_record, const Tensor& value_record,
+                            const Tensor& gate_record, const Tensor& beta_record,
+                            const Tensor& out) {
+    const std::int32_t qk_heads = k.ne[1];
+    const std::int32_t v_heads  = v.ne[1];
+    const std::int32_t width    = v.ne[2];
+    const std::int32_t batch    = v.ne[3];
+    // The record domain is a speculative round's: the draft window plus its anchor, over the
+    // engine's lanes. The delta net's record form has the same bounds.
+    require(width >= 2 && width <= 16, "the record width T must be in [2,16]");
+    require(batch > 0 && batch <= kMaximumBatchColumns,
+            "the record batch B must be in [1, the lane cap]");
+    require(are_head_counts_valid(qk_heads, v_heads),
+            "value heads must be a positive multiple of the qk heads");
+    require_batched(q, DType::BF16, kStateDim, qk_heads, width, batch, "q");
+    require_batched(k, DType::BF16, kStateDim, qk_heads, width, batch, "k");
+    require_batched(v, DType::BF16, kStateDim, v_heads, width, batch, "v");
+    require_batched(g, DType::FP32, kStateDim, v_heads, width, batch, "g");
+    require(beta.dtype == DType::FP32 && beta.data != nullptr && beta.is_contiguous() &&
+                beta.ne[0] == v_heads && beta.ne[1] == width && beta.ne[2] == batch &&
+                beta.ne[3] == 1,
+            "beta must be contiguous FP32 [value heads, W, B]");
+    require_batched(out, DType::BF16, kStateDim, v_heads, width, batch, "out");
+    require(states.data != nullptr && states.is_contiguous() && states.ne[0] == kStateDim &&
+                states.ne[1] == kStateDim && states.ne[2] == v_heads && states.ne[3] > 0,
+            "the state pool must be contiguous [128, 128, value heads, slots]");
+    require_slots(initial_state_slots, batch, "initial_state_slots");
+    if (valid_columns.data != nullptr) { require_slots(valid_columns, batch, "valid_columns"); }
+    require_batched(key_record, DType::BF16, kStateDim, qk_heads, width, batch, "key record");
+    require_batched(value_record, DType::BF16, kStateDim, v_heads, width, batch, "value record");
+    require_batched(gate_record, DType::FP32, kStateDim, v_heads, width, batch, "gate record");
+    require(beta_record.dtype == DType::FP32 && beta_record.data != nullptr &&
+                beta_record.is_contiguous() && beta_record.ne[0] == v_heads &&
+                beta_record.ne[1] == width && beta_record.ne[2] == batch &&
+                beta_record.ne[3] == 1,
+            "the beta record must be contiguous FP32 [value heads, W, B]");
+    const float expected_scale = 1.0F / std::sqrt(static_cast<float>(kStateDim));
+    require(std::isfinite(scale) && std::abs(scale - expected_scale) <= 1.0e-6F,
+            "scale must be 1/sqrt(128)");
+
+    std::vector<Range> ranges;
+    for (const Tensor* tensor : {&q, &k, &v, &g, &beta, &states, &valid_columns,
+                                 &initial_state_slots, &key_record, &value_record, &gate_record,
+                                 &beta_record, &out}) {
+        if (tensor->data != nullptr) { ranges.push_back(range_of(*tensor)); }
+    }
+    for (std::size_t lhs = 0; lhs < ranges.size(); ++lhs) {
+        for (std::size_t rhs = lhs + 1; rhs < ranges.size(); ++rhs) {
+            require(!(ranges[lhs].begin < ranges[rhs].end && ranges[rhs].begin < ranges[lhs].end),
+                    "replay-record tensors must not overlap");
+        }
+    }
+}
+
 } // namespace
 
 void kimi_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -125,6 +196,20 @@ void kimi_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, 
                                                       ssm_states, valid_columns,
                                                       initial_state_slots, snapshot_base_slots,
                                                       out, stream);
+}
+
+void kimi_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& g, const Tensor& beta, float scale,
+                                  const Tensor& ssm_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots, Tensor& key_record,
+                                  Tensor& value_record, Tensor& gate_record, Tensor& beta_record,
+                                  Tensor& out, cudaStream_t stream) {
+    validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+                           key_record, value_record, gate_record, beta_record, out);
+    detail::kimi_delta_net::launch_recurrent_record(q, k, v, g, beta, scale, ssm_states,
+                                                    valid_columns, initial_state_slots, key_record,
+                                                    value_record, gate_record, beta_record, out,
+                                                    stream);
 }
 
 } // namespace sinfer::ops

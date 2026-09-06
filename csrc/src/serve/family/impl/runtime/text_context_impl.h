@@ -378,8 +378,10 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
 
     Tensor e = roots.normalized_embedding;
     Tensor h = roots.normalized_hidden;
-    ops::rmsnorm(emb, *mtp_.pre_fc_norm_embedding, cfg_.rms_eps, true, e, s);
-    ops::rmsnorm(flat_hidden, *mtp_.pre_fc_norm_hidden, cfg_.rms_eps, true, h, s);
+    ops::rmsnorm(emb, *mtp_.pre_fc_norm_embedding, cfg_.rms_eps, norm_unit_offset<Variant>(), e,
+                 s);
+    ops::rmsnorm(flat_hidden, *mtp_.pre_fc_norm_hidden, cfg_.rms_eps, norm_unit_offset<Variant>(),
+                 h, s);
 
     Tensor fc_in = roots.packed_input;
     ops::mtp_pack_fc_input(e, h, fc_in, s);
@@ -388,7 +390,12 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     ops::linear(fc_in, *mtp_.fc, x, s);
 
     ah = roots.attention_hidden;
-    ops::rmsnorm(x, *mtp_.input_norm, cfg_.rms_eps, true, ah, s);
+    ops::rmsnorm(x, *mtp_.input_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), ah, s);
+}
+
+void TextContext::mtp_attention_output(const Tensor& attention, Tensor& out) {
+    family::detail::mtp_attention_output_dispatch<Variant>(
+        attention, mtp_.payload->attention, *mtp_.o_proj, out, work_, ctx_.stream);
 }
 
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
@@ -410,10 +417,18 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                       v_flat, work_, s);
 
     const auto results = workspace_recipe::mtp_attention_results(work_, cfg_geometry(), T);
-    Tensor qn          = results.normalized_query.view({cfg_.head_dim, cfg_.n_q, T});
-    Tensor kn          = results.normalized_key.view({cfg_.head_dim, cfg_.n_kv, T});
-    ops::rmsnorm(q, *mtp_.q_norm, cfg_.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *mtp_.k_norm, cfg_.rms_eps, true, kn, s);
+    // As in the trunk: a target without per-head norms attends over the projection's own
+    // output, and the normalised planes stay unwritten.
+    Tensor qn = attention_qk_norm<Variant>()
+                    ? results.normalized_query.view({cfg_.head_dim, cfg_.n_q, T})
+                    : q;
+    Tensor kn = attention_qk_norm<Variant>()
+                    ? results.normalized_key.view({cfg_.head_dim, cfg_.n_kv, T})
+                    : k;
+    if constexpr (attention_qk_norm<Variant>()) {
+        ops::rmsnorm(q, *mtp_.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
+        ops::rmsnorm(k, *mtp_.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+    }
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     if constexpr (applies_rotary<Variant>()) {
         ops::rope(rope_for_op, cfg_.rotary_dim, cfg_.rope_theta, qn, kn, s);
@@ -438,15 +453,16 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
-    ops::sigmoid_mul(gate, a, s);
+    // A head whose attention writes no gate rows skips the multiply, as the trunk does.
+    if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
 
     const auto post = workspace_recipe::mtp_post_attention(work_, cfg_geometry(), T);
     Tensor o        = post.output;
-    ops::linear(a.view({cfg_.q_size, T}), *mtp_.o_proj, o, s);
+    mtp_attention_output(a.view({cfg_.q_size, T}), o);
     ops::residual_add(o, x, s);
 
     Tensor mh = post.post_mixer_hidden;
-    ops::rmsnorm(x, *mtp_.post_attn_norm, cfg_.rms_eps, true, mh, s);
+    ops::rmsnorm(x, *mtp_.post_attn_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), mh, s);
 
     {
         auto post_mixer_scope = work_.scope();
@@ -454,7 +470,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({cfg_.hidden, T}); // fixed tail only
-    ops::rmsnorm(x, *mtp_.norm, cfg_.rms_eps, true, flat_mtp_hidden, s);
+    ops::rmsnorm(x, *mtp_.norm, cfg_.rms_eps, norm_unit_offset<Variant>(), flat_mtp_hidden, s);
 }
 
 void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
@@ -597,8 +613,11 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Variant::mtp_kv_projection(ah, mtp_.payload->attention, k_flat, v_flat, work_, s);
         Tensor k  = k_flat.view({cfg_.head_dim, cfg_.n_kv, T});
         Tensor v  = v_flat.view({cfg_.head_dim, cfg_.n_kv, T});
-        Tensor kn = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_kv, T});
-        ops::rmsnorm(k, *mtp_.k_norm, cfg_.rms_eps, true, kn, s);
+        Tensor kn = k;
+        if constexpr (attention_qk_norm<Variant>()) {
+            kn = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_kv, T});
+            ops::rmsnorm(k, *mtp_.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+        }
         if constexpr (applies_rotary<Variant>()) {
             ops::rope(rope_positions, cfg_.rotary_dim, cfg_.rope_theta, kn, s);
         }
@@ -625,8 +644,11 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                        s);
         Tensor q    = q_flat.view({cfg_.head_dim, cfg_.n_q, 1});
         Tensor gate = gate_flat.view({cfg_.head_dim, cfg_.n_q, 1});
-        Tensor qn   = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
-        ops::rmsnorm(q, *mtp_.q_norm, cfg_.rms_eps, true, qn, s);
+        Tensor qn   = q;
+        if constexpr (attention_qk_norm<Variant>()) {
+            qn = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
+            ops::rmsnorm(q, *mtp_.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
+        }
         Tensor last_position = positions.slice(0, T - 1, 1);
         Tensor last_rope_position;
         if (rope_positions.ne[1] == 1) {
@@ -648,19 +670,21 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor a = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
         ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
                                   work_, a, s);
-        ops::sigmoid_mul(gate, a, s);
+        if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
 
         Tensor o = work_.alloc(DType::BF16, {cfg_.hidden, 1});
-        ops::linear(a.view({cfg_.q_size, 1}), *mtp_.o_proj, o, s);
+        mtp_attention_output(a.view({cfg_.q_size, 1}), o);
         ops::residual_add(o, x_last, s);
 
         Tensor mh = work_.alloc(DType::BF16, {cfg_.hidden, 1});
-        ops::rmsnorm(x_last, *mtp_.post_attn_norm, cfg_.rms_eps, true, mh, s);
+        ops::rmsnorm(x_last, *mtp_.post_attn_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), mh,
+                     s);
         {
             auto post_mixer_scope = work_.scope();
             Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);
         }
-        ops::rmsnorm(x_last, *mtp_.norm, cfg_.rms_eps, true, *final_hidden, s);
+        ops::rmsnorm(x_last, *mtp_.norm, cfg_.rms_eps, norm_unit_offset<Variant>(), *final_hidden,
+                     s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
     }
 }
@@ -1487,21 +1511,13 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             o.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
-            if constexpr (kLinearMixer != family::LinearMixer::GatedDelta) {
-                // Replay-record exists so a speculative round can be re-folded from the tokens
-                // it accepted. Only the delta net has that form; a target whose mixer is
-                // another one reaches this only by having been given a draft head it cannot
-                // verify, and saying so beats recording the wrong recurrence.
-                throw std::logic_error(
-                    "this target's linear mixer has no replay-record form, so it cannot verify "
-                    "a speculative round");
-            } else {
-                GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-                ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
-                                                   kGdnScale, recurrent_states, valid,
-                                                   *active_linear_state_slots_, records.key,
-                                                   records.value, records.gate, out_batch, s);
-            }
+            // Replay-record exists so a speculative round can be re-folded from the tokens it
+            // accepted; the mixer says which recurrence records, and a mixer without the form
+            // refuses there.
+            GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            family::detail::linear_recurrence_record<Variant>(
+                q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,
+                *active_linear_state_slots_, records, out_batch, s);
         } else {
             family::detail::linear_recurrence_snapshot<Variant>(
                 q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,

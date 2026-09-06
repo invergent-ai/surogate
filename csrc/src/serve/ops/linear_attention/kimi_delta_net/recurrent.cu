@@ -84,6 +84,69 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     }
 }
 
+template <bool Masked>
+void kda_launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
+                                       const Tensor& g, const Tensor& beta, float scale,
+                                       const Tensor& ssm_states, const Tensor& valid_columns,
+                                       const Tensor& initial_state_slots, Tensor& key_record,
+                                       Tensor& value_record, Tensor& gate_record,
+                                       Tensor& beta_record, Tensor& out, cudaStream_t stream) {
+    const auto heads = head_map::of(q.ne[1], v.ne[1]);
+    const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
+                    static_cast<unsigned>(kStateDim / kBlockDv));
+    const dim3 block(kWarpSize, kNumWarps, 1);
+    const std::int64_t state_slot_stride =
+        static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
+    const RecordAccess<Masked, ForgetGate::Diagonal> access{
+        static_cast<const __nv_bfloat16*>(q.data),
+        static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data),
+        static_cast<const float*>(g.data),
+        static_cast<const float*>(beta.data),
+        static_cast<const GdnStateStorage*>(ssm_states.data),
+        Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+        static_cast<const std::int32_t*>(initial_state_slots.data),
+        static_cast<__nv_bfloat16*>(key_record.data),
+        static_cast<__nv_bfloat16*>(value_record.data),
+        static_cast<float*>(gate_record.data),
+        static_cast<float*>(beta_record.data),
+        static_cast<__nv_bfloat16*>(out.data),
+        heads,
+        q.ne[2],
+        state_slot_stride,
+        scale,
+    };
+    recurrent_record_kernel<Masked, ForgetGate::Diagonal><<<grid, block, 0, stream>>>(access);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Geometry>
+void kda_launch_replay_fold_fixed(const GdnReplayRecords& records,
+                                  LinearAttentionStateAllLayersView states,
+                                  const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                                  cudaStream_t stream) {
+    const FoldAccess<Geometry, ForgetGate::Diagonal> access{
+        static_cast<const __nv_bfloat16*>(records.key.data),
+        static_cast<const __nv_bfloat16*>(records.value.data),
+        static_cast<const float*>(records.gate.data),
+        static_cast<const float*>(records.beta.data),
+        static_cast<const __nv_bfloat16*>(records.conv.data),
+        static_cast<GdnStateStorage*>(states.recurrent_layer0.data),
+        static_cast<__nv_bfloat16*>(states.conv_layer0.data),
+        states.recurrent_layer_stride_bytes / static_cast<std::int64_t>(sizeof(GdnStateStorage)),
+        states.conv_layer_stride_bytes / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+        records.spec.record_capacity,
+        records.spec.width,
+        rows,
+    };
+    const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
+                    static_cast<unsigned>(active_rows),
+                    static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
+    const dim3 block(kWarpSize, kNumWarps, 1);
+    recurrent_fold_kernel<Geometry, ForgetGate::Diagonal><<<grid, block, 0, stream>>>(access);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 // Not in the anonymous namespace above: the op's own entry point forwards to it.
@@ -117,9 +180,64 @@ void kda_launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, con
     CUDA_CHECK(cudaGetLastError());
 }
 
+/// The replay-record form: the delta net's record kernel with the diagonal gate, so a lane
+/// records the four channels of g it owns beside the key and value it read.
+void kda_launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                 const Tensor& g, const Tensor& beta, float scale,
+                                 const Tensor& ssm_states, const Tensor& valid_columns,
+                                 const Tensor& initial_state_slots, Tensor& key_record,
+                                 Tensor& value_record, Tensor& gate_record, Tensor& beta_record,
+                                 Tensor& out, cudaStream_t stream) {
+    if (valid_columns.data == nullptr) {
+        kda_launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states,
+                                                 valid_columns, initial_state_slots, key_record,
+                                                 value_record, gate_record, beta_record, out,
+                                                 stream);
+    } else {
+        kda_launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states,
+                                                valid_columns, initial_state_slots, key_record,
+                                                value_record, gate_record, beta_record, out,
+                                                stream);
+    }
+}
+
+/// The fold over every registered diagonal-gate geometry. One today: GLM-5.3-Flash's.
+void kda_launch_replay_fold(const GdnReplayRecords& records,
+                            LinearAttentionStateAllLayersView states,
+                            const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                            cudaStream_t stream) {
+    if (records.spec.layers == FoldGeometry34x64::kLayers &&
+        records.spec.qk_heads == FoldGeometry34x64::kQkHeads &&
+        records.spec.value_heads == FoldGeometry34x64::kValueHeads &&
+        records.spec.conv_channels == FoldGeometry34x64::kConvChannels) {
+        kda_launch_replay_fold_fixed<FoldGeometry34x64>(records, states, rows, active_rows,
+                                                        stream);
+        return;
+    }
+    throw std::invalid_argument(
+        "Kimi Delta Attention replay fold launcher received an unregistered geometry");
+}
+
 } // namespace sinfer::ops::detail::gated_delta_net
 
 namespace sinfer::ops::detail::kimi_delta_net {
+
+void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                             const Tensor& beta, float scale, const Tensor& ssm_states,
+                             const Tensor& valid_columns, const Tensor& initial_state_slots,
+                             Tensor& key_record, Tensor& value_record, Tensor& gate_record,
+                             Tensor& beta_record, Tensor& out, cudaStream_t stream) {
+    ::sinfer::ops::detail::gated_delta_net::kda_launch_recurrent_record(
+        q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+        value_record, gate_record, beta_record, out, stream);
+}
+
+void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                        const gated_delta_net::GdnReplayFoldKernelRows& rows,
+                        std::int32_t active_rows, cudaStream_t stream) {
+    ::sinfer::ops::detail::gated_delta_net::kda_launch_replay_fold(records, states, rows,
+                                                                   active_rows, stream);
+}
 
 void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                       const Tensor& beta, float scale, bool normalize_qk,

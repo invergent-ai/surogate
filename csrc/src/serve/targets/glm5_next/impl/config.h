@@ -194,7 +194,8 @@ inline constexpr float kAbsorbScale                      = 1.4142135623730951F;
 /// 1/sqrt(128) for the delta recurrence.
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
-inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 0;
+/// The NextN draft head proposes up to this many tokens a round, the family's bound.
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
 /// What this target serves, not what the checkpoint was trained for (1,048,576). The sparse
 /// indexer is not bound, and below its budget full attention is exactly what it would have

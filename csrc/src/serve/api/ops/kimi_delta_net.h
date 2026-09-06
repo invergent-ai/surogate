@@ -82,4 +82,29 @@ void kimi_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& initial_state_slots,
                              const Tensor& snapshot_base_slots, Tensor& out, cudaStream_t stream);
 
+/**
+ * Op: kimi_delta_net_replay_record
+ *
+ * The replay-record form of the same recurrence, which is what lets a speculative round be
+ * verified over this mixer: B lanes are evaluated from absolute state slots that are never
+ * written, and what a later fold needs to re-derive the state from the accepted prefix is
+ * recorded beside the output. Shapes are the snapshot form's -- q/k BF16 [128,Hqk,T,B], v/out
+ * BF16 [128,Hv,T,B], g FP32 [128,Hv,T,B], beta FP32 [Hv,T,B], ssm_states [128,128,Hv,S] -- with
+ * T in [2,16], B at most the engine's lane cap, and `normalize_qk` always on, as the delta
+ * net's record form has it.
+ *
+ * For each valid transition, key_record BF16 [128,Hqk,T,B], value_record BF16 [128,Hv,T,B],
+ * gate_record FP32 [128,Hv,T,B] and beta_record FP32 [Hv,T,B] receive bit-preserving copies of
+ * raw k, v, g and beta. The gate is recorded per channel because that is what the transition
+ * reads; the delta net records a {g, beta} pair where this records a plane and a scalar. The
+ * invalid record suffix is unchanged and the invalid out suffix is exact BF16 zero. Inputs,
+ * state, records and out are pairwise non-overlapping.
+ */
+void kimi_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& g, const Tensor& beta, float scale,
+                                  const Tensor& ssm_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots, Tensor& key_record,
+                                  Tensor& value_record, Tensor& gate_record, Tensor& beta_record,
+                                  Tensor& out, cudaStream_t stream);
+
 } // namespace sinfer::ops

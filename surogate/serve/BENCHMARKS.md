@@ -226,7 +226,8 @@ without batch flags understated it 3.9× and are gone.
 ### GLM-5.3-Flash (200 GB MoE; 181.65 GiB of weights against 256 GiB of cards)
 
 `models/GLM-5.3-Flash-UD-Q4_K_XL-*.gguf` read in place, 2026-09-06, idle host, 512/128, one
-engine at a time, every row below re-measured in one session on the same binary. Ours: the
+engine at a time; the eight-card rows were re-measured after the draft head landed, on the
+binary that carries it, and llama.cpp's 16 and 64-user rows with them. Ours: the
 eight-stage pipeline with the latent attention served **absorbed** -- the query folded through
 the key half of the expansion into the 512-wide latent, one key/value head per token in the
 cache -- `--max-model-len 704 --max-num-batched-tokens 512 --kv-cache-dtype bf16`.
@@ -236,12 +237,12 @@ architecture.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 8 | 1 | **164.4** | **39.7** | **204.1** | **0.65 s** | `--kv-capacity 704`, everything resident. Ahead of llama.cpp on all three columns; it was 119.6 / 28.9 / 0.66 before the two hyper-connection kernels were fixed |
+| **surogate** | 8 | 1 | **168.4** | **40.7** | **209.1** | **0.56 s** | `--kv-capacity 704`, everything resident. Ahead of llama.cpp on all three columns; it was 119.6 / 28.9 / 0.66 before the two hyper-connection kernels were fixed |
 | llama.cpp | 8 | 1 | 156.6 | 37.8 | 194.4 | 1.18 s | `-np 1` |
-| llama.cpp | 8 | 16 | 153.9 | 37.2 | 191.1 | 56.25 s | `-np 16`, and identical to its one-user row: the sixteen streams are served one after another, so this is queueing rather than batching |
-| **surogate** | 8 | 16 | **1,217.4** | **294.0** | **1,511.4** | **1.61 s** | `--kv-capacity 11264`, **everything resident**: the absorbed attention caches one 512-wide head per token, so sixteen lanes fit where the expanded form needed 10.4 GiB on a 3.5 GiB stage. 176 requests, 0 errors. **7.9× llama.cpp's decode and prefill at 1/35 of its TTFT** |
-| llama.cpp | 8 | 64 | 41.7 | 10.1 | 51.8 | 779.24 s | `-np 64` |
-| **surogate** | 8 | 64 | **99.6** | **24.1** | **123.7** | **31.78 s** | `--kv-capacity auto --host-moe-layers auto`, which moved 1–2 mixture layers per stage to host memory to hold 45,056 KV tokens; those layers cross PCIe on every token and are the ceiling here. **2.4× llama.cpp's decode and prefill at 1/24 of its TTFT**; 108 of 150 requests still timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
+| llama.cpp | 8 | 16 | 173.4 | 41.9 | 215.3 | 55.13 s | `-np 16`, and barely above its one-user row: the sixteen streams are served nearly one after another, so this is queueing rather than batching |
+| **surogate** | 8 | 16 | **1,212.7** | **292.9** | **1,505.6** | **1.59 s** | `--kv-capacity 11264`, **everything resident**: the absorbed attention caches one 512-wide head per token, so sixteen lanes fit where the expanded form needed 10.4 GiB on a 3.5 GiB stage. 176 requests, 0 errors. **7.0× llama.cpp's decode and prefill at 1/35 of its TTFT** |
+| llama.cpp | 8 | 64 | 44.4 | 10.7 | 55.1 | 729.58 s | `-np 64` |
+| **surogate** | 8 | 64 | **99.0** | **23.9** | **122.9** | **31.94 s** | `--kv-capacity auto --host-moe-layers auto`, which moved 1–2 mixture layers per stage to host memory to hold 45,056 KV tokens; those layers cross PCIe on every token and are the ceiling here. **2.2× llama.cpp's decode and prefill at 1/23 of its TTFT**; 108 of 150 requests still timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
 | surogate | **1** | 1 | 7.5 | 1.8 | 9.3 | 28.71 s | `--host-moe-layers all`: 8.91 GiB on the card, 172.74 GiB pinned. A capacity result, not a speed one — every routed expert crosses PCIe on every token. Measured before the hyper-connection fixes. **llama.cpp does not serve this model on one card at all** |
 | surogate | **1** | 16 | 7.4 | 1.8 | 9.2 | 89.88 s | same; concurrency buys nothing once the bus is the bottleneck |
 
@@ -274,6 +275,24 @@ cache row never appended. Neither had a registered shape to show on.
 
 Parity, 40,880 scored positions; the absorbed and expanded forms differ by the rounding of
 the folded sqrt(2) and a 16-key tile order, well inside the error bar. The gate script is `scratchpad/ppl_gate_glm.sh`.
+
+**The draft head (2026-09-06).** The checkpoint's NextN block is bound under `mtp/` and
+`--spec mtp` runs it. The rows below are the one place it can run today -- a single card with
+the experts in host memory -- because a pipeline runs no speculative round: a verify is accepted
+on the stage that holds the head, and the other stages would fold their recurrent state on a
+decision they never see, so `--devices A,B` refuses `--spec`. Same prompt, greedy, 160 tokens,
+the second of two requests:
+
+| GLM-5.3-Flash, one 5090, `--host-moe-layers all` | decode tok/s | tokens / round | drafts accepted |
+|---|---:|---:|---:|
+| ordinary decode | 3.1 | 1.00 | -- |
+| `--spec mtp --draft-tokens 3` | 1.5 | 2.94 | 64.8 % |
+
+The head drafts well -- 2.94 tokens a round of a possible four, and the text is the trunk's own
+-- and the row is slower anyway. On this configuration a token's cost is its experts crossing
+PCIe, and a verify of four columns fetches roughly four tokens' worth of them for the 2.94 it
+keeps. Speculation pays where a round is latency-bound, which on this model is the eight-card
+pipeline (40 tok/s at 14 % GPU busy); that row waits on the pipeline learning to verify.
 
 ## Prefill on the 27B GGUF, and where it goes (2026-09-04)
 

@@ -99,6 +99,23 @@ struct TextLayerPlan {
     FeedForwardPlan feed_forward;
 };
 
+/// The NextN draft head: one latent-attention layer over the mixture, on a single-stream
+/// residual of its own, between a fold that seeds it from the next token's embedding and the
+/// trunk's normalised hidden and a norm that reads it out for the trunk's LM head. No
+/// hyper-connection anywhere in it, which is what makes it the family's fixed draft tail rather
+/// than a trunk block. The embedding table and the LM head are the trunk's.
+struct MtpPlan {
+    bool present = false; ///< the artifact carries a head
+    artifact::ObjectHandle embedding_norm; // [hidden]
+    artifact::ObjectHandle hidden_norm;    // [hidden]
+    WeightPlan input_projection;           // [hidden, 2 * hidden]
+    artifact::ObjectHandle input_norm;
+    LatentAttentionPlan attention;
+    artifact::ObjectHandle post_attention_norm;
+    FeedForwardPlan feed_forward;
+    artifact::ObjectHandle final_norm;     // `shared_head.norm`
+};
+
 struct BindingPlan {
     family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
     family::FrontendResourcePlan frontend;
@@ -114,6 +131,8 @@ struct BindingPlan {
     std::vector<TextLayerPlan> text_layers;
     artifact::ObjectHandle final_norm;
     WeightPlan output_head;
+
+    MtpPlan mtp;
 
     /// Objects this stage puts in pinned host memory instead of on the card. Empty unless
     /// `--host-moe-layers` asked for it.
@@ -192,10 +211,18 @@ struct FeedForwardPayload {
     ops::SparseMoeWeights moe;
 };
 
-/// Declared so the family's `MtpWeights<...>` instantiates; never materialised, because
-/// `bind_artifact` refuses speculation.
+/// The draft head's attention: the trunk's latent projections without the hyper-connection,
+/// because the head runs on a single-stream residual. The same member names as
+/// `LatentAttentionPayload`, so one loader fills either.
 struct MtpAttentionPayload {
-    Weight packed;
+    float rms_epsilon = 0.0F;
+    Weight query_a;
+    Tensor query_a_norm;
+    Weight query_b;
+    Weight kv_a;
+    Tensor kv_a_norm;
+    Weight k_b;
+    Weight v_b;
 };
 
 using RuntimeModelView =

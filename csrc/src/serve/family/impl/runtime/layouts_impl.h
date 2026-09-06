@@ -257,6 +257,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          .value_heads     = plan.geometry.gdn_value_heads,
                          .key_dim         = plan.geometry.gdn_key_head_dim,
                          .value_dim       = plan.geometry.gdn_value_head_dim,
+                         // A per-channel forget gate records a plane where a per-head one
+                         // records a pair; the spec says which, and the fold reads it back.
+                         .diagonal_gate =
+                             family::linear_mixer_gate_is_per_channel(schedule::kLinearMixer),
                      });
     }
     if constexpr (Variant::supports_dflash) {
@@ -489,6 +493,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                               bool preembedded) {
         (void)workspace_recipe::mtp_stem(layout, plan.geometry, tokens, !preembedded);
     };
+    // A draft head that unfolds its attended latent itself has scratch of its own between
+    // the attention and the residual add; the one-linear tail has none.
+    const auto mtp_output_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
+                                        std::int32_t last) {
+        scratch(layout, mtp_attention_output_capacity_bytes<Variant>(plan.geometry, first, last));
+    };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::GqaExecutionEnvelope envelope) {
         auto core = layout.scope();
@@ -501,6 +511,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             plan.geometry.kv_heads, plan.kv_dtype, envelope,
                             1, tokens, tokens));
         (void)workspace_recipe::mtp_post_attention(layout, plan.geometry, tokens);
+        mtp_output_scratch(layout, tokens, tokens);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(plan.geometry, tokens, tokens));
     };
     const auto mtp_full_call = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -537,6 +548,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             plan.geometry.kv_heads, plan.kv_dtype,
                             text_envelope, 1, 1, 1));
         matrix(layout, DType::BF16, plan.geometry.hidden, 1);
+        mtp_output_scratch(layout, 1, 1);
         matrix(layout, DType::BF16, plan.geometry.hidden, 1);
         scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(plan.geometry, 1, 1));
         proposal_scratch(layout, 1);
@@ -612,6 +624,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                     plan.geometry.kv_heads, plan.kv_dtype,
                                     text_envelope, batch, width, width));
                 (void)workspace_recipe::mtp_post_attention(layout, plan.geometry, tokens);
+                mtp_output_scratch(layout, tokens, tokens);
                 scratch(layout, Variant::mtp_post_mixer_workspace_capacity_bytes(plan.geometry, tokens, tokens));
             };
 

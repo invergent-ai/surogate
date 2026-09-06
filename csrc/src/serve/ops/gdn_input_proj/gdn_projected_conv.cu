@@ -134,6 +134,13 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
                                        initial_state_slots, query, key, value, publish, stream);
         return;
     }
+    // GLM-5.3-Flash's Kimi Delta Attention: 64 heads of 128 for q, k and v alike.
+    if (projected.ne[0] == 24576 && query.ne[0] == 8192 && key.ne[0] == 8192 &&
+        value.ne[0] == 8192) {
+        launch<24576, 8192, 8192, 8192>(projected, conv_weight, state_read, valid_columns,
+                                        initial_state_slots, query, key, value, publish, stream);
+        return;
+    }
     throw std::invalid_argument("GDN projected-conv received an unregistered geometry");
 }
 

@@ -490,6 +490,9 @@ private:
     Tensor lm_head_view(const Tensor& stored, cudaStream_t stream);
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
+    /// The draft head's attended heads to the model width: the target's own leaf where it has
+    /// one (an absorbed attention unfolds per head first), the family's one linear otherwise.
+    void mtp_attention_output(const Tensor& attention, Tensor& out);
     void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                           const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                           Tensor& mtp_hidden);

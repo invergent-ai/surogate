@@ -23,8 +23,10 @@ using GraphExecutionProfile = family::GraphExecutionProfile;
 // compresses the key and value to a 512-wide latent and expands it per head, with no rotary at
 // all. Its non-attending layers run Kimi Delta Attention, whose forget gate is one value per key
 // channel; the family's mixer dispatch handles that, and what is here is the projection that
-// writes the wider gate. The MTP leaves are declared because the runtime is a template over this
-// interface, not because they can run -- each one throws, naming why (see variant.cpp).
+// writes the wider gate. Its NextN draft head is one latent-attention layer over the mixture on
+// a single-stream residual -- no hyper-connection -- so it is the family's fixed draft tail,
+// with the attention leaves below and one more the tail asks for: the attended latent has to be
+// unfolded per head before the output projection can read it.
 struct Variant {
     using WeightsProfile                 = detail::WeightsProfile;
     using TextConfig                     = detail::TextConfig;
@@ -188,6 +190,16 @@ struct Variant {
                                         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                             std::int32_t last);
+    /// The draft head's attended latent to the model width: unfolded per head through the value
+    /// half of the expansion, then the output projection. The family's tail is one linear over
+    /// the attended heads; this attention attends over the latent itself, so it supplies the
+    /// unfold, and the family sizes the tail's scratch by the capacity beside it.
+    static void mtp_attention_output_projection(const Tensor& attention,
+                                                const MtpAttentionProjectionWeights& weights,
+                                                const Weight& output, Tensor& out,
+                                                WorkspaceArena& workspace, cudaStream_t stream);
+    [[nodiscard]] static std::size_t mtp_attention_output_projection_workspace_capacity_bytes(
+        const family::TextGeometry& geometry, std::int32_t first, std::int32_t last);
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);

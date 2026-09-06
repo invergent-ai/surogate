@@ -132,7 +132,7 @@ on decode at a draft window of 3.
 
 | Flag | Meaning |
 |---|---|
-| `--spec mtp` | Multi-token prediction, using the model's own MTP block. Draft window 1–5. |
+| `--spec mtp` | Multi-token prediction, using the model's own MTP block. Draft window 1–5. One device: a pipeline runs no speculative round. |
 | `--spec dflash` | A separate trained drafter. Draft window 1–15; needs a bf16 KV cache, and is not combinable with `--vision`. |
 | `--draft-tokens N` | Tokens proposed per round |
 | `--lm-head-draft` | Propose through the reduced draft head instead of the full output head |

@@ -275,6 +275,19 @@ _GLM5_MOE_OBJECTS: tuple[ServeObject, ...] = (
 )
 
 
+#: The NextN draft head's own objects, in the order the artifact stores them. Its block is one
+#: latent-attention layer over the mixture *without* hyper-connections -- the head runs on a
+#: single-stream residual -- so it replays the MLA-over-MoE block's objects minus the two
+#: hyper-connection sites, between the three tensors that fold the next token's embedding in
+#: and the norm that reads the result out for the trunk's LM head.
+GLM5_NEXT_MTP_LAYER_OBJECTS: tuple[ServeObject, ...] = (
+    _GLM5_NORM_OBJECTS[0],
+    *_MLA_SERVE_OBJECTS,
+    _GLM5_NORM_OBJECTS[1],
+    *_GLM5_MOE_OBJECTS,
+)
+
+
 def _glm5_serve_objects(*, mixer: str, sparse: bool) -> tuple[ServeObject, ...]:
     """The objects one block kind holds, in the order the artifact stores them."""
     return (

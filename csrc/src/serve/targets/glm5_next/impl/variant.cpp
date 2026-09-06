@@ -8,12 +8,14 @@
 #include "api/ops/silu_mul.h"
 #include "api/ops/head_linear.h"
 #include "api/ops/manifold_hyper_connection.h"
+#include "api/ops/residual_add.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/scatter.h"
 #include "api/ops/sparse_moe.h"
 
 #include "core/device.h"
 #include "family/impl/lora_hook.h"
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -184,14 +186,6 @@ void project(const char* what, const Tensor& x, const Weight& w, Tensor& out,
         "for a target whose declared mixer is KimiDelta.");
 }
 
-[[noreturn]] void no_speculation(const char* leaf) {
-    throw std::logic_error(
-        std::string("glm5_next: ") + leaf +
-        " was called, but this target binds no draft head, and Kimi Delta Attention has no "
-        "replay-record form to verify a speculative round with; --spec is refused when the "
-        "artifact is bound. Reaching here means a speculative round started without one.");
-}
-
 QType profile_qtype(WeightsProfile weights_profile) {
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
@@ -236,8 +230,33 @@ std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_
     return family::graph_profiles_through(capacity - 1, {127, 511, 2047});
 }
 
-std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t, std::uint32_t) {
-    return {};
+std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t capacity,
+                                                               std::uint32_t draft_window) {
+    if (draft_window == 0 || capacity == 0) { return {}; }
+    // The same cuts the other draft heads capture at: the final AR window E+2K at the
+    // split-policy transitions until the grid reaches its cap, and one concrete kernel
+    // implementation per range at the T=4/5/6 launch boundaries.
+    std::vector<std::uint32_t> ends;
+    const auto add_shifted = [&](std::uint32_t visible_end, std::uint32_t offset) {
+        if (visible_end >= offset) { ends.push_back(visible_end - offset); }
+    };
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
+        add_shifted(visible_end, 2 * draft_window);
+    }
+    if (draft_window == 3) {
+        add_shifted(1029, draft_window + 1);
+    } else if (draft_window == 4) {
+        for (const std::uint32_t visible_end : {128U, 512U, 1029U}) {
+            add_shifted(visible_end, draft_window + 1);
+        }
+    } else if (draft_window == 5) {
+        for (const std::uint32_t visible_end : {128U, 160U, 2054U, 8198U}) {
+            add_shifted(visible_end, draft_window + 1);
+        }
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return family::graph_profiles_through(capacity - 1, ends);
 }
 
 std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
@@ -287,6 +306,78 @@ void Variant::post_mixer_norm(const Tensor& residual, const PostMixerWeights& we
 
 // ---- Multi-head latent attention, NoPE --------------------------------------
 
+namespace {
+
+/// The latent: `kv_a` then its norm, straight into the key buffer. In the absorbed form it *is*
+/// the layer's key, and its value, and the cache holds it as such -- 512 wide, one head.
+template <class Payload>
+void latent_key(const Tensor& hidden, const Payload& weights, Tensor& key,
+                WorkspaceArena& workspace, cudaStream_t stream) {
+    project("mla/kv_a", hidden, weights.kv_a, key, workspace, stream);
+    ops::rmsnorm(key, weights.kv_a_norm, weights.rms_epsilon, /*unit_offset=*/false, key, stream);
+}
+
+/// The absorbed query: the low rank, its norm, the heads, and every head folded through its own
+/// key half into the latent, carrying the sqrt 2 that turns the kernels' 1/sqrt(512) into the
+/// model's 1/sqrt(256). Each low rank is normalised whole, which is what replaces the per-head
+/// query and key norms every other target in this family carries.
+template <class Payload>
+void absorbed_query(const Tensor& hidden, const Payload& weights, Tensor& query,
+                    WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = hidden.ne[1];
+    auto scope                = workspace.scope();
+    Tensor q_low   = workspace.alloc(DType::BF16, {weights.query_a.n, tokens});
+    Tensor q_heads = workspace.alloc(DType::BF16, {weights.query_b.n, tokens});
+    project("mla/query_a", hidden, weights.query_a, q_low, workspace, stream);
+    ops::rmsnorm(q_low, weights.query_a_norm, weights.rms_epsilon, /*unit_offset=*/false, q_low,
+                 stream);
+    project("mla/query_b", q_low, weights.query_b, q_heads, workspace, stream);
+    const std::int32_t heads = weights.k_b.n / weights.kv_a.n;
+    ops::head_linear(q_heads, weights.k_b, heads, kAbsorbScale, query, stream);
+}
+
+/// The attended latent back through the value half, per head, then the output projection.
+void unfold_and_project(const Tensor& attention, const Weight& value_unfold, const Weight& output,
+                        Tensor& out, WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens  = attention.ne[1];
+    const std::int32_t heads   = static_cast<std::int32_t>(attention.ne[0] / value_unfold.k);
+    auto scope      = workspace.scope();
+    Tensor unfolded = workspace.alloc(DType::BF16, {value_unfold.n, tokens});
+    ops::head_linear(attention, value_unfold, heads, 1.0F, unfolded, stream);
+    project("mla/output", unfolded, output, out, workspace, stream);
+    apply_lora(output, 3, unfolded, out, stream);
+}
+
+std::size_t absorbed_query_capacity(const family::TextGeometry& geometry,
+                                    WeightsProfile weights_profile, std::int32_t first,
+                                    std::int32_t last) {
+    // The query low rank and the heads `query_b` produces; the absorption is a per-head kernel
+    // with no transient of its own.
+    return plane_bytes(geometry.q_lora_rank, last, DType::BF16) +
+           plane_bytes(geometry.query_heads * TextConfig::qk_head_dim, last, DType::BF16) +
+           std::max(linear_capacity(weights_profile, geometry.q_lora_rank, geometry.hidden, first,
+                                    last),
+                    linear_capacity(weights_profile,
+                                    geometry.query_heads * TextConfig::qk_head_dim,
+                                    geometry.q_lora_rank, first, last));
+}
+
+std::size_t latent_key_capacity(const family::TextGeometry& geometry,
+                                WeightsProfile weights_profile, std::int32_t first,
+                                std::int32_t last) {
+    return linear_capacity(weights_profile, geometry.kv_lora_rank, geometry.hidden, first, last);
+}
+
+std::size_t unfold_capacity(const family::TextGeometry& geometry, WeightsProfile weights_profile,
+                            std::int32_t first, std::int32_t last) {
+    // The unfolded heads, then the output projection's transient.
+    return plane_bytes(geometry.query_heads * TextConfig::v_head_dim, last, DType::BF16) +
+           linear_capacity(weights_profile, geometry.hidden,
+                           geometry.query_heads * TextConfig::v_head_dim, first, last);
+}
+
+} // namespace
+
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, family::TextPhase,
@@ -294,24 +385,8 @@ void Variant::attention_projection(const Tensor& hidden,
     // `gate` is deliberately untouched: this attention writes no output-gate rows and the family
     // skips the multiply (`Variant::attention_output_gate == false`).
     (void)gate;
-    const std::int32_t tokens = hidden.ne[1];
-    auto scope                = workspace.scope();
-    Tensor q_low   = workspace.alloc(DType::BF16, {weights.query_a.n, tokens});
-    Tensor q_heads = workspace.alloc(DType::BF16, {weights.query_b.n, tokens});
-    project("mla/query_a", hidden, weights.query_a, q_low, workspace, stream);
-    // The latent is projected straight into the key buffer: in the absorbed form it *is* this
-    // layer's key, and its value, and the cache holds it as such -- 512 wide, one head.
-    project("mla/kv_a", hidden, weights.kv_a, key, workspace, stream);
-    // Each low rank is normalised whole, which is what replaces the per-head query and key
-    // norms every other target in this family carries.
-    ops::rmsnorm(q_low, weights.query_a_norm, weights.rms_epsilon, /*unit_offset=*/false, q_low,
-                 stream);
-    ops::rmsnorm(key, weights.kv_a_norm, weights.rms_epsilon, /*unit_offset=*/false, key, stream);
-    project("mla/query_b", q_low, weights.query_b, q_heads, workspace, stream);
-    // The absorption: every query head is folded through its own key half into the latent,
-    // carrying the sqrt 2 that turns the kernels' 1/sqrt(512) into the model's 1/sqrt(256).
-    const std::int32_t heads = weights.k_b.n / weights.kv_a.n;
-    ops::head_linear(q_heads, weights.k_b, heads, kAbsorbScale, query, stream);
+    latent_key(hidden, weights, key, workspace, stream);
+    absorbed_query(hidden, weights, query, workspace, stream);
     CUDA_CHECK(cudaMemcpyAsync(value.data, key.data,
                                static_cast<std::size_t>(key.numel()) * sizeof(__nv_bfloat16),
                                cudaMemcpyDeviceToDevice, stream));
@@ -324,18 +399,50 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     if (t_value_unfold == nullptr) {
         throw std::logic_error("glm5_next: attention output before its projection on this thread");
     }
-    const Weight& value_unfold = *t_value_unfold;
-    const std::int32_t tokens  = attention.ne[1];
     // The attended latent, per head, back through the value half: the heads at their own
     // width, which is what the output projection was trained to read.
-    const std::int32_t heads = static_cast<std::int32_t>(attention.ne[0] / value_unfold.k);
-    auto scope      = workspace.scope();
-    Tensor unfolded = workspace.alloc(DType::BF16, {value_unfold.n, tokens});
-    ops::head_linear(attention, value_unfold, heads, 1.0F, unfolded, stream);
+    const std::int32_t tokens = attention.ne[1];
+    auto scope = workspace.scope();
     Tensor out = workspace.alloc(DType::BF16, {weight.n, tokens});
-    project("mla/output", unfolded, weight, out, workspace, stream);
-    apply_lora(weight, 3, unfolded, out, stream);
+    unfold_and_project(attention, *t_value_unfold, weight, out, workspace, stream);
     combine_into(out, residual, stream);
+}
+
+// ---- The draft head's attention: the same latent attention, no hyper-connection ----
+
+void Variant::mtp_attention_projection(const Tensor& hidden,
+                                       const MtpAttentionProjectionWeights& weights,
+                                       Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
+                                       WorkspaceArena& workspace, cudaStream_t stream) {
+    (void)gate; // no output-gate rows; the family's tail skips the multiply
+    latent_key(hidden, weights, key, workspace, stream);
+    absorbed_query(hidden, weights, query, workspace, stream);
+    CUDA_CHECK(cudaMemcpyAsync(value.data, key.data,
+                               static_cast<std::size_t>(key.numel()) * sizeof(__nv_bfloat16),
+                               cudaMemcpyDeviceToDevice, stream));
+}
+
+void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
+                                Tensor& key, Tensor& value, WorkspaceArena& workspace,
+                                cudaStream_t stream) {
+    latent_key(hidden, weights, key, workspace, stream);
+    CUDA_CHECK(cudaMemcpyAsync(value.data, key.data,
+                               static_cast<std::size_t>(key.numel()) * sizeof(__nv_bfloat16),
+                               cudaMemcpyDeviceToDevice, stream));
+}
+
+void Variant::mtp_q_gate_projection(const Tensor& hidden,
+                                    const MtpAttentionProjectionWeights& weights, Tensor& query,
+                                    Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream) {
+    (void)gate;
+    absorbed_query(hidden, weights, query, workspace, stream);
+}
+
+void Variant::mtp_attention_output_projection(const Tensor& attention,
+                                              const MtpAttentionProjectionWeights& weights,
+                                              const Weight& output, Tensor& out,
+                                              WorkspaceArena& workspace, cudaStream_t stream) {
+    unfold_and_project(attention, weights.v_b, output, out, workspace, stream);
 }
 
 // ---- Kimi Delta Attention ---------------------------------------------------
@@ -405,6 +512,26 @@ void Variant::gdn_input_projection_snapshot(
     project("kda/gate_b", gate_low, weights.gate_b, flat_gate, workspace, stream);
 }
 
+void Variant::gdn_input_projection_record(
+    const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
+    const Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slots,
+    Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
+    family::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream) {
+    // A speculative round records the projection the convolution reads instead of advancing
+    // the convolution's state: a rejected draft is undone by folding the accepted prefix from
+    // the record, so the recurrent state is re-derived rather than rolled back. The projection
+    // is this layer's own; the convolution from a state it does not write is the family's,
+    // the same one the delta-net targets compose with.
+    const std::int32_t columns = hidden.ne[1] * hidden.ne[2];
+    Tensor flat_hidden         = hidden.view({hidden.ne[0], columns});
+    Tensor flat_record         = conv_record.view({conv_record.ne[0], columns});
+    gdn_input_projection(flat_hidden, weights, flat_record, output_gate, phase, workspace,
+                         stream);
+    ops::detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states,
+                                                  valid_columns, initial_slots, query, key, value,
+                                                  stream);
+}
+
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                     family::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
@@ -416,6 +543,52 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
 }
 
 // ---- The feed-forward -------------------------------------------------------
+
+namespace {
+
+/// The dense feed-forward as two row-range projections and a pointwise, not the fused SwiGLU.
+/// That op's kernels are instantiated per (intermediate, k), and this shape -- 12,288 over
+/// 4,096 -- would be three more instantiations for three of forty-five layers. `linear_rows`
+/// reads the same fused parent and is shape-free. Written to `out`, not added.
+void dense_feed_forward(const Tensor& hidden, const FeedForwardPayload& weights, Tensor& out,
+                        WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = hidden.ne[1];
+    auto scope                = workspace.scope();
+    const std::int32_t width  = weights.gate_up.n / 2;
+    Tensor gate = workspace.alloc(DType::BF16, {width, tokens});
+    Tensor up   = workspace.alloc(DType::BF16, {width, tokens});
+    ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
+    ops::linear_rows(hidden, weights.gate_up, width, up, &workspace, stream);
+    // Clamped, like every other SwiGLU this model has.
+    ops::silu_mul(gate, up, gate, kMoeGeometry.swiglu_limit, stream);
+    project("mlp/down", gate, weights.down, out, workspace, stream);
+}
+
+std::size_t feed_forward_capacity(const family::TextGeometry& geometry,
+                                  WeightsProfile weights_profile, std::int32_t first,
+                                  std::int32_t last) {
+    const QType qtype = profile_qtype(weights_profile);
+    // Whichever of the two feed-forwards is larger. A layer is one or the other, but the
+    // layout is planned for the stack rather than per layer.
+    const std::size_t mixture = std::max({
+        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, qtype, qtype, first, last),
+        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q4_K, first,
+                                                 last),
+        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q6_K, first,
+                                                 last),
+        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q5_K, QType::Q6_K, first,
+                                                 last),
+    });
+    const std::size_t dense =
+        2 * plane_bytes(geometry.dense_intermediate, last, DType::BF16) +
+        std::max(linear_capacity(weights_profile, 2 * geometry.dense_intermediate, geometry.hidden,
+                                 first, last),
+                 linear_capacity(weights_profile, geometry.hidden, geometry.dense_intermediate,
+                                 first, last));
+    return std::max(mixture, dense);
+}
+
+} // namespace
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
@@ -429,20 +602,23 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         CUDA_CHECK(cudaMemsetAsync(out.data, 0, out.bytes(), stream));
         run_sparse_moe(hidden, weights.moe, out, workspace, stream);
     } else {
-        // The dense feed-forward as two row-range projections and a pointwise, not the fused
-        // SwiGLU. That op's kernels are instantiated per (intermediate, k), and this shape --
-        // 12,288 over 4,096 -- would be three more instantiations for three of forty-five
-        // layers. `linear_rows` reads the same fused parent and is shape-free.
-        const std::int32_t width = weights.gate_up.n / 2;
-        Tensor gate = workspace.alloc(DType::BF16, {width, tokens});
-        Tensor up   = workspace.alloc(DType::BF16, {width, tokens});
-        ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
-        ops::linear_rows(hidden, weights.gate_up, width, up, &workspace, stream);
-        // Clamped, like every other SwiGLU this model has.
-        ops::silu_mul(gate, up, gate, kMoeGeometry.swiglu_limit, stream);
-        project("mlp/down", gate, weights.down, out, workspace, stream);
+        dense_feed_forward(hidden, weights, out, workspace, stream);
     }
     combine_into(out, residual, stream);
+}
+
+void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
+                             Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
+    // The head's residual is one stream, so the block's output is added rather than
+    // recombined -- which for the mixture is its epilogue's own destination.
+    if (weights.sparse) {
+        run_sparse_moe(hidden, weights.moe, residual, workspace, stream);
+        return;
+    }
+    auto scope = workspace.scope();
+    Tensor out = workspace.alloc(DType::BF16, {hidden.ne[0], hidden.ne[1]});
+    dense_feed_forward(hidden, weights, out, workspace, stream);
+    ops::residual_add(out, residual, stream);
 }
 
 // ---- Workspace capacities ---------------------------------------------------
@@ -453,28 +629,18 @@ Variant::attention_projection_workspace_capacity_bytes(const family::TextGeometr
                                                        family::TextPhase, std::int32_t first,
                                                        std::int32_t last) {
     family::validate_token_interval(first, last);
-    // The query low rank and the heads `query_b` produces; the latent goes straight into the
-    // key buffer and the absorption is a per-head kernel with no transient of its own.
-    return plane_bytes(geometry.q_lora_rank, last, DType::BF16) +
-           plane_bytes(geometry.query_heads * TextConfig::qk_head_dim, last, DType::BF16) +
-           std::max({linear_capacity(weights_profile, geometry.q_lora_rank, geometry.hidden, first,
-                                     last),
-                     linear_capacity(weights_profile, geometry.kv_lora_rank, geometry.hidden,
-                                     first, last),
-                     linear_capacity(weights_profile,
-                                     geometry.query_heads * TextConfig::qk_head_dim,
-                                     geometry.q_lora_rank, first, last)});
+    // The latent goes straight into the key buffer; the query's transients are its own.
+    return std::max(latent_key_capacity(geometry, weights_profile, first, last),
+                    absorbed_query_capacity(geometry, weights_profile, first, last));
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase,
     std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
-    // The unfolded heads, then the output projection's transient.
-    return plane_bytes(geometry.query_heads * TextConfig::v_head_dim, last, DType::BF16) +
-           plane_bytes(geometry.hidden, last, DType::BF16) +
-           linear_capacity(weights_profile, geometry.hidden,
-                           geometry.query_heads * TextConfig::v_head_dim, first, last);
+    // The block's output plane, then the unfold's own.
+    return plane_bytes(geometry.hidden, last, DType::BF16) +
+           unfold_capacity(geometry, weights_profile, first, last);
 }
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(
@@ -538,25 +704,57 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
-    const QType qtype = profile_qtype(weights_profile);
-    // The block's own output plane, then whichever of the two feed-forwards is larger. A layer
-    // is one or the other, but the layout is planned for the stack rather than per layer.
-    const std::size_t mixture = std::max({
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, qtype, qtype, first, last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q4_K, first,
-                                                 last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q6_K, first,
-                                                 last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q5_K, QType::Q6_K, first,
-                                                 last),
-    });
-    const std::size_t dense =
-        2 * plane_bytes(geometry.dense_intermediate, last, DType::BF16) +
-        std::max(linear_capacity(weights_profile, 2 * geometry.dense_intermediate, geometry.hidden,
-                                 first, last),
-                 linear_capacity(weights_profile, geometry.hidden, geometry.dense_intermediate,
-                                 first, last));
-    return plane_bytes(geometry.hidden, last, DType::BF16) + std::max(mixture, dense);
+    // The block's own output plane, then the feed-forward's.
+    return plane_bytes(geometry.hidden, last, DType::BF16) +
+           feed_forward_capacity(geometry, weights_profile, first, last);
+}
+
+std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
+    const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase phase,
+    std::int32_t batch_size, std::int32_t first, std::int32_t last) {
+    // The record is the projection itself, written where the fold will read it; only the
+    // projection's own transients are the leaf's.
+    family::validate_token_interval(first, last);
+    const std::int32_t columns = last * std::max(batch_size, 1);
+    return gdn_input_projection_workspace_capacity_bytes(geometry, weights_profile, phase, 1,
+                                                         columns);
+}
+
+// ---- The draft head's own capacities ----------------------------------------
+
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(
+    const family::TextGeometry& geometry, std::int32_t first, std::int32_t last) {
+    family::validate_token_interval(first, last);
+    return std::max(latent_key_capacity(geometry, WeightsProfile::GroupwiseInt, first, last),
+                    absorbed_query_capacity(geometry, WeightsProfile::GroupwiseInt, first, last));
+}
+
+std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(
+    const family::TextGeometry& geometry, std::int32_t first, std::int32_t last) {
+    family::validate_token_interval(first, last);
+    return latent_key_capacity(geometry, WeightsProfile::GroupwiseInt, first, last);
+}
+
+std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(
+    const family::TextGeometry& geometry, std::int32_t first, std::int32_t last) {
+    family::validate_token_interval(first, last);
+    return absorbed_query_capacity(geometry, WeightsProfile::GroupwiseInt, first, last);
+}
+
+std::size_t Variant::mtp_attention_output_projection_workspace_capacity_bytes(
+    const family::TextGeometry& geometry, std::int32_t first, std::int32_t last) {
+    family::validate_token_interval(first, last);
+    return unfold_capacity(geometry, WeightsProfile::GroupwiseInt, first, last);
+}
+
+std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry,
+                                                             std::int32_t first,
+                                                             std::int32_t last) {
+    family::validate_token_interval(first, last);
+    // A dense head writes its output to a plane of its own before the add; the mixture adds in
+    // place. Planned for either.
+    return plane_bytes(geometry.hidden, last, DType::BF16) +
+           feed_forward_capacity(geometry, WeightsProfile::GroupwiseInt, first, last);
 }
 
 // ---- Leaves this target cannot run -----------------------------------------
@@ -564,28 +762,9 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
 // The family runtime is a template over this interface, so every leaf below has to exist. None
 // can be reached by this topology, and each says so rather than returning quietly: a silent
 // no-op would be a layer that contributed nothing to the residual, which reads as a model that
-// merely answers badly.
-
-// This target runs the delta-net leaves and the mixer output projection, so only the short
-// convolution's and the draft head's are refused. The record form is its own refusal below:
-// Kimi Delta Attention has no replay, which is a property of the recurrence rather than of the
-// mixer's presence.
+// merely answers badly. Only the short convolution's are left: this target's mixer is a delta
+// rule, and its draft head runs above.
 SINFER_FAMILY_UNRUNNABLE_SHORT_CONV_LEAVES(no_short_conv)
-SINFER_FAMILY_UNRUNNABLE_MTP_LEAVES(no_speculation)
-
-void Variant::gdn_input_projection_record(const Tensor&, const GdnProjectionWeights&,
-                                          const Tensor&, const Tensor&, const Tensor&,
-                                          const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                                          Tensor&, family::TextPhase, WorkspaceArena&,
-                                          cudaStream_t) {
-    no_speculation("gdn_input_projection_record");
-}
-
-std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
-    const family::TextGeometry&, WeightsProfile, family::TextPhase, std::int32_t, std::int32_t,
-    std::int32_t) {
-    return 0;
-}
 
 void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
     // Only the magic is this target's: 'G53F'.

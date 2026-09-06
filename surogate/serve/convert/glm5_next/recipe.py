@@ -47,7 +47,7 @@ from surogate.serve.convert.common.recipe import (
 
 from . import inventory as inv
 
-RECIPE_ID = "glm5-next-v3"
+RECIPE_ID = "glm5-next-v4"
 
 #: Objects whose op reads the row-split W8 planes rather than the file's own block format.
 #: Their weights are still read from the GGUF where they lie -- Q8_0 and W8G32_F16S hold the
@@ -74,6 +74,7 @@ NATIVE_EXCLUDE_SUFFIXES = (
     "mlp/down",
     "moe/shared_gate_up",
     "moe/shared_down",
+    "mtp/input_projection",
 )
 
 
@@ -275,6 +276,40 @@ def _moe(layer: int, prefix: str, geometry: inv.Geometry) -> list[TensorRecipe]:
     return out
 
 
+def _mtp(geometry: inv.Geometry) -> list[TensorRecipe]:
+    """The NextN draft head: the block past the trunk, under `mtp/`.
+
+    Its layer is the trunk's latent-attention-over-mixture layer, so the two builders above
+    read it unchanged; only the fold's three tensors and the read-out norm are the head's own.
+    The GGUF carries neither an embedding table nor an LM head for it -- both are the trunk's.
+    """
+    if geometry.nextn_layers == 0:
+        return []
+    if geometry.nextn_layers != 1:
+        raise NotImplementedError(
+            f"this checkpoint declares {geometry.nextn_layers} NextN layers; the served draft "
+            f"head is one layer deep"
+        )
+    layer = geometry.layers
+    blk = _blk(layer)
+    hidden = geometry.hidden
+    out = [
+        TensorRecipe(
+            "mtp/input_projection", source(f"{blk}nextn.eh_proj.weight", (hidden, 2 * hidden))
+        ),
+        TensorRecipe("mtp/embedding_norm", source(f"{blk}nextn.enorm.weight", (hidden,))),
+        TensorRecipe("mtp/hidden_norm", source(f"{blk}nextn.hnorm.weight", (hidden,))),
+        TensorRecipe("mtp/layer/input_norm", source(f"{blk}attn_norm.weight", (hidden,))),
+        *_mla(layer, "mtp/layer/", geometry),
+        TensorRecipe("mtp/layer/post_attention_norm", source(f"{blk}ffn_norm.weight", (hidden,))),
+        *_moe(layer, "mtp/layer/", geometry),
+        TensorRecipe(
+            "mtp/final_norm", source(f"{blk}nextn.shared_head_norm.weight", (hidden,))
+        ),
+    ]
+    return out
+
+
 def build_recipes(geometry: inv.Geometry) -> dict[str, TensorRecipe]:
     """Every object's source expression, keyed by object name."""
     recipes: list[TensorRecipe] = [
@@ -308,6 +343,7 @@ def build_recipes(geometry: inv.Geometry) -> dict[str, TensorRecipe]:
             if geometry.is_dense(layer)
             else _moe(layer, prefix, geometry)
         )
+    recipes += _mtp(geometry)
     return {recipe.object_name: recipe for recipe in recipes}
 
 

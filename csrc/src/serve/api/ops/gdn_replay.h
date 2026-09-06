@@ -30,9 +30,13 @@ struct GdnReplayFoldRow {
  * order, writes the final FP32 recurrent state, and sets convolution history to
  * tail_3(old_history || conv_record[0:commit_columns]).
  *
- * The Op admits the two registered all-layer geometries only, owns no workspace or metadata
- * allocation, and does not read query or generate token output. The four record planes are
+ * The Op admits the registered all-layer geometries only, owns no workspace or metadata
+ * allocation, and does not read query or generate token output. The record planes are
  * read-only, disjoint, and do not overlap either state region.
+ *
+ * The records' spec says which recurrence produced them: a scalar-gate record folds with the
+ * gated delta net's transition, a diagonal-gate one (`diagonal_gate`, Kimi Delta Attention)
+ * with the per-channel transition, reading g from the channel plane and beta from its own.
  */
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                      std::span<const GdnReplayFoldRow> rows, cudaStream_t stream);

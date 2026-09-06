@@ -127,6 +127,82 @@ void bind_feed_forward(artifact::Binder& binder, const std::string& prefix, bool
                                    static_cast<std::uint64_t>(kMoeGeometry.shared_intermediate)});
 }
 
+void bind_latent_attention(artifact::Binder& binder, const std::string& prefix,
+                           NumericFormat weights, const family::TextGeometry& g,
+                           LatentAttentionPlan& mla) {
+    mla.query_a      = bind_weight(binder, prefix + "mla/query_a", weights,
+                                   {static_cast<std::uint64_t>(g.q_lora_rank),
+                                    static_cast<std::uint64_t>(g.hidden)});
+    mla.query_a_norm = bind_layer_tensor(binder, prefix + "mla/query_a_norm", NumericFormat::BF16,
+                                         {static_cast<std::uint64_t>(g.q_lora_rank)});
+    mla.query_b      = bind_weight(binder, prefix + "mla/query_b", weights,
+                                   {static_cast<std::uint64_t>(g.query_heads) *
+                                        TextConfig::qk_head_dim,
+                                    static_cast<std::uint64_t>(g.q_lora_rank)});
+    mla.kv_a         = bind_weight(binder, prefix + "mla/kv_a", weights,
+                                   {static_cast<std::uint64_t>(g.kv_lora_rank),
+                                    static_cast<std::uint64_t>(g.hidden)});
+    mla.kv_a_norm    = bind_layer_tensor(binder, prefix + "mla/kv_a_norm", NumericFormat::BF16,
+                                         {static_cast<std::uint64_t>(g.kv_lora_rank)});
+    // Both halves of the expansion are read where they lie. llama.cpp stores the key half in
+    // the orientation it applies to the *query* -- [latent, nope] per head -- and the absorbed
+    // form applies it to the query too, so what once had to be transposed into BF16 is now the
+    // file's own Q8_0.
+    mla.k_b    = bind_weight(binder, prefix + "mla/k_b", weights,
+                             {static_cast<std::uint64_t>(g.latent_key_rows()),
+                              static_cast<std::uint64_t>(TextConfig::qk_head_dim)});
+    mla.v_b    = bind_weight(binder, prefix + "mla/v_b", weights,
+                             {static_cast<std::uint64_t>(g.query_heads) * TextConfig::v_head_dim,
+                              static_cast<std::uint64_t>(g.kv_lora_rank)});
+    mla.output = bind_weight(binder, prefix + "mla/output", weights,
+                             {static_cast<std::uint64_t>(g.hidden),
+                              static_cast<std::uint64_t>(g.query_heads) * TextConfig::v_head_dim});
+}
+
+/// The NextN draft head, bound where the trunk's layers are and placed by whether the run asked
+/// for it: a run without `--spec mtp` validates the head's shapes and uploads nothing. The head
+/// keeps its experts beside it -- a token drafted every round would cross PCIe for them every
+/// round -- so the trunk's expert offload does not reach it.
+void bind_mtp_head(artifact::Binder& binder, NumericFormat weights,
+                   family::StartupFeatures features, BindingPlan& out) {
+    const family::TextGeometry& g = out.geometry;
+    MtpPlan& mtp                  = out.mtp;
+    mtp.present                   = binder.has("mtp/input_projection");
+    if (!mtp.present) {
+        if (features.mtp()) {
+            throw std::runtime_error(
+                "glm5_next: --spec mtp asks for the NextN draft head, and this artifact carries "
+                "none (the checkpoint it was converted from is trunk-only, or the conversion "
+                "predates the head); run without --spec");
+        }
+        return;
+    }
+    g_layer_placement  = features.mtp() ? artifact::TensorPlacement::Device
+                                        : artifact::TensorPlacement::ValidateOnly;
+    g_expert_placement = g_layer_placement;
+    const std::string prefix = "mtp/";
+    const std::string layer  = prefix + "layer/";
+    mtp.embedding_norm   = bind_layer_tensor(binder, prefix + "embedding_norm", NumericFormat::BF16,
+                                             {static_cast<std::uint64_t>(g.hidden)});
+    mtp.hidden_norm      = bind_layer_tensor(binder, prefix + "hidden_norm", NumericFormat::BF16,
+                                             {static_cast<std::uint64_t>(g.hidden)});
+    mtp.input_projection = bind_weight(binder, prefix + "input_projection", weights,
+                                       {static_cast<std::uint64_t>(g.hidden),
+                                        static_cast<std::uint64_t>(g.mtp_input_rows())});
+    mtp.input_norm       = bind_layer_tensor(binder, layer + "input_norm", NumericFormat::BF16,
+                                             {static_cast<std::uint64_t>(g.hidden)});
+    bind_latent_attention(binder, layer, weights, g, mtp.attention);
+    mtp.post_attention_norm = bind_layer_tensor(binder, layer + "post_attention_norm",
+                                                NumericFormat::BF16,
+                                                {static_cast<std::uint64_t>(g.hidden)});
+    const bool sparse = binder.reader().find(layer + "moe/router") != nullptr;
+    bind_feed_forward(binder, layer, sparse, weights, g, mtp.feed_forward);
+    mtp.final_norm = bind_layer_tensor(binder, prefix + "final_norm", NumericFormat::BF16,
+                                       {static_cast<std::uint64_t>(g.hidden)});
+    g_layer_placement  = artifact::TensorPlacement::Device;
+    g_expert_placement = artifact::TensorPlacement::Device;
+}
+
 void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, int stage_first,
                       int stage_last, std::uint32_t host_moe_layers, std::uint32_t gpu_layers,
                       BindingPlan& out) {
@@ -166,38 +242,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
                                                 NumericFormat::BF16,
                                                 {static_cast<std::uint64_t>(g.hidden)});
         if (target.attends) {
-            LatentAttentionPlan& mla = target.attention;
-            mla.query_a      = bind_weight(binder, prefix + "mla/query_a", weights,
-                                           {static_cast<std::uint64_t>(g.q_lora_rank),
-                                            static_cast<std::uint64_t>(g.hidden)});
-            mla.query_a_norm = bind_layer_tensor(
-                binder, prefix + "mla/query_a_norm", NumericFormat::BF16,
-                {static_cast<std::uint64_t>(g.q_lora_rank)});
-            mla.query_b      = bind_weight(binder, prefix + "mla/query_b", weights,
-                                           {static_cast<std::uint64_t>(g.query_heads) *
-                                                TextConfig::qk_head_dim,
-                                            static_cast<std::uint64_t>(g.q_lora_rank)});
-            mla.kv_a         = bind_weight(binder, prefix + "mla/kv_a", weights,
-                                           {static_cast<std::uint64_t>(g.kv_lora_rank),
-                                            static_cast<std::uint64_t>(g.hidden)});
-            mla.kv_a_norm    = bind_layer_tensor(
-                binder, prefix + "mla/kv_a_norm", NumericFormat::BF16,
-                {static_cast<std::uint64_t>(g.kv_lora_rank)});
-            // Both halves of the expansion are read where they lie. llama.cpp stores the key
-            // half in the orientation it applies to the *query* -- [latent, nope] per head --
-            // and the absorbed form applies it to the query too, so what once had to be
-            // transposed into BF16 is now the file's own Q8_0.
-            mla.k_b    = bind_weight(binder, prefix + "mla/k_b", weights,
-                                     {static_cast<std::uint64_t>(g.latent_key_rows()),
-                                      static_cast<std::uint64_t>(TextConfig::qk_head_dim)});
-            mla.v_b    = bind_weight(binder, prefix + "mla/v_b", weights,
-                                     {static_cast<std::uint64_t>(g.query_heads) *
-                                          TextConfig::v_head_dim,
-                                      static_cast<std::uint64_t>(g.kv_lora_rank)});
-            mla.output = bind_weight(binder, prefix + "mla/output", weights,
-                                     {static_cast<std::uint64_t>(g.hidden),
-                                      static_cast<std::uint64_t>(g.query_heads) *
-                                          TextConfig::v_head_dim});
+            bind_latent_attention(binder, prefix, weights, g, target.attention);
         } else {
             KdaPlan& kda        = target.kda;
             kda.query_key_value = bind_weight(binder, prefix + "kda/query_key_value", weights,
@@ -263,6 +308,41 @@ HyperConnectionPayload load_hyper_connection(const artifact::MaterializedArtifac
     return out;
 }
 
+/// The feed-forward's weights, dense or the mixture, into a payload whose site (norm and
+/// hyper-connection) the caller has already set.
+void load_feed_forward_weights(const artifact::MaterializedArtifact& backing,
+                               const FeedForwardPlan& source, const family::TextGeometry& g,
+                               FeedForwardPayload& out) {
+    out.sparse = source.sparse;
+    if (!out.sparse) {
+        out.gate_up = materialized_weight(backing, source.gate_up, 2 * g.dense_intermediate,
+                                          g.hidden);
+        out.down    = materialized_weight(backing, source.down, g.hidden, g.dense_intermediate);
+        return;
+    }
+    out.moe.router_shared_gate = materialized_weight(backing, source.router,
+                                                     kMoeGeometry.router_rows(), g.hidden);
+    out.moe.router_bias        = static_cast<const float*>(
+        artifact::materialized_tensor(backing, source.router_bias, NumericFormat::FP32,
+                                      {static_cast<std::uint64_t>(kMoeGeometry.experts)})
+            .data);
+    // Resident or banked in host memory, the weight is built the same way: the bank has already
+    // given the artifact the mapped pointer for the objects it holds.
+    out.moe.routed_gate_up = materialized_weight(backing, source.routed_gate_up,
+                                                 kMoeGeometry.routed_gate_rows(), g.hidden);
+    out.moe.routed_down    = materialized_weight(backing, source.routed_down,
+                                                 kMoeGeometry.routed_down_rows(),
+                                                 kMoeGeometry.intermediate);
+    out.moe.shared_gate_up = materialized_weight(backing, source.shared_gate_up,
+                                                 kMoeGeometry.shared_rows(), g.hidden);
+    out.moe.shared_down    = materialized_weight(backing, source.shared_down, g.hidden,
+                                                 kMoeGeometry.shared_intermediate);
+    out.moe.experts_per_token = kMoeGeometry.experts_per_token;
+    out.moe.routed_scale      = kMoeGeometry.routed_scale;
+    out.moe.shared_gated      = kMoeGeometry.shared_gated;
+    out.moe.swiglu_limit      = kMoeGeometry.swiglu_limit;
+}
+
 FeedForwardPayload load_feed_forward(const artifact::MaterializedArtifact& backing,
                                      const TextLayerPlan& source, const family::TextGeometry& g,
                                      const Tensor& post_norm, std::int32_t layer) {
@@ -270,37 +350,31 @@ FeedForwardPayload load_feed_forward(const artifact::MaterializedArtifact& backi
     out.hc          = load_hyper_connection(backing, source.feed_forward_hc, g, layer);
     out.norm        = post_norm;
     out.rms_epsilon = g.rms_epsilon;
-    out.sparse      = source.feed_forward.sparse;
-    if (!out.sparse) {
-        out.gate_up = materialized_weight(backing, source.feed_forward.gate_up,
-                                          2 * g.dense_intermediate, g.hidden);
-        out.down    = materialized_weight(backing, source.feed_forward.down, g.hidden,
-                                          g.dense_intermediate);
-        return out;
-    }
-    out.moe.router_shared_gate = materialized_weight(backing, source.feed_forward.router,
-                                                     kMoeGeometry.router_rows(), g.hidden);
-    out.moe.router_bias        = static_cast<const float*>(
-        artifact::materialized_tensor(backing, source.feed_forward.router_bias,
-                                      NumericFormat::FP32,
-                                      {static_cast<std::uint64_t>(kMoeGeometry.experts)})
-            .data);
-    // Resident or banked in host memory, the weight is built the same way: the bank has already
-    // given the artifact the mapped pointer for the objects it holds.
-    out.moe.routed_gate_up = materialized_weight(backing, source.feed_forward.routed_gate_up,
-                                                 kMoeGeometry.routed_gate_rows(), g.hidden);
-    out.moe.routed_down    = materialized_weight(backing, source.feed_forward.routed_down,
-                                                 kMoeGeometry.routed_down_rows(),
-                                                 kMoeGeometry.intermediate);
-    out.moe.shared_gate_up = materialized_weight(backing, source.feed_forward.shared_gate_up,
-                                                 kMoeGeometry.shared_rows(), g.hidden);
-    out.moe.shared_down    = materialized_weight(backing, source.feed_forward.shared_down, g.hidden,
-                                                 kMoeGeometry.shared_intermediate);
-    out.moe.experts_per_token = kMoeGeometry.experts_per_token;
-    out.moe.routed_scale      = kMoeGeometry.routed_scale;
-    out.moe.shared_gated      = kMoeGeometry.shared_gated;
-    out.moe.swiglu_limit      = kMoeGeometry.swiglu_limit;
+    load_feed_forward_weights(backing, source.feed_forward, g, out);
     return out;
+}
+
+/// The latent attention's projections into either payload that carries them by these names:
+/// the trunk's, beside its hyper-connection, or the draft head's.
+template <class Payload>
+void load_latent_projection(const artifact::MaterializedArtifact& backing,
+                            const LatentAttentionPlan& source, const family::TextGeometry& g,
+                            Payload& payload) {
+    payload.query_a      = materialized_weight(backing, source.query_a, g.q_lora_rank, g.hidden);
+    payload.query_a_norm = artifact::materialized_tensor(
+        backing, source.query_a_norm, NumericFormat::BF16,
+        {static_cast<std::uint64_t>(g.q_lora_rank)});
+    payload.query_b      = materialized_weight(backing, source.query_b,
+                                               g.query_heads * TextConfig::qk_head_dim,
+                                               g.q_lora_rank);
+    payload.kv_a         = materialized_weight(backing, source.kv_a, g.kv_lora_rank, g.hidden);
+    payload.kv_a_norm    = artifact::materialized_tensor(
+        backing, source.kv_a_norm, NumericFormat::BF16,
+        {static_cast<std::uint64_t>(g.kv_lora_rank)});
+    payload.k_b = materialized_weight(backing, source.k_b, g.latent_key_rows(),
+                                      TextConfig::qk_head_dim);
+    payload.v_b = materialized_weight(backing, source.v_b,
+                                      g.query_heads * TextConfig::v_head_dim, g.kv_lora_rank);
 }
 
 } // namespace
@@ -336,11 +410,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     if (features.vision) {
         throw std::runtime_error("glm5_next is a text-only target: --vision is unsupported");
     }
-    if (features.speculative_enabled()) {
+    if (features.dflash()) {
         throw std::runtime_error(
-            "glm5_next carries no draft head: the checkpoint's NextN block is not bound, and "
-            "Kimi Delta Attention has no replay-record form to verify a speculative round "
-            "with. Run without --spec.");
+            "glm5_next has no DFlash stack; its speculation is the checkpoint's own NextN draft "
+            "head, --spec mtp");
     }
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
@@ -367,6 +440,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     bind_text_layers(binder, weights_profile, stage_first, stage_last, host_moe_layers,
                      gpu_layers, out);
     g_expert_placement  = artifact::TensorPlacement::Device;
+    bind_mtp_head(binder, vocabulary_format, features, out);
     out.final_norm      = artifact::bind_device_tensor(
         binder, "text/final_norm", NumericFormat::BF16,
         {static_cast<std::uint64_t>(g.hidden)});
@@ -423,24 +497,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             payload.hc          = load_hyper_connection(backing, source.attention_hc, g, layer);
             payload.norm        = input_norm;
             payload.rms_epsilon = g.rms_epsilon;
-            payload.query_a = materialized_weight(backing, source.attention.query_a, g.q_lora_rank,
-                                                  g.hidden);
-            payload.query_a_norm = artifact::materialized_tensor(
-                backing, source.attention.query_a_norm, NumericFormat::BF16,
-                {static_cast<std::uint64_t>(g.q_lora_rank)});
-            payload.query_b = materialized_weight(backing, source.attention.query_b,
-                                                  g.query_heads * TextConfig::qk_head_dim,
-                                                  g.q_lora_rank);
-            payload.kv_a    = materialized_weight(backing, source.attention.kv_a, g.kv_lora_rank,
-                                                  g.hidden);
-            payload.kv_a_norm = artifact::materialized_tensor(
-                backing, source.attention.kv_a_norm, NumericFormat::BF16,
-                {static_cast<std::uint64_t>(g.kv_lora_rank)});
-            payload.k_b = materialized_weight(backing, source.attention.k_b, g.latent_key_rows(),
-                                              TextConfig::qk_head_dim);
-            payload.v_b = materialized_weight(backing, source.attention.v_b,
-                                              g.query_heads * TextConfig::v_head_dim,
-                                              g.kv_lora_rank);
+            load_latent_projection(backing, source.attention, g, payload);
             target.projection = std::move(payload);
             // No per-head query or key norm: this attention normalises its two low ranks
             // instead, and those live in the projection payload.
@@ -487,6 +544,36 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = post_norm;
             target.post_mixer          = load_feed_forward(backing, source, g, post_norm, layer);
         }
+    }
+
+    if (plan.features.mtp() && plan.mtp.present) {
+        MtpWeights& mtp      = runtime.mtp.emplace();
+        mtp.input_projection = materialized_weight(backing, plan.mtp.input_projection, g.hidden,
+                                                   g.mtp_input_rows());
+        mtp.embedding_norm   = artifact::materialized_tensor(
+            backing, plan.mtp.embedding_norm, NumericFormat::BF16,
+            {static_cast<std::uint64_t>(g.hidden)});
+        mtp.hidden_norm      = artifact::materialized_tensor(
+            backing, plan.mtp.hidden_norm, NumericFormat::BF16,
+            {static_cast<std::uint64_t>(g.hidden)});
+        mtp.input_norm       = artifact::materialized_tensor(
+            backing, plan.mtp.input_norm, NumericFormat::BF16,
+            {static_cast<std::uint64_t>(g.hidden)});
+        mtp.attention.rms_epsilon = g.rms_epsilon;
+        load_latent_projection(backing, plan.mtp.attention, g, mtp.attention);
+        // No per-head query or key norm and no output gate, as in the trunk: the family's
+        // tail skips both for this target and the two norm slots stay empty.
+        mtp.output = materialized_weight(backing, plan.mtp.attention.output, g.hidden,
+                                         g.query_heads * TextConfig::v_head_dim);
+        mtp.post_attention_norm = artifact::materialized_tensor(
+            backing, plan.mtp.post_attention_norm, NumericFormat::BF16,
+            {static_cast<std::uint64_t>(g.hidden)});
+        mtp.post_mixer.norm        = mtp.post_attention_norm;
+        mtp.post_mixer.rms_epsilon = g.rms_epsilon;
+        load_feed_forward_weights(backing, plan.mtp.feed_forward, g, mtp.post_mixer);
+        mtp.final_norm = artifact::materialized_tensor(
+            backing, plan.mtp.final_norm, NumericFormat::BF16,
+            {static_cast<std::uint64_t>(g.hidden)});
     }
 
     if (plan.finishes) {

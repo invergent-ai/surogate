@@ -85,11 +85,20 @@ void validate_layout(const GdnReplayRecordLayout& layout) {
     require_region(layout.value, DType::BF16,
                    {layout.spec.value_dim, layout.spec.value_heads, layout.spec.width, outer},
                    "value");
-    require_region(layout.gate, DType::FP32, {2, layout.spec.value_heads, layout.spec.width, outer},
+    require_region(layout.gate, DType::FP32,
+                   {layout.spec.gate_rows(), layout.spec.value_heads, layout.spec.width, outer},
                    "gate");
+    if (layout.spec.diagonal_gate) {
+        require_region(layout.beta, DType::FP32, {layout.spec.value_heads, layout.spec.width, outer, 1},
+                       "beta");
+    } else if (layout.beta.region.bytes != 0) {
+        throw std::logic_error("GDN replay beta plane is planned for a scalar gate");
+    }
 
-    const TensorRegion* regions[] = {&layout.conv, &layout.key, &layout.value, &layout.gate};
-    for (std::size_t i = 0; i < std::size(regions); ++i) {
+    const TensorRegion* regions[] = {&layout.conv, &layout.key, &layout.value, &layout.gate,
+                                     &layout.beta};
+    const std::size_t planned = layout.spec.diagonal_gate ? 5 : 4;
+    for (std::size_t i = 0; i < planned; ++i) {
         for (std::size_t j = 0; j < i; ++j) { require_disjoint(*regions[i], *regions[j]); }
     }
 }
@@ -110,18 +119,25 @@ GdnReplayRecordLayout plan_gdn_replay_records(LayoutBuilder& builder,
     layout.value =
         builder.add_tensor(DType::BF16, {spec.value_dim, spec.value_heads, spec.width, outer},
                            kRecordAlignment, "GDN replay value records");
-    layout.gate = builder.add_tensor(DType::FP32, {2, spec.value_heads, spec.width, outer},
+    layout.gate = builder.add_tensor(DType::FP32,
+                                     {spec.gate_rows(), spec.value_heads, spec.width, outer},
                                      kRecordAlignment, "GDN replay gate records");
+    if (spec.diagonal_gate) {
+        layout.beta = builder.add_tensor(DType::FP32, {spec.value_heads, spec.width, outer},
+                                         kRecordAlignment, "GDN replay beta records");
+    }
     return layout;
 }
 
 std::size_t GdnReplayRecordLayout::payload_bytes() const noexcept {
-    return conv.region.bytes + key.region.bytes + value.region.bytes + gate.region.bytes;
+    return conv.region.bytes + key.region.bytes + value.region.bytes + gate.region.bytes +
+           beta.region.bytes;
 }
 
 GdnReplayRecords::GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayout& layout)
     : conv(layout.conv.bind(backing)), key(layout.key.bind(backing)),
-      value(layout.value.bind(backing)), gate(layout.gate.bind(backing)), spec(layout.spec) {
+      value(layout.value.bind(backing)), gate(layout.gate.bind(backing)),
+      beta(layout.spec.diagonal_gate ? layout.beta.bind(backing) : Tensor{}), spec(layout.spec) {
     validate_layout(layout);
 }
 
@@ -139,6 +155,7 @@ GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int3
         .key   = key.slice(3, outer_begin, rows),
         .value = value.slice(3, outer_begin, rows),
         .gate  = gate.slice(3, outer_begin, rows),
+        .beta  = spec.diagonal_gate ? beta.slice(2, outer_begin, rows) : Tensor{},
     };
 }
 

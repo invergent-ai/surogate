@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -44,26 +45,31 @@ from . import recipe as rcp
 RECIPE_ID = rcp.RECIPE_ID
 
 
-def _refuse_what_is_not_bound(source: GgufSource, geometry: inv.Geometry) -> None:
+def _refuse_what_is_not_bound(source: GgufSource, geometry: inv.Geometry) -> inv.Geometry:
     """What the file carries that this artifact does not, said out loud.
 
-    Both are real parts of the published model, and serving without either changes what the
-    engine computes -- for the indexer only past a bound, which the artifact records so the
-    engine can refuse rather than quietly attend to more than the model was trained to.
+    The indexer is a real part of the published model, and serving without it changes what the
+    engine computes past a bound, which the artifact records so the engine can refuse rather
+    than quietly attend to more than the model was trained to. A draft head the file declares
+    but does not carry (a trunk-only export) is dropped from the geometry, so the artifact says
+    it has none and `--spec mtp` refuses by name.
     """
     if any(name.startswith(("v.", "mm.")) or "vision" in name for name in source.tensors):
         raise NotImplementedError(
             "this GGUF carries a vision tower; the glm5_next recipes cover the text stack only"
         )
     head = f"blk.{geometry.layers}.nextn.eh_proj.weight"
-    if head in source.tensors:
-        print("note: the NextN draft head is present and is not bound; the trunk answers "
-              "without it, at the cost of speculative decoding", flush=True)
+    if geometry.nextn_layers and head not in source.tensors:
+        print("note: the file declares a NextN draft head and does not carry it (a trunk-only "
+              "export); the artifact is written without one and --spec mtp will refuse",
+              flush=True)
+        geometry = replace(geometry, nextn_layers=0)
     if any(".indexer." in name for name in source.tensors):
         print(f"note: the sparse indexer is present and is not bound. It selects "
               f"{geometry.index_topk} tokens, so up to that context every visible token is "
               f"selected and full attention is exactly what it would have asked for; the "
               f"artifact records the bound and the engine refuses beyond it", flush=True)
+    return geometry
 
 
 def materialize_unspoken(source: GgufSource, name: str, spec) -> bytes:
@@ -117,7 +123,7 @@ def _geometry_block(geometry: inv.Geometry) -> dict[str, float]:
         "gdn_value_heads": float(geometry.kda_heads),
         "gdn_value_head_dim": float(geometry.kda_head_dim),
         "kda_gate_rank": float(geometry.kda_head_dim),
-        "mtp_layers": 0.0,
+        "mtp_layers": float(geometry.nextn_layers),
         "rms_epsilon": float(geometry.rms_epsilon),
     }
 
@@ -132,8 +138,7 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
     output = Path(out_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    geometry = inv.geometry_from_gguf(source.kv)
-    _refuse_what_is_not_bound(source, geometry)
+    geometry = _refuse_what_is_not_bound(source, inv.geometry_from_gguf(source.kv))
     tensor_specs = inv.build_tensor_specs(geometry)
     object_specs: tuple = inv.RESOURCE_SPECS + tensor_specs
     recipes = rcp.build_recipes(geometry)

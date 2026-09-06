@@ -497,9 +497,14 @@ struct SnapshotAccess {
     }
 };
 
-template <bool Masked>
+/// The record plane a gate of either shape writes: {g, beta} pairs for a scalar gate, the key
+/// channels of g for a diagonal one, whose beta then has a plane of its own.
+template <ForgetGate Gate>
+using GateRecordOf = std::conditional_t<Gate == ForgetGate::Diagonal, float, uint2>;
+
+template <bool Masked, ForgetGate Gate = ForgetGate::Scalar>
 struct RecordAccess {
-    static constexpr ForgetGate kGate = ForgetGate::Scalar;
+    static constexpr ForgetGate kGate = Gate;
 
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -511,7 +516,8 @@ struct RecordAccess {
     const std::int32_t* initial_slots;
     __nv_bfloat16* key_record;
     __nv_bfloat16* value_record;
-    uint2* gate_record;
+    GateRecordOf<Gate>* gate_record;
+    float* beta_record; // diagonal gate only; null for a scalar one
     __nv_bfloat16* out;
     head_map heads;
     std::int32_t width;
@@ -550,9 +556,17 @@ struct RecordAccess {
         return v + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
     }
 
-    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
-                                                     std::int32_t token) const {
-        return load_source_gate(g, beta, column(coord, token) * heads.H_v + coord.value_head);
+    __device__ __forceinline__ GateOf<Gate> load_gate(const RecurrentCoordinates& coord,
+                                                      std::int32_t token) const {
+        const std::int64_t offset = column(coord, token) * heads.H_v + coord.value_head;
+        if constexpr (Gate == ForgetGate::Diagonal) {
+            RawDiagonalGate out_gate;
+            load_qk_lane(out_gate.channel, g + offset * kStateDim, coord.dqk_base);
+            out_gate.beta = beta[offset];
+            return out_gate;
+        } else {
+            return load_source_gate(g, beta, offset);
+        }
     }
 
     __device__ __forceinline__ const __nv_bfloat16* query_ptr(const RecurrentCoordinates& coord,
@@ -585,9 +599,16 @@ struct RecordAccess {
     }
 
     __device__ __forceinline__ void store_gate(const RecurrentCoordinates& coord,
-                                               std::int32_t token, const RawGatePair& raw) const {
-        if (coord.state_tile == 0 && coord.warp == 0 && coord.lane == 0) {
-            gate_record[column(coord, token) * heads.H_v + coord.value_head] = raw.bits;
+                                               std::int32_t token, const GateOf<Gate>& raw) const {
+        if (coord.state_tile != 0 || coord.warp != 0) { return; }
+        const std::int64_t offset = column(coord, token) * heads.H_v + coord.value_head;
+        if constexpr (Gate == ForgetGate::Diagonal) {
+            // One warp per (head, token) writes the gate: every lane its own four channels, the
+            // same ones it read, and lane 0 the head's beta.
+            store_qk_lane(raw.channel, gate_record + offset * kStateDim, coord.dqk_base);
+            if (coord.lane == 0) { beta_record[offset] = raw.beta; }
+        } else {
+            if (coord.lane == 0) { gate_record[offset] = raw.bits; }
         }
     }
 };
@@ -613,14 +634,19 @@ using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
 // differ from the registered pair -- kLayers is an identity tag the kernel body
 // never reads, and the grid comes from kValueHeads.
 using FoldGeometry18x16 = FoldGeometry<18, 16, 16, 6144>;
+// GLM-5.3-Flash's Kimi Delta Attention: 34 of its 45 layers, 64 symmetric heads of 128, so
+// three planes of 8192 convolution channels. Its gate is diagonal, which the access below
+// carries as a template parameter; the geometry itself is only strides.
+using FoldGeometry34x64 = FoldGeometry<34, 64, 64, 24576>;
 
-template <class Geometry>
+template <class Geometry, ForgetGate Gate = ForgetGate::Scalar>
 struct FoldAccess {
-    static constexpr ForgetGate kGate = ForgetGate::Scalar;
+    static constexpr ForgetGate kGate = Gate;
 
     const __nv_bfloat16* key_record;
     const __nv_bfloat16* value_record;
-    const uint2* gate_record;
+    const GateRecordOf<Gate>* gate_record;
+    const float* beta_record; // diagonal gate only; null for a scalar one
     const __nv_bfloat16* conv_record;
     GdnStateStorage* recurrent_layer0;
     __nv_bfloat16* conv_layer0;
@@ -681,10 +707,18 @@ struct FoldAccess {
         return value_record + (column * Geometry::kValueHeads + coord.value_head) * kStateDim;
     }
 
-    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
-                                                     std::int32_t token) const {
+    __device__ __forceinline__ GateOf<Gate> load_gate(const RecurrentCoordinates& coord,
+                                                      std::int32_t token) const {
         const std::int64_t column = record_outer(coord) * width + token;
-        return load_record_gate(gate_record, column * Geometry::kValueHeads + coord.value_head);
+        const std::int64_t offset = column * Geometry::kValueHeads + coord.value_head;
+        if constexpr (Gate == ForgetGate::Diagonal) {
+            RawDiagonalGate out_gate;
+            load_qk_lane(out_gate.channel, gate_record + offset * kStateDim, coord.dqk_base);
+            out_gate.beta = beta_record[offset];
+            return out_gate;
+        } else {
+            return load_record_gate(gate_record, offset);
+        }
     }
 
     __device__ __forceinline__ void
@@ -808,17 +842,17 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                                                   access.active_columns(coord));
 }
 
-template <bool Masked>
+template <bool Masked, ForgetGate Gate = ForgetGate::Scalar>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_record_kernel(RecordAccess<Masked> access) {
+    recurrent_record_kernel(RecordAccess<Masked, Gate> access) {
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Record, true>(access, coord, access.width,
                                                      access.active_columns(coord));
 }
 
-template <class Geometry>
+template <class Geometry, ForgetGate Gate = ForgetGate::Scalar>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
+    recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry, Gate> access) {
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Fold, true>(access, coord, access.width,
                                                    access.active_columns(coord));
