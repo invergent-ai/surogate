@@ -1,6 +1,7 @@
 #pragma once
 
 #include "api/types.h"
+#include "api/ops/linear.h"
 #include "runtime/engine/pipeline_instance.h"
 #include "runtime/engine/request_memory.h"
 #include <api/targets/gemma3/package.h>
@@ -138,8 +139,20 @@ struct ConstructedTarget {
 /// tiles) -- 1.5x their size, an over-estimate on purpose. Subtracted from what is free before
 /// the KV capacity is resolved; a target that sizes its own device pools before that point
 /// must leave it too, which is why it is declared rather than kept to the registry.
-std::size_t projected_derived_residency_bytes(const artifact::Binder& binder,
-                                              const artifact::MaterializationPlan& plan);
+/// `policy` is the target's linear policy: the planes are derived only when an A8 or A4
+/// compute profile is admitted, so a target that admits A16 alone projects nothing -- GLM-5.3
+/// and Flash-Next both, and the 1.5x of their W8 bytes was starving the expert pool.
+std::size_t projected_derived_residency_bytes(
+    const artifact::Binder& binder, const artifact::MaterializationPlan& plan,
+    ops::LinearPolicy policy = ops::LinearPolicy::AllowA4);
+
+/// Device memory the load holds only while it runs: the materializer stages the source bytes
+/// of every object it rearranges rather than copies (a GGUF's F16 into W8 planes, a permuted
+/// parent) in one scratch arena, and frees it before serving. It is 13.7 GiB on GLM-5.3-Flash's
+/// card against 8.8 GiB of resident weights, and anything created before the load -- the
+/// expert pool -- has to leave it room. Computed the way the materializer will.
+std::size_t projected_load_staging_bytes(const artifact::Binder& binder,
+                                         const artifact::MaterializationPlan& plan);
 
 } // namespace targets
 } // namespace sinfer

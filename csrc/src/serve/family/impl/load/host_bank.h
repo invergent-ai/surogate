@@ -94,6 +94,9 @@ public:
     HostBank& operator=(HostBank&&)      = delete;
 
     [[nodiscard]] const HostObject& object(artifact::ObjectHandle handle) const;
+    /// The same, or null for an object the bank does not hold: the question a loader asks of a
+    /// weight that is banked on one stage and resident on another.
+    [[nodiscard]] const HostObject* find(artifact::ObjectHandle handle) const noexcept;
     [[nodiscard]] std::size_t total_bytes() const noexcept { return total_bytes_; }
 
     /// The process-wide bank for this plan: pipeline stages of one model in one process share
@@ -152,5 +155,31 @@ artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank
 /// would have produced.
 [[nodiscard]] Weight host_w8_weight(const HostObject& object, std::int32_t rows,
                                     std::int32_t columns);
+
+/// The Q4G32AM flavour: base pointer and shape only. The object is not a W8 plane pair, so the
+/// W8 size validation and the scale-plane split do not apply; readers derive the Q4 planes from
+/// the geometry (`ops::q4_bank_planes`). Only the expert cache reads such an object -- it
+/// decodes each group on its way into the pool -- so a Q4 bank needs the cache.
+[[nodiscard]] Weight host_q4_weight(const HostObject& object, std::int32_t rows,
+                                    std::int32_t columns);
+
+/// What a banked mixture object becomes as the bank fills. `Native` keeps a GGUF's blocks as
+/// they lie (the gather decodes each group on its way to the device; the host expert path
+/// decodes a row at a time and reads the bank at a fraction of memory speed); `W8` decodes
+/// them into row-split int8 planes, the bank a converted artifact would hold, lossless to the
+/// pool's own requantisation; `Q4` goes on to Q4G32AM through a row of W8 -- 59 % of the W8
+/// bytes and the fastest host path, exact for a Q4_K source and a requantisation for anything
+/// wider.
+enum class BankPlanes : std::uint8_t { Native, W8, Q4 };
+
+/// Marks a banked object stored as GGML blocks for `planes` as the bank is filled. `rows x
+/// columns` is the weight's shape and `stored` the file's type. A format the bank does not
+/// decode, or `Native`, leaves the plan alone; returns what the object will present.
+BankPlanes bank_as_planes(HostObjectPlan& plan, std::int64_t rows, std::int32_t columns,
+                          QType stored, BankPlanes planes);
+
+/// The plan of a banked object, or null when the bank does not hold it.
+[[nodiscard]] const HostObjectPlan* find_plan(const HostBankPlan& bank,
+                                              artifact::ObjectHandle handle) noexcept;
 
 } // namespace sinfer::family

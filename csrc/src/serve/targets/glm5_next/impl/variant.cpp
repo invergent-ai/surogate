@@ -15,6 +15,7 @@
 
 #include "core/device.h"
 #include "family/impl/lora_hook.h"
+#include "family/impl/moe/expert_cache.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 
 #include <algorithm>
@@ -600,7 +601,28 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         // The mixture's epilogue adds into its destination, and what the recombination needs is
         // the block's own output, so the destination starts at zero.
         CUDA_CHECK(cudaMemsetAsync(out.data, 0, out.bytes(), stream));
-        run_sparse_moe(hidden, weights.moe, out, workspace, stream);
+        const family::BankedMixture mixture{weights.layer,         weights.layers,
+                                            &weights.moe,          weights.host_bank_q4,
+                                            weights.host_gate_up,  weights.host_down};
+        // Experts in the host bank go through the expert cache: resident ones from the device
+        // pool, the rest fetched over PCIe or -- the split's share -- computed on the host and
+        // added back here before the recombination. A layer whose experts are on the card
+        // takes the plain route; the pool holds nothing it would want.
+        family::ExpertCache* cache =
+            mixture.banked()
+                ? &family::ExpertCache::for_current_device(kMoeGeometry, weights.layers)
+                : nullptr;
+        if (cache != nullptr && cache->enabled()) {
+            cache->run(mixture, hidden, out, workspace, stream);
+            cache->add_pending_partial(out, stream);
+        } else if (mixture.host_bank_q4) {
+            // The Q4 bank's routed Weights are a base pointer and a shape; only the cache
+            // decodes them, so without a pool there is nothing the plain route could read.
+            throw std::logic_error("glm5_next: the Q4 host expert bank needs the expert cache "
+                                   "(the pool could not be sized; pass --expert-slots)");
+        } else {
+            run_sparse_moe(hidden, weights.moe, out, workspace, stream);
+        }
     } else {
         dense_feed_forward(hidden, weights, out, workspace, stream);
     }

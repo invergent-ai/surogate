@@ -8,12 +8,16 @@
 #include "artifact/reader.h"
 #include "targets/glm5_next/impl/load/bindings.h"
 #include "targets/glm5_next/impl/variant.h"
+#include "targets/registry.h"
+#include "family/impl/moe/expert_cache.h"
+#include "api/ops/sparse_moe.h"
 
 #include "core/device.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <utility>
 
@@ -166,14 +170,46 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
+/// Whether this run keeps any mixture's experts in the host bank -- the only case the expert
+/// cache has anything to hold. Sized from free device memory before the KV planner measures
+/// it, a pool on a run with every expert resident would only take room from the cache.
+bool banks_experts(const EngineOptions& options) noexcept {
+    return options.host_moe_layers != 0 || options.gpu_layers != 0;
+}
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile,
-        detail::bind_artifact(binder, weights_profile, family::startup_features(options),
-                              options.pipeline_stage_first, options.pipeline_stage_last,
-                              options.host_moe_layers, options.gpu_layers,
-                              options.load_progress)));
+    // The banked experts become planes as the bank fills: W8 unless asked otherwise. This
+    // file's gate and up experts are Q4_K but its down experts are Q5_K and Q6_K, and the Q4
+    // bank would requantise those to four bits; W8 is lossless to what the pool holds anyway,
+    // at 1.7x the pinned bytes. `--host-expert-bank q4` is the denser, faster opt-in.
+    const family::BankPlanes planes = options.host_expert_bank == EngineOptions::HostExpertBank::Q4
+                                          ? family::BankPlanes::Q4
+                                          : family::BankPlanes::W8;
+    if (banks_experts(options)) {
+        std::fprintf(stderr, "glm5_next: host expert bank %s planes%s\n",
+                     planes == family::BankPlanes::Q4 ? "Q4G32AM" : "W8",
+                     planes == family::BankPlanes::Q4
+                         ? " (requantised while loading; this file's down experts are Q5_K/Q6_K)"
+                         : " (decoded while loading; --host-expert-bank q4 halves the bytes)");
+    }
+    auto plan = detail::bind_artifact(binder, weights_profile, family::startup_features(options),
+                                      options.pipeline_stage_first, options.pipeline_stage_last,
+                                      options.host_moe_layers, options.gpu_layers, planes,
+                                      options.load_progress);
+    if (banks_experts(options)) {
+        // What the runtime will derive from the resident weights once they are on the device,
+        // and the weights themselves, which at pool-sizing time are still in the artifact: an
+        // automatic expert pool sizes itself before either is measured and has to leave both.
+        family::ExpertCache::configure_derived_reserve(
+            targets::projected_derived_residency_bytes(binder, plan.materialization,
+                                                       Package::linear_policy) +
+            static_cast<std::size_t>(plan.materialization.device_capacity_bytes));
+        // ...and what the load holds only while it runs, which is the pool's other neighbour.
+        family::ExpertCache::configure_load_staging(
+            targets::projected_load_staging_bytes(binder, plan.materialization));
+    }
+    return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(plan)));
 }
 
 SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
@@ -205,12 +241,27 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     // The stream mixings travel between a site's collapse and its scatter in a device buffer
     // this target owns, and every device that runs a layer needs its own before the first
     // forward -- a pipeline stage plans on the device it will run on, so this is where it is
-    // reachable.
+    // reachable. The expert cache's pool is the same kind of thing, with one more constraint:
+    // it is device memory the KV planner must not count as free, so it is created here, before
+    // the engine measures free memory for `--kv-capacity auto`, and sized to leave the least
+    // the planner says the runtime needs.
     {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(device.device));
         detail::Variant::prewarm_device_scratch();
+        if (banks_experts(options)) {
+            // The runtime's floor and the load's staging are never resident together, so the
+            // pool leaves room for the larger, on top of the weights.
+            const std::size_t runtime_floor =
+                family::ExpertCache::derived_reserve() +
+                std::max(planner.capacity_curve().minimum_device_reservation_bytes +
+                             options.kv_capacity.automatic_headroom_bytes,
+                         family::ExpertCache::load_staging());
+            family::ExpertCache::configure(options, runtime_floor, detail::TextConfig::experts);
+            (void)family::ExpertCache::for_current_device(
+                ops::kSparseMoeGlm53Geometry, geometry.layers + geometry.mtp_layers);
+        }
         CUDA_CHECK(cudaSetDevice(previous));
     }
     return planner;
@@ -235,6 +286,33 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
         CUDA_CHECK(cudaSetDevice(device.device));
         ops::detail::bf16_cublaslt_prewarm();
         detail::Variant::prewarm_device_scratch();
+        if (model.impl_->data.host_bank != nullptr) {
+            // This stage banked experts (the bank exists exactly when it holds something).
+            // `--cpu-moe-share auto`: the split's share is measured on the first banked
+            // mixture layer, outside any capture; a no-op for a fixed share.
+            const detail::RuntimeModelView& runtime = model.impl_->data.runtime;
+            const detail::FeedForwardPayload* banked = nullptr;
+            for (const auto& layer : runtime.gdn_layers) {
+                if (layer.post_mixer.sparse && layer.post_mixer.host_gate_up != nullptr) {
+                    banked = &layer.post_mixer;
+                    break;
+                }
+            }
+            for (const auto& layer : runtime.full_layers) {
+                if (banked != nullptr) { break; }
+                if (layer.post_mixer.sparse && layer.post_mixer.host_gate_up != nullptr) {
+                    banked = &layer.post_mixer;
+                }
+            }
+            family::ExpertCache& cache = family::ExpertCache::for_current_device(
+                ops::kSparseMoeGlm53Geometry, runtime.geometry.layers + runtime.geometry.mtp_layers);
+            cache.prepare_split(banked == nullptr
+                                    ? family::BankedMixture{}
+                                    : family::BankedMixture{banked->layer, banked->layers,
+                                                            &banked->moe, false,
+                                                            banked->host_gate_up,
+                                                            banked->host_down});
+        }
         CUDA_CHECK(cudaSetDevice(previous));
     }
     return family::create_program<detail::Variant>(

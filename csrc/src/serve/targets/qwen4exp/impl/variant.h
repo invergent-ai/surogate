@@ -72,31 +72,13 @@ struct Variant {
                                Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream);
     static void post_mixer_norm(const Tensor& residual, const PostMixerWeights& weights,
                                 Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream);
-    /// Creates the device scratch the mix/combine pair shares; call before any graph capture.
+    /// Creates the device scratch the mix/combine pair shares and the expert cache of the
+    /// current device (`family::ExpertCache`, configured by the package); call before any
+    /// graph capture.
     static void prewarm_device_scratch();
-    /// Number of expert slots the cache on the current device should hold (0 disables); read
-    /// when the cache is created in prewarm_device_scratch. SUROGATE_SERVE_EXPERT_SLOTS is the
-    /// fallback when nothing was configured.
-    /// `runtime_floor_bytes`: what the runtime must be left after the pool (KV floor and
-    /// headroom); an automatic pool never sizes itself into it.
-    static void configure_expert_slots(std::uint32_t slots, std::size_t runtime_floor_bytes = 0);
-    /// The registry's projection of what the runtime derives from the resident weights, stashed
-    /// at plan time so the pool can leave it.
-    static void configure_derived_reserve(std::size_t bytes);
-    [[nodiscard]] static std::size_t derived_reserve();
-    /// Fraction of a round's missing experts the host computes (SUROGATE_SERVE_CPU_MOE_SHARE is
-    /// the fallback when nothing was configured).
-    static void configure_cpu_moe_share(float share);
-    /// Minimum round width (columns) for the split; 0 keeps the default (4).
-    static void configure_cpu_moe_min_tokens(std::uint32_t tokens);
-    /// Share of a prefill round's misses computed on the host (batched kernel) and the widest
-    /// prefill round (the engine's prefill chunk), which sizes the host staging.
-    static void configure_cpu_moe_prefill(float share, std::uint32_t prefill_chunk);
-    /// Host pools per NUMA node (pipeline stages) instead of one over all cores.
-    static void configure_cpu_pool_per_socket(bool per_socket);
-    /// With `--cpu-moe-share auto`, times a PCIe gather and a host round of layer 0's experts
-    /// (outside graph capture) and sets the share to host/(host+pcie). Called by
-    /// create_program before the graphs are captured; a no-op otherwise.
+    /// With `--cpu-moe-share auto`, hands the first banked mixture layer to the expert cache's
+    /// rate measurement (`ExpertCache::prepare_split`). Called by create_program before the
+    /// graphs are captured; a no-op otherwise.
     static void prepare_expert_split(const ModelView& model);
     static constexpr bool has_layer_prologue = true;
     // 48 layers, a four-stream residual, the PLE nodes and (with the CPU split) the host-round

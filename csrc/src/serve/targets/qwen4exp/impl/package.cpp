@@ -1,6 +1,7 @@
 #include "targets/registry.h"
 #include <api/targets/qwen4exp/package.h>
 #include "family/impl/lora_bind.h"
+#include "family/impl/moe/expert_cache.h"
 #include <api/family/frontend_resources.h>
 #include <api/family/prepared_prompt.h>
 
@@ -90,9 +91,13 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     // ...and the weights themselves, which at pool-sizing time are still in the artifact: the
     // pool is created before the engine measures free memory, and that measurement happens
     // before materialisation too.
-    detail::Variant::configure_derived_reserve(
-        targets::projected_derived_residency_bytes(binder, plan.materialization) +
+    family::ExpertCache::configure_derived_reserve(
+        targets::projected_derived_residency_bytes(binder, plan.materialization,
+                                                       Package::linear_policy) +
         static_cast<std::size_t>(plan.materialization.device_capacity_bytes));
+    // ...and what the load holds only while it runs, which is the pool's other neighbour.
+    family::ExpertCache::configure_load_staging(
+        targets::projected_load_staging_bytes(binder, plan.materialization));
     return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(plan)));
 }
 
@@ -133,33 +138,14 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     // plus the automatic headroom, or the engine refuses to start once it asks for it.
     auto planner = family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
                                                                  geometry);
+    // The runtime's floor and the load's staging are never resident together, so the
+    // pool leaves room for the larger, on top of the weights.
     const std::size_t runtime_floor =
-        planner.capacity_curve().minimum_device_reservation_bytes +
-        options.kv_capacity.automatic_headroom_bytes + detail::Variant::derived_reserve();
-    detail::Variant::configure_expert_slots(options.expert_slots, runtime_floor);
-    {
-        // A pipeline stage whose pool holds (nearly) all of its layers' experts gains nothing
-        // from the CPU split — every layer would still pay a host round trip — so the split
-        // is off above 90 % residency unless the share was given explicitly.
-        float share = options.cpu_moe_share;
-        const bool staged = options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0;
-        if (staged && share < 0.0F && options.expert_slots > 0) {
-            // Pipeline stages default to the gather-only pool: at 8 stages a 68 %-resident
-            // stage decodes faster without the split (514 vs 395 tok/s at 64 users), because it
-            // pays a host round trip per layer it could have served from its own slots. (The
-            // cross-lane corruption once blamed on this path was a sampling artefact and is
-            // retracted — INFERENCE.md, 2026-08-29 10:50.) An explicit --cpu-moe-share enables it.
-            const int stage_layers = options.pipeline_stage_last - options.pipeline_stage_first;
-            const std::uint64_t stage_experts = static_cast<std::uint64_t>(stage_layers) * detail::TextConfig::experts;
-            share = 0.0F;
-            std::fprintf(stderr, "qwen4exp: pipeline stage holds %u of %llu experts; CPU split off (pass --cpu-moe-share to enable)\n",
-                         options.expert_slots, static_cast<unsigned long long>(stage_experts));
-        }
-        detail::Variant::configure_cpu_moe_share(share);
-    }
-    detail::Variant::configure_cpu_moe_min_tokens(options.cpu_moe_min_tokens);
-    detail::Variant::configure_cpu_moe_prefill(options.cpu_moe_prefill_share, options.prefill_chunk);
-    detail::Variant::configure_cpu_pool_per_socket(options.cpu_moe_pool_per_socket);
+        family::ExpertCache::derived_reserve() +
+        std::max(planner.capacity_curve().minimum_device_reservation_bytes +
+                     options.kv_capacity.automatic_headroom_bytes,
+                 family::ExpertCache::load_staging());
+    family::ExpertCache::configure(options, runtime_floor, detail::TextConfig::experts);
     {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));

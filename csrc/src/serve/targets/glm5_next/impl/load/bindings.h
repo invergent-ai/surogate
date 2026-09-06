@@ -147,7 +147,9 @@ struct ArtifactLoadPlan {
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features, int stage_first = 0,
                                int stage_last = 0, std::uint32_t host_moe_layers = 0,
-                               std::uint32_t gpu_layers = 0, LoadProgress progress = {});
+                               std::uint32_t gpu_layers = 0,
+                               family::BankPlanes bank_planes = family::BankPlanes::W8,
+                               LoadProgress progress = {});
 
 /// Which layers of this artifact attend, read from the objects it holds rather than from a
 /// number beside them: a layer carrying a latent key/value projection attends, one carrying
@@ -209,6 +211,18 @@ struct FeedForwardPayload {
     Weight gate_up;
     Weight down;
     ops::SparseMoeWeights moe;
+    /// The layer's index and the model's layer count (draft head included): what keys the
+    /// expert cache's directory when the mixture's experts are in the host bank.
+    std::int32_t layer  = -1;
+    std::int32_t layers = 0;
+    /// Host addresses of the routed expert objects when the bank holds them (`moe` carries the
+    /// device-mapped aliases); null for a layer whose experts are on the card. The expert cache
+    /// reads the bank's planes through these on the host instead of fetching them over PCIe.
+    const std::byte* host_gate_up = nullptr;
+    const std::byte* host_down    = nullptr;
+    /// The banked objects are Q4G32AM planes (`--host-expert-bank q4`): the routed Weights are
+    /// then a base pointer and a shape, readable by the expert cache alone.
+    bool host_bank_q4 = false;
 };
 
 /// The draft head's attention: the trunk's latent projections without the hyper-connection,

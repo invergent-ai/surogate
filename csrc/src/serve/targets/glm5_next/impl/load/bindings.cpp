@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace sinfer::targets::glm5_next::detail {
@@ -309,11 +310,16 @@ HyperConnectionPayload load_hyper_connection(const artifact::MaterializedArtifac
 }
 
 /// The feed-forward's weights, dense or the mixture, into a payload whose site (norm and
-/// hyper-connection) the caller has already set.
+/// hyper-connection) the caller has already set. `bank` is the host bank when the stage has
+/// one: a mixture whose routed experts it holds gets their host addresses, which is what lets
+/// the expert cache compute them on the CPU rather than stream them over PCIe.
 void load_feed_forward_weights(const artifact::MaterializedArtifact& backing,
                                const FeedForwardPlan& source, const family::TextGeometry& g,
-                               FeedForwardPayload& out) {
+                               const family::HostBank* bank, const family::HostBankPlan* bank_plan,
+                               std::int32_t layer, FeedForwardPayload& out) {
     out.sparse = source.sparse;
+    out.layer  = layer;
+    out.layers = g.layers + g.mtp_layers;
     if (!out.sparse) {
         out.gate_up = materialized_weight(backing, source.gate_up, 2 * g.dense_intermediate,
                                           g.hidden);
@@ -326,13 +332,32 @@ void load_feed_forward_weights(const artifact::MaterializedArtifact& backing,
         artifact::materialized_tensor(backing, source.router_bias, NumericFormat::FP32,
                                       {static_cast<std::uint64_t>(kMoeGeometry.experts)})
             .data);
-    // Resident or banked in host memory, the weight is built the same way: the bank has already
-    // given the artifact the mapped pointer for the objects it holds.
-    out.moe.routed_gate_up = materialized_weight(backing, source.routed_gate_up,
-                                                 kMoeGeometry.routed_gate_rows(), g.hidden);
-    out.moe.routed_down    = materialized_weight(backing, source.routed_down,
-                                                 kMoeGeometry.routed_down_rows(),
-                                                 kMoeGeometry.intermediate);
+    // Resident, the weight is the artifact's. Banked, it is what the bank made of the object
+    // as it filled: the file's blocks as they lie (the bank has given the artifact the mapped
+    // pointer, so the same builder serves), W8 planes, or Q4G32AM planes -- the last two
+    // presented over the bank's mapped alias, since nothing in the artifact describes them.
+    const auto routed = [&](const WeightPlan& plan, std::int32_t rows, std::int32_t columns,
+                            const std::byte*& host) {
+        const family::HostObject* object = bank != nullptr ? bank->find(plan.object) : nullptr;
+        const family::HostObjectPlan* planned =
+            bank_plan != nullptr ? family::find_plan(*bank_plan, plan.object) : nullptr;
+        if (object == nullptr) { return materialized_weight(backing, plan, rows, columns); }
+        host = static_cast<const std::byte*>(object->host);
+        if (planned != nullptr && planned->q4_rows > 0) {
+            out.host_bank_q4 = true;
+            return family::host_q4_weight(*object, rows, columns);
+        }
+        if (planned != nullptr && planned->decode_rows > 0) {
+            return family::host_w8_weight(*object, rows, columns);
+        }
+        return materialized_weight(backing, plan, rows, columns);
+    };
+    const std::byte* host_gate_up = nullptr;
+    const std::byte* host_down    = nullptr;
+    out.moe.routed_gate_up = routed(source.routed_gate_up, kMoeGeometry.routed_gate_rows(),
+                                    g.hidden, host_gate_up);
+    out.moe.routed_down    = routed(source.routed_down, kMoeGeometry.routed_down_rows(),
+                                    kMoeGeometry.intermediate, host_down);
     out.moe.shared_gate_up = materialized_weight(backing, source.shared_gate_up,
                                                  kMoeGeometry.shared_rows(), g.hidden);
     out.moe.shared_down    = materialized_weight(backing, source.shared_down, g.hidden,
@@ -341,16 +366,25 @@ void load_feed_forward_weights(const artifact::MaterializedArtifact& backing,
     out.moe.routed_scale      = kMoeGeometry.routed_scale;
     out.moe.shared_gated      = kMoeGeometry.shared_gated;
     out.moe.swiglu_limit      = kMoeGeometry.swiglu_limit;
+    // A layer is banked as a pair, so either both pointers are set or neither.
+    if (host_gate_up != nullptr && host_down != nullptr) {
+        out.host_gate_up = host_gate_up;
+        out.host_down    = host_down;
+    } else if (out.host_bank_q4) {
+        throw std::logic_error("glm5_next: a mixture layer is banked as Q4 on one side only");
+    }
 }
 
 FeedForwardPayload load_feed_forward(const artifact::MaterializedArtifact& backing,
                                      const TextLayerPlan& source, const family::TextGeometry& g,
-                                     const Tensor& post_norm, std::int32_t layer) {
+                                     const family::HostBank* bank,
+                                     const family::HostBankPlan* bank_plan, const Tensor& post_norm,
+                                     std::int32_t layer) {
     FeedForwardPayload out;
     out.hc          = load_hyper_connection(backing, source.feed_forward_hc, g, layer);
     out.norm        = post_norm;
     out.rms_epsilon = g.rms_epsilon;
-    load_feed_forward_weights(backing, source.feed_forward, g, out);
+    load_feed_forward_weights(backing, source.feed_forward, g, bank, bank_plan, layer, out);
     return out;
 }
 
@@ -400,7 +434,8 @@ family::TextGeometry declared_geometry_with_schedule(const artifact::Reader& rea
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features, int stage_first,
                                int stage_last, std::uint32_t host_moe_layers,
-                               std::uint32_t gpu_layers, LoadProgress progress) {
+                               std::uint32_t gpu_layers, family::BankPlanes bank_planes,
+                               LoadProgress progress) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.geometry     = declared_geometry_with_schedule(binder.reader());
@@ -451,6 +486,23 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     load_plan.materialization = binder.finish();
     out.host_bank = family::collect_host_bank(binder, load_plan.materialization,
                                               std::move(progress));
+    // What the bank makes of a GGUF's expert blocks as it fills them: planes the host expert
+    // path reads at memory speed (W8 lossless, Q4 the denser opt-in), or the blocks as they
+    // lie. A row-split W8 artifact is already planes and the marking leaves it alone.
+    for (family::HostObjectPlan& object : out.host_bank.objects) {
+        const bool gate_up = object.name.ends_with("moe/routed_gate_up");
+        const bool down    = object.name.ends_with("moe/routed_down");
+        if (!gate_up && !down) { continue; }
+        const artifact::ObjectDescriptor* stored = binder.reader().find(object.name);
+        const auto* tensor = stored != nullptr ? std::get_if<artifact::TensorDescriptor>(stored)
+                                               : nullptr;
+        if (tensor == nullptr) { continue; }
+        const std::int64_t rows = gate_up ? kMoeGeometry.routed_gate_rows()
+                                          : kMoeGeometry.routed_down_rows();
+        const std::int32_t columns = gate_up ? g.hidden : kMoeGeometry.intermediate;
+        family::bank_as_planes(object, rows, columns, artifact::qtype_for(tensor->format),
+                               bank_planes);
+    }
     return load_plan;
 }
 
@@ -504,7 +556,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = materialized_weight(backing, source.attention.output, g.hidden,
                                                 g.query_heads * TextConfig::v_head_dim);
             target.post_attention_norm = post_norm;
-            target.post_mixer          = load_feed_forward(backing, source, g, post_norm, layer);
+            target.post_mixer = load_feed_forward(backing, source, g, host_bank.get(),
+                                                  &plan.host_bank, post_norm, layer);
         } else {
             KdaWeights& target = runtime.gdn_layers.at(kda_index++);
             target.input_norm  = input_norm;
@@ -542,7 +595,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = materialized_weight(backing, source.kda.output, g.hidden,
                                                 g.value_dim());
             target.post_attention_norm = post_norm;
-            target.post_mixer          = load_feed_forward(backing, source, g, post_norm, layer);
+            target.post_mixer = load_feed_forward(backing, source, g, host_bank.get(),
+                                                  &plan.host_bank, post_norm, layer);
         }
     }
 
@@ -570,7 +624,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             {static_cast<std::uint64_t>(g.hidden)});
         mtp.post_mixer.norm        = mtp.post_attention_norm;
         mtp.post_mixer.rms_epsilon = g.rms_epsilon;
-        load_feed_forward_weights(backing, plan.mtp.feed_forward, g, mtp.post_mixer);
+        // The head's experts stay on the card (bind_mtp_head places them there), so it has
+        // no bank to ask; its layer index is the one past the trunk.
+        load_feed_forward_weights(backing, plan.mtp.feed_forward, g, nullptr, nullptr, g.layers,
+                                  mtp.post_mixer);
         mtp.final_norm = artifact::materialized_tensor(
             backing, plan.mtp.final_norm, NumericFormat::BF16,
             {static_cast<std::uint64_t>(g.hidden)});

@@ -4,7 +4,8 @@
 // scales fp16 per 32-group; down = hidden rows of `intermediate` codes. Per job:
 //   xq   = quantise(x)                      (int8 per group, float scale per group)
 //   g,u  = dot(gate_row, xq), dot(up_row, xq)
-//   h    = silu(g) * u                       (float, intermediate wide)
+//   h    = silu(clamp(g)) * clamp(u)         (float, intermediate wide; the clamp where the
+//                                             geometry states a swiglu_limit)
 //   hq   = quantise(h)
 //   y    = dot(down_row, hq)                 (hidden wide)
 //   out += weight * y
@@ -77,6 +78,17 @@ inline float fp16_to_float(std::uint16_t h) {
 }
 
 inline float silu(float v) { return v / (1.0F + std::exp(-v)); }
+// The SwiGLU the GPU expert kernels apply (ops/common/math.cuh `swiglu_clamped`): both halves
+// bounded before the product where the geometry states a limit, the plain product otherwise.
+// GLM-5.3 states 10; a host round that skipped it would compute a different function from the
+// device round it stands in for, and the split's shadow check would say so on every layer.
+inline float swiglu(float gate, float up, float limit) {
+    if (limit > 0.0F) {
+        gate = std::min(gate, limit);
+        up   = std::min(std::max(up, -limit), limit);
+    }
+    return silu(gate) * up;
+}
 
 /// Quantises `count` floats (a multiple of 32) into int8 groups with one float scale each.
 void quantise_groups(const float* values, int count, std::int8_t* q, float* scales);
@@ -711,6 +723,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
     }
     const int hidden       = geometry.hidden;
     const int intermediate = geometry.intermediate;
+    const float limit      = geometry.swiglu_limit;
     const Scratch s        = carve_scratch(geometry, scratch);
     for (int i = 0; i < hidden; ++i) { s.x_float[i] = bf16_to_float(x_column[i]); }
     quantise_groups(s.x_float, hidden, s.xq, s.xs);
@@ -742,7 +755,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                 bank.gate_up_ggml, hidden, 1);
             float g = 0.0F, u = 0.0F;
             dot_two_rows(s.wq, s.ws, s.wq + hidden, s.ws + groups_h, s.xq, s.xs, hidden, g, u);
-            s.h[j] = silu(g) * u;
+            s.h[j] = swiglu(g, u, limit);
         }
         quantise_groups(s.h, intermediate, s.hq, s.hs);
         const auto* down_blocks = bank.down_codes + static_cast<std::size_t>(job.expert) *
@@ -774,7 +787,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                 gate4 + static_cast<std::size_t>(intermediate + j) * (hidden / 2),
                 gsc + (intermediate + j) * groups_h, gmn + (intermediate + j) * groups_h, s.xq,
                 s.xs, hidden);
-            s.h[j] = silu(g) * u;
+            s.h[j] = swiglu(g, u, limit);
         }
         quantise_groups(s.h, intermediate, s.hq, s.hs);
         const auto* down4 = reinterpret_cast<const std::uint8_t*>(bank.down_codes) +
@@ -803,7 +816,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
         dot_two_rows(gate_codes + j * gate_row_codes, gate_scales + j * gate_row_scales,
                      gate_codes + (intermediate + j) * gate_row_codes,
                      gate_scales + (intermediate + j) * gate_row_scales, s.xq, s.xs, hidden, g, u);
-        s.h[j] = silu(g) * u;
+        s.h[j] = swiglu(g, u, limit);
     }
     quantise_groups(s.h, intermediate, s.hq, s.hs);
 
@@ -1047,6 +1060,7 @@ struct CpuExpertPool::Impl {
     void do_item(int ph, std::int64_t item, std::uint32_t worker) {
         const int hidden       = geometry.hidden;
         const int intermediate = geometry.intermediate;
+        const float limit      = geometry.swiglu_limit;
         const int groups_h     = hidden / kGroup;
         const int groups_i     = intermediate / kGroup;
         if (ph == 0) {
@@ -1132,8 +1146,8 @@ struct CpuExpertPool::Impl {
                             xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
                             xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga,
                             ua, gb, ub);
-                        h[ia * intermediate + j] = silu(ga) * ua;
-                        h[ib * intermediate + j] = silu(gb) * ub;
+                        h[ia * intermediate + j] = swiglu(ga, ua, limit);
+                        h[ib * intermediate + j] = swiglu(gb, ub, limit);
                     }
                     if (i < g1) {
                         const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1144,7 +1158,7 @@ struct CpuExpertPool::Impl {
                                         xs.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         xc.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         hidden, ga, ua);
-                        h[ia * intermediate + j] = silu(ga) * ua;
+                        h[ia * intermediate + j] = swiglu(ga, ua, limit);
                     }
                 }
                 return;
@@ -1177,8 +1191,8 @@ struct CpuExpertPool::Impl {
                         dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(b) * bb, hidden, xa, sa, xb, sb, ga, gb);
                         dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(blocks + b) * bb, hidden, xa, sa, xb, sb, ua, ub);
                         for (int r = 0; r < kTileRows; ++r) {
-                            h[ia * intermediate + j0 + b * kTileRows + r] = silu(ga[r]) * ua[r];
-                            if (i + 1 < g1) { h[ib * intermediate + j0 + b * kTileRows + r] = silu(gb[r]) * ub[r]; }
+                            h[ia * intermediate + j0 + b * kTileRows + r] = swiglu(ga[r], ua[r], limit);
+                            if (i + 1 < g1) { h[ib * intermediate + j0 + b * kTileRows + r] = swiglu(gb[r], ub[r], limit); }
                         }
                     }
                 }
@@ -1200,15 +1214,15 @@ struct CpuExpertPool::Impl {
                                             xq.data() + static_cast<std::size_t>(jb.token) * hidden,
                                             xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
                                             xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga, ua, gb, ub);
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j]     = silu(ga) * ua;
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]) * intermediate + j] = silu(gb) * ub;
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j]     = swiglu(ga, ua, limit);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]) * intermediate + j] = swiglu(gb, ub, limit);
                 }
                 if (i < g1) {
                     const CpuExpertJob& ja = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(i)])];
                     float ga = 0.0F, ua = 0.0F;
                     dot_two_rows(gc, gs, uc, us, xq.data() + static_cast<std::size_t>(ja.token) * hidden,
                                  xs.data() + static_cast<std::size_t>(ja.token) * groups_h, hidden, ga, ua);
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j] = silu(ga) * ua;
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j] = swiglu(ga, ua, limit);
                 }
             }
             return;

@@ -4,6 +4,7 @@
 
 #include "ops/linear/ggml/ggml_host_decode.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -80,6 +81,16 @@ Bank make_bank(std::mt19937& rng) {
     return b;
 }
 
+// The clamped SwiGLU, as the kernels apply it: both halves bounded before the product where
+// the geometry states a limit (GLM-5.3: 10), the plain product otherwise.
+double swiglu_ref(double g, double u, double limit) {
+    if (limit > 0.0) {
+        g = std::min(g, limit);
+        u = std::min(std::max(u, -limit), limit);
+    }
+    return (g / (1.0 + std::exp(-g))) * u;
+}
+
 // Reference: identical quantisation rules in double precision.
 void quantise_ref(const std::vector<double>& v, std::vector<int>& q, std::vector<double>& s) {
     const int groups = static_cast<int>(v.size()) / 32;
@@ -107,7 +118,8 @@ double dot_ref(const std::int8_t* codes, const std::uint16_t* scales, const std:
     }
     return acc;
 }
-std::vector<double> reference_job(const Bank& b, int expert, const std::vector<std::uint16_t>& x, float weight) {
+std::vector<double> reference_job(const Bank& b, int expert, const std::vector<std::uint16_t>& x, float weight,
+                                  double limit = 0.0) {
     const int H = kGeometry.hidden, I = kGeometry.intermediate;
     std::vector<double> xf(H);
     for (int i = 0; i < H; ++i) { xf[i] = bf16_to_float(x[i]); }
@@ -120,7 +132,7 @@ std::vector<double> reference_job(const Bank& b, int expert, const std::vector<s
     for (int j = 0; j < I; ++j) {
         const double g = dot_ref(gc + j * H, gs + j * (H / 32), xq, xs, H);
         const double u = dot_ref(gc + (I + j) * H, gs + (I + j) * (H / 32), xq, xs, H);
-        h[j]           = (g / (1.0 + std::exp(-g))) * u;
+        h[j]           = swiglu_ref(g, u, limit);
     }
     std::vector<int> hq;
     std::vector<double> hs;
@@ -187,7 +199,8 @@ double dot_ref_q4(const std::uint8_t* q4, const std::uint16_t* scales, const std
 }
 
 std::vector<double> reference_job_q4(const Q4Bank& b, int expert,
-                                     const std::vector<std::uint16_t>& x, float weight) {
+                                     const std::vector<std::uint16_t>& x, float weight,
+                                     double limit = 0.0) {
     const int H = kGeometry.hidden, I = kGeometry.intermediate;
     std::vector<double> xf(H);
     for (int i = 0; i < H; ++i) { xf[i] = bf16_to_float(x[i]); }
@@ -202,7 +215,7 @@ std::vector<double> reference_job_q4(const Q4Bank& b, int expert,
         const double g = dot_ref_q4(gc + j * (H / 2), gs + j * (H / 32), gm + j * (H / 32), xq, xs, H);
         const double u = dot_ref_q4(gc + (I + j) * (H / 2), gs + (I + j) * (H / 32),
                                     gm + (I + j) * (H / 32), xq, xs, H);
-        h[j] = (g / (1.0 + std::exp(-g))) * u;
+        h[j] = swiglu_ref(g, u, limit);
     }
     std::vector<int> hq;
     std::vector<double> hs;
@@ -472,6 +485,75 @@ int main() {
         const double rel = std::sqrt(err2 / std::max(ref2, 1e-30));
         std::cout << "info q4-vs-w8 rel-L2 " << rel << " (random codes; affine sources are near-exact)\n";
         failures += rel < 0.2 ? 0 : 1;
+    }
+    // --- The clamped SwiGLU ---
+    // The same banks under a geometry that states a limit: every path (single job, the paired
+    // and odd-tail pool paths, W8 and Q4) must bound both halves before the product. The limit
+    // is the one GLM-5.3 states, and the random codes drive the dot products well past it, so
+    // the case first checks the clamp actually engages -- a reference that agreed with the
+    // kernel because neither clamped would prove nothing.
+    {
+        constexpr ops::SparseMoeGeometry kClamped{.hidden            = 128,
+                                                  .experts           = 4,
+                                                  .experts_per_token = 2,
+                                                  .intermediate      = 128,
+                                                  .swiglu_limit      = 10.0F};
+        const double limit = kClamped.swiglu_limit;
+        {
+            const std::vector<double> plain   = reference_job(bank, 2, x, 0.75F);
+            const std::vector<double> clamped = reference_job(bank, 2, x, 0.75F, limit);
+            double diff2 = 0.0, ref2 = 0.0;
+            for (int i = 0; i < H; ++i) {
+                diff2 += (plain[i] - clamped[i]) * (plain[i] - clamped[i]);
+                ref2 += plain[i] * plain[i];
+            }
+            const double rel     = std::sqrt(diff2 / std::max(ref2, 1e-30));
+            const bool engaged   = rel > 1e-3;
+            std::cout << (engaged ? "ok   " : "FAIL ") << "clamp engages (rel-L2 vs unclamped " << rel << ")\n";
+            failures += engaged ? 0 : 1;
+        }
+        std::vector<float> outc(H, 0.0F);
+        std::vector<std::byte> cscratch(ops::cpu_expert_scratch_bytes(kClamped) + 64);
+        ops::cpu_expert_compute_job(kClamped, bank.view(), job, x.data(), outc.data(), cscratch.data());
+        failures += compare("clamped single job expert 2", outc, reference_job(bank, 2, x, 0.75F, limit));
+        const Q4Bank q4c = requantise_bank(bank);
+        std::fill(outc.begin(), outc.end(), 0.0F);
+        ops::cpu_expert_compute_job(kClamped, q4c.view(), job, x.data(), outc.data(), cscratch.data());
+        failures += compare("clamped q4 single job expert 2", outc, reference_job_q4(q4c, 2, x, 0.75F, limit));
+
+        const int many = 13;
+        std::vector<std::uint16_t> xm(static_cast<std::size_t>(H) * many);
+        for (auto& v : xm) { v = float_to_bf16(act(rng)); }
+        std::vector<ops::CpuExpertJob> jm;
+        std::uniform_real_distribution<float> wdist(0.05F, 0.95F);
+        for (int t2 = 0; t2 < many; ++t2) {
+            jm.push_back({t2, t2 % 4, wdist(rng)});
+            jm.push_back({t2, (t2 * 7 + 1) % 4, wdist(rng)});
+            if (t2 % 3 == 0) { jm.push_back({t2, 3, wdist(rng)}); }
+        }
+        ops::CpuExpertPool poolc(kClamped, {.threads = 6, .pin_threads = false});
+        for (const bool q4_bank : {false, true}) {
+            std::vector<float> om(static_cast<std::size_t>(H) * many, 0.0F);
+            ops::CpuExpertRound rm{xm.data(), om.data(), many, jm};
+            poolc.run(q4_bank ? q4c.view() : bank.view(), rm);
+            int bad = 0;
+            for (int t2 = 0; t2 < many; ++t2) {
+                std::vector<std::uint16_t> column(xm.begin() + t2 * H, xm.begin() + (t2 + 1) * H);
+                std::vector<double> want(H, 0.0);
+                for (const auto& j2 : jm) {
+                    if (j2.token != t2) { continue; }
+                    const std::vector<double> y = q4_bank
+                                                      ? reference_job_q4(q4c, j2.expert, column, j2.weight, limit)
+                                                      : reference_job(bank, j2.expert, column, j2.weight, limit);
+                    for (int i = 0; i < H; ++i) { want[i] += y[i]; }
+                }
+                std::vector<float> got(om.begin() + t2 * H, om.begin() + (t2 + 1) * H);
+                bad += compare(std::string(q4_bank ? "clamped q4 pooled token " : "clamped pooled token ") +
+                                   std::to_string(t2),
+                               got, want);
+            }
+            failures += bad;
+        }
     }
     std::cout << (failures ? "FAIL" : "OK") << " cpu_expert_compute\n";
     return failures ? 1 : 0;

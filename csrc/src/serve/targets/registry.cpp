@@ -120,8 +120,12 @@ std::size_t subtract_saturating(std::size_t value, std::size_t amount) noexcept 
 } // namespace
 
 std::size_t projected_derived_residency_bytes(const artifact::Binder& binder,
-                                              const artifact::MaterializationPlan& plan) {
+                                              const artifact::MaterializationPlan& plan,
+                                              ops::LinearPolicy policy) {
     if (!ops::detail::w8fp8_plane_enabled() && !ops::detail::marlin_plane_enabled()) { return 0; }
+    // Every derivation below serves an A8 or A4 compute profile; a target whose policy admits
+    // only A16 never asks for one and derives nothing from its W8 weights.
+    if (policy == ops::LinearPolicy::A16Only) { return 0; }
     std::uint64_t w8_bytes = 0;
     for (const artifact::DeviceMaterialization& object : plan.device_objects) {
         const auto& descriptor = binder.descriptor(object.object);
@@ -137,6 +141,33 @@ std::size_t projected_derived_residency_bytes(const artifact::Binder& binder,
     // costs cache.
     return static_cast<std::size_t>(w8_bytes + w8_bytes / 2U);
 }
+
+std::size_t projected_load_staging_bytes(const artifact::Binder& binder,
+                                         const artifact::MaterializationPlan& plan) {
+    const artifact::Reader& reader = binder.reader();
+    std::uint64_t staged           = 0;
+    for (const artifact::DeviceMaterialization& object : plan.device_objects) {
+        const auto& descriptor = reader.objects().at(object.object.index);
+        const auto* tensor     = std::get_if<artifact::TensorDescriptor>(&descriptor);
+        if (tensor == nullptr || tensor->transform == artifact::PayloadTransform::None) { continue; }
+        for (const artifact::PayloadRun& run : reader.runs(descriptor)) { staged += run.bytes; }
+    }
+    return static_cast<std::size_t>(staged);
+}
+
+namespace {
+
+/// The linear policy a target declares, or the conservative one for a target that says nothing.
+template <class Target>
+constexpr ops::LinearPolicy target_linear_policy() {
+    if constexpr (requires { Target::linear_policy; }) {
+        return Target::linear_policy;
+    } else {
+        return ops::LinearPolicy::AllowA4;
+    }
+}
+
+} // namespace
 
 namespace {
 
@@ -208,7 +239,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     artifact::Binder binder(reader);
     auto load_plan = Target::plan_load(binder, options, weights_profile);
     const std::size_t derived_residency_bytes =
-        projected_derived_residency_bytes(binder, load_plan.materialization());
+        projected_derived_residency_bytes(binder, load_plan.materialization(),
+                                          target_linear_policy<Target>());
     const std::size_t preflight_runtime_bytes = subtract_saturating(
         runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes),
         derived_residency_bytes);
@@ -470,7 +502,8 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
     StageFit fit{};
     fit.budget_bytes = subtract_saturating(
         runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
-        projected_derived_residency_bytes(binder, plan.materialization()));
+        projected_derived_residency_bytes(binder, plan.materialization(),
+                                          target_linear_policy<Target>()));
     if (max_context == 0) { return fit; }
     EngineOptions sized = stage;
     sized.max_context   = max_context;

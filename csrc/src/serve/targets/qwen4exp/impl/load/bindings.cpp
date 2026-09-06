@@ -185,31 +185,6 @@ ops::HyperConnectionWeights load_hc(const artifact::MaterializedArtifact& backin
 }
 
 
-// The Q4G32AM flavour: base pointer + shape only. The object is not a W8 plane pair, so the
-// W8 size validation and the scale-plane split do not apply; readers derive the Q4 planes from
-// the geometry (ops::q4_bank_planes).
-Weight host_q4_weight(const HostObject& object, std::int32_t rows, std::int32_t columns) {
-    Weight out{};
-    out.payload         = static_cast<const std::byte*>(object.device);
-    out.payload_bytes   = object.bytes;
-    out.qtype           = QType::W8G32_F16S; // metadata only; see above
-    out.layout          = QuantLayout::RowSplit;
-    out.group_size      = 32;
-    out.qdata           = static_cast<const std::byte*>(object.device);
-    out.qhigh           = nullptr;
-    out.scales          = nullptr;
-    out.n               = rows;
-    out.k               = columns;
-    out.group           = 32;
-    out.scale_dtype     = DType::FP16;
-    out.ndim            = 2;
-    out.shape[0]        = rows;
-    out.shape[1]        = columns;
-    out.padded_shape[0] = rows;
-    out.padded_shape[1] = columns;
-    return out;
-}
-
 SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const HostBank& bank,
                           const MoePlan& plan, ops::HyperConnectionWeights mix, bool q4) {
     SparseMoePayload out;

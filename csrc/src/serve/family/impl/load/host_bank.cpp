@@ -1,4 +1,5 @@
 #include "family/impl/load/host_bank.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "core/numa.h"
 
 #include "api/ops/cpu_expert_compute.h"
@@ -342,10 +343,15 @@ HostBank::~HostBank() {
 }
 
 const HostObject& HostBank::object(artifact::ObjectHandle handle) const {
-    for (const auto& [index, object] : objects_) {
-        if (index == handle.index) { return object; }
-    }
+    if (const HostObject* found = find(handle); found != nullptr) { return *found; }
     throw std::out_of_range("host bank has no object for this handle");
+}
+
+const HostObject* HostBank::find(artifact::ObjectHandle handle) const noexcept {
+    for (const auto& [index, object] : objects_) {
+        if (index == handle.index) { return &object; }
+    }
+    return nullptr;
 }
 
 
@@ -539,6 +545,52 @@ Weight host_w8_weight(const HostObject& object, std::int32_t rows, std::int32_t 
     out.padded_shape[0]  = rows;
     out.padded_shape[1]  = static_cast<std::int32_t>(geometry.padded_columns);
     return out;
+}
+
+Weight host_q4_weight(const HostObject& object, std::int32_t rows, std::int32_t columns) {
+    Weight out{};
+    out.payload         = static_cast<const std::byte*>(object.device);
+    out.payload_bytes   = object.bytes;
+    out.qtype           = QType::W8G32_F16S; // metadata only; see the declaration
+    out.layout          = QuantLayout::RowSplit;
+    out.group_size      = 32;
+    out.qdata           = static_cast<const std::byte*>(object.device);
+    out.qhigh           = nullptr;
+    out.scales          = nullptr;
+    out.n               = rows;
+    out.k               = columns;
+    out.group           = 32;
+    out.scale_dtype     = DType::FP16;
+    out.ndim            = 2;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
+    return out;
+}
+
+BankPlanes bank_as_planes(HostObjectPlan& plan, std::int64_t rows, std::int32_t columns,
+                          QType stored, BankPlanes planes) {
+    if (planes == BankPlanes::Native || !ops::detail::ggml::is_ggml_qtype(stored)) {
+        return BankPlanes::Native;
+    }
+    plan.decode_rows = rows;
+    plan.decode_k    = columns;
+    plan.decode_type = stored;
+    if (planes == BankPlanes::Q4) {
+        // Decoded to a row of W8 and requantised from there: the two steps a converted
+        // artifact's bank takes, fused per row so no W8 copy of the experts exists.
+        plan.q4_rows = rows;
+        plan.q4_k    = columns;
+    }
+    return planes;
+}
+
+const HostObjectPlan* find_plan(const HostBankPlan& bank, artifact::ObjectHandle handle) noexcept {
+    for (const HostObjectPlan& object : bank.objects) {
+        if (object.handle.index == handle.index) { return &object; }
+    }
+    return nullptr;
 }
 
 } // namespace sinfer::family

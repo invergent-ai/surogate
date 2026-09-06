@@ -1,6 +1,7 @@
 #pragma once
 
 #include "api/types.h"
+#include "api/ops/linear.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
 #include <api/family/frontend.h>
@@ -60,6 +61,9 @@ struct Package {
     /// the largest the device's free memory allows, up to this. A function, not a constant:
     /// `detail::Variant` is only forward-declared here.
     [[nodiscard]] static std::uint32_t maximum_context() noexcept;
+    /// Every linear of this target runs an A16 profile: nothing is derived from its W8 weights,
+    /// and the registry's reservation projection may take that at its word.
+    static constexpr ops::LinearPolicy linear_policy = ops::LinearPolicy::A16Only;
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;
