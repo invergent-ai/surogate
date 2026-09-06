@@ -120,6 +120,12 @@ void mix_into(const Tensor& residual, const HyperConnectionPayload& hc, const Te
                                        TextConfig::hc_sinkhorn_iterations, collapsed, post, comb,
                                        workspace, stream);
     ops::rmsnorm(collapsed, norm, eps, /*unit_offset=*/false, hidden, stream);
+    // Parity probes. Under SUROGATE_SERVE_DUMP_RESIDUAL these are the only tensors of this
+    // stack a reference implementation can be compared against directly: the stream collapse,
+    // the two mixings it produced, and (below) the residual the recombination left.
+    Variant::debug_probe("hc_collapsed", collapsed, stream);
+    Variant::debug_probe("hc_normed", hidden, stream);
+    Variant::debug_probe("hc_post", post, stream);
     t_post = post;
     t_comb = comb;
     CUDA_CHECK(cudaGetDevice(&t_mixing_device));
@@ -131,8 +137,10 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
         throw std::logic_error("glm5_next: a combine without a matching collapse");
     }
     check_device_handoff("the stream mixings", t_mixing_device);
+    Variant::debug_probe("block_output", block_output, stream);
     ops::manifold_hyper_connection_combine(block_output, t_post, t_comb, kStreams, residual,
                                            stream);
+    Variant::debug_probe("residual", residual, stream);
     t_post          = Tensor{};
     t_comb          = Tensor{};
     t_mixing_device = -1;
@@ -557,7 +565,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
 
 void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
     // Only the magic is this target's: 'G53F'.
-    family::debug_probe_dump(0x47353346, tag, tensor, TextConfig::layers, stream);
+    family::debug_probe_dump(0x47353346, tag, tensor, 2 * TextConfig::layers, stream);
 }
 
 } // namespace sinfer::targets::glm5_next::detail
