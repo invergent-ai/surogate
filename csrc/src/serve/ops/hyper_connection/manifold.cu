@@ -21,6 +21,138 @@ constexpr int kMaxRows    = (2 + kMaxStreams) * kMaxStreams;
 /// The residual column is staged in shared memory, so its width is what bounds the op.
 constexpr int kMaxWidth = 32768;
 
+/// The projection, split across the width. One block per (token, slice): each accumulates its
+/// slice's contribution to the column's sum of squares and to every projection row, into an
+/// FP32 workspace of `1 + rows` floats per token.
+///
+/// A block per *token* was the first shape, staging the whole column in shared memory so it
+/// could be read once for the norm, once per projection row and once for the collapse. That is
+/// the right shape when there are many tokens and the wrong one when there is a single token:
+/// one CTA of 256 threads then reads the projection's 786 KB alone, on one SM of a hundred and
+/// seventy, and a decode round spends 136 us in each of ninety calls. Splitting the width is
+/// what puts the card to work; the column is re-read from global for the collapse, which costs
+/// 32 KB a token against the 12 ms a round was losing.
+__global__ __launch_bounds__(kThreads) void manifold_project_kernel(
+    const __nv_bfloat16* __restrict__ residual, const __nv_bfloat16* __restrict__ mix, int width,
+    int rows, int slices, float* __restrict__ partials) {
+    const int token       = static_cast<int>(blockIdx.y);
+    const int slice       = static_cast<int>(blockIdx.x);
+    const std::int64_t at = static_cast<std::int64_t>(token) * width;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    const int stride      = kThreads * slices;
+
+    __shared__ float reduce[kWarps * (kMaxRows + 1)];
+
+    float sum_sq = 0.0F;
+    float dot[kMaxRows];
+    for (int r = 0; r < rows; ++r) { dot[r] = 0.0F; }
+    for (int i = slice * kThreads + static_cast<int>(threadIdx.x); i < width; i += stride) {
+        const float value = __bfloat162float(residual[at + i]);
+        sum_sq            = fmaf(value, value, sum_sq);
+        for (int r = 0; r < rows; ++r) {
+            dot[r] = fmaf(__bfloat162float(mix[static_cast<std::int64_t>(r) * width + i]), value,
+                          dot[r]);
+        }
+    }
+    sum_sq = warp_reduce_sum(sum_sq);
+    if (lane == 0) { reduce[warp * (rows + 1)] = sum_sq; }
+    for (int r = 0; r < rows; ++r) {
+        const float sum = warp_reduce_sum(dot[r]);
+        if (lane == 0) { reduce[warp * (rows + 1) + 1 + r] = sum; }
+    }
+    __syncthreads();
+    if (static_cast<int>(threadIdx.x) <= rows) {
+        const int slot = static_cast<int>(threadIdx.x);
+        float sum      = 0.0F;
+        for (int w = 0; w < kWarps; ++w) { sum += reduce[w * (rows + 1) + slot]; }
+        atomicAdd(&partials[static_cast<std::int64_t>(token) * (rows + 1) + slot], sum);
+    }
+}
+
+/// One warp per token: the accumulated dots become `pre`, `post` and the doubly-stochastic
+/// `comb`. Tiny, and serial by nature -- Sinkhorn is twenty passes over a 4x4 matrix.
+__global__ void manifold_reduce_kernel(const float* __restrict__ partials,
+                                       const float* __restrict__ base,
+                                       const float* __restrict__ scale, int width, int streams,
+                                       int rows, float rms_eps, float hc_eps,
+                                       int sinkhorn_iterations, float* __restrict__ pre_out,
+                                       float* __restrict__ post, float* __restrict__ comb) {
+    const int token = static_cast<int>(blockIdx.x);
+    if (threadIdx.x != 0) { return; }
+    const float* accumulated = partials + static_cast<std::int64_t>(token) * (rows + 1);
+    const float inv          = rsqrtf(accumulated[0] / static_cast<float>(width) + rms_eps);
+
+    float logits[kMaxRows];
+    for (int r = 0; r < rows; ++r) { logits[r] = accumulated[1 + r] * inv; }
+    for (int s = 0; s < streams; ++s) {
+        pre_out[static_cast<std::int64_t>(token) * streams + s] =
+            sigmoid(logits[s] * scale[0] + base[s]) + hc_eps;
+        post[static_cast<std::int64_t>(token) * streams + s] =
+            2.0F * sigmoid(logits[streams + s] * scale[1] + base[streams + s]);
+    }
+    // softmax over j, then Sinkhorn-Knopp onto the doubly-stochastic manifold. Small enough
+    // (streams <= 4) that one thread is the clearest way to keep the iteration order the
+    // reference's.
+    float matrix[kMaxStreams * kMaxStreams];
+    for (int i = 0; i < streams; ++i) {
+        float maximum = -3.402823466e+38F;
+        for (int j = 0; j < streams; ++j) {
+            const int index         = 2 * streams + i * streams + j;
+            matrix[i * streams + j] = logits[index] * scale[2] + base[index];
+            maximum                 = fmaxf(maximum, matrix[i * streams + j]);
+        }
+        float sum = 0.0F;
+        for (int j = 0; j < streams; ++j) {
+            matrix[i * streams + j] = __expf(matrix[i * streams + j] - maximum);
+            sum += matrix[i * streams + j];
+        }
+        for (int j = 0; j < streams; ++j) {
+            matrix[i * streams + j] = matrix[i * streams + j] / sum + hc_eps;
+        }
+    }
+    for (int j = 0; j < streams; ++j) {
+        float sum = 0.0F;
+        for (int i = 0; i < streams; ++i) { sum += matrix[i * streams + j]; }
+        const float denominator = sum + hc_eps;
+        for (int i = 0; i < streams; ++i) { matrix[i * streams + j] /= denominator; }
+    }
+    for (int iteration = 1; iteration < sinkhorn_iterations; ++iteration) {
+        for (int i = 0; i < streams; ++i) {
+            float sum = 0.0F;
+            for (int j = 0; j < streams; ++j) { sum += matrix[i * streams + j]; }
+            const float denominator = sum + hc_eps;
+            for (int j = 0; j < streams; ++j) { matrix[i * streams + j] /= denominator; }
+        }
+        for (int j = 0; j < streams; ++j) {
+            float sum = 0.0F;
+            for (int i = 0; i < streams; ++i) { sum += matrix[i * streams + j]; }
+            const float denominator = sum + hc_eps;
+            for (int i = 0; i < streams; ++i) { matrix[i * streams + j] /= denominator; }
+        }
+    }
+    float* out = comb + static_cast<std::int64_t>(token) * streams * streams;
+    for (int i = 0; i < streams * streams; ++i) { out[i] = matrix[i]; }
+}
+
+/// collapsed[d,t] = sum_s pre[s,t] * residual[s*hidden+d, t]. One thread per output element.
+__global__ void manifold_collapse_kernel(const __nv_bfloat16* __restrict__ residual,
+                                         const float* __restrict__ pre, int hidden, int streams,
+                                         std::int64_t count,
+                                         __nv_bfloat16* __restrict__ collapsed) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    const int d               = static_cast<int>(i % hidden);
+    const std::int64_t token  = i / hidden;
+    const std::int64_t at     = token * static_cast<std::int64_t>(hidden) * streams;
+    const float* token_pre    = pre + token * streams;
+    float sum                 = 0.0F;
+    for (int s = 0; s < streams; ++s) {
+        sum = fmaf(token_pre[s], __bfloat162float(residual[at + s * hidden + d]), sum);
+    }
+    collapsed[i] = __float2bfloat16_rn(sum);
+}
+
 /// One block per token. The column is read once into shared memory and answers three questions:
 /// its own RMS, every projection row's dot product, and the weighted collapse at the end.
 __global__ __launch_bounds__(kThreads) void manifold_mix_kernel(
@@ -217,7 +349,13 @@ std::size_t manifold_hyper_connection_mix_workspace_capacity_bytes(std::int32_t 
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("manifold_hyper_connection: invalid token interval");
     }
-    return 0;
+    // `partials` (one sum of squares plus one dot per projection row, per token) and `pre`.
+    const std::int32_t rows = (2 + streams) * streams;
+    const std::size_t per_token =
+        (static_cast<std::size_t>(rows) + 1 + static_cast<std::size_t>(streams)) * sizeof(float);
+    // One arena allocation, rounded the way the arena rounds it.
+    const std::size_t bytes = per_token * static_cast<std::size_t>(max_tokens);
+    return (bytes + 255U) / 256U * 256U + 256U;
 }
 
 void manifold_hyper_connection_mix(const Tensor& residual,
@@ -268,21 +406,50 @@ void manifold_hyper_connection_mix(const Tensor& residual,
         throw std::invalid_argument("manifold_hyper_connection: at least one Sinkhorn iteration");
     }
 
-    const std::size_t shared = shared_bytes(streams, hidden);
-    static thread_local bool configured = false;
-    if (!configured) {
-        CUDA_CHECK(cudaFuncSetAttribute(manifold_mix_kernel,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(shared_bytes(kMaxStreams, kMaxWidth / kMaxStreams))));
-        configured = true;
+    // Enough blocks to fill the card, and never more slices than there is width to divide:
+    // a decode round has one token and would otherwise run a single CTA against the
+    // projection's whole 786 KB. Two blocks per SM is the point where more stops helping and
+    // the atomics start to cost.
+    const int slice_cap = (width + kThreads - 1) / kThreads;
+    int slices          = 1;
+    {
+        int device_id = 0;
+        CUDA_CHECK(cudaGetDevice(&device_id));
+        int multiprocessors = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
+                                          device_id));
+        const int wanted = (2 * multiprocessors + tokens - 1) / tokens;
+        slices           = std::max(1, std::min(slice_cap, wanted));
     }
-    manifold_mix_kernel<<<static_cast<unsigned>(tokens), kThreads, shared, stream>>>(
+
+    const std::size_t partial_floats =
+        static_cast<std::size_t>(rows + 1) * static_cast<std::size_t>(tokens);
+    const std::size_t pre_floats =
+        static_cast<std::size_t>(streams) * static_cast<std::size_t>(tokens);
+    const DeviceArena::Scope reserved = workspace.scope();
+    const DeviceSpan span = workspace.alloc_bytes((partial_floats + pre_floats) * sizeof(float));
+    auto* partials        = static_cast<float*>(span.data);
+    float* pre            = partials + partial_floats;
+    CUDA_CHECK(cudaMemsetAsync(partials, 0, partial_floats * sizeof(float), stream));
+
+    const dim3 project_grid(static_cast<unsigned>(slices), static_cast<unsigned>(tokens));
+    manifold_project_kernel<<<project_grid, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(residual.data),
-        static_cast<const __nv_bfloat16*>(weights.mix.qdata),
-        static_cast<const float*>(weights.base.data),
-        static_cast<const float*>(weights.scale.data), hidden, streams, rows, rms_eps, hc_eps,
-        sinkhorn_iterations, static_cast<__nv_bfloat16*>(collapsed.data),
-        static_cast<float*>(post.data), static_cast<float*>(comb.data));
+        static_cast<const __nv_bfloat16*>(weights.mix.qdata), width, rows, slices, partials);
+    CUDA_CHECK(cudaGetLastError());
+
+    manifold_reduce_kernel<<<static_cast<unsigned>(tokens), 32, 0, stream>>>(
+        partials, static_cast<const float*>(weights.base.data),
+        static_cast<const float*>(weights.scale.data), width, streams, rows, rms_eps, hc_eps,
+        sinkhorn_iterations, pre, static_cast<float*>(post.data),
+        static_cast<float*>(comb.data));
+    CUDA_CHECK(cudaGetLastError());
+
+    const std::int64_t collapse_count =
+        static_cast<std::int64_t>(hidden) * static_cast<std::int64_t>(tokens);
+    manifold_collapse_kernel<<<grid_for(collapse_count), kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(residual.data), pre, hidden, streams, collapse_count,
+        static_cast<__nv_bfloat16*>(collapsed.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
