@@ -151,6 +151,14 @@ struct EngineOptions {
     // explicit Q4 without the slot cache is refused).
     enum class HostExpertBank : std::uint8_t { Auto, W8, Q4 };
     HostExpertBank host_expert_bank    = HostExpertBank::Auto;
+    // Experts of this many mixture layers live in pinned, device-mapped host memory instead of
+    // on the card, and the kernels read them zero-copy over PCIe. A whole-model figure: each
+    // pipeline stage offloads the mixture layers it runs, counting from the first. 0 keeps
+    // every expert resident; a number at or above the layer count offloads all of them. This is
+    // what lets a model far larger than the cards load at all, at PCIe speed -- distinct from
+    // `cpu_moe_share`, which is about where the arithmetic runs rather than where the bytes
+    // live. Targets without a host bank refuse it rather than ignoring it.
+    std::uint32_t host_moe_layers      = 0;
     // Expert slot cache for targets that stream MoE experts from the host: number of device
     // expert slots (0 = experts are read from the host bank in place). Targets without a
     // host bank ignore it.

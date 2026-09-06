@@ -53,31 +53,6 @@ artifact::ObjectHandle host_q4(artifact::Binder& binder, HostBankPlan& bank,
     return handle;
 }
 
-// How the bank will find an object's bytes. One run is a span; several are the stretches of a
-// GGUF a fused parent is assembled from, and the bank concatenates them into pinned memory.
-HostObjectPlan host_plan(artifact::Binder& binder, artifact::ObjectHandle handle,
-                         const std::string& name) {
-    const auto runs = binder.runs(handle);
-    HostObjectPlan plan{handle, {}, name};
-    if (runs.size() == 1) {
-        plan.payload = binder.payload(handle).data;
-        return plan;
-    }
-    plan.parts.reserve(runs.size());
-    for (const artifact::PayloadRun& run : runs) { plan.parts.push_back(binder.run_span(run)); }
-    return plan;
-}
-
-// As `host`, but the format is read from the artifact rather than asserted. A GGUF-native
-// artifact stores the routed experts as the file's own blocks and never rewrites them.
-artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank,
-                                    const std::string& name, std::int32_t rows,
-                                    std::int32_t columns) {
-    const artifact::LinearBinding binding =
-        artifact::bind_linear(binder, name, rows, columns, TensorPlacement::ValidateOnly);
-    bank.objects.push_back(host_plan(binder, binding.object, name));
-    return binding;
-}
 
 // Validates the object and records its mapping for the pinned host bank.
 artifact::ObjectHandle host(artifact::Binder& binder, HostBankPlan& bank, const std::string& name,
@@ -209,72 +184,6 @@ ops::HyperConnectionWeights load_hc(const artifact::MaterializedArtifact& backin
     return out;
 }
 
-// A row-split W8 weight whose planes live in the pinned host bank, addressed through the
-// mapped device pointer (the same layout the device materializer produces).
-Weight host_ggml_weight(const HostObject& object, NumericFormat format, std::int32_t rows,
-                        std::int32_t columns) {
-    const auto values = static_cast<std::int32_t>(artifact::ggml_block_values(format));
-    if (columns % values != 0) {
-        throw std::logic_error("host bank object " + object.name +
-                               " has a width that is not a whole number of blocks");
-    }
-    const auto* bytes = static_cast<const std::byte*>(object.device);
-    Weight out{};
-    out.payload       = bytes;
-    out.payload_bytes = object.bytes;
-    out.qtype         = artifact::qtype_for(format);
-    out.layout        = QuantLayout::GgmlBlocks;
-    out.qdata         = bytes;
-    // A GGML block carries its own scale, so there is no separate plane and no padding: the
-    // stored width is the logical width.
-    out.scales          = nullptr;
-    out.group_size      = static_cast<std::uint32_t>(values);
-    out.group           = values;
-    out.scale_dtype     = DType::FP16;
-    out.ndim            = 2;
-    out.n               = rows;
-    out.k               = columns;
-    out.shape[0]        = rows;
-    out.shape[1]        = columns;
-    out.shape[2]        = 1;
-    out.shape[3]        = 1;
-    out.padded_shape[0] = rows;
-    out.padded_shape[1] = columns;
-    out.padded_shape[2] = 1;
-    out.padded_shape[3] = 1;
-    return out;
-}
-
-Weight host_w8_weight(const HostObject& object, std::int32_t rows, std::int32_t columns) {
-    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
-                                                static_cast<std::uint64_t>(columns)};
-    const artifact::RowSplitGeometry geometry =
-        artifact::row_split_geometry(NumericFormat::W8G32_F16S, shape);
-    if (geometry.encoded_bytes != object.bytes) {
-        throw std::logic_error("host bank object " + object.name + " has an unexpected size");
-    }
-    const auto* bytes = static_cast<const std::byte*>(object.device);
-    Weight out{};
-    out.payload          = bytes;
-    out.payload_bytes    = geometry.encoded_bytes;
-    out.high_plane_bytes = geometry.high_plane_bytes;
-    out.qtype            = QType::W8G32_F16S;
-    out.layout           = QuantLayout::RowSplit;
-    out.group_size       = static_cast<std::uint32_t>(geometry.group_size);
-    out.qdata            = bytes;
-    out.qhigh            = nullptr;
-    out.scales           = bytes + geometry.scale_plane_offset;
-    out.n                = rows;
-    out.k                = columns;
-    out.group            = static_cast<std::int32_t>(geometry.group_size);
-    out.scale_dtype      = DType::FP16;
-    out.ndim             = 2;
-    out.shape[0]         = rows;
-    out.shape[1]         = columns;
-    out.padded_shape[0]  = rows;
-    out.padded_shape[1]  = static_cast<std::int32_t>(geometry.padded_columns);
-    return out;
-}
 
 // The Q4G32AM flavour: base pointer + shape only. The object is not a W8 plane pair, so the
 // W8 size validation and the scale-plane split do not apply; readers derive the Q4 planes from

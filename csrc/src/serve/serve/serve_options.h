@@ -60,6 +60,9 @@ struct ServeOptions {
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
+    // --host-moe-layers N|all: experts of this many mixture layers live in pinned host memory,
+    // read over PCIe, instead of on the card. What lets a model larger than the cards load.
+    std::uint32_t host_moe_layers          = 0;
     std::uint32_t expert_slots             = 0; // --expert-slots N (host-streamed MoE targets)
     EngineOptions::HostExpertBank host_expert_bank               = EngineOptions::HostExpertBank::Auto; // --host-expert-bank w8|q4 (default: q4 when the slot cache is on)
     float cpu_moe_share                    = 0.0F; // --cpu-moe-share F (fraction of misses on the host)

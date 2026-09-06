@@ -77,7 +77,7 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.sinfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N|auto] [--kv-capacity N|auto] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N|auto] [--kv-capacity N|auto] [--host-moe-layers N|all] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices A,B,...]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
@@ -139,6 +139,10 @@ Options parse_options(int argc, char** argv) {
             } else if (text != "auto") {
                 throw std::invalid_argument("--host-expert-bank must be w8, q4 or auto");
             }
+        } else if (arg == "--host-moe-layers") {
+            const std::string spec = value(arg);
+            options.host_moe_layers = spec == "all" ? std::numeric_limits<std::uint32_t>::max()
+                                                    : parse_u32(spec.c_str(), "host-moe-layers");
         } else if (arg == "--expert-slots") {
             options.expert_slots = parse_u32(value(arg), "expert-slots");
         } else if (arg == "--cpu-moe-min-tokens") {

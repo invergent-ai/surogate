@@ -27,6 +27,12 @@ inline constexpr ops::SparseMoeGeometry kMoeGeometry = ops::kSparseMoeGlm53Geome
 /// so this is what makes eight of them enough.
 thread_local artifact::TensorPlacement g_layer_placement = artifact::TensorPlacement::Device;
 
+/// Whether the layer being bound puts its routed experts in the pinned host bank instead of on
+/// the card. Set per layer beside `g_layer_placement`, for the same reason: the binders are
+/// deep and threading a flag through every one of them would say nothing the site does not.
+thread_local bool g_layer_host_experts = false;
+thread_local family::HostBankPlan* g_host_bank = nullptr;
+
 NumericFormat endpoint_format(WeightsProfile weights_profile) {
     switch (weights_profile) {
     case WeightsProfile::GroupwiseInt:
@@ -98,13 +104,26 @@ void bind_feed_forward(artifact::Binder& binder, const std::string& prefix, bool
                                    static_cast<std::uint64_t>(g.hidden)});
     out.router_bias = bind_layer_tensor(binder, prefix + "moe/router_bias", NumericFormat::FP32,
                                         {experts});
-    out.routed_gate_up =
-        bind_weight(binder, prefix + "moe/routed_gate_up", weights,
-                    {experts * static_cast<std::uint64_t>(kMoeGeometry.expert_rows()),
-                     static_cast<std::uint64_t>(g.hidden)});
-    out.routed_down = bind_weight(binder, prefix + "moe/routed_down", weights,
-                                  {experts * static_cast<std::uint64_t>(g.hidden),
-                                   static_cast<std::uint64_t>(kMoeGeometry.intermediate)});
+    // The experts are 99.5 % of a mixture layer's bytes, so they are the only thing worth
+    // moving off the card -- and the only thing whose absence a round can absorb, because a
+    // token touches eight of 288 while the router and the shared expert run on every one.
+    const auto routed = [&](const std::string& name, std::int32_t rows, std::int32_t columns) {
+        if (!g_layer_host_experts) {
+            return bind_weight(binder, name, weights,
+                               {static_cast<std::uint64_t>(rows),
+                                static_cast<std::uint64_t>(columns)});
+        }
+        const artifact::LinearBinding binding =
+            family::host_linear(binder, *g_host_bank, name, rows, columns);
+        return WeightPlan{.object = binding.object, .format = binding.format};
+    };
+    out.host_experts   = g_layer_host_experts;
+    out.routed_gate_up = routed(prefix + "moe/routed_gate_up",
+                                static_cast<std::int32_t>(experts) * kMoeGeometry.expert_rows(),
+                                g.hidden);
+    out.routed_down    = routed(prefix + "moe/routed_down",
+                                static_cast<std::int32_t>(experts) * g.hidden,
+                                kMoeGeometry.intermediate);
     out.shared_gate_up =
         bind_weight(binder, prefix + "moe/shared_gate_up", weights,
                     {static_cast<std::uint64_t>(kMoeGeometry.shared_rows()),
@@ -115,10 +134,11 @@ void bind_feed_forward(artifact::Binder& binder, const std::string& prefix, bool
 }
 
 void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, int stage_first,
-                      int stage_last, BindingPlan& out) {
+                      int stage_last, std::uint32_t host_moe_layers, BindingPlan& out) {
     const NumericFormat weights   = endpoint_format(weights_profile);
     const family::TextGeometry& g = out.geometry;
     out.text_layers.resize(static_cast<std::size_t>(g.layers));
+    g_host_bank = &out.host_bank;
     for (std::size_t layer = 0; layer < out.text_layers.size(); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = layer_prefix(layer);
@@ -128,6 +148,10 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
                                       static_cast<int>(layer) < stage_last);
         g_layer_placement        = target.resident ? artifact::TensorPlacement::Device
                                                    : artifact::TensorPlacement::ValidateOnly;
+        // A whole-model count, so every stage offloads the same layers whatever the split: a
+        // layer below the bound keeps its experts on the host wherever it runs. Only a layer
+        // this stage actually runs has anything to put in the bank.
+        g_layer_host_experts = target.resident && layer < host_moe_layers;
 
         target.attention_hc = bind_hyper_connection(binder, prefix, "attn", g);
         target.input_norm   = bind_layer_tensor(binder, prefix + "input_norm",
@@ -227,8 +251,9 @@ HyperConnectionPayload load_hyper_connection(const artifact::MaterializedArtifac
 }
 
 FeedForwardPayload load_feed_forward(const artifact::MaterializedArtifact& backing,
-                                     const TextLayerPlan& source, const family::TextGeometry& g,
-                                     const Tensor& post_norm, std::int32_t layer) {
+                                     const family::HostBank* bank, const TextLayerPlan& source,
+                                     const family::TextGeometry& g, const Tensor& post_norm,
+                                     std::int32_t layer) {
     FeedForwardPayload out;
     out.hc          = load_hyper_connection(backing, source.feed_forward_hc, g, layer);
     out.norm        = post_norm;
@@ -248,11 +273,25 @@ FeedForwardPayload load_feed_forward(const artifact::MaterializedArtifact& backi
                                       NumericFormat::FP32,
                                       {static_cast<std::uint64_t>(kMoeGeometry.experts)})
             .data);
-    out.moe.routed_gate_up = materialized_weight(backing, source.feed_forward.routed_gate_up,
-                                                 kMoeGeometry.routed_gate_rows(), g.hidden);
-    out.moe.routed_down    = materialized_weight(backing, source.feed_forward.routed_down,
-                                                 kMoeGeometry.routed_down_rows(),
-                                                 kMoeGeometry.intermediate);
+    if (source.feed_forward.host_experts) {
+        if (bank == nullptr) {
+            throw std::logic_error("glm5_next: a layer was bound to the host expert bank but no "
+                                   "bank was built");
+        }
+        out.moe.routed_gate_up = family::host_ggml_weight(
+            bank->object(source.feed_forward.routed_gate_up.object),
+            source.feed_forward.routed_gate_up.format, kMoeGeometry.routed_gate_rows(), g.hidden);
+        out.moe.routed_down = family::host_ggml_weight(
+            bank->object(source.feed_forward.routed_down.object),
+            source.feed_forward.routed_down.format, kMoeGeometry.routed_down_rows(),
+            kMoeGeometry.intermediate);
+    } else {
+        out.moe.routed_gate_up = materialized_weight(backing, source.feed_forward.routed_gate_up,
+                                                     kMoeGeometry.routed_gate_rows(), g.hidden);
+        out.moe.routed_down    = materialized_weight(backing, source.feed_forward.routed_down,
+                                                     kMoeGeometry.routed_down_rows(),
+                                                     kMoeGeometry.intermediate);
+    }
     out.moe.shared_gate_up = materialized_weight(backing, source.feed_forward.shared_gate_up,
                                                  kMoeGeometry.shared_rows(), g.hidden);
     out.moe.shared_down    = materialized_weight(backing, source.feed_forward.shared_down, g.hidden,
@@ -286,7 +325,8 @@ family::TextGeometry declared_geometry_with_schedule(const artifact::Reader& rea
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features, int stage_first,
-                               int stage_last) {
+                               int stage_last, std::uint32_t host_moe_layers,
+                               LoadProgress progress) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.geometry     = declared_geometry_with_schedule(binder.reader());
@@ -324,7 +364,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                       {static_cast<std::uint64_t>(g.output_rows),
                                        static_cast<std::uint64_t>(g.hidden)});
     g_layer_placement   = artifact::TensorPlacement::Device;
-    bind_text_layers(binder, weights_profile, stage_first, stage_last, out);
+    out.host_bank.progress = std::move(progress);
+    bind_text_layers(binder, weights_profile, stage_first, stage_last, host_moe_layers, out);
+    g_layer_host_experts   = false;
+    g_host_bank            = nullptr;
     out.final_norm      = artifact::bind_device_tensor(
         binder, "text/final_norm", NumericFormat::BF16,
         {static_cast<std::uint64_t>(g.hidden)});
@@ -337,7 +380,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+    : backing(std::move(materialized)),
+      host_bank(plan.host_bank.objects.empty() ? nullptr
+                                               : family::HostBank::shared(plan.host_bank)) {
     runtime.geometry              = plan.geometry;
     const family::TextGeometry& g = runtime.geometry;
 
@@ -398,7 +443,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = materialized_weight(backing, source.attention.output, g.hidden,
                                                 g.query_size());
             target.post_attention_norm = post_norm;
-            target.post_mixer          = load_feed_forward(backing, source, g, post_norm, layer);
+            target.post_mixer          = load_feed_forward(backing, host_bank.get(), source, g, post_norm, layer);
         } else {
             KdaWeights& target = runtime.gdn_layers.at(kda_index++);
             target.input_norm  = input_norm;
@@ -436,7 +481,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = materialized_weight(backing, source.kda.output, g.hidden,
                                                 g.value_dim());
             target.post_attention_norm = post_norm;
-            target.post_mixer          = load_feed_forward(backing, source, g, post_norm, layer);
+            target.post_mixer          = load_feed_forward(backing, host_bank.get(), source, g, post_norm, layer);
         }
     }
 

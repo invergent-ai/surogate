@@ -15,7 +15,7 @@
 #include "artifact/materializer.h"
 #include "core/tensor.h"
 #include "targets/qwen4exp/impl/config.h"
-#include "targets/qwen4exp/impl/load/host_bank.h"
+#include "family/impl/load/host_bank.h"
 
 #include <array>
 #include <cstddef>
@@ -25,6 +25,20 @@
 #include <vector>
 
 namespace sinfer::targets::qwen4exp::detail {
+
+// The pinned host expert bank is the family's (`family/impl/load/host_bank.h`): any target with
+// a mixture can put its experts there and let the kernels read them zero-copy over PCIe. These
+// names keep this target's older spelling.
+using family::HostBank;
+using family::HostBankPlan;
+using family::HostObject;
+using family::HostObjectPlan;
+using family::host_ggml_weight;
+using family::host_linear;
+using family::host_plan;
+using family::host_tensor;
+using family::host_w8_weight;
+
 
 inline constexpr std::size_t kTextLayers          = TextConfig::layers;
 inline constexpr std::size_t kFullAttentionLayers = TextConfig::full_attention_layers();

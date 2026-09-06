@@ -13,6 +13,9 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
+#include "family/impl/load/host_bank.h"
+
+#include <memory>
 
 #include <cstddef>
 #include <cstdint>
@@ -71,6 +74,10 @@ struct KdaPlan {
 /// to layer numbers would have to be reconstructed.
 struct FeedForwardPlan {
     bool sparse = false;
+    /// This layer's routed experts live in the pinned host bank, not on the card, and the
+    /// kernels read them over PCIe. The shared expert and the router stay resident: they are a
+    /// thousandth of the bytes and run on every token.
+    bool host_experts = false;
     WeightPlan gate_up;   ///< dense: [2 * dense_intermediate, hidden]
     WeightPlan down;      ///< dense: [hidden, dense_intermediate]
     WeightPlan router;
@@ -111,6 +118,10 @@ struct BindingPlan {
     std::vector<TextLayerPlan> text_layers;
     artifact::ObjectHandle final_norm;
     WeightPlan output_head;
+
+    /// Objects this stage puts in pinned host memory instead of on the card. Empty unless
+    /// `--host-moe-layers` asked for it.
+    family::HostBankPlan host_bank;
 };
 
 struct ArtifactLoadPlan {
@@ -120,7 +131,8 @@ struct ArtifactLoadPlan {
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features, int stage_first = 0,
-                               int stage_last = 0);
+                               int stage_last = 0, std::uint32_t host_moe_layers = 0,
+                               LoadProgress progress = {});
 
 /// Which layers of this artifact attend, read from the objects it holds rather than from a
 /// number beside them: a layer carrying a latent key/value projection attends, one carrying
@@ -207,6 +219,9 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    /// Pinned host memory for the experts this stage did not upload. Shared process-wide, so
+    /// eight pipeline stages of one model pin one copy rather than eight.
+    std::shared_ptr<family::HostBank> host_bank;
     family::FrontendResources frontend;
     RuntimeModelView runtime;
 };

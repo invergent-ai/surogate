@@ -1,4 +1,4 @@
-#include "targets/qwen4exp/impl/load/host_bank.h"
+#include "family/impl/load/host_bank.h"
 #include "core/numa.h"
 
 #include "api/ops/cpu_expert_compute.h"
@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -27,7 +28,7 @@
 #include <numaif.h>
 #endif
 
-namespace sinfer::targets::qwen4exp::detail {
+namespace sinfer::family {
 
 namespace {
 
@@ -367,4 +368,108 @@ std::shared_ptr<HostBank> HostBank::shared(const HostBankPlan& plan) {
     return bank;
 }
 
-} // namespace sinfer::targets::qwen4exp::detail
+// -------------------------------------------------------------------------------------------
+// Binding an object into the bank instead of onto the device
+// -------------------------------------------------------------------------------------------
+
+HostObjectPlan host_plan(artifact::Binder& binder, artifact::ObjectHandle handle,
+                         const std::string& name) {
+    const auto runs = binder.runs(handle);
+    HostObjectPlan plan{handle, {}, name};
+    if (runs.size() == 1) {
+        plan.payload = binder.payload(handle).data;
+        return plan;
+    }
+    plan.parts.reserve(runs.size());
+    for (const artifact::PayloadRun& run : runs) { plan.parts.push_back(binder.run_span(run)); }
+    return plan;
+}
+
+artifact::ObjectHandle host_tensor(artifact::Binder& binder, HostBankPlan& bank,
+                                   const std::string& name, artifact::NumericFormat format,
+                                   std::initializer_list<std::uint64_t> shape) {
+    const artifact::ObjectHandle handle =
+        artifact::bind_tensor(binder, name, format, shape, artifact::TensorPlacement::ValidateOnly);
+    bank.objects.push_back(host_plan(binder, handle, name));
+    return handle;
+}
+
+artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank,
+                                    const std::string& name, std::int32_t rows,
+                                    std::int32_t columns) {
+    const artifact::LinearBinding binding =
+        artifact::bind_linear(binder, name, rows, columns, artifact::TensorPlacement::ValidateOnly);
+    bank.objects.push_back(host_plan(binder, binding.object, name));
+    return binding;
+}
+
+// -------------------------------------------------------------------------------------------
+// Reading the bank from a kernel
+// -------------------------------------------------------------------------------------------
+
+Weight host_ggml_weight(const HostObject& object, artifact::NumericFormat format, std::int32_t rows,
+                        std::int32_t columns) {
+    const auto values = static_cast<std::int32_t>(artifact::ggml_block_values(format));
+    if (columns % values != 0) {
+        throw std::logic_error("host bank object " + object.name +
+                               " has a width that is not a whole number of blocks");
+    }
+    const auto* bytes = static_cast<const std::byte*>(object.device);
+    Weight out{};
+    out.payload       = bytes;
+    out.payload_bytes = object.bytes;
+    out.qtype         = artifact::qtype_for(format);
+    out.layout        = QuantLayout::GgmlBlocks;
+    out.qdata         = bytes;
+    // A GGML block carries its own scale, so there is no separate plane and no padding: the
+    // stored width is the logical width.
+    out.scales          = nullptr;
+    out.group_size      = static_cast<std::uint32_t>(values);
+    out.group           = values;
+    out.scale_dtype     = DType::FP16;
+    out.ndim            = 2;
+    out.n               = rows;
+    out.k               = columns;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.shape[2]        = 1;
+    out.shape[3]        = 1;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
+    out.padded_shape[2] = 1;
+    out.padded_shape[3] = 1;
+    return out;
+}
+
+Weight host_w8_weight(const HostObject& object, std::int32_t rows, std::int32_t columns) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const artifact::RowSplitGeometry geometry =
+        artifact::row_split_geometry(artifact::NumericFormat::W8G32_F16S, shape);
+    if (geometry.encoded_bytes != object.bytes) {
+        throw std::logic_error("host bank object " + object.name + " has an unexpected size");
+    }
+    const auto* bytes = static_cast<const std::byte*>(object.device);
+    Weight out{};
+    out.payload          = bytes;
+    out.payload_bytes    = geometry.encoded_bytes;
+    out.high_plane_bytes = geometry.high_plane_bytes;
+    out.qtype            = QType::W8G32_F16S;
+    out.layout           = QuantLayout::RowSplit;
+    out.group_size       = static_cast<std::uint32_t>(geometry.group_size);
+    out.qdata            = bytes;
+    out.qhigh            = nullptr;
+    out.scales           = bytes + geometry.scale_plane_offset;
+    out.n                = rows;
+    out.k                = columns;
+    out.group            = static_cast<std::int32_t>(geometry.group_size);
+    out.scale_dtype      = DType::FP16;
+    out.ndim             = 2;
+    out.shape[0]         = rows;
+    out.shape[1]         = columns;
+    out.padded_shape[0]  = rows;
+    out.padded_shape[1]  = static_cast<std::int32_t>(geometry.padded_columns);
+    return out;
+}
+
+} // namespace sinfer::family

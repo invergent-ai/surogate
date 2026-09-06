@@ -2,23 +2,31 @@
 
 #include "api/types.h"
 
-// Pinned, device-mapped host memory for the objects that never become device resident: the
-// routed expert banks of every layer and the n-gram embedding table. Kernels read them
-// zero-copy over PCIe through the mapped device pointer (phase 1); later phases add a device
-// slot cache and CPU expert compute in front of the same bank.
+// Pinned, device-mapped host memory for the objects that never become device resident: a
+// mixture's routed experts, and whatever else a target decides not to keep on the card.
+// Kernels read them zero-copy over PCIe through the mapped device pointer; a target that also
+// wants a device slot cache and host-side expert compute builds those in front of this bank.
+//
+// This is family machinery, not one target's: a mixture is a mixture, and where its experts'
+// bytes live is a question about memory rather than about the model. A target opts in by
+// binding those objects with `host_tensor`/`host_linear` instead of the device binders, and by
+// handing the kernels `host_ggml_weight`/`host_w8_weight` over the bank's mapped pointers.
 
 #include "artifact/binder.h"
+#include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "artifact/typed_binding.h"
 #include "core/tensor.h"
 
 #include <cstddef>
 #include <memory>
 #include <cstdint>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <vector>
 
-namespace sinfer::targets::qwen4exp::detail {
+namespace sinfer::family {
 
 struct HostObjectPlan {
     artifact::ObjectHandle handle;
@@ -90,4 +98,39 @@ private:
     std::size_t total_bytes_ = 0;
 };
 
-} // namespace sinfer::targets::qwen4exp::detail
+// -------------------------------------------------------------------------------------------
+// Binding an object into the bank instead of onto the device
+// -------------------------------------------------------------------------------------------
+
+/// How the bank will find an object's bytes. One run is a span; several are the stretches of a
+/// GGUF a fused parent is assembled from, and the bank concatenates them into pinned memory.
+[[nodiscard]] HostObjectPlan host_plan(artifact::Binder& binder, artifact::ObjectHandle handle,
+                                       const std::string& name);
+
+/// Validate the object against the artifact and record its mapping for the bank. The object is
+/// never uploaded: `artifact::TensorPlacement::ValidateOnly` is what keeps its bytes off the device.
+artifact::ObjectHandle host_tensor(artifact::Binder& binder, HostBankPlan& bank,
+                                   const std::string& name, artifact::NumericFormat format,
+                                   std::initializer_list<std::uint64_t> shape);
+
+/// As `host_tensor`, but the format is read from the artifact rather than asserted -- a
+/// GGUF-native artifact stores a mixture as the file's own blocks and never rewrites them.
+artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank,
+                                    const std::string& name, std::int32_t rows,
+                                    std::int32_t columns);
+
+// -------------------------------------------------------------------------------------------
+// Reading the bank from a kernel
+// -------------------------------------------------------------------------------------------
+
+/// A weight held as the file's own GGML blocks, addressed through the bank's mapped device
+/// pointer. A block carries its own scale, so there is no separate plane and no padding.
+[[nodiscard]] Weight host_ggml_weight(const HostObject& object, artifact::NumericFormat format,
+                                      std::int32_t rows, std::int32_t columns);
+
+/// A row-split W8 weight whose planes live in the bank, in the layout the device materializer
+/// would have produced.
+[[nodiscard]] Weight host_w8_weight(const HostObject& object, std::int32_t rows,
+                                    std::int32_t columns);
+
+} // namespace sinfer::family
