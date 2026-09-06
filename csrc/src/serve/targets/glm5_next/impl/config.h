@@ -57,13 +57,16 @@ struct TextConfig {
     static constexpr int q_lora_rank   = 1536;
     static constexpr int kv_lora_rank  = 512;
 
-    // The sparse indexer, which this target does not run. Below this many cached tokens it
-    // selects every visible one, so dense attention is exactly what it would have asked for;
+    // The sparse indexer, which this target does not run. It selects `index_top_k / index_pool`
+    // pools of `index_pool` tokens and, because `index_kpool_always_select_tail` is set, the up
+    // to `index_pool - 1` newest tokens that do not yet fill a pool; that is 2,051 cells, the
+    // `n_select` llama.cpp gates its own indexer on. Below that many cached tokens every visible
+    // one is selected, so dense attention is exactly what the indexer would have asked for;
     // above it the two differ and the engine refuses rather than attending to more than the
     // model was trained to.
-    static constexpr int index_top_k     = 2048;
-    static constexpr int index_pool       = 4;
-    static constexpr int dense_exact_context = index_top_k;
+    static constexpr int index_top_k         = 2048;
+    static constexpr int index_pool          = 4;
+    static constexpr int dense_exact_context = index_top_k + index_pool - 1;
 
     // The mixture: a sigmoid-plus-bias router over 288 experts, top-8 renormalised and scaled,
     // plus an always-on expert added with weight one. Its router therefore has one row per
@@ -134,6 +137,7 @@ static_assert(TextConfig::full_attention_index(3) == 0 &&
               TextConfig::full_attention_index(43) == 10);
 static_assert(TextConfig::gdn_index(0) == 0 && TextConfig::gdn_index(44) == 33);
 static_assert(TextConfig::hc_mix == 24 && TextConfig::hc_width == 16384);
+static_assert(TextConfig::dense_exact_context == 2051);
 static_assert(TextConfig::query_size == TextConfig::kv_size,
               "MLA expands the latent to one key/value head per query head");
 

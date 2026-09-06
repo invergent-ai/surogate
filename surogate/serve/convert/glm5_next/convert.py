@@ -24,6 +24,9 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
+import torch
+
 from surogate.serve.artifact.container import ArtifactIdentity, ArtifactWriter
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common.gguf_repack import GgufRepackSource
@@ -61,6 +64,27 @@ def _refuse_what_is_not_bound(source: GgufSource, geometry: inv.Geometry) -> Non
               f"{geometry.index_topk} tokens, so up to that context every visible token is "
               f"selected and full attention is exactly what it would have asked for; the "
               f"artifact records the bound and the engine refuses beyond it", flush=True)
+
+
+def materialize_unspoken(source: GgufSource, name: str, spec) -> bytes:
+    """The objects `recipe.materialized_objects` names: the KDA decay's `A_log`.
+
+    llama.cpp's converter folds the exponential -- `ssm_a = -exp(A_log)` -- so that its graph
+    multiplies by the stored value directly. The engine's gate takes `A_log`, as the checkpoint
+    writes it, so the fold is undone here. The sign is checked because it is the whole
+    convention: a stored value that is not negative is not `-exp` of anything, and serving it
+    as `A_log` would be silent.
+    """
+    if not name.endswith("kda/a_log"):
+        raise KeyError(f"no materialiser covers artifact object {name!r}")
+    stored_name = f"blk.{name.split('/')[2]}.ssm_a"
+    stored = source.float32(stored_name).reshape(-1)
+    if stored.size == 0 or not np.all(stored < 0.0):
+        raise ValueError(
+            f"{stored_name}: expected -exp(A_log), every value negative; the largest is "
+            f"{stored.max() if stored.size else 'nothing'}"
+        )
+    return encode_tensor(torch.from_numpy(np.log(-stored)), spec)
 
 
 def _geometry_block(geometry: inv.Geometry) -> dict[str, float]:
@@ -110,6 +134,7 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
     tensor_specs = inv.build_tensor_specs(geometry)
     object_specs: tuple = inv.RESOURCE_SPECS + tensor_specs
     recipes = rcp.build_recipes(geometry)
+    materialized = rcp.materialized_objects(geometry)
 
     repack = GgufRepackSource.from_sources(source.shards, candidate_sources(source))
     # Two ways to read a weight where it lies. A K-quant the kernels already decode is served
@@ -162,6 +187,8 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
                 if spec.name not in resources:
                     continue
                 payload: bytes = resources[spec.name]
+            elif spec.name in materialized:
+                payload = materialize_unspoken(source, spec.name, spec)
             else:
                 tensor = rcp.materialize_recipe(recipes[spec.name], reader)
                 payload = encode_tensor(tensor, spec)

@@ -6,7 +6,7 @@ the GGUF's logical ones (reversed `ne`). The expression language, the row algebr
 it and the planners that turn it into runs are the shared ones.
 
 Almost everything is a row program over one or three sources, which is what lets the 185 GB of
-experts stay in the file. Three objects are not, and each is not for its own reason:
+experts stay in the file. Four objects are not, and each is not for its own reason:
 
 - **the convolution taps.** The file holds one `[channels, K]` tensor per projection, ggml's
   channel-major order; the op reads `weight[tap * C + c]`. Concatenating the three and
@@ -18,6 +18,12 @@ experts stay in the file. Three objects are not, and each is not for its own rea
   it into a quantised object would mean re-quantising weights the file had already quantised.
   The value half is already stored as the projection and stays in the file.
 - **the router**, which the file keeps in F32 and the artifact holds in BF16.
+- **the decay's `A_log`.** llama.cpp stores `ssm_a = -exp(A_log)` so that its own graph
+  multiplies by the tensor as it lies; the engine's gate, like the checkpoint's, is written in
+  terms of `A_log`. Undoing the fold is a log of a negation, which no row program says, so the
+  driver materialises it (`materialized_objects`). Bound as stored, the gate ran at
+  `exp(-exp(A_log))` -- between 6e-6 and 0.4 where the model wants 1 to 12 -- and every
+  linear-attention state forgot its past at one rate whatever the token said.
 
 Everything else -- the fused KDA q|k|v, the fused dense and shared gate/up, and every one of
 the 288 experts per layer -- is rows drawn from mapped sources, read where they lie.
@@ -43,7 +49,7 @@ from surogate.serve.convert.common.recipe import (
 
 from . import inventory as inv
 
-RECIPE_ID = "glm5-next-v1"
+RECIPE_ID = "glm5-next-v2"
 
 #: Objects whose op reads the row-split W8 planes rather than the file's own block format.
 #: Their weights are still read from the GGUF where they lie -- Q8_0 and W8G32_F16S hold the
@@ -70,6 +76,19 @@ NATIVE_EXCLUDE_SUFFIXES = (
     "moe/shared_gate_up",
     "moe/shared_down",
 )
+
+
+def materialized_objects(geometry: inv.Geometry) -> frozenset[str]:
+    """Objects the expression language cannot say, which the driver computes instead.
+
+    One kind: the KDA decay's `A_log`, stored by llama.cpp as `-exp(A_log)`. Every other value
+    transform a GGUF needs is a rearrangement of rows, and the planners read those in place.
+    """
+    return frozenset(
+        f"text/layers/{layer}/kda/a_log"
+        for layer in range(geometry.layers)
+        if not geometry.is_attention(layer)
+    )
 
 
 def _blk(layer: int) -> str:
@@ -133,7 +152,7 @@ def _kda(layer: int, prefix: str, geometry: inv.Geometry) -> list[TensorRecipe]:
             source(f"{blk}ssm_f_b.weight", (dim, geometry.kda_gate_rank)),
         ),
         TensorRecipe(f"{prefix}kda/decay_bias", source(f"{blk}ssm_dt.bias", (dim,))),
-        TensorRecipe(f"{prefix}kda/a_log", source(f"{blk}ssm_a", (geometry.kda_heads,))),
+        # `kda/a_log` is not a row program: see `materialized_objects`.
         TensorRecipe(
             f"{prefix}kda/beta", source(f"{blk}ssm_beta.weight", (geometry.kda_heads, hidden))
         ),
@@ -299,6 +318,7 @@ __all__ = [
     "RECIPE_ID",
     "build_recipes",
     "expression_sources",
+    "materialized_objects",
     "materialize_expression",
     "materialize_recipe",
     "validate_recipe_coverage",
