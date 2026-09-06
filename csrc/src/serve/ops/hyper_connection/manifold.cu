@@ -70,21 +70,32 @@ __global__ __launch_bounds__(kThreads) void manifold_project_kernel(
     }
 }
 
-/// One warp per token: the accumulated dots become `pre`, `post` and the doubly-stochastic
-/// `comb`. Tiny, and serial by nature -- Sinkhorn is twenty passes over a 4x4 matrix.
+/// One thread per token: the accumulated dots become `pre`, `post` and the doubly-stochastic
+/// `comb`. Sinkhorn is twenty passes over a `kStreams`-square matrix, serial by nature.
+///
+/// `kStreams` is a template parameter and not an argument because it indexes the two small
+/// arrays below. With a runtime bound the compiler cannot keep them in registers and they land
+/// in local memory, which is DRAM: the same arithmetic then took 53.8 us a call where it takes
+/// about two, and at ninety calls a token that was five milliseconds of a decode round.
+template <int kStreams>
 __global__ void manifold_reduce_kernel(const float* __restrict__ partials,
                                        const float* __restrict__ base,
-                                       const float* __restrict__ scale, int width, int streams,
+                                       const float* __restrict__ scale, int width, int tokens,
                                        int rows, float rms_eps, float hc_eps,
                                        int sinkhorn_iterations, float* __restrict__ pre_out,
                                        float* __restrict__ post, float* __restrict__ comb) {
-    const int token = static_cast<int>(blockIdx.x);
-    if (threadIdx.x != 0) { return; }
+    constexpr int streams = kStreams;
+    const int token       = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                            static_cast<int>(threadIdx.x);
+    if (token >= tokens) { return; }
     const float* accumulated = partials + static_cast<std::int64_t>(token) * (rows + 1);
     const float inv          = rsqrtf(accumulated[0] / static_cast<float>(width) + rms_eps);
 
-    float logits[kMaxRows];
-    for (int r = 0; r < rows; ++r) { logits[r] = accumulated[1 + r] * inv; }
+    constexpr int kRows = (2 + kStreams) * kStreams;
+    float logits[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) { logits[r] = accumulated[1 + r] * inv; }
+#pragma unroll
     for (int s = 0; s < streams; ++s) {
         pre_out[static_cast<std::int64_t>(token) * streams + s] =
             sigmoid(logits[s] * scale[0] + base[s]) + hc_eps;
@@ -94,44 +105,59 @@ __global__ void manifold_reduce_kernel(const float* __restrict__ partials,
     // softmax over j, then Sinkhorn-Knopp onto the doubly-stochastic manifold. Small enough
     // (streams <= 4) that one thread is the clearest way to keep the iteration order the
     // reference's.
-    float matrix[kMaxStreams * kMaxStreams];
+    float matrix[kStreams * kStreams];
+    #pragma unroll
     for (int i = 0; i < streams; ++i) {
         float maximum = -3.402823466e+38F;
+        #pragma unroll
         for (int j = 0; j < streams; ++j) {
             const int index         = 2 * streams + i * streams + j;
             matrix[i * streams + j] = logits[index] * scale[2] + base[index];
             maximum                 = fmaxf(maximum, matrix[i * streams + j]);
         }
         float sum = 0.0F;
+        #pragma unroll
         for (int j = 0; j < streams; ++j) {
             matrix[i * streams + j] = __expf(matrix[i * streams + j] - maximum);
             sum += matrix[i * streams + j];
         }
+        #pragma unroll
         for (int j = 0; j < streams; ++j) {
             matrix[i * streams + j] = matrix[i * streams + j] / sum + hc_eps;
         }
     }
+    #pragma unroll
     for (int j = 0; j < streams; ++j) {
         float sum = 0.0F;
+        #pragma unroll
         for (int i = 0; i < streams; ++i) { sum += matrix[i * streams + j]; }
         const float denominator = sum + hc_eps;
+        #pragma unroll
         for (int i = 0; i < streams; ++i) { matrix[i * streams + j] /= denominator; }
     }
+    #pragma unroll
     for (int iteration = 1; iteration < sinkhorn_iterations; ++iteration) {
+        #pragma unroll
         for (int i = 0; i < streams; ++i) {
             float sum = 0.0F;
+            #pragma unroll
             for (int j = 0; j < streams; ++j) { sum += matrix[i * streams + j]; }
             const float denominator = sum + hc_eps;
+            #pragma unroll
             for (int j = 0; j < streams; ++j) { matrix[i * streams + j] /= denominator; }
         }
+        #pragma unroll
         for (int j = 0; j < streams; ++j) {
             float sum = 0.0F;
+            #pragma unroll
             for (int i = 0; i < streams; ++i) { sum += matrix[i * streams + j]; }
             const float denominator = sum + hc_eps;
+            #pragma unroll
             for (int i = 0; i < streams; ++i) { matrix[i * streams + j] /= denominator; }
         }
     }
     float* out = comb + static_cast<std::int64_t>(token) * streams * streams;
+#pragma unroll
     for (int i = 0; i < streams * streams; ++i) { out[i] = matrix[i]; }
 }
 
@@ -438,11 +464,23 @@ void manifold_hyper_connection_mix(const Tensor& residual,
         static_cast<const __nv_bfloat16*>(weights.mix.qdata), width, rows, slices, partials);
     CUDA_CHECK(cudaGetLastError());
 
-    manifold_reduce_kernel<<<static_cast<unsigned>(tokens), 32, 0, stream>>>(
-        partials, static_cast<const float*>(weights.base.data),
-        static_cast<const float*>(weights.scale.data), width, streams, rows, rms_eps, hc_eps,
-        sinkhorn_iterations, pre, static_cast<float*>(post.data),
-        static_cast<float*>(comb.data));
+    // A thread per token, and the stream count compiled in: the four-stream form is the one
+    // every released mHC checkpoint has, and a wider one would need its own instantiation here
+    // rather than silently taking a slower path.
+    {
+        constexpr int kReduceThreads = 128;
+        const unsigned grid = (static_cast<unsigned>(tokens) + kReduceThreads - 1) / kReduceThreads;
+        if (streams != 4) {
+            throw std::invalid_argument(
+                "manifold_hyper_connection: only a four-stream residual is compiled; got " +
+                std::to_string(streams));
+        }
+        manifold_reduce_kernel<4><<<grid, kReduceThreads, 0, stream>>>(
+            partials, static_cast<const float*>(weights.base.data),
+            static_cast<const float*>(weights.scale.data), width, tokens, rows, rms_eps, hc_eps,
+            sinkhorn_iterations, pre, static_cast<float*>(post.data),
+            static_cast<float*>(comb.data));
+    }
     CUDA_CHECK(cudaGetLastError());
 
     const std::int64_t collapse_count =
