@@ -363,6 +363,12 @@ std::vector<int> balanced_stage_bounds(const EngineOptions& options, artifact::R
         EngineOptions probe        = options;
         probe.pipeline_stage_first = 0;
         probe.pipeline_stage_last  = last;
+        // Weigh a layer by what it *is*, not by what an offload policy would leave of it:
+        // planning with offload on makes every mixture layer look like its norms, and the
+        // boundaries then balance nothing. Offload trims the stages this split leaves tight,
+        // which is the other half of the same decision and comes after it.
+        probe.host_moe_layers      = 0;
+        probe.gpu_layers           = 0;
         artifact::Binder binder(reader);
         return Target::plan_load(binder, probe, weights_profile)
             .materialization()
@@ -442,7 +448,47 @@ template <class Target>
 struct StagePreflight {
     std::uint32_t max_context = 0;
     std::uint32_t kv_tokens   = 0;
+    /// Mixture layers each stage moves to host memory. Zero everywhere unless the operator
+    /// asked for `auto`, and then the least each stage needs -- usually zero for most of them,
+    /// because the stages are not equally tight.
+    std::vector<std::uint32_t> host_moe;
 };
+
+/// What one stage can hold as planned. Planning uploads nothing.
+struct StageFit {
+    std::size_t budget_bytes = 0;
+    std::uint32_t kv_tokens  = 0;
+};
+
+template <class Target>
+StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
+                   typename Target::WeightsProfile weights_profile,
+                   const family::TextGeometry& geometry, DeviceContext& probe,
+                   std::uint32_t max_context) {
+    artifact::Binder binder(reader);
+    auto plan = Target::plan_load(binder, stage, weights_profile);
+    StageFit fit{};
+    fit.budget_bytes = subtract_saturating(
+        runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
+        projected_derived_residency_bytes(binder, plan.materialization()));
+    if (max_context == 0) { return fit; }
+    EngineOptions sized = stage;
+    sized.max_context   = max_context;
+    sized.prefill_chunk = std::min(stage.prefill_chunk, max_context);
+    if (sized.elastic_kv_overcommit) { sized.elastic_kv = true; }
+    const runtime::SequenceCapacityCurve curve =
+        Target::make_sequence_planner(probe, sized, weights_profile, geometry).capacity_curve();
+    const KvCapacityPolicy policy =
+        sized.elastic_kv_overcommit && sized.kv_capacity.mode == KvCapacityMode::Automatic
+            ? KvCapacityPolicy::explicit_capacity(sized.max_context)
+            : sized.kv_capacity;
+    fit.kv_tokens = runtime::resolve_kv_capacity(
+                        policy, curve,
+                        subtract_saturating(fit.budget_bytes,
+                                            elastic_kv_unmapped_commitment(probe.device)))
+                        .resolved_tokens;
+    return fit;
+}
 
 template <class Target>
 StagePreflight<Target>
@@ -452,42 +498,64 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
     const family::TextGeometry geometry = Target::declared_geometry(reader);
     const auto count                    = stage_options.size();
 
-    std::vector<std::size_t> budgets(count, 0);
     StagePreflight<Target> out{};
+    out.host_moe.assign(count, 0);
     for (std::size_t s = 0; s < count; ++s) {
         DeviceContext probe(stage_options[s].device);
-        artifact::Binder binder(reader);
-        auto plan  = Target::plan_load(binder, stage_options[s], weights_profile);
-        budgets[s] = subtract_saturating(
-            runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
-            projected_derived_residency_bytes(binder, plan.materialization()));
+        const StageFit fit =
+            stage_fit<Target>(reader, stage_options[s], weights_profile, geometry, probe, 0);
         if (options.max_context != 0) { continue; }
         const std::uint32_t resolved = resolve_automatic_context<Target>(
-            probe, stage_options[s], weights_profile, geometry, budgets[s]);
+            probe, stage_options[s], weights_profile, geometry, fit.budget_bytes);
         out.max_context = out.max_context == 0 ? resolved : std::min(out.max_context, resolved);
     }
     if (options.max_context != 0) { out.max_context = options.max_context; }
 
     // The ceiling is shared, so every stage plans the same curve shape; what differs is what a
     // token costs on each (its own layers) and what each has spare.
+    //
+    // Under `auto` a stage that cannot hold the pool this run needs moves its own mixture layers
+    // to host memory, one at a time, until it can. What the run needs is the KV for its lanes at
+    // the resolved ceiling. A stage that already holds that offloads nothing -- which on an
+    // uneven split is most of them, and is the whole point: a layer moved off a card that had
+    // room costs PCIe on every token it serves and buys nothing.
+    const bool automatic = options.host_moe_layers == EngineOptions::kHostMoeLayersAuto;
+    const std::uint64_t wanted = static_cast<std::uint64_t>(options.max_concurrency) *
+                                 static_cast<std::uint64_t>(out.max_context);
     for (std::size_t s = 0; s < count; ++s) {
         DeviceContext probe(stage_options[s].device);
         EngineOptions stage = stage_options[s];
-        stage.max_context   = out.max_context;
-        stage.prefill_chunk = std::min(options.prefill_chunk, out.max_context);
-        if (stage.elastic_kv_overcommit) { stage.elastic_kv = true; }
-        const runtime::SequenceCapacityCurve curve =
-            Target::make_sequence_planner(probe, stage, weights_profile, geometry).capacity_curve();
-        const KvCapacityPolicy policy =
-            stage.elastic_kv_overcommit && stage.kv_capacity.mode == KvCapacityMode::Automatic
-                ? KvCapacityPolicy::explicit_capacity(stage.max_context)
-                : stage.kv_capacity;
-        const std::uint32_t tokens =
-            runtime::resolve_kv_capacity(
-                policy, curve,
-                subtract_saturating(budgets[s], elastic_kv_unmapped_commitment(probe.device)))
-                .resolved_tokens;
-        out.kv_tokens = out.kv_tokens == 0 ? tokens : std::min(out.kv_tokens, tokens);
+        if (automatic) { stage.host_moe_layers = 0; }
+        // A stage that cannot hold even the minimum pool does not return a small number, it
+        // refuses -- which under `auto` is one more reason to offload a layer, not an error.
+        const auto fit_or_zero = [&](const EngineOptions& candidate) {
+            try {
+                return stage_fit<Target>(reader, candidate, weights_profile, geometry, probe,
+                                         out.max_context);
+            } catch (const std::invalid_argument&) {
+                return StageFit{};
+            }
+        };
+        StageFit fit = automatic ? fit_or_zero(stage)
+                                 : stage_fit<Target>(reader, stage, weights_profile, geometry,
+                                                     probe, out.max_context);
+        if (automatic) {
+            const auto layers = static_cast<std::uint32_t>(stage.pipeline_stage_last -
+                                                           stage.pipeline_stage_first);
+            while (fit.kv_tokens < wanted && stage.host_moe_layers < layers) {
+                ++stage.host_moe_layers;
+                fit = fit_or_zero(stage);
+            }
+            out.host_moe[s] = stage.host_moe_layers;
+            if (stage.host_moe_layers != 0) {
+                std::fprintf(stderr,
+                             "pipeline: stage %zu offloads %u mixture layer(s) to host memory so "
+                             "the pipeline can hold %llu KV tokens\n",
+                             s, stage.host_moe_layers,
+                             static_cast<unsigned long long>(wanted));
+            }
+        }
+        out.kv_tokens = out.kv_tokens == 0 ? fit.kv_tokens : std::min(out.kv_tokens, fit.kv_tokens);
     }
     return out;
 }
@@ -506,6 +574,7 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
     std::uint32_t resolved_context = 0;
     const std::vector<int> bounds =
         balanced_stage_bounds<Target>(options, reader, layers, stage_count);
+    std::vector<std::uint32_t> stage_host_moe;
     const auto stage_options_for = [&](int s) {
         EngineOptions stage_options             = options;
         stage_options.device                    = options.devices[static_cast<std::size_t>(s)];
@@ -520,6 +589,9 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
             stage_options.kv_capacity   = KvCapacityPolicy::explicit_capacity(resolved_kv);
             stage_options.max_context   = resolved_context;
             stage_options.prefill_chunk = std::min(options.prefill_chunk, resolved_context);
+            stage_options.host_moe_layers = stage_host_moe.empty()
+                                                ? stage_options.host_moe_layers
+                                                : stage_host_moe[static_cast<std::size_t>(s)];
         }
         return stage_options;
     };
@@ -532,6 +604,7 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
             preflight_pipeline<Target>(options, reader, probe_options);
         resolved_context = shared.max_context;
         resolved_kv      = shared.kv_tokens;
+        stage_host_moe   = shared.host_moe;
         std::fprintf(stderr,
                      "pipeline: %d stages, max context %u tokens, KV pool %u tokens "
                      "(the tightest stage's)\n",

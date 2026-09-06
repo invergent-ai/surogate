@@ -158,6 +158,11 @@ struct EngineOptions {
     // what lets a model far larger than the cards load at all, at PCIe speed -- distinct from
     // `cpu_moe_share`, which is about where the arithmetic runs rather than where the bytes
     // live. Targets without a host bank refuse it rather than ignoring it.
+    /// `--host-moe-layers auto`: let the pipeline constructor decide, per stage, the fewest
+    /// mixture layers that stage must move to host memory for the run's lanes to fit. A stage
+    /// that already fits offloads nothing, which is the point -- offloading a layer that did
+    /// not need to move costs PCIe on every token it serves and buys nothing.
+    static constexpr std::uint32_t kHostMoeLayersAuto = 0xFFFFFFFEU;
     std::uint32_t host_moe_layers      = 0;
     // Layers whose weights stay on the card, counted from the first, as llama.cpp's `-ngl`
     // counts them. Every later layer is read from pinned host memory in its entirety --

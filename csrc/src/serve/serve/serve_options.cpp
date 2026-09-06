@@ -105,7 +105,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.sinfer> [--host H] [--port N] [--api-key KEY] "
-           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] [--host-moe-layers N|all] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
+           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] [--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices A,B,...] "
@@ -241,9 +241,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             // its routers, norms, attention and shared experts resident.
             const std::string spec = require_value("--host-moe-layers");
             options.host_moe_layers =
-                spec == "all" ? std::numeric_limits<std::uint32_t>::max()
-                              : static_cast<std::uint32_t>(
-                                    parse_nonnegative_int(spec.c_str(), "host-moe-layers"));
+                spec == "all"  ? std::numeric_limits<std::uint32_t>::max()
+                : spec == "auto" ? EngineOptions::kHostMoeLayersAuto
+                                 : static_cast<std::uint32_t>(
+                                       parse_nonnegative_int(spec.c_str(), "host-moe-layers"));
         } else if (arg == "--expert-slots") {
             options.expert_slots =
                 static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--expert-slots"), "expert-slots"));

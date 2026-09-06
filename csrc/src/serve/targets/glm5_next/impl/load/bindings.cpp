@@ -133,6 +133,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
     const NumericFormat weights   = endpoint_format(weights_profile);
     const family::TextGeometry& g = out.geometry;
     out.text_layers.resize(static_cast<std::size_t>(g.layers));
+    std::uint32_t stage_mixture_seen = 0;
     for (std::size_t layer = 0; layer < out.text_layers.size(); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = layer_prefix(layer);
@@ -144,14 +145,21 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
         // nothing else. A layer past `gpu_layers` is read from host memory in its entirety.
         // Otherwise it is resident, and `host_moe_layers` may still move its experts.
         //
-        // Both counts are whole-model, so the same layers are offloaded whatever the pipeline
-        // split -- a stage boundary should not change which weights live where.
+        // `host_moe_layers` counts the mixture layers *this stage runs*, not the model's. On a
+        // pipeline the stages are not equally tight -- the leading dense layers make the first
+        // one light -- so a whole-model count offloads from whichever stage happens to hold the
+        // low-numbered layers, which is the one that needed it least. Per stage, the pipeline
+        // constructor can give each the amount it actually needs.
         const bool on_card = gpu_layers == 0 || layer < gpu_layers;
         g_layer_placement  = !target.resident ? artifact::TensorPlacement::ValidateOnly
                              : on_card       ? artifact::TensorPlacement::Device
                                              : artifact::TensorPlacement::HostBank;
-        g_expert_placement = layer < host_moe_layers ? artifact::TensorPlacement::HostBank
-                                                     : artifact::TensorPlacement::Device;
+        const bool sparse_layer = binder.has(prefix + "moe/router");
+        const bool offload_experts =
+            target.resident && sparse_layer && stage_mixture_seen < host_moe_layers;
+        if (target.resident && sparse_layer) { ++stage_mixture_seen; }
+        g_expert_placement = offload_experts ? artifact::TensorPlacement::HostBank
+                                             : artifact::TensorPlacement::Device;
 
         target.attention_hc = bind_hyper_connection(binder, prefix, "attn", g);
         target.input_norm   = bind_layer_tensor(binder, prefix + "input_norm",
