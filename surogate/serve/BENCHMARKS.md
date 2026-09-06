@@ -163,7 +163,7 @@ gap because llama.cpp's server does not batch these as well as its kernels run.
 | **surogate** | 1 | 100 | **5,815** | **1,302** | **7,117** | **170 ms** | all-NVFP4, 128 lanes, chunk 4,096, `--max-model-len 2048`; 2026-08-30 07:11, uncapped GPU 2. Reproduces the pre-cap pass of 08-28 (1,330) within noise, so nothing regressed — the 1,068 measured under the caps was the cap |
 | vLLM | 1 | 100 | 5,003 | 1,120 | 6,123 | 8.06 s | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`, `--max-num-seqs 128`; 2026-08-30 07:28, uncapped GPU 3, idle host. surogate **+16 % decode, 47× TTFT** |
 | surogate | 8 | 100 | 4,403 | 986 | 5,389 | 1.33 s | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:18, uncapped. **Below the one card above** — the pipeline buys capacity, not throughput per card |
-| **surogate** | 8 | 1 | **306** | **68.6** | **374** | **0.16 s** | same, one user: each card holds 6 layers, so a token costs ~0.9 ms across the eight stages against ~5 ms on one card |
+| **surogate** | 8 | 1 | **168.5** | **40.7** | **209.2** | **0.57 s** | `--kv-capacity 704`, everything resident, the latent attention served absorbed (one 512-wide key/value head per token). Ahead of llama.cpp on all three columns; 119.6 / 28.9 / 0.66 on the first pass, 164.4 / 39.7 / 0.65 with the expanded attention |
 | **surogate** | 1 | 100 | 768 | **2,097** | **2,865** | **13.7 s** | decode-heavy 128/512, 64 lanes, `--max-model-len 1024 --max-pending-requests 512`; 2026-08-30 19:32, GPU 4, launched and probed concurrently with the row below. Replaces an undated pass that read 1,884. The pending queue is not optional here — 100 users against 64 lanes rejects with 429 on the default |
 | vLLM | 1 | 100 | 608 | 1,662 | 2,270 | 21.8 s | decode-heavy, GPU 5, same session. surogate **+26 % decode at 0.6× the TTFT** |
 | surogate | 1 | 100 | 11,557 | 87.8 | 11,645 | 15.38 s | prefill-heavy 2048/16, chunk 4,096, `--max-model-len 2304`, 128 lanes; 2026-08-30 18:57, GPU 1, same session as the vLLM row below. **89 % of vLLM's prefill** — and the shape is insensitive to the two obvious knobs: KV/admission moves it 1.5 % (context 4,096 → 2,304, 11,389 → 11,557) and the prompt chunk not at all (2,048 fails on KV entitlement; 8,192 reads 11,553 and 16,384 reads 11,538) |
@@ -227,7 +227,9 @@ without batch flags understated it 3.9× and are gone.
 
 `models/GLM-5.3-Flash-UD-Q4_K_XL-*.gguf` read in place, 2026-09-06, idle host, 512/128, one
 engine at a time, every row below re-measured in one session on the same binary. Ours: the
-eight-stage pipeline, `--max-model-len 704 --max-num-batched-tokens 512 --kv-cache-dtype bf16`.
+eight-stage pipeline with the latent attention served **absorbed** -- the query folded through
+the key half of the expansion into the 512-wide latent, one key/value head per token in the
+cache -- `--max-model-len 704 --max-num-batched-tokens 512 --kv-cache-dtype bf16`.
 llama.cpp: the same file on the same eight cards, `--split-mode layer -ngl 99 -fa 1 -np N`,
 built from ggml-org PR 27754 (`study/llama.cpp-glm`) — no released llama.cpp knows this
 architecture.
@@ -236,36 +238,42 @@ architecture.
 |---|---:|---:|---:|---:|---:|---:|---|
 | **surogate** | 8 | 1 | **164.4** | **39.7** | **204.1** | **0.65 s** | `--kv-capacity 704`, everything resident. Ahead of llama.cpp on all three columns; it was 119.6 / 28.9 / 0.66 before the two hyper-connection kernels were fixed |
 | llama.cpp | 8 | 1 | 156.6 | 37.8 | 194.4 | 1.18 s | `-np 1` |
-| **llama.cpp** | 8 | 16 | **153.9** | **37.2** | **191.1** | 56.25 s | `-np 16`, and identical to its one-user row: the sixteen streams are served one after another, so this is queueing rather than batching |
-| surogate | 8 | 16 | 67.3 | 16.3 | 83.6 | **28.56 s** | `--host-moe-layers auto`, which moved 1–3 mixture layers per stage to host memory to find sixteen lanes' KV. **Half llama.cpp's TTFT, 44 % of its rate**: the moved layers cross PCIe on every token. 1 of 17 requests timed out |
+| llama.cpp | 8 | 16 | 153.9 | 37.2 | 191.1 | 56.25 s | `-np 16`, and identical to its one-user row: the sixteen streams are served one after another, so this is queueing rather than batching |
+| **surogate** | 8 | 16 | **1,217.4** | **294.0** | **1,511.4** | **1.61 s** | `--kv-capacity 11264`, **everything resident**: the absorbed attention caches one 512-wide head per token, so sixteen lanes fit where the expanded form needed 10.4 GiB on a 3.5 GiB stage. 176 requests, 0 errors. **7.9× llama.cpp's decode and prefill at 1/35 of its TTFT** |
 | llama.cpp | 8 | 64 | 41.7 | 10.1 | 51.8 | 779.24 s | `-np 64` |
-| surogate | 8 | 64 | 28.5 | 6.9 | 35.4 | **80.45 s** | `--host-moe-layers auto`. **10× llama.cpp's TTFT** at 68 % of its rate; 160 of 176 requests timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
+| **surogate** | 8 | 64 | **99.6** | **24.1** | **123.7** | **31.78 s** | `--kv-capacity auto --host-moe-layers auto`, which moved 1–2 mixture layers per stage to host memory to hold 45,056 KV tokens; those layers cross PCIe on every token and are the ceiling here. **2.4× llama.cpp's decode and prefill at 1/24 of its TTFT**; 108 of 150 requests still timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
 | surogate | **1** | 1 | 7.5 | 1.8 | 9.3 | 28.71 s | `--host-moe-layers all`: 8.91 GiB on the card, 172.74 GiB pinned. A capacity result, not a speed one — every routed expert crosses PCIe on every token. Measured before the hyper-connection fixes. **llama.cpp does not serve this model on one card at all** |
 | surogate | **1** | 16 | 7.4 | 1.8 | 9.2 | 89.88 s | same; concurrency buys nothing once the bus is the bottleneck |
 
-**Reading it.** At one user we lead on every column, and the two changes that got us there were
-both in the manifold hyper-connection: its projection ran one block per token, which on a
-single-token round put 256 threads on one SM of a hundred and seventy, and its Sinkhorn indexed
-a four-by-four matrix by a runtime bound, which put it in local memory. Neither is a mixture
-kernel; GPU time is now the mixture and the decode-shape linears, but each card is only ~14 %
-busy at one user, so the next thing to measure is the eight-stage handoff.
+**Reading it.** llama.cpp's 16-user decode is identical to its one-user decode, so it serves
+sixteen streams one after another and its rate never grows with users; ours grows with lanes,
+and the only question was whether the lanes fit. They did not, at first: the expanded latent
+attention cached 64 heads of 256 for every token -- 902 KB a token, measured at three lane
+counts and exactly linear -- and sixteen lanes needed 10.4 GiB on a stage that had 3.5. Served
+absorbed the cache is one 512-wide head per token, 64× less, and sixteen lanes sit resident at
+a 2.41 GiB runtime reservation. Sixty-four lanes still want 9.5 GiB against 3, so that row buys
+them by moving one or two mixture layers per stage to host memory, and those layers cross PCIe
+on every token: it leads llama.cpp on every column and is a fifth of the sixteen-lane rate.
+What scales with the lane count now is the graph allowance (48 MiB a lane) and the delta
+recurrence's state slots (2 MiB per layer per lane), not the cache.
 
-**The concurrency rows are a memory result, not a speed one.** The runtime reservation is
-**902 KB per KV token** — measured exactly, three lane counts, perfectly linear — because this
-target expands the latent to 64 heads of 256 and caches K and V per head, where the latent
-itself is 512 wide. Sixteen lanes of 704 tokens therefore need 10.4 GiB on a stage that has 3.5,
-and `auto` buys them by moving mixture layers to the host. Absorbed MLA, which caches the latent
-and folds `k_b` into the query as llama.cpp's own graph does, is 64× less: it would put those
-lanes back on the card and is the change these two rows are waiting on.
+Two things the absorbed form needed from the kernels, both found by the attention conformance
+test once its geometry list carried the shape: the prompt kernel indexed the block table by
+key-block index, which was the page index only while a block was 64 keys (a 512-wide head takes
+a 16-key tile to stay inside the card's opt-in shared memory); and the small-T dispatch launched
+width one with a 32-row tile where a group of 64 needs 64, returning silently -- zeros and a
+cache row never appended. Neither had a registered shape to show on.
 
 **Accuracy.** Wikitext-2 test, the first 40 windows of 2,048 tokens, the same windows for both:
 
 | engine | PPL |
 |---|---:|
-| surogate, 8 stages, BF16 KV, eager | 2.8548 ± 0.0263 |
+| surogate, 8 stages, BF16 KV, eager, absorbed attention | 2.8574 ± 0.0264 |
+| surogate, the same with the attention expanded | 2.8548 ± 0.0263 |
 | llama.cpp (PR 27754) | 2.8541 ± 0.0263 |
 
-Parity, 40,880 scored positions. The gate script is `scratchpad/ppl_gate_glm.sh`.
+Parity, 40,880 scored positions; the absorbed and expanded forms differ by the rounding of
+the folded sqrt(2) and a 16-key tile order, well inside the error bar. The gate script is `scratchpad/ppl_gate_glm.sh`.
 
 ## Prefill on the 27B GGUF, and where it goes (2026-09-04)
 
