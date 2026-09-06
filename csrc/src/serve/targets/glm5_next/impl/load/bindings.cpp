@@ -128,7 +128,8 @@ void bind_feed_forward(artifact::Binder& binder, const std::string& prefix, bool
 }
 
 void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, int stage_first,
-                      int stage_last, std::uint32_t host_moe_layers, BindingPlan& out) {
+                      int stage_last, std::uint32_t host_moe_layers, std::uint32_t gpu_layers,
+                      BindingPlan& out) {
     const NumericFormat weights   = endpoint_format(weights_profile);
     const family::TextGeometry& g = out.geometry;
     out.text_layers.resize(static_cast<std::size_t>(g.layers));
@@ -139,11 +140,16 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
         const bool staged        = stage_last > 0;
         target.resident          = !staged || (static_cast<int>(layer) >= stage_first &&
                                       static_cast<int>(layer) < stage_last);
-        g_layer_placement        = target.resident ? artifact::TensorPlacement::Device
-                                                   : artifact::TensorPlacement::ValidateOnly;
-        // A whole-model count, so every stage offloads the same layers whatever the split: a
-        // layer below the bound keeps its experts on the host wherever it runs. Only a layer
-        // this stage actually runs has anything to put in the bank.
+        // Three placements, and the order matters. A layer another stage runs is validated and
+        // nothing else. A layer past `gpu_layers` is read from host memory in its entirety.
+        // Otherwise it is resident, and `host_moe_layers` may still move its experts.
+        //
+        // Both counts are whole-model, so the same layers are offloaded whatever the pipeline
+        // split -- a stage boundary should not change which weights live where.
+        const bool on_card = gpu_layers == 0 || layer < gpu_layers;
+        g_layer_placement  = !target.resident ? artifact::TensorPlacement::ValidateOnly
+                             : on_card       ? artifact::TensorPlacement::Device
+                                             : artifact::TensorPlacement::HostBank;
         g_expert_placement = layer < host_moe_layers ? artifact::TensorPlacement::HostBank
                                                      : artifact::TensorPlacement::Device;
 
@@ -307,7 +313,7 @@ family::TextGeometry declared_geometry_with_schedule(const artifact::Reader& rea
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features, int stage_first,
                                int stage_last, std::uint32_t host_moe_layers,
-                               LoadProgress progress) {
+                               std::uint32_t gpu_layers, LoadProgress progress) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.geometry     = declared_geometry_with_schedule(binder.reader());
@@ -345,7 +351,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                       {static_cast<std::uint64_t>(g.output_rows),
                                        static_cast<std::uint64_t>(g.hidden)});
     g_layer_placement   = artifact::TensorPlacement::Device;
-    bind_text_layers(binder, weights_profile, stage_first, stage_last, host_moe_layers, out);
+    bind_text_layers(binder, weights_profile, stage_first, stage_last, host_moe_layers,
+                     gpu_layers, out);
     g_expert_placement  = artifact::TensorPlacement::Device;
     out.final_norm      = artifact::bind_device_tensor(
         binder, "text/final_norm", NumericFormat::BF16,

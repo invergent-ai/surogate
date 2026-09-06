@@ -150,6 +150,23 @@ void Binder::bank_on_host(ObjectHandle handle) {
         throw ArtifactError("artifact object has more than one materialization placement: " +
                             std::string(tensor->name));
     }
+    // The bank holds an object's stored bytes. An object the device loader would *rearrange* on
+    // the way in -- a Q8_0 projection whose op reads row-split W8 planes, a tensor whose columns
+    // are permuted into the order the activation expects -- is not the same object once copied
+    // verbatim, and a kernel reading it would produce plausible garbage rather than fail. Until
+    // the bank can run those transforms on its way in, this is a refusal.
+    if (tensor->transform != PayloadTransform::None) {
+        throw ArtifactError(
+            "cannot bank " + std::string(tensor->name) +
+            " in host memory: the loader rearranges it into another layout on the device, and "
+            "the bank stores what the artifact holds. Offload only the objects stored in the "
+            "form their kernels read -- a mixture's experts, on a GGUF-native artifact, are.");
+    }
+    if (!tensor->group_map.empty()) {
+        throw ArtifactError("cannot bank " + std::string(tensor->name) +
+                            " in host memory: its columns are permuted at load, and the map that "
+                            "undoes it is built for device-resident weights only.");
+    }
     materialization_.bank_objects.push_back(BankMaterialization{handle});
     planned_[handle.index] = true;
 }

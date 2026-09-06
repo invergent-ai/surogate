@@ -159,6 +159,14 @@ struct EngineOptions {
     // `cpu_moe_share`, which is about where the arithmetic runs rather than where the bytes
     // live. Targets without a host bank refuse it rather than ignoring it.
     std::uint32_t host_moe_layers      = 0;
+    // Layers whose weights stay on the card, counted from the first, as llama.cpp's `-ngl`
+    // counts them. Every later layer is read from pinned host memory in its entirety --
+    // attention and norms as well as any mixture -- so this is the coarse dial and
+    // `host_moe_layers` the surgical one. 0 means what it has always meant: every layer
+    // resident. A dense layer on the host crosses PCIe for every byte on every token, where an
+    // offloaded mixture crosses only the experts a token routes to, so prefer the latter where
+    // a model has one.
+    std::uint32_t gpu_layers           = 0;
     // Expert slot cache for targets that stream MoE experts from the host: number of device
     // expert slots (0 = experts are read from the host bank in place). Targets without a
     // host bank ignore it.

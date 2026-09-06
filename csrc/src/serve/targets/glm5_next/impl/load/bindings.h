@@ -128,7 +128,7 @@ struct ArtifactLoadPlan {
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features, int stage_first = 0,
                                int stage_last = 0, std::uint32_t host_moe_layers = 0,
-                               LoadProgress progress = {});
+                               std::uint32_t gpu_layers = 0, LoadProgress progress = {});
 
 /// Which layers of this artifact attend, read from the objects it holds rather than from a
 /// number beside them: a layer carrying a latent key/value projection attends, one carrying

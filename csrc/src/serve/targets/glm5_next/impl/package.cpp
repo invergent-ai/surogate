@@ -171,7 +171,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         weights_profile,
         detail::bind_artifact(binder, weights_profile, family::startup_features(options),
                               options.pipeline_stage_first, options.pipeline_stage_last,
-                              options.host_moe_layers, options.load_progress)));
+                              options.host_moe_layers, options.gpu_layers,
+                              options.load_progress)));
 }
 
 SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
