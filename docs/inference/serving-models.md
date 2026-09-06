@@ -75,7 +75,34 @@ surogate serve merged-Q4_K_M.gguf
 
 ### MoE larger than VRAM
 
-A mixture-of-experts model whose experts do not fit on the card turns on the offload wing:
+## A model larger than the card
+
+Weights the card has no room for go in pinned, device-mapped host memory, and the kernels read
+them over PCIe. Nothing is dequantised on the way, so the answer is the one the resident model
+gives; what changes is speed, because those bytes cross the bus instead of sitting on it.
+
+```bash
+# GLM-5.3-Flash: 200 GB of weights, one 32 GB card
+surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
+  --device 0 --host-moe-layers all --max-model-len 2048
+```
+
+- `--host-moe-layers N|all` places the routed experts of that many mixture layers. This is the
+  trade worth making: the experts are almost all of a mixture layer's bytes and a token routes
+  to a handful of them, so little of what is offloaded is actually read per token. GLM's 45
+  layers leave 8.91 GiB on the card and pin 172.74 GiB.
+- `--gpu-layers N` (`-ngl N`, as llama.cpp spells it) keeps the first N layers on the card and
+  reads every later one from host memory in full — attention and norms included. Coarser, and
+  slower per token, because an offloaded dense layer crosses PCIe for every byte. GLM at
+  `--gpu-layers 1` runs on **1.54 GiB** of VRAM.
+- Both counts are whole-model, so a pipeline split does not change which weights live where.
+- Filling the bank runs at roughly 4 GB/s: GLM's 172.74 GiB adds 43 s to the load. Pipeline
+  stages of one model in one process share the pinned bytes.
+- **Watch host memory.** The bank is pinned and cannot be swapped. Size the box for it and run
+  one such process at a time.
+
+A mixture-of-experts model whose experts do not fit on the card can go further, on the
+Flash-Next target, with a device cache and host-side compute in front of the same bank:
 
 ```bash
 surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \

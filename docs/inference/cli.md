@@ -64,9 +64,47 @@ The most common ones; `--engine-help` has the rest.
 | `--device N` | 0 | Single GPU |
 | `--devices A,B,...` | — | Pipeline stages across GPUs, one stage per card |
 
-### MoE offload
+### Host offload
 
-For models whose experts exceed VRAM.
+For a model larger than the cards it is being served on. Weights placed on the host live in
+pinned, device-mapped memory: the kernels read them over PCIe, nothing is dequantised, and the
+answer is the same one the resident model gives.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--host-moe-layers N\|all` | off | Routed experts of that many mixture layers live in host memory |
+| `--gpu-layers N\|all`, `-ngl N` | all | Layers kept on the card; every later layer is read from host memory in full |
+
+Prefer `--host-moe-layers` where the model has a mixture. A token routes to a handful of a
+layer's experts, so only those cross PCIe, while an offloaded dense layer crosses every byte on
+every token. Both counts are whole-model, so a pipeline split does not change which weights
+live where.
+
+    # GLM-5.3-Flash, 200 GB, on one 32 GB card
+    surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
+      --device 0 --host-moe-layers all
+
+Measured on one RTX 5090 (weights on the card / pinned in host memory):
+
+| Model | Resident | Pinned |
+|---|---:|---:|
+| GLM-5.3-Flash, `--host-moe-layers all` | 8.91 GiB | 172.74 GiB |
+| GLM-5.3-Flash, `--gpu-layers 8` | 23.31 GiB | 158.34 GiB |
+| GLM-5.3-Flash, `--gpu-layers 1` | 1.54 GiB | 180.10 GiB |
+| Qwen3.6-35B-A3B, `--host-moe-layers all` | 2.33 GiB | 18.22 GiB |
+
+Filling the bank costs about 4 GB/s of host bandwidth: GLM's 172.74 GiB takes 43 s on top of
+the load. Pipeline stages of one model in one process share the pinned bytes rather than
+pinning a copy per card.
+
+An object the loader rearranges on its way to the card is honoured — the bank runs the same
+kernel and holds the rearranged planes — but one whose *columns* are permuted at load is
+refused by name, because the map that undoes it is built for device-resident weights only.
+
+### MoE expert cache
+
+A device cache in front of the host bank, with optional host-side expert compute. Available on
+the Flash-Next target.
 
 | Flag | Default | Meaning |
 |---|---|---|

@@ -18,9 +18,11 @@ surogate serve Qwen/Qwen3.6-27B --port 8080
 - **Speculative decoding** with MTP or DFlash draft heads (`--spec`, `--draft-tokens`).
 - **Multi-GPU** as data-parallel replicas or pipeline stages (`--devices 0,1,...`). Tensor
   parallelism is not offered: P2P is disabled on the consumer cards this engine targets.
-- **MoE larger than VRAM** — a pinned host expert bank, a device LRU slot cache, and optional
-  CPU expert compute that takes a measured share of the routed work (`--expert-slots`,
-  `--cpu-moe-share`).
+- **A model larger than VRAM** — weights the card has no room for live in pinned,
+  device-mapped host memory and the kernels read them over PCIe: `--host-moe-layers N|all` for
+  a mixture's routed experts, `--gpu-layers N` (`-ngl`) for whole layers. GLM-5.3-Flash, 200 GB,
+  serves on one 32 GB card. Any target inherits this; the Flash-Next target adds a device LRU
+  slot cache and CPU expert compute on top (`--expert-slots`, `--cpu-moe-share`).
 - **Vision input** (images, video) for models that carry a vision tower (`--vision`).
 
 Embedding models run it in its own process, on either GPU or CPU. See [Serving models](serving-models.md#embedding-model-cpu-and-gpu).
