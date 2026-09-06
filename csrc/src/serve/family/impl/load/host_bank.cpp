@@ -4,6 +4,7 @@
 #include "api/ops/cpu_expert_compute.h"
 #include "api/ops/expert_slot_cache.h"
 #include "ops/linear/ggml/ggml_host_decode.h"
+#include "ops/linear/ggml/ggml_repack.h"
 #include "core/device.h"
 
 #include <string>
@@ -35,6 +36,7 @@ namespace {
 
 /// Bytes an object occupies once assembled, however it is stored.
 std::size_t object_bytes(const HostObjectPlan& plan) {
+    if (plan.q8_rows != 0) { return static_cast<std::size_t>(plan.q8_stored_bytes); }
     if (plan.q4_rows != 0) {
         // Requantised on the way in: the object is the Q4 planes, whatever it came from.
         return ops::q4_bank_planes(plan.q4_rows, plan.q4_k).total_bytes;
@@ -152,7 +154,44 @@ HostBank::HostBank(const HostBankPlan& plan) {
             (void)madvise(reinterpret_cast<void*>(start), length, MADV_WILLNEED);
         }
         std::vector<std::thread> threads;
-        if (source.decode_rows != 0) {
+        if (source.q8_rows != 0) {
+            // The loader rearranges this object on the way to the card, so the bank has to hold
+            // what the card would have held, not what the file holds. It runs the loader's own
+            // kernel to get there: the stored blocks go up into scratch, the kernel writes the
+            // planes into a second scratch, and the planes come back into pinned memory. Two
+            // transient device buffers the size of one object, freed before the next.
+            std::vector<std::span<const std::byte>> stretches = source.parts;
+            if (stretches.empty()) { stretches.push_back(source.payload); }
+            std::size_t source_bytes = 0;
+            for (const auto& part : stretches) { source_bytes += part.size(); }
+
+            void* blocks = nullptr;
+            void* planes = nullptr;
+            std::int32_t* group_map = nullptr;
+            CUDA_CHECK(cudaMalloc(&blocks, source_bytes));
+            CUDA_CHECK(cudaMalloc(&planes, object.bytes));
+            std::size_t at = 0;
+            for (const auto& part : stretches) {
+                CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(blocks) + at, part.data(),
+                                      part.size(), cudaMemcpyHostToDevice));
+                at += part.size();
+            }
+            if (!source.q8_group_map.empty()) {
+                CUDA_CHECK(cudaMalloc(&group_map,
+                                      source.q8_group_map.size() * sizeof(std::int32_t)));
+                CUDA_CHECK(cudaMemcpy(group_map, source.q8_group_map.data(),
+                                      source.q8_group_map.size() * sizeof(std::int32_t),
+                                      cudaMemcpyHostToDevice));
+            }
+            ops::detail::ggml::q8_0_to_w8_rowsplit_launch(blocks, planes, source.q8_rows,
+                                                          source.q8_columns, object.bytes,
+                                                          group_map, nullptr);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(object.host, planes, object.bytes, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(blocks));
+            CUDA_CHECK(cudaFree(planes));
+            if (group_map != nullptr) { CUDA_CHECK(cudaFree(group_map)); }
+        } else if (source.decode_rows != 0) {
             // Decode while copying. The blocks arrive as stretches of the GGUF in row order,
             // each a whole number of rows; a worker owns a contiguous row range and walks the
             // stretches to find its rows. The planes it writes are the ones a converted
@@ -384,7 +423,14 @@ HostBankPlan collect_host_bank(artifact::Binder& binder, const artifact::Materia
         if (tensor == nullptr) {
             throw artifact::ArtifactError("a resource cannot be banked in host memory");
         }
-        out.objects.push_back(host_plan(binder, banked.object, std::string(tensor->name)));
+        HostObjectPlan object = host_plan(binder, banked.object, std::string(tensor->name));
+        if (tensor->transform == artifact::PayloadTransform::Q8ToW8RowSplit) {
+            object.q8_rows          = static_cast<std::int32_t>(tensor->shape.at(0));
+            object.q8_columns       = static_cast<std::int32_t>(tensor->shape.at(1));
+            object.q8_stored_bytes  = tensor->bytes;
+            object.q8_group_map     = tensor->group_map;
+        }
+        out.objects.push_back(std::move(object));
     }
     return out;
 }

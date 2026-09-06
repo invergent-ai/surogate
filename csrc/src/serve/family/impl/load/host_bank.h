@@ -51,6 +51,14 @@ struct HostObjectPlan {
     std::int64_t decode_rows = 0;
     std::int32_t decode_k    = 0;
     QType decode_type        = QType::W8G32_F16S; // meaningless unless decode_rows != 0
+    // Non-zero: the object is stored as Q8_0 blocks and its op reads row-split W8 planes, so the
+    // bank runs the same rearrangement the device loader runs -- the source lands in device
+    // scratch, the kernel writes the planes, and the planes come back into pinned memory. Using
+    // the loader's own kernel is what makes the banked bytes the bytes the card would have held.
+    std::int32_t q8_rows           = 0;
+    std::int32_t q8_columns        = 0;
+    std::uint64_t q8_stored_bytes  = 0; // the planes' size, which is the object's size in the bank
+    std::vector<std::int32_t> q8_group_map;
 };
 
 struct HostBankPlan {
