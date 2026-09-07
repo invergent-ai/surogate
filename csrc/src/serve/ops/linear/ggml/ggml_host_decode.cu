@@ -1,8 +1,10 @@
 #include "ops/linear/ggml/ggml_host_decode.h"
 
 #include "ops/linear/ggml/ggml_moe_codec.cuh"
+#include "api/ops/expert_slot_cache.h" // kQ5GroupBytes
 
 #include <cmath>
+#include <cstring>
 
 namespace sinfer::ops {
 namespace {
@@ -93,7 +95,91 @@ void q4_1_row_to_q4g32am(const void* blocks, std::int64_t k, std::uint8_t* codes
     }
 }
 
+/// Twenty code bytes of one Q5G32AM group: the low nibbles packed pairwise, then the fifth
+/// bits as a 32-bit word whose bit v is value v's.
+template <class Pick>
+void pack_group_q5(std::uint8_t* out, Pick low, std::uint32_t high) {
+    pack_group(out, low);
+    std::memcpy(out + 16, &high, sizeof(high));
+}
+
+void q5_K_row_to_q5g32am(const void* blocks, std::int64_t k, std::uint8_t* codes,
+                         std::uint16_t* scales, std::uint16_t* mins) {
+    const auto* x = static_cast<const detail::ggml::block_q5_K*>(blocks);
+    for (std::int64_t b = 0; b < k / detail::ggml::QK_K; ++b) {
+        const float d    = __half2float(__low2half(x[b].dm));
+        const float dmin = __half2float(__high2half(x[b].dm));
+        for (int is = 0; is < 8; ++is) {
+            std::uint8_t sc = 0, m = 0;
+            detail::ggml::get_scale_min_k4(is, x[b].scales, sc, m);
+            const std::int64_t g  = b * 8 + is;
+            scales[g]             = half_bits(d * static_cast<float>(sc));
+            mins[g]               = half_bits(-(dmin * static_cast<float>(m)));
+            // Low nibbles as Q4_K's: sub-block pairs of 32 bytes, the even one low, the odd
+            // one high. Fifth bits: bit `is` of qh[v] for value v of sub-block `is`.
+            const std::uint8_t* q = x[b].qs + 32 * (is / 2);
+            const int shift       = (is & 1) != 0 ? 4 : 0;
+            std::uint32_t high    = 0;
+            for (int v = 0; v < 32; ++v) {
+                high |= static_cast<std::uint32_t>((x[b].qh[v] >> is) & 1U) << v;
+            }
+            pack_group_q5(codes + g * kQ5GroupBytes, [&](int v) { return q[v] >> shift; }, high);
+        }
+    }
+}
+
+void q5_0_row_to_q5g32am(const void* blocks, std::int64_t k, std::uint8_t* codes,
+                         std::uint16_t* scales, std::uint16_t* mins) {
+    const auto* x = static_cast<const detail::ggml::block_q5_0*>(blocks);
+    for (std::int64_t g = 0; g < k / 32; ++g) {
+        const float d = __half2float(x[g].d);
+        scales[g]     = half_bits(d);
+        mins[g]       = half_bits(-16.0F * d); // value = d * (q - 16)
+        std::uint32_t high = 0;
+        std::memcpy(&high, x[g].qh, sizeof(high));
+        const std::uint8_t* q = x[g].qs;
+        pack_group_q5(codes + g * kQ5GroupBytes, [&](int v) { return v < 16 ? q[v] : q[v - 16] >> 4; },
+                      high);
+    }
+}
+
+void q5_1_row_to_q5g32am(const void* blocks, std::int64_t k, std::uint8_t* codes,
+                         std::uint16_t* scales, std::uint16_t* mins) {
+    const auto* x = static_cast<const detail::ggml::block_q5_1*>(blocks);
+    for (std::int64_t g = 0; g < k / 32; ++g) {
+        scales[g] = half_bits(__half2float(__low2half(x[g].dm)));
+        mins[g]   = half_bits(__half2float(__high2half(x[g].dm))); // value = d * q + m
+        std::uint32_t high = 0;
+        std::memcpy(&high, x[g].qh, sizeof(high));
+        const std::uint8_t* q = x[g].qs;
+        pack_group_q5(codes + g * kQ5GroupBytes, [&](int v) { return v < 16 ? q[v] : q[v - 16] >> 4; },
+                      high);
+    }
+}
+
 } // namespace
+
+bool ggml_row_to_q5g32am(QType type, const void* blocks, std::int64_t k, std::uint8_t* codes,
+                         std::uint16_t* scales, std::uint16_t* mins) noexcept {
+    if (blocks == nullptr || codes == nullptr || scales == nullptr || mins == nullptr || k <= 0 ||
+        k % 32 != 0) {
+        return false;
+    }
+    switch (type) {
+    case QType::Q5_K:
+        if (k % detail::ggml::QK_K != 0) { return false; }
+        q5_K_row_to_q5g32am(blocks, k, codes, scales, mins);
+        return true;
+    case QType::Q5_0:
+        q5_0_row_to_q5g32am(blocks, k, codes, scales, mins);
+        return true;
+    case QType::Q5_1:
+        q5_1_row_to_q5g32am(blocks, k, codes, scales, mins);
+        return true;
+    default:
+        return false;
+    }
+}
 
 bool ggml_row_to_q4g32am(QType type, const void* blocks, std::int64_t k, std::uint8_t* codes,
                          std::uint16_t* scales, std::uint16_t* mins) noexcept {

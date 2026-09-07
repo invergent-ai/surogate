@@ -60,11 +60,11 @@ struct MoePlan {
     /// stores W8 row-split planes already.
     artifact::NumericFormat routed_gate_up_format = artifact::NumericFormat::W8G32_F16S;
     artifact::NumericFormat routed_down_format    = artifact::NumericFormat::W8G32_F16S;
-    /// Which half the bank holds as Q4G32AM planes. Independent, because the two halves of a
-    /// K_XL mixture are routinely stored at different widths and only a 4-bit affine source
-    /// reaches Q4G32AM without loss (`family::BankPlanes`).
-    bool routed_gate_up_q4 = false;
-    bool routed_down_q4    = false;
+    /// What the bank holds each half as (`family::BankPlanes`). Independent, because the two
+    /// halves of a K_XL mixture are routinely stored at different widths: this checkpoint's
+    /// Q4_K gate/up reach Q4G32AM, its Q5_1 down reach Q5G32AM, its Q8_0 down stay W8.
+    family::BankPlanes routed_gate_up_planes = family::BankPlanes::Native;
+    family::BankPlanes routed_down_planes    = family::BankPlanes::Native;
     artifact::ObjectHandle shared_gate_up;
     artifact::ObjectHandle shared_down;
 };
@@ -206,10 +206,11 @@ struct GdnProjectionPayload {
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
     ops::HyperConnectionWeights mix;
-    /// Which routed halves are Q4G32AM planes: such a Weight is a base pointer and a shape,
-    /// readable by the expert cache alone (the slot cache is then required).
-    bool host_gate_up_q4 = false;
-    bool host_down_q4    = false;
+    /// What the bank holds each routed half as (`family::BankPlanes`): Q4 or Q5 planes are a
+    /// base pointer and a shape, readable by the expert cache alone (the slot cache is then
+    /// required); anything else is what the Weight says.
+    family::BankPlanes gate_up_planes = family::BankPlanes::Native;
+    family::BankPlanes down_planes    = family::BankPlanes::Native;
     std::int32_t layer = -1; // text layer index (the expert slot cache keys its tables by it)
     // Host virtual addresses of the routed expert objects (the Weights above hold the
     // device-mapped aliases); the CPU expert compute reads the planes through these.

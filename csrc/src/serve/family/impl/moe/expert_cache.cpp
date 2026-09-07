@@ -448,19 +448,22 @@ struct ExpertCache::Impl {
             const ops::SparseMoeWeights& op = *mixture.op;
             // The device view: each half by its own source -- the Q4 planes' base where the
             // bank requantised it, the Weight (W8 planes or the file's blocks) otherwise.
+            const auto half_source = [](const Weight& weight, BankPlanes planes) {
+                ops::ExpertBankHalfSource source{&weight, nullptr, nullptr};
+                if (planes == BankPlanes::Q4) { source.q4_base = weight.qdata; }
+                if (planes == BankPlanes::Q5) { source.q5_base = weight.qdata; }
+                return source;
+            };
             entry.bank = ops::expert_host_bank(
-                geometry,
-                ops::ExpertBankHalfSource{&op.routed_gate_up,
-                                          mixture.host_gate_up_q4 ? op.routed_gate_up.qdata : nullptr},
-                ops::ExpertBankHalfSource{&op.routed_down,
-                                          mixture.host_down_q4 ? op.routed_down.qdata : nullptr});
+                geometry, half_source(op.routed_gate_up, mixture.gate_up_planes),
+                half_source(op.routed_down, mixture.down_planes));
             // The host view of the same planes, for the CPU expert path: nothing unless the
             // caller gave the host addresses (an object that is device resident has none, and
             // the layer then runs its misses through the pool alone).
             if (mixture.host_gate_up == nullptr || mixture.host_down == nullptr) { return entry; }
             const auto host_half = [&](bool gate_up) {
                 const std::byte* host       = gate_up ? mixture.host_gate_up : mixture.host_down;
-                const bool q4               = gate_up ? mixture.host_gate_up_q4 : mixture.host_down_q4;
+                const BankPlanes planes     = gate_up ? mixture.gate_up_planes : mixture.down_planes;
                 const Weight& weight        = gate_up ? op.routed_gate_up : op.routed_down;
                 ops::ExpertBankFormat& fmt  = gate_up ? entry.cpu_bank.gate_up_format
                                                       : entry.cpu_bank.down_format;
@@ -470,15 +473,24 @@ struct ExpertCache::Impl {
                                                       : entry.cpu_bank.down_scales;
                 const std::byte*& mins      = gate_up ? entry.cpu_bank.gate_up_mins
                                                       : entry.cpu_bank.down_mins;
-                if (q4) {
-                    const ops::Q4BankPlanes planes = ops::q4_bank_planes(
-                        static_cast<std::int64_t>(geometry.experts) *
-                            (gate_up ? geometry.expert_rows() : geometry.hidden),
-                        gate_up ? geometry.hidden : geometry.intermediate);
+                const std::int64_t rows_total =
+                    static_cast<std::int64_t>(geometry.experts) *
+                    (gate_up ? geometry.expert_rows() : geometry.hidden);
+                const std::int32_t k = gate_up ? geometry.hidden : geometry.intermediate;
+                if (planes == BankPlanes::Q4) {
+                    const ops::Q4BankPlanes layout = ops::q4_bank_planes(rows_total, k);
                     fmt    = ops::ExpertBankFormat::Q4G32AM;
                     codes  = host;
-                    scales = host + planes.scales_offset;
-                    mins   = host + planes.mins_offset;
+                    scales = host + layout.scales_offset;
+                    mins   = host + layout.mins_offset;
+                    return;
+                }
+                if (planes == BankPlanes::Q5) {
+                    const ops::Q5BankPlanes layout = ops::q5_bank_planes(rows_total, k);
+                    fmt    = ops::ExpertBankFormat::Q5G32AM;
+                    codes  = host;
+                    scales = host + layout.scales_offset;
+                    mins   = host + layout.mins_offset;
                     return;
                 }
                 const ops::ExpertBankFormat device_format =

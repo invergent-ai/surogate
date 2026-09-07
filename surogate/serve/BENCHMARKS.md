@@ -205,17 +205,17 @@ earlier `-ot exps=CPU` rows without batch flags understated it 3.9× and are gon
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 1 | **137** | **30.8** | **168** | **0.98 s** | defaults (2026-09-07, the per-object bank): pool 3,172 slots (15.4 GiB, sized to leave the runtime its floor -- the floor no longer charges this A16-only target for FP8/Marlin planes it never derives), unpinned host workers sized to the cores other jobs leave free, host round started and joined through stream memory operations (no host-function dispatch: +6 % decode over the event path), the CPU/PCIe split measured with both sides running against each other (155 vs 49 GB/s), min-tokens 1 so the split fires on one-token rounds. **+48 % decode and +47 % prefill over llama.cpp, at matching perplexity** (3.3231 against its 3.3223 -- the table below) |
-| surogate `--host-expert-bank q4` | 1 | 1 | 163 | 36.7 | 200 | 0.83 s | the same run with every expert half requantised to four bits: **+19 % decode for +0.69 % perplexity** (3.3451). This was the default until 2026-09-07, when the cost was first measured; the per-object bank above keeps the file's 4-bit halves at four bits and its Q5_1/Q8_0 down halves at eight, for 116.7 GiB pinned against 98.6 |
+| **surogate** | 1 | 1 | **156** | **35.2** | **192** | **0.88 s** | defaults (2026-09-07, the per-object bank): pool 3,172 slots (15.4 GiB, sized to leave the runtime its floor -- the floor no longer charges this A16-only target for FP8/Marlin planes it never derives), unpinned host workers sized to the cores other jobs leave free, host round started and joined through stream memory operations (no host-function dispatch: +6 % decode over the event path), the CPU/PCIe split measured with both sides running against each other (189 vs 46 GB/s), min-tokens 1 so the split fires on one-token rounds. The bank holds each expert half at the narrowest width that loses nothing: the Q4_K gate/up at four bits, the Q5_1 down at six, the Q8_0 down at eight -- 105.7 GiB pinned. **+69 % decode and +68 % prefill over llama.cpp, at matching perplexity** (3.3219 against its 3.3223 -- the table below). With the Q5_1 halves held as W8 instead this read 137 / 30.8 / 0.98 s |
+| surogate `--host-expert-bank q4` | 1 | 1 | 163 | 36.7 | 200 | 0.83 s | the same run with every expert half requantised to four bits: **+4 % decode for +0.69 % perplexity** (3.3451). This was the default until 2026-09-07, when the cost was first measured |
 | llama.cpp | 1 | 1 | 93 | 20.8 | 114 | 2.95 s | the same GGUF, served by both engines as the file's own blocks now. surogate **+62 % decode, 3.5× the prompt rate** |
 | **surogate** | 1 | 1 | — | **40.8** | — | **7.06 s** | 28k prompt into 131k context (23.1 GiB VRAM): **3,966 tok/s prompt processing**; decode is the post-28k stream rate |
 | surogate (re-measured 2026-09-04) | 1 | 1 | — | 39.1 | — | 7.07 s | the same shape on today's tree with `--max-num-batched-tokens 8192`: 3,989 tok/s prompt processing, TTFT 7.07 s, 39.1 tok/s after the 28k prompt -- the row holds. On the defaults (prefill chunk 2,048, the compromise the 8-card pipeline wanted) the same request reads 11.6 s / 2,434 tok/s / 39.4: a one-card long-prompt serve should pass the flag |
 | surogate `--spec mtp --draft-tokens 1` (2026-09-04) | 1 | 1 | 157 | **35.2** | — | 0.85 s | the NextN head at the shortest draft, 71.6 % accepted; drafts 2 / 3 read 34.6 / 32.6 (55 % / 45 %) against 32.6 without -- every extra column widens the expert gather faster than the acceptance pays |
 | llama.cpp | 1 | 1 | — | 27.3 | — | 23.02 s | 28k prompt, 80k context: 1,216 tok/s prompt processing. surogate **3.3× ingestion, +49 % decode** |
 | cafe-llama.cpp `-hmoe` | 1 | 1 | — | 18.8 / 4.3 | — | 3.55 s / 25.46 s | 512 and 28k prompts. Experts pinned in host memory, computed on the GPU over PCIe — **our architecture in their engine** (935-1,100 tok/s at 28k); kept as the like-for-like reference |
-| **surogate** | 1 | 16 | **373** | **83.7** | **456** | **2.03 s** | defaults, `--max-num-seqs 16`: KV auto 65,536 tokens (2026-09-07, the per-object bank). `--host-expert-bank q4` reads 454 / 101.9 / 1.71 s here, +22 % decode for the 0.69 % perplexity above; the 09-04 row read 381 / 85.7 / 1.74 with a 3,004-slot pool. Run-to-run spread at 16 users is ~±8 % |
+| **surogate** | 1 | 16 | **431** | **96.7** | **528** | **1.83 s** | defaults, `--max-num-seqs 16`: KV auto 65,536 tokens (2026-09-07, the per-object bank). `--host-expert-bank q4` reads 454 / 101.9 / 1.71 s here, +5 % decode for the 0.69 % perplexity above; with the Q5_1 halves held as W8 this read 373 / 83.7 / 2.03 s; the 09-04 row read 381 / 85.7 / 1.74 with a 3,004-slot pool. Run-to-run spread at 16 users is ~±8 % |
 | llama.cpp | 1 | 16 | 253 | 56.8 | 310 | 16.17 s | `-np 16`. surogate **+51 % decode at 9× lower TTFT** |
-| **surogate** | 1 | 64 | **533** | **119.8** | **653** | **5.15 s** | defaults, `--max-num-seqs 64 --max-pending-requests 512` (2026-09-07, the per-object bank): the pool sized itself to 3,172 slots and the KV cache to 158,272 tokens, where the 09-04 row (518 / 116.4 / 4.73 s) got 1,985 slots and 74,240 tokens -- the registry had reserved 1.5x the card's W8 bytes for derived planes this target never makes, and both the pool and the cache were paying for it. `--host-expert-bank q4` reads 609 / 136.7 / 1.90 s here, +14 % decode for the 0.69 % perplexity above |
+| **surogate** | 1 | 64 | **567** | **127.3** | **694** | **3.20 s** | defaults, `--max-num-seqs 64 --max-pending-requests 512` (2026-09-07, the per-object bank): the pool sized itself to 3,172 slots and the KV cache to 160,192 tokens, where the 09-04 row (518 / 116.4 / 4.73 s) got 1,985 slots and 74,240 tokens -- the registry had reserved 1.5x the card's W8 bytes for derived planes this target never makes, and both the pool and the cache were paying for it. `--host-expert-bank q4` reads 609 / 136.7 / 1.90 s here, +7 % decode for the 0.69 % perplexity above; with the Q5_1 halves held as W8 this read 533 / 119.8 / 5.15 s |
 | llama.cpp | 1 | 64 | 46 | 10.4 | 56 | 655 s | `-np 64`: CPU expert compute serialises across 64 decodes and the queue is the run — every request ~13 min. surogate **11.2×** |
 | ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels, `-ot exps=CPU` |
 | ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s |  |
@@ -236,7 +236,8 @@ These are the first accuracy numbers this target's bank has ever had.
 |---|---:|---:|---:|
 | the file's own blocks, kept (`SUROGATE_SERVE_HOST_BANK_NATIVE=1`) | 3.3215 ± 0.0336 | 101.0 GiB | — |
 | W8 planes throughout (`--host-expert-bank w8`) | 3.3215 ± 0.0336 | 148.8 GiB | — |
-| **per object: Q4G32AM for the Q4_K halves, W8 for the Q5_1/Q8_0 halves** (the default) | **3.3231 ± 0.0337** | **116.7 GiB** | **30.8** |
+| **per object: Q4G32AM for the Q4_K halves, Q5G32AM for the Q5_1 halves, W8 for the Q8_0 halves** (the default) | **3.3219 ± 0.0337** | **105.7 GiB** | **35.2** |
+| per object with the Q5_1 halves held as W8 (the default for the twelve hours before) | 3.3231 ± 0.0337 | 116.7 GiB | 30.8 |
 | Q4G32AM throughout (`--host-expert-bank q4`) | 3.3451 ± 0.0340 | 98.6 GiB | 36.7 |
 | llama.cpp (`study/llama.cpp-glm`, eight cards) | 3.3223 ± 0.0336 | — | 20.8 |
 
@@ -245,9 +246,10 @@ blocks themselves score identically, which is the bank's decode agreeing with th
 the last digit. Requantising *every* half to four bits costs **0.69 %**, because this
 checkpoint stores its down experts as Q5_1 in 43 layers and Q8_0 in 5, and four bits is not
 where their levels sit. Keeping each half at the narrowest width that loses nothing recovers
-it -- 3.3231 against llama.cpp's 3.3223, a twentieth of the error bar -- for 18 % more pinned
-bytes and 16 % of the one-user decode. The four-bit bank remains one flag away for a run that
-wants the rate and can spend the quality.
+it: with the Q5_1 halves as six-bit planes by an exact repack the bank reads 3.3219, a
+hundredth of the error bar from llama.cpp, for 7 % more pinned bytes than the four-bit bank
+(the Q8_0 halves are already exactly W8 and cost nothing). The four-bit bank remains one flag
+away for a run that wants its rate and can spend the quality.
 
 ### GLM-5.3-Flash (200 GB MoE; 181.65 GiB of weights against 256 GiB of cards)
 
@@ -269,9 +271,9 @@ architecture.
 | **surogate** | 8 | 16 | **1,212.7** | **292.9** | **1,505.6** | **1.59 s** | `--kv-capacity 11264`, **everything resident**: the absorbed attention caches one 512-wide head per token, so sixteen lanes fit where the expanded form needed 10.4 GiB on a 3.5 GiB stage. 176 requests, 0 errors. **7.0× llama.cpp's decode and prefill at 1/35 of its TTFT** |
 | llama.cpp | 8 | 64 | 44.4 | 10.7 | 55.1 | 729.58 s | `-np 64` |
 | **surogate** | 8 | 64 | **99.0** | **23.9** | **122.9** | **31.94 s** | `--kv-capacity auto --host-moe-layers auto`, which moved 1–2 mixture layers per stage to host memory to hold 45,056 KV tokens; those layers cross PCIe on every token and are the ceiling here. **2.2× llama.cpp's decode and prefill at 1/23 of its TTFT**; 108 of 150 requests still timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
-| **surogate** | **1** | 1 | **51.3** | **12.4** | **63.7** | **3.62 s** | `--host-moe-layers all --cpu-moe-share auto --max-num-batched-tokens 1024` (2026-09-06, the expert cache lifted into the family, on the mixed bank; two passes read 3.64 and 3.62 s): the routed experts are repacked into a 220.5 GiB pinned bank in 68 s at load -- Q4G32AM planes for the Q4_K gate/up halves (an exact repack), W8 for the Q5_K/Q6_K down halves, each read by its own format -- and 83 % of every round's misses are computed on the 32 host cores (host 244 GB/s against 49 over PCIe, measured overlapped) with the rest gathered into a 456-slot pool. The server times each request at 19.0 tok/s of decode after a 3.59 s prompt; the prompt is one gather of every expert of every layer over the link. **+22 % decode, +21 % prefill over llama.cpp at 64 % of its TTFT**, at parity on the perplexity gate below. The all-W8 bank read 9.9 / 40.9 / 4.64 s on this configuration, and 8.9 / 36.7 / 6.12 s at chunk 512; the row before the cache 1.8 / 7.5 / 29.54 s |
+| **surogate** | **1** | 1 | **53.2** | **12.9** | **66.1** | **3.27 s** | `--host-moe-layers all --cpu-moe-share auto --max-num-batched-tokens 1024` (2026-09-07, the expert cache lifted into the family, on the per-object bank): the routed experts are repacked into a 191.7 GiB pinned bank in 55 s at load -- Q4G32AM planes for the Q4_K gate/up halves, Q5G32AM for the Q5_K down halves (exact repacks both), W8 for the three Q6_K down halves, each read by its own format -- and 83 % of every round's misses are computed on the 32 host cores (host 202 GB/s against 46 over PCIe, measured overlapped) with the rest gathered into a 456-slot pool. The server times each request at 18.8 tok/s of decode after a 3.27 s prompt; the prompt is one gather of every expert of every layer over the link. **+26 % decode, +25 % prefill over llama.cpp at 58 % of its TTFT**, at parity on the perplexity gate below. With the Q5_K halves held as W8 instead (220.5 GiB) it read 51.3 / 12.4 / 3.62 s; the all-W8 bank 40.9 / 9.9 / 4.64 s; chunk 512 on that bank 36.7 / 8.9 / 6.12 s; the row before the cache 7.5 / 1.8 / 29.54 s |
 | llama.cpp | **1** | 1 | 42.4 | 10.2 | 52.6 | 5.64 s | `-cmoe -t 32`: the same 172 GB off the card, the expert matmuls on 32 EPYC cores, the bytes from ordinary RAM. On the morning's binary, which streamed the experts over PCIe, it was ahead 5.7× with a fifth of our TTFT; by evening it is behind on all three columns |
-| **surogate** | **1** | 16 | **80.3** | **19.4** | **99.7** | **28.50 s** | the same cache on the mixed bank, `--max-num-seqs 16 --kv-capacity 11264 --max-num-batched-tokens 2048` (2026-09-06): a 456-slot pool sized automatically, 83 % of every round's misses on the host, **16 of 16 served, 0 expired**. **+40 % decode and +40 % prefill over llama.cpp at 31 % of its TTFT.** A 16-lane round routes to most of a layer's experts, so the split carries ~9 GB of bank bytes a round; the prompt rounds, which gather every expert over the link, are what queue, and a 2,048-token chunk lets several prompts share one gather. On the all-W8 bank this configuration read 66.4 / 16.0 / 31.82 s with 1 of 17 expired, and at chunk 512 57.4 / 13.9 / 38.23 s with 4 of 20 expired, a tie. The row before the cache read 7.4 / 1.8 / 9.2 / 91.35 s with 22 of 28 expired |
+| **surogate** | **1** | 16 | **84.8** | **20.5** | **105.3** | **25.78 s** | the same cache on the per-object bank, `--max-num-seqs 16 --kv-capacity 11264 --max-num-batched-tokens 2048` (2026-09-07): a 456-slot pool sized automatically, 83 % of every round's misses on the host, **16 of 16 served, 0 expired**. **+48 % decode and +48 % prefill over llama.cpp at 28 % of its TTFT.** A 16-lane round routes to most of a layer's experts, so the split carries ~8 GB of bank bytes a round; the prompt rounds, which gather every expert over the link, are what queue, and a 2,048-token chunk lets several prompts share one gather. With the Q5_K halves held as W8 this read 80.3 / 19.4 / 28.50 s; on the all-W8 bank 66.4 / 16.0 / 31.82 s with 1 of 17 expired; at chunk 512 on that bank 57.4 / 13.9 / 38.23 s with 4 of 20 expired, a tie. The row before the cache read 7.4 / 1.8 / 9.2 / 91.35 s with 22 of 28 expired |
 | llama.cpp | **1** | 16 | 57.4 | 13.9 | 71.3 | 90.73 s | `-cmoe -t 32 --kv-unified`, 16 of 16 served |
 
 **The single-card rows, and what changed between morning and afternoon.** Both engines keep
@@ -320,18 +322,19 @@ cache row never appended. Neither had a registered shape to show on.
 | surogate, the same with the attention expanded | 2.8548 ± 0.0263 |
 | surogate, **one card**, every expert in the W8 host bank, half of each prompt round's expert jobs computed by the host kernels (`--host-moe-layers all --cpu-moe-share auto --cpu-moe-prefill-share 0.5`, 2026-09-06) | 2.8600 ± 0.0264 |
 | surogate, one card, the same bank with every prompt-round miss gathered into the device pool instead (`--host-moe-layers all --cpu-moe-share auto`) | 2.8567 ± 0.0263 |
-| surogate, **one card, the mixed bank** (the default: Q4G32AM planes for the Q4_K gate/up halves by an exact repack, W8 for the Q5_K/Q6_K down halves), default route | 2.8614 ± 0.0264 |
+| surogate, **one card, the per-object bank** (the default: Q4G32AM planes for the Q4_K gate/up halves, Q5G32AM for the Q5_K down halves, both by exact repack; W8 for the three Q6_K down halves), default route | 2.8586 ± 0.0263 |
+| surogate, one card, the same with the Q5_K halves held as W8 instead (the 2026-09-06 default) | 2.8614 ± 0.0264 |
 | surogate, the same mixed bank when its Q4 planes were reached through a W8 row and an affine refit (the first cut; replaced) | 2.8695 ± 0.0265 |
 | llama.cpp (PR 27754) | 2.8541 ± 0.0263 |
 
 Parity, 40,880 scored positions; the absorbed and expanded forms differ by the rounding of
 the folded sqrt(2) and a 16-key tile order, well inside the error bar. The one-card rows are
-the expert cache's accuracy gate: the routed experts decoded into planes at load, read by the
+the expert cache's accuracy gate: the routed experts repacked into planes at load, read by the
 host's AVX-512 kernels with the SwiGLU clamp for most of every decode round (and half of every
 prompt round in the host-scored row) and by the device pool for the rest. The W8 bank lands
-where the all-GPU eight-stage number does, and the mixed bank the board rows run on lands
-0.16 % above it -- inside the 0.12 % the W8 bank's own two routes span, and a quarter of the
-error bar. The first cut of the mixed bank read 0.45 % above, a systematic loss: it reached
+where the all-GPU eight-stage number does, and the per-object bank the board rows run on
+lands 0.07 % above it -- with its Q5_K halves as six-bit planes by an exact repack, where
+holding them as W8 (a requantisation to amax/127) had read 0.16 % above. The first cut of the mixed bank read 0.45 % above, a systematic loss: it reached
 Q4G32AM through a W8 row and an affine refit, and an int8 grid is not where a Q4_K sub-block's
 sixteen levels sit. The repack that replaced it is exact to FP16 rounding of the endpoints
 (0.035 % of the range on random blocks, tested). The gate script is `scratchpad/ppl_gate_glm.sh`.

@@ -35,7 +35,11 @@ namespace sinfer::ops {
 /// How an expert bank holds its weights on the host. W8G32 is the pool's own layout; Q4G32AM
 /// halves it during the copy into pinned memory; GgmlBlocks is the GGUF's own bytes, so the
 /// artifact stores no requantised copy of the experts at all and the gather decodes them.
-enum class ExpertBankFormat : std::uint8_t { W8G32 = 0, Q4G32AM = 1, GgmlBlocks = 2 };
+/// Q5G32AM: the Q4G32AM affine grid with 32 levels -- per group of 32, sixteen bytes of low
+/// nibbles in the pairwise order followed by four bytes whose bit v is value v's fifth bit
+/// (GGML's own Q5 arrangement), then FP16 scale and FP16 minimum. Six bits a value: what a
+/// Q5_0, Q5_1 or Q5_K half costs to hold without loss, against W8's eight and a half.
+enum class ExpertBankFormat : std::uint8_t { W8G32 = 0, Q4G32AM = 1, GgmlBlocks = 2, Q5G32AM = 3 };
 
 struct CpuExpertBank {
     /// One format per half. A K_XL mixture's gate/up and down halves are routinely stored at
@@ -51,12 +55,12 @@ struct CpuExpertBank {
     /// another.
     QType gate_up_ggml;
     QType down_ggml;
-    const std::byte* gate_up_codes  = nullptr; // [experts][2*intermediate][hidden] int8 | u4x2
+    const std::byte* gate_up_codes  = nullptr; // [experts][2*intermediate][hidden] int8 | u4x2 | q5 20 B/32
     const std::byte* gate_up_scales = nullptr; // [experts][2*intermediate][hidden/32] fp16
-    const std::byte* gate_up_mins   = nullptr; // Q4G32AM only, same shape as the scales
+    const std::byte* gate_up_mins   = nullptr; // Q4G32AM / Q5G32AM only, same shape as the scales
     const std::byte* down_codes     = nullptr; // [experts][hidden][intermediate] int8 | u4x2
     const std::byte* down_scales    = nullptr; // [experts][hidden][intermediate/32] fp16
-    const std::byte* down_mins      = nullptr; // Q4G32AM only
+    const std::byte* down_mins      = nullptr; // Q4G32AM / Q5G32AM only
 };
 
 /// Requantises `groups` W8 groups (32 int8 codes + FP16 scale each, in parallel plane order)

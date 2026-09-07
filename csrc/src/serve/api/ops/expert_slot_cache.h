@@ -32,10 +32,10 @@ struct ExpertHostBank {
     ExpertBankFormat down_format    = ExpertBankFormat::W8G32;
     const std::byte* gate_up_codes  = nullptr; // [experts * 2 * intermediate rows] codes plane
     const std::byte* gate_up_scales = nullptr; // scales plane, same row order
-    const std::byte* gate_up_mins   = nullptr; // Q4G32AM only: FP16 group minima
+    const std::byte* gate_up_mins   = nullptr; // Q4G32AM / Q5G32AM only: FP16 group minima
     const std::byte* down_codes     = nullptr; // [experts * hidden rows]
     const std::byte* down_scales    = nullptr;
-    const std::byte* down_mins      = nullptr; // Q4G32AM only
+    const std::byte* down_mins      = nullptr; // Q4G32AM / Q5G32AM only
     std::uint64_t gate_up_codes_bytes_per_expert  = 0; // halves under Q4G32AM
     std::uint64_t gate_up_scales_bytes_per_expert = 0; // also the mins stride
     std::uint64_t down_codes_bytes_per_expert     = 0;
@@ -61,6 +61,19 @@ struct Q4BankPlanes {
     std::uint64_t total_bytes   = 0; // 20 * groups
 };
 [[nodiscard]] Q4BankPlanes q4_bank_planes(std::int64_t rows_total, std::int32_t k);
+
+/// Plane layout of one Q5G32AM host object (`ExpertBankFormat::Q5G32AM`): 20 code bytes per
+/// group -- sixteen of low nibbles in the pairwise order, four whose bit v is value v's fifth
+/// bit -- then every group's FP16 scale, then every group's FP16 min. 24 bytes per 32 values.
+inline constexpr std::uint64_t kQ5GroupBytes = 20;
+struct Q5BankPlanes {
+    std::uint64_t groups        = 0; // rows_total * k / 32
+    std::uint64_t codes_bytes   = 0; // 20 * groups, at offset 0
+    std::uint64_t scales_offset = 0; // == codes_bytes
+    std::uint64_t mins_offset   = 0; // scales_offset + 2 * groups
+    std::uint64_t total_bytes   = 0; // 24 * groups
+};
+[[nodiscard]] Q5BankPlanes q5_bank_planes(std::int64_t rows_total, std::int32_t k);
 
 /// Device pool of `slots` experts in the same plane layout; `routed_gate_up` / `routed_down`
 /// are Weights over the pool that the MoE kernels consume unchanged (n = slots * rows).
@@ -158,12 +171,13 @@ void expert_slot_directory_reset(ExpertSlotDirectory& directory, cudaStream_t st
                                               const Weight& routed_down);
 
 /// One half of a bank as its source presents it: a `Weight` over the bank's mapped alias for
-/// W8 row-split planes or GGML blocks, or the base pointer of a Q4G32AM object, which no
-/// `Weight` describes (its planes follow from the geometry, `q4_bank_planes`). A set `q4_base`
-/// wins.
+/// W8 row-split planes or GGML blocks, or the base pointer of a Q4G32AM or Q5G32AM object,
+/// which no `Weight` describes (its planes follow from the geometry, `q4_bank_planes` /
+/// `q5_bank_planes`). A set base pointer wins over the Weight.
 struct ExpertBankHalfSource {
     const Weight* weight = nullptr;
     const void* q4_base  = nullptr;
+    const void* q5_base  = nullptr; // Q5G32AM planes, laid out per `q5_bank_planes`
 };
 
 /// A bank whose halves are described independently: each is W8 planes, GGML blocks or Q4G32AM

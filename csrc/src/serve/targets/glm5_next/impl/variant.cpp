@@ -602,8 +602,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         // the block's own output, so the destination starts at zero.
         CUDA_CHECK(cudaMemsetAsync(out.data, 0, out.bytes(), stream));
         const family::BankedMixture mixture{weights.layer,          weights.layers,
-                                            &weights.moe,           weights.host_gate_up_q4,
-                                            weights.host_down_q4,   weights.host_gate_up,
+                                            &weights.moe,           weights.gate_up_planes,
+                                            weights.down_planes,    weights.host_gate_up,
                                             weights.host_down};
         // Experts in the host bank go through the expert cache: resident ones from the device
         // pool, the rest fetched over PCIe or -- the split's share -- computed on the host and
@@ -616,7 +616,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         if (cache != nullptr && cache->enabled()) {
             cache->run(mixture, hidden, out, workspace, stream);
             cache->add_pending_partial(out, stream);
-        } else if (mixture.host_gate_up_q4 || mixture.host_down_q4) {
+        } else if (family::bank_planes_are_affine(mixture.gate_up_planes) ||
+                   family::bank_planes_are_affine(mixture.down_planes)) {
             // The Q4 bank's routed Weights are a base pointer and a shape; only the cache
             // decodes them, so without a pool there is nothing the plain route could read.
             throw std::logic_error("glm5_next: the Q4 host expert bank needs the expert cache "

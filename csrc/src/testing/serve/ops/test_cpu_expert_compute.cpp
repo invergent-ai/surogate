@@ -262,6 +262,103 @@ std::vector<double> reference_job_mixed(const Q4Bank& q, const Bank& b, int expe
     return y;
 }
 
+// --- Q5G32AM bank: random planes (the format is its own source of truth here; the repack from
+// GGML blocks is checked separately against the codec). Per group: 16 bytes of pairwise
+// nibbles, 4 bytes whose bit v is value v's fifth bit, then FP16 scale and min.
+struct Q5Bank {
+    std::vector<std::uint8_t> gate_codes, down_codes; // 20 bytes per group
+    std::vector<std::uint16_t> gate_scales, gate_mins, down_scales, down_mins;
+    ops::CpuExpertBank view() const {
+        ops::CpuExpertBank bank;
+        bank.gate_up_format = ops::ExpertBankFormat::Q5G32AM;
+        bank.down_format    = ops::ExpertBankFormat::Q5G32AM;
+        bank.gate_up_codes  = reinterpret_cast<const std::byte*>(gate_codes.data());
+        bank.gate_up_scales = reinterpret_cast<const std::byte*>(gate_scales.data());
+        bank.gate_up_mins   = reinterpret_cast<const std::byte*>(gate_mins.data());
+        bank.down_codes     = reinterpret_cast<const std::byte*>(down_codes.data());
+        bank.down_scales    = reinterpret_cast<const std::byte*>(down_scales.data());
+        bank.down_mins      = reinterpret_cast<const std::byte*>(down_mins.data());
+        return bank;
+    }
+};
+
+Q5Bank make_q5_bank(std::mt19937& rng) {
+    const int H = kGeometry.hidden, I = kGeometry.intermediate, E = kGeometry.experts;
+    const std::size_t gate_groups = static_cast<std::size_t>(E) * 2 * I * (H / 32);
+    const std::size_t down_groups = static_cast<std::size_t>(E) * H * (I / 32);
+    Q5Bank b;
+    b.gate_codes.resize(gate_groups * 20);
+    b.down_codes.resize(down_groups * 20);
+    b.gate_scales.resize(gate_groups);
+    b.gate_mins.resize(gate_groups);
+    b.down_scales.resize(down_groups);
+    b.down_mins.resize(down_groups);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> scale(0.002F, 0.02F);
+    std::uniform_real_distribution<float> minimum(-0.3F, 0.0F);
+    for (auto& c : b.gate_codes) { c = static_cast<std::uint8_t>(byte(rng)); }
+    for (auto& c : b.down_codes) { c = static_cast<std::uint8_t>(byte(rng)); }
+    for (auto& v : b.gate_scales) { v = float_to_fp16(scale(rng)); }
+    for (auto& v : b.down_scales) { v = float_to_fp16(scale(rng)); }
+    for (auto& v : b.gate_mins) { v = float_to_fp16(minimum(rng)); }
+    for (auto& v : b.down_mins) { v = float_to_fp16(minimum(rng)); }
+    return b;
+}
+
+int q5_code(const std::uint8_t* group, int v) {
+    std::uint32_t high;
+    std::memcpy(&high, group + 16, sizeof(high));
+    const int low = (group[v / 2] >> (4 * (v % 2))) & 0xF;
+    return low | static_cast<int>((high >> v) & 1U) << 4;
+}
+
+double dot_ref_q5(const std::uint8_t* q5, const std::uint16_t* scales, const std::uint16_t* mins,
+                  const std::vector<int>& xq, const std::vector<double>& xs, int k) {
+    double acc = 0.0;
+    for (int g = 0; g < k / 32; ++g) {
+        long dot = 0, sum = 0;
+        for (int v = 0; v < 32; ++v) {
+            dot += static_cast<long>(q5_code(q5 + g * 20, v)) * xq[g * 32 + v];
+            sum += xq[g * 32 + v];
+        }
+        acc += xs[g] * (static_cast<double>(fp16_to_float(scales[g])) * static_cast<double>(dot) +
+                        static_cast<double>(fp16_to_float(mins[g])) * static_cast<double>(sum));
+    }
+    return acc;
+}
+
+std::vector<double> reference_job_q5(const Q5Bank& b, int expert,
+                                     const std::vector<std::uint16_t>& x, float weight,
+                                     double limit = 0.0) {
+    const int H = kGeometry.hidden, I = kGeometry.intermediate;
+    std::vector<double> xf(H);
+    for (int i = 0; i < H; ++i) { xf[i] = bf16_to_float(x[i]); }
+    std::vector<int> xq;
+    std::vector<double> xs;
+    quantise_ref(xf, xq, xs);
+    const std::size_t gh = static_cast<std::size_t>(H / 32), gi = static_cast<std::size_t>(I / 32);
+    const std::uint8_t* gc  = b.gate_codes.data() + static_cast<std::size_t>(expert) * 2 * I * gh * 20;
+    const std::uint16_t* gs = b.gate_scales.data() + static_cast<std::size_t>(expert) * 2 * I * gh;
+    const std::uint16_t* gm = b.gate_mins.data() + static_cast<std::size_t>(expert) * 2 * I * gh;
+    std::vector<double> h(I);
+    for (int j = 0; j < I; ++j) {
+        const double g = dot_ref_q5(gc + j * gh * 20, gs + j * gh, gm + j * gh, xq, xs, H);
+        const double u = dot_ref_q5(gc + (I + j) * gh * 20, gs + (I + j) * gh, gm + (I + j) * gh, xq, xs, H);
+        h[j] = swiglu_ref(g, u, limit);
+    }
+    std::vector<int> hq;
+    std::vector<double> hs;
+    quantise_ref(h, hq, hs);
+    const std::uint8_t* dc  = b.down_codes.data() + static_cast<std::size_t>(expert) * H * gi * 20;
+    const std::uint16_t* ds = b.down_scales.data() + static_cast<std::size_t>(expert) * H * gi;
+    const std::uint16_t* dm = b.down_mins.data() + static_cast<std::size_t>(expert) * H * gi;
+    std::vector<double> y(H);
+    for (int r = 0; r < H; ++r) {
+        y[r] = weight * dot_ref_q5(dc + r * gi * 20, ds + r * gi, dm + r * gi, hq, hs, I);
+    }
+    return y;
+}
+
 int compare(const std::string& label, const std::vector<float>& got, const std::vector<double>& want) {
     double max_abs = 0.0, max_ref = 0.0, err2 = 0.0, ref2 = 0.0;
     for (std::size_t i = 0; i < want.size(); ++i) {
@@ -673,6 +770,113 @@ int main() {
             bad += compare("mixed pooled token " + std::to_string(t2), got, want);
         }
         failures += bad;
+    }
+    // --- The Q5G32AM bank: single job (scalar oracle path), the pooled paths, and Q5 gate/up
+    // over W8 down, which is the shape a checkpoint with Q5 gate/up and Q8_0 down takes ---
+    {
+        const Q5Bank q5 = make_q5_bank(rng);
+        std::vector<float> out5(H, 0.0F);
+        ops::cpu_expert_compute_job(kGeometry, q5.view(), job, x.data(), out5.data(), scratch.data());
+        failures += compare("q5 single job expert 2", out5, reference_job_q5(q5, 2, x, 0.75F));
+        const int many = 13;
+        std::vector<std::uint16_t> xm(static_cast<std::size_t>(H) * many);
+        for (auto& v : xm) { v = float_to_bf16(act(rng)); }
+        std::vector<ops::CpuExpertJob> jm;
+        std::uniform_real_distribution<float> wdist(0.05F, 0.95F);
+        for (int t2 = 0; t2 < many; ++t2) {
+            jm.push_back({t2, t2 % 4, wdist(rng)});
+            if (t2 % 2 == 0) { jm.push_back({t2, (t2 * 7 + 1) % 4, wdist(rng)}); }
+            if (t2 % 3 == 0) { jm.push_back({t2, 3, wdist(rng)}); }
+        }
+        ops::CpuExpertPool pool5(kGeometry, {.threads = 6, .pin_threads = false});
+        for (const bool mixed : {false, true}) {
+            ops::CpuExpertBank view = q5.view();
+            if (mixed) {
+                const ops::CpuExpertBank w8 = bank.view();
+                view.down_format = ops::ExpertBankFormat::W8G32;
+                view.down_codes  = w8.down_codes;
+                view.down_scales = w8.down_scales;
+                view.down_mins   = nullptr;
+            }
+            std::vector<float> om(static_cast<std::size_t>(H) * many, 0.0F);
+            ops::CpuExpertRound rm{xm.data(), om.data(), many, jm};
+            pool5.run(view, rm);
+            int bad = 0;
+            for (int t2 = 0; t2 < many; ++t2) {
+                std::vector<std::uint16_t> column(xm.begin() + t2 * H, xm.begin() + (t2 + 1) * H);
+                std::vector<double> want(H, 0.0);
+                for (const auto& j2 : jm) {
+                    if (j2.token != t2) { continue; }
+                    std::vector<double> y;
+                    if (mixed) {
+                        // Q5 gate/up, W8 down: compose the two oracles through the same h.
+                        const int I = kGeometry.intermediate;
+                        std::vector<double> xf(H);
+                        for (int i = 0; i < H; ++i) { xf[i] = bf16_to_float(column[i]); }
+                        std::vector<int> xq; std::vector<double> xs;
+                        quantise_ref(xf, xq, xs);
+                        const std::size_t gh = static_cast<std::size_t>(H / 32);
+                        const std::uint8_t* gc  = q5.gate_codes.data() + static_cast<std::size_t>(j2.expert) * 2 * I * gh * 20;
+                        const std::uint16_t* gs = q5.gate_scales.data() + static_cast<std::size_t>(j2.expert) * 2 * I * gh;
+                        const std::uint16_t* gm = q5.gate_mins.data() + static_cast<std::size_t>(j2.expert) * 2 * I * gh;
+                        std::vector<double> hh(I);
+                        for (int j = 0; j < I; ++j) {
+                            const double g = dot_ref_q5(gc + j * gh * 20, gs + j * gh, gm + j * gh, xq, xs, H);
+                            const double u = dot_ref_q5(gc + (I + j) * gh * 20, gs + (I + j) * gh, gm + (I + j) * gh, xq, xs, H);
+                            hh[j] = swiglu_ref(g, u, 0.0);
+                        }
+                        std::vector<int> hq; std::vector<double> hs;
+                        quantise_ref(hh, hq, hs);
+                        const std::int8_t* dc   = bank.down_codes.data() + static_cast<std::size_t>(j2.expert) * H * I;
+                        const std::uint16_t* ds = bank.down_scales.data() + static_cast<std::size_t>(j2.expert) * H * (I / 32);
+                        y.resize(H);
+                        for (int r = 0; r < H; ++r) { y[r] = j2.weight * dot_ref(dc + r * I, ds + r * (I / 32), hq, hs, I); }
+                    } else {
+                        y = reference_job_q5(q5, j2.expert, column, j2.weight);
+                    }
+                    for (int i = 0; i < H; ++i) { want[i] += y[i]; }
+                }
+                std::vector<float> got(om.begin() + t2 * H, om.begin() + (t2 + 1) * H);
+                bad += compare(std::string(mixed ? "q5 gate/up over w8 down token " : "q5 pooled token ") + std::to_string(t2), got, want);
+            }
+            failures += bad;
+        }
+    }
+    // --- 5-bit affine blocks straight to Q5G32AM: exact against the codec's float decode ---
+    {
+        for (const auto& [name, type] : std::vector<std::pair<const char*, QType>>{
+                 {"Q5_K", QType::Q5_K}, {"Q5_0", QType::Q5_0}, {"Q5_1", QType::Q5_1}}) {
+            const int k = 512;
+            std::vector<std::byte> row(static_cast<std::size_t>(ops::ggml_row_bytes(type, k)));
+            std::uniform_int_distribution<int> byte(0, 255);
+            for (auto& b : row) { b = static_cast<std::byte>(byte(rng) & 0x3F); }
+            std::vector<float> want(k);
+            std::vector<std::uint8_t> codes(static_cast<std::size_t>(k) / 32 * 20);
+            std::vector<std::uint16_t> scales(static_cast<std::size_t>(k) / 32), mins(static_cast<std::size_t>(k) / 32);
+            const bool a = ops::ggml_decode_row_float(type, row.data(), k, want.data());
+            const bool b = ops::ggml_row_to_q5g32am(type, row.data(), k, codes.data(), scales.data(), mins.data());
+            double worst = 0.0, range = 1e-30;
+            for (int g = 0; g < k / 32 && a && b; ++g) {
+                const double sc = fp16_to_float(scales[static_cast<std::size_t>(g)]);
+                const double mn = fp16_to_float(mins[static_cast<std::size_t>(g)]);
+                for (int v = 0; v < 32; ++v) {
+                    const double got  = sc * q5_code(codes.data() + static_cast<std::size_t>(g) * 20, v) + mn;
+                    const double wref = want[static_cast<std::size_t>(g * 32 + v)];
+                    worst = std::max(worst, std::fabs(got - wref));
+                    range = std::max(range, std::fabs(wref));
+                }
+            }
+            const bool ok = a && b && worst <= 2e-3 * range;
+            std::cout << (ok ? "ok   " : "FAIL ") << name << " -> Q5G32AM exact repack: max|err| " << worst
+                      << " over range " << range << "\n";
+            failures += ok ? 0 : 1;
+        }
+        std::vector<std::byte> q4(static_cast<std::size_t>(ops::ggml_row_bytes(QType::Q4_K, 256)));
+        std::vector<std::uint8_t> c5(8 * 20);
+        std::vector<std::uint16_t> s5(8), m5(8);
+        const bool refused = !ops::ggml_row_to_q5g32am(QType::Q4_K, q4.data(), 256, c5.data(), s5.data(), m5.data());
+        std::cout << (refused ? "ok   " : "FAIL ") << "Q4_K -> Q5G32AM refused\n";
+        failures += refused ? 0 : 1;
     }
     std::cout << (failures ? "FAIL" : "OK") << " cpu_expert_compute\n";
     return failures ? 1 : 0;

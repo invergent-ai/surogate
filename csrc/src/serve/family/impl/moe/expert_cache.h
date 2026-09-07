@@ -15,6 +15,7 @@
 // host worker pool (one per process, or one per NUMA node with `--cpu-moe-pool-per-socket`).
 
 #include "api/ops/cpu_expert_compute.h"
+#include "family/impl/load/host_bank.h"
 #include "api/ops/expert_slot_cache.h"
 #include "api/ops/sparse_moe.h"
 #include "api/types.h"
@@ -39,12 +40,13 @@ struct BankedMixture {
     /// The kernels' view: router and shared expert on the device, the routed pair over the
     /// bank's device-mapped alias. The cache swaps the routed pair for the pool's.
     const ops::SparseMoeWeights* op = nullptr;
-    /// Which routed halves the bank holds as Q4G32AM planes (requantised on the way in; the
-    /// pool decodes them). A half that is not is W8 planes or the file's blocks, as its
-    /// `Weight` says. The halves are independent: a K_XL mixture keeps its 4-bit gate/up as
-    /// 4-bit planes and its wider down as W8.
-    bool host_gate_up_q4 = false;
-    bool host_down_q4    = false;
+    /// What the bank holds each routed half as. `Q4` and `Q5` name affine planes only the cache
+    /// reads (a base pointer, the layout from the geometry); anything else means the half is
+    /// what its `Weight` says, W8 planes or the file's blocks. The halves are independent: a
+    /// K_XL mixture keeps its 4-bit gate/up at four bits, its 5-bit down at six, its 8-bit
+    /// down at W8.
+    BankPlanes gate_up_planes = BankPlanes::Native;
+    BankPlanes down_planes    = BankPlanes::Native;
     /// Host virtual addresses of the routed expert objects (the Weights above hold the mapped
     /// aliases); the CPU expert path reads the planes -- or the file's blocks -- through these.
     const std::byte* host_gate_up = nullptr;

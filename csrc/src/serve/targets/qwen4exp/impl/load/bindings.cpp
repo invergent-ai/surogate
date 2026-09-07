@@ -110,17 +110,17 @@ MoePlan bind_moe(artifact::Binder& binder, HostBankPlan& bank, const std::string
     // gather decodes each group on its way into the pool) or turns them into planes on the way
     // into pinned memory -- which planes is per object under `Auto`, so a half stored 4-bit
     // affine becomes Q4G32AM by an exact repack and a wider one becomes W8.
-    NumericFormat gate_up_format = NumericFormat::W8G32_F16S;
-    NumericFormat down_format    = NumericFormat::W8G32_F16S;
-    bool gate_up_q4 = false;
-    bool down_q4    = false;
+    NumericFormat gate_up_format          = NumericFormat::W8G32_F16S;
+    NumericFormat down_format             = NumericFormat::W8G32_F16S;
+    family::BankPlanes gate_up_planes     = family::BankPlanes::Native;
+    family::BankPlanes down_planes        = family::BankPlanes::Native;
     const auto routed = [&](const std::string& name, std::initializer_list<std::uint64_t> shape,
-                            NumericFormat& format, bool& q4) {
+                            NumericFormat& format, family::BankPlanes& half) {
         const auto rows    = static_cast<std::int32_t>(*shape.begin());
         const auto columns = static_cast<std::int32_t>(*(shape.begin() + 1));
         if (planes == family::BankPlanes::Q4 && !ggml_artifact) {
             // The requantiser reads W8 planes, which is what a converted artifact stores.
-            q4 = true;
+            half = family::BankPlanes::Q4;
             return host_q4(binder, bank, name, NumericFormat::W8G32_F16S, shape);
         }
         const artifact::LinearBinding binding = host_linear(binder, bank, name, rows, columns);
@@ -128,7 +128,7 @@ MoePlan bind_moe(artifact::Binder& binder, HostBankPlan& bank, const std::string
         const family::BankPlanes chosen = family::bank_as_planes(
             bank.objects.back(), rows, columns, artifact::qtype_for(binding.format), planes);
         if (chosen != family::BankPlanes::Native) {
-            q4     = chosen == family::BankPlanes::Q4;
+            half   = chosen;
             format = NumericFormat::W8G32_F16S; // what the bank presents to the runtime
         }
         return binding.object;
@@ -137,13 +137,13 @@ MoePlan bind_moe(artifact::Binder& binder, HostBankPlan& bank, const std::string
         .router_shared_gate = device(binder, prefix + "router_shared_gate", NumericFormat::BF16,
                                      {kExperts + 1, kHidden}),
         .routed_gate_up = routed(prefix + "routed_gate_up", {kExperts * 2 * kFfn, kHidden},
-                                 gate_up_format, gate_up_q4),
+                                 gate_up_format, gate_up_planes),
         .routed_down    = routed(prefix + "routed_down", {kExperts * kHidden, kFfn},
-                                 down_format, down_q4),
+                                 down_format, down_planes),
         .routed_gate_up_format = gate_up_format,
         .routed_down_format    = down_format,
-        .routed_gate_up_q4     = gate_up_q4,
-        .routed_down_q4        = down_q4,
+        .routed_gate_up_planes = gate_up_planes,
+        .routed_down_planes    = down_planes,
         .shared_gate_up = device(binder, prefix + "shared_gate_up", NumericFormat::W8G32_F16S,
                                  {2 * kFfn, kHidden}),
         .shared_down =
@@ -187,8 +187,8 @@ ops::HyperConnectionWeights load_hc(const artifact::MaterializedArtifact& backin
 SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const HostBank& bank,
                           const MoePlan& plan, ops::HyperConnectionWeights mix) {
     SparseMoePayload out;
-    out.host_gate_up_q4       = plan.routed_gate_up_q4;
-    out.host_down_q4          = plan.routed_down_q4;
+    out.gate_up_planes        = plan.routed_gate_up_planes;
+    out.down_planes           = plan.routed_down_planes;
     out.op.router_shared_gate = artifact::materialized_weight(
         backing, plan.router_shared_gate, NumericFormat::BF16,
         static_cast<std::int32_t>(kExperts + 1), static_cast<std::int32_t>(kHidden));
@@ -197,20 +197,23 @@ SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const H
     // mandatory: no kernel ever reads it as W8 planes -- expert_slot_weights swaps in the
     // pool's). Blocks the bank kept are read by the gather's codec; W8 planes are the pool's
     // own layout, copied straight through.
-    const auto routed = [&](artifact::ObjectHandle handle, bool q4, NumericFormat format,
-                            std::int32_t rows, std::int32_t columns) {
+    const auto routed = [&](artifact::ObjectHandle handle, family::BankPlanes planes,
+                            NumericFormat format, std::int32_t rows, std::int32_t columns) {
         const HostObject& object = bank.object(handle);
-        if (q4) { return family::host_q4_weight(object, rows, columns); }
+        if (family::bank_planes_are_affine(planes)) {
+            return family::host_affine_weight(planes, object, rows, columns);
+        }
         if (format != NumericFormat::W8G32_F16S) {
             return host_ggml_weight(object, format, rows, columns);
         }
         return host_w8_weight(object, rows, columns);
     };
-    out.op.routed_gate_up = routed(plan.routed_gate_up, plan.routed_gate_up_q4,
+    out.op.routed_gate_up = routed(plan.routed_gate_up, plan.routed_gate_up_planes,
                                    plan.routed_gate_up_format,
                                    static_cast<std::int32_t>(kExperts * 2 * kFfn),
                                    static_cast<std::int32_t>(kHidden));
-    out.op.routed_down    = routed(plan.routed_down, plan.routed_down_q4, plan.routed_down_format,
+    out.op.routed_down    = routed(plan.routed_down, plan.routed_down_planes,
+                                   plan.routed_down_format,
                                    static_cast<std::int32_t>(kExperts * kHidden),
                                    static_cast<std::int32_t>(kFfn));
     out.op.shared_gate_up = artifact::materialized_weight(

@@ -42,6 +42,7 @@ std::size_t object_bytes(const HostObjectPlan& plan) {
         // Requantised on the way in: the object is the Q4 planes, whatever it came from.
         return ops::q4_bank_planes(plan.q4_rows, plan.q4_k).total_bytes;
     }
+    if (plan.q5_rows != 0) { return ops::q5_bank_planes(plan.q5_rows, plan.q5_k).total_bytes; }
     if (plan.decode_rows != 0) {
         // Decoded on the way in: the object is the W8 planes, not the blocks it came from.
         return static_cast<std::size_t>(plan.decode_rows) * plan.decode_k +
@@ -76,8 +77,11 @@ HostBank::HostBank(const HostBankPlan& plan) {
     report(0);
     for (const auto& source : plan.objects) {
         const bool q4 = source.q4_rows > 0;
+        const bool q5 = source.q5_rows > 0;
         const ops::Q4BankPlanes q4_planes =
             q4 ? ops::q4_bank_planes(source.q4_rows, source.q4_k) : ops::Q4BankPlanes{};
+        const ops::Q5BankPlanes q5_planes =
+            q5 ? ops::q5_bank_planes(source.q5_rows, source.q5_k) : ops::Q5BankPlanes{};
         HostObject object;
         object.bytes = q4 ? q4_planes.total_bytes : object_bytes(source);
         object.name  = source.name;
@@ -235,6 +239,9 @@ HostBank::HostBank(const HostBankPlan& plan) {
             auto* q4_dst_codes  = reinterpret_cast<std::uint8_t*>(q4_dst);
             auto* q4_dst_scales = reinterpret_cast<std::uint16_t*>(q4_dst + q4_planes.scales_offset);
             auto* q4_dst_mins   = reinterpret_cast<std::uint16_t*>(q4_dst + q4_planes.mins_offset);
+            auto* q5_dst_codes  = reinterpret_cast<std::uint8_t*>(q4_dst);
+            auto* q5_dst_scales = reinterpret_cast<std::uint16_t*>(q4_dst + q5_planes.scales_offset);
+            auto* q5_dst_mins   = reinterpret_cast<std::uint16_t*>(q4_dst + q5_planes.mins_offset);
             const std::size_t workers = std::max<std::size_t>(16, std::thread::hardware_concurrency());
             const std::int64_t chunk  = (rows + static_cast<std::int64_t>(workers) - 1) /
                                        static_cast<std::int64_t>(workers);
@@ -253,6 +260,18 @@ HostBank::HostBank(const HostBankPlan& plan) {
                             stretches[part].data() +
                             static_cast<std::size_t>(r - first_row[part]) * static_cast<std::size_t>(row_in);
                         const std::int64_t group0 = r * (k / 32);
+                        // A 5-bit affine source goes to Q5G32AM directly and exactly, and only
+                        // such a source is ever marked for it.
+                        if (q5) {
+                            if (!ops::ggml_row_to_q5g32am(source.decode_type, blocks, k,
+                                                          q5_dst_codes + group0 * ops::kQ5GroupBytes,
+                                                          q5_dst_scales + group0,
+                                                          q5_dst_mins + group0)) {
+                                throw std::runtime_error("host bank object " + source.name +
+                                                         " is not a 5-bit affine type");
+                            }
+                            continue;
+                        }
                         // A 4-bit affine source goes to Q4G32AM directly and exactly; anything
                         // wider takes the W8 row and the affine refit (a requantisation).
                         if (q4 && ops::ggml_row_to_q4g32am(source.decode_type, blocks, k,
@@ -378,6 +397,7 @@ std::shared_ptr<HostBank> HostBank::shared(const HostBankPlan& plan) {
         key += ':';
         key += std::to_string(source.payload.size());
         if (source.q4_rows > 0) { key += ":q4"; }
+        if (source.q5_rows > 0) { key += ":q5"; }
         key += ';';
     }
     std::shared_future<std::shared_ptr<HostBank>> pending;
@@ -582,13 +602,22 @@ BankPlanes bank_as_planes(HostObjectPlan& plan, std::int64_t rows, std::int32_t 
     if (planes == BankPlanes::Native || !ops::detail::ggml::is_ggml_qtype(stored)) {
         return BankPlanes::Native;
     }
+    const bool affine4 = stored == QType::Q4_K || stored == QType::Q4_0 || stored == QType::Q4_1;
+    const bool affine5 = stored == QType::Q5_K || stored == QType::Q5_0 || stored == QType::Q5_1;
     if (planes == BankPlanes::Auto) {
-        const bool affine4 = stored == QType::Q4_K || stored == QType::Q4_0 || stored == QType::Q4_1;
-        planes             = affine4 ? BankPlanes::Q4 : BankPlanes::W8;
+        planes = affine4 ? BankPlanes::Q4 : affine5 ? BankPlanes::Q5 : BankPlanes::W8;
     }
+    // Q5G32AM has no requantiser behind it, and needs none: it is asked for only where it is
+    // exact, and a request for it elsewhere falls back to W8 rather than guessing.
+    if (planes == BankPlanes::Q5 && !affine5) { planes = BankPlanes::W8; }
     plan.decode_rows = rows;
     plan.decode_k    = columns;
     plan.decode_type = stored;
+    if (planes == BankPlanes::Q5) {
+        plan.q5_rows = rows;
+        plan.q5_k    = columns;
+        return planes;
+    }
     if (planes == BankPlanes::Q4) {
         // Decoded to a row of W8 and requantised from there: the two steps a converted
         // artifact's bank takes, fused per row so no W8 copy of the experts exists.

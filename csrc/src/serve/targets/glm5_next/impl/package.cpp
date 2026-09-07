@@ -181,9 +181,10 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile weights_profile) {
     // The banked experts become planes as the bank fills. By default each object keeps the
     // narrowest planes that lose nothing: Q4G32AM where the file stores it 4-bit affine (this
-    // file's gate and up experts, Q4_K), W8 where it is wider (its down experts, Q5_K/Q6_K,
-    // which a Q4 bank would requantise to four bits). `--host-expert-bank w8` keeps everything
-    // W8; `q4` requantises everything, the denser, faster, lossy opt-in.
+    // file's gate and up experts, Q4_K), Q5G32AM where it is 5-bit affine (its down experts in
+    // 40 layers, Q5_K), W8 where it is wider (the three Q6_K down halves). `--host-expert-bank
+    // w8` keeps everything W8; `q4` requantises everything to four bits, the denser, faster,
+    // lossy opt-in.
     const family::BankPlanes planes =
         options.host_expert_bank == EngineOptions::HostExpertBank::Q4   ? family::BankPlanes::Q4
         : options.host_expert_bank == EngineOptions::HostExpertBank::W8 ? family::BankPlanes::W8
@@ -195,8 +196,9 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                            "down experts are Q5_K/Q6_K and lose precision here)"
                      : planes == family::BankPlanes::W8
                          ? "W8 planes throughout (decoded while loading)"
-                         : "Q4G32AM planes for the 4-bit halves, W8 for the wider ones (decoded "
-                           "while loading; --host-expert-bank w8|q4 forces one)");
+                         : "Q4G32AM planes for the 4-bit halves, Q5G32AM for the 5-bit ones, W8 "
+                           "for the wider ones (repacked while loading; --host-expert-bank w8|q4 "
+                           "forces one)");
     }
     auto plan = detail::bind_artifact(binder, weights_profile, family::startup_features(options),
                                       options.pipeline_stage_first, options.pipeline_stage_last,
@@ -314,8 +316,8 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
             cache.prepare_split(banked == nullptr
                                     ? family::BankedMixture{}
                                     : family::BankedMixture{banked->layer, banked->layers,
-                                                            &banked->moe, banked->host_gate_up_q4,
-                                                            banked->host_down_q4,
+                                                            &banked->moe, banked->gate_up_planes,
+                                                            banked->down_planes,
                                                             banked->host_gate_up,
                                                             banked->host_down});
         }

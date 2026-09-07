@@ -369,6 +369,65 @@ __global__ void __launch_bounds__(kGatherThreads)
     }
 }
 
+// The Q5G32AM twin: 20 bytes a group -- sixteen of nibbles, four of fifth bits -- read as five
+// words, since a group's start is only 4-byte aligned. Same requantisation into the pool.
+__global__ void __launch_bounds__(kGatherThreads)
+    gather_unpack_q5_kernel(const __grid_constant__ GatherQ4Params p) {
+    const int bank         = static_cast<int>(blockIdx.x) / kGatherBlocksPerBank;
+    const int blk          = static_cast<int>(blockIdx.x) % kGatherBlocksPerBank;
+    const GatherQ4Bank b   = p.banks[bank];
+    const long long n      = *p.miss_count;
+    const std::uint64_t total = static_cast<std::uint64_t>(n) * b.groups_per_expert;
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(kGatherBlocksPerBank) * kGatherThreads;
+    for (std::uint64_t u = static_cast<std::uint64_t>(blk) * kGatherThreads + threadIdx.x;
+         u < total; u += stride) {
+        const std::uint64_t row     = u / b.groups_per_expert;
+        const std::uint64_t group   = u - row * b.groups_per_expert;
+        const std::uint64_t src_row = static_cast<std::uint64_t>(p.miss_experts[row]);
+        const std::uint64_t dst_row = static_cast<std::uint64_t>(p.miss_slots[row]);
+        const std::uint64_t g       = src_row * b.groups_per_expert + group;
+        const unsigned int* src = reinterpret_cast<const unsigned int*>(b.src_codes + g * kQ5GroupBytes);
+        std::uint32_t words[4];
+#pragma unroll
+        for (int w = 0; w < 4; ++w) { words[w] = __ldcs(src + w); }
+        const std::uint32_t high = __ldcs(src + 4);
+        const float step   = __half2float(reinterpret_cast<const __half&>(b.src_scales[g]));
+        const float lo     = __half2float(reinterpret_cast<const __half&>(b.src_mins[g]));
+        float value[32];
+        float amax = 0.0F;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int v     = w * 8 + i;
+                const int q     = ((words[w] >> (4 * i)) & 0xF) | (((high >> v) & 1U) << 4);
+                const float val = step * static_cast<float>(q) + lo;
+                value[v]        = val;
+                amax            = fmaxf(amax, fabsf(val));
+            }
+        }
+        const float scale = amax / 127.0F;
+        const float inv   = scale > 0.0F ? 1.0F / scale : 0.0F;
+        std::uint32_t out[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            std::uint32_t packed_out = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int c = __float2int_rn(value[w * 4 + i] * inv);
+                packed_out |= (static_cast<std::uint32_t>(c) & 0xFFU) << (8 * i);
+            }
+            out[w] = packed_out;
+        }
+        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + group * 32;
+        __stcs(reinterpret_cast<uint4*>(dst), make_uint4(out[0], out[1], out[2], out[3]));
+        __stcs(reinterpret_cast<uint4*>(dst + 16), make_uint4(out[4], out[5], out[6], out[7]));
+        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + group * 2) =
+            __float2half_rn(scale);
+    }
+}
+
 // One GGML-block matrix of the bank: the GGUF's own bytes on the host, the pool's W8 codes and
 // scales on the device. Same shape as the Q4G32AM gather above -- one thread owns one 32-value
 // group, decodes it and requantises to the pool's symmetric int8 -- so the kernels reading the
@@ -641,6 +700,18 @@ void fill_bank_half(const SparseMoeGeometry& geometry, const ExpertBankHalfSourc
                                                 : bank.down_scales_bytes_per_expert;
     QType& ggml                       = gate_up ? bank.gate_up_ggml : bank.down_ggml;
     const char* half                  = gate_up ? "gate/up" : "down";
+    if (source.q5_base != nullptr) {
+        const Q5BankPlanes planes =
+            q5_bank_planes(static_cast<std::int64_t>(geometry.experts) * rows_per_expert, k);
+        const auto experts = static_cast<std::uint64_t>(geometry.experts);
+        format       = ExpertBankFormat::Q5G32AM;
+        codes        = static_cast<const std::byte*>(source.q5_base);
+        scales       = static_cast<const std::byte*>(source.q5_base) + planes.scales_offset;
+        mins         = static_cast<const std::byte*>(source.q5_base) + planes.mins_offset;
+        codes_bytes  = planes.codes_bytes / experts;
+        scales_bytes = planes.groups / experts * 2;
+        return;
+    }
     if (source.q4_base != nullptr) {
         const Q4BankPlanes planes =
             q4_bank_planes(static_cast<std::int64_t>(geometry.experts) * rows_per_expert, k);
@@ -769,6 +840,20 @@ void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t la
     CUDA_CHECK(cudaGetLastError());
 }
 
+Q5BankPlanes q5_bank_planes(std::int64_t rows_total, std::int32_t k) {
+    if (rows_total <= 0 || k <= 0 || k % kW8Group != 0) {
+        throw std::invalid_argument("expert_slot_cache: q5 planes need rows and k % 32 == 0");
+    }
+    Q5BankPlanes out;
+    out.groups        = static_cast<std::uint64_t>(rows_total) * static_cast<std::uint64_t>(k) /
+                 static_cast<std::uint64_t>(kW8Group);
+    out.codes_bytes   = out.groups * kQ5GroupBytes;
+    out.scales_offset = out.codes_bytes;
+    out.mins_offset   = out.scales_offset + out.groups * 2;
+    out.total_bytes   = out.mins_offset + out.groups * 2;
+    return out;
+}
+
 Q4BankPlanes q4_bank_planes(std::int64_t rows_total, std::int32_t k) {
     if (rows_total <= 0 || k <= 0 || k % kW8Group != 0) {
         throw std::invalid_argument("expert_slot_cache: q4 planes need rows and k % 32 == 0");
@@ -821,9 +906,9 @@ void gather_half(const ExpertHostBank& bank, bool gate_up, const ExpertMissList&
         launch_ggml_gather(gate_up ? bank.gate_up_ggml : bank.down_ggml, half, ids, stream);
         return;
     }
-    if (format == ExpertBankFormat::Q4G32AM) {
+    if (format == ExpertBankFormat::Q4G32AM || format == ExpertBankFormat::Q5G32AM) {
         if (mins == nullptr) {
-            throw std::invalid_argument("expert_slot_cache: q4 bank half has no min plane");
+            throw std::invalid_argument("expert_slot_cache: affine bank half has no min plane");
         }
         GatherQ4Params p{};
         p.banks[0] = {reinterpret_cast<const std::uint8_t*>(codes),
@@ -832,12 +917,16 @@ void gather_half(const ExpertHostBank& bank, bool gate_up, const ExpertMissList&
                       dst_codes,
                       dst_scales,
                       groups,
-                      codes_bytes * 2,
-                      scales_bytes};
+                      groups * 32,
+                      groups * 2};
         p.miss_slots   = miss_slots;
         p.miss_experts = miss_experts;
         p.miss_count   = miss_count;
-        gather_unpack_q4_kernel<<<kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
+        if (format == ExpertBankFormat::Q4G32AM) {
+            gather_unpack_q4_kernel<<<kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
+        } else {
+            gather_unpack_q5_kernel<<<kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

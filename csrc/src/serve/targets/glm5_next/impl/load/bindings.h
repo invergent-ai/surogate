@@ -220,11 +220,12 @@ struct FeedForwardPayload {
     /// reads the bank's planes through these on the host instead of fetching them over PCIe.
     const std::byte* host_gate_up = nullptr;
     const std::byte* host_down    = nullptr;
-    /// Which banked halves are Q4G32AM planes: such a routed Weight is a base pointer and a
-    /// shape, readable by the expert cache alone. Under the default the bank keeps a half as
-    /// 4-bit planes only where the file stores it 4-bit (this file: gate/up), W8 otherwise.
-    bool host_gate_up_q4 = false;
-    bool host_down_q4    = false;
+    /// What the bank holds each banked half as (`family::BankPlanes`): Q4 or Q5 planes are a
+    /// base pointer and a shape, readable by the expert cache alone; anything else is what the
+    /// Weight says. Under the default each half is at the narrowest width that loses nothing --
+    /// this file: gate/up Q4_K at four bits, down Q5_K at six, the three Q6_K down halves W8.
+    family::BankPlanes gate_up_planes = family::BankPlanes::Native;
+    family::BankPlanes down_planes    = family::BankPlanes::Native;
 };
 
 /// The draft head's attention: the trunk's latent projections without the hyper-connection,

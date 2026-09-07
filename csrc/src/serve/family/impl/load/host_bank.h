@@ -42,6 +42,11 @@ struct HostObjectPlan {
     std::int64_t q4_rows           = 0;
     std::int32_t q4_k              = 0;
     std::size_t q4_w8_scale_offset = 0;
+    // Non-zero: the object's GGML blocks (a 5-bit affine type: Q5_0, Q5_1, Q5_K) are repacked
+    // into Q5G32AM planes as the bank fills -- exactly, no W8 in between (`decode_rows` and
+    // `decode_type` say which blocks).
+    std::int64_t q5_rows = 0;
+    std::int32_t q5_k    = 0;
     // Non-zero: the object is a GGUF's own blocks (`decode_type`, `parts` in row order), and the
     // bank decodes them into W8 row-split planes while it copies -- `decode_rows x decode_k`
     // weights, 32 int8 codes and one FP16 scale per group, amax/127, the same requantisation
@@ -162,6 +167,13 @@ artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank
 /// decodes each group on its way into the pool -- so a Q4 bank needs the cache.
 [[nodiscard]] Weight host_q4_weight(const HostObject& object, std::int32_t rows,
                                     std::int32_t columns);
+/// The same view for a Q5G32AM object: only the plane layout differs, and the cache derives
+/// that from the geometry, so the Weight is identical metadata.
+[[nodiscard]] inline Weight host_q5_weight(const HostObject& object, std::int32_t rows,
+                                           std::int32_t columns) {
+    return host_q4_weight(object, rows, columns);
+}
+
 
 /// What a banked mixture object becomes as the bank fills. `Native` keeps a GGUF's blocks as
 /// they lie (the gather decodes each group on its way to the device; the host expert path
@@ -175,7 +187,23 @@ artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank
 /// to FP16 rounding of the endpoints), W8 for anything wider. A K_XL mixture's bank then holds
 /// its gate/up as 4-bit planes and its Q5_K/Q6_K down as W8: 27 % fewer bytes than all-W8 and
 /// the same numbers.
-enum class BankPlanes : std::uint8_t { Native, W8, Q4, Auto };
+/// `Q5` is Q5G32AM, six bits a value, for the 5-bit affine sources (Q5_0, Q5_1, Q5_K); `Auto`
+/// picks it for exactly those, so a K_XL mixture's Q5 down halves cost 6 bits instead of W8's
+/// 8.5 and lose nothing.
+enum class BankPlanes : std::uint8_t { Native, W8, Q4, Auto, Q5 };
+
+/// Whether a resolved `BankPlanes` names planes only the expert cache can read (a base pointer
+/// and a geometry-derived layout, no `Weight` for them).
+[[nodiscard]] constexpr bool bank_planes_are_affine(BankPlanes planes) noexcept {
+    return planes == BankPlanes::Q4 || planes == BankPlanes::Q5;
+}
+
+/// The view for whichever affine planes `planes` names.
+[[nodiscard]] inline Weight host_affine_weight(BankPlanes planes, const HostObject& object,
+                                               std::int32_t rows, std::int32_t columns) {
+    return planes == BankPlanes::Q5 ? host_q5_weight(object, rows, columns)
+                                    : host_q4_weight(object, rows, columns);
+}
 
 /// Marks a banked object stored as GGML blocks for `planes` as the bank is filled. `rows x
 /// columns` is the weight's shape and `stored` the file's type. A format the bank does not

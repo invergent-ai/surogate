@@ -31,8 +31,16 @@ namespace sinfer::ops {
                                        std::uint8_t* codes, std::uint16_t* scales,
                                        std::uint16_t* mins) noexcept;
 
+/// The five-bit twin: Q5_K, Q5_0 and Q5_1 rows into Q5G32AM planes -- 20 code bytes per group
+/// (sixteen of low nibbles in the pairwise order, four whose bit v is value v's fifth bit,
+/// which is how GGML stores them, so the fifth bits copy straight across), FP16 scale, FP16
+/// minimum. Exact to the FP16 rounding of the endpoints, as above. False for any other type.
+[[nodiscard]] bool ggml_row_to_q5g32am(QType type, const void* blocks, std::int64_t k,
+                                       std::uint8_t* codes, std::uint16_t* scales,
+                                       std::uint16_t* mins) noexcept;
+
 /// Decodes one row into floats, group by group, with the codec the gather uses -- the oracle
-/// for the two conversions above.
+/// for the conversions above.
 [[nodiscard]] bool ggml_decode_row_float(QType type, const void* blocks, std::int64_t k,
                                          float* out) noexcept;
 

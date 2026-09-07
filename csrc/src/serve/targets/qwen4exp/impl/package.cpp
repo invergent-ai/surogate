@@ -77,10 +77,11 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     // A narrow bank is what this target's single-card rows live on: it halves the bytes every
     // miss moves over PCIe and through host DRAM against W8 planes, and that was 27.3 against
     // 20.2 tok/s (2026-09-04, GGUF-native artifact, GPU 0). Which planes is per object by
-    // default: Q4G32AM where the file stores a half 4-bit affine (this checkpoint's gate and
-    // up experts, Q4_K -- an exact repack), W8 where it is wider (its down experts, Q5_1 and
-    // Q8_0, which a Q4 bank would requantise to four bits). `--host-expert-bank q4` asks for
-    // four bits throughout and `w8` for eight.
+    // default, at the narrowest width that loses nothing: Q4G32AM where the file stores a half
+    // 4-bit affine (this checkpoint's gate and up experts, Q4_K), Q5G32AM where it is 5-bit
+    // affine (its Q5_1 down experts, 43 layers), W8 where it is wider (its Q8_0 down experts,
+    // which are already exactly W8). A Q4 bank throughout would requantise the down halves to
+    // four bits: `--host-expert-bank q4` asks for that, and `w8` for eight throughout.
     const family::BankPlanes planes =
         options.host_expert_bank == EngineOptions::HostExpertBank::Q4   ? family::BankPlanes::Q4
         : options.host_expert_bank == EngineOptions::HostExpertBank::W8 ? family::BankPlanes::W8
@@ -91,8 +92,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                        "stores wider than four bits)"
                  : planes == family::BankPlanes::W8
                      ? "W8 planes throughout"
-                     : "Q4G32AM planes for the 4-bit halves, W8 for the wider ones "
-                       "(--host-expert-bank w8|q4 forces one)");
+                     : "Q4G32AM planes for the 4-bit halves, Q5G32AM for the 5-bit ones, W8 "
+                       "for the wider ones (--host-expert-bank w8|q4 forces one)");
     auto plan = detail::bind_artifact(binder, features, options.pipeline_stage_first,
                                       options.pipeline_stage_last, planes, options.load_progress);
     // What the runtime will derive from the resident weights once they are on the device: the
