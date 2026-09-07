@@ -1992,6 +1992,18 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     const int base_i = segments.front().kv_base;
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
 
+    // SUROGATE_SERVE_PREFILL_TIMING=1: the whole body's stream time, per call and stage. A
+    // diagnostic that waits for the body's end event, so it serialises a pipeline the way the
+    // synchronize this body used to end with did; never read a throughput with it on.
+    static const bool body_timing = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
+    cudaEvent_t body_begin{}, body_end{};
+    const auto body_host_begin = std::chrono::steady_clock::now();
+    if (body_timing) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&body_begin, cudaEventDefault));
+        CUDA_CHECK(cudaEventCreateWithFlags(&body_end, cudaEventDefault));
+        CUDA_CHECK(cudaEventRecord(body_begin, s));
+    }
+
     work_.reset();
     const auto roots = workspace_recipe::text_prefill_roots(work_, cfg_geometry(), total, 0, 0);
     Tensor ids_device = roots.ids;
@@ -2470,7 +2482,28 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     } // stage_finishes
     const bool is_last = finalizers > 0;
 
-    ctx_.synchronize();
+    if (body_timing) {
+        CUDA_CHECK(cudaEventRecord(body_end, s));
+        const double host_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - body_host_begin).count();
+        CUDA_CHECK(cudaEventSynchronize(body_end));
+        float stream_ms = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&stream_ms, body_begin, body_end));
+        std::fprintf(stderr,
+                     "mixed-timing: stage [%d,%d) %d prefill columns in %zu segment(s) + %d rows: "
+                     "%.1f ms on the stream, %.1f ms host to enqueue\n",
+                     stage_first_, stage_last_, prefill_cols, segments.size(), batch, stream_ms,
+                     host_ms);
+        CUDA_CHECK(cudaEventDestroy(body_begin));
+        CUDA_CHECK(cudaEventDestroy(body_end));
+    }
+    // Enqueued, not finished: the mixed round is a launch/consume pair, and the consume
+    // synchronises. This body used to synchronise here, which the graph replay never did, so
+    // whenever a round could not replay a graph -- every round under the draft head -- the
+    // launch blocked the pipeline driver for the round's whole duration and the stages ran
+    // one after another: a wave of eight prompts took 53 % longer than the graph path's on
+    // four stages with the same per-stage stream time. The workspace reset is stream-safe:
+    // the next body on this stage is launched only after this one has been consumed.
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(prefill_cols),
                               .finalized        = is_last};
