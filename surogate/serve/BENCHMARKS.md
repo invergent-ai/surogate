@@ -663,9 +663,12 @@ old types only, and the same IQ4_XS codec matches on the 0.8B (TODOv2 item 5).
   10 % was the wide-N GEMM kernel spilling under `-rdc=true` (fixed: whole-program
   `sinfer_nvfp4_cutlass`, the 256-row tile the wide route's default) plus the unfused SwiGLU
   (fixed: `ops::linear_swiglu_down_add`). Left, each small: the GDN chunked kernels' ~0.6
-  us/token, the narrow key/value slices still on cuBLASLt, the FP8 route's registered table
-  (27B-only, like the NVFP4 one was) which refuses the adapter split's half geometry
-  (17,408 x 5,120) where it runs. And a build rule worth keeping: a CUTLASS kernel under
+  us/token, the narrow key/value slices still on cuBLASLt, and a row-scaled FP8 parent's halves,
+  which are not independently addressable (`weight_row_view` admits RowSplit and Contiguous,
+  and the FP8 validation insists the scale plane sit at a fixed offset from the payload), so
+  an adapter on the 3.8's FP8 MLP layers is refused at bind time. The FP8 route's 27B-only
+  shape table is closed: it serves any (rows, k) whose K is a whole number of 32 values
+  (573e53d3), the 27B's own numbers unchanged. And a build rule worth keeping: a CUTLASS kernel under
   CUDA_SEPARABLE_COMPILATION is not the kernel flashinfer or vLLM measured -- check its SASS
   for LDL/STL between the first and last MMA before comparing.
 - **Measuring at the cap.** Cards differ by +/-8 % in sustained clock at 400 W (GPUs
