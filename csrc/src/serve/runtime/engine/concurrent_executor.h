@@ -1097,6 +1097,16 @@ private:
             top_up_prefill_lanes();
             seg_timer_.admit += std::chrono::duration<double>(Clock::now() - t_admit).count();
         }
+        // The round's width, for a draft head deciding whether a verify pays: every lane that
+        // is decode-ready, whichever group it rides in.
+        {
+            std::uint32_t decode_lanes = 0;
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                const auto& request = slots_[lane];
+                if (request != nullptr && request->decode_ready) { ++decode_lanes; }
+            }
+            program.set_round_width_hint(decode_lanes);
+        }
         // Launch every idle group that has work.
         bool launched = false;
         for (std::uint32_t g = 0; g < groups; ++g) {
@@ -1262,6 +1272,7 @@ private:
             }
         }
         instance_.program->set_round_burst_limit(burst_limit);
+        instance_.program->set_round_width_hint(static_cast<std::uint32_t>(lanes.size()));
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
         process_decode_round(membership, round);

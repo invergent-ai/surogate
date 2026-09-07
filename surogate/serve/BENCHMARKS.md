@@ -270,7 +270,7 @@ architecture.
 | llama.cpp | 8 | 1 | 156.6 | 37.8 | 194.4 | 1.18 s | `-np 1` |
 | llama.cpp | 8 | 16 | 173.4 | 41.9 | 215.3 | 55.13 s | `-np 16`, and barely above its one-user row: the sixteen streams are served nearly one after another, so this is queueing rather than batching |
 | **surogate** | 8 | 16 | **1,212.7** | **292.9** | **1,505.6** | **1.59 s** | `--kv-capacity 11264`, **everything resident**: the absorbed attention caches one 512-wide head per token, so sixteen lanes fit where the expanded form needed 10.4 GiB on a 3.5 GiB stage. 176 requests, 0 errors. **7.0× llama.cpp's decode and prefill at 1/35 of its TTFT** |
-| surogate `--spec mtp --draft-tokens 3` | 8 | 16 | 648.0 | 156.5 | 804.5 | 1.05 s | the head at sixteen users, 96 of 96 served (2026-09-07): a verify puts four columns per lane through every mixture, so the throughput-bound placement pays for tokens it then discards, and each prompt runs as a lone flight instead of riding a batched mixed round. The draft head is a latency lever, for one user or a few; the row above is the one for sixteen |
+| surogate `--spec mtp --draft-tokens 3` | 8 | 16 | 679.0 | 164.0 | 843.0 | 4.29 s | the head left on at sixteen users, 80 of 80 served (2026-09-07 evening): above one lane the rounds run *narrow* -- one column per lane through the trunk, the head aligned on it and proposing nothing -- so no lane ever verifies a batch that cannot pay for it. What the head still costs here is the prompt path: under the head a prompt runs as a lone flight through the eight stages instead of riding a mixed round with seven others, and the rate is 56 % of the row above where the wide verify's was 53 %. The draft head is a latency lever, for one user; the row above is the one for sixteen |
 | llama.cpp | 8 | 64 | 44.4 | 10.7 | 55.1 | 729.58 s | `-np 64` |
 | **surogate** | 8 | 64 | **99.0** | **23.9** | **122.9** | **31.94 s** | `--kv-capacity auto --host-moe-layers auto`, which moved 1–2 mixture layers per stage to host memory to hold 45,056 KV tokens; those layers cross PCIe on every token and are the ceiling here. **2.2× llama.cpp's decode and prefill at 1/23 of its TTFT**; 108 of 150 requests still timed out against our 30 s admission window, where llama.cpp queues indefinitely and reports none |
 | **surogate** | **1** | 1 | **53.2** | **12.9** | **66.1** | **3.27 s** | `--host-moe-layers all --cpu-moe-share auto --max-num-batched-tokens 1024` (2026-09-07, the expert cache lifted into the family, on the per-object bank): the routed experts are repacked into a 191.7 GiB pinned bank in 55 s at load -- Q4G32AM planes for the Q4_K gate/up halves, Q5G32AM for the Q5_K down halves (exact repacks both), W8 for the three Q6_K down halves, each read by its own format -- and 83 % of every round's misses are computed on the 32 host cores (host 202 GB/s against 46 over PCIe, measured overlapped) with the rest gathered into a 456-slot pool. The server times each request at 18.8 tok/s of decode after a 3.27 s prompt; the prompt is one gather of every expert of every layer over the link. **+26 % decode, +25 % prefill over llama.cpp at 58 % of its TTFT**, at parity on the perplexity gate below. With the Q5_K halves held as W8 instead (220.5 GiB) it read 51.3 / 12.4 / 3.62 s; the all-W8 bank 40.9 / 9.9 / 4.64 s; chunk 512 on that bank 36.7 / 8.9 / 6.12 s; the row before the cache 7.5 / 1.8 / 29.54 s |
@@ -396,9 +396,29 @@ stages as bytes before every stage folds on the same integers -- plus the four t
 plumbing turned up on the way (`design/INFERENCE.md`, 2026-09-07). With the head the pipeline
 reads **65.2 tok/s wall, 70.9 engine** against llama.cpp's 63.3 / 74.7 on this client, a 41 %
 gain over its own 46.1, at the same 2.98 tokens a round the single card drafts. On the board's
-own client the one-user row goes 40.7 → 50.1 decode. At sixteen users the head costs half the
-throughput, which is the shape of speculation on a throughput-bound placement, and the row
-above says so.
+own client the one-user row goes 40.7 → 50.1 decode.
+
+**Where the head stops paying, and what the engine does about it (2026-09-07 evening).** The
+board client, eight cards, with and without the head, the head verifying at every width:
+
+| users | no head | verify at every width | verify at one lane, narrow above (the default now) |
+|---:|---:|---:|---:|
+| 1 | 40.7 | **50.1** | **49.7** |
+| 2 | 67.3 | 68.5 | 66.7 |
+| 4 | 114.0 | 91.7 | 100.7 |
+| 8 | 215.3 | 141.0 | 136.8 |
+| 16 | 292.9 | 156.5 | 164.0 |
+
+A verify puts four columns per lane through every mixture layer and each column routes to its
+own experts, so on a placement bound by expert bytes the head pays at one lane, breaks even at
+two on these salted prompts, and loses from four up. `--spec-max-lanes` (default 1) is the
+width above which an MTP round runs narrow: one column per lane through the trunk, sampled as
+an ordinary round samples, the head aligned on it so its cache stays current, no proposals, the
+recurrent state updated in place with nothing to fold. It is never the wide verify's loss, and
+what remains between it and the no-head row at eight and sixteen users is the prompt path --
+a draft-head prompt runs as a lone flight through the stages, where the no-head engine batches
+eight prompts into one mixed round -- which is the next piece of work, not a property of the
+head.
 
 Read the two one-user numbers together rather than against each other. On this client -- a
 30-token prompt, so almost no prefill -- llama.cpp's steady-state decode is ahead of ours

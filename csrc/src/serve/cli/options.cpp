@@ -84,7 +84,7 @@ std::string usage_text(const char* argv0) {
            "[--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank w8|q4] "
            "[--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices A,B,...]\n"
-           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -196,6 +196,10 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--spec-max-lanes") {
+            const std::string spec = value(arg);
+            options.speculative.max_lanes =
+                spec == "all" ? kSpeculateAtAnyWidth : parse_u32(spec.c_str(), "spec-max-lanes");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {

@@ -276,7 +276,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     : cfg(model_in.geometry), model(model_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
+      draft_window(plan.draft_window), speculative_max_lanes(plan.speculative_max_lanes),
+      speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       rewrite_checkpoints(plan.rewrite_checkpoints),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
@@ -398,6 +399,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 
     CUDA_CHECK(cudaMalloc(&chain_one_storage, sizeof(std::int32_t)));
     chain_one = Tensor(chain_one_storage, DType::I32, {1});
+    narrow_counts_.fill(1);
     set_device_i32(chain_one, 1);
 
     host_tokens = static_cast<TokenId*>(round_host.data());
@@ -832,9 +834,13 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.lifecycle      = Lifecycle::Prefilling;
         // Deferred first chunk (PATCHES.md #30): leave the staged prefill to
         // the executor loop so it can ride a mixed round with the active
-        // decode lanes. Ineligible shapes keep the classic behavior.
-        if (defer_first_chunk && speculative_backend == SpeculativeBackend::None &&
-            !staged.vision && !staged.prepare_mtp && staged.mtp_bridge == MtpBridgeMode::None &&
+        // decode lanes -- or, for a shape no mixed round takes, a lone prefill
+        // step. A draft-head prompt defers too: on a pipeline the deferred path
+        // is the one that respects stage ownership, and a first chunk run at
+        // admission shares a stage's boundary buffers with whatever round is in
+        // flight there. Vision prompts and bridged reuse keep the classic order.
+        if (defer_first_chunk && speculative_backend != SpeculativeBackend::DFlash &&
+            !staged.vision && staged.mtp_bridge == MtpBridgeMode::None &&
             staged.cursor < staged.prompt_tokens) {
             return runtime::PrefillStepResult{
                 .summary = runtime::BeginSummary{.prompt_tokens        = staged.prompt_tokens,
@@ -943,7 +949,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         }
         fold_rows[row] = ops::GdnReplayFoldRow{
             .linear_state_slot = LinearStateSlots::current_state_slot(lane, max_concurrency),
-            .commit_columns    = static_cast<std::int32_t>(committed),
+            // A narrow round updated its state in place and recorded nothing: zero columns,
+            // which the fold treats as a strict no-op for the row.
+            .commit_columns    = pending.in_place_state ? 0 : static_cast<std::int32_t>(committed),
         };
         const bool partial_terminal =
             !cancelled[row] && terminal[row] && committed < pending.produced;
@@ -952,11 +960,19 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         needs_hidden_correction = needs_hidden_correction || partial_terminal;
     }
 
+    // A round that ran narrow updated its state in place and left nothing to fold; a round
+    // of only such rows enqueues no fold and waits for nothing.
+    bool anything_to_fold = false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        anything_to_fold = anything_to_fold || fold_rows[row].commit_columns > 0;
+    }
     const auto tail_started = Clock::now();
     try {
-        ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
-                             std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+        if (anything_to_fold) {
+            ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
+                                 std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
+                                 device.stream);
+        }
 
         // The correction re-selects a column of the round's device frame, which only the
         // stage with the head filled -- and which matters only there, where the tail hidden
@@ -1011,8 +1027,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             }
         }
 
-        device.synchronize();
-        work.reset();
+        if (anything_to_fold || needs_hidden_correction) {
+            device.synchronize();
+            work.reset();
+        }
     } catch (...) {
         try {
             device.synchronize();
@@ -1573,7 +1591,7 @@ void ProgramImplCore::prepare_graphs() {
         validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
         schedule::MtpBatchContext mtp_state{
             execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
-            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store};
+            *mtp_host_ingress, *mtp_host_egress, tail_hidden_store, chain_one};
         const GraphExecutionProfile code_warm = planned_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
@@ -1595,6 +1613,38 @@ void ProgramImplCore::prepare_graphs() {
                 schedule::capture_mtp_decode_batch(
                     mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
                     mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+            }
+        }
+        // The narrow round's family, when a width limit can reach it. Its ingress shape is
+        // the round's own: nothing drafted, one valid column, rope positions at stride one.
+        if (speculative_max_lanes != kSpeculateAtAnyWidth) {
+            prepare_representative(code_warm.min, 1);
+            for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+                mtp_host_ingress->current_extents[row]      = 0;
+                mtp_host_ingress->target_valid_columns[row] = 1;
+                mtp_host_ingress->target_rope_positions[row] =
+                    checked_i32(code_warm.min, "graph representative narrow rope position");
+            }
+            device.synchronize();
+            schedule::mtp_decode_batch(mtp_state, 1, draft_window,
+                                       mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+                                       nullptr, /*narrow=*/true);
+            device.synchronize();
+            mtp_narrow_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
+            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    mtp_narrow_graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = mtp_narrow_graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                    schedule::capture_mtp_decode_batch(
+                        mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
+                        mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition,
+                        /*narrow=*/true);
+                }
             }
         }
     }
@@ -1652,6 +1702,19 @@ void ProgramImplCore::prepare_graphs() {
     ops::detail::marlin_plane_freeze_scratch();
     if (speculative_backend == SpeculativeBackend::Mtp) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
+        if (!mtp_narrow_graphs.profiles.empty()) {
+            // The narrow round's representative: the same batch, in the narrow ingress shape.
+            const auto prepare_narrow = [&](std::uint32_t frontier, std::uint32_t batch_size) {
+                prepare_representative(frontier, batch_size);
+                for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+                    mtp_host_ingress->current_extents[row]      = 0;
+                    mtp_host_ingress->target_valid_columns[row] = 1;
+                    mtp_host_ingress->target_rope_positions[row] =
+                        checked_i32(frontier, "graph representative narrow rope position");
+                }
+            };
+            instantiate_graph_family(mtp_narrow_graphs, "MTP narrow", device, prepare_narrow);
+        }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
@@ -3000,16 +3063,21 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    // Too many lanes in flight to pay for a verify: the narrow round, one column per lane.
+    const bool narrow  = narrow_round_for(lanes.size());
     const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
             mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
-        if (use_cuda_graph) {
+        DecodeGraphFamily& family = narrow ? mtp_narrow_graphs : mtp_graphs;
+        if (use_cuda_graph && !family.profiles.empty()) {
             DecodeGraphProfile& profile =
-                select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "MTP batch");
-            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch", device.stream);
+                select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
+                                     maximum_frontier, narrow ? "MTP narrow batch" : "MTP batch");
+            executable = &install_graph_profile(family, profile,
+                                                narrow ? "MTP narrow batch" : "MTP batch",
+                                                device.stream);
             envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
         }
 
@@ -3021,8 +3089,9 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
             const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
-                          capacity - sequence.execution_frontier - 1});
+                narrow ? 0U
+                       : std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
+                                   capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -3033,10 +3102,16 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                 mtp_host_ingress->current_drafts[row * draft_window + j] =
                     j < extent ? sequence.mtp_drafts[j] : sequence.ledger.back();
             }
-            for (std::uint32_t j = 0; j < width; ++j) {
-                const std::uint32_t position = frontier + std::min(j, extent);
-                mtp_host_ingress->target_rope_positions[row * width + j] =
-                    checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
+            if (narrow) {
+                // The narrow body reads the rope positions as [1, B]: stride one.
+                mtp_host_ingress->target_rope_positions[row] =
+                    checked_i32(frontier, "MTP batch RoPE position") + sequence.rope_delta;
+            } else {
+                for (std::uint32_t j = 0; j < width; ++j) {
+                    const std::uint32_t position = frontier + std::min(j, extent);
+                    mtp_host_ingress->target_rope_positions[row * width + j] =
+                        checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
+                }
             }
             mtp_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             mtp_host_ingress->mtp_kv_table_rows[row]  = sequence.kv->backend->bound_row();
@@ -3056,16 +3131,18 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                                                  *io.mtp_decode,
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
-                                                 tail_hidden_store};
+                                                 tail_hidden_store,
+                                                 chain_one};
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                   draft_window, envelopes, executable);
+                                   draft_window, envelopes, executable, narrow);
 
-        in_flight_ = InFlightRound{.id    = ++in_flight_counter_,
-                                   .rows  = static_cast<std::uint32_t>(lanes.size()),
-                                   .burst = 0,
-                                   .start = started};
+        in_flight_ = InFlightRound{.id     = ++in_flight_counter_,
+                                   .rows   = static_cast<std::uint32_t>(lanes.size()),
+                                   .burst  = 0,
+                                   .start  = started,
+                                   .narrow = narrow};
         std::copy(lanes.begin(), lanes.end(), in_flight_.lanes.begin());
         std::copy(budgets.begin(), budgets.end(), in_flight_.budgets.begin());
         return runtime::RoundHandle{.id = in_flight_.id, .rows = in_flight_.rows};
@@ -3087,7 +3164,10 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
     const std::span<const std::uint32_t> lanes(in_flight_.lanes.data(), in_flight_.rows);
     const std::span<const runtime::RoundBudget> budgets(in_flight_.budgets.data(), in_flight_.rows);
     const auto started          = in_flight_.start;
+    const bool narrow           = in_flight_.narrow;
     const std::uint32_t width   = draft_window + 1;
+    // A narrow round wrote one token per lane at stride one, and licensed exactly that.
+    const std::uint32_t stride  = narrow ? 1U : width;
     try {
         device.synchronize();
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -3100,11 +3180,12 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
                 SequenceState& sequence = sequences[lanes[row]];
                 RequestControl& request = requests[lanes[row]];
                 request.pending         = PendingCandidate{
-                            .kind          = PendingKind::Speculative,
-                            .base_E        = sequence.execution_frontier,
-                            .base_S        = sequence.ledger_frontier,
-                            .prompt_tokens = 0,
-                            .produced      = 0,
+                            .kind           = PendingKind::Speculative,
+                            .base_E         = sequence.execution_frontier,
+                            .base_S         = sequence.ledger_frontier,
+                            .prompt_tokens  = 0,
+                            .produced       = 0,
+                            .in_place_state = narrow,
                 };
                 request.lifecycle = Lifecycle::Pending;
                 request.timings.decode_seconds += seconds;
@@ -3123,9 +3204,10 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
             RequestControl& request       = requests[lanes[row]];
             const std::uint32_t base_E    = sequence.execution_frontier;
             const std::uint32_t base_S    = sequence.ledger_frontier;
-            const std::int32_t count_i    = mtp_host_egress->licensed_counts[row];
-            const std::int32_t accepted_i = mtp_host_egress->accepted_drafts[row];
-            const std::int32_t next_i     = mtp_host_egress->next_extents[row];
+            // A narrow round licenses its one sampled token and proposes nothing.
+            const std::int32_t count_i    = narrow ? 1 : mtp_host_egress->licensed_counts[row];
+            const std::int32_t accepted_i = narrow ? 0 : mtp_host_egress->accepted_drafts[row];
+            const std::int32_t next_i     = narrow ? 0 : mtp_host_egress->next_extents[row];
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || next_i < 0 ||
                 next_i > static_cast<std::int32_t>(draft_window) ||
@@ -3135,7 +3217,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
                 throw std::runtime_error("MTP batch returned invalid row metadata");
             }
             const std::span<const TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() +
-                                                          row * width,
+                                                          row * stride,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
             // The lane's own copy of the decision (see SpeculativeOutcome): the egress is
@@ -3154,7 +3236,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
                         sizeof(SpeculativeOutcome));
 
             const std::uint32_t pcur =
-                static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
+                narrow ? 0U : static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
             if (pcur == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
@@ -3167,21 +3249,23 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
                 }
             }
             request.pending = PendingCandidate{
-                .kind          = PendingKind::Speculative,
-                .base_E        = base_E,
-                .base_S        = base_S,
-                .prompt_tokens = 0,
-                .produced      = static_cast<std::uint32_t>(count_i),
+                .kind           = PendingKind::Speculative,
+                .base_E         = base_E,
+                .base_S         = base_S,
+                .prompt_tokens  = 0,
+                .produced       = static_cast<std::uint32_t>(count_i),
+                .in_place_state = narrow,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
-                                                   lanes.size() * width),
-            .row_counts = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
-                                                        lanes.size()),
-            .row_stride = width};
+                                                   lanes.size() * stride),
+            .row_counts = std::span<const std::int32_t>(
+                narrow ? narrow_counts_.data() : mtp_host_egress->licensed_counts.data(),
+                lanes.size()),
+            .row_stride = stride};
     } catch (...) {
         try {
             device.synchronize();

@@ -26,6 +26,7 @@
 #include "runtime/engine/request_memory.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
@@ -122,6 +123,7 @@ public:
         assembled_prefill_tokens_.fill(0);
         flights_.resize(groups_);
         stage_owner_.assign(stages_.size(), -1);
+        held_by_.assign(stages_.size(), -1);
     }
 
     [[nodiscard]] RequestBasePlan plan_request_base(const PreparedPrompt& prompt,
@@ -253,6 +255,12 @@ public:
     void set_round_burst_limit(std::uint32_t limit) noexcept {
         for (Stage* stage : stages_) { stage->program->set_round_burst_limit(limit); }
     }
+    /// The round width the executor reports is taken once, when a flight begins, and pinned
+    /// onto each stage right before that stage launches the flight's round: a program decides
+    /// the shape of its MTP round from the hint, and the stages of one round must all decide
+    /// alike -- a round stage 0 launched wide that a later stage launched narrow, after the
+    /// hint moved, crosses a boundary whose two sides disagree on how many columns it holds.
+    void set_round_width_hint(std::uint32_t lanes) noexcept { width_hint_ = lanes; }
     void resolve_prefill_lane(std::uint32_t lane, bool terminal) {
         for (std::size_t s = 0; s < stages_.size(); ++s) {
             select(s);
@@ -264,6 +272,13 @@ public:
         for (std::size_t s = 0; s < stages_.size(); ++s) {
             select(s);
             stages_[s]->program->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled);
+        }
+        // The fold these lanes' round left for every stage has now been enqueued: the stages a
+        // verifying flight of theirs held are free for the next one.
+        for (std::size_t s = 0; s < held_by_.size(); ++s) {
+            if (held_by_[s] < 0) { continue; }
+            const Flight& holder = flights_[static_cast<std::size_t>(held_by_[s])];
+            if (same_lanes(holder.lanes, lanes)) { held_by_[s] = -1; }
         }
     }
     void abort_lane(std::uint32_t lane) noexcept {
@@ -402,10 +417,6 @@ public:
             finish_stage(static_cast<std::uint32_t>(oldest), s, finished);
         }
         advance_parked(finished);
-        // The head stage was held only for this call: the executor resolves what finished
-        // here before it asks again, and the next launch on that stage may then overwrite
-        // the round's device frame.
-        hold_head_stage_ = false;
         return finished;
     }
     [[nodiscard]] const GroupResult& group_result(std::uint32_t g) const { return flights_.at(g).result; }
@@ -427,6 +438,15 @@ private:
         // A speculative round's decision, copied out of the last stage at consume time for the
         // same reason as the tokens below.
         std::vector<std::byte> outcome;
+        // The round licensed one token per lane at stride one: a narrow MTP round.
+        bool narrow = false;
+        // Decided when the flight began, from the pinned width: a verifying (wide) MTP round
+        // records every stage's recurrent state for a fold that runs at resolve, into records
+        // indexed by batch row and shared by every round on the stage. Until that fold has
+        // been enqueued, no other verifying flight may run on a stage this one ran on -- its
+        // verify would overwrite the records the fold is about to read, and one lane would
+        // fold another's state. Narrow rounds and prefills write no records and pass freely.
+        bool verifying = false;
         // A finished prompt's first sampled token, copied out of the last stage's egress buffer:
         // the executor reads the result after `tick()` returns, by which time another round may
         // have been launched on that stage and overwritten the buffer the span pointed into.
@@ -434,6 +454,7 @@ private:
         TokenId lone_prefill_token = 0;
         std::vector<std::byte> park;
         std::size_t carry_bytes = 0; // bytes of residual this flight carries across a boundary
+        std::uint32_t width_hint = 0; // the round width the flight was launched under
         GroupResult result{};
     };
     std::vector<Flight> flights_;
@@ -452,6 +473,13 @@ private:
         f.budgets.assign(budgets.begin(), budgets.end());
         f.prefill_lanes.assign(prefill_lanes.begin(), prefill_lanes.end());
         f.prefill_lane = prefill_lane;
+        f.width_hint   = width_hint_;
+        f.verifying    = false;
+        if (kind == FlightKind::Decode && width_ > 1 && !lanes.empty()) {
+            select(0);
+            stages_[0]->program->set_round_width_hint(f.width_hint);
+            f.verifying = !stages_[0]->program->speculative_round_is_narrow(lanes.size());
+        }
         f.result       = GroupResult{};
         // A decode round's residual is exactly `width` columns per lane (one, or the verify's
         // draft window plus one); mixed and prefill rounds carry the full boundary (their
@@ -481,6 +509,7 @@ private:
             const std::span<const std::byte> outcome = stages_.back()->program->speculative_outcome();
             f.outcome.assign(outcome.begin(), outcome.end());
         }
+        f.narrow = width_ > 1 && stride == 1;
         f.result.round = BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(f.tokens.data(), f.lanes.size() * width_),
             .row_counts = std::span<const std::int32_t>(f.counts.data(), f.lanes.size()),
@@ -491,9 +520,11 @@ private:
     void finish_stage(std::uint32_t g, std::size_t s, std::vector<std::uint32_t>& finished) {
         Flight& f = flights_[g];
         trace("finished-stage", s, g);
+        if (f.verifying) { held_by_[s] = static_cast<int>(g); }
         if (s + 1 < stages_.size()) {
             f.park.resize(boundary_bytes_);
             std::memcpy(f.park.data(), stages_[s]->program->stage_export_buffer(), f.carry_bytes);
+            park_checksum(g, s, f);
             f.between = true;
             f.stage   = s + 1;
             return;
@@ -508,10 +539,6 @@ private:
             }
         } else {
             propagate_round_tokens(f.lanes, f.result.round, f.outcome);
-            // A speculative round's resolution re-reads the head stage's device frame (the
-            // hidden of a partially accepted row); no other round may launch there until the
-            // executor has resolved this one, which it does before the next tick.
-            if (width_ > 1 && f.kind == FlightKind::Decode) { hold_head_stage_ = true; }
             if (f.kind == FlightKind::Mixed) {
                 for (std::size_t i = 0; i < f.result.mixed.prefill_count && i < f.prefill_lanes.size(); ++i) {
                     PrefillStepResult& step = f.result.mixed.prefills[i];
@@ -533,7 +560,7 @@ private:
             for (std::size_t g = 0; g < flights_.size(); ++g) {
                 const Flight& f = flights_[g];
                 if (!f.active || !f.between || stage_owner_[f.stage] >= 0) { continue; }
-                if (hold_head_stage_ && f.stage + 1 == stages_.size()) { continue; }
+                if (f.verifying && held_by_[f.stage] >= 0 && held_by_[f.stage] != static_cast<int>(g)) { continue; }
                 if (pick < 0 || f.stage_sequence < flights_[static_cast<std::size_t>(pick)].stage_sequence) {
                     pick = static_cast<int>(g);
                 }
@@ -555,6 +582,7 @@ private:
                 continue;
             }
             stage_owner_[s] = pick;
+            stages_[s]->program->set_round_width_hint(f.width_hint);
             if (f.kind == FlightKind::Mixed) {
                 trace("launch_mixed_round", s, f.prefill_lanes.size() * 1000 + f.lanes.size());
                 f.handle = stages_[s]->program->launch_mixed_round(f.prefill_lanes, f.lanes, f.budgets);
@@ -566,6 +594,39 @@ private:
     }
 
     void select(std::size_t stage) const noexcept { (void)cudaSetDevice(devices_[stage]); }
+
+    /// SUROGATE_SERVE_PIPELINE_CHECKSUM=N: for the first N parked residuals, one line per
+    /// column of the carry -- sum and absmax of the BF16 values -- so a graph replay's crossing
+    /// can be read on the host, column by column, where the runtime's own checksum (which runs
+    /// inside a body) cannot see a replay.
+    void park_checksum(std::uint32_t g, std::size_t s, const Flight& f) {
+        static const long budget = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_PIPELINE_CHECKSUM");
+            return raw != nullptr ? std::strtol(raw, nullptr, 10) : 0L;
+        }();
+        static long printed = 0;
+        if (budget <= 0 || printed >= budget) { return; }
+        ++printed;
+        const std::size_t column_values = column_bytes_ / sizeof(std::uint16_t);
+        const std::size_t columns       = column_values == 0 ? 0 : f.carry_bytes / column_bytes_;
+        const auto* values              = reinterpret_cast<const std::uint16_t*>(f.park.data());
+        std::string line = "pipeline-checksum: group " + std::to_string(g) + " stage " + std::to_string(s) +
+                           " kind " + std::to_string(static_cast<int>(f.kind)) + " columns " + std::to_string(columns);
+        for (std::size_t c = 0; c < columns && c < 8; ++c) {
+            double sum = 0.0, absmax = 0.0;
+            for (std::size_t i = 0; i < column_values; ++i) {
+                const std::uint32_t bits = static_cast<std::uint32_t>(values[c * column_values + i]) << 16;
+                float v;
+                std::memcpy(&v, &bits, sizeof(v));
+                sum += v;
+                absmax = std::max(absmax, static_cast<double>(std::fabs(v)));
+            }
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " | c%zu sum %.5g absmax %.4g", c, sum, absmax);
+            line += buf;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
 
     // One executor round as a software pipeline over the stages: the decode lanes are
     // partitioned into groups (lane % groups); when the round carries prefill lanes they all
@@ -610,6 +671,8 @@ private:
         std::vector<RoundHandle> in_flight(N);
         std::vector<bool> in_flight_mixed(N, false);
         assembled_mixed_ = MixedRoundResult{};
+        const std::uint32_t width_hint = width_hint_; // one decision for every stage of the round
+        for (Stage* stage : stages_) { stage->program->set_round_width_hint(width_hint); }
         for (std::size_t t = 0; t + 1 < G + N + 1; ++t) {
             for (std::size_t s = 0; s < N; ++s) {
                 if (t >= s + 1 && t - s - 1 < G) {
@@ -765,8 +828,18 @@ private:
     MixedRoundResult assembled_mixed_{};
     /// Tokens a decode round may license per lane: 1, or the draft window plus one.
     std::uint32_t width_ = 1;
-    /// Set when a speculative group finished on the last stage inside the current tick.
-    bool hold_head_stage_ = false;
+    /// The executor's latest round width; pinned per flight at launch (see set_round_width_hint).
+    std::uint32_t width_hint_ = 0;
+    /// Per stage: the group whose verifying round last ran there and has not been resolved,
+    /// or -1 (see Flight::verifying).
+    std::vector<int> held_by_;
+    static bool same_lanes(const std::vector<std::uint32_t>& a, std::span<const std::uint32_t> b) {
+        if (a.size() != b.size()) { return false; }
+        std::vector<std::uint32_t> x(a.begin(), a.end()), y(b.begin(), b.end());
+        std::sort(x.begin(), x.end());
+        std::sort(y.begin(), y.end());
+        return x == y;
+    }
 };
 
 /// The executor's instance: owns the stage instances and their device contexts.

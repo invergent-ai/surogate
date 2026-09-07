@@ -29,9 +29,10 @@ namespace sinfer::product {
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     switch (options.backend) {
     case SpeculativeBackend::None:
-        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
+        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full ||
+            options.max_lanes != 0) {
             throw std::invalid_argument(
-                "--draft-tokens and --lm-head-draft require --spec mtp|dflash");
+                "--draft-tokens, --lm-head-draft and --spec-max-lanes require --spec mtp|dflash");
         }
         return;
     case SpeculativeBackend::Mtp:
@@ -39,6 +40,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
         }
         return;
+    // (--spec-max-lanes is honoured by the MTP round only; DFlash verifies at any width.)
     case SpeculativeBackend::DFlash:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");

@@ -79,10 +79,26 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
 };
 
+/// `SpeculativeOptions::max_lanes` meaning "verify at any width".
+inline constexpr std::uint32_t kSpeculateAtAnyWidth = 0xFFFFFFFFu;
+/// The width a round may reach and still verify drafts, when the run does not say. A verify
+/// puts the draft window plus one columns per lane through every mixture layer, and each
+/// column routes to its own experts: on a placement bound by expert bytes the head pays only
+/// while the batch is narrow. Measured on GLM-5.3-Flash over eight cards (2026-09-07): +23 %
+/// at one lane, break-even at two on the board's salted prompts, -47 % at sixteen. One lane,
+/// then: the round where the head pays, and the only width at which two verifying flights can
+/// never be in flight together on a pipeline.
+inline constexpr std::uint32_t kDefaultSpeculationLanes = 1;
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    /// Widest round (decode lanes in flight) that still verifies drafts; wider rounds run the
+    /// head's narrow round -- one column per lane through the trunk, the head aligned and
+    /// proposing as usual -- so a draft head never costs a throughput-bound batch. 0 takes
+    /// `kDefaultSpeculationLanes`; `kSpeculateAtAnyWidth` verifies always.
+    std::uint32_t max_lanes = 0;
 };
 
 struct LoadProgress {

@@ -248,6 +248,11 @@ public:
     /// adopt before every stage folds on it; a lane's draft state after a prefill crosses the
     /// same way. The bytes are the family's own record and opaque to the driver.
     [[nodiscard]] std::uint32_t speculative_round_width() const noexcept;
+    /// Decode lanes in flight this round, across every group of a pipeline: an MTP round
+    /// verifies drafts only within the run's width limit and runs its narrow round otherwise.
+    void set_round_width_hint(std::uint32_t lanes) noexcept;
+    /// Whether an MTP round of `lanes` rows would run narrow under the current width hint.
+    [[nodiscard]] bool speculative_round_is_narrow(std::size_t lanes) const noexcept;
     [[nodiscard]] std::span<const std::byte> speculative_outcome() const noexcept;
     void adopt_speculative_outcome(std::span<const std::uint32_t> lanes,
                                    std::span<const std::byte> outcome);

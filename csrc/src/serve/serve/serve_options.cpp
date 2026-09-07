@@ -116,7 +116,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-cache-dtype auto|fp8|int8] [--kv-cache-dtype-skip-layers L,...] "
-           "[--spec mtp|dflash --draft-tokens N] "
+           "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] "
            "[--default-max-tokens N] "
            "[--vision] [--enforce-eager] [--no-prefix-reuse] "
            "[--enable-sleep-mode] [--no-elastic-kv] [--elastic-kv-overcommit] "
@@ -362,6 +362,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--spec-max-lanes") {
+            // The widest round that still verifies drafts; wider rounds run the head's narrow
+            // round. "all" verifies at any width; unset takes the engine's default.
+            const std::string spec = require_value("--spec-max-lanes");
+            options.speculative.max_lanes =
+                spec == "all" ? kSpeculateAtAnyWidth
+                              : static_cast<std::uint32_t>(
+                                    parse_nonnegative_int(spec.c_str(), "spec-max-lanes"));
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -461,10 +469,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 } else if (key == "draft-tokens") {
                     extra.speculative.draft_tokens =
                         static_cast<std::uint32_t>(std::stoul(val));
+                } else if (key == "spec-max-lanes") {
+                    extra.speculative.max_lanes =
+                        val == "all" ? kSpeculateAtAnyWidth
+                                     : static_cast<std::uint32_t>(std::stoul(val));
                 } else {
                     throw std::invalid_argument(
                         "--model: unknown key '" + key +
-                        "' (kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, priority, lora)");
+                        "' (kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, "
+                        "spec-max-lanes, priority, lora)");
                 }
                 if (comma == std::string::npos) { break; }
                 cursor = comma + 1;

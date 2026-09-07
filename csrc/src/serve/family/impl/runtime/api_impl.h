@@ -320,6 +320,16 @@ std::uint32_t Program<Variant>::speculative_round_width() const noexcept {
 }
 
 template <>
+void Program<Variant>::set_round_width_hint(std::uint32_t lanes) noexcept {
+    impl_->set_round_width_hint(lanes);
+}
+
+template <>
+bool Program<Variant>::speculative_round_is_narrow(std::size_t lanes) const noexcept {
+    return impl_->speculative_backend == SpeculativeBackend::Mtp && impl_->narrow_round_for(lanes);
+}
+
+template <>
 std::span<const std::byte> Program<Variant>::speculative_outcome() const noexcept {
     return impl_->speculative_outcome();
 }

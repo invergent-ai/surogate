@@ -73,6 +73,7 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
+    std::uint32_t speculative_max_lanes    = 0; ///< resolved: never 0 once planned
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
@@ -113,6 +114,7 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
+    std::uint32_t speculative_max_lanes    = 0; ///< resolved: never 0 once planned
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;

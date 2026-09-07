@@ -4,12 +4,15 @@
 #include "api/ops/mtp_round.h"
 #include "api/ops/scatter.h"
 #include "api/ops/scalar.h"
+#include "api/ops/position.h"
+#include "api/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
@@ -213,14 +216,130 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
     };
 }
 
+// The narrow round: what the head runs when the batch is too wide to pay for a verify. The
+// trunk sees one column per lane -- the anchor at the frontier, exactly what an ordinary round
+// sees -- sampled under the lane's config; the head is aligned on that one column, so its
+// cache stays current, and proposes nothing. A round that is wide again verifies one column
+// and proposes, as the first round after a prefill does. The wide frame's buffers are read as
+// width-one views over their first B entries (the frame is one contiguous buffer per tensor,
+// so the prefix is contiguous); the host fills the ingress with stride one and reads the
+// egress the same way.
+auto mtp_narrow_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                           MtpGqaEnvelopes envelopes) {
+    return [&state, batch_size, k, envelopes] {
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+            k == 0 || k > kMtpDecodeMaximumDrafts || state.one.data == nullptr) {
+            throw std::logic_error("MTP narrow batch state is incomplete");
+        }
+        family::MtpDecodeState& frame = state.frame;
+        cudaStream_t stream            = state.execution.device.stream;
+        CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
+                                   sizeof(family::MtpDecodeIngress), cudaMemcpyHostToDevice,
+                                   stream));
+
+        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                         &state.text_cache, &state.mtp_cache);
+        card.set_ple_state(state.execution.ple);
+        if (std::getenv("SUROGATE_SERVE_TRACE_STAGE") != nullptr) {
+            std::fprintf(stderr, "stage-trace: a narrow MTP round carries stage [%d, %d)\n",
+                         state.execution.stage.first, state.execution.stage.last);
+        }
+        card.set_stage(state.execution.stage);
+
+        const auto over = [](const Tensor& wide, DType dtype,
+                             std::initializer_list<std::int32_t> shape) {
+            return Tensor(wide.data, dtype, shape);
+        };
+        const std::int32_t hidden_width  = frame.target_hidden.ne[0];
+        const std::int32_t vocab         = frame.target_logits.ne[0];
+        Tensor anchors           = frame.anchors.slice(0, 0, batch_size);
+        Tensor frontiers         = frame.base_frontiers.slice(0, 0, batch_size);
+        Tensor target_valid      = frame.target_valid_columns.slice(0, 0, batch_size); // one
+        Tensor text_rows         = frame.text_kv_table_rows.slice(0, 0, batch_size);
+        Tensor mtp_rows          = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
+        Tensor lanes             = frame.lanes.slice(0, 0, batch_size);
+        Tensor verify_ids        = over(frame.verify_ids, DType::I32, {1, batch_size});
+        Tensor target_positions  = over(frame.target_positions, DType::I32, {1, batch_size});
+        Tensor target_rope       = over(frame.target_rope_positions, DType::I32, {1, batch_size});
+        Tensor target_tokens     = over(frame.target_argmax, DType::I32, {1, batch_size});
+        Tensor target_logits     = over(frame.target_logits, DType::BF16, {vocab, 1, batch_size});
+        Tensor target_hidden     = over(frame.target_hidden, DType::BF16, {hidden_width, 1, batch_size});
+        Tensor alignment_hidden  = over(frame.alignment_hidden, DType::BF16, {frame.alignment_hidden.ne[0], 1, batch_size});
+        Tensor licensed_tokens   = over(frame.licensed_tokens, DType::I32, {batch_size});
+        const std::size_t column_ids = static_cast<std::size_t>(batch_size) * sizeof(std::int32_t);
+        const char* narrow_step = "prologue";
+        try {
+
+        // The one verify column: the anchor, at the frontier.
+        CUDA_CHECK(cudaMemcpyAsync(verify_ids.data, anchors.data, column_ids,
+                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(target_positions.data, frontiers.data, column_ids,
+                                   cudaMemcpyDeviceToDevice, stream));
+        // One column, nothing to accept or reject: the recurrent state updates in place, as
+        // an ordinary round's does, and the resolve folds nothing for this round (a pending
+        // candidate marked in-place commits zero columns to the fold).
+        narrow_step = "verify";
+        card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
+        card.target_verify_batch(verify_ids, target_positions, target_rope, target_valid, text_rows,
+                                 lanes, envelopes.target_verify, target_hidden, target_logits,
+                                 target_tokens);
+        if (!card.stage_finishes()) { return; } // a stage without the head: exported, done
+
+        // The token, sampled the way the ordinary round samples; it is the round's whole licence.
+        narrow_step = "sample";
+        Tensor logits_flat    = over(frame.target_logits, DType::BF16, {vocab, batch_size});
+        Tensor positions_flat = over(frame.target_positions, DType::I32, {batch_size});
+        ops::sample(logits_flat, licensed_tokens, state.execution.model.geometry.token_domain,
+                    frame.sampling, positions_flat, ops::kSamplePurposeDecode, state.execution.work,
+                    stream);
+        narrow_step = "scatter";
+        Tensor hidden_flat = over(frame.target_hidden, DType::BF16, {hidden_width, batch_size});
+        ops::scatter(hidden_flat, lanes, state.continuation_hidden_store, stream);
+        // The head, aligned on the one column so its cache stays current for the round that
+        // is narrow no longer: the token pairs with the hidden it was sampled from, at that
+        // position, exactly as the wide round pairs accepted tokens with their columns. It
+        // proposes nothing -- three proposal steps for a token the next round will not verify
+        // were most of what a narrow round cost -- so the first wide round after a narrow
+        // stretch verifies one column and proposes, as after a prefill.
+        narrow_step = "align";
+        CUDA_CHECK(cudaMemcpyAsync(anchors.data, licensed_tokens.data, column_ids,
+                                   cudaMemcpyDeviceToDevice, stream));
+        Tensor alignment_ids = over(frame.anchors, DType::I32, {1, batch_size});
+        card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions, target_rope,
+                                      target_valid, mtp_rows, envelopes.batch, alignment_hidden);
+
+        narrow_step = "egress";
+        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
+                                   sizeof(family::MtpDecodeEgress), cudaMemcpyDeviceToHost,
+                                   stream));
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string("narrow MTP round, step ") + narrow_step + ": " +
+                                     error.what());
+        }
+    };
+}
+
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition) {
+                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition,
+                              bool narrow) {
+    if (narrow) {
+        auto body = mtp_narrow_batch_body(state, batch_size, k, envelopes);
+        capture_graph(state, definition, body);
+        return;
+    }
     auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
     capture_graph(state, definition, body);
 }
 
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable) {
+                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable, bool narrow) {
+    if (narrow) {
+        auto body = mtp_narrow_batch_body(state, batch_size, k, envelopes);
+        run_prepared(state, executable, body);
+        return;
+    }
     auto body = mtp_decode_batch_body(state, batch_size, k, envelopes);
     run_prepared(state, executable, body);
 }

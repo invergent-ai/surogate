@@ -826,6 +826,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->pipeline_import_pinned = inputs.pipeline_import_pinned;
     impl->pipeline_boundary_columns = inputs.pipeline_boundary_columns;
     impl->draft_window        = inputs.draft_window;
+    impl->speculative_max_lanes = inputs.speculative_max_lanes;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
@@ -928,6 +929,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
+        .speculative_max_lanes = options.speculative.max_lanes == 0 ? kDefaultSpeculationLanes
+                                                                     : options.speculative.max_lanes,
         .speculative_backend = options.speculative.backend,
         .kv_dtype       = kv_storage_dtype(kv_storage),
         .kv_quant_group = kv_storage == KvCacheStorage::Int8Group64 ? family::kKvQuantGroup : 0,

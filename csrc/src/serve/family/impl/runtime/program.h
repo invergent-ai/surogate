@@ -21,6 +21,7 @@
 #include "family/impl/runtime/vision_prefill.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <string>
 #include <array>
@@ -125,6 +126,9 @@ struct PendingCandidate {
     std::uint32_t base_S        = 0;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
+    /// A speculative round that ran narrow: one column, its recurrent state already updated
+    /// in place, nothing recorded -- the resolve folds zero columns for this lane.
+    bool in_place_state = false;
 };
 
 /// What one speculative round decided for one lane, copied out of the round's host egress
@@ -339,6 +343,20 @@ public:
     [[nodiscard]] std::uint32_t speculative_round_width() const noexcept {
         return speculative_backend == SpeculativeBackend::Mtp ? draft_window + 1U : 1U;
     }
+    /// How many decode lanes the executor has in flight this round, across every group of a
+    /// pipeline: the MTP round verifies drafts only while that is within
+    /// `speculative_max_lanes`, and runs its narrow round otherwise. A program that is never
+    /// told sees its own batch.
+    void set_round_width_hint(std::uint32_t lanes) noexcept { round_width_hint_ = lanes; }
+    [[nodiscard]] bool narrow_round_for(std::size_t lanes) const noexcept {
+        // SUROGATE_SERVE_MTP_FORCE_NARROW=1: every MTP round narrow, whatever the width -- the
+        // diagnostic that isolates the narrow round from the switch into it.
+        static const bool force_narrow = std::getenv("SUROGATE_SERVE_MTP_FORCE_NARROW") != nullptr;
+        if (force_narrow) { return true; }
+        if (speculative_max_lanes == kSpeculateAtAnyWidth) { return false; }
+        return std::max<std::uint32_t>(round_width_hint_, static_cast<std::uint32_t>(lanes)) >
+               speculative_max_lanes;
+    }
     /// The decision of the round this program last consumed, one `SpeculativeOutcome` per
     /// row in the round's lane order, for the pipeline driver to hand to the stages without
     /// the head. Valid until the next consume.
@@ -381,6 +399,7 @@ public:
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const std::uint32_t speculative_max_lanes;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
@@ -446,8 +465,13 @@ public:
         std::array<std::uint32_t, kMaximumConcurrency> lanes{};
         /// The MTP round checks what it licensed against the budget when it consumes.
         std::array<runtime::RoundBudget, kMaximumConcurrency> budgets{};
+        /// An MTP round that verified nothing: one column per lane, tokens at stride one.
+        bool narrow = false;
     };
     InFlightRound in_flight_{};
+    std::uint32_t round_width_hint_ = 0;
+    /// A narrow round licenses exactly one token per lane.
+    std::array<std::int32_t, kMaximumConcurrency> narrow_counts_{};
     /// `speculative_outcome()`: the last consumed MTP round's decisions, row-major.
     std::vector<std::byte> outcome_export_;
     /// `lane_draft_state()`: one record, rewritten per call.
@@ -483,6 +507,8 @@ public:
     // backend is plain decode and SUROGATE_SERVE_PREFILL_GRAPH != 0.
     std::optional<PrefillGraphFamily> prefill_graphs;
     DecodeGraphFamily mtp_graphs;
+    /// The narrow round's graphs, captured only when a width limit makes them reachable.
+    DecodeGraphFamily mtp_narrow_graphs;
     DecodeGraphFamily dflash_graphs;
 
     PinnedHostBuffer round_host;

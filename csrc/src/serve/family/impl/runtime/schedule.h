@@ -89,6 +89,8 @@ struct MtpBatchContext {
     const family::MtpDecodeIngress& host_ingress;
     family::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    /// Device I32 scalar holding 1: the narrow round advances the frontiers by it in-graph.
+    Tensor one;
 };
 
 struct DFlashBatchContext {
@@ -198,10 +200,15 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 
 // Executes one exact-B MTP verification/alignment/proposal transaction. Each row may carry a
 // different current and next proposal extent while the model traversal remains batched.
+// `narrow`: the head's round for a batch too wide to pay for a verify -- one column per lane
+// through the trunk, sampled as an ordinary round samples, the head aligned on it and
+// proposing the next drafts as usual.
 void capture_mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition);
+                              MtpGqaEnvelopes envelopes, DecodeGraphDefinition& definition,
+                              bool narrow = false);
 void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable);
+                      MtpGqaEnvelopes envelopes, DecodeGraphExecutable* executable,
+                      bool narrow = false);
 
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
