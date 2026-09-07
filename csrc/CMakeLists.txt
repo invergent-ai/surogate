@@ -101,6 +101,12 @@ option(SUROGATE_SERVE_TESTS "Expose the serve engine test targets" OFF)
 option(SUROGATE_SERVE_BENCH "Expose the serve engine bench targets" OFF)
 set(SUROGATE_SERVE_CUDA_ARCHS "120a" CACHE STRING
     "CUDA architectures for the serve engine targets (RTX consumer set)")
+# A build machine missing FFmpeg or libcurl drops the serve targets with a status
+# line, which is right for a training-only tree and wrong for a wheel: it would
+# publish a package whose `surogate serve` exits 127 and say nothing. The wheel
+# build turns this on (pyproject.toml) so a missing host dependency fails the
+# build instead of silently shipping a trainer.
+option(SUROGATE_REQUIRE_SERVE "Fail the build if the serve engine cannot be built" OFF)
 
 FetchContent_Declare(
         json
@@ -745,8 +751,12 @@ if (PYTHON_BINDING)
             INSTALL_RPATH_USE_LINK_PATH FALSE
     )
 
+    # COMPONENT is what keeps the wheel to this project's own products: the build
+    # installs by component (pyproject.toml), so llama.cpp's and ggml's install rules
+    # -- which reference tools nobody asked to build -- never run.
     install(TARGETS _surogate surogate-common
             LIBRARY DESTINATION surogate
+            COMPONENT surogate
     )
 endif ()
 
@@ -778,7 +788,11 @@ endif()
 
 if(SUROGATE_BUILD_SERVE)
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
-        message(STATUS "serve: requires CUDA >= 13.1; targets disabled")
+        if(SUROGATE_REQUIRE_SERVE)
+            message(FATAL_ERROR "serve: requires CUDA >= 13.1, found ${CMAKE_CUDA_COMPILER_VERSION}.")
+        else()
+            message(STATUS "serve: requires CUDA >= 13.1; targets disabled")
+        endif()
     else()
         enable_language(C)  # utf8proc
         set(SINFER_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/serve)
@@ -796,7 +810,12 @@ if(SUROGATE_BUILD_SERVE)
             pkg_check_modules(FFMPEG IMPORTED_TARGET
                 libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
             if(NOT FFMPEG_FOUND)
-                message(STATUS "serve: FFmpeg dev libraries not found; media-decode stub")
+                if(SUROGATE_REQUIRE_SERVE)
+                    message(FATAL_ERROR "serve: FFmpeg dev libraries not found (libavformat/libavcodec/libavutil/libswscale). "
+                    "Install them, or configure with -DSINFER_ENABLE_FFMPEG=OFF to serve without media decoding.")
+                else()
+                    message(STATUS "serve: FFmpeg dev libraries not found; media-decode stub")
+                endif()
                 set(SINFER_ENABLE_FFMPEG OFF)
             endif()
         else()
@@ -806,7 +825,11 @@ if(SUROGATE_BUILD_SERVE)
             pkg_check_modules(LIBCURL IMPORTED_TARGET libcurl>=7.85)
         endif()
         if(NOT LIBCURL_FOUND)
-            message(STATUS "serve: pkg-config/libcurl not found; serve targets disabled")
+            if(SUROGATE_REQUIRE_SERVE)
+                message(FATAL_ERROR "serve: pkg-config and libcurl>=7.85 are required by the serve engine and were not found.")
+            else()
+                message(STATUS "serve: pkg-config/libcurl not found; serve targets disabled")
+            endif()
         endif()
         set(SERVE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/serve)
         if(LIBCURL_FOUND)
@@ -1345,7 +1368,7 @@ endif()
 add_executable(surogate-embed EXCLUDE_FROM_ALL ${SERVE_ROOT}/encoder/embedding_server.cpp)
 target_include_directories(surogate-embed PRIVATE
   ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
-target_link_libraries(surogate-embed PRIVATE sinfer_encoder)
+# Links sinfer_shared, with the other three products, once that target exists below.
 
 sinfer_internal_includes(sinfer_ops)
 # surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a
@@ -1477,6 +1500,67 @@ if(SINFER_BUILD_SERVE)
 endif()
 
 
+        # ---- one shared library behind every serve product ----
+# surogate-engine, surogate-engine-cli, surogate-embed and the _surogate_serve
+# module are the same engine behind different front doors. Linked against the
+# archives, each embedded its own copy of the device code: 490 MB of fatbin per
+# product and 2.0 GB for the four, which a wheel would carry four times over.
+# They link this instead, so the fatbin exists once -- in the package, and in
+# csrc/build-serve, where it also cuts the link time of a serve rebuild.
+#
+# Membership is asked of the build rather than restated here: these archives are
+# gated on architecture, on host libraries and on SINFER_BUILD_APPS, and a list
+# that names a target this configuration did not define is a configure error.
+set(SINFER_SHARED_ARCHIVES "")
+foreach(candidate IN ITEMS
+    sinfer_engine sinfer_core sinfer_ops sinfer_artifact sinfer_text sinfer_encoder
+    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_trtllm_moe sinfer_media_decode
+    sinfer_serve sinfer_media_acquire sinfer_product_prompt_input
+    sinfer_product_load_progress sinfer_product_cuda_visibility)
+  if(TARGET ${candidate})
+    list(APPEND SINFER_SHARED_ARCHIVES ${candidate})
+  endif()
+endforeach()
+
+add_library(sinfer_shared SHARED ${SERVE_ROOT}/shared_library.cpp)
+set_target_properties(sinfer_shared PROPERTIES
+  OUTPUT_NAME sinfer
+  # The library has no CUDA sources of its own, and every archive resolved its
+  # device symbols when it was created (sinfer_cuda_archive above). Asking for a
+  # second device link here does not just waste a step: CMake runs it as a host
+  # `gcc -c`, and the whole-archive block below reaches it as input files.
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+  POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(sinfer_shared PRIVATE
+  SINFER_BUILD_CUDA_ARCHS="${SUROGATE_SERVE_CUDA_ARCHS}")
+target_include_directories(sinfer_shared PUBLIC ${SERVE_ROOT})
+# The products compile serve headers that reach for cuda_runtime.h, and call the
+# runtime themselves. They used to inherit that from whichever archive they linked
+# (sinfer_encoder -> sinfer_core -> CUDA::cudart); the archives are private to the
+# shared library now, so the requirement lives here.
+target_link_libraries(sinfer_shared PUBLIC CUDA::cudart)
+
+# Each archive goes in whole exactly once. CMake's WHOLE_ARCHIVE link feature cannot
+# do that here: most of these archives are reached again through another's
+# INTERFACE_LINK_LIBRARIES, and the feature repeats the item on every path that
+# reaches it -- an archive pulled in whole twice is a link full of duplicate
+# definitions. So the whole-archive block is spelled out as link options, where the
+# list is exactly the list. Whole is not optional either: the library has no callers
+# of its own, so an ordinary link would resolve nothing and produce an empty .so.
+set(SINFER_SHARED_WHOLE "LINKER:--push-state,--whole-archive")
+foreach(archive IN LISTS SINFER_SHARED_ARCHIVES)
+  list(APPEND SINFER_SHARED_WHOLE "$<TARGET_FILE:${archive}>")
+endforeach()
+list(APPEND SINFER_SHARED_WHOLE "LINKER:--pop-state")
+target_link_options(sinfer_shared PRIVATE ${SINFER_SHARED_WHOLE})
+add_dependencies(sinfer_shared ${SINFER_SHARED_ARCHIVES})
+# Linked as targets too, for their usage requirements: cudart, FFmpeg, libcurl,
+# sentencepiece, numa, Threads. Their objects are all in by this point, so the
+# archives themselves resolve nothing further and cost nothing.
+target_link_libraries(sinfer_shared PRIVATE ${SINFER_SHARED_ARCHIVES})
+add_library(sinfer::shared ALIAS sinfer_shared)
+
+
         # ---- serve executables (formerly src/serve/apps/CMakeLists.txt) ----
 add_executable(sinfer EXCLUDE_FROM_ALL   # surogate vendor patch (csrc/src/serve/PATCHES.md): product binary names.
   ${SERVE_ROOT}/cli/main.cpp
@@ -1485,11 +1569,7 @@ target_include_directories(sinfer PRIVATE
   ${SERVE_ROOT}
   ${SERVE_ROOT}
   ${SUROGATE_VENDOR_DIR})
-target_link_libraries(sinfer PRIVATE
-  sinfer_engine
-  sinfer_product_load_progress
-  sinfer_product_cuda_visibility
-  sinfer_product_prompt_input)
+target_link_libraries(sinfer PRIVATE sinfer_shared)
 
 add_executable(sinfer-serve EXCLUDE_FROM_ALL ${SERVE_ROOT}/server/main.cpp)
 target_include_directories(sinfer-serve PRIVATE
@@ -1498,8 +1578,8 @@ target_include_directories(sinfer-serve PRIVATE
   ${SERVE_ROOT}
   ${SUROGATE_VENDOR_DIR}
   ${SUROGATE_VENDOR_DIR}/cpp-httplib)
-target_link_libraries(sinfer-serve PRIVATE sinfer_serve sinfer_product_load_progress
-  sinfer_product_cuda_visibility)
+target_link_libraries(sinfer-serve PRIVATE sinfer_shared)
+target_link_libraries(surogate-embed PRIVATE sinfer_shared)
 
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the product binaries carry
 # surogate's name; SInfer attribution lives in NOTICE, not in process names.
@@ -1521,9 +1601,65 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
                 ${CMAKE_CURRENT_SOURCE_DIR}/src/binding/py_serve.cpp)
             target_include_directories(_surogate_serve PRIVATE
                 ${SERVE_ROOT} ${SINFER_JSON_INCLUDE})
-            target_link_libraries(_surogate_serve PRIVATE
-                sinfer_engine sinfer_product_prompt_input)
+            target_link_libraries(_surogate_serve PRIVATE sinfer_shared)
             set_target_properties(_surogate_serve PROPERTIES EXCLUDE_FROM_ALL TRUE)
+        endif()
+
+        # ---- packaging ----
+        # What an installed wheel needs for `surogate serve` to work the way it
+        # works in a source tree: the three product binaries, the shared library
+        # holding their device code, and the Python module. The binaries go under
+        # the package rather than into the venv's bin/ for the same reason the
+        # quantiser does (csrc/cmake/llama_cpp_quantizer.cmake) -- a serving engine
+        # is an implementation detail of `surogate serve`, not a command of its
+        # own -- and surogate/cli/serve.py looks there.
+        set(SUROGATE_SERVE_INSTALL_DIR "surogate/serve/_bin")
+        if(SKBUILD)
+            # libsinfer.so sits at the package root beside libsurogate-common.so;
+            # $ORIGIN/../.. is what takes the binaries there from _bin, and the
+            # nvidia/* wheels are three levels further up from the same point.
+            set(SINFER_BIN_RPATH_LIST
+                "$ORIGIN"
+                "$ORIGIN/../.."
+                "$ORIGIN/../../../nvidia/cuda_runtime/lib"
+                "$ORIGIN/../../../nvidia/cublas/lib"
+                "$ORIGIN/../../../nvidia/cudnn/lib")
+            list(JOIN SINFER_BIN_RPATH_LIST ":" SINFER_BIN_RPATH)
+            set(SINFER_LIB_RPATH_LIST
+                "$ORIGIN"
+                "$ORIGIN/../nvidia/cuda_runtime/lib"
+                "$ORIGIN/../nvidia/cublas/lib"
+                "$ORIGIN/../nvidia/cudnn/lib")
+            list(JOIN SINFER_LIB_RPATH_LIST ":" SINFER_LIB_RPATH)
+
+            set_target_properties(sinfer sinfer-serve surogate-embed PROPERTIES
+                INSTALL_RPATH "${SINFER_BIN_RPATH}"
+                BUILD_WITH_INSTALL_RPATH OFF
+                INSTALL_RPATH_USE_LINK_PATH FALSE)
+            set_target_properties(sinfer_shared PROPERTIES
+                INSTALL_RPATH "${SINFER_LIB_RPATH}"
+                BUILD_WITH_INSTALL_RPATH OFF
+                INSTALL_RPATH_USE_LINK_PATH FALSE)
+            install(TARGETS sinfer sinfer-serve surogate-embed
+                    RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR}
+                    COMPONENT serve)
+            install(TARGETS sinfer_shared
+                    LIBRARY DESTINATION surogate
+                    COMPONENT serve)
+            if(PYTHON_BINDING)
+                set_target_properties(_surogate_serve PROPERTIES
+                    INSTALL_RPATH "${SINFER_LIB_RPATH}"
+                    BUILD_WITH_INSTALL_RPATH OFF
+                    INSTALL_RPATH_USE_LINK_PATH FALSE)
+                install(TARGETS _surogate_serve
+                        LIBRARY DESTINATION surogate
+                        COMPONENT serve)
+            endif()
+        else()
+            install(TARGETS sinfer sinfer-serve surogate-embed sinfer_shared
+                    RUNTIME DESTINATION bin
+                    LIBRARY DESTINATION lib
+                    COMPONENT serve)
         endif()
 
         endif()  # LIBCURL_FOUND
