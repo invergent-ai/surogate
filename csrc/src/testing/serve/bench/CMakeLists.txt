@@ -6,7 +6,7 @@ function(sinfer_add_op_bench name)
     ${CMAKE_CURRENT_SOURCE_DIR}/ops
     ${SERVE_ROOT}
     ${SERVE_ROOT})
-  target_link_libraries(${name} PRIVATE sinfer_ops)
+  target_link_libraries(${name} PRIVATE sinfer_shared)
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
@@ -80,7 +80,7 @@ target_include_directories(sinfer_bench PRIVATE
   ${SERVE_ROOT}
   ${SUROGATE_VENDOR_DIR})
 target_compile_definitions(sinfer_bench PRIVATE SINFER_SOURCE_DIR="${SERVE_ROOT}")
-target_link_libraries(sinfer_bench PRIVATE sinfer_engine CUDA::cudart)
+target_link_libraries(sinfer_bench PRIVATE sinfer_shared CUDA::cudart)
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .sinfer artifact.
@@ -92,8 +92,7 @@ target_include_directories(sinfer_qwen3_5_mtp_round_bench PRIVATE
   ${SUROGATE_VENDOR_DIR}
   ${SERVE_ROOT}/targets/qwen3_5/export
   ${SERVE_ROOT}/targets/qwen3_5/export)
-target_link_libraries(sinfer_qwen3_5_mtp_round_bench PRIVATE
-  sinfer_engine sinfer_core)
+target_link_libraries(sinfer_qwen3_5_mtp_round_bench PRIVATE sinfer_shared)
 
 # Complete production DFlash steady round: confirmed-context append, next proposal, target
 # verification/acceptance, and host publication over a real 35B artifact.
@@ -105,5 +104,4 @@ target_include_directories(sinfer_qwen3_5_moe_dflash_round_bench PRIVATE
   ${SUROGATE_VENDOR_DIR}
   ${SERVE_ROOT}/targets/qwen3_5_moe/export
   ${SERVE_ROOT}/targets/qwen3_5/export)
-target_link_libraries(sinfer_qwen3_5_moe_dflash_round_bench PRIVATE
-  sinfer_engine sinfer_core)
+target_link_libraries(sinfer_qwen3_5_moe_dflash_round_bench PRIVATE sinfer_shared)
