@@ -1,16 +1,14 @@
 # Inference CLI
 
-Serving is a subcommand of the same `surogate` CLI that runs training:
-
 ```bash
 surogate serve <model> [options...]                       # OpenAI/Anthropic HTTP server
-surogate serve --generate <model> --prompt "..."          # one-shot generation to stdout
-surogate serve --embed <model> [--frontend DIR]           # /v1/embeddings for an encoder model
+surogate serve --generate <model> --prompt "..."          # one-shot generation
+surogate serve --embed <model> [--frontend DIR]           # embeddings server
 ```
 
-`<model>` is a **Hugging Face repo id, a local safetensors directory, or a GGUF file**. A GGUF is
-read where it lies, with a small index written beside it on the first start; other sources are
-converted into a local cache once. Later loads are instant either way.
+`<model>` is a Hugging Face repo id, a local safetensors directory, or a GGUF file. The first
+start prepares and caches the model; later starts reuse that preparation. Keep source GGUF
+files in place while using their cache entries.
 
 ```bash
 surogate serve Qwen/Qwen3.6-27B
@@ -18,281 +16,282 @@ surogate serve ~/models/qwen3.6-27b-hf/
 surogate serve ~/models/qwen3.6-27b-Q4_K_M.gguf
 ```
 
-From a source checkout the engine binaries come from `make serve-build`. They are internal
-implementation, not a user interface — `surogate serve` resolves and executes them, and no
-Python (and no Python CUDA context) stays in the serving process.
-
-`surogate serve --engine-help` prints the full option surface of whichever binary the mode
-selects, which is always the canonical list.
+From a source checkout, build serving support with `make serve-build`.
+`surogate serve --engine-help` prints server help. Add `--generate` or `--embed` to see the
+options for those modes.
 
 ## Server options
-
-The most common ones; `--engine-help` has the rest.
 
 ### Endpoint and access
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--host H` | `127.0.0.1` | Bind address |
-| `--port N` | `8080` | Bind port |
-| `--api-key KEY` | none | Require this bearer token |
-| `--served-model-name ID` | model identity | Override the reported model id |
-| `--cors` | off | Allow cross-origin browser requests |
-| `--max-request-mib N` | 384 | Body cap, enforced before JSON parsing |
-| `--request-log-jsonl FILE` | none | Append full-precision request records |
-| `--log-stats-interval-ms N` | 5000 | Periodic throughput log; `0` disables |
+| `--host H` | `127.0.0.1` | Bind address; use `0.0.0.0` to accept remote connections |
+| `--port N` | `8080` | HTTP port |
+| `--api-key KEY` | none | Require this key through a bearer token or `x-api-key` header |
+| `--served-model-name ID` | model identity | Name clients use in the `model` field |
+| `--cors` | off | Allow browser cross-origin requests |
+| `--max-request-mib N` | 384 | Maximum request body size |
+| `--request-log-jsonl FILE` | none | Append request records to this file |
+| `--log-stats-interval-ms N` | 5000 | Throughput log interval; `0` disables |
 
 ### Context and KV cache
 
+The context limit controls how much text a request can use. The KV cache holds information
+from earlier tokens; its capacity affects how many requests can run together.
+
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-model-len N\|auto` | 8192 | Context length, capped by the model's trained maximum |
-| `--kv-capacity N\|auto` | 8192 | KV pool size in tokens; `auto` sizes from free VRAM, leaving 1024 MiB. Under `--elastic-kv-overcommit` this is the model's guaranteed floor instead (`auto` = one full-context request) |
-| `--no-elastic-kv` | off | Keep the KV pool's planes in the static arena. By default the pool is **elastic**: its planned size is a virtual span, and only pages in use (plus a small reserve) hold VRAM — see [Serving models](serving-models.md#several-models-on-one-gpu) |
-| `--elastic-kv-overcommit` | off | Let co-resident models share the GPU's idle KV: each model is guaranteed only its `--kv-capacity`, and every page past that is admitted against the memory actually free |
-| `--kv-cache-dtype auto\|fp8\|bf16\|int8` | `fp8` | Cache precision; `auto` = fp8 (e4m3) |
-| `--kv-cache-dtype-skip-layers L,...` | none | Hold these full-attention layers at BF16 |
-| `--no-cache` | off | Rebuild the index beside the model instead of reusing one |
-| `--no-prefix-reuse` | off | Disable compatible-prefix caching |
-| `--rewrite-checkpoints` | off | Keep a per-lane GDN checkpoint so an edited last turn resumes from its prefix |
-| `--enforce-eager` | off | Skip CUDA graph capture (debugging) |
+| `--max-model-len N\|auto` | `auto` | Context limit per request; `auto` fits available GPU memory up to the model's maximum |
+| `--kv-capacity N\|auto` | follows context | Total cache capacity in tokens; `auto` sizes from free GPU memory, leaving 1024 MiB |
+| `--kv-cache-dtype auto\|fp8\|bf16\|int8` | `auto` | Choose cache precision automatically for the model, or force a specific format |
+| `--kv-cache-dtype-skip-layers L,...` | none | Keep the listed attention layers' cache at BF16 |
+| `--no-elastic-kv` | off | Reserve the full cache in GPU memory instead of growing memory use with demand |
+| `--elastic-kv-overcommit` | off | Let several models share unused GPU memory for their caches |
+| `--no-cache` | off | Rebuild the prepared model cache on disk |
+| `--no-prefix-reuse` | off | Disable reuse of compatible earlier prompts |
+| `--enable-prefix-caching`, `--no-enable-prefix-caching` | enabled | Alternative spellings for enabling or disabling prompt reuse |
+| `--rewrite-checkpoints` | off | Use extra memory to make editing and resending the last turn faster |
+| `--enforce-eager` | off | Disable CUDA graphs for debugging |
+
+When `--max-model-len` is automatic, omitted `--kv-capacity` also defaults to `auto`. When
+context is explicit, omitted cache capacity defaults to that same token count. Use
+`--kv-capacity auto` explicitly to make more cache available for simultaneous requests.
+
+Cache precision `auto` selects BF16 for models such as Qwen3 and Llama, and FP8 for hybrid
+models such as Qwen3.5/3.6/3.8. FP8 uses half the cache storage of BF16. DFlash requires BF16.
+
+With `--elastic-kv-overcommit`, `--kv-capacity` becomes a guaranteed minimum; `auto` guarantees
+enough for one full-context request per model. See [Serving models](serving-models.md#several-models-on-one-gpu).
 
 ### Devices
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--device N` | 0 | Single GPU |
-| `--devices A,B,...` | — | Pipeline stages across GPUs, one stage per card |
+| `--device N` | 0 | Use one GPU |
+| `--devices A,B,...` | — | Split a supported model across the listed GPUs |
+
+Multiple GPUs are supported for GLM-5.3-Flash, Qwen3.8 Flash-Next, Qwen3.5/3.6/3.8 dense
+models, and Qwen3.5/3.6 MoE models. MTP can be used with these models when their checkpoint
+includes compatible MTP weights.
+
+DFlash, additional models through `--model`, and sleep mode currently require a single GPU.
+To run independent replicas, start separate servers on different devices and ports.
 
 ### Host offload
 
-For a model larger than the cards it is being served on. Weights placed on the host live in
-pinned, device-mapped memory: the kernels read them over PCIe, nothing is dequantised, and the
-answer is the same one the resident model gives.
+Use system RAM for part of a model when it does not fit in GPU memory. This reduces GPU memory
+requirements but can make responses slower. The machine needs enough RAM to hold the offloaded
+weights; that memory cannot be swapped out while the model is loaded.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--host-moe-layers N\|all` | off | Routed experts of that many mixture layers live in host memory |
-| `--gpu-layers N\|all`, `-ngl N` | all | Layers kept on the card; every later layer is read from host memory in full |
+| `--host-moe-layers N\|auto\|all` | off | Move MoE expert weights to RAM; with multiple GPUs, `auto` chooses how much to offload on each GPU |
+| `--gpu-layers N\|all`, `-ngl N` | all | Keep N model layers on the GPU and use RAM for the rest |
 
-Prefer `--host-moe-layers` where the model has a mixture. A token routes to a handful of a
-layer's experts, so only those cross PCIe, while an offloaded dense layer crosses every byte on
-every token. Both counts are whole-model, so a pipeline split does not change which weights
-live where.
+For a mixture-of-experts (MoE) model, try `--host-moe-layers` first. It generally transfers
+less data than offloading whole layers.
 
-    # GLM-5.3-Flash, 200 GB, on one 32 GB card
-    surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
-      --device 0 --host-moe-layers all
-
-Measured on one RTX 5090 (weights on the card / pinned in host memory):
-
-| Model | Resident | Pinned |
-|---|---:|---:|
-| GLM-5.3-Flash, `--host-moe-layers all` | 8.91 GiB | 172.74 GiB |
-| GLM-5.3-Flash, `--gpu-layers 8` | 23.31 GiB | 158.34 GiB |
-| GLM-5.3-Flash, `--gpu-layers 1` | 1.54 GiB | 180.10 GiB |
-| Qwen3.6-35B-A3B, `--host-moe-layers all` | 2.33 GiB | 18.22 GiB |
-
-Filling the bank costs about 4 GB/s of host bandwidth: GLM's 172.74 GiB takes 43 s on top of
-the load. Pipeline stages of one model in one process share the pinned bytes rather than
-pinning a copy per card.
-
-An object the loader rearranges on its way to the card is honoured — the bank runs the same
-kernel and holds the rearranged planes — but one whose *columns* are permuted at load is
-refused by name, because the map that undoes it is built for device-resident weights only.
+```bash
+surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
+  --device 0 --host-moe-layers all --max-model-len 2048
+```
 
 ### MoE expert cache
 
-A device cache in front of the host bank, with optional host-side expert compute. Available on
-the Flash-Next target.
+Flash-Next and GLM-5.3-Flash can keep frequently used offloaded experts on the GPU and use CPU
+cores for some expert computation. These settings apply when the model has offloaded experts.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--expert-slots N` | off | Device LRU slot cache; enabling it turns on the pinned host bank |
-| `--host-expert-bank w8\|q4` | `q4` with slots | Host bank precision; `w8` restores the artifact's format |
-| `--cpu-moe-share F\|auto` | off | Share of routed expert work on host cores; `auto` measures host vs PCIe rates at startup |
-| `--cpu-moe-prefill-share F` | 0.5 | Separate share during prefill; `0` disables |
-| `--cpu-moe-min-tokens N` | target default | Skip the CPU split below this token count |
+| `--expert-slots N` | automatic where supported | Number of experts cached on the GPU; omitted or `0` lets the model choose based on available memory |
+| `--host-expert-bank auto\|w8\|q4` | `auto` | Precision of offloaded experts. `w8` uses eight bits throughout; `q4` uses four bits, saving RAM but potentially reducing quality |
+| `--cpu-moe-share F\|auto` | off | Fraction of expert work sent to CPU cores; `auto` measures the machine at startup |
+| `--cpu-moe-prefill-share F` | 0.5 when CPU sharing is on | CPU share during prompt processing; `0` disables it |
+| `--cpu-moe-min-tokens N` | model default | Minimum token count before CPU sharing is used |
+
+Automatic host precision keeps four-bit, five-bit, and wider source weights at suitable
+precisions. Force `q4` only when you want the RAM saving from reducing wider weights to four bits.
 
 ### Scheduling
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-num-seqs N` | 1 | Concurrent lanes — raise it for any real serving load |
-| `--max-num-batched-tokens N` | 2048 | Prefill chunk size; must be a positive multiple of 128 |
-| `--max-pending-requests N` | 16 | Admission queue depth |
-| `--pending-timeout-ms N` | 30000 | Queue wait before rejection |
-| `--default-max-tokens N` | 8192 | Used when a request omits `max_tokens` |
+| `--max-num-seqs N` | 1 | Maximum simultaneous requests, from 1 to 128 |
+| `--max-num-batched-tokens N` | 2048 | Prompt tokens processed at a time; must be a positive multiple of 128 |
+| `--max-pending-requests N` | 16 | Additional requests allowed to wait |
+| `--pending-timeout-ms N` | 30000 | Time allowed for prompt preparation and waiting to start generation |
+| `--default-max-tokens N` | 8192 | Output limit when a request omits it |
+
+Raise `--max-num-seqs` when serving multiple users. More simultaneous requests need more
+memory; pair it with `--kv-capacity auto`. The pending timeout does not limit how long an
+already-running response may take.
 
 ### Speculative decoding
 
-Draft tokens are proposed cheaply and verified by the full model, so output is
-identical to non-speculative decoding — it just arrives faster. Measured 2.2–2.5×
-on decode at a draft window of 3.
+Speculative decoding can make generation faster by proposing several tokens for the model to
+check together. It works best when those proposals are often accepted. Measure it with your
+workload: more simultaneous requests or heavy CPU offload can reduce the benefit.
 
 | Flag | Meaning |
 |---|---|
-| `--spec mtp` | Multi-token prediction, using the model's own MTP block. Draft window 1–5. One device: a pipeline runs no speculative round. |
-| `--spec dflash` | A separate trained drafter. Draft window 1–15; needs a bf16 KV cache, and is not combinable with `--vision`. |
-| `--draft-tokens N` | Tokens proposed per round |
-| `--lm-head-draft` | Propose through the reduced draft head instead of the full output head |
+| `--spec mtp` | Enable MTP on a supported model; supports one or multiple GPUs |
+| `--spec dflash` | Use a compatible separate drafter; requires one GPU, `--kv-cache-dtype bf16`, and no `--vision` |
+| `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec` |
+| `--spec-max-lanes N\|all` | MTP checks drafts only while at most N requests are decoding. Default (or `0`) is 1; `all` keeps checking at every concurrency level. Does not affect DFlash |
+| `--lm-head-draft` | Use a smaller draft vocabulary when the checkpoint provides one |
 
-Availability depends on what the model carries. `mtp` needs the checkpoint's MTP
-(`nextn`) block — most first-party checkpoints have it, and community exports
-frequently strip it. `dflash` needs a drafter checkpoint that is converted in
-alongside the model. Either way a model without one refuses at startup, naming
-what is missing, rather than silently serving unaccelerated.
+MTP needs the checkpoint's MTP weights, which some community exports omit. DFlash
+needs a compatible drafter included during model preparation. Missing draft weights produce
+a startup error.
 
 ### Serving several models from one process
 
-| Flag | Meaning |
+Use `--model name=path[,key=value...]` for each additional model. Currently, the additional
+model's path must be a prepared `.sinfer` file from the serving cache. Prepare the model
+separately first, then use its cache path; see [Serving models](serving-models.md#several-models-on-one-gpu).
+The first, positional model still accepts a repo id, safetensors directory, or GGUF.
+
+| Setting | Meaning |
 |---|---|
-| `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N][,spec=mtp\|dflash][,draft-tokens=N][,lora=name:path][,priority=high\|normal\|low]` | Serve an additional model beside the primary; repeatable. `lora=` (repeatable within one `--model`) gives that model its own adapters. |
-| `--model-priority high\|normal\|low` | The primary model's scheduler weight class. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is optional with the elastic pool (the default) and required under `--no-elastic-kv`, where each extra must state its KV budget. |
+| `--model name=path` | Add a model; clients select it with `model: "name"` |
+| `kv-tokens=N` | Override this model's cache budget; required with `--no-elastic-kv` |
+| `max-num-seqs=N` | Override its maximum simultaneous requests |
+| `max-model-len=N` | Override its context limit |
+| `spec=mtp\|dflash` | Enable speculation for this model; defaults its draft token count to 3 |
+| `draft-tokens=N`, `spec-max-lanes=N\|all` | Override this model's speculation settings |
+| `lora=name:path` | Add an adapter to this model; repeatable |
+| `priority=high\|normal\|low` | Priority when models compete for memory; defaults to `normal` |
+| `--model-priority high\|normal\|low` | Set the first model's priority |
 
-Each model runs its own engine — weights, cache, scheduler, CUDA graphs — on
-its own stream inside one process, so concurrent requests for different models
-genuinely share the GPU rather than time-slicing it (measured: two busy models
-in one process reach ~1.3× the aggregate of the same pair in two processes).
-An idle co-resident model costs nothing but its memory — and with the elastic
-pool, its KV is only the pages it actually holds: an idle model's cache
-shrinks to its prefix reuse, and a busy one maps what its requests reach.
-`--elastic-kv-overcommit` goes further and lets the models' caches grow into
-each other's idle room, with a floor each is guaranteed; see
-[Serving models](serving-models.md#several-models-on-one-gpu) for the numbers
-and what happens when the GPU runs short.
+Put per-model settings after its path, separated by commas. Omitted context, concurrency,
+and cache settings inherit from the first model. Speculation is off unless enabled for each
+additional model. `/v1/models` lists all served model and adapter names.
 
-With `--enable-sleep-mode` as well, the models need not all fit at once: a
-request for a model that is asleep waits while the scheduler frees room —
-sleeping the least recently used idle models — and wakes it, typically in
-under a second (the first eviction of a model also allocates its host backup,
-which takes a few seconds once). After a grace period a busy model can be
-preempted at a round boundary — its generations park and resume byte-identically
-after re-wake. Priorities shape all of it: eviction takes lower-priority models
-first, a busy model yields only to an equal-or-higher-priority requester (a
-lower-priority request waits for the natural drain instead), and higher tiers
-keep their warmth longer. Idle models of any tier remain evictable, so nothing
-pins VRAM by doing nothing. Management endpoints take `?model=NAME`.
+With `--enable-sleep-mode`, the models do not all need to fit in GPU memory at once. Requests
+for a sleeping model wait while the server frees room and wakes it. Less recently used,
+lower-priority idle models are preferred for sleeping. After a grace period, a busy model may
+be paused for an equal- or higher-priority request, then resumed when memory is available.
+Higher-priority models stay ready longer after use, but idle models can still be put to sleep.
+
+Allow enough system RAM for the saved models. Multi-model startup prepares this memory in
+advance. Management endpoints accept `?model=NAME` to select a particular model.
 
 ### Sleep mode
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--enable-sleep-mode` | off | Adds `POST /sleep` and `POST /wake_up`. Sleeping releases the model's VRAM with all state parked in host RAM; waking restores it in about a second. Single-device serving. |
+| `--enable-sleep-mode` | off | Enable `/sleep` and `/wake_up` to release and restore GPU memory while preserving model state; one GPU only |
+
+See the [API guide](api.md#sleep-mode) for commands and behavior while asleep.
 
 ### LoRA adapters
 
-Serve PEFT adapters beside the base model, several at once, each addressable by
-name. A request selects one by putting the adapter's name in `model`; the base
-id keeps meaning the unadapted model, and requests for different adapters share
-a batch. Adapters can also be loaded and unloaded at runtime through
-`POST /v1/load_lora_adapter` and `POST /v1/unload_lora_adapter`, without a
-restart — see the API page.
+Serve PEFT adapters beside the base model. A request selects an adapter by putting its name in
+`model`; the base model's name selects the unadapted model. Different adapters can serve
+requests at the same time.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--enable-lora` | off | Prepare the adapter machinery. Valid with zero adapters named — they can arrive later through the runtime endpoints. |
-| `--lora-modules name=path,...` | — | PEFT adapter directories to load at startup, each addressable as `name` |
-| `--max-loras N` | 1 | Resident adapter slots |
-| `--max-lora-rank N` | 16 | Largest adapter rank accepted |
+| `--enable-lora` | off | Enable adapters, including loading them later through the API |
+| `--lora-modules name=path,...` | — | Adapter directories to load at startup |
+| `--max-loras N` | 1 | Maximum loaded adapters per model |
+| `--max-lora-rank N` | 32 | Largest adapter rank accepted |
 
-Adapters apply to `q_proj`, `k_proj`, `v_proj`, `o_proj`, and — on dense-MLP
-models — `down_proj`. A module the server cannot apply is refused at load with
-the reason, rather than skipped: an adapter only partly applied is neither the
-base model nor the fine-tune. Two refusals you may meet: `gate_proj`/`up_proj`
-are fused and consumed inside the SwiGLU projection, and Mixture-of-Experts
-models route their MLP through per-expert weights; in both cases, merging the
-adapter into the checkpoint before conversion (`surogate merge`) serves its full
-effect.
+Supported adapter modules include `q_proj`, `k_proj`, `v_proj`, `o_proj`, and, on supported
+dense models, `down_proj`. Support depends on the model. Unsupported modules are refused;
+merge such an adapter before serving with `surogate merge` to apply its full effect.
+Adapters can be used with supported quantized base models, including NVFP4.
 
-Adapters run under CUDA graphs and with quantized (e.g. NVFP4) base weights;
-the delta is computed in BF16 beside the base projection either way.
-
-On a multi-model server, every model carries its own adapters — the primary's
-via these flags, an extra's via `lora=name:path` keys in its `--model` entry —
-and all served names (models and adapters alike) share one flat namespace,
-because a request selects by the single `model` string. Collisions are refused
-at startup and at runtime load. The runtime endpoints target a specific model
-with `?model=NAME`.
+Additional models have their own adapters through `lora=name:path` in `--model`. Every model
+and adapter name must be unique. The runtime load/unload endpoints accept `?model=NAME`; see
+[LoRA adapters at runtime](api.md#lora-adapters-at-runtime).
 
 ### Sampling defaults
 
 `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--frequency-penalty`,
-`--seed`, `--greedy` (forces temperature 0, exact argmax).
-
-Defaults come from the loaded model and the resolved thinking mode; these flags override
-individual values, and request fields override the flags.
+and `--seed` override the model's defaults. Request fields override individual server settings.
+`--greedy` always forces temperature zero, including when a request asks for another value.
+Requests also accept `repetition_penalty`.
 
 ### Thinking
 
-`--no-thinking` disables reasoning; `--preserve-thinking` retains closed-turn assistant
-reasoning in later prompts.
+`--no-thinking` requests answers without reasoning when the model supports disabling it.
+`--preserve-thinking` keeps earlier assistant reasoning in later prompts. These settings are
+independent and can be overridden per request. Supported reasoning-effort values depend on
+the model's chat template.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--reasoning-parser NAME` | `qwen3` | Read reasoning in the model's output format; also accepts `deepseek_r1`, `glm4_moe`, `think`, or `none`/`off` |
+| `--tool-call-parser NAME` | `qwen3_xml` | Read tool calls; also accepts `hermes`, `llama3_json`, `llama4_json`, or `none`/`off` |
+| `--enable-auto-tool-choice` | off | Allow the model to choose a tool automatically; requires an enabled tool parser |
+| `--chat-template FILE` | model template | Use this Jinja file to format chat prompts |
 
 ### Vision
 
-`--vision` enables media input and loads the fixed vision allocations. `--media-cache-mib N`
-(1024; `0` disables retained reuse), `--media-live-mib N` (2048), `--media-preprocess-threads N`
-(0 = auto, at most 16).
+`--vision` enables images and video on supported models. `--media-cache-mib N` (default 1024)
+sets how much processed media to retain for reuse; `0` disables retention. `--media-live-mib N`
+(default 2048) limits memory for media currently being processed or used by requests.
+`--media-preprocess-threads N` chooses processing threads; `0` selects automatically, up to 16.
 
 ### Responses state
 
-`--response-store-max-records N` (1024) and `--response-store-max-mib N` (256) bound the
-process-local Responses store.
+`--response-store-max-records N` (1024) and `--response-store-max-mib N` (256) limit stored
+Responses API conversations. They are lost when the server restarts and are not shared across
+separate servers.
 
 ## `--generate`: one-shot
 
 ```bash
-surogate serve --generate Qwen/Qwen3.6-27B --prompt "Explain paged attention." --max-new 256
+surogate serve --generate Qwen/Qwen3.6-27B --prompt "Suggest three easy vegetarian dinners." --max-new 256
 ```
 
-Answer content goes to stdout, reasoning and diagnostics to stderr, so `> answer.txt` keeps only
-the answer. This mode has its own spellings for a few options — `--max-context` rather than
-`--max-model-len`, `--kv-dtype` rather than `--kv-cache-dtype` — plus:
+Answer content goes to stdout; reasoning and diagnostics go to stderr. Use `> answer.txt` to
+save only the answer. This mode uses `--max-context` instead of `--max-model-len`, and
+`--kv-dtype` instead of `--kv-cache-dtype`.
 
 | Flag | Meaning |
 |---|---|
 | `--prompt <text>` / `--messages <file.json>` | Input |
-| `--max-new N` | Tokens to generate |
-| `--prefill-chunk N` | Prefill chunk size (default 2048) |
+| `--max-new N` | Maximum new tokens |
+| `--prefill-chunk N` | Prompt-processing size; default 2048 |
 | `--stop <text>`, `--stop-token-id N`, `--reasoning-stop <text>` | Repeatable stop conditions |
-| `--raw-output`, `--print-token-ids` | Verbatim output / token ids |
-| `--prefill-warmup` | Warm the prefill path before timing |
-| `--no-cuda-graph` | Eager decode |
-| `--reasoning-effort low\|medium\|xhigh` | Thinking budget |
+| `--raw-output`, `--print-token-ids` | Verbatim output or token ids |
+| `--prefill-warmup` | Warm up before timing prompt processing |
+| `--no-cuda-graph` | Disable CUDA graphs for debugging |
+| `--reasoning-effort minimal\|low\|medium\|high\|xhigh\|max` | Reasoning setting, where the model supports it |
 
 ## `--embed`: encoder models
 
 ```bash
-surogate serve --embed <model.gguf> --frontend <hf-snapshot-dir> [--device N|cpu]
+surogate serve --embed <model.gguf> --frontend <hf-snapshot-dir> --device 0
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--host H` | `127.0.0.1` | Bind address |
-| `--port N` | 8413 | Bind port |
-| `--device N\|cpu` | `0` | GPU ordinal, or `cpu` for the host backend |
-| `--frontend DIR` | beside the GGUF | Tokenizer source for conversion (`tokenizer.model`, `tokenizer_config.json`) |
+| `--port N` | 8413 | HTTP port |
+| `--device N\|cpu` | `0` | GPU number, or `cpu` |
+| `--frontend DIR` | beside the GGUF | Model directory containing `tokenizer.model` and `tokenizer_config.json` for preparation |
 
-`--frontend` is consumed during conversion and is unnecessary once the model is cached.
+`--frontend` is needed during preparation only; it can be omitted once the model is cached.
 
 ### CPU environment
 
-The CPU backend is tuned by environment, not flags:
-
-| Variable | Recommended | Why |
+| Variable | Setting | Purpose |
 |---|---|---|
-| `OMP_WAIT_POLICY` | `ACTIVE` | Everything runs on one OpenMP team, so spinning covers the microsecond gaps between phases. Must be an environment variable — libgomp reads it before `main`. |
-| `OMP_NUM_THREADS` | physical cores of one NUMA node | Every matmul ends in a barrier, so the slowest thread sets the pace: SMT siblings contend for ports, and cross-socket threads wait on interconnect. |
-| `SINFER_CPU_GEMM` | unset | `builtin`, `onednn` or `zendnn` to override the vendor GEMM choice. |
+| `OMP_WAIT_POLICY` | `ACTIVE` | Reduce delays between CPU operations |
+| `OMP_NUM_THREADS` | Physical cores of one NUMA node | Keep work on one CPU socket; avoid counting SMT threads as extra cores |
+| `SINFER_CPU_GEMM` | unset | Use automatic selection, or force `builtin`, `onednn`, or `zendnn` when available in the build |
 
-Pin the process to match: `numactl --cpunodebind=0 --membind=0`. On a 2×EPYC 9124 host, 16
-threads on one node measured 2.15× faster than 64 threads spanning both sockets.
+Pin CPU and memory use to the same node with `numactl --cpunodebind=0 --membind=0`.
+See [CPU embedding examples](serving-models.md#on-cpu).
 
 ## Environment
 
 | Variable | Meaning |
 |---|---|
-| `SUROGATE_SERVE_CACHE` | Converted-weights cache (default `~/.cache/surogate/serve`) |
-| `SUROGATE_CONVERT_DEVICE` | Device used for conversion (e.g. `cuda`, `cpu`) |
-| `SUROGATE_SERVE_ELASTIC_KV_RESERVE` | Granules the elastic KV pool keeps mapped ahead of demand (default 4; 64 MiB each on a 27B). Trimming starts at twice this. |
-| `SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB` | Under `--elastic-kv-overcommit`, VRAM the admission gate never lets KV grow into (default 1024) — room for CUDA graph captures and workspace growth. |
+| `SUROGATE_SERVE_CACHE` | Prepared-model cache directory; default `~/.cache/surogate/serve` |
+| `SUROGATE_CONVERT_DEVICE` | Device used during conversion, such as `cuda` or `cpu` |
+| `SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB` | GPU memory kept free when sharing caches across models; default 1024 MiB |

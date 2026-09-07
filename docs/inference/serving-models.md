@@ -1,38 +1,36 @@
 # Serving models
 
-`surogate serve <model>` takes a Hugging Face repo id, a local safetensors directory, or a GGUF
-file, and turns it into a running endpoint. Conversion happens once, transparently, into
-`~/.cache/surogate/serve`; every later start reuses it.
+`surogate serve <model>` accepts a Hugging Face repo id, a local safetensors directory, or a
+GGUF file. The first start prepares the model and saves the result under
+`~/.cache/surogate/serve`; later starts reuse it.
 
 ```bash
 surogate serve Qwen/Qwen3.6-27B --port 8080
 ```
 
-Three worked examples below: an NVFP4 checkpoint, a GGUF checkpoint, and an embedding model on
-both GPU and CPU.
+The examples below cover quantized models, models larger than GPU memory, several models on
+one GPU, and embeddings. See the [CLI reference](cli.md) for all options.
 
 ## NVFP4 model
 
-NVFP4 is the 4-bit float format Blackwell's tensor cores consume directly (E2M1 weights, one
-E4M3FN scale per 16 values). There is no separate flag for it: the quantization is read out of
-the checkpoint's own `quantization_config`, and the matching converter is selected for you.
+NVFP4 checkpoints use four-bit weights and require a supported Blackwell GPU. Surogate detects
+the format automatically; no quantization flag is needed.
 
 ```bash
 surogate serve nvidia/Qwen3.6-27B-NVFP4 \
+  --served-model-name qwen3.6-27b \
   --host 0.0.0.0 --port 8080 \
-  --max-model-len 8192 \
-  --kv-capacity auto \
-  --max-num-seqs 32
+  --max-model-len 8192 --kv-capacity auto --max-num-seqs 32
 ```
 
 A local directory works the same way:
 
 ```bash
-surogate serve ~/models/qwen3.6-27b-nvfp4/ --port 8080 --max-num-seqs 32
+surogate serve ~/models/qwen3.6-27b-nvfp4/ \
+  --served-model-name qwen3.6-27b --port 8080 --max-num-seqs 32
 ```
 
-First run prints its conversion progress and writes the cache entry; the second starts in
-seconds. Then:
+Once the server is ready, send a request:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -40,74 +38,72 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Notes:
+Adjust the settings to your workload:
 
-- `--max-num-seqs` defaults to **1**. Raise it for any real serving load; lanes and the KV pool
-  compete for the same memory, so `--kv-capacity auto` is the easy pairing.
-- The KV cache is fp8 regardless of weight format. `--kv-cache-dtype bf16` for a full-precision
-  cache.
-- Speculative decoding is worth turning on at low concurrency: `--spec mtp --draft-tokens 3`
-  measured 2.2–2.5× on decode, with byte-identical output. It needs the checkpoint's MTP block,
-  and says so at startup if the model lacks one.
+- **Simultaneous requests:** `--max-num-seqs` defaults to 1. Raise it to serve more users at
+  once. `--kv-capacity auto` uses available GPU memory for the conversation cache.
+- **Context length:** `--max-model-len` defaults to `auto`. Set a number, as above, to choose
+  a specific limit for each request. Longer conversations need more memory.
+- **Cache precision:** the default `auto` chooses FP8 for this Qwen3.6 model. Use
+  `--kv-cache-dtype bf16` for BF16 precision; it needs more memory.
+- **Generation speed:** try `--spec mtp --draft-tokens 3` when the checkpoint includes MTP
+  weights. The benefit depends on the prompts, hardware, and number of simultaneous requests.
+  By default, MTP checks drafts only while one request is decoding.
 
 ## GGUF model
 
-Point `surogate serve` at the `.gguf` file. Nothing is copied and nothing is requantised: the
-K-quant superblocks are read from the file as it stores them, `Q8_0` tensors are rearranged into
-the same numbers the engine's 8-bit format holds, and what lands beside the file is a small index
-naming the stretches each tensor comes from. For a 22 GB `Q4_K_M` that index is about 70 MB and
-takes ~18 seconds to build once.
+Point `surogate serve` at the `.gguf` file:
 
 ```bash
-surogate serve ~/models/Qwen3.6-27B-Q4_K_M.gguf --host 0.0.0.0 --port 8080 --max-num-seqs 16
+surogate serve ~/models/Qwen3.6-27B-Q4_K_M.gguf \
+  --host 0.0.0.0 --port 8080 --max-num-seqs 16 --kv-capacity auto
 ```
 
-For a split GGUF, pass the **first shard** — the rest are found automatically.
+Supported GGUF weights are read from the source files without creating another full copy.
+Prepared files go under `~/.cache/surogate/serve`, or the directory set by
+`SUROGATE_SERVE_CACHE`. Keep the source GGUF files at their original paths while using the
+cache. For a split GGUF, pass the **first shard**; the rest are found automatically.
 
-A model you trained here is not a GGUF yet. Merge the adapter and quantize it first, then serve
-the result the same way:
+To serve an adapter you trained here as a merged model, merge it first. You can serve the
+merged directory directly:
 
 ```bash
 surogate merge --base-model Qwen/Qwen3.5-0.8B --checkpoint-dir out/step_00000050 --output merged
+surogate serve merged
+```
+
+Or quantize the merged model before serving:
+
+```bash
 surogate quantize --model merged --output merged-Q4_K_M.gguf --type q4_k_m
 surogate serve merged-Q4_K_M.gguf
 ```
 
-### MoE larger than VRAM
-
 ## A model larger than the card
 
-Weights the card has no room for go in pinned, device-mapped host memory, and the kernels read
-them over PCIe. Nothing is dequantised on the way, so the answer is the one the resident model
-gives; what changes is speed, because those bytes cross the bus instead of sitting on it.
+Use system RAM for part of a model when its weights do not fit in GPU memory. This requires
+enough RAM for the offloaded weights and usually makes generation slower.
+
+For a supported mixture-of-experts (MoE) model, start with `--host-moe-layers`:
 
 ```bash
-# GLM-5.3-Flash: 200 GB of weights, one 32 GB card
 surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
   --device 0 --host-moe-layers all --max-model-len 2048
 ```
 
-- `--host-moe-layers N|all` places the routed experts of that many mixture layers. This is the
-  trade worth making: the experts are almost all of a mixture layer's bytes and a token routes
-  to a handful of them, so little of what is offloaded is actually read per token. GLM's 45
-  layers leave 8.91 GiB on the card and pin 172.74 GiB.
-- `--gpu-layers N` (`-ngl N`, as llama.cpp spells it) keeps the first N layers on the card and
-  reads every later one from host memory in full — attention and norms included. Coarser, and
-  slower per token, because an offloaded dense layer crosses PCIe for every byte. GLM at
-  `--gpu-layers 1` runs on **1.54 GiB** of VRAM.
-- Both counts are whole-model, so a pipeline split does not change which weights live where.
-- The checkpoint's NextN draft head is bound too, so `--spec mtp --draft-tokens 1..5` runs on
-  one card. It drafts well (about two of every three proposals accepted) and does not pay on
-  this configuration, where a token's cost is its experts crossing PCIe and a verify of four
-  columns fetches four tokens' worth of them. Speculation is the pipeline's row, and a pipeline
-  runs no speculative round yet: `--devices A,B` with `--spec` is refused.
-- Filling the bank runs at roughly 4 GB/s: GLM's 172.74 GiB adds 43 s to the load. Pipeline
-  stages of one model in one process share the pinned bytes.
-- **Watch host memory.** The bank is pinned and cannot be swapped. Size the box for it and run
-  one such process at a time.
+`--host-moe-layers all` puts all routed expert weights in system RAM; use a number to offload
+fewer layers. With several GPUs, `--host-moe-layers auto` chooses how much to offload on each
+GPU. `--gpu-layers N` is another option: it keeps N model layers on the GPU and uses RAM for
+the rest. For MoE models, offloading just the experts usually gives a better speed tradeoff.
 
-A mixture-of-experts model whose experts do not fit on the card can go further, on the
-Flash-Next target, with a device cache and host-side compute in front of the same bank:
+Offloaded weight memory cannot be swapped out, so leave enough RAM for the operating system
+and other applications. Loading large offloaded models also takes time on every start, even
+when model preparation is cached.
+
+### Using CPU cores and an expert cache
+
+Flash-Next and GLM-5.3-Flash can cache frequently used offloaded experts on the GPU and send
+some expert computation to CPU cores. For example:
 
 ```bash
 surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
@@ -116,91 +112,98 @@ surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
   --cpu-moe-share auto
 ```
 
-- The device expert cache sizes itself: it takes what the card has left after the weights,
-  the KV floor for `--max-num-seqs` lanes and the runtime's own reservation, so 64 lanes
-  simply get a smaller pool. `--expert-slots N` still fixes it by hand.
-- The pinned host bank holds the GGUF's experts decoded to Q4G32AM (about 88 GB for
-  Flash-Next; built at load, ~70 s). The host worker pool follows the machine's load: one
-  pinned worker per physical core on an idle box, fewer and unpinned when other jobs are
-  running.
-- `--cpu-moe-share auto` measures host-memory versus PCIe rates at startup and splits routed
-  expert work accordingly. `--cpu-moe-prefill-share 0.7` suits a single user; `0` turns the
-  prefill split off.
-- `--host-expert-bank w8` restores the artifact's 8-bit bank if you would rather spend host RAM
-  than accept the 4-bit requantisation.
-- **Watch host memory.** A model in this tier pins its expert bank in RAM and can approach
-  300 GB between that and page cache. Size the box for it, and run one such process at a time.
+The expert cache sizes itself from available GPU memory. Start with the automatic settings;
+use `--expert-slots N` if you need to choose its size explicitly. Raising concurrency or
+context length leaves less memory for this cache.
 
-Across several GPUs instead, one pipeline stage per card:
+`--cpu-moe-share auto` measures the machine at startup to choose how much work to send to the
+CPU. `--cpu-moe-prefill-share` controls the CPU share during prompt processing; `0` disables
+that share.
+
+Offloaded experts use an automatically selected precision based on their source weights.
+`--host-expert-bank q4` forces four-bit storage to save system RAM, but can reduce quality when
+the source uses higher precision. `--host-expert-bank w8` uses eight-bit storage and more RAM.
+
+### Using several GPUs
+
+Use `--devices` to spread a supported model across several cards:
 
 ```bash
 surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
   --devices 0,1,2,3,4,5,6,7 \
-  --max-num-seqs 64 --max-model-len 2048 --kv-capacity auto --expert-slots 3072
+  --max-num-seqs 64 --max-model-len 2048 --kv-capacity auto
 ```
 
-Each card materialises only its own layers and holds every expert of those layers locally.
+Memory requirements depend on the model, context length, and concurrency. Add
+`--host-moe-layers auto` when the model needs additional system RAM. Supported models can
+also use MTP across multiple GPUs if their checkpoints include the required draft weights.
+See [Devices](cli.md#devices) for the supported families. DFlash currently requires one GPU.
 
 ## Several models on one GPU
 
-`--model name=path` serves an additional model beside the primary, each in its own engine
-inside one process, so requests for different models genuinely share the GPU:
+Use `--model name=path` to add a model to the same server. Clients select one by its name in
+the request's `model` field.
+
+Additional models currently require a prepared `.sinfer` cache file. To prepare one, start
+it separately first:
+
+```bash
+surogate serve Qwen/Qwen3.5-0.8B --served-model-name small
+```
+
+Note the cache path printed during preparation, then stop that server. Use that path in place
+of `/path/to/cached-small.sinfer` below. Cache files normally live in
+`~/.cache/surogate/serve`.
 
 ```bash
 surogate serve nvidia/Qwen3.6-27B-NVFP4 --served-model-name big \
-  --model small=nvidia/Qwen3.5-4B-NVFP4,max-num-seqs=16,max-model-len=8192 \
+  --model small=/path/to/cached-small.sinfer,max-num-seqs=16,max-model-len=8192 \
   --kv-capacity auto --max-model-len 8192 --max-num-seqs 16 --port 8080
 ```
 
-### The KV pool is elastic
+The first model accepts a repo id, local safetensors directory, or GGUF as usual. Additional
+models use cache paths. Check `/v1/models` for all available names.
 
-By default a model's KV pool is a **virtual span**: it is laid out at its planned size, but
-only the pages a request actually reaches hold VRAM, mapped in 2 MiB-per-plane granules as
-sequences grow and returned once they finish. A small reserve (four granules) is kept mapped
-ahead of demand so a request never waits on the driver. Throughput is the same as with a static
-pool — measured on this 27B + 4B pair, both busy at 8 + 8 users: 313 + 626 tok/s elastic
-against 318 + 635 static — and what changes is what sits idle:
+### Cache memory grows with demand
 
-| | static pool | elastic pool |
-|---|---|---|
-| free VRAM after the 27B starts | 9.75 GiB | 13.56 GiB |
-| KV held with both models busy | 6.0 GiB provisioned | 0.62 + 0.31 GiB mapped |
-| KV held by the 27B asleep | 4 GiB | 192 MiB |
+By default, each model's conversation cache uses GPU memory as requests need it, instead of
+reserving its full capacity immediately. The server can retain reusable prompts after a
+request finishes, so memory use does not necessarily drop to zero when the model is idle.
 
-`GET /kv_stats` shows the numbers per model. `--no-elastic-kv` restores the static arena, in
-which case every extra model must state its budget with `kv-tokens=N`.
+Use `/kv_stats` to inspect cache memory use. `--no-elastic-kv` reserves the full cache instead;
+with that setting, each additional model needs an explicit `kv-tokens=N` budget.
 
-### Sharing the room: `--elastic-kv-overcommit`
+### Sharing unused cache memory
 
-Elastic pools still each fit the GPU on their own: their caps are checked against free memory
-at startup and never sum past it, so one model's idle cache is not available to another's
-requests. `--elastic-kv-overcommit` makes each model's `--kv-capacity` a **guaranteed floor**
-(`auto` = one full-context request) and admits every page past it against the memory the GPU
-actually has free, shared by all models on the device:
+Add `--elastic-kv-overcommit` to let models use spare GPU memory beyond their individual cache
+budgets:
 
 ```bash
 surogate serve nvidia/Qwen3.6-27B-NVFP4 --served-model-name big \
-  --model small=nvidia/Qwen3.5-4B-NVFP4,max-num-seqs=16,max-model-len=8192 \
+  --model small=/path/to/cached-small.sinfer,max-num-seqs=16,max-model-len=8192 \
   --elastic-kv-overcommit --kv-capacity auto --max-model-len 8192 --max-num-seqs 16
 ```
 
-When the GPU runs short, a request waits in its model's queue (the ordinary
-`--pending-timeout-ms` applies) rather than failing, the models trim their reserves, give back
-their prefix caches, and resume admitting as running requests finish — measured with two
-engines pushing 4 GB of KV demand into 2.4 GB of room for two minutes: every request
-completed, none rejected, both models holding a share, and full throughput back once the
-burst ended. A headroom (`SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB`, default 1024) is never
-given to KV: CUDA graphs are captured lazily and need it. Overcommit changes when a request
-runs, never how it runs — the output is identical.
+With this option, `--kv-capacity` sets each model's guaranteed minimum. `auto` reserves enough
+for one full-context request per model; additional requests share available memory. When
+memory is tight, new requests may wait until others finish. Requests that wait too long can
+expire according to `--pending-timeout-ms`.
 
-With `--enable-sleep-mode` as well, models that do not fit together at all are swapped by the
-scheduler; see the [CLI page](cli.md#serving-several-models-from-one-process) for priorities
-and preemption.
+### Models that do not fit together
+
+Add `--enable-sleep-mode` to let the server save models in system RAM and wake them when
+requested. This also requires enough RAM for their saved state. A request for a sleeping
+model waits while the server makes room and restores it.
+
+Give frequently used models `priority=high` in their `--model` settings, or use
+`--model-priority high` for the first model. Lower-priority idle models are preferred for
+sleeping. See the [CLI reference](cli.md#serving-several-models-from-one-process) for how
+priorities affect waiting requests.
 
 ## Embedding model, CPU and GPU
 
-Embedding models take the encoder path — one forward, no KV cache, no sampler, no CUDA graphs —
-so they are served with `--embed`. The same model runs on either device.
+Start an embeddings server with `--embed`. EmbeddingGemma can run on an NVIDIA GPU or on an
+AVX-512-capable CPU.
 
 ### On GPU
 
@@ -210,27 +213,28 @@ surogate serve --embed ~/models/embeddinggemma-300M-Q8_0.gguf \
   --host 0.0.0.0 --port 8413 --device 0
 ```
 
-`--frontend` points at the model's Hugging Face snapshot, which supplies the tokenizer the GGUF
-does not carry in the form the converter wants. It is needed only for the first (converting) run.
+`--frontend` points at a Hugging Face model directory containing the tokenizer files. It is
+needed only during preparation and can be omitted once the model is cached.
 
 ### On CPU
 
-Same command, `--device cpu`, plus the OpenMP environment — those settings matter more than any
-flag:
+Use `--device cpu`. On a machine with 16 physical cores in one NUMA node, for example:
 
 ```bash
 OMP_WAIT_POLICY=ACTIVE OMP_NUM_THREADS=16 \
 numactl --cpunodebind=0 --membind=0 \
   surogate serve --embed ~/models/embeddinggemma-300M-Q8_0.gguf \
+    --frontend ~/models/embeddinggemma-300m \
     --host 0.0.0.0 --port 8413 --device cpu
 ```
 
-Size `OMP_NUM_THREADS` to the **physical cores of one NUMA node** and pin to that node. Every
-matmul ends in a barrier, so the slowest thread sets the pace: SMT siblings contend for the same
-execution ports, and a thread on the far socket waits on the interconnect. On a 2×EPYC 9124
-(32 physical cores, 2 nodes), 16 pinned threads beat 64 unpinned ones by 2.15×.
+Set `OMP_NUM_THREADS` to the physical cores of one NUMA node, without counting SMT threads as
+extra cores. Keeping CPU and memory use on the same node can improve performance. Adjust
+`16` and the node number to match your machine.
 
-Either way the request is identical:
+### Sending an embedding request
+
+The API request is the same on either device:
 
 ```bash
 curl http://127.0.0.1:8413/v1/embeddings \
@@ -238,16 +242,5 @@ curl http://127.0.0.1:8413/v1/embeddings \
   -d '{"model":"embeddinggemma-300m","input":"the capital of France"}'
 ```
 
-### Which device?
-
-Measured at 512 tokens, single stream, on this reference host (RTX 5090 / 2×EPYC 9124):
-
-| | per request | vs llama.cpp |
-|---|---|---|
-| GPU | 7.4 ms | 1.35× faster |
-| CPU (16 pinned cores) | 70.4 ms | 2.6× faster |
-
-The GPU is roughly 10× faster per request, so it wins whenever a card is free. The CPU path
-exists because embedding work often has nowhere else to go — a card busy serving an LLM, a
-CPU-only host, or a retrieval service whose throughput needs are modest. At those sizes the host
-answers in tens of milliseconds while leaving the GPU alone.
+Use a GPU when embedding speed is the priority and a card is available. CPU serving is useful
+when the GPU is busy with text generation, on CPU-only hosts, or for modest retrieval workloads.

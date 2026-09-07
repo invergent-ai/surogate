@@ -1,138 +1,123 @@
 # Inference
 
-Surogate serves models with the same CLI that trains them: `surogate serve` starts a
-standalone C++/CUDA runtime that answers OpenAI- and Anthropic-compatible HTTP requests.
+Surogate serves models with the same CLI that trains them. Start a server, then connect an
+OpenAI- or Anthropic-compatible client:
 
 ```bash
 surogate serve Qwen/Qwen3.6-27B --port 8080
 ```
 
-## What the engine does
+## Features
 
-- **CUDA-graph-captured decode** over a paged KV cache, with continuous batching across lanes.
-- **Prefix reuse** — a shared prompt prefix is prefilled once and reused (`--no-prefix-reuse` disables).
-- **Elastic KV cache** — the pool is a virtual span and only the pages in use hold VRAM, so an
-  idle model gives its cache back and several models on one GPU can share the room
-  (`--elastic-kv-overcommit`; `--no-elastic-kv` for the static arena).
-- **Streaming SSE**, tool calls, reasoning/thinking separation, request cancellation.
-- **Speculative decoding** with MTP or DFlash draft heads (`--spec`, `--draft-tokens`).
-- **Multi-GPU** as data-parallel replicas or pipeline stages (`--devices 0,1,...`). Tensor
-  parallelism is not offered: P2P is disabled on the consumer cards this engine targets.
-- **A model larger than VRAM** — weights the card has no room for live in pinned,
-  device-mapped host memory and the kernels read them over PCIe: `--host-moe-layers N|all` for
-  a mixture's routed experts, `--gpu-layers N` (`-ngl`) for whole layers. GLM-5.3-Flash, 200 GB,
-  serves on one 32 GB card. Any target inherits this; the Flash-Next target adds a device LRU
-  slot cache and CPU expert compute on top (`--expert-slots`, `--cpu-moe-share`).
-- **Vision input** (images, video) for models that carry a vision tower (`--vision`).
+- **Chat and text completion**, with streaming responses, tool calls, and separate reasoning output.
+- **Concurrent requests** — set `--max-num-seqs` to the number of requests to process at once.
+- **Prompt caching** — reuse compatible earlier prompts to reduce processing time.
+- **Speculative decoding** — speed up supported models with MTP or DFlash (`--spec`).
+- **Models larger than GPU memory** — use system RAM for part of a model, or spread supported
+  models across several GPUs.
+- **Several models on one GPU**, with optional sleep mode to free memory when a model is idle.
+- **Images and video** for supported vision models (`--vision`).
+- **Embeddings** on GPU or CPU through `surogate serve --embed`.
 
-Embedding models run it in its own process, on either GPU or CPU. See [Serving models](serving-models.md#embedding-model-cpu-and-gpu).
+See [Serving models](serving-models.md) for worked examples.
 
-## A GGUF is served where it lies
+## Loading a model
 
-Point `surogate serve` at a **Hugging Face repo id, a local safetensors directory, or a GGUF
-file**.
+The model argument can be a **Hugging Face repo id, a local safetensors directory, or a GGUF
+file**:
 
-```
-HF repo id     ─┐                    ┌─ safetensors: converted once, cached
-safetensors dir ┼─► surogate serve ──┤                                        ─► OpenAI/Anthropic
-GGUF file      ─┘                    └─ GGUF: read in place, small index beside it
+```bash
+surogate serve Qwen/Qwen3.6-27B
+surogate serve ~/models/qwen3.6-27b-hf/
+surogate serve ~/models/qwen3.6-27b-Q4_K_M.gguf
 ```
 
-For a GGUF there is no copy and no requantisation. The first start writes a small index naming
-the stretches of the file each tensor is assembled from, and the weights are read from the GGUF
-itself on every load: a 22.13 GB `Q4_K_M` file gets a **70 MB** index, built in about 18 seconds,
-and its K-quant tensors reach the GPU as the superblocks the file stores. Nothing is dequantised
-on the way in, so serving a GGUF costs exactly the accuracy the file already has.
+The first start prepares the model and saves reusable files under `~/.cache/surogate/serve`.
+Later starts skip that preparation, but still need time to load the model. Set
+`SUROGATE_SERVE_CACHE` to use a different cache directory; `--no-cache` rebuilds an entry.
 
-For a Hugging Face or safetensors source there is real work to do, and the result is cached under
-`~/.cache/surogate/serve` so later starts are a file read. That cached form is an internal,
-regenerable detail, never an interchange format. Either way the artifact carries the model's own
-tokenizer and chat template, so a serving host needs no Python and no `transformers`.
+Supported GGUF weights are read from the original file, so preparation does not require a
+second full copy of the model. Keep the GGUF files at their original paths while using the
+cache. For a split GGUF, pass the first shard; the remaining shards are found automatically.
 
-A model you trained here has no GGUF yet; `surogate quantize` produces one from a merged
-checkpoint (see the [CLI reference](../reference/cli.md)).
+The model's tokenizer and chat template are included during preparation. A base model without
+a chat template can be used through `/v1/completions`.
+
+To serve a model you trained here, merge its adapter first. You can serve the merged
+safetensors directory directly or create a GGUF with `surogate quantize`; see the
+[CLI reference](../reference/cli.md).
 
 ## Supported quantizations
 
-Weight storage is a closed registry — every tensor the engine loads is in one of these:
+Quantization is detected from the model files. There is no separate serving flag to select the
+weight format. Supported formats depend on the model family and export:
 
-GGML's own block formats are served as the file stores them, byte for byte:
-
-| Format | Weight | Block | Scales | Notes |
-|---|---|---|---|---|
-| `Q4_K` | 4-bit | 256 | two binary16 plus 6-bit sub-scales | 144 B a superblock |
-| `Q5_K` | 5-bit | 256 | same, plus a high-bit plane | 176 B |
-| `Q6_K` | 6-bit | 256 | one binary16, 8-bit sub-scales | 210 B, symmetric |
-| `Q2_K`, `Q3_K` | 2- and 3-bit | 256 | | accepted, rarely wanted |
-| `Q8_0` | 8-bit signed | 32 | one binary16 | identical to `W8G32_F16S` |
-
-The rest are the engine's own, for sources that are not GGUF:
-
-| Format | Weight | Group | Scale | Typical use |
-|---|---|---|---|---|
-| `BF16` | 16-bit float | — | — | norms, small projections, embedding tables |
-| `FP32` | 32-bit float | — | — | host-side reference objects |
-| `I32` | 32-bit int | — | — | index resources |
-| `W8G32_F16S` | 8-bit signed (−127…127) | 32 | binary16 per group | the workhorse; identical to GGUF `Q8_0` |
-| `NVFP4` | E2M1 (4-bit float) | 16 | E4M3FN per group | Blackwell FP4 tensor cores |
-| `FP8_E4M3FN_ROW_BF16S` | E4M3FN | per row | BF16 per row | FP8 checkpoints |
-| `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S` | 4-, 5-, 6-bit signed | 64 | binary16 per group | older home-grown formats, being retired |
-
-### What converts from what
-
-| Source | Handling |
+| Format | What to know |
 |---|---|
-| GGUF K-quants (`Q2_K`…`Q6_K`) | **Served natively.** The superblocks are read from the file as they are; no dequantise, no requantise, no copy. |
-| GGUF `Q8_0` | **Bit-exact rearrangement** into `W8G32_F16S` — the same numbers (int8 codes, one binary16 scale per 32), gathered into code and scale planes at load. |
-| GGUF `Q4_0`, `Q5_0`, `IQ4_NL` | Bit-exact plane repack by the same path. |
-| HF safetensors BF16 | Encoded direct, or quantized per the family recipe. |
-| NVFP4 checkpoints (vLLM / compressed-tensors) | Block scales re-encoded to the engine's swizzle; paired with a BF16 base checkpoint for the objects NVFP4 does not carry. |
-| FP8 row-scaled checkpoints | Encoded as `FP8_E4M3FN_ROW_BF16S`. |
+| GGUF K-quants (`Q2_K` through `Q6_K`) | Supported models retain the GGUF's weight quantization |
+| GGUF `Q8_0` | Eight-bit weights; preparation preserves their values |
+| Other GGUF formats | Includes `Q4_0`, `Q5_0`, `Q4_1`, `Q5_1`, and supported IQ formats; availability depends on the model |
+| BF16 safetensors | Prepared using the model family's conversion settings |
+| NVFP4 checkpoints | Four-bit floating-point weights for supported Blackwell GPUs |
+| FP8 checkpoints | Supported row- and block-scaled exports |
 
-Serving a K-quant GGUF is therefore lossless with respect to the file. Measured against
-llama.cpp on the same `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`, wikitext-2 perplexity over 145 windows
-of 2048 tokens: **6.2370 for us, 6.2311 for llama.cpp**, both ±0.040.
+### Preparing model files
+
+| Source | First-start behavior |
+|---|---|
+| Supported GGUF | Prepare cached metadata and read supported weights from the source files |
+| Hugging Face repo | Download the checkpoint, prepare it, and cache the result |
+| Local safetensors directory | Prepare and cache the model without downloading the checkpoint |
+| NVFP4 export | Detect its quantization settings; some exports also need a compatible base checkpoint for missing model files |
+
+Weight precision and prompt-cache precision are separate settings. Host offload also has its
+own precision option: forcing `--host-expert-bank q4` can reduce the precision of weights
+originally stored at more than four bits.
 
 ### KV cache precision
 
-Separate from weight storage, and set at launch: `--kv-cache-dtype auto|fp8|bf16|int8`.
-The default is **fp8 (e4m3)**, which halves the cache; `auto` means the same; `bf16` asks for a
-full-precision cache. Only full-attention layers hold a KV cache at all, so linear-attention
-(GDN) layers are never quantized. `--kv-cache-dtype-skip-layers L,...` holds named layers at
-BF16. `int8` exists for experiments and is not recommended — it costs measurable accuracy.
+The KV cache stores information from earlier tokens so the model can continue a response
+without processing the whole conversation again. Set its precision with
+`--kv-cache-dtype auto|fp8|bf16|int8`.
+
+The default, **auto**, chooses a setting for the model: BF16 for models such as Qwen3 and
+Llama, and FP8 for hybrid models such as Qwen3.5/3.6/3.8. Explicit `fp8` uses half the cache
+storage of BF16; explicit `bf16` keeps BF16 regardless of model family. Changing cache
+precision can affect output quality. `int8` is also available for comparison.
+
+DFlash requires `--kv-cache-dtype bf16`.
 
 ## Model families
 
-Recognised automatically from the checkpoint:
+The family is detected automatically. Available formats and optional features vary by model:
 
-| Family | Sizes | Notes |
-|---|---|---|
-| Qwen3 | any | dense |
-| Llama | any | dense |
-| Gemma 3 | any | dense; sliding-window attention |
-| Qwen3.5 | any | dense; NVFP4 for the 4B |
-| Qwen3.6 | 27B | dense hybrid; BF16 and NVFP4 |
-| Qwen3.6 MoE | 35B-A3B | routed experts; optional draft head |
-| Qwen3.8 | 27B | BF16 and NVFP4 |
-| Qwen3.8 Flash-Next | MoE | GGUF source; the CPU-offload tier |
-| EmbeddingGemma | 300M | encoder; GPU and CPU |
+| Family | Notes |
+|---|---|
+| Qwen3 | Dense models |
+| Qwen3 MoE | Mixture-of-experts models |
+| Llama | Includes TinyLlama |
+| Gemma 3 | Text generation |
+| LFM2 | Text generation |
+| Qwen3.5/3.6/3.8 | Includes BF16 and NVFP4 exports |
+| Qwen3.5/3.6 MoE | Includes 35B-A3B; optional speculative decoding |
+| Qwen3.8 Flash-Next | GGUF; supports CPU offload |
+| GLM-5.3-Flash | GGUF; supports CPU offload, multiple GPUs, and MTP |
+| EmbeddingGemma 300M | Embeddings on GPU or CPU |
 
-"Any" means what it says. A checkpoint states its own dimensions in the index built beside
-it, and the engine binds against those, so a family listed that way serves whatever size you
-hand it -- Qwen3-1.7B is served by the same code as Qwen3-0.6B, with nothing to register. The
-sizes named for the other families are the ones their loaders are still written around.
-
-An unrecognised model is refused at load with the reason printed, never served incorrectly.
+Model size is detected from the checkpoint. Its format and features must still be supported;
+unsupported checkpoints are refused with an error message.
 
 ## Hardware
 
-The engine targets **sm_89 and sm_120** — RTX 4070 and 4090, RTX 5070/5080/5090, and
-RTX Pro 6000 Blackwell. Multi-GPU is available through data-parallel replicas or pipeline stages. Tensor parallelism is not offered on any of them because P2P/NVLink is not enabled on consumer cardds. 
+Supported GPU builds target NVIDIA Ada and Blackwell cards, including RTX 4070/4090,
+RTX 5070/5080/5090, and RTX Pro 6000 Blackwell. The accelerated NVFP4 path requires Blackwell.
+See the [CLI reference](cli.md#devices) for models that can use several GPUs.
 
-The CPU path covers the **encoder (embedding) models only** and needs AVX-512 support in the CPU.
+CPU-only serving supports **embedding models** and requires AVX-512. Generative models need
+an NVIDIA GPU even when some work is offloaded to the CPU.
 
 ## Next
 
-- [OpenAI-compatible API](api.md) — endpoints, supported request fields, and what is refused.
-- [CLI and parameters](cli.md) — every flag on the three serving binaries.
-- [Serving models](serving-models.md) — worked NVFP4, GGUF, and embedding examples.
+- [OpenAI-compatible API](api.md) — endpoints, request fields, and supported client features.
+- [CLI and parameters](cli.md) — options and defaults.
+- [Serving models](serving-models.md) — NVFP4, GGUF, offload, and embedding examples.
