@@ -31,6 +31,17 @@ bool w4fp4_cutlass_gemm_store(const std::uint8_t* act_codes, const std::uint8_t*
                               const float* alpha_one, void* out_bf16, std::int32_t tokens,
                               std::int32_t n, std::int32_t k, cudaStream_t stream);
 
+// The same GEMM for the engine's native NVFP4 route: alpha by value (the product of the
+// per-tensor divisors, so nothing is folded), both operands already in the atom layout, and
+// a tile choice -- 0 = 128x128x128, 1 = 256x128x128 (two consumer warpgroups over the
+// tokens, the shape vLLM's CUTLASS kernel runs on this card). `residual_bf16` null stores,
+// otherwise D = acc + residual in place. Returns false when the launch could not be
+// configured (caller falls back).
+bool nvfp4_cutlass_gemm(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
+                        const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom, float alpha,
+                        void* residual_bf16, void* out_bf16, std::int32_t tokens, std::int32_t n,
+                        std::int32_t k, int tile, cudaStream_t stream);
+
 bool w4fp4_cutlass_gemm_residual(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
                                  const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom,
                                  const float* alpha_one, void* residual_bf16, std::int32_t tokens,

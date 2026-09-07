@@ -27,6 +27,12 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream);
 
+/// Whether `tokens` takes the wide (cuBLASLt / CUTLASS) GEMM, whose operand is the tiled-scale
+/// layout, and that GEMM over an operand a caller quantised itself.
+[[nodiscard]] bool nvfp4_linear_add_w4a4_wide(const Weight& weight, std::int32_t tokens);
+void nvfp4_linear_add_w4a4_wide_gemm(const Weight& weight, Nvfp4W4a4Workspace workspace,
+                                     Tensor& residual, std::int32_t tokens, cudaStream_t stream);
+
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 

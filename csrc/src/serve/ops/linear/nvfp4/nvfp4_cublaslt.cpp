@@ -178,6 +178,14 @@ bool nvfp4_cublaslt_route(std::int32_t tokens) {
     return enabled && tokens >= min_tokens;
 }
 
+int nvfp4_cutlass_tile() {
+    static const int tile = [] {
+        const int requested = env_int("SUROGATE_SERVE_NVFP4_CUTLASS", 0);
+        return requested == 128 ? 0 : requested == 256 ? 1 : -1;
+    }();
+    return tile;
+}
+
 void nvfp4_cublaslt_gemm(const Weight& weight, std::int32_t row_begin, std::int32_t rows,
                          const std::uint8_t* activation_codes,
                          const std::uint8_t* activation_tiled_scales, __nv_bfloat16* out,

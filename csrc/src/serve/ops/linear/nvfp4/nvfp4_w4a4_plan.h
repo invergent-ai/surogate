@@ -62,6 +62,14 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
                                 cudaStream_t stream,
                                 Nvfp4ScaleLayout layout = Nvfp4ScaleLayout::TokenMajor);
 
+/// The SwiGLU of a gate/up GEMM's token-major [2 * K, T] BF16 plane (gate rows first), quantised
+/// straight into `weight`'s (the down projection's, K = `weight.k`) W4A4 operand: what
+/// `silu_mul` followed by `launch_nvfp4_w4a4_quantize` would write, without the activation.
+void launch_nvfp4_w4a4_swiglu_quantize(const Tensor& projected, const Weight& weight,
+                                       Nvfp4W4a4Workspace workspace, float limit,
+                                       cudaStream_t stream,
+                                       Nvfp4ScaleLayout layout = Nvfp4ScaleLayout::TokenMajor);
+
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream);
 

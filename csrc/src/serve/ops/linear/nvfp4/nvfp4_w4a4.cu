@@ -2,7 +2,9 @@
 
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_swiglu_quantize.cuh"
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
+#include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_split.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
@@ -49,6 +51,27 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Works
     } else {
         nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, false><<<grid, kThreads, 0, stream>>>(
             input, workspace.codes, workspace.scales, tokens, weight.input_scale_divisor);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class ActivationGeometry>
+void launch_swiglu_quantize_exact(const Tensor& projected, const Weight& weight,
+                                  Nvfp4W4a4Workspace workspace, float limit, cudaStream_t stream,
+                                  Nvfp4ScaleLayout layout) {
+    const std::int32_t tokens = projected.ne[1];
+    constexpr int kThreads    = 256;
+    const std::int32_t tasks  = tokens * ActivationGeometry::kGroupsPerRow;
+    const dim3 grid((tasks + kThreads - 1) / kThreads);
+    const auto* input = static_cast<const __nv_bfloat16*>(projected.data);
+    if (layout == Nvfp4ScaleLayout::Tiled) {
+        nvfp4_w4a4_swiglu_quantize_kernel<ActivationGeometry, kThreads, true>
+            <<<grid, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
+                                            weight.input_scale_divisor, limit);
+    } else {
+        nvfp4_w4a4_swiglu_quantize_kernel<ActivationGeometry, kThreads, false>
+            <<<grid, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
+                                            weight.input_scale_divisor, limit);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -110,6 +133,28 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
 
 } // namespace
 
+void launch_nvfp4_w4a4_swiglu_quantize(const Tensor& projected, const Weight& weight,
+                                       Nvfp4W4a4Workspace workspace, float limit,
+                                       cudaStream_t stream, Nvfp4ScaleLayout layout) {
+    if (workspace.codes == nullptr || workspace.scales == nullptr) {
+        throw std::invalid_argument("nvfp4 W4A4 requires caller workspace");
+    }
+    if (projected.dtype != DType::BF16 || projected.ne[0] != 2 * weight.k) {
+        throw std::invalid_argument("nvfp4 W4A4 swiglu quantize: projected plane must be BF16 [2K, T]");
+    }
+    switch (weight.k) {
+#define SINFER_NVFP4_K_CASE(K)                                                                    \
+    case K:                                                                                       \
+        launch_swiglu_quantize_exact<Nvfp4ActivationGeometry<K>>(projected, weight, workspace,    \
+                                                                 limit, stream, layout);          \
+        return;
+        SINFER_NVFP4_FOR_EACH_ACTIVATION_K(SINFER_NVFP4_K_CASE)
+#undef SINFER_NVFP4_K_CASE
+    default:
+        throw std::invalid_argument("nvfp4 W4A4 swiglu quantize: unsupported K");
+    }
+}
+
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
                                 cudaStream_t stream, Nvfp4ScaleLayout layout) {
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
@@ -140,6 +185,14 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     }
     if (nvfp4_cublaslt_route(tokens) || is_nvfp4_generic_problem(weight.n, weight.k)) {
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
+        if (const int tile = nvfp4_cutlass_tile(); tile >= 0 &&
+            nvfp4_cutlass_gemm(workspace.codes, workspace.scales,
+                               static_cast<const std::uint8_t*>(weight.qdata),
+                               static_cast<const std::uint8_t*>(weight.scales),
+                               1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor),
+                               nullptr, out.data, tokens, weight.n, weight.k, tile, stream)) {
+            return;
+        }
         nvfp4_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.scales,
                             static_cast<__nv_bfloat16*>(out.data), weight.n, tokens, 0.0F, stream);
         return;

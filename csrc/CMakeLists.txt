@@ -1220,6 +1220,7 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/wrapper/lora_store.cpp
     ${SERVE_ROOT}/ops/wrapper/linear_pair.cpp
   ${SERVE_ROOT}/ops/wrapper/linear_swiglu.cpp
+  ${SERVE_ROOT}/ops/wrapper/linear_swiglu_down_add.cpp
   ${SERVE_ROOT}/ops/wrapper/mtp_pack.cpp
   ${SERVE_ROOT}/ops/wrapper/mtp_round.cpp
   ${SERVE_ROOT}/ops/wrapper/speculative_round.cpp

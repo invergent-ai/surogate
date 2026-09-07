@@ -160,16 +160,16 @@ gap because llama.cpp's server does not batch these as well as its kernels run.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 100 | **5,474** | **1,227** | **6,701** | **1.91 s** | `qwen3_8_27b_nvfp4_all.sinfer` (the `nvfp4-all` profile of vLLM's own checkpoint, 17.4 GB), 128 lanes, chunk 4,096, `--max-model-len 2304 --kv-capacity auto` (55k KV tokens: see the comment on the prefill-heavy row) `--max-pending-requests 512`; 2026-09-07 15:59, GPU 4. Replaces the 2026-08-30 pass (5,815 / 1,302 / 170 ms, 104k KV tokens). **+11 % decode at 0.24× the TTFT** |
+| **surogate** | 1 | 100 | **5,896** | **1,321** | **7,217** | **0.17 s** | `qwen3_8_27b_nvfp4_all.sinfer` (the `nvfp4-all` profile of vLLM's own checkpoint, 17.4 GB), 128 lanes, chunk 4,096, `--max-model-len 2304 --kv-capacity auto` (104,384 KV tokens) `--max-pending-requests 512`; 2026-09-07 16:09, GPU 7, three cells on the host. Replaces the 2026-08-30 pass (5,815 / 1,302 / 170 ms) and a 15:59 pass with 55k KV tokens (5,474 / 1,227 / 1.91 s -- the graph allowance had eaten the KV; fixed in 611a2f16). **+19 % decode at 0.02× the TTFT** |
 | vLLM | 1 | 100 | 4,950 | 1,109 | 6,059 | 8.09 s | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`, `--max-num-seqs 128 --max-model-len 4096`; 2026-09-07 15:28, GPU 3, one other engine loading on the host. Replaces the 2026-08-30 pass (5,003 / 1,120 / 8.06 s): unchanged |
 | surogate | 1 | 100 | 4,006 | 898 | 4,904 | 6.02 s | mixed 512/128 on the `nvfp4-mlp-only` artifact at 64 lanes (as below); 2026-09-07 15:53, GPU 4. 81 % of vLLM's decode at 0.74× its TTFT: 64 lanes against its 128, and FP8 attention bytes against its NVFP4 |
 | surogate | 8 | 100 | 4,403 | 986 | 5,389 | 1.33 s | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:18, uncapped. **Below the one card above** — the pipeline buys capacity, not throughput per card |
 | **surogate** | 8 | 1 | **168.5** | **40.7** | **209.2** | **0.57 s** | `--kv-capacity 704`, everything resident, the latent attention served absorbed (one 512-wide key/value head per token). Ahead of llama.cpp on all three columns; 119.6 / 28.9 / 0.66 on the first pass, 164.4 / 39.7 / 0.65 with the expanded attention |
-| **surogate** | 1 | 100 | 816 | **2,236** | **3,052** | **1.12 s** | decode-heavy 128/512 on the all-NVFP4 artifact, 128 lanes, `--max-model-len 2304 --max-pending-requests 512`; 2026-09-07 15:57, GPU 7. Replaces the 2026-08-30 pass (2,097 / 13.7 s at 64 lanes). **+32 % decode at 0.05× the TTFT** |
+| **surogate** | 1 | 100 | 856 | **2,345** | **3,201** | **0.11 s** | decode-heavy 128/512 on the all-NVFP4 artifact, 128 lanes, `--max-model-len 2304 --max-pending-requests 512` (104k KV tokens); 2026-09-07 16:09, GPU 2. Replaces the 2026-08-30 pass (2,097 / 13.7 s at 64 lanes) and the 15:57 pass with 55k KV tokens (2,236 / 1.12 s). **+39 % decode at 0.005× the TTFT** |
 | vLLM | 1 | 100 | 616 | 1,688 | 2,304 | 21.5 s | decode-heavy 128/512, `--max-num-seqs 128 --max-model-len 1024`; 2026-09-07 15:20, GPU 3. Replaces the 2026-08-30 pass (608 / 1,662 / 21.8 s): unchanged |
 | **surogate** | 1 | 100 | 691 | **1,892** | **2,583** | **3.24 s** | decode-heavy 128/512 on `qwen3_8_27b_nvfp4.sinfer` (`nvfp4-mlp-only`: FP8 attention/GDN/vocabulary + NVFP4 MLPs, 21.5 GB) at **64 lanes** -- 128 want 14.2 GB of runtime on this artifact (the GDN state per lane, not the chunk) and the card has 10.8 GiB left; `--max-model-len 2304 --kv-capacity auto --max-pending-requests 512`; 2026-09-07 15:51, GPU 7, same session as the vLLM row above. **+12 % decode at 0.15× the TTFT** |
-| surogate | 1 | 100 | 11,196 | 85.0 | 11,281 | 15.89 s | prefill-heavy 2048/16 on the all-NVFP4 artifact, chunk 4,096, 128 lanes, `SUROGATE_SERVE_ROUND_TIMING=1`; 2026-09-07 15:57, GPU 6 (the sibling cell without the timers on GPU 4 read 10,777 / 16.49 s, 4 % under, its shape run second). Replaces the 2026-08-30 pass (11,557 / 15.38 s). **90 % of vLLM.** Under nsys the GPU is busy 89 % of the wall and the block-scaled NVFP4 GEMM is 67 % of its time: cuBLASLt's first heuristic, 0.91 PFLOP/s on gate/up (34,816 × 2,304 × 5,120) and 1.21 on down -- 54 % and 72 % of the card's dense FP4 peak; the GDN chunked kernels 13 %, attention 5 %, the unfused SwiGLU 5 %. This pass ran with 55k KV tokens against 08-30's 104k because the per-lane graph allowance was raised to 24 MiB for the GGUF route that morning (fixed the same evening: the allowance follows the weights profile) |
-| **vLLM** | 1 | 100 | **12,451** | 94.5 | **12,545** | **14.43 s** | prefill-heavy 2048/16, `--max-num-seqs 128 --max-model-len 4096`; 2026-09-07 15:26, GPU 3. Replaces the 2026-08-30 pass (12,942 / 13.81 s), which was 4 % higher on an idle host; a 14:39 pass on GPU 4 beside three other jobs read 11,904 |
+| surogate | 1 | 100 | 11,278 | 85.6 | 11,364 | 15.77 s | prefill-heavy 2048/16 on the all-NVFP4 artifact, chunk 4,096, 128 lanes, 104k KV tokens; 2026-09-07 16:12, GPU 6, **simultaneous with the vLLM row below** (both cards at 400 W and a median 1,860 MHz through the pass). Replaces the 2026-08-30 pass (11,557 / 15.38 s) and four passes today between 10,777 and 11,920 whose spread was the cards and the host, not the engine (the same engine alone on GPU 5 reads 11,920 at 2.10 GHz; on GPU 4 beside four cells 10,777 at 1.75 GHz; under one identical GEMM at the cap GPUs 2/4/5/7 clock 2.13/2.13/2.36/2.22 GHz). **90 % of vLLM.** Under nsys the GPU is 97 % busy inside a wave and the prompt rounds are graphed (inter-kernel gaps 1.7 us); per prompt token we spend 80 us of GPU time to vLLM's 76: the cuBLASLt block-scaled NVFP4 GEMM (67 % of our time, 128x128x256 tiles, the first heuristic) costs 54 us to its CUTLASS 256x128x128 cooperative kernel's 50; GDN 12.0 vs 10.8; attention 5.3 vs 5.6; our unfused SwiGLU plus three quantisers 6.0 vs its fused `silu_mul_cvt` 3.7. Not the lever: KV room (55k reads the same), the prompt chunk (rounds hold one 2,048 prompt plus decode columns), the in-house TMA route (10,860 on the same card) |
+| **vLLM** | 1 | 100 | **12,507** | 95.0 | **12,602** | **14.29 s** | prefill-heavy 2048/16, `--max-num-seqs 128 --max-model-len 4096`; 2026-09-07 16:12, GPU 3, simultaneous with the row above. Replaces the 2026-08-30 pass (12,942 / 13.81 s) and a 15:26 pass alone on GPU 3 (12,451 / 14.43 s) |
 | surogate | 1 | 100 | 8,369 | 63.6 | 8,432 | 21.25 s | prefill-heavy 2048/16 on the `nvfp4-mlp-only` artifact at 64 lanes (as above), `SUROGATE_SERVE_ROUND_TIMING=1` (cheap segment timers); 2026-09-07 15:51, GPU 6. **67 % of vLLM.** The executor is 99 % busy in prompt rounds and a 4,096-token round reads 262 ms (15.6k tok/s inside the rounds), so it is the rounds, not the scheduling: the FP8 attention/GDN projections on the row-scaled FP8 route, and the NVFP4 MLPs |
 | **surogate** | 1 | 1 | — | **107.3** | — | **0.16 s** | `qwen3_8_27b_nvfp4_all.sinfer` (the `nvfp4-all` profile of vLLM's own checkpoint, `sakamakismile/Qwen3.8-27B-MTP-NVFP4`, 17.4 GB) **with MTP** (`--spec mtp --draft-tokens 1`, `--max-num-seqs 1`); 2026-09-07 15:56, GPU 5, same session as the vLLM row below. **+50 % decode at the same TTFT** (10 ms behind) |
 | surogate | 1 | 1 | — | 70.1 | — | 0.18 s | the same all-NVFP4 artifact without the head, `--max-num-seqs 1`; 2026-09-07 15:56, GPU 2 (69.0 / 0.18 s on the 128-lane configuration, GPU 4). Replaces the 2026-08-30 pass (70.8 / 170 ms): decode within 2 % of vLLM, TTFT 30 ms behind |
@@ -579,15 +579,27 @@ old types only, and the same IQ4_XS codec matches on the 0.8B (TODOv2 item 5).
 - **Lanes are 128** where the model fits them; with 100 users and 64 lanes a
   third of the load queued for a lane and that queue was the TTFT.
 - **The 27B's prompt processing is the one place a competitor is ahead, and it is
-  not the kernels.** vLLM serves 12,942 prompt tok/s on the prefill-heavy shape
-  against our 11,557 — 89 %, measured in one session on one card. Our kernels do
-  **12,707** at pp2048 in `sinfer_bench` with no server at all, which is vLLM's
-  served number to within 2 %, so the loss sits between our kernels and our
-  serving. Neither obvious knob touches it: admission is worth 1.5 % and the prompt
-  chunk nothing across 2,048-16,384, and vLLM wins while running *less* KV than we
-  do. The one-user 27B row is the same finding seen from the other end — a †
-  prefill figure is TTFT restated, so 11,200 † against 13,600 † and 170 ms against
-  140 ms are one fact, not two.
+  energy, not scheduling.** Measured as a pair -- both engines at once, one card each,
+  both cards at 400 W and a median 1,860 MHz through the pass -- vLLM serves 12,507
+  prompt tok/s on the prefill-heavy shape against our 11,278: 90 %, the same 89 % as
+  08-30. Every other 27B shape is ours on vLLM's own weights (mixed +19 % decode at
+  0.02× the TTFT, decode-heavy +39 %, one user +50 % with the head at the same TTFT).
+  Where the 10 % is: inside a wave the GPU is 97 % busy and the prompt rounds are
+  graphed, so it is GPU time per prompt token, 80 us against 76 -- the cuBLASLt
+  block-scaled GEMM (two thirds of our time; the same kernel does 552 us standalone
+  in 13 ms bursts, 650 sustained at the cap, 905 inside the engine, because the round
+  burns more per clock than the GEMM alone and the card settles at 1.75-1.86 GHz),
+  the unfused SwiGLU and its three quantisers (6.0 us against vLLM's fused 3.7), GDN
+  (12.0 against 10.8). Not the lever: KV room (55k and 104k tokens read the same),
+  the prompt chunk (rounds hold one 2,048 prompt plus decode columns), cuBLASLt's other
+  heuristics (within 2 %; the down projection's split-K +5 % is under 1 % overall),
+  the in-house TMA route (-9 %) or a CUTLASS 128x128x128 instantiation of vLLM's kernel
+  class (-2 %). The earlier reading of this row -- "our kernels do 12,707 at pp2048 in
+  `sinfer_bench`, so the loss sits between the kernels and the serving" -- was the
+  clock: a bench in bursts boosts to 2.6+ GHz, and the same engine reads 10,777 to
+  11,920 across cards and host loads, which is why only a simultaneous pair counts.
+  The one-user row is no longer that finding from the other end: 0.16-0.18 s against
+  0.15 s.
 - **Flash-Next: the CPU belongs in decode, not in prefill.** The decode split (70 %
   of misses on the host, measured shares) carries the one-user rows; the *prefill*
   split was a pure loss at every chunk width — the host GEMM runs at 16 % of VNNI
@@ -650,6 +662,22 @@ old types only, and the same IQ4_XS codec matches on the 0.8B (TODOv2 item 5).
   `nvfp4-pack-quantized` (a ModelOpt export inverts the global-scale convention).
 
 ## Open items
+
+- **The 27B's prompt round, 10 % behind vLLM at equal clocks (2026-09-07).** Energy per
+  prompt token at the 400 W cap: the cuBLASLt block-scaled GEMM, the unfused SwiGLU and
+  its quantisers, the GDN chunked kernels. Landed: the SwiGLU fused with the down
+  projection's FP4 quantiser (`ops::linear_swiglu_down_add`, bit-identical to the pair);
+  measured on a quiet host below. Not it: KV room, prompt chunk, cuBLASLt's other
+  heuristics, the in-house TMA route, a CUTLASS 128x128x128 instantiation of vLLM's
+  kernel class. Left: the GEMM's operand traffic at the cap (vLLM's 256x128x128
+  cooperative tile; our CUTLASS 256 instantiation ran at a third of the speed and was
+  not investigated), the GDN kernels' 1.2 us/token, and the FP8 route's registered
+  table (27B-only, like the NVFP4 one was) which refuses the adapter split's half
+  geometry (17,408 x 5,120) where it runs.
+- **Measuring at the cap.** Cards differ by +/-8 % in sustained clock at 400 W (GPUs
+  2/4/5/7: 2.13/2.13/2.36/2.22 GHz under one identical GEMM) and a prompt round sits
+  lower than a lone GEMM; a bench in bursts boosts to 2.6+ GHz. Pairs are two engines
+  at once, one card each, with the clock sampled through the pass.
 
 - **Hardware: four PCIe links train at x8.** GPUs 2, 3, 5 and 7, although both
   the card and its root port advertise x16 — so a physical path issue (MCIO

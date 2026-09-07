@@ -132,7 +132,14 @@ std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType gate
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
             down_qtype, g.hidden, g.intermediate, policy, first, last));
     }
-    return layout.peak_bytes(1);
+    std::size_t peak = layout.peak_bytes(1);
+    if (gate_up_qtype == QType::NVFP4 && down_qtype == QType::NVFP4 &&
+        policy == ops::LinearPolicy::AllowA4) {
+        WorkspaceLayoutBuilder fused;
+        family::swiglu_mlp_down_add_layout(fused, g.intermediate, g.hidden, policy, first, last);
+        peak = std::max(peak, fused.peak_bytes(1));
+    }
+    return peak;
 }
 
 } // namespace
@@ -385,7 +392,12 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope        = workspace.scope();
+    auto scope = workspace.scope();
+    if (family::swiglu_mlp_down_add(hidden, weights.gate_up, weights.down, residual,
+                                    text_policy(weights.gate_up), /*limit=*/0.0F, workspace,
+                                    stream)) {
+        return;
+    }
     Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
     family::swiglu_mlp(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
                        stream);

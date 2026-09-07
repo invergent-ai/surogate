@@ -20,6 +20,8 @@
 
 #include "api/ops/linear.h"
 #include "api/ops/linear_swiglu.h"
+#include "api/ops/linear_swiglu_down_add.h"
+#include "api/ops/linear_add.h"
 #include "api/ops/silu_mul.h"
 #include "core/layout.h"
 #include "core/tensor.h"
@@ -31,6 +33,33 @@
 #include <cuda_runtime.h>
 
 namespace sinfer::family {
+
+/// The whole MLP, residual += down(silu(gate) * up), on the route that never materialises
+/// the activation. Only where nothing needs it: no adapter on gate, up or down (adapters
+/// read and write the BF16 activation), and both projections on the wide NVFP4 route.
+/// Returns false without touching anything when the route does not serve the call, and
+/// the caller runs `swiglu_mlp` and `linear_add` as before.
+inline bool swiglu_mlp_down_add(const Tensor& hidden, const Weight& gate_up, const Weight& down,
+                                Tensor& residual, ops::LinearPolicy policy, float limit,
+                                WorkspaceArena& workspace, cudaStream_t stream) {
+    if (lora_bound(gate_up, kGatePort) || lora_bound(gate_up, kUpPort) ||
+        lora_bound(down, kDownPort)) {
+        return false;
+    }
+    if (!ops::linear_swiglu_down_add_admits(gate_up, down, policy, hidden.ne[1])) { return false; }
+    ops::linear_swiglu_down_add(hidden, gate_up, down, residual, policy, limit, workspace, stream);
+    return true;
+}
+
+/// The fused route's transient capacity, for a plan that must hold it beside the unfused
+/// pair's (`swiglu_mlp_layout` plus the down projection's `linear_add` capacity).
+inline void swiglu_mlp_down_add_layout(WorkspaceLayoutBuilder& layout, std::int32_t intermediate,
+                                       std::int32_t hidden, ops::LinearPolicy policy,
+                                       std::int32_t first, std::int32_t last) {
+    auto scope = layout.scope();
+    (void)layout.alloc_bytes(ops::linear_swiglu_down_add_workspace_capacity_bytes(
+        intermediate, hidden, policy, first, last));
+}
 
 /// Whether this fused parent's two halves can be projected on their own.
 ///

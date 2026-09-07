@@ -107,21 +107,14 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
 }
 #endif  // __CUDA_ARCH__ < 1200
 
-__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
-                                                                float input_scale_divisor) {
-    const uint4 packed0                = load_vec<uint4>(source);
-    const uint4 packed1                = load_vec<uint4>(source + 8);
-    const std::uint32_t represented[8] = {
-        packed0.x, packed0.y, packed0.z, packed0.w, packed1.x, packed1.y, packed1.z, packed1.w,
-    };
-
-    float2 values[8];
+/// Sixteen values already in registers (BF16-exact, as the pointer form loads them).
+__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16_values(float2 (&values)[8],
+                                                                       float input_scale_divisor) {
     float max_abs = 0.0F;
 #pragma unroll
     for (int pair = 0; pair < 8; ++pair) {
-        values[pair] = bf16x2_bits_to_float2(represented[pair]);
-        max_abs      = fmaxf(max_abs, fabsf(values[pair].x));
-        max_abs      = fmaxf(max_abs, fabsf(values[pair].y));
+        max_abs = fmaxf(max_abs, fabsf(values[pair].x));
+        max_abs = fmaxf(max_abs, fabsf(values[pair].y));
     }
 
     Nvfp4QuantizedK16 result{};
@@ -137,6 +130,19 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     }
     pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
     return result;
+}
+
+__device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
+                                                                float input_scale_divisor) {
+    const uint4 packed0                = load_vec<uint4>(source);
+    const uint4 packed1                = load_vec<uint4>(source + 8);
+    const std::uint32_t represented[8] = {
+        packed0.x, packed0.y, packed0.z, packed0.w, packed1.x, packed1.y, packed1.z, packed1.w,
+    };
+    float2 values[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) { values[pair] = bf16x2_bits_to_float2(represented[pair]); }
+    return quantize_nvfp4_k16_values(values, input_scale_divisor);
 }
 
 } // namespace sinfer::ops::detail

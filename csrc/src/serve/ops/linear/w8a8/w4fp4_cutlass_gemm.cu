@@ -23,11 +23,13 @@ namespace {
 
 using namespace cute;
 
-// CTA 128x128x128 measured best at every engine shape (679-813 TF/s).
-template <bool WithResidual>
+// CTA 128x128x128 measured best at the 4B shapes (679-813 TF/s); the 27B's prompt rounds are
+// measured on both this and 256x128x128 (the cooperative schedule's two consumer warpgroups
+// each take 128 tokens), which is the tile vLLM's kernel runs.
+template <bool WithResidual, class Tile = Shape<_128, _128, _128>>
 struct GemmDef {
     using OutElementType = cutlass::bfloat16_t;
-    using CTAShape       = Shape<_128, _128, _128>;
+    using CTAShape       = Tile;
     using Arch           = cutlass::arch::Sm120;
     using ClusterShape   = Shape<_1, _1, _1>;
     using ElementA       = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
@@ -71,12 +73,12 @@ int device_sm_count() {
     return count;
 }
 
-template <bool WithResidual>
+template <bool WithResidual, class Tile = Shape<_128, _128, _128>>
 bool launch(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
             const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom, const float* alpha_one,
             void* c_bf16, void* d_bf16, std::int32_t tokens, std::int32_t n, std::int32_t k,
-            cudaStream_t stream) {
-    using Def  = GemmDef<WithResidual>;
+            cudaStream_t stream, float alpha = 1.0f) {
+    using Def  = GemmDef<WithResidual, Tile>;
     using Gemm = typename Def::Gemm;
     using Cfg  = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
@@ -95,6 +97,9 @@ bool launch(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
         args.epilogue.ptr_C = nullptr;
     }
     args.epilogue.ptr_D            = static_cast<cutlass::bfloat16_t*>(d_bf16);
+    // A device pointer when the caller has one (the folded plane's constant one); otherwise the
+    // value itself, which a graph capture can carry.
+    args.epilogue.thread.alpha     = alpha;
     args.epilogue.thread.alpha_ptr = alpha_one;
     args.mainloop.dA =
         cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, {tokens, k, 1});
@@ -135,6 +140,23 @@ bool w4fp4_cutlass_gemm_residual(const std::uint8_t* act_codes, const std::uint8
                                  std::int32_t n, std::int32_t k, cudaStream_t stream) {
     return launch<true>(act_codes, act_sf_atom, w_codes, w_sf_atom, alpha_one, residual_bf16,
                         residual_bf16, tokens, n, k, stream);
+}
+
+bool nvfp4_cutlass_gemm(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
+                        const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom, float alpha,
+                        void* residual_bf16, void* out_bf16, std::int32_t tokens, std::int32_t n,
+                        std::int32_t k, int tile, cudaStream_t stream) {
+    using Wide = Shape<_256, _128, _128>;
+    if (residual_bf16 != nullptr) {
+        return tile == 1 ? launch<true, Wide>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr,
+                                              residual_bf16, residual_bf16, tokens, n, k, stream, alpha)
+                         : launch<true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr,
+                                        residual_bf16, residual_bf16, tokens, n, k, stream, alpha);
+    }
+    return tile == 1 ? launch<false, Wide>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr,
+                                           nullptr, out_bf16, tokens, n, k, stream, alpha)
+                     : launch<false>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr,
+                                     out_bf16, tokens, n, k, stream, alpha);
 }
 
 } // namespace sinfer::ops::detail

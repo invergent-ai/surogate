@@ -19,6 +19,10 @@ constexpr std::int32_t kNvfp4CublasLtDefaultMinTokens = 64;
 
 bool nvfp4_cublaslt_route(std::int32_t tokens);
 
+/// SUROGATE_SERVE_NVFP4_CUTLASS=128|256: the wide W4A4 GEMMs go to the CUTLASS SM120
+/// block-scaled kernel at that tile instead of cuBLASLt (-1 when unset: cuBLASLt).
+int nvfp4_cutlass_tile();
+
 // Create this device's handle and workspace now. The state is otherwise built on first use,
 // and a first use inside a CUDA graph capture cannot cudaMalloc: capture fails with
 // cudaErrorStreamCaptureUnsupported instead of the route quietly initialising (#85).
