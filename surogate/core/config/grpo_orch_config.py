@@ -80,6 +80,38 @@ class TeacherModelConfig:
 
 
 @dataclass
+class GRPOReplayConfig:
+    """Frozen replay samples appended to every on-policy optimizer update."""
+
+    path: str | None = None
+    sha256: str | None = None
+    samples_per_step: int | None = None
+    seed: int = 0
+
+    def __init__(self, cfg: DictDefault):
+        self.path = cfg.get("path", self.path)
+        self.sha256 = cfg.get("sha256", self.sha256)
+        self.samples_per_step = cfg.get("samples_per_step", self.samples_per_step)
+        self.seed = cfg.get("seed", self.seed)
+        if not isinstance(self.path, str) or not self.path.strip():
+            raise ValueError("replay.path must be a non-empty file path")
+        if (
+            not isinstance(self.sha256, str)
+            or len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+        ):
+            raise ValueError("replay.sha256 must be a lowercase SHA-256 digest")
+        if self.samples_per_step is not None and (
+            isinstance(self.samples_per_step, bool)
+            or not isinstance(self.samples_per_step, int)
+            or self.samples_per_step <= 0
+        ):
+            raise ValueError("replay.samples_per_step must be a positive integer")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise ValueError("replay.seed must be an integer")
+
+
+@dataclass
 class GRPOTemperatureSchedulerConfig:
     """
     Configures temperature scheduling over training steps. Use this OR sampling.temperature, not both.
@@ -364,11 +396,53 @@ class GRPOBufferConfig:
     easy_fraction: float | None = 0.0
     hard_fraction: float | None = 0.0
     online_difficulty_filtering: bool | None = False
+    # Variance-aware group filtering (2026-08-16): exclude ZERO-VARIANCE
+    # groups' rollouts from batches (their group-centered advantage is 0
+    # for every member) and move the task to a cooldown pool recycled at
+    # recycle_flat_fraction. Subsumes online_difficulty_filtering (which
+    # keys on mean 0.0/1.0 and misses the dominant all-0.5 flat class,
+    # ~20% of groups measured on the planfix run).
+    flat_group_filtering: bool | None = False
+    recycle_flat_fraction: float | None = 0.15
+    # Near-flat trigger: groups whose reward spread (max-min) is <= this are
+    # filtered like exact-flat ones. 0.15 catches the measured 61-63/64
+    # identical-0.5 terminal carpets (one 0.4 outlier -> spread 0.1) while
+    # leaving any group containing a single win (spread >= 0.5) untouched.
+    flat_group_epsilon: float | None = 0.15
     normal_pool_min_examples: int | None = 0
     recycle_easy_fraction: float | None = 0.0
     recycle_hard_fraction: float | None = 0.0
     hash_keys: list[str] | None = field(default_factory=lambda: ["info", "prompt"])
     sample_without_replacement: bool = False
+    # Frontier-biased sampling. The frontier signal is the group's reward
+    # DISPERSION, not its mean (2026-08-22, measured): GRPO normalizes
+    # advantages by the group std, so a group's training value IS its std.
+    # A mean-band rule mis-fires badly on partial-credit carpets — a FACET
+    # group of 61x0.5 + 2x0.0 has mean 0.48 (dead centre of a 0.2-0.7 band,
+    # so it would be BOOSTED) while carrying almost no gradient (std 0.088
+    # vs 0.39 for a genuine 12-win hard-task group).
+    # Tasks with NO history keep weight 1.0 (explore fresh tasks uniformly).
+    # None = off (uniform within-env draw, the pre-2026-08-21 behavior).
+    midband_sampling_boost: float | None = None
+    gradient_std_high: float | None = 0.15   # >= this -> boost (real dispersion)
+    gradient_std_low: float | None = 0.12    # <  this -> demote (carpet; measured carpets sit at 0.088)
+    # vtc rescue (2026-08-22, MEASURED): chunked GRPO reads the step's
+    # ValidTokenCount from the LAST micro's CHUNK 0 (upstream issue #74). If
+    # EVERY sample in a batch has a prompt longer than the chunk (1792 tok),
+    # chunk 0 holds only prompt tokens, vtc reads 0 and the ENTIRE STEP IS
+    # DISCARDED — step 103 lost ~2h of generation this way (0/256 samples
+    # under 1792, vs 64/256 on the healthy step 102). The FACET blend made
+    # this reachable: its prompts run 2,752-4,044 tokens, and terminal+swe
+    # is ~56% of draws, so ~1 step in 10 would be silently wasted.
+    # When set, sampling guarantees at least one short-prompt example per
+    # batch so the trainer's reorder guard always has a rescue micro.
+    vtc_min_short_prompt_examples: int | None = None
+    vtc_short_prompt_max_chars: int | None = 6000
+    vtc_rescue_window: int | None = 4
+    # Flat-group filter, dispersion form: drop groups whose reward std is
+    # below this. max-min spread is defeated by a single outlier (the 0.5
+    # carpets above show spread 0.50 while 95% of rollouts are identical).
+    flat_group_std_min: float | None = None
 
     def __init__(self, cfg: DictDefault):
         self.seed = cfg.get("seed", self.seed)
@@ -378,9 +452,21 @@ class GRPOBufferConfig:
         self.easy_fraction = cfg.get("easy_fraction", self.easy_fraction)
         self.hard_fraction = cfg.get("hard_fraction", self.hard_fraction)
         self.online_difficulty_filtering = cfg.get("online_difficulty_filtering", self.online_difficulty_filtering)
+        self.flat_group_filtering = cfg.get("flat_group_filtering", self.flat_group_filtering)
+        self.recycle_flat_fraction = cfg.get("recycle_flat_fraction", self.recycle_flat_fraction)
+        self.flat_group_epsilon = cfg.get("flat_group_epsilon", self.flat_group_epsilon)
         self.normal_pool_min_examples = cfg.get("normal_pool_min_examples", self.normal_pool_min_examples)
         self.recycle_easy_fraction = cfg.get("recycle_easy_fraction", self.recycle_easy_fraction)
         self.recycle_hard_fraction = cfg.get("recycle_hard_fraction", self.recycle_hard_fraction)
+        self.midband_sampling_boost = cfg.get("midband_sampling_boost", self.midband_sampling_boost)
+        self.gradient_std_high = cfg.get("gradient_std_high", self.gradient_std_high)
+        self.gradient_std_low = cfg.get("gradient_std_low", self.gradient_std_low)
+        self.flat_group_std_min = cfg.get("flat_group_std_min", self.flat_group_std_min)
+        self.vtc_min_short_prompt_examples = cfg.get(
+            "vtc_min_short_prompt_examples", self.vtc_min_short_prompt_examples)
+        self.vtc_short_prompt_max_chars = cfg.get(
+            "vtc_short_prompt_max_chars", self.vtc_short_prompt_max_chars)
+        self.vtc_rescue_window = cfg.get("vtc_rescue_window", self.vtc_rescue_window)
         self.hash_keys = cfg.get("hash_keys", ["info", "prompt"])
         self.sample_without_replacement = cfg.get(
             "sample_without_replacement", self.sample_without_replacement
@@ -731,6 +817,7 @@ class GRPOCheckpointConfig:
         keep_interval: Keep checkpoints at every N steps permanently (e.g., keep_interval=100 keeps step 100, 200, ...). If None, no interval-based keeping.
         skip_progress: Whether to skip loading the progress from checkpoint.
         skip_buffer: Whether to skip loading the buffer from checkpoint.
+        spool_inflight: Persist in-flight rollout groups to an append-only spool so a restart resumes partially generated groups instead of regenerating them. Restored rollouts respect max_off_policy_steps.
     """
 
     interval: int | None = None
@@ -740,6 +827,7 @@ class GRPOCheckpointConfig:
     keep_interval: int | None = None
     skip_progress: bool | None = False
     skip_buffer: bool | None = False
+    spool_inflight: bool | None = False
 
     def __init__(self, cfg: DictDefault):
         self.interval = cfg.get("interval", self.interval)
@@ -749,6 +837,7 @@ class GRPOCheckpointConfig:
         self.keep_interval = cfg.get("keep_interval", self.keep_interval)
         self.skip_progress = cfg.get("skip_progress", self.skip_progress)
         self.skip_buffer = cfg.get("skip_buffer", self.skip_buffer)
+        self.spool_inflight = cfg.get("spool_inflight", self.spool_inflight)
 
 
 @dataclass
@@ -878,6 +967,7 @@ class GRPOOrchestratorConfig:
     client: GRPOClientConfig | None = None
     model: GRPOModelConfig | None = None
     teacher_model: TeacherModelConfig | None = None
+    replay: GRPOReplayConfig | None = None
     learning_rate: float | None = 1e-4
     sampling: GRPOSamplingConfig | None = None
     env: list[GRPOEnvConfig] | None = None
@@ -914,6 +1004,7 @@ class GRPOOrchestratorConfig:
     token_batch_size: int | None = None
     max_inflight_rollouts: int | None = None
     dump_metrics: bool | None = False
+    trainable_metric: str | None = None
 
     def __init__(self, cfg: DictDefault):
         self.client = GRPOClientConfig(cfg.get("client", {}))
@@ -921,6 +1012,9 @@ class GRPOOrchestratorConfig:
 
         if cfg.get("teacher_model") is not None:
             self.teacher_model = TeacherModelConfig(cfg.get("teacher_model"))
+
+        if cfg.get("replay") is not None:
+            self.replay = GRPOReplayConfig(cfg.get("replay"))
 
         self.learning_rate = cfg.get("learning_rate", self.learning_rate)
         self.sampling = GRPOSamplingConfig(cfg.get("sampling", {}))
@@ -964,6 +1058,7 @@ class GRPOOrchestratorConfig:
         else:
             self.filters = [GRPOGibberishFilterConfig({}), GRPORepetitionFilterConfig({})]
 
+        self.trainable_metric = cfg.get("trainable_metric", self.trainable_metric)
 
         self.log = GRPOLogConfig(cfg.get("log", {}))
 

@@ -41,7 +41,9 @@ def test_masks_and_targets_and_pairing():
 
     assert b.n_pairs == 1
     assert b.n_seq == 2
-    assert b.input_ids.shape == (2, 32)
+    # Width tracks the data, not the `max_len` cap: these rows are far short
+    # of 32, and allocating at the cap was the padding waste bug 26 removes.
+    assert b.input_ids.shape == (2, int(b.seq_len.max()))
 
     for k in range(2):
         L = int(b.seq_len[k])
@@ -157,3 +159,136 @@ def test_span_mask_drops_pair_when_only_one_side_has_surviving_edit_tokens():
 
     with pytest.raises(ValueError, match="no preference pair"):
         tokenize_preference_pairs(rows, tok, max_len=8, span_mask=True)
+
+
+# ── padding must not look like document boundaries ─────────────────
+
+
+def test_position_ids_advance_across_padding():
+    """A padded row must read as ONE document to the engine, not as one per
+    pad token.
+
+    `compute_doc_masking` starts a new document wherever a position id fails to
+    advance by one, and the flash-varlen backward sizes `dq_accum` per
+    document, so a zero-filled pad tail made the allocation scale with padding:
+    4027 MB against a 1298 MB arena for 101 real tokens in 4096 slots.
+
+    The fixture must contain rows of DIFFERING length. Rows are trimmed to the
+    longest one, so a uniform fixture ends up with no padding at all and this
+    would assert nothing.
+    """
+    tok = FakeTok()
+    rows = [
+        {"prompt": "un prompt ceva mai lung aici", "chosen": "raspuns lung", "rejected": "raspuns scurt"},
+        {"prompt": "scurt", "chosen": "da", "rejected": "nu"},
+    ]
+    b = tokenize_preference_pairs(rows, tok, max_len=2048)
+
+    padding = [b.width - int(L) for L in b.seq_len]
+    assert max(padding) > 0, "fixture must actually pad, or this test is vacuous"
+
+    for k in range(b.n_seq):
+        # Every step is exactly one, so the engine sees a single document
+        # spanning the row however much of it is padding.
+        assert np.all(np.diff(b.position_ids[k]) == 1)
+        # And the padding stays out of the loss, as it always did.
+        L = int(b.seq_len[k])
+        assert b.loss_mask[k, L:].sum() == 0
+        assert np.all(b.targets[k, L:] == 0)
+
+
+# ── the batch is sized to the data, not to the config ──────────────
+
+
+def test_batch_width_tracks_the_data_not_the_cap():
+    """A 50-token pair used to cost a 2048-token forward, three times over:
+    the policy pass, the frozen reference pass, and the backward."""
+    tok = FakeTok()
+    rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
+    b = tokenize_preference_pairs(rows, tok, max_len=2048)
+
+    longest = int(b.seq_len.max())
+    assert b.width == longest, f"width {b.width} should track the longest row {longest}"
+    assert b.input_ids.shape == (b.n_seq, longest)
+    assert b.position_ids.shape == (b.n_seq, longest)
+    assert b.loss_mask.shape == (b.n_seq, longest)
+
+
+def test_width_never_exceeds_the_cap():
+    """Trimming must not turn the cap into a suggestion. Note rows longer than
+    `max_len` are left-truncated to it rather than dropped, so what this checks
+    is that the realised width still honours the ceiling."""
+    tok = FakeTok()
+    rows = [
+        {"prompt": "a b c d e f g h", "chosen": "x y z", "rejected": "p q r"},
+        {"prompt": "scurt", "chosen": "da", "rejected": "nu"},
+    ]
+    b = tokenize_preference_pairs(rows, tok, max_len=4)
+
+    assert b.width <= 4
+    assert int(b.seq_len.max()) <= 4
+
+
+def test_padding_still_present_when_rows_differ_in_length():
+    """Trimming is to the longest row, not per row: shorter rows keep their
+    padding, and it still must not read as document boundaries."""
+    tok = FakeTok()
+    rows = [
+        {"prompt": "un prompt ceva mai lung aici", "chosen": "raspuns lung", "rejected": "raspuns scurt"},
+        {"prompt": "scurt", "chosen": "da", "rejected": "nu"},
+    ]
+    b = tokenize_preference_pairs(rows, tok, max_len=2048)
+
+    lengths = {int(x) for x in b.seq_len}
+    assert len(lengths) > 1, "fixture must contain rows of differing length"
+    assert b.width == max(lengths)
+    for k in range(b.n_seq):
+        assert np.all(np.diff(b.position_ids[k]) == 1)
+
+
+# ── the width must keep the divisibility the config was validated for ──
+
+
+def test_width_is_rounded_up_to_the_requested_multiple():
+    """`sequence_len` is validated against `lmhead_chunks` at config time; a
+    trimmed width has to carry that forward itself.
+
+    The fused lm-head splits `B * T` into `lmhead_chunks` equal nano-batches by
+    truncating division and runs exactly that many, so a non-divisible width
+    silently drops the remainder. In the reference forward those tokens come
+    back as logprob 0.0, and because the width is the *longest* row, the dropped
+    tail belongs to a row with real scored tokens: wrong margins, no error.
+    """
+    tok = FakeTok()
+    rows = [
+        {"prompt": "un prompt ceva mai lung aici", "chosen": "raspuns lung", "rejected": "raspuns scurt"},
+        {"prompt": "scurt", "chosen": "da", "rejected": "nu"},
+    ]
+    natural = tokenize_preference_pairs(rows, tok, max_len=2048)
+    aligned = tokenize_preference_pairs(rows, tok, max_len=2048, width_multiple=16)
+
+    assert aligned.width % 16 == 0
+    assert aligned.width >= natural.width
+    assert aligned.width - natural.width < 16  # rounded up, not inflated
+
+
+def test_alignment_never_exceeds_the_cap():
+    """Rounding up must not push the width past `max_len`, whatever multiple is
+    asked for."""
+    tok = FakeTok()
+    rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
+    b = tokenize_preference_pairs(rows, tok, max_len=8, width_multiple=64)
+
+    assert b.width <= 8
+
+
+def test_padding_from_alignment_is_still_one_document():
+    """The pad cells alignment adds are padding like any other, and must not
+    read as document boundaries."""
+    tok = FakeTok()
+    rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
+    b = tokenize_preference_pairs(rows, tok, max_len=2048, width_multiple=16)
+
+    assert b.width > int(b.seq_len.max()), "alignment must have added padding here"
+    for k in range(b.n_seq):
+        assert np.all(np.diff(b.position_ids[k]) == 1)

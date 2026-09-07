@@ -30,13 +30,6 @@ def prepare_command_parser(parser=None):
         help="Device to run the local teacher model on (default cuda:0). "
         "Ignored with a warning in API mode (--api-base).",
     )
-    parser.add_argument(
-        "--allow-cross-doc-attention",
-        action="store_true",
-        help="Allow sdpa fallback when flash-attention-2 is unavailable; packed documents "
-        "will attend across document boundaries during capture. "
-        "Ignored with a warning in API mode (--api-base).",
-    )
     parser.add_argument("--hub_token", type=str, help="Hugging Face token for private model access", default=None)
 
     return parser

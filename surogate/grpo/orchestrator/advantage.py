@@ -88,10 +88,24 @@ def compute_advantages(
         rewards: Flattened list of rewards where first `samples_per_problem` rewards are for the first problem
         completion_lengths: List of completion lengths for each reward
         samples_per_problem: Number of samples (and thus, rewards) per problem
-        advantage_config: Configuration for advantage computation (AdvantageConfig or CustomAdvantageConfig)
+        advantage_config: Configuration for advantage computation (AdvantageConfig or
+            CustomAdvantageConfig). Required: a falsy value raises, because
+            centering is not optional.
+
+    Raises:
+        ValueError: if *advantage_config* is falsy.
     """
     if not advantage_config:
-        return rewards
+        # Returning the rewards here made them advantages with no baseline
+        # subtracted, which is REINFORCE with all-positive advantages: every
+        # completion is reinforced, including the bad ones. Silent, and it looks
+        # like a training curve that is merely disappointing. No config reaches
+        # this (the builder always yields a truthy GRPOAdvantageConfig), so a
+        # None here is a caller's bug and should say so rather than train wrong.
+        raise ValueError(
+            "compute_advantages requires an advantage_config; got None. "
+            "Pass GRPOAdvantageConfig({}) for the default mean baseline."
+        )
 
     advantage_fn = setup_advantage_fn(advantage_config)
 

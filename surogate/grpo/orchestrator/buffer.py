@@ -11,6 +11,8 @@ from datasets import Dataset
 from verifiers.utils.save_utils import make_serializable
 
 from surogate.core.config.grpo_orch_config import GRPOBufferConfig
+from statistics import pstdev
+
 from surogate.grpo.orchestrator.vf_utils import get_task
 from surogate.grpo.utils.utils import format_num, mean, mean_normalize
 from surogate.utils.logger import get_logger
@@ -81,6 +83,13 @@ class Buffer:
         # Initialize buffers for easy/ hard examples
         self.easy_examples: list[dict] = []
         self.hard_examples: list[dict] = []
+        # Zero-variance groups: every rollout scored identically, so the
+        # group-centered advantage is 0 for all members — the task taught
+        # nothing THIS time. Cooldown-pool it (with recycling) rather than
+        # retiring it: a task that is flat today can become variant as the
+        # policy improves. Mean-based easy/hard pools cannot see the
+        # all-0.5 flat class, which measured ~20% of groups (2026-08-16).
+        self.flat_examples: list[dict] = []
         self.consumed_examples: list[dict] = []
 
         # Initialize rollout buffer (flat list of rollouts)
@@ -88,15 +97,61 @@ class Buffer:
 
         # Rollout write-ahead log: completed rollouts become durable the
         # moment update() ingests them, so an orchestrator restart replays
-        # them instead of regenerating. Lifecycle: attach_wal() arms it;
-        # update() appends delivered rollouts; save() truncates (the
-        # checkpoint owns them from then on); replay_wal() restores the
-        # post-checkpoint delta after load(). NOTE for step purges: deleting
-        # a poisoned step's rollouts must also delete the live_spool dir,
-        # or replay resurrects them.
+        # them instead of regenerating (measured cost of mid-step bounces
+        # before this existed: 128-192 rollouts / 2-3h each, 2026-08-20/21).
+        # Lifecycle: attach_wal() arms it; update() appends delivered
+        # rollouts; save() truncates (the checkpoint owns them from then on);
+        # replay_wal() restores the post-checkpoint delta after load().
+        # NOTE for step purges: deleting a poisoned step's rollouts must also
+        # delete the live_spool dir, or replay resurrects them.
         self._wal_path: Path | None = None
 
+        # Per-task difficulty memory for frontier-biased sampling: EMA of
+        # group-mean reward keyed "env:example_id", updated on every completed
+        # group (including flat/easy/hard-pooled ones — a 0.5-carpet's 0.5 EMA
+        # correctly lands it off-band). Persisted in checkpoints; advisory
+        # only, so absent history (fresh tasks, old checkpoints) is fine.
+        self.example_reward_ema: dict[str, float] = {}
+        # Per-task DISPERSION memory: EMA of the group's reward std. This —
+        # not the mean — is the frontier signal, because GRPO divides
+        # advantages by the group std, so a group's training value IS its
+        # dispersion. Measured 2026-08-22: a FACET group of 61x0.5 + 2x0.0
+        # has mean 0.48 (would be boosted by a mean-band rule) but std 0.088,
+        # versus 0.39 for a genuine 12-win hard-task group.
+        self.example_std_ema: dict[str, float] = {}
+        self._long_draw_streak: int = 0
+
         self.reset_step_metrics()
+
+    def _pick_example(self, env_name: str) -> dict:
+        """Within-env draw; frontier-biased when midband_sampling_boost is set.
+
+        The frontier signal is the task's recent reward DISPERSION, not its
+        mean: boost tasks whose group std >= gradient_std_high (they produce
+        real advantage spread), demote carpets below gradient_std_low (95% of
+        rollouts identical => ~no gradient however good the mean looks), and
+        leave unseen tasks at 1.0 so fresh material still gets explored.
+        Demoted tasks stay drawable — difficulty migrates as the policy
+        improves and the EMA keeps tracking them.
+        """
+        examples = list(self.example_buffer[env_name].values())
+        boost = self.config.midband_sampling_boost
+        if not boost or boost <= 1.0:
+            return random.choice(examples)
+        hi = self.config.gradient_std_high if self.config.gradient_std_high is not None else 0.15
+        lo = self.config.gradient_std_low if self.config.gradient_std_low is not None else 0.08
+        weights = []
+        for ex in examples:
+            std = self.example_std_ema.get(f"{env_name}:{ex['example_id']}")
+            if std is None:
+                weights.append(1.0)          # unseen task: explore uniformly
+            elif std >= hi:
+                weights.append(boost)        # real dispersion = real gradient
+            elif std < lo:
+                weights.append(1.0 / boost)  # carpet (uniform outcome): demote
+            else:
+                weights.append(1.0)
+        return random.choices(examples, weights=weights, k=1)[0]
 
     def attach_wal(self, spool_dir: Path) -> None:
         """Arms the rollout write-ahead log under the given directory."""
@@ -165,8 +220,13 @@ class Buffer:
 
         write_jsonl(self.easy_examples, path / "easy_examples.jsonl")
         write_jsonl(self.hard_examples, path / "hard_examples.jsonl")
+        write_jsonl(self.flat_examples, path / "flat_examples.jsonl")
         write_jsonl(self.consumed_examples, path / "consumed_examples.jsonl")
         write_jsonl(self.rollout_buffer, path / "rollout_buffer.jsonl")
+        with open(path / "reward_ema.json", "w") as f:
+            json.dump(self.example_reward_ema, f)
+        with open(path / "reward_std_ema.json", "w") as f:
+            json.dump(self.example_std_ema, f)
         # The checkpoint now owns every delivered rollout; the WAL restarts empty.
         self._wal_truncate()
 
@@ -179,6 +239,10 @@ class Buffer:
 
         saved_easy_examples = read_jsonl(path / "easy_examples.jsonl")
         saved_hard_examples = read_jsonl(path / "hard_examples.jsonl")
+        # Checkpoints written before the flat pool existed have no file;
+        # treat absent as empty (forward-compatible resume).
+        flat_path = path / "flat_examples.jsonl"
+        saved_flat_examples = read_jsonl(flat_path) if flat_path.exists() else []
         consumed_path = path / "consumed_examples.jsonl"
         if self.config.sample_without_replacement and not consumed_path.is_file():
             raise ValueError(
@@ -188,6 +252,15 @@ class Buffer:
             read_jsonl(consumed_path) if consumed_path.is_file() else []
         )
         saved_rollout_buffer = cast(list[vf.RolloutOutput], read_jsonl(path / "rollout_buffer.jsonl"))
+        # Difficulty EMA: advisory memory; absent on pre-feature checkpoints.
+        ema_path = path / "reward_ema.json"
+        if ema_path.exists():
+            with open(ema_path) as f:
+                self.example_reward_ema = json.load(f)
+        std_path = path / "reward_std_ema.json"
+        if std_path.exists():
+            with open(std_path) as f:
+                self.example_std_ema = json.load(f)
 
         if (
             any(saved_easy_examples)
@@ -223,6 +296,8 @@ class Buffer:
                                 break
                 return num_moved
 
+            if any(saved_flat_examples):
+                move_saved_pool(saved_flat_examples, self.flat_examples)
             if any(saved_easy_examples):
                 num_moved = move_saved_pool(saved_easy_examples, self.easy_examples)
                 logger.debug(f"Loaded {num_moved}/{len(saved_easy_examples)} example(s) to easy pool from checkpoint.")
@@ -293,24 +368,58 @@ class Buffer:
 
     def _recycle_examples_if_needed(self) -> None:
         min_normal = self.config.normal_pool_min_examples or 0
-        if self._normal_example_count() > min_normal:
-            return
+        if self._normal_example_count() <= min_normal:
+            moved_easy = self._move_examples_to_normal(self.easy_examples, self.config.recycle_easy_fraction)
+            moved_hard = self._move_examples_to_normal(self.hard_examples, self.config.recycle_hard_fraction)
+            moved_flat = self._move_examples_to_normal(
+                self.flat_examples, self.config.recycle_flat_fraction)
+            self.recycled_examples_per_step["hard"] += moved_flat
+            self.recycled_examples_per_step["easy"] += moved_easy
+            self.recycled_examples_per_step["hard"] += moved_hard
 
-        moved_easy = self._move_examples_to_normal(self.easy_examples, self.config.recycle_easy_fraction)
-        moved_hard = self._move_examples_to_normal(self.hard_examples, self.config.recycle_hard_fraction)
-        self.recycled_examples_per_step["easy"] += moved_easy
-        self.recycled_examples_per_step["hard"] += moved_hard
-
-        if moved_easy or moved_hard:
-            logger.info(
-                "Recycled %d easy and %d hard example(s) into the normal pool "
-                "(normal=%d, easy=%d, hard=%d)",
-                moved_easy,
-                moved_hard,
-                self._normal_example_count(),
-                len(self.easy_examples),
-                len(self.hard_examples),
-            )
+            if moved_easy or moved_hard:
+                logger.info(
+                    "Recycled %d easy and %d hard example(s) into the normal pool "
+                    "(normal=%d, easy=%d, hard=%d)",
+                    moved_easy,
+                    moved_hard,
+                    self._normal_example_count(),
+                    len(self.easy_examples),
+                    len(self.hard_examples),
+                )
+        # Per-env starvation guard: sample_examples() deals only envs whose
+        # NORMAL pool is non-empty, and the global floor above cannot trip
+        # while other envs stay full — so an env whose every example was
+        # classified easy/hard/flat is silently never dealt again (an env can
+        # get there through an outage that scores its whole registry under
+        # hard_threshold). Return ALL of that env's sidelined examples to
+        # normal; difficulty re-classifies as fresh results arrive.
+        # flat_examples is included deliberately: the carpet filter added a
+        # THIRD sideline pool after this guard was written, and a lane whose
+        # grader emits one partial-credit value for everything (measured: a
+        # terminal grader returning exactly 0.50 for every rollout) sends its
+        # whole registry to flat, not to easy/hard. Draining only easy+hard
+        # would leave precisely that lane starved.
+        for env_name, prob in self.env_probs.items():
+            if prob <= 0 or self.example_buffer.get(env_name):
+                continue
+            pools = (self.easy_examples, self.hard_examples, self.flat_examples)
+            starved = [e for pool in pools for e in pool if get_task(e) == env_name]
+            for example in starved:
+                for pool in pools:
+                    if example in pool:
+                        pool.remove(example)
+                        break
+                self.example_buffer.setdefault(env_name, {})[example["example_id"]] = example
+                self.recycled_examples_per_step["hard"] += 1
+            if starved:
+                logger.info(
+                    "Env %s normal pool was empty while weighted %.3f — recycled "
+                    "%d of its easy/hard/flat example(s) back to normal.",
+                    env_name,
+                    prob,
+                    len(starved),
+                )
 
     def sample_examples(self, n: int) -> list[dict]:
         """Samples n examples from the buffer, respecting env ratios."""
@@ -329,9 +438,7 @@ class Buffer:
                     weights=[self.env_probs[env] for env in non_empty_envs],
                     k=1,
                 )[0]
-                sampled_example = random.choice(
-                    list(self.example_buffer[sampled_env].values())
-                )
+                sampled_example = self._pick_example(sampled_env)
                 self.example_buffer[sampled_env].pop(sampled_example["example_id"])
                 self.consumed_examples.append(sampled_example)
                 sampled_examples.append(sampled_example)
@@ -345,10 +452,77 @@ class Buffer:
         non_empty_env_probs = [self.env_probs[env] for env in non_empty_envs]
         sampled_examples = []
         for sampled_env in random.choices(non_empty_envs, weights=non_empty_env_probs, k=n):
-            sampled_example = random.choice(list(self.example_buffer[sampled_env].values()))
-            sampled_examples.append(sampled_example)
+            sampled_examples.append(self._pick_example(sampled_env))
 
+        self._ensure_short_prompt_example(sampled_examples, non_empty_envs)
         return sampled_examples
+
+    @staticmethod
+    def _prompt_chars(example: dict) -> int:
+        prompt = example.get("prompt")
+        if isinstance(prompt, str):
+            return len(prompt)
+        if isinstance(prompt, list):
+            return sum(len(str(m.get("content", ""))) for m in prompt if isinstance(m, dict))
+        return 0
+
+    def _ensure_short_prompt_example(self, sampled: list[dict], envs: list[str]) -> None:
+        """Guarantee >=1 short-prompt example per STEP (vtc rescue, issue #74).
+
+        Chunked GRPO takes the step's ValidTokenCount from the LAST micro's
+        CHUNK 0. If every sample's prompt is longer than the chunk, chunk 0
+        contains no completion tokens, vtc reads 0 and the WHOLE STEP is
+        discarded (measured: step 103, 0/256 samples under 1792 tokens, ~2h
+        of generation lost; healthy step 102 had 64/256). The trainer's
+        reorder guard can only pin the best micro last — it cannot create one.
+        So the fix belongs here: swap a drawn example for a short-prompt one
+        when a whole step's worth of draws has produced none.
+
+        The window is what makes this safe. The orchestrator draws ONE example
+        per group, so a per-draw guarantee silently becomes "every group must
+        be short" — which collapsed step 104 into an all-CRM batch pinned to a
+        single worker (~24h ETA, two GPUs idle) before this was caught. Forcing
+        at most `need` swaps per `vtc_rescue_window` issued examples keeps the
+        real guarantee (any window of `window` consecutive groups holds a short
+        one, so every step has its valid chunk-0 micro) while costing ~1 group
+        in `window` of env-ratio distortion instead of the entire mix.
+        """
+        need = self.config.vtc_min_short_prompt_examples
+        if not need:
+            return
+        max_chars = self.config.vtc_short_prompt_max_chars or 6000
+        short_n = sum(1 for e in sampled if self._prompt_chars(e) <= max_chars)
+        if short_n >= need:
+            self._long_draw_streak = 0
+            return
+        # This draw is all-long. A later draw in the same step can still supply
+        # the short micro, so only intervene once a full window has gone by.
+        self._long_draw_streak += len(sampled)
+        window = self.config.vtc_rescue_window or 4
+        if self._long_draw_streak < window:
+            return
+        candidates = [
+            e for env in envs for e in self.example_buffer[env].values()
+            if self._prompt_chars(e) <= max_chars
+        ]
+        if not candidates:
+            logger.warning(
+                "vtc rescue: batch has %d/%d short-prompt examples (<=%d chars) and the "
+                "buffer holds NONE — the step may be discarded (issue #74)",
+                short_n, need, max_chars)
+            return
+        for slot in range(len(sampled)):
+            if short_n >= need:
+                break
+            if self._prompt_chars(sampled[slot]) <= max_chars:
+                continue
+            sampled[slot] = random.choice(candidates)
+            short_n += 1
+            self._long_draw_streak = 0
+            logger.info(
+                "vtc rescue: swapped a long-prompt example for a short one (<=%d chars) "
+                "after %d all-long draws so the step keeps a valid chunk-0 micro",
+                max_chars, window)
 
     def update(self, rollouts: list[vf.RolloutOutput]):
         """Updates the buffer state with completed rollouts."""
@@ -358,8 +532,54 @@ class Buffer:
             rollouts_by_example[rollout["example_id"]].append(rollout)
 
         for example_id, example_rollouts in rollouts_by_example.items():
-            avg_reward = mean([r["reward"] for r in example_rollouts])
+            rewards = [r["reward"] for r in example_rollouts]
+            avg_reward = mean(rewards)
             env_name = get_task(example_rollouts[0])
+
+            ema_key = f"{env_name}:{example_id}"
+            prev_ema = self.example_reward_ema.get(ema_key)
+            self.example_reward_ema[ema_key] = (
+                avg_reward if prev_ema is None else 0.7 * prev_ema + 0.3 * avg_reward
+            )
+            group_std = pstdev(rewards) if len(rewards) > 1 else 0.0
+            prev_std = self.example_std_ema.get(ema_key)
+            self.example_std_ema[ema_key] = (
+                group_std if prev_std is None else 0.7 * prev_std + 0.3 * group_std
+            )
+
+            reward_spread = max(rewards) - min(rewards)
+            if (
+                self.config.flat_group_filtering
+                and len(example_rollouts) > 1
+                and (
+                    len(set(rewards)) == 1
+                    or reward_spread <= (self.config.flat_group_epsilon or 0.0)
+                    or (
+                        self.config.flat_group_std_min is not None
+                        and len(rewards) > 1
+                        and pstdev(rewards) < self.config.flat_group_std_min
+                    )
+                )
+            ):
+                # Zero- OR near-zero-variance group: exclude its rollouts from
+                # the batch and cool the task down. The exact-match trigger
+                # alone misses the dominant live pattern (measured run 4 steps
+                # 13-18: terminal groups at 61-63/64 identical 0.5s with one
+                # 0.4 outlier, std 0.012-0.09 — one outlier defeats set()==1
+                # while the group still carries ~no gradient and holds a
+                # 0.4-weight lane slot).
+                logger.info(
+                    f"[{env_name}] FLAT-DROP example={example_id} "
+                    f"n={len(example_rollouts)} rewards(min/max/mean)="
+                    f"{min(rewards):.2f}/{max(rewards):.2f}/{avg_reward:.2f} "
+                    f"spread={reward_spread:.3f} — excluded from batch, task cooled down"
+                )
+                if example_id in self.example_buffer[env_name]:
+                    example = self.example_buffer[env_name].pop(example_id)
+                    self.flat_examples.append(example)
+                self.num_examples_per_step[env_name]["hard"] += 1
+                self.num_rollouts_per_step[env_name]["hard"] += len(example_rollouts)
+                continue
 
             if self.config.easy_threshold is not None and avg_reward >= self.config.easy_threshold:
                 pool = "easy"

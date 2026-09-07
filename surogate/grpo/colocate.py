@@ -23,6 +23,7 @@ from threading import Event, Thread
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
+from surogate.grpo.abort import AbortReason
 from surogate.grpo.config import GRPOTrainConfig
 from surogate.grpo.inference.grpo_infer import setup_vllm_env
 from surogate.utils.logger import get_logger
@@ -128,9 +129,10 @@ def _run_vllm_server(
                     loop.close()
                 except Exception:
                     pass
-    except Exception as e:
-        logger.error(f"vLLM server error: {e}")
+    except Exception:
+        # Set the channel first, for the same reason as `_run_trainer` below.
         error_event.set()
+        logger.exception("vLLM server error")
         raise
 
 
@@ -323,13 +325,17 @@ def _run_trainer(
 
         trainer = GRPOTrainer(train_config, external_weights=external_weights)
         trainer.train()
-    except Exception as e:
-        logger.error(f"Trainer error: {e}")
+    except Exception:
+        # Set the channel first: anything that goes wrong while logging must not
+        # cost the watchdog its only notification. The re-raise is for the
+        # thread's own stack, not for propagation -- this runs in a daemon
+        # thread, where it is dropped.
         error_event.set()
+        logger.exception("Trainer error")
         raise
 
 
-def _watch_components(error_event: Event, shutdown_event: Event) -> None:
+def _watch_components(error_event: Event, shutdown_event: Event, abort: AbortReason) -> None:
     """Watchdog: aborts the orchestrator if vLLM or the trainer raise.
 
     Both `_run_vllm_server` and `_run_trainer` set `error_event` in their
@@ -342,7 +348,11 @@ def _watch_components(error_event: Event, shutdown_event: Event) -> None:
             break
     if shutdown_event.is_set():
         return
-    logger.error("vLLM or trainer reported an error — aborting GRPO pipeline")
+    reason = "vLLM or trainer reported an error"
+    logger.error(f"{reason} — aborting GRPO pipeline")
+    # Record before signalling: the main thread reads this to tell our own abort
+    # apart from a user's Ctrl-C, and it must be set by the time the signal lands.
+    abort.reason = reason
     os.kill(os.getpid(), signal.SIGINT)
 
 
@@ -442,24 +452,55 @@ def grpo_colocate(
     # Watchdog must come up before the orchestrator so we never miss an early
     # vLLM/trainer crash. shutdown_event suppresses spurious aborts during
     # the planned teardown in the finally block below.
+    abort = AbortReason()
     watchdog_thread = Thread(
         target=_watch_components,
-        args=(error_event, shutdown_event),
+        args=(error_event, shutdown_event, abort),
         daemon=True,
         name="grpo-watchdog",
     )
     watchdog_thread.start()
+
+    # A terminal Ctrl-C reaches vLLM's EngineCore children too: unlike the split
+    # runner, colocate does not `setsid` them, so they share our process group.
+    # They die, `_run_vllm_server` sets `error_event`, and if the watchdog wins
+    # that race a user-initiated stop is reported as a component crash and exits
+    # non-zero. Marking the shutdown planned *before* the interrupt propagates
+    # makes the watchdog return quietly, so an interrupt stays an interrupt.
+    def _interrupt_is_a_planned_stop(signum, frame):
+        shutdown_event.set()
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _interrupt_is_a_planned_stop)
+    except ValueError:
+        # Not the main thread, so there is no handler to install. Nothing below
+        # depends on it; the teardown mask is installed separately.
+        pass
 
     try:
         from surogate.grpo.orchestrator.grpo_orch import orchestrate
 
         asyncio.run(orchestrate(orch_config))
     except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
+        # A watchdog abort arrives here as an ordinary Ctrl-C (see
+        # `AbortReason`); the recorded reason is what tells them apart. The
+        # watchdog has already logged the cause and the raise below carries it,
+        # so only a genuine interrupt needs a line.
+        if not abort.reason:
+            logger.warning("Interrupted by user")
     except Exception as e:
         logger.error(f"Orchestrator error: {e}")
         raise
     finally:
+        # Mask FIRST. The watchdog can pass its own `shutdown_event` check and
+        # still be inside `logger.error` when we enter here; its `os.kill` would
+        # then land during the joins below, raise KeyboardInterrupt out of this
+        # `finally`, and skip the event-loop stop, the joins and the raise after
+        # it. Split has masked here all along; colocate did not.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
         logger.info("GRPO pipeline shutting down")
 
         # Tell the watchdog this teardown is intentional and tell the vLLM
@@ -477,3 +518,9 @@ def grpo_colocate(
             vllm_thread.join(timeout=10.0)
 
         watchdog_thread.join(timeout=2.0)
+
+    # After teardown, not instead of it: the finally block above stops the vLLM
+    # loop and joins the trainer. Raising here is what turns a dead component
+    # into a non-zero exit, so ops records the run as failed, not completed.
+    if abort.reason:
+        raise RuntimeError(f"GRPO pipeline aborted: {abort.reason}")

@@ -37,6 +37,7 @@ import psutil
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
+from surogate.grpo.abort import AbortReason
 from surogate.grpo.config import GRPOTrainConfig
 from surogate.utils.logger import get_logger
 
@@ -82,19 +83,27 @@ def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event):
     orchestrator. Re-raising here would be silently dropped by daemon-thread
     teardown — the event is the propagation channel to the main thread.
     """
-    from surogate.grpo.trainer import GRPOTrainer
-
     try:
+        # Inside the try: an ImportError here is a crash like any other, and
+        # leaving it outside meant the most likely failure on a dependency bump
+        # set no event, raised no signal, and hung the run in `running`.
+        from surogate.grpo.trainer import GRPOTrainer
+
         GRPOTrainer(train_config, external_weights=None).train()
     except Exception:
-        logger.exception("Trainer thread crashed")
+        # Set the channel FIRST: this used to log first, and the logging call
+        # itself raised, so the line below never ran, the watchdog was never
+        # told, and the run hung in `running` holding its GPUs. Whatever goes
+        # wrong in logging, the signal must already be out.
         failure_event.set()
+        logger.exception("Trainer thread crashed")
 
 
 def _watch_components(
     vllm_procs: list[tuple["mp.Process", str]],
     trainer_failed: threading.Event,
     shutdown_event: threading.Event,
+    abort: AbortReason,
 ) -> None:
     """Watchdog: aborts the pipeline if any vLLM or the trainer dies unexpectedly.
 
@@ -116,6 +125,14 @@ def _watch_components(
                 crashed = f"{label} subprocess died unexpectedly (exitcode={proc.exitcode})"
                 break
         if crashed:
+            # Only a sentinel can fire as a side effect of planned teardown, which
+            # kills the vLLM subprocesses; re-check before calling that a crash, or
+            # a successful run gets marked failed. The trainer branch below needs
+            # no such re-check: teardown only *joins* the trainer thread, so
+            # `trainer_failed` is never a consequence of shutting down, and
+            # discarding it here would downgrade a real late crash to exit 0.
+            if shutdown_event.is_set():
+                return
             break
         if trainer_failed.is_set():
             crashed = "Trainer thread crashed"
@@ -123,6 +140,10 @@ def _watch_components(
     if crashed is None:
         return
     logger.error(f"{crashed} — aborting GRPO pipeline")
+    # Record before signalling: the main thread reads this to tell our own
+    # abort apart from a user's Ctrl-C, and it must be set by the time the
+    # signal lands.
+    abort.reason = crashed
     # Wake the main thread out of asyncio.run; existing finally block tears down.
     os.kill(os.getpid(), signal.SIGINT)
 
@@ -217,9 +238,10 @@ def grpo_split(
     if judge_proc is not None:
         watched_vllms.append((judge_proc, "judge vLLM"))
     shutdown_event = threading.Event()
+    abort = AbortReason()
     watchdog_thread = Thread(
         target=_watch_components,
-        args=(watched_vllms, trainer_failed, shutdown_event),
+        args=(watched_vllms, trainer_failed, shutdown_event, abort),
         daemon=True,
         name="grpo-watchdog",
     )
@@ -230,21 +252,30 @@ def grpo_split(
 
         asyncio.run(orchestrate(orch_config))
     except KeyboardInterrupt:
-        logger.warning("Interrupted by user")
+        # A watchdog abort arrives here as an ordinary Ctrl-C (see
+        # `AbortReason`); the recorded reason is what tells them apart. The
+        # watchdog has already logged the cause and the raise below carries it,
+        # so only a genuine interrupt needs a line.
+        if not abort.reason:
+            logger.warning("Interrupted by user")
     except Exception as e:
         logger.error(f"Split GRPO pipeline error: {e}")
         raise
     finally:
+        # Mask FIRST, before anything that can be interrupted. These two lines
+        # used to sit below the log and the event set, leaving a window where a
+        # watchdog SIGINT would raise inside the `finally` itself -- skipping the
+        # vLLM reap entirely and stranding the process trees on their GPUs, which
+        # is the exact outcome the trailing raise is placed after teardown to
+        # avoid. Also covers a second Ctrl-C during cleanup.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
         logger.info("Split GRPO pipeline shutting down")
 
         # Tell the watchdog this teardown is intentional; otherwise it would see
         # vLLM's planned death and re-fire SIGINT.
         shutdown_event.set()
-
-        # Ignore further Ctrl-Cs/SIGTERMs so cleanup runs to completion. Without this,
-        # a second Ctrl-C interrupts the vLLM teardown and leaks the subprocess tree.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
         # Reap vLLMs in parallel — each can take up to 15s on SIGTERM→SIGKILL escalation.
         # Sequential teardown would double that on a typical RULER topology. This is the
@@ -275,7 +306,7 @@ def grpo_split(
         except Exception as e:
             logger.warning(f"Survivor reap failed during shutdown: {e}")
 
-        # Leave without running interpreter finalization.
+        # Leave without running interpreter finalization -- on the clean path.
         #
         # The trainer is a daemon thread and may still be winding down -- the join
         # above waits two seconds and then says so. If it holds the stderr buffer's
@@ -284,13 +315,24 @@ def grpo_split(
         # every step and wrote every checkpoint reports itself as crashed. Every
         # subprocess has been reaped by this point and the only work left is
         # finalization itself, so flush what we own and go.
-        logging.shutdown()
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:
-                pass
-        os._exit(0)
+        #
+        # An abort does not take this door: the raise below is what turns a dead
+        # component into a non-zero exit, and exiting 0 here would hide it.
+        if not abort.reason:
+            logging.shutdown()
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            os._exit(0)
+
+    # After teardown, not instead of it: the finally block above reaps the vLLM
+    # process trees, and exiting early would strand them holding GPUs. Raising
+    # here is what turns a dead component into a non-zero exit, so ops records
+    # the run as failed rather than completed.
+    if abort.reason:
+        raise RuntimeError(f"GRPO pipeline aborted: {abort.reason}")
 
 
 def _spawn_vllm(
