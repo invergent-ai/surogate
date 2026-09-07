@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/load_progress/load_progress.h"
+#include "product/cuda_visibility/cuda_visibility.h"
 #include "product/prompt_input/prompt_input.h"
 
 #include "api/engine.h"
@@ -265,6 +266,12 @@ int main(int argc, char** argv) {
         engine_options.artifact_path  = cli.artifact_path;
         engine_options.device         = cli.device;
         engine_options.devices        = cli.devices;
+        // Before the first CUDA call: the process sees only the cards it was given.
+        if (const std::string narrowed = sinfer::product::narrow_cuda_visible_devices(
+                engine_options.device, engine_options.devices);
+            !narrowed.empty()) {
+            std::cerr << narrowed << '\n';
+        }
         engine_options.max_context    = cli.max_context;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.host_moe_layers = cli.host_moe_layers;

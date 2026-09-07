@@ -345,6 +345,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 if (comma == std::string::npos) { break; }
                 start = comma + 1;
             }
+            if (!options.devices.empty()) { options.device = options.devices.front(); }
             if (options.devices.empty()) { throw std::invalid_argument("--devices needs at least one device"); }
             options.device = options.devices.front();
         } else if (arg == "--kv-cache-dtype") {

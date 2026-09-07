@@ -90,6 +90,9 @@ sinfer_add_test(sinfer_arena_test        SOURCES test_arena.cpp)
 sinfer_add_test(sinfer_request_memory_test SOURCES test_request_memory.cpp)
 sinfer_add_test(sinfer_admission_policy_test SOURCES test_admission_policy.cpp)
 sinfer_add_test(sinfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
+sinfer_add_test(sinfer_cuda_visibility_test
+  SOURCES test_cuda_visibility.cpp
+  LIBRARIES sinfer_product_cuda_visibility)
 sinfer_add_test(sinfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES sinfer_engine)

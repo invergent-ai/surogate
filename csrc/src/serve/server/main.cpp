@@ -1,4 +1,5 @@
 #include "product/load_progress/load_progress.h"
+#include "product/cuda_visibility/cuda_visibility.h"
 #include "core/sleep.h"
 #include "serve/model_scheduler.h"
 #include "serve/console_log.h"
@@ -56,6 +57,12 @@ int main(int argc, char** argv) {
         return 0;
     }
     try {
+        // Before the first CUDA call: the process sees only the cards it was given.
+        if (const std::string narrowed = sinfer::product::narrow_cuda_visible_devices(
+                options.device, options.devices);
+            !narrowed.empty()) {
+            sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, narrowed);
+        }
 
         using Clock = std::chrono::steady_clock;
         sinfer::serve::HttpServer server(options);

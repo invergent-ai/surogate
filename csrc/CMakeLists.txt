@@ -1373,6 +1373,10 @@ if(SINFER_BUILD_APPS OR BUILD_TESTING)
   add_library(sinfer_product_load_progress STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/product/load_progress/load_progress.cpp)
   sinfer_internal_includes(sinfer_product_load_progress)
+  # The cards a process may touch: narrows CUDA_VISIBLE_DEVICES before the first CUDA call.
+  add_library(sinfer_product_cuda_visibility STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/product/cuda_visibility/cuda_visibility.cpp)
+  sinfer_internal_includes(sinfer_product_cuda_visibility)
 endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
@@ -1456,6 +1460,7 @@ target_include_directories(sinfer PRIVATE
 target_link_libraries(sinfer PRIVATE
   sinfer_engine
   sinfer_product_load_progress
+  sinfer_product_cuda_visibility
   sinfer_product_prompt_input)
 
 add_executable(sinfer-serve EXCLUDE_FROM_ALL ${SERVE_ROOT}/server/main.cpp)
@@ -1465,7 +1470,8 @@ target_include_directories(sinfer-serve PRIVATE
   ${SERVE_ROOT}
   ${SUROGATE_VENDOR_DIR}
   ${SUROGATE_VENDOR_DIR}/cpp-httplib)
-target_link_libraries(sinfer-serve PRIVATE sinfer_serve sinfer_product_load_progress)
+target_link_libraries(sinfer-serve PRIVATE sinfer_serve sinfer_product_load_progress
+  sinfer_product_cuda_visibility)
 
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the product binaries carry
 # surogate's name; SInfer attribution lives in NOTICE, not in process names.

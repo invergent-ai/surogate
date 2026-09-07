@@ -161,7 +161,7 @@ public:
     using Executor = runtime::ExecutorVariantFor<targets::ActiveTarget>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(std::move(engine_options)), device(options.device) {
+        : options(normalized_device(std::move(engine_options))), device(options.device) {
         // The engine's op-layer state home. Bound here so everything target
         // construction creates -- Marlin scratch and adoption, LoRA banks,
         // sleepable arenas (which record this as their owner) -- lands in THIS
@@ -227,6 +227,15 @@ public:
         try {
             device.synchronize();
         } catch (...) {}
+    }
+
+    // A pipeline names its cards in `devices`; the engine's own context, its streams and
+    // everything that reads `device` -- the log's environment, the worker's binding -- must
+    // live on one of them. Left at the default, every pipeline put a context on card 0 whether
+    // it ran there or not, which on a shared host is someone else's card.
+    static EngineOptions normalized_device(EngineOptions options) {
+        if (!options.devices.empty()) { options.device = options.devices.front(); }
+        return options;
     }
 
     // Declared first so it is destroyed last: the executor's teardown and the
