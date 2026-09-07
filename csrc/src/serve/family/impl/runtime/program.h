@@ -20,12 +20,15 @@
 #include "family/impl/runtime/vision_context.h"
 #include "family/impl/runtime/vision_prefill.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <array>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
@@ -124,6 +127,29 @@ struct PendingCandidate {
     std::uint32_t produced      = 0;
 };
 
+/// What one speculative round decided for one lane, copied out of the round's host egress
+/// the moment the round is consumed. The egress is one buffer per program, and the next
+/// round's copy into it is enqueued as soon as that round launches -- so a lane whose
+/// resolution comes after another round's launch (a pipeline keeping several groups in
+/// flight) would read the wrong round's decision from it. This is the lane's own copy, and
+/// it is also the record a stage without the head adopts from the stage that has it.
+struct SpeculativeOutcome {
+    std::int32_t licensed_count  = 0;
+    std::int32_t accepted_drafts = 0;
+    std::int32_t next_extent     = 0;
+    std::array<TokenId, family::kMtpDecodeMaximumWidth> licensed_tokens{};
+    std::array<TokenId, family::kMtpDecodeMaximumDrafts> next_drafts{};
+};
+static_assert(std::is_trivially_copyable_v<SpeculativeOutcome>);
+
+/// A lane's draft state after a prefill: what the head proposed for the first round. On a
+/// pipeline only the stage with the head proposes anything; the others adopt this.
+struct LaneDraftState {
+    std::uint32_t count = 0;
+    std::array<TokenId, family::kMtpDecodeMaximumDrafts> drafts{};
+};
+static_assert(std::is_trivially_copyable_v<LaneDraftState>);
+
 enum class Lifecycle : std::uint8_t {
     Empty,
     Prefilling,
@@ -191,6 +217,8 @@ struct SequenceState {
 struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
+    /// Valid while `pending.kind == Speculative`: the round's decision for this lane.
+    SpeculativeOutcome outcome;
     ops::SamplingConfig sampling_host;
     /// The adapter slot this request selected; staged per lane every round.
     std::int32_t lora_slot = -1;
@@ -301,16 +329,47 @@ public:
     [[nodiscard]] bool pipeline_stage() const noexcept {
         return stage.first > 0 || (stage.last >= 0 && stage.last < cfg.layers);
     }
+    /// True where the logits are: a whole-model program, or the pipeline stage that runs the
+    /// last layer. A speculative round is decided here and adopted everywhere else.
+    [[nodiscard]] bool stage_holds_head() const noexcept {
+        return !(stage.last >= 0 && stage.last < cfg.layers);
+    }
+    /// Columns a decode round licenses per lane at most: the draft window plus the anchor
+    /// under MTP, one otherwise. The pipeline driver sizes its token and residual carries by it.
+    [[nodiscard]] std::uint32_t speculative_round_width() const noexcept {
+        return speculative_backend == SpeculativeBackend::Mtp ? draft_window + 1U : 1U;
+    }
+    /// The decision of the round this program last consumed, one `SpeculativeOutcome` per
+    /// row in the round's lane order, for the pipeline driver to hand to the stages without
+    /// the head. Valid until the next consume.
+    [[nodiscard]] std::span<const std::byte> speculative_outcome() const noexcept {
+        return std::span<const std::byte>(outcome_export_.data(), outcome_export_.size());
+    }
+    /// A stage without the head: takes the head stage's decision for these lanes, whose
+    /// rounds it ran headless and left pending with nothing produced. After this the lanes
+    /// resolve exactly as they do on the head stage.
+    void adopt_speculative_outcome(std::span<const std::uint32_t> lanes,
+                                   std::span<const std::byte> outcome);
+    /// The lane's draft state (`LaneDraftState`) after its prefill completed, and its
+    /// adoption on a stage whose own prefill proposed nothing.
+    [[nodiscard]] std::span<const std::byte> lane_draft_state(std::uint32_t lane) const;
+    void adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state);
     void configure_stage(const SequencePlanImpl& plan);
     /// Pipeline stages without the head record a placeholder token per round; the driver
     /// replaces each lane's last ledger entry with the token the last stage sampled.
     void replace_pending_tokens(std::span<const std::uint32_t> lanes, std::span<const TokenId> tokens);
-    /// Pipeline driver access to the decode round's two halves.
+    /// Pipeline driver access to the decode round's two halves, whichever round the backend
+    /// runs: the ordinary round, or the MTP verify round.
     [[nodiscard]] runtime::RoundHandle launch_decode_round(std::span<const std::uint32_t> lanes,
                                                            std::span<const runtime::RoundBudget> budgets) {
+        if (speculative_backend == SpeculativeBackend::Mtp) { return launch_mtp_round(lanes, budgets); }
+        if (speculative_backend == SpeculativeBackend::DFlash) {
+            throw std::logic_error("the DFlash round has no launch and consume halves");
+        }
         return launch_ordinary_round(lanes, budgets);
     }
     [[nodiscard]] runtime::BatchedGeneratedRound consume_decode_round(runtime::RoundHandle handle) {
+        if (speculative_backend == SpeculativeBackend::Mtp) { return consume_mtp_round(handle); }
         return consume_ordinary_round(handle);
     }
     [[nodiscard]] runtime::RoundHandle launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
@@ -385,8 +444,16 @@ public:
         std::uint32_t burst = 0;
         std::chrono::steady_clock::time_point start{};
         std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        /// The MTP round checks what it licensed against the budget when it consumes.
+        std::array<runtime::RoundBudget, kMaximumConcurrency> budgets{};
     };
     InFlightRound in_flight_{};
+    /// `speculative_outcome()`: the last consumed MTP round's decisions, row-major.
+    std::vector<std::byte> outcome_export_;
+    /// `lane_draft_state()`: one record, rewritten per call.
+    mutable std::array<std::byte, sizeof(LaneDraftState)> draft_state_export_{};
+    /// A headless stage's MTP round licenses nothing itself; its result carries these.
+    std::array<std::int32_t, kMaximumConcurrency> headless_counts_{};
     std::uint64_t in_flight_counter_ = 0;
     // A mixed round between launch and consume (the pipeline driver's seam).
     struct MixedInFlight {
@@ -468,6 +535,15 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_mtp_batch(std::span<const std::uint32_t> lanes,
                      std::span<const runtime::RoundBudget> budgets);
+    /// The MTP round's two halves (the ordinary round's seam, for the pipeline): launch
+    /// stages the ingress and enqueues the round without synchronising; consume waits, reads
+    /// the egress into each lane's `SpeculativeOutcome` and records the pending candidate.
+    /// A stage without the head runs the verify forward only and leaves the lanes pending
+    /// with nothing produced, for `adopt_speculative_outcome`.
+    [[nodiscard]] runtime::RoundHandle
+    launch_mtp_round(std::span<const std::uint32_t> lanes,
+                     std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound consume_mtp_round(runtime::RoundHandle handle);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets);

@@ -607,13 +607,11 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
                                      int layers) {
     const int stage_count = static_cast<int>(options.devices.size());
     if (stage_count > layers) { throw std::invalid_argument("more pipeline stages than layers"); }
-    if (options.speculative.backend != SpeculativeBackend::None) {
-        // A speculative round is accepted where the logits are -- on the stage that holds the
-        // head -- and every stage folds its recurrent state on that decision. The pipeline
-        // driver carries the residual between stages and nothing else, so the other stages
-        // would fold on a decision they never see.
+    if (options.speculative.backend == SpeculativeBackend::DFlash) {
+        // The MTP round has the launch/consume halves and the headless body a stage needs
+        // (runtime/engine/pipeline_instance.h); the DFlash round does not yet.
         throw std::invalid_argument(
-            "pipeline parallelism runs no speculative round: --spec needs a single device");
+            "pipeline parallelism runs no DFlash round yet: --spec dflash needs a single device");
     }
     std::vector<std::unique_ptr<DeviceContext>> devices;
     std::vector<std::unique_ptr<Instance>> stages;
@@ -631,7 +629,11 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
         stage_options.pipeline_stage_last       = bounds[static_cast<std::size_t>(s) + 1];
         stage_options.pipeline_import_pinned    = nullptr; // each stage owns its import buffer
         stage_options.cpu_moe_pool_per_socket   = std::getenv("SUROGATE_SERVE_CPU_MOE_POOL_SHARED") == nullptr;
-        stage_options.pipeline_boundary_columns = options.prefill_chunk + options.max_concurrency + 128;
+        // The widest residual a stage exports: a prefill chunk beside the decode lanes, or a
+        // verify's draft window plus one per lane.
+        stage_options.pipeline_boundary_columns =
+            std::max(options.prefill_chunk + options.max_concurrency + 128,
+                     options.max_concurrency * (options.speculative.draft_tokens + 1) + 128);
         // Zero until the preflight below has run, and then the shared values every stage --
         // stage 0 included -- is built with.
         if (resolved_kv != 0) {

@@ -9,6 +9,13 @@
 //
 // Status (2026-08-28): lockstep — stage s+1 starts a round when stage s has finished it; the
 // overlap of several micro-batches across stages is step C.
+//
+// Speculative rounds (2026-09-07): a decode round may license up to `width` tokens per lane
+// (the draft window plus one). Every stage runs the verify forward for its own layers; the
+// stage with the head decides -- accept, propose -- and its decision, as bytes the family
+// defines, is adopted by the other stages before the executor resolves the round and every
+// stage folds its recurrent state on the same integers. A prefill's first drafts cross the
+// same way. The driver never reads the bytes.
 
 #include "api/types.h"
 #include "core/device.h"
@@ -19,6 +26,7 @@
 #include "runtime/engine/request_memory.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -108,7 +116,8 @@ public:
             boundary.resize(groups_);
             for (auto& slot : boundary) { slot.resize(boundary_bytes_); }
         }
-        assembled_tokens_.resize(kMaximumConcurrency);
+        width_ = std::max<std::uint32_t>(1, stages_.front()->program->speculative_round_width());
+        assembled_tokens_.resize(static_cast<std::size_t>(kMaximumConcurrency) * width_);
         assembled_counts_.resize(kMaximumConcurrency);
         assembled_prefill_tokens_.fill(0);
         flights_.resize(groups_);
@@ -164,12 +173,24 @@ public:
         PrefillStepResult result{};
         for (std::size_t s = 0; s < stages_.size(); ++s) {
             select(s);
+            // A program honours the deferral only for the shapes a mixed round can advance; a
+            // draft-head prompt, a vision prompt or a bridged reuse runs its first chunk right
+            // here, on every stage in turn -- so the residual crosses between them exactly as it
+            // does in advance_prefill_lane. Nothing processed on the previous stage means
+            // nothing to carry.
+            if (s > 0 && result.processed_prompt_tokens > 0) {
+                std::memcpy(stages_[s]->program->stage_import_buffer(),
+                            stages_[s - 1]->program->stage_export_buffer(), boundary_bytes_);
+            }
             PreparedPrompt copy = (s + 1 == stages_.size()) ? std::move(prompt) : prompt.clone();
             trace("start_prefill_lane", s, defer_first_chunk ? 0 : 1);
             result = stages_[s]->program->start_prefill_lane(lane, std::move(copy), std::move(plan.stages[s]),
                                                             stages_[s]->request_memory.region(),
                                                             defer_first_chunk);
         }
+        // A prompt that completed inside its first chunk sampled its token on the last stage
+        // only; the others recorded placeholders (and, under a draft head, proposed nothing).
+        if (result.complete) { propagate_prefill_token(lane, result); }
         return result;
     }
     [[nodiscard]] PrefillStepResult advance_prefill_lane(std::uint32_t lane) {
@@ -194,10 +215,10 @@ public:
         }
         run_grouped_round({}, lanes, budgets);
         BatchedGeneratedRound result{
-            .tokens     = std::span<const TokenId>(assembled_tokens_.data(), lanes.size()),
+            .tokens     = std::span<const TokenId>(assembled_tokens_.data(), lanes.size() * width_),
             .row_counts = std::span<const std::int32_t>(assembled_counts_.data(), lanes.size()),
-            .row_stride = 1};
-        propagate_round_tokens(lanes, result);
+            .row_stride = width_};
+        propagate_round_tokens(lanes, result, assembled_outcome_);
         return result;
     }
     [[nodiscard]] MixedRoundResult advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes,
@@ -210,10 +231,10 @@ public:
         run_grouped_round(prefill_lanes, lanes, budgets);
         MixedRoundResult result = assembled_mixed_;
         result.round            = BatchedGeneratedRound{
-            .tokens     = std::span<const TokenId>(assembled_tokens_.data(), lanes.size()),
+            .tokens     = std::span<const TokenId>(assembled_tokens_.data(), lanes.size() * width_),
             .row_counts = std::span<const std::int32_t>(assembled_counts_.data(), lanes.size()),
-            .row_stride = 1};
-        propagate_round_tokens(lanes, result.round);
+            .row_stride = width_};
+        propagate_round_tokens(lanes, result.round, assembled_outcome_);
         for (std::size_t i = 0; i < result.prefill_count && i < prefill_lanes.size(); ++i) {
             const PrefillStepResult& step = result.prefill_at(i);
             if (step.complete) { propagate_prefill_token(prefill_lanes[i], step); }
@@ -319,6 +340,13 @@ public:
     [[nodiscard]] std::uint32_t group_count() const noexcept { return groups_; }
     [[nodiscard]] bool group_in_flight(std::uint32_t g) const noexcept { return flights_.at(g).active; }
     [[nodiscard]] bool has_finished_pending() const noexcept { return !pending_finished_.empty(); }
+    /// A group whose flight completed inside another group's launch (a lone prefill parked
+    /// mid-pipeline runs on whenever a stage frees up) waits here for the next tick to hand it
+    /// back. It is not in flight, but it is not free either: its lane's result has not been
+    /// resolved, and launching it again would run the same prefill step twice.
+    [[nodiscard]] bool group_finished_pending(std::uint32_t g) const noexcept {
+        return std::find(pending_finished_.begin(), pending_finished_.end(), g) != pending_finished_.end();
+    }
     [[nodiscard]] bool any_in_flight() const noexcept {
         for (const auto& f : flights_) { if (f.active) { return true; } }
         return false;
@@ -374,6 +402,10 @@ public:
             finish_stage(static_cast<std::uint32_t>(oldest), s, finished);
         }
         advance_parked(finished);
+        // The head stage was held only for this call: the executor resolves what finished
+        // here before it asks again, and the next launch on that stage may then overwrite
+        // the round's device frame.
+        hold_head_stage_ = false;
         return finished;
     }
     [[nodiscard]] const GroupResult& group_result(std::uint32_t g) const { return flights_.at(g).result; }
@@ -392,6 +424,9 @@ private:
         std::uint32_t prefill_lane = 0;
         std::vector<TokenId> tokens;
         std::vector<std::int32_t> counts;
+        // A speculative round's decision, copied out of the last stage at consume time for the
+        // same reason as the tokens below.
+        std::vector<std::byte> outcome;
         // A finished prompt's first sampled token, copied out of the last stage's egress buffer:
         // the executor reads the result after `tick()` returns, by which time another round may
         // have been launched on that stage and overwritten the buffer the span pointed into.
@@ -418,27 +453,38 @@ private:
         f.prefill_lanes.assign(prefill_lanes.begin(), prefill_lanes.end());
         f.prefill_lane = prefill_lane;
         f.result       = GroupResult{};
-        // A decode round's residual is exactly one column per lane; mixed and prefill rounds
-        // carry the full boundary (their graphs pad to buckets).
-        f.carry_bytes = kind == FlightKind::Decode ? std::min(boundary_bytes_, column_bytes_ * lanes.size())
-                                                   : boundary_bytes_;
+        // A decode round's residual is exactly `width` columns per lane (one, or the verify's
+        // draft window plus one); mixed and prefill rounds carry the full boundary (their
+        // graphs pad to buckets).
+        f.carry_bytes = kind == FlightKind::Decode
+                            ? std::min(boundary_bytes_, column_bytes_ * lanes.size() * width_)
+                            : boundary_bytes_;
         advance_parked(pending_finished_);
     }
     std::vector<std::uint32_t> pending_finished_;
     void store_round(Flight& f, const BatchedGeneratedRound& part) {
         const std::size_t stride = part.row_stride > 0 ? static_cast<std::size_t>(part.row_stride) : 1;
-        f.tokens.resize(f.lanes.size());
+        f.tokens.assign(f.lanes.size() * width_, 0);
         f.counts.resize(f.lanes.size());
         for (std::size_t i = 0; i < f.lanes.size(); ++i) {
             const std::int32_t count = part.row_counts.empty() ? 1 : part.row_counts[i];
-            if (count > 1) { throw std::logic_error("pipeline stages expect single-token rounds"); }
+            if (count < 0 || static_cast<std::uint32_t>(count) > width_ ||
+                (count > 0 && i * stride + static_cast<std::size_t>(count) > part.tokens.size())) {
+                throw std::logic_error("pipeline round licensed more tokens than its width");
+            }
             f.counts[i] = count;
-            f.tokens[i] = count == 1 ? part.tokens[i * stride] : 0;
+            for (std::size_t j = 0; j < static_cast<std::size_t>(count); ++j) {
+                f.tokens[i * width_ + j] = part.tokens[i * stride + j];
+            }
+        }
+        if (width_ > 1) {
+            const std::span<const std::byte> outcome = stages_.back()->program->speculative_outcome();
+            f.outcome.assign(outcome.begin(), outcome.end());
         }
         f.result.round = BatchedGeneratedRound{
-            .tokens     = std::span<const TokenId>(f.tokens.data(), f.lanes.size()),
+            .tokens     = std::span<const TokenId>(f.tokens.data(), f.lanes.size() * width_),
             .row_counts = std::span<const std::int32_t>(f.counts.data(), f.lanes.size()),
-            .row_stride = 1};
+            .row_stride = width_};
     }
     // The group finished stage s (consumed, or a synchronous prefill step): park it for the
     // next stage or complete it.
@@ -461,7 +507,11 @@ private:
                 propagate_prefill_token(f.prefill_lane, f.result.prefill);
             }
         } else {
-            propagate_round_tokens(f.lanes, f.result.round);
+            propagate_round_tokens(f.lanes, f.result.round, f.outcome);
+            // A speculative round's resolution re-reads the head stage's device frame (the
+            // hidden of a partially accepted row); no other round may launch there until the
+            // executor has resolved this one, which it does before the next tick.
+            if (width_ > 1 && f.kind == FlightKind::Decode) { hold_head_stage_ = true; }
             if (f.kind == FlightKind::Mixed) {
                 for (std::size_t i = 0; i < f.result.mixed.prefill_count && i < f.prefill_lanes.size(); ++i) {
                     PrefillStepResult& step = f.result.mixed.prefills[i];
@@ -483,6 +533,7 @@ private:
             for (std::size_t g = 0; g < flights_.size(); ++g) {
                 const Flight& f = flights_[g];
                 if (!f.active || !f.between || stage_owner_[f.stage] >= 0) { continue; }
+                if (hold_head_stage_ && f.stage + 1 == stages_.size()) { continue; }
                 if (pick < 0 || f.stage_sequence < flights_[static_cast<std::size_t>(pick)].stage_sequence) {
                     pick = static_cast<int>(g);
                 }
@@ -531,7 +582,12 @@ private:
         // min_lanes_per_group_ (the partition is per round; every lane's state lives on every
         // stage, so lanes may move between groups from round to round).
         const std::uint32_t width_groups = static_cast<std::uint32_t>(std::max<std::size_t>(1, lanes.size() / min_lanes_per_group_));
-        const std::uint32_t groups       = std::max<std::uint32_t>(1, std::min(groups_, width_groups));
+        // Under speculation this path runs one group: the round's decision is adopted from the
+        // last stage's consume and its resolution reads that stage's frame, so a second
+        // group's round on that stage before the first resolved would overwrite both. The
+        // executor's flight loop (tick) orders that per group; this synchronous path does
+        // not, and is not the executor's.
+        const std::uint32_t groups       = width_ > 1 ? 1U : std::max<std::uint32_t>(1, std::min(groups_, width_groups));
         std::vector<std::vector<std::uint32_t>> group_lanes(groups);
         std::vector<std::vector<RoundBudget>> group_budgets(groups);
         std::vector<std::vector<std::size_t>> group_rows(groups);
@@ -612,15 +668,34 @@ private:
         const std::size_t stride = part.row_stride > 0 ? static_cast<std::size_t>(part.row_stride) : 1;
         for (std::size_t i = 0; i < rows.size(); ++i) {
             const std::int32_t count = part.row_counts.empty() ? 1 : part.row_counts[i];
-            if (count > 1) { throw std::logic_error("pipeline stages expect single-token rounds"); }
+            if (count < 0 || static_cast<std::uint32_t>(count) > width_ ||
+                (count > 0 && i * stride + static_cast<std::size_t>(count) > part.tokens.size())) {
+                throw std::logic_error("pipeline round licensed more tokens than its width");
+            }
             assembled_counts_[rows[i]] = count;
-            assembled_tokens_[rows[i]] = count == 1 ? part.tokens[i * stride] : 0;
+            for (std::size_t j = 0; j < width_; ++j) {
+                assembled_tokens_[rows[i] * width_ + j] =
+                    j < static_cast<std::size_t>(count) ? part.tokens[i * stride + j] : 0;
+            }
+        }
+        if (width_ > 1) {
+            const std::span<const std::byte> outcome = stages_.back()->program->speculative_outcome();
+            assembled_outcome_.assign(outcome.begin(), outcome.end());
         }
     }
     // The stages without the head recorded placeholder tokens this round: overwrite them with
-    // the tokens the last stage sampled (one per lane; stages run single rounds).
-    void propagate_round_tokens(std::span<const std::uint32_t> lanes, const BatchedGeneratedRound& round) {
+    // the tokens the last stage sampled (one per lane; stages run single rounds). Under
+    // speculation they recorded nothing and adopt the last stage's decision instead.
+    void propagate_round_tokens(std::span<const std::uint32_t> lanes, const BatchedGeneratedRound& round,
+                                const std::vector<std::byte>& outcome) {
         if (stages_.size() < 2 || lanes.empty()) { return; }
+        if (width_ > 1) {
+            const std::span<const std::byte> bytes(outcome.data(), outcome.size());
+            for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
+                stages_[s]->program->adopt_speculative_outcome(lanes, bytes);
+            }
+            return;
+        }
         // Decode rounds carry per-row counts and a stride; mixed rounds carry one token per
         // row and nothing else. Stages run single rounds, so every row has at most one token.
         const std::size_t stride = round.row_stride > 0 ? static_cast<std::size_t>(round.row_stride) : 1;
@@ -660,6 +735,13 @@ private:
         for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
             stages_[s]->program->replace_pending_tokens(lanes, tokens);
         }
+        if (width_ > 1) {
+            // Only the stage with the head proposed anything for the first round.
+            const std::span<const std::byte> drafts = stages_.back()->program->lane_draft_state(lane);
+            for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
+                stages_[s]->program->adopt_lane_draft_state(lane, drafts);
+            }
+        }
     }
 
     std::array<TokenId, runtime::kMaximumMixedPrefills> assembled_prefill_tokens_{};
@@ -679,7 +761,12 @@ private:
     std::vector<std::vector<std::vector<std::byte>>> slots_; // [boundary][group]
     std::vector<TokenId> assembled_tokens_;
     std::vector<std::int32_t> assembled_counts_;
+    std::vector<std::byte> assembled_outcome_;
     MixedRoundResult assembled_mixed_{};
+    /// Tokens a decode round may license per lane: 1, or the draft window plus one.
+    std::uint32_t width_ = 1;
+    /// Set when a speculative group finished on the last stage inside the current tick.
+    bool hold_head_stage_ = false;
 };
 
 /// The executor's instance: owns the stage instances and their device contexts.

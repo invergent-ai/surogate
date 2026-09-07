@@ -315,6 +315,32 @@ runtime::MixedRoundResult Program<Variant>::consume_mixed_round(runtime::RoundHa
 }
 
 template <>
+std::uint32_t Program<Variant>::speculative_round_width() const noexcept {
+    return impl_->speculative_round_width();
+}
+
+template <>
+std::span<const std::byte> Program<Variant>::speculative_outcome() const noexcept {
+    return impl_->speculative_outcome();
+}
+
+template <>
+void Program<Variant>::adopt_speculative_outcome(std::span<const std::uint32_t> lanes,
+                                                 std::span<const std::byte> outcome) {
+    impl_->adopt_speculative_outcome(lanes, outcome);
+}
+
+template <>
+std::span<const std::byte> Program<Variant>::lane_draft_state(std::uint32_t lane) const {
+    return impl_->lane_draft_state(lane);
+}
+
+template <>
+void Program<Variant>::adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state) {
+    impl_->adopt_lane_draft_state(lane, state);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile,

@@ -105,7 +105,9 @@ struct TextLayerPlan {
 /// hyper-connection anywhere in it, which is what makes it the family's fixed draft tail rather
 /// than a trunk block. The embedding table and the LM head are the trunk's.
 struct MtpPlan {
-    bool present = false; ///< the artifact carries a head
+    bool present  = false; ///< the artifact carries a head
+    bool resident = false; ///< ...and this run wants it on this device: `--spec mtp`, on the
+                           ///< stage that holds the head (a whole model, or the last stage)
     artifact::ObjectHandle embedding_norm; // [hidden]
     artifact::ObjectHandle hidden_norm;    // [hidden]
     WeightPlan input_projection;           // [hidden, 2 * hidden]

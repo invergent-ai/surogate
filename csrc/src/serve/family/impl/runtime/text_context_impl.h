@@ -301,10 +301,10 @@ void TextContext::bind() {
 
     // A trunk-block draft head carries no fixed-tail weights: its block is an ordinary layer,
     // bound where the trunk's are, and the family reads it through the target's hooks.
-    if (mtp_enabled() && !mtp_block_is_trunk_layer<Variant>()) {
-        if (!weights_.mtp) {
-            throw std::invalid_argument("MTP state was enabled without materialized MTP weights");
-        }
+    // The head's KV and frames exist on every pipeline stage (the verify's inputs are theirs),
+    // the head's weights only where it runs; a stage without them leaves `mtp_` empty and
+    // `mtp_weights()` refuses any use.
+    if (mtp_enabled() && !mtp_block_is_trunk_layer<Variant>() && weights_.mtp) {
         const auto& source = *weights_.mtp;
         mtp_               = MtpW{&source,
                     &source.input_projection,
@@ -351,7 +351,9 @@ void TextContext::bind() {
 }
 
 const MtpW& TextContext::mtp_weights() const {
-    if (!mtp_enabled()) { throw std::runtime_error("MTP draft weights are not enabled"); }
+    if (!mtp_enabled() || mtp_.payload == nullptr) {
+        throw std::runtime_error("MTP draft weights are not enabled on this device");
+    }
     return mtp_;
 }
 
@@ -477,6 +479,12 @@ void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
                                    const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
                                    Tensor& mtp_hidden, const Tensor* input_embeddings) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if constexpr (!mtp_block_is_trunk_layer<Variant>()) {
+        // A pipeline stage without the head has the head's KV but not its weights.
+        if (mtp_.payload == nullptr) {
+            throw std::runtime_error("MTP draft weights are not on this device");
+        }
+    }
     auto scratch_scope = work_.scope();
     if constexpr (mtp_block_is_trunk_layer<Variant>()) {
         mtp_forward_trunk_block(ids, hidden, input_embeddings, positions, rope_positions, envelope,
@@ -1836,17 +1844,59 @@ void TextContext::set_stage(const StageSpan& stage) {
     stage_       = stage;
 }
 
+namespace {
+/// SUROGATE_SERVE_STAGE_CHECKSUM=1: the residual as it crosses a boundary, one line per copy,
+/// so two runs can be compared stage by stage. Synchronises the stream; diagnostics only.
+inline bool stage_checksum_enabled() {
+    static const bool enabled = std::getenv("SUROGATE_SERVE_STAGE_CHECKSUM") != nullptr;
+    return enabled;
+}
+inline void stage_checksum(const char* what, int first, int last, const void* device_data,
+                           std::int32_t rows, std::int32_t columns, cudaStream_t stream) {
+    if (!stage_checksum_enabled()) { return; }
+    // Graph capture forbids a synchronise; the captured bodies are the decode rounds, and the
+    // prefill's boundary crossings are what this is for.
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capturing) != cudaSuccess ||
+        capturing != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::size_t count = static_cast<std::size_t>(rows) * static_cast<std::size_t>(columns);
+    std::vector<std::uint16_t> host(count);
+    CUDA_CHECK(cudaMemcpy(host.data(), device_data, count * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost));
+    double sum = 0.0, absmax = 0.0, last_column_sum = 0.0;
+    std::size_t nans = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uint32_t bits = static_cast<std::uint32_t>(host[i]) << 16;
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        if (value != value) { ++nans; continue; }
+        sum += value;
+        absmax = std::max(absmax, static_cast<double>(std::fabs(value)));
+        if (i >= count - static_cast<std::size_t>(rows)) { last_column_sum += value; }
+    }
+    std::fprintf(stderr,
+                 "stage-checksum: %s stage [%d, %d) columns %d sum %.6g absmax %.6g last-column "
+                 "%.6g nans %zu\n",
+                 what, first, last, columns, sum, absmax, last_column_sum, nans);
+}
+} // namespace
+
 void TextContext::stage_import(Tensor& x, cudaStream_t stream) {
     const std::int32_t columns = x.ne[1];
     if (columns > stage_.columns) { throw std::logic_error("pipeline stage import wider than its buffer"); }
     CUDA_CHECK(cudaMemcpyAsync(x.data, stage_.import_pinned,
                                static_cast<std::size_t>(cfg_.residual) * columns * sizeof(std::uint16_t),
                                cudaMemcpyHostToDevice, stream));
+    stage_checksum("import", stage_first_, stage_last_, x.data, cfg_.residual, columns, stream);
 }
 
 void TextContext::stage_export(const Tensor& x, cudaStream_t stream) {
     const std::int32_t columns = x.ne[1];
     if (columns > stage_.columns) { throw std::logic_error("pipeline stage export wider than its buffer"); }
+    stage_checksum("export", stage_first_, stage_last_, x.data, cfg_.residual, columns, stream);
     CUDA_CHECK(cudaMemcpyAsync(stage_.export_pinned, x.data,
                                static_cast<std::size_t>(cfg_.residual) * columns * sizeof(std::uint16_t),
                                cudaMemcpyDeviceToHost, stream));
@@ -3009,7 +3059,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {cfg_.hidden, len});
             if (stage_finishes()) {
+                stage_checksum("finish-input", stage_first_, stage_last_, x.data, cfg_.residual,
+                               len, s);
                 Tensor xl = finish_prefill(xf, x, s);
+                stage_checksum("finish-output", stage_first_, stage_last_, xl.data, xl.ne[0],
+                               xl.ne[1], s);
                 debug_next_token_nll(xl, ids_device, len, *lm_head_, cfg_.vocab, static_cast<std::int32_t>(kTokenDomain), work_, s);
             } else {
                 stage_export(x, s);
@@ -3032,7 +3086,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            if (prepare_mtp_prompt) {
+            // The head's own prefill -- its KV over the prompt and the first proposal -- runs
+            // where the head is; a stage before the last exported its residual above and has
+            // nothing to feed it.
+            if (prepare_mtp_prompt && stage_finishes()) {
                 const std::uint32_t alignment_tokens =
                     multimodal != nullptr ? static_cast<std::uint32_t>(multimodal->token_ids.size())
                     : text_prefill != nullptr

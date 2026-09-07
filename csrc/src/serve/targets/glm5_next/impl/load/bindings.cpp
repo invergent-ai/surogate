@@ -161,11 +161,15 @@ void bind_latent_attention(artifact::Binder& binder, const std::string& prefix,
 }
 
 /// The NextN draft head, bound where the trunk's layers are and placed by whether the run asked
-/// for it: a run without `--spec mtp` validates the head's shapes and uploads nothing. The head
+/// for it and whether this stage is where the logits are: a run without `--spec mtp`, or a
+/// pipeline stage before the last, validates the head's shapes and uploads nothing. The head
 /// keeps its experts beside it -- a token drafted every round would cross PCIe for them every
-/// round -- so the trunk's expert offload does not reach it.
+/// round -- so the trunk's expert offload does not reach it; and on a pipeline those experts
+/// are a whole mixture layer's worth per card, which is why only the stage that runs the head
+/// carries them (the other stages run the verify forward for their own layers and adopt the
+/// head stage's decision).
 void bind_mtp_head(artifact::Binder& binder, NumericFormat weights,
-                   family::StartupFeatures features, BindingPlan& out) {
+                   family::StartupFeatures features, bool holds_head, BindingPlan& out) {
     const family::TextGeometry& g = out.geometry;
     MtpPlan& mtp                  = out.mtp;
     mtp.present                   = binder.has("mtp/input_projection");
@@ -178,8 +182,9 @@ void bind_mtp_head(artifact::Binder& binder, NumericFormat weights,
         }
         return;
     }
-    g_layer_placement  = features.mtp() ? artifact::TensorPlacement::Device
-                                        : artifact::TensorPlacement::ValidateOnly;
+    mtp.resident       = features.mtp() && holds_head;
+    g_layer_placement  = mtp.resident ? artifact::TensorPlacement::Device
+                                      : artifact::TensorPlacement::ValidateOnly;
     g_expert_placement = g_layer_placement;
     const std::string prefix = "mtp/";
     const std::string layer  = prefix + "layer/";
@@ -470,9 +475,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // pipeline-capable target uploads the head everywhere, so the gap has never shown. Pruning
     // it here would trade 0.65 GB for a crash on a path this target cannot yet prove is
     // unreachable; the honest thing is to carry it and leave the gap named.
-    const bool staged   = stage_last > 0;
-    out.embeds          = !staged || stage_first == 0;
-    out.finishes        = true;
+    const bool staged     = stage_last > 0;
+    // The head runs where the logits are (the last stage, or a whole model), and it embeds the
+    // tokens it verifies and drafts -- so that stage carries the table too.
+    const bool holds_head = !staged || stage_last >= g.layers;
+    out.embeds            = !staged || stage_first == 0 || (features.mtp() && holds_head);
+    out.finishes          = true;
     g_layer_placement   = out.embeds ? artifact::TensorPlacement::Device
                                      : artifact::TensorPlacement::ValidateOnly;
     out.token_embedding = bind_weight(binder, "text/token_embedding", vocabulary_format,
@@ -482,7 +490,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     bind_text_layers(binder, weights_profile, stage_first, stage_last, host_moe_layers,
                      gpu_layers, out);
     g_expert_placement  = artifact::TensorPlacement::Device;
-    bind_mtp_head(binder, vocabulary_format, features, out);
+    bind_mtp_head(binder, vocabulary_format, features, holds_head, out);
     out.final_norm      = artifact::bind_device_tensor(
         binder, "text/final_norm", NumericFormat::BF16,
         {static_cast<std::uint64_t>(g.hidden)});
@@ -609,7 +617,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         }
     }
 
-    if (plan.features.mtp() && plan.mtp.present) {
+    if (plan.features.mtp() && plan.mtp.present && plan.mtp.resident) {
         MtpWeights& mtp      = runtime.mtp.emplace();
         mtp.input_projection = materialized_weight(backing, plan.mtp.input_projection, g.hidden,
                                                    g.mtp_input_rows());

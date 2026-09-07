@@ -311,9 +311,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // A trunk-block draft head is not in `model.mtp`: its block is bound where the trunk's
     // layers are, and the target answers for it. `Variant::mtp_block` refuses if the run asked
     // for a head the artifact did not carry.
+    // ...and a pipeline stage before the last carries no head at all: the head runs where the
+    // logits are, and the other stages adopt its decisions.
+    const bool plan_holds_head =
+        !(plan.pipeline_stage_last > 0 && plan.pipeline_stage_last < cfg.layers);
     const bool mtp_view_matches = mtp_block_is_trunk_layer<Variant>()
                                       ? true
-                                      : model.mtp.has_value() == plan.features.mtp();
+                                      : model.mtp.has_value() == (plan.features.mtp() && plan_holds_head);
     if (model.features != plan.features || !mtp_view_matches ||
         model.dflash.has_value() != plan.features.dflash() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
@@ -954,7 +958,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                              std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
 
-        if (needs_hidden_correction) {
+        // The correction re-selects a column of the round's device frame, which only the
+        // stage with the head filled -- and which matters only there, where the tail hidden
+        // is read.
+        if (needs_hidden_correction && stage_holds_head()) {
             const auto batch = static_cast<std::int32_t>(lanes.size());
             Tensor selector_tensor;
             Tensor hidden;
@@ -1030,9 +1037,11 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
+            // MTP reads the lane's own copy of the decision (SpeculativeOutcome), never the
+            // shared egress: another round may already be copying into that.
             const TokenId* token_base =
                 speculative_backend == SpeculativeBackend::Mtp
-                    ? mtp_host_egress->licensed_tokens.data() + row * width
+                    ? request.outcome.licensed_tokens.data()
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
@@ -1046,11 +1055,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 if (terminal[row]) {
                     sequence.mtp_draft_count = 0;
                 } else {
-                    const std::int32_t next  = mtp_host_egress->next_extents[row];
+                    const std::int32_t next  = request.outcome.next_extent;
                     sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
-                        sequence.mtp_drafts[step] =
-                            mtp_host_egress->next_drafts[step * max_concurrency + row];
+                        sequence.mtp_drafts[step] = request.outcome.next_drafts[step];
                     }
                 }
             } else {
@@ -2009,16 +2017,20 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 .position        = checked_i32(staged.base - 1, "MTP bridge position"),
                 .rope_position   = prompt_rope_position(staged.prompt, staged.base - 1),
             };
-            if (staged.vision) {
-                schedule::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
-                                                bridge);
-            } else {
-                Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
-                const TokenId token = staged.prompt.token_ids[staged.base];
-                CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
-                                           cudaMemcpyHostToDevice, device.stream));
-                schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
-                                                 bridge.position, bridge.rope_position, false);
+            // The bridge runs the head, which only the stage with the logits carries; a
+            // stage before it keeps the bookkeeping and nothing else.
+            if (stage_holds_head()) {
+                if (staged.vision) {
+                    schedule::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
+                                                    bridge);
+                } else {
+                    Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
+                    const TokenId token = staged.prompt.token_ids[staged.base];
+                    CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
+                                               cudaMemcpyHostToDevice, device.stream));
+                    schedule::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
+                                                     bridge.position, bridge.rope_position, false);
+                }
             }
             sequence.mtp_kv_valid = staged.base;
             staged.mtp_bridge     = MtpBridgeMode::None;
@@ -2132,12 +2144,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                     throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
                 }
                 mark_workspace_usage(workspace_plan.mtp_prefill);
-                const auto bridge_rope =
-                    prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
-                schedule::mtp_bridge_and_propose(
-                    schedule_state, io.token, sequence.tail_hidden,
-                    checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
-                    bridge_rope, staged.initial_mtp_extent != 0);
+                if (stage_holds_head()) {
+                    const auto bridge_rope =
+                        prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
+                    schedule::mtp_bridge_and_propose(
+                        schedule_state, io.token, sequence.tail_hidden,
+                        checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
+                        bridge_rope, staged.initial_mtp_extent != 0);
+                }
                 sequence.mtp_kv_valid = staged.prompt_tokens;
                 staged.mtp_bridge     = MtpBridgeMode::None;
             }
@@ -2145,9 +2159,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 
         copy_round_token();
         std::array<TokenId, family::kMtpDecodeMaximumDrafts> initial_drafts{};
-        if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
+        // A stage without the head proposed nothing; it adopts the head stage's first drafts
+        // (adopt_lane_draft_state) and starts with none of its own.
+        const std::uint32_t proposed_extent = stage_holds_head() ? staged.initial_mtp_extent : 0U;
+        if (staged.prepare_mtp && proposed_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
-                                       staged.initial_mtp_extent * sizeof(TokenId),
+                                       proposed_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
         }
         const auto pre_sync = Clock::now();
@@ -2180,9 +2197,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (sequence.mtp_kv_valid != prompt_tokens) {
                 throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
             }
-            sequence.mtp_draft_count = staged.initial_mtp_extent;
-            std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
-                        sequence.mtp_drafts.begin());
+            sequence.mtp_draft_count = proposed_extent;
+            std::copy_n(initial_drafts.begin(), proposed_extent, sequence.mtp_drafts.begin());
         } else if (speculative_backend == SpeculativeBackend::DFlash &&
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
@@ -2944,8 +2960,8 @@ ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_la
     return consume_mixed_round(launch_mixed_round(prefill_lanes, lanes, budgets));
 }
 
-runtime::BatchedGeneratedRound
-ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+runtime::RoundHandle
+ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets) {
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
@@ -2953,6 +2969,10 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
         throw std::invalid_argument("MTP batch membership is invalid");
+    }
+    if (in_flight_.id != 0 && in_flight_.rows != 0) {
+        // The ordinary round tolerates a stale record because its consume clears nothing;
+        // here a launch over an unconsumed round would hand two rounds one egress.
     }
 
     const std::uint32_t width      = draft_window + 1;
@@ -3041,9 +3061,63 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
-        device.synchronize();
 
+        in_flight_ = InFlightRound{.id    = ++in_flight_counter_,
+                                   .rows  = static_cast<std::uint32_t>(lanes.size()),
+                                   .burst = 0,
+                                   .start = started};
+        std::copy(lanes.begin(), lanes.end(), in_flight_.lanes.begin());
+        std::copy(budgets.begin(), budgets.end(), in_flight_.budgets.begin());
+        return runtime::RoundHandle{.id = in_flight_.id, .rows = in_flight_.rows};
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
+    }
+}
+
+runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::RoundHandle handle) {
+    if (!handle.valid() || handle.id != in_flight_.id) {
+        throw std::logic_error("consuming an MTP round that is not in flight");
+    }
+    const std::span<const std::uint32_t> lanes(in_flight_.lanes.data(), in_flight_.rows);
+    const std::span<const runtime::RoundBudget> budgets(in_flight_.budgets.data(), in_flight_.rows);
+    const auto started          = in_flight_.start;
+    const std::uint32_t width   = draft_window + 1;
+    try {
+        device.synchronize();
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+
+        if (!stage_holds_head()) {
+            // This stage ran the verify forward for its layers and exported the residual;
+            // the decision is made where the logits are. The lanes wait, pending with nothing
+            // produced, until the driver brings that decision in `adopt_speculative_outcome`.
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                SequenceState& sequence = sequences[lanes[row]];
+                RequestControl& request = requests[lanes[row]];
+                request.pending         = PendingCandidate{
+                            .kind          = PendingKind::Speculative,
+                            .base_E        = sequence.execution_frontier,
+                            .base_S        = sequence.ledger_frontier,
+                            .prompt_tokens = 0,
+                            .produced      = 0,
+                };
+                request.lifecycle = Lifecycle::Pending;
+                request.timings.decode_seconds += seconds;
+            }
+            outcome_export_.clear();
+            return runtime::BatchedGeneratedRound{
+                .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
+                                                       lanes.size() * width),
+                .row_counts = std::span<const std::int32_t>(headless_counts_.data(), lanes.size()),
+                .row_stride = width};
+        }
+
+        outcome_export_.resize(lanes.size() * sizeof(SpeculativeOutcome));
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];
@@ -3064,6 +3138,21 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            // The lane's own copy of the decision (see SpeculativeOutcome): the egress is
+            // the next round's the moment that round launches.
+            SpeculativeOutcome& outcome = request.outcome;
+            outcome                     = SpeculativeOutcome{};
+            outcome.licensed_count      = count_i;
+            outcome.accepted_drafts     = accepted_i;
+            outcome.next_extent         = next_i;
+            std::copy(row_tokens.begin(), row_tokens.end(), outcome.licensed_tokens.begin());
+            for (std::int32_t step = 0; step < next_i; ++step) {
+                outcome.next_drafts[static_cast<std::size_t>(step)] =
+                    mtp_host_egress->next_drafts[static_cast<std::size_t>(step) * max_concurrency + row];
+            }
+            std::memcpy(outcome_export_.data() + row * sizeof(SpeculativeOutcome), &outcome,
+                        sizeof(SpeculativeOutcome));
+
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
             if (pcur == 0) {
@@ -3102,6 +3191,78 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
         throw;
     }
+}
+
+runtime::BatchedGeneratedRound
+ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+                                  std::span<const runtime::RoundBudget> budgets) {
+    return consume_mtp_round(launch_mtp_round(lanes, budgets));
+}
+
+void ProgramImplCore::adopt_speculative_outcome(std::span<const std::uint32_t> lanes,
+                                                std::span<const std::byte> outcome) {
+    if (speculative_backend != SpeculativeBackend::Mtp) {
+        throw std::logic_error("adopting a speculative outcome requires the MTP backend");
+    }
+    if (stage_holds_head()) {
+        throw std::logic_error("the stage with the head decides its own speculative rounds");
+    }
+    if (lanes.empty() || lanes.size() > max_concurrency ||
+        outcome.size() != lanes.size() * sizeof(SpeculativeOutcome)) {
+        throw std::invalid_argument("speculative outcome does not match the round's membership");
+    }
+    const std::uint32_t width = draft_window + 1;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+        RequestControl& request       = requests[lane];
+        const SequenceState& sequence = sequences[lane];
+        if (request.lifecycle != Lifecycle::Pending ||
+            request.pending.kind != PendingKind::Speculative || request.pending.produced != 0) {
+            throw std::logic_error(
+                "adopting a speculative outcome needs a headless pending round on the lane");
+        }
+        SpeculativeOutcome adopted{};
+        std::memcpy(&adopted, outcome.data() + row * sizeof(SpeculativeOutcome),
+                    sizeof(SpeculativeOutcome));
+        const std::int32_t count_i = adopted.licensed_count;
+        if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) ||
+            adopted.accepted_drafts < 0 || adopted.accepted_drafts + 1 != count_i ||
+            adopted.next_extent < 0 || adopted.next_extent > static_cast<std::int32_t>(draft_window) ||
+            static_cast<std::uint64_t>(sequence.execution_frontier) +
+                    static_cast<std::uint32_t>(count_i) >
+                capacity) {
+            throw std::runtime_error("adopted speculative outcome has invalid row metadata");
+        }
+        validate_licensed_tokens(std::span<const TokenId>(adopted.licensed_tokens.data(),
+                                                          static_cast<std::size_t>(count_i)));
+        request.outcome          = adopted;
+        request.pending.produced = static_cast<std::uint32_t>(count_i);
+    }
+}
+
+std::span<const std::byte> ProgramImplCore::lane_draft_state(std::uint32_t lane) const {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    const SequenceState& sequence = sequences[lane];
+    const LaneDraftState state{.count = sequence.mtp_draft_count, .drafts = sequence.mtp_drafts};
+    std::memcpy(draft_state_export_.data(), &state, sizeof(state));
+    return std::span<const std::byte>(draft_state_export_.data(), sizeof(state));
+}
+
+void ProgramImplCore::adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (state.size() != sizeof(LaneDraftState)) {
+        throw std::invalid_argument("lane draft state has the wrong size");
+    }
+    LaneDraftState adopted{};
+    std::memcpy(&adopted, state.data(), sizeof(adopted));
+    if (adopted.count > draft_window) {
+        throw std::invalid_argument("adopted draft state is wider than the draft window");
+    }
+    validate_licensed_tokens(std::span<const TokenId>(adopted.drafts.data(), adopted.count));
+    SequenceState& sequence  = sequences[lane];
+    sequence.mtp_draft_count = adopted.count;
+    sequence.mtp_drafts      = adopted.drafts;
 }
 
 runtime::BatchedGeneratedRound

@@ -242,6 +242,17 @@ public:
                                                           std::span<const std::uint32_t> lanes,
                                                           std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] runtime::MixedRoundResult consume_mixed_round(runtime::RoundHandle handle);
+    /// Pipeline driver, speculative rounds. A decode round licenses up to `width` tokens per
+    /// lane. The stage with the head decides the round -- the licensed tokens and the next
+    /// drafts, per lane -- and hands that decision out as bytes the stages without the head
+    /// adopt before every stage folds on it; a lane's draft state after a prefill crosses the
+    /// same way. The bytes are the family's own record and opaque to the driver.
+    [[nodiscard]] std::uint32_t speculative_round_width() const noexcept;
+    [[nodiscard]] std::span<const std::byte> speculative_outcome() const noexcept;
+    void adopt_speculative_outcome(std::span<const std::uint32_t> lanes,
+                                   std::span<const std::byte> outcome);
+    [[nodiscard]] std::span<const std::byte> lane_draft_state(std::uint32_t lane) const;
+    void adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state);
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;

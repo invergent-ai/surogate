@@ -7,6 +7,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
@@ -90,6 +92,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
         card.set_ple_state(state.execution.ple);
+        if (std::getenv("SUROGATE_SERVE_TRACE_STAGE") != nullptr) {
+            std::fprintf(stderr, "stage-trace: an MTP round carries stage [%d, %d)\n",
+                         state.execution.stage.first, state.execution.stage.last);
+        }
+        card.set_stage(state.execution.stage);
         Tensor anchors           = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers         = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets           = frame.remaining_budgets.slice(0, 0, batch_size);
@@ -123,6 +130,22 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
+        if (!card.stage_finishes()) {
+            // A pipeline stage without the head: the verify forward over the draft columns
+            // for its own layers, the recurrent state recorded for the fold, the residual
+            // exported for the next stage -- and nothing more. Accept, select, align and
+            // propose are the head stage's; what it decides reaches this stage as host
+            // integers (adopt_speculative_outcome, then resolve_pending_batch).
+            if (state.execution.replay_records == nullptr) {
+                throw std::logic_error("speculative target verify has no ReplaySSM record storage");
+            }
+            card.set_gdn_state_action(GdnStateAction::RecordForReplay,
+                                      state.execution.replay_records);
+            card.target_verify_batch(verify_ids, target_positions, target_rope, target_valid,
+                                     text_rows, lanes, envelopes.target_verify, target_hidden,
+                                     target_logits, target_tokens);
+            return;
+        }
         target_verify_accept(state.execution, state.continuation_hidden_store, card,
                              TargetVerifyFrameView{
                                  .ids             = verify_ids,

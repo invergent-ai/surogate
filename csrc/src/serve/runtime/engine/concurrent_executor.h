@@ -1100,7 +1100,10 @@ private:
         // Launch every idle group that has work.
         bool launched = false;
         for (std::uint32_t g = 0; g < groups; ++g) {
-            if (program.group_in_flight(g)) { continue; }
+            // A group whose flight finished inside an earlier launch of this same loop is
+            // handed back by the next tick; until then its lane is neither decode-ready nor
+            // free of its prefill, and relaunching it would advance a step that already ran.
+            if (program.group_in_flight(g) || program.group_finished_pending(g)) { continue; }
             GroupMeta& meta = group_meta_[g];
             meta.membership = RoundMembership{};
             for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {

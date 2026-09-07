@@ -323,7 +323,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     out.mtp.present = binder.has("mtp/input_projection");
     if (out.mtp.present) {
         MtpPlan& mtp      = out.mtp;
-        mtp.resident      = features.mtp();
+        // ...and on a pipeline, only on the stage that runs the head: the last one.
+        mtp.resident      = features.mtp() && (!staged || stage_last >= out.geometry.layers);
         g_layer_placement = mtp.resident ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
         mtp.embedding_norm = device(binder, "mtp/embedding_norm", NumericFormat::BF16, {kHidden});
         mtp.hidden_norm    = device(binder, "mtp/hidden_norm", NumericFormat::FP32, {kHcWidth});
