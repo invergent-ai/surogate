@@ -510,6 +510,15 @@ void TextContext::mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidde
     cudaStream_t s          = ctx_.stream;
     const int T             = ids.ne[0] * ids.ne[1];
     const std::int32_t wide = weights_.geometry.residual;
+    // SUROGATE_SERVE_PREFILL_TIMING=1: where a head-block call spends its time, on the stream.
+    static const bool timing = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
+    cudaEvent_t lap[5]{};
+    const auto mark = [&](int i) {
+        if (!timing) { return; }
+        CUDA_CHECK(cudaEventCreateWithFlags(&lap[i], cudaEventDefault));
+        CUDA_CHECK(cudaEventRecord(lap[i], s));
+    };
+    mark(0);
 
     auto roots = workspace_recipe::mtp_trunk_stem(work_, cfg_geometry(), T,
                                                   input_embeddings == nullptr);
@@ -525,6 +534,7 @@ void TextContext::mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidde
     // own wide residual at the previous position.
     Tensor x = roots.residual;
     V::mtp_fold(weights_, emb, hidden.view({wide, T}), x, work_, s);
+    mark(1);
 
     // One trunk block. The head keeps its own KV plane, one layer deep.
     ScopedValue<const Tensor*> position_binding(active_cache_positions_, &positions);
@@ -544,15 +554,28 @@ void TextContext::mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidde
         auto mixer_scope = work_.scope();
         attn_mix(block, x, 0, TextConfig::layers, Phase::Verify, KvPlane::Mtp);
     }
+    mark(2);
     {
         auto post_mixer_scope = work_.scope();
         mlp_tail(block.post_attn_norm, block.mlp, x, Phase::Verify);
     }
+    mark(3);
 
     // The wide residual is the head's output: the next draft step folds into it again. The
     // collapse to the LM head's width happens at proposal time, not here.
     Tensor out = mtp_hidden.view({wide, T});
     CUDA_CHECK(cudaMemcpyAsync(out.data, x.data, out.bytes(), cudaMemcpyDeviceToDevice, s));
+    mark(4);
+    if (timing) {
+        CUDA_CHECK(cudaEventSynchronize(lap[4]));
+        float ms[4]{};
+        for (int i = 0; i < 4; ++i) { CUDA_CHECK(cudaEventElapsedTime(&ms[i], lap[i], lap[i + 1])); }
+        std::fprintf(stderr,
+                     "mtp-timing: head block over %d columns: fold %.1f attn %.1f mixture %.1f "
+                     "copy %.1f ms (batch %d)\n",
+                     T, ms[0], ms[1], ms[2], ms[3], active_sequence_batch_);
+        for (auto& e : lap) { CUDA_CHECK(cudaEventDestroy(e)); }
+    }
     }
 }
 
@@ -2359,28 +2382,29 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     for (std::size_t sg = 0; sg < segments.size(); ++sg) {
         const MixedPrefillSegment& segment = segments[sg];
         if (segment.mtp_kv_table_row < 0) { continue; }
-        const int len = static_cast<int>(segment.ids.size());
-        if (segment.finalize || segment.mtp_shifted_ids.size() != static_cast<std::size_t>(len)) {
+        const int len   = static_cast<int>(segment.ids.size());
+        const int count = static_cast<int>(segment.mtp_shifted_ids.size());
+        if (segment.finalize || count > len) {
             throw std::invalid_argument(
-                "mixed chunk head alignment needs one shifted id per column and no finalizer");
+                "mixed chunk head alignment needs at most one shifted id per column and no finalizer");
         }
-        if (!mtp_kv_.valid()) {
-            throw std::logic_error("mixed chunk head alignment without the head's KV");
+        // A segment that ends at the prompt's last column aligns one column fewer: that column
+        // pairs with the token the zero-suffix step samples. A one-token tail aligns nothing.
+        if (count == 0) { continue; }
+        if (!segment.mtp_kv.valid()) {
+            throw std::logic_error("mixed chunk head alignment without the segment's head KV");
         }
-        if constexpr (!mtp_block_is_trunk_layer<Variant>()) {
-            // The fixed tail appends and attends through the card's per-sequence view: one
-            // segment, the sequence that view belongs to.
-            if (segments.size() != 1) {
-                throw std::logic_error("a fixed-tail draft head aligns one mixed segment a round");
-            }
-        }
+        // The fixed tail appends through the card's per-sequence head view; each segment
+        // brings its own, bound for its call (the trunk-block head reads the batch view by
+        // the row scalar below and ignores it).
+        ScopedValue<family::PagedKVCacheView> segment_view(mtp_kv_, segment.mtp_kv);
         auto alignment_scope = work_.scope();
-        Tensor shifted       = work_.alloc(DType::I32, {len});
+        Tensor shifted       = work_.alloc(DType::I32, {count});
         copy_i32(segment.mtp_shifted_ids.data(), shifted, s);
         ops::set_i32_scalar(io_.backend_kv_table_row, segment.mtp_kv_table_row, s);
-        Tensor segment_hidden    = xf.slice(1, segment_begin[sg], len);
-        Tensor segment_positions = positions.slice(0, segment_begin[sg], len);
-        const auto seen          = static_cast<std::uint32_t>(segment.kv_base + len);
+        Tensor segment_hidden    = xf.slice(1, segment_begin[sg], count);
+        Tensor segment_positions = positions.slice(0, segment_begin[sg], count);
+        const auto seen          = static_cast<std::uint32_t>(segment.kv_base + count);
         mtp_prefill_chunk(shifted, segment_hidden, nullptr, segment_positions, segment_positions,
                           ops::GqaExecutionEnvelope{seen, seen}, false, nullptr, nullptr, nullptr);
     }

@@ -370,9 +370,12 @@ public:
         std::int32_t state_slot;   // its GDN/conv state slot
         bool finalize;             // sample after this chunk
         // The draft head, aligned over this chunk's columns on the stage that holds it: the
-        // head's paged-KV row, and the prompt's next token per column (the ids shifted by
-        // one). A negative row leaves the head out of the round.
+        // head's paged-KV row (a trunk-block head addresses the batch view by it), the
+        // segment's own per-sequence head view (a fixed-tail head appends through it), and
+        // the prompt's next token per column (the ids shifted by one). A negative row leaves
+        // the head out of the round.
         std::int32_t mtp_kv_table_row = -1;
+        family::PagedKVCacheView mtp_kv{};
         std::span<const int> mtp_shifted_ids{};
     };
     // Staging for the segments that finish in this round: their last hidden columns are

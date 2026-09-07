@@ -2571,11 +2571,12 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const no
         return false;
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        // Under the draft head a mixed round takes a prompt up to, never through, its last
-        // token: that column pairs with the token the prompt's final chunk samples, and the
-        // final chunk -- the lone step, as before -- pairs it, proposes, and hands the lane
-        // its first drafts.
-        return staged.prepare_mtp && staged.cursor + 1 < staged.prompt_tokens;
+        // Under the draft head a mixed round takes the whole prompt and aligns the head over
+        // every column but the last, which pairs with the token not yet sampled; the prompt
+        // then finishes as a no-head prompt does, with a zero-suffix step off its tail hidden,
+        // where the exact-hit bridge pairs that column, proposes, and hands the lane its
+        // first drafts (consume marks the lane for it).
+        return staged.prepare_mtp;
     }
     return !staged.prepare_mtp;
 }
@@ -2610,8 +2611,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         const SequenceState& staged_sequence = sequences[lane];
         if (entry.vision || entry.prepare_mtp != head || entry.cursor >= entry.prompt_tokens ||
             entry.mtp_bridge != MtpBridgeMode::None ||
-            (head && (entry.cursor + 1 >= entry.prompt_tokens || !staged_sequence.kv ||
-                      !staged_sequence.kv->backend ||
+            (head && (!staged_sequence.kv || !staged_sequence.kv->backend ||
                       staged_sequence.kv->backend->bound_row() < 0))) {
             throw std::logic_error("mixed round does not support this staged prefill");
         }
@@ -2711,16 +2711,9 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
         std::uint32_t window_left = mixed_chunk_cap;
         std::size_t staged_count  = 0;
-        // A fixed-tail draft head aligns through the card's one per-sequence KV view, so under
-        // such a head a round takes one prompt; a trunk-block head addresses each segment by
-        // its own row and takes them all.
-        const std::size_t segment_limit =
-            head && !mtp_block_is_trunk_layer<Variant>() ? 1 : prefill_lanes.size();
-        for (std::size_t i = 0; i < segment_limit && window_left > 0; ++i) {
+        for (std::size_t i = 0; i < prefill_lanes.size() && window_left > 0; ++i) {
             const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
-            // Under the head the prompt's last token is the final chunk's (see
-            // mixed_round_supported).
-            const std::uint32_t want = entry.prompt_tokens - entry.cursor - (head ? 1U : 0U);
+            const std::uint32_t want = entry.prompt_tokens - entry.cursor;
             nominals[i]              = std::min(window_left, want);
             window_left -= nominals[i];
             ++staged_count;
@@ -2759,10 +2752,9 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             mark_workspace_usage(workspace_plan.mtp_round);
         }
 
-        // The first staged prompt owns the card's per-sequence views, the head's included: a
-        // trunk-block head addresses every segment through the batch view and its own row, a
-        // fixed-tail head through this view alone, which is why such a head takes one segment
-        // a round (see the window above).
+        // The first staged prompt owns the card's per-sequence views, the head's included;
+        // each segment carries its own head view for the alignment (a fixed-tail head appends
+        // through it, a trunk-block head addresses the batch view by the segment's row).
         schedule::TextContext card(device, model, work, text_kv_view(prefill_sequence),
                                    decoder->linear_attention, io, prefill_hidden, prefill_chunk,
                                    staged.cursor,
@@ -2908,9 +2900,16 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                     .mtp_kv_table_row = head && stage_holds_head()
                                             ? sequence.kv->backend->bound_row()
                                             : -1,
-                    .mtp_shifted_ids  = head ? std::span<const TokenId>(entry.prompt.token_ids)
-                                                   .subspan(entry.cursor + 1, nominals[i])
-                                             : std::span<const TokenId>{},
+                    .mtp_kv = head && stage_holds_head() ? mtp_kv_view(sequence)
+                                                          : family::PagedKVCacheView{},
+                    // Every column but the prompt's last pairs with the prompt's next token;
+                    // the last pairs with the token the zero-suffix step samples (the bridge).
+                    .mtp_shifted_ids =
+                        head ? std::span<const TokenId>(entry.prompt.token_ids)
+                                   .subspan(entry.cursor + 1,
+                                            std::min(nominals[i],
+                                                     entry.prompt_tokens - entry.cursor - 1))
+                             : std::span<const TokenId>{},
                 };
             }
             chunk = card.mixed_chunk_multi(
@@ -3101,8 +3100,15 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             entry.cursor += processed;
             sequence.text_kv_valid = entry.cursor;
             // The head's KV followed the trunk's through the segment (on the stage that
-            // holds the head; the others keep the count, as the lone chunk does).
-            if (head) { sequence.mtp_kv_valid = entry.cursor; }
+            // holds the head; the others keep the count, as the lone chunk does) -- to the
+            // column before the prompt's last, whose pairing waits for the sampled token: the
+            // prompt finishes with the zero-suffix step and its exact-hit bridge, exactly as
+            // a prompt whose whole prefix was reused does.
+            if (head) {
+                const bool reached_end = entry.cursor == entry.prompt_tokens;
+                sequence.mtp_kv_valid  = entry.cursor - (reached_end ? 1U : 0U);
+                if (reached_end) { entry.mtp_bridge = MtpBridgeMode::AfterExactHit; }
+            }
             result.prefills[i]     = runtime::PrefillStepResult{
                     .summary = summary, .processed_prompt_tokens = processed};
             if (entry.use_graph && graph_hit) {
