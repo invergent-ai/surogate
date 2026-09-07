@@ -9,7 +9,9 @@ request asks for `stream_options.include_usage` so the token accounting is the e
 SHARDS > 1 spreads the clients over that many processes (one process cannot drive a fast
 engine: 100 streaming clients under one GIL saturate a core before the engine saturates).
 
-Reports, over the measured window only (a warm-up of the same shape runs first when asked):
+Reports, over the measured window only (a warm-up of the same shape runs first when asked;
+SUROGATE_PROBE_REQUESTS=N makes every client send exactly N requests instead of filling a
+window -- one wave, seconds on a large model):
   decode tok/s   = completion tokens / wall
   prefill tok/s  = prompt tokens / wall (a throughput share, decode phases included)
   TTFT p50 / p90 = time to the first streamed token (content or reasoning)
@@ -44,7 +46,12 @@ def run(port, model, users, seconds, prompt_tokens, max_tokens, label):
         # arrivals stay smooth; the phase spread then persists for the run.
         if jitter > 0:
             time.sleep(random.uniform(0.0, jitter))
-        while time.time() < stop:
+        sent = 0
+        # SUROGATE_PROBE_REQUESTS=N: every client sends exactly N requests and stops, whatever
+        # the window -- one wave, the llama-bench shape (pp512 / tg128 at N streams), seconds
+        # instead of minutes on a large model. The window rule stays the default.
+        while (sent < requests_per_client) if requests_per_client > 0 else (time.time() < stop):
+            sent += 1
             with lock:
                 serial[0] += 1
                 tag = serial[0]
@@ -100,6 +107,7 @@ def run(port, model, users, seconds, prompt_tokens, max_tokens, label):
                     err[0] += 1
                     errors.append(str(exc)[:80])
 
+    requests_per_client = int(os.environ.get("SUROGATE_PROBE_REQUESTS", "0"))
     begin = time.time()
     threads = [threading.Thread(target=worker) for _ in range(users)]
     for t in threads:
