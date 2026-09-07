@@ -69,6 +69,52 @@ __global__ __launch_bounds__(Threads,
     if (tid == 0) { scales[token] = scale; }
 }
 
+/// The same per-token E4M3 quantisation for a runtime K: one block a token, a pass to find the
+/// row's maximum and a pass to encode against it. The templated kernel above unrolls K into
+/// registers and reads it once; this one re-reads from L2, which is what an unregistered shape
+/// pays for having no schedule of its own.
+template <int Threads>
+__global__ __launch_bounds__(Threads, 2) void fp8_a8_quantize_generic_kernel(
+    const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
+    float* __restrict__ scales, std::int32_t input_rows) {
+    constexpr int warps = Threads / 32;
+    __shared__ float warp_maxima[warps];
+    __shared__ float token_scale;
+    const int token = static_cast<int>(blockIdx.x);
+    const int tid   = static_cast<int>(threadIdx.x);
+    const int lane  = tid & 31;
+    const int warp  = tid >> 5;
+    const int pairs = input_rows / 2;
+    const auto* input_pairs = reinterpret_cast<const std::uint32_t*>(
+        input + static_cast<std::int64_t>(token) * input_rows);
+    auto* output_pairs = reinterpret_cast<std::uint16_t*>(
+        codes + static_cast<std::int64_t>(token) * input_rows);
+
+    float maximum = 0.0F;
+    for (int pair = tid; pair < pairs; pair += Threads) {
+        const float2 value = bf16x2_bits_to_float2(input_pairs[pair]);
+        maximum            = fmaxf(maximum, fabsf(value.x));
+        maximum            = fmaxf(maximum, fabsf(value.y));
+    }
+    maximum = warp_max(maximum);
+    if (lane == 0) { warp_maxima[warp] = maximum; }
+    __syncthreads();
+    if (warp == 0) {
+        maximum = lane < warps ? warp_maxima[lane] : 0.0F;
+        maximum = warp_max(maximum);
+        if (lane == 0) { token_scale = maximum > 0.0F ? maximum / 448.0F : 0.0F; }
+    }
+    __syncthreads();
+    const float scale   = token_scale;
+    const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+    for (int pair = tid; pair < pairs; pair += Threads) {
+        const float2 value  = bf16x2_bits_to_float2(input_pairs[pair]);
+        const float2 scaled = make_float2(value.x * inverse, value.y * inverse);
+        output_pairs[pair]  = __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
+    }
+    if (tid == 0) { scales[token] = scale; }
+}
+
 template <class Geometry, class Schedule, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std::int32_t tokens,
                 cudaStream_t stream) {
@@ -139,8 +185,15 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
         launch_quantize_exact<Fp8Activation17408Geometry>(x, workspace, stream);
         return;
     default:
-        throw std::invalid_argument("fp8 A8 quantize: unsupported K");
+        break;
     }
+    constexpr int kThreads = 256;
+    if ((weight.k % 32) != 0) {
+        throw std::invalid_argument("fp8 A8 quantize: K must be a whole number of 32 values");
+    }
+    fp8_a8_quantize_generic_kernel<kThreads><<<x.ne[1], kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales, weight.k);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
@@ -153,6 +206,12 @@ void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Work
                             weight.n, workspace.scales, tokens,
                             static_cast<__nv_bfloat16*>(out.data), weight.n, false, stream);
         return;
+    }
+    if (!is_fp8_registered_problem(weight.n, weight.k)) {
+        // The generic shape has no in-house A8 kernel: the router only sends it here at the
+        // widths where the cuBLASLt GEMM above takes it.
+        throw std::invalid_argument(
+            "fp8 A8: an unregistered shape has no A8 kernel without the cuBLASLt route");
     }
     switch (resolve_fp8_problem(weight.n, weight.k)) {
     case Fp8Problem::AttnInput:

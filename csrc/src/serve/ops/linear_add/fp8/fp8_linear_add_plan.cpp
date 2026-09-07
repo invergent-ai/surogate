@@ -3,6 +3,7 @@
 
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_launch.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -17,12 +18,24 @@ enum class Fp8LinearAddRoute : std::uint8_t {
     A8,
 };
 
+/// The residual geometries this route has kernels for -- both Qwen3.8-27B projections.
+bool is_registered(std::int32_t output_rows, std::int32_t input_rows) {
+    return output_rows == Fp8Residual6144Geometry::kOutputRows &&
+           (input_rows == Fp8Residual6144Geometry::kInputRows ||
+            input_rows == Fp8Residual17408Geometry::kInputRows);
+}
+
 Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                 LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || output_rows != Fp8Residual6144Geometry::kOutputRows ||
-        (input_rows != Fp8Residual6144Geometry::kInputRows &&
-         input_rows != Fp8Residual17408Geometry::kInputRows)) {
+    if (tokens <= 0 || !is_fp8_linear_problem(output_rows, input_rows)) {
         throw std::invalid_argument("fp8 linear_add: unsupported shape");
+    }
+    if (!is_registered(output_rows, input_rows)) {
+        // As on the linear route: the generic shape's A8 path is the cuBLASLt GEMM, and below
+        // its width the generic BF16 kernel adds into the residual itself.
+        return policy == LinearPolicy::AllowA8 && fp8_cublaslt_route(tokens)
+                   ? Fp8LinearAddRoute::A8
+                   : Fp8LinearAddRoute::A16;
     }
     if (policy == LinearPolicy::A16Only) { return Fp8LinearAddRoute::A16; }
     if (policy != LinearPolicy::AllowA8) {
@@ -33,6 +46,10 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+    if (!is_registered(weight.n, weight.k)) {
+        launch_fp8_generic(x, weight, residual, /*accumulate=*/true, stream);
+        return;
+    }
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kFp8LastSmallT) {
         const std::int32_t active = std::min(kFp8LastSmallT, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +

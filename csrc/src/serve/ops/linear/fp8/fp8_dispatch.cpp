@@ -23,6 +23,15 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
     if (tokens <= 0 || !is_fp8_linear_problem(output_rows, input_rows)) {
         throw std::invalid_argument("fp8 linear: unsupported shape");
     }
+    if (!is_fp8_registered_problem(output_rows, input_rows)) {
+        // The generic shape's A8 path is the cuBLASLt GEMM, which starts at its own width;
+        // below it, and for a policy that does not ask for quantised activations, the generic
+        // BF16 kernel. A permissive policy does not require a lower-precision route, so A4 --
+        // which this format has no kernel for -- reads as A16 rather than a refusal.
+        return policy == LinearPolicy::AllowA8 && fp8_cublaslt_route(tokens)
+                   ? Fp8LinearRoute::A8
+                   : Fp8LinearRoute::A16;
+    }
     const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
     if (policy == LinearPolicy::A16Only) { return Fp8LinearRoute::A16; }
     // A permissive policy does not require a lower-precision route. Vocabulary logits retain
@@ -52,6 +61,10 @@ Fp8LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows, 
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (!is_fp8_registered_problem(weight.n, weight.k)) {
+        launch_fp8_generic(x, weight, out, /*accumulate=*/false, stream);
+        return;
+    }
     const Fp8Problem problem = resolve_fp8_problem(weight.n, weight.k);
     const std::int32_t chunk = problem == Fp8Problem::Vocabulary ? kFp8VocabularyLastA16MmaT
                                                                  : fp8_linear_small_t_max(problem);
@@ -104,10 +117,14 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::i
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 linear workspace: invalid token interval");
     }
-    const Fp8Problem problem = resolve_fp8_problem(output_rows, input_rows);
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
     (void)resolve_route(output_rows, input_rows, policy, max_tokens);
-    return interval_uses_a8(problem, policy, min_tokens, max_tokens)
+    const bool uses_a8 =
+        is_fp8_registered_problem(output_rows, input_rows)
+            ? interval_uses_a8(resolve_fp8_problem(output_rows, input_rows), policy, min_tokens,
+                               max_tokens)
+            : (policy == LinearPolicy::AllowA8 && fp8_cublaslt_route(max_tokens));
+    return uses_a8
                ? fp8_a8_workspace_capacity_bytes(max_tokens, input_rows,
                                                  fp8_cublaslt_route(max_tokens) ? output_rows : 0)
                : 0;

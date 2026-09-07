@@ -76,6 +76,12 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
                             static_cast<__nv_bfloat16*>(residual.data), weight.n, true, stream);
         return;
     }
+    if (!is_fp8_registered_problem(weight.n, weight.k)) {
+        // The router sends an unregistered shape here only at the widths the cuBLASLt GEMM
+        // above takes; there is no in-house A8 kernel for it.
+        throw std::invalid_argument(
+            "fp8 linear_add A8: an unregistered shape has no A8 kernel without the cuBLASLt route");
+    }
     switch (resolve_fp8_problem(weight.n, weight.k)) {
     case Fp8Problem::Residual6144:
         launch_problem<Fp8Residual6144Geometry>(weight, residual, scratch, x.ne[1], stream);

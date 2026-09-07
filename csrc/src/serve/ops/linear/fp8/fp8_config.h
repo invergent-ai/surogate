@@ -156,7 +156,10 @@ enum class Fp8Problem : std::uint8_t {
     Residual17408,
 };
 
-inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
+/// The registered geometries: the shapes with hand-tuned decode, small-T and A8 schedules.
+/// Every one of them is a Qwen3.8-27B projection.
+inline constexpr bool is_fp8_registered_problem(std::int32_t output_rows,
+                                                std::int32_t input_rows) {
     return (output_rows == Fp8AttnInputGeometry::kOutputRows &&
             input_rows == Fp8AttnInputGeometry::kInputRows) ||
            (output_rows == Fp8GdnInputGeometry::kOutputRows &&
@@ -169,6 +172,21 @@ inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32
             input_rows == Fp8Residual6144Geometry::kInputRows) ||
            (output_rows == Fp8Residual17408Geometry::kOutputRows &&
             input_rows == Fp8Residual17408Geometry::kInputRows);
+}
+
+/// A shape the table does not hold, which the generic route serves instead: one runtime-shaped
+/// kernel over BF16 activations at every width, and the A8 route's cuBLASLt GEMM at prefill
+/// widths. K is a whole number of 32 values -- what the activation planes and the vector loads
+/// need -- and that is the only shape this format cannot serve.
+inline constexpr bool is_fp8_generic_problem(std::int32_t output_rows, std::int32_t input_rows) {
+    return output_rows > 0 && input_rows > 0 && (input_rows % 32) == 0 &&
+           !is_fp8_registered_problem(output_rows, input_rows);
+}
+
+/// Whether this route can serve the shape at all, by either path.
+inline constexpr bool is_fp8_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
+    return is_fp8_registered_problem(output_rows, input_rows) ||
+           is_fp8_generic_problem(output_rows, input_rows);
 }
 
 inline Fp8Problem resolve_fp8_problem(std::int32_t output_rows, std::int32_t input_rows) {

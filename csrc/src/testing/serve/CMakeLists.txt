@@ -339,6 +339,7 @@ sinfer_add_linear_test(sinfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 sinfer_add_op_test(sinfer_linear_nvfp4_cublaslt_test SOURCES ops/linear/test_nvfp4_cublaslt.cpp  LIBRARIES sinfer_ops CUDA::cublasLt)
 sinfer_add_linear_test(sinfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
 sinfer_add_linear_test(sinfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
+sinfer_add_linear_test(sinfer_linear_fp8_generic_test ops/linear/test_fp8_generic.cpp)
 sinfer_add_op_test(sinfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES sinfer_ops)
