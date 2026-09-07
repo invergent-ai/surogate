@@ -785,9 +785,10 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
 
 bool Tokenizer::renders_chat_template() const noexcept { return delegate_ != nullptr; }
 
-std::string Tokenizer::render_chat_template(
-    const std::vector<std::pair<std::string, std::string>>& messages,
-    bool add_generation_prompt) const {
+std::string
+Tokenizer::render_chat_template(const std::vector<std::pair<std::string, std::string>>& messages,
+                                bool add_generation_prompt,
+                                const ChatTemplateVariables& variables) const {
     if (!delegate_) {
         throw std::logic_error("Tokenizer::render_chat_template: no template renderer for this "
                                "checkpoint");
@@ -795,7 +796,10 @@ std::string Tokenizer::render_chat_template(
     std::vector<::tokenizer::ChatMessage> converted;
     converted.reserve(messages.size());
     for (const auto& [role, content] : messages) { converted.push_back({role, content}); }
-    return delegate_->inner.apply_chat_template(converted, add_generation_prompt);
+    return delegate_->inner.apply_chat_template(
+        converted, add_generation_prompt,
+        ::tokenizer::ChatTemplateVariables{.enable_thinking  = variables.enable_thinking,
+                                           .reasoning_effort = variables.reasoning_effort});
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {

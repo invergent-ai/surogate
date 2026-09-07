@@ -287,6 +287,26 @@ int main(int argc, char** argv) {
         print_load_summary(engine.load_summary(), load_wall);
         engine.reset_memory_peaks();
 
+        // What this artifact's template accepts, asked of the artifact. Refusing here
+        // names the alternatives; the request path would otherwise fail deeper, with
+        // a message that could not list them.
+        if (cli.reasoning_effort) {
+            const sinfer::PromptCapabilities capabilities = engine.prompt_capabilities();
+            if (!capabilities.reasoning_effort.supports(*cli.reasoning_effort)) {
+                std::string accepted;
+                for (const sinfer::ReasoningEffort effort : sinfer::kReasoningEfforts) {
+                    if (!capabilities.reasoning_effort.supports(effort)) { continue; }
+                    if (!accepted.empty()) { accepted += ", "; }
+                    accepted += sinfer::reasoning_effort_name(effort);
+                }
+                throw std::invalid_argument(
+                    "--reasoning-effort " +
+                    std::string(sinfer::reasoning_effort_name(*cli.reasoning_effort)) +
+                    ": this artifact's chat template " +
+                    (accepted.empty() ? "chooses no reasoning effort" : "accepts " + accepted));
+            }
+        }
+
         // surogate vendor patch (PATCHES.md #20): a discarded warmup request
         // absorbs one-time lazy work (FP8 plane derivation) so the measured
         // request reflects steady serving state.

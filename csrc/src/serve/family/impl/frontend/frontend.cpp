@@ -381,6 +381,23 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     return result;
 }
 
+/// The role names an artifact's own template expects. The hand-written templates
+/// write their own markers and never see these.
+std::string jinja_role_name(ChatRole role) {
+    switch (role) {
+    case ChatRole::System:
+    case ChatRole::Developer:
+        return "system";
+    case ChatRole::User:
+        return "user";
+    case ChatRole::Assistant:
+        return "assistant";
+    case ChatRole::Tool:
+        return "tool";
+    }
+    throw std::invalid_argument("chat template: unknown role");
+}
+
 fi::ChatRenderOptions render_options(const PromptOptions& options) {
     return fi::ChatRenderOptions{.add_generation_prompt = options.add_generation_prompt,
                                  .enable_thinking       = options.enable_thinking,
@@ -763,6 +780,19 @@ public:
                 options.media_cache_bytes, options.media_live_bytes,
                 options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
         }
+        // The two hand-written templates state what they support; an artifact's own
+        // Jinja is asked instead of assumed, by rendering it here once. Doing it at
+        // load keeps a request from paying for it, and makes a template that cannot
+        // be rendered at all a startup fact rather than a per-request surprise.
+        capabilities =
+            chat_template.rendered_by_tokenizer()
+                ? fi::probe_jinja_capabilities(chat_template.jinja_source(),
+                                               [this](const fi::ChatTemplateVariables& variables) {
+                                                   return tokenizer->render_chat_template(
+                                                       {{"user", "hello"}},
+                                                       /*add_generation_prompt=*/true, variables);
+                                               })
+                : chat_template.capabilities();
         if (registered_checkpoint && options.registered_tokenizer) {
             validate_registered_tokenizer(*tokenizer);
         }
@@ -775,11 +805,54 @@ public:
         }
     }
 
+    /// The variables this checkpoint's template is rendered with, which is a subset
+    /// of what the request asked for: what the template cannot honour is not set,
+    /// and an effort it does not implement is refused rather than dropped.
+    [[nodiscard]] fi::ChatTemplateVariables template_variables(const PromptOptions& options) const {
+        fi::ChatTemplateVariables variables;
+        if (capabilities.enable_thinking) { variables.enable_thinking = options.enable_thinking; }
+        if (options.reasoning_effort) {
+            if (!capabilities.reasoning_effort.supports(*options.reasoning_effort)) {
+                throw std::invalid_argument(
+                    "loaded chat template does not support reasoning effort '" +
+                    std::string(reasoning_effort_name(*options.reasoning_effort)) + "'");
+            }
+            variables.reasoning_effort =
+                std::string(reasoning_effort_name(*options.reasoning_effort));
+        }
+        return variables;
+    }
+
+    /// Renders the conversation with whichever renderer this checkpoint's template
+    /// belongs to. Both prepare() and count_tokens() come through here: rendering in
+    /// two places is how counting a prompt came to throw for every artifact whose
+    /// template this family does not reproduce by hand.
+    [[nodiscard]] fi::RenderedChat render_chat(const std::vector<fi::ChatMessage>& messages,
+                                               const PromptOptions& options) const {
+        if (!tokenizer->renders_chat_template()) {
+            return chat_template.render(messages, render_options(options));
+        }
+        // A checkpoint whose template this family does not reproduce by hand is
+        // rendered by the tokenizer, from the artifact's own Jinja.
+        std::vector<std::pair<std::string, std::string>> plain;
+        plain.reserve(messages.size());
+        for (const fi::ChatMessage& message : messages) {
+            plain.emplace_back(jinja_role_name(message.role), message.rendered_content());
+        }
+        fi::RenderedChat rendered;
+        rendered.text = tokenizer->render_chat_template(plain, options.add_generation_prompt,
+                                                        template_variables(options));
+        return rendered;
+    }
+
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
+    /// What the loaded template can actually be asked for. The hand-written
+    /// templates state it; an artifact's own Jinja is asked, by rendering it.
+    PromptCapabilities capabilities;
     bool vision_enabled = true;
     /// Whether anything was compiled above. A checkpoint with no template is a base model, and
     /// only the raw-prompt path can serve it.
@@ -1054,6 +1127,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
+    // A template with no reasoning turn never starts in one, whatever the request
+    // asked for: its capabilities are what the artifact can actually do.
+    bool opens_reasoning = options.add_generation_prompt && options.enable_thinking &&
+                           impl_->capabilities.enable_thinking;
     if (has_media) {
         fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
                                 impl_->media_cache);
@@ -1087,34 +1164,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
     } else {
-        // A checkpoint whose template this family does not reproduce by hand is
-        // rendered by the tokenizer, from the artifact's own Jinja.
-        fi::RenderedChat rendered;
-        if (impl_->tokenizer->renders_chat_template()) {
-            std::vector<std::pair<std::string, std::string>> plain;
-            plain.reserve(messages.size());
-            const auto role_name = [](ChatRole role) -> std::string {
-                switch (role) {
-                case ChatRole::System:
-                case ChatRole::Developer:
-                    return "system";
-                case ChatRole::User:
-                    return "user";
-                case ChatRole::Assistant:
-                    return "assistant";
-                case ChatRole::Tool:
-                    return "tool";
-                }
-                throw std::invalid_argument("chat template: unknown role");
-            };
-            for (const fi::ChatMessage& message : messages) {
-                plain.emplace_back(role_name(message.role), message.rendered_content());
-            }
-            rendered.text =
-                impl_->tokenizer->render_chat_template(plain, options.add_generation_prompt);
-        } else {
-            rendered = impl_->chat_template.render(messages, render_options(options));
-        }
+        fi::RenderedChat rendered = impl_->render_chat(messages, options);
         // `SUROGATE_SERVE_RAW_PROMPT`: a lone text-only user message is the prompt itself, no
         // template around it. Measurement only -- it is how a perplexity run scores raw text
         // the way llama-perplexity does, since a chat turn changes what the model predicts.
@@ -1122,6 +1172,15 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         if (raw_prompt && messages.size() == 1 && messages.front().role == ChatRole::User) {
             rendered      = fi::RenderedChat{};
             rendered.text = messages.front().rendered_content();
+        }
+        // The artifact's own template is not reproduced here, so what it did with the
+        // request is read off the prompt it produced: a prompt that ends inside
+        // `<think>` hands the model an open reasoning turn, whatever the template's
+        // vocabulary for asking. GLM-5.3-Flash always opens one and was answering
+        // with its reasoning in `content` because this was assumed instead.
+        if (impl_->tokenizer->renders_chat_template()) {
+            opens_reasoning =
+                options.add_generation_prompt && fi::prompt_opens_reasoning(rendered.text);
         }
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
@@ -1134,10 +1193,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;
-    // A template with no reasoning turn never starts in one, whatever the request
-    // asked for: its capabilities are what the artifact can actually do.
-    result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking &&
-                                 impl_->chat_template.capabilities().enable_thinking;
+    result.starts_in_reasoning = opens_reasoning;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1162,8 +1218,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     if (!has_media) {
-        const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+        const fi::RenderedChat rendered = impl_->render_chat(messages, options);
         const std::uint32_t count =
             checked_token_count(impl_->tokenizer->encode(rendered.text).size());
         fi::check_preparation_control(control, "tokenization");
@@ -1180,7 +1235,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
 }
 
 PromptCapabilities Frontend::prompt_capabilities() const noexcept {
-    return impl_ != nullptr ? impl_->chat_template.capabilities() : PromptCapabilities{};
+    return impl_ != nullptr ? impl_->capabilities : PromptCapabilities{};
 }
 
 MediaCacheSummary Frontend::media_cache_summary() const {

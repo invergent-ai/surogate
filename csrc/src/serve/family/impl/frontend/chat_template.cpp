@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cctype>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -297,6 +298,16 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
         return {};
     case ReasoningEffort::XHigh:
         return kXHighReasoningInstructions;
+    case ReasoningEffort::Minimal:
+    case ReasoningEffort::High:
+    case ReasoningEffort::Max:
+        // Names from other templates' vocabularies. Translation refuses them
+        // against this template's advertised capabilities long before here; a
+        // caller that bypassed it gets the same refusal rather than a silent
+        // substitution.
+        throw std::invalid_argument("loaded chat template does not support reasoning effort '" +
+                                    std::string(reasoning_effort_name(*options.reasoning_effort)) +
+                                    "'");
     }
     throw std::invalid_argument("invalid reasoning effort");
 }
@@ -365,6 +376,10 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     // template is rendered as written and has no such mode, so claiming one would
     // route its whole answer into reasoning_content.
     result.enable_thinking = semantics_ != ChatTemplateSemantics::Jinja;
+    // Both hand-written templates end their generation prompt inside `<think>`
+    // when thinking is on, which is the same fact the Jinja probe establishes by
+    // rendering. A Jinja template's capabilities never come from here.
+    result.reasoning_turn = result.enable_thinking;
     if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
         result.reasoning_effort.low            = true;
         result.reasoning_effort.medium         = true;
@@ -517,6 +532,93 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         }
     }
     return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
+}
+
+namespace {
+
+/// The template refers to the variable at all. A template that never names it
+/// cannot be driven by it, and probing one is a waste of a render.
+bool mentions_variable(std::string_view source, std::string_view identifier) noexcept {
+    return source.find(identifier) != std::string_view::npos;
+}
+
+/// The template writes the value as a literal -- `reasoning_effort in ['low', 'high']`,
+/// `else 'max'`. A name it never writes is one it cannot be comparing against, and
+/// rendering with it would fall into whatever branch the template keeps for the
+/// values it does not know.
+bool names_literal(std::string_view source, std::string_view value) {
+    for (const char quote : {'\'', '"'}) {
+        std::string needle(1, quote);
+        needle.append(value);
+        needle.push_back(quote);
+        if (source.find(needle) != std::string_view::npos) { return true; }
+    }
+    return false;
+}
+
+} // namespace
+
+bool prompt_opens_reasoning(std::string_view rendered) noexcept {
+    constexpr std::string_view kOpen = "<think>";
+    std::size_t end                  = rendered.size();
+    while (end > 0 && std::isspace(static_cast<unsigned char>(rendered[end - 1])) != 0) { --end; }
+    const std::string_view trimmed = rendered.substr(0, end);
+    return trimmed.size() >= kOpen.size() &&
+           trimmed.compare(trimmed.size() - kOpen.size(), kOpen.size(), kOpen) == 0;
+}
+
+PromptCapabilities probe_jinja_capabilities(std::string_view source,
+                                            const JinjaRenderProbe& render) {
+    PromptCapabilities result;
+    if (!render) { return result; }
+    const auto attempt = [&](const ChatTemplateVariables& variables) -> std::optional<std::string> {
+        try {
+            return render(variables);
+        } catch (const std::exception&) {
+            // The template refused these variables -- Qwen's raises on an effort it
+            // does not know. That is an answer, not a failure.
+            return std::nullopt;
+        }
+    };
+
+    // The render with nothing set is what this artifact does when asked for nothing,
+    // and every other render is read against it. A template that cannot be rendered
+    // at all is credited with nothing rather than guessed at.
+    const std::optional<std::string> base = attempt({});
+    if (!base) { return result; }
+    result.reasoning_turn = prompt_opens_reasoning(*base);
+
+    if (mentions_variable(source, "enable_thinking")) {
+        const std::optional<std::string> on  = attempt({.enable_thinking = true});
+        const std::optional<std::string> off = attempt({.enable_thinking = false});
+        // Only a template whose prompt actually changes has a switch to drive.
+        result.enable_thinking = on && off && *on != *off;
+    }
+
+    if (!mentions_variable(source, "reasoning_effort")) { return result; }
+    std::vector<ReasoningEffort> accepted;
+    std::vector<ReasoningEffort> unchanged;
+    bool honoured = false;
+    for (const ReasoningEffort effort : kReasoningEfforts) {
+        const std::string_view name = reasoning_effort_name(effort);
+        if (!names_literal(source, name)) { continue; }
+        const std::optional<std::string> text = attempt({.reasoning_effort = std::string(name)});
+        if (!text) { continue; }
+        accepted.push_back(effort);
+        if (*text == *base) {
+            unchanged.push_back(effort);
+        } else {
+            honoured = true;
+        }
+    }
+    // Every named value rendered the same prompt: the variable is decoration, and
+    // advertising it would promise a setting that changes nothing.
+    if (!honoured) { return result; }
+    for (const ReasoningEffort effort : accepted) { result.reasoning_effort.set(effort, true); }
+    // Exactly one value renders what the template renders on its own, so that value
+    // is its default. Several would make the claim ambiguous, and none is stated.
+    if (unchanged.size() == 1) { result.reasoning_effort.default_effort = unchanged.front(); }
+    return result;
 }
 
 } // namespace sinfer::family::frontend_internal

@@ -188,7 +188,7 @@ struct Tokenizer::Impl {
     // Render the chat template with the given messages and options.
     std::string render_chat_template(const nlohmann::ordered_json& messages,
                                      bool add_generation_prompt,
-                                     std::optional<bool> enable_thinking = std::nullopt) const {
+                                     const ChatTemplateVariables& variables = {}) const {
         if (!chat_tmpl_root) {
             throw std::runtime_error("No chat template loaded.");
         }
@@ -196,11 +196,15 @@ struct Tokenizer::Impl {
             {"messages", messages},
             {"add_generation_prompt", add_generation_prompt},
         });
-        // Only define enable_thinking when explicitly requested. The template
-        // gates on `enable_thinking is defined`, so leaving it unset preserves
-        // the template's own default behavior for non-training callers.
-        if (enable_thinking.has_value()) {
-            ctx_json["enable_thinking"] = *enable_thinking;
+        // Only define a variable when the caller asked for it. The templates gate
+        // on `is defined`, so leaving one unset preserves the template's own
+        // default -- which is the only correct rendering of a template that was
+        // written elsewhere.
+        if (variables.enable_thinking.has_value()) {
+            ctx_json["enable_thinking"] = *variables.enable_thinking;
+        }
+        if (variables.reasoning_effort.has_value()) {
+            ctx_json["reasoning_effort"] = *variables.reasoning_effort;
         }
         auto context = minja::Context::make(ctx_json);
         context->set("bos_token", bos_token_str);
@@ -230,14 +234,14 @@ struct Tokenizer::Impl {
     std::string render_prefix(const std::vector<ChatMessage>& messages,
                               size_t count,
                               bool add_generation_prompt,
-                              std::optional<bool> enable_thinking = std::nullopt) const {
+                              const ChatTemplateVariables& variables = {}) const {
         TokTimer _t(tok_profile().render_ns);
         if (tok_profile_enabled()) tok_profile().renders.fetch_add(1, std::memory_order_relaxed);
         nlohmann::ordered_json arr = nlohmann::ordered_json::array();
         for (size_t k = 0; k < count && k < messages.size(); ++k) {
             arr.push_back({{"role", messages[k].role}, {"content", messages[k].content}});
         }
-        return render_chat_template(arr, add_generation_prompt, enable_thinking);
+        return render_chat_template(arr, add_generation_prompt, variables);
     }
 
     void build_lookup() {
@@ -1138,7 +1142,15 @@ std::string Tokenizer::special_token(const std::string& name) const {
 std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
                                            bool add_generation_prompt,
                                            std::optional<bool> enable_thinking) const {
-    return impl_->render_prefix(messages, messages.size(), add_generation_prompt, enable_thinking);
+    return apply_chat_template(messages,
+                               add_generation_prompt,
+                               ChatTemplateVariables{.enable_thinking = enable_thinking});
+}
+
+std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
+                                           bool add_generation_prompt,
+                                           const ChatTemplateVariables& variables) const {
+    return impl_->render_prefix(messages, messages.size(), add_generation_prompt, variables);
 }
 
 std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,
@@ -1201,11 +1213,11 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
         // MUST use the same mode, or the byte-diff that defines the trainable span
         // misaligns — which previously trained the model to emit reasoning after an
         // already-closed think block (i.e. to "think" in no-think mode).
-        std::optional<bool> enable_thinking = (messages[i + 1].content.find("</think>") != std::string::npos);
+        const ChatTemplateVariables variables{.enable_thinking =
+                                                  (messages[i + 1].content.find("</think>") != std::string::npos)};
 
         // 1. Render up to user_i with gen_prompt=true → prefix/chrome segment
-        std::string render_with_user =
-            impl_->render_prefix(messages, i + 1, /*add_generation_prompt=*/true, enable_thinking);
+        std::string render_with_user = impl_->render_prefix(messages, i + 1, /*add_generation_prompt=*/true, variables);
 
         if (render_with_user.size() > prev_render.size()) {
             std::string chrome = render_with_user.substr(prev_render.size());
@@ -1215,7 +1227,7 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
 
         // 2. Render up to asst_i with gen_prompt=false → response segment
         std::string render_with_asst =
-            impl_->render_prefix(messages, i + 2, /*add_generation_prompt=*/false, enable_thinking);
+            impl_->render_prefix(messages, i + 2, /*add_generation_prompt=*/false, variables);
 
         if (render_with_asst.size() > render_with_user.size()) {
             std::string response = render_with_asst.substr(render_with_user.size());

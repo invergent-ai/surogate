@@ -36,6 +36,16 @@ struct ChatMessage {
     std::string content;
 };
 
+// Template variables beyond the messages and the generation prompt. Each is left
+// undefined in the render when unset, so a template that gates on `is defined`
+// keeps its own default. Both names are the ones the model cards use:
+// enable_thinking for the Qwen family's switch, reasoning_effort for the templates
+// that choose an effort instead (GLM names low/high/max, Qwen low/medium/xhigh).
+struct ChatTemplateVariables {
+    std::optional<bool> enable_thinking;
+    std::optional<std::string> reasoning_effort;
+};
+
 class Tokenizer {
 public:
     ~Tokenizer();
@@ -109,6 +119,12 @@ public:
     std::string apply_chat_template(const std::vector<ChatMessage>& messages,
                                     bool add_generation_prompt = false,
                                     std::optional<bool> enable_thinking = std::nullopt) const;
+
+    // Same, with every template variable this renderer can set. The overload above
+    // is the thinking switch on its own, which is all the training paths ask for.
+    std::string apply_chat_template(const std::vector<ChatMessage>& messages,
+                                    bool add_generation_prompt,
+                                    const ChatTemplateVariables& variables) const;
 
     // Convenience: apply_chat_template + encode_with_special_tokens in one call.
     std::vector<int32_t> apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,

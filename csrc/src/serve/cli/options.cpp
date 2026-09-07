@@ -66,9 +66,12 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 }
 
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
-    if (text == "low") { return ReasoningEffort::Low; }
-    if (text == "medium") { return ReasoningEffort::Medium; }
-    if (text == "xhigh") { return ReasoningEffort::XHigh; }
+    // Every name any served template uses. Which of them the loaded artifact
+    // honours is checked against that artifact once it is open, so a name is
+    // refused here only when no template could mean it.
+    for (const ReasoningEffort effort : kReasoningEfforts) {
+        if (text == reasoning_effort_name(effort)) { return effort; }
+    }
     throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
 }
 
@@ -77,7 +80,9 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.sinfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] [--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] "
+           "[--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank w8|q4] "
+           "[--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices A,B,...]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
@@ -85,7 +90,7 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--prefill-warmup]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--reasoning-effort minimal|low|medium|high|xhigh|max] [--vision]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"

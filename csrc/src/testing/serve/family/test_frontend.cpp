@@ -94,17 +94,27 @@ const std::string& official_tokenizer_dir() {
     // surogate patch: host-environmental fixture (upstream hardcoded the
     // author's checkout). SINFER_FAMILY_TOKENIZER_DIR overrides; absent
     // resources SKIP the test (ctest exit 77) instead of aborting.
+    //
+    // The checkout's own frontend fixture is tried before the author's path. A
+    // default that exists nowhere skipped this whole file on every machine, and a
+    // suite that always skips reports nothing: three checks in it had gone stale
+    // against deliberate changes and no run said so.
     static const std::string base = [] {
-        const char* env = std::getenv("SINFER_FAMILY_TOKENIZER_DIR");
-        const std::string dir =
-            env != nullptr ? env : "/home/densemax2/work/models/hf/qwen/Qwen3.6-27B/base-hf-bf16";
-        if (!std::ifstream(dir + "/tokenizer.json").good()) {
-            std::fprintf(stderr,
-                         "SKIP: Qwen3.6-27B tokenizer resources not found (set "
-                         "SINFER_FAMILY_TOKENIZER_DIR)\n");
-            std::exit(77);
+        std::vector<std::string> candidates;
+        if (const char* env = std::getenv("SINFER_FAMILY_TOKENIZER_DIR"); env != nullptr) {
+            candidates.emplace_back(env);
         }
-        return dir;
+        candidates.emplace_back(SINFER_SOURCE_DIR "/../../../../models/Qwen3.8-Flash-Next-frontend");
+        candidates.emplace_back("/home/densemax2/work/models/hf/qwen/Qwen3.6-27B/base-hf-bf16");
+        for (const std::string& dir : candidates) {
+            if (std::ifstream(dir + "/tokenizer.json").good()) {
+                return dir;
+            }
+        }
+        std::fprintf(stderr,
+                     "SKIP: no artifact tokenizer resources found (set "
+                     "SINFER_FAMILY_TOKENIZER_DIR)\n");
+        std::exit(77);
     }();
     return base;
 }
@@ -458,11 +468,23 @@ int test_official_chat_template() {
                 "</IMPORTANT>\n\nbe exact<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n"),
         "tools system block differs from official tojson rendering");
 
-    failures += check(throws_invalid_argument([&] {
-                          (void)render_chat({chat_message(sinfer::ChatRole::System, "only")},
-                                            no_generation);
-                      }),
-                      "message history without a user query was accepted");
+    // A history with no user turn is not malformed: a client that stitches turns
+    // renders a lone assistant message to measure what the template puts between
+    // them. Refusing it made that measurement impossible, so it renders -- and what
+    // makes it usable is that the message renders as a past turn, byte for byte the
+    // same as it does inside a longer history.
+    failures += check(render_chat_text({chat_message(sinfer::ChatRole::System, "only")}, no_generation) ==
+                          "<|im_start|>system\nonly<|im_end|>\n",
+                      "a history of one instruction turn did not render as that turn");
+    fi::ChatMessage stitched = chat_message(sinfer::ChatRole::Assistant, "answer");
+    stitched.reasoning_content = "thought";
+    const std::string alone = render_chat_text({stitched}, no_generation);
+    const std::string embedded = render_chat_text(
+        {chat_message(sinfer::ChatRole::User, "q1"), stitched, chat_message(sinfer::ChatRole::User, "q2")},
+        no_generation);
+    failures += check(alone.find("<think>") == std::string::npos && embedded.find(alone) != std::string::npos,
+                      "a lone assistant turn rendered differently from the same turn inside a "
+                      "history, which is the prefix property a stitching client measures");
     return failures;
 }
 
@@ -675,6 +697,156 @@ int test_reasoning_effort_chat_template() {
     return failures;
 }
 
+/// The mechanism GLM-5.3-Flash's own template uses, in miniature: an effort
+/// vocabulary of its own (low and high, everything else falling back to max), and
+/// a generation prompt that always opens a reasoning turn. The engine reproduces
+/// no such template by hand -- it is rendered as the artifact wrote it -- so what
+/// it can be asked for has to be established by rendering it.
+constexpr std::string_view kEffortJinjaTemplate =
+    "{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and "
+    "reasoning_effort in ['low', 'high'] else 'max' -%}"
+    "<|system|>Reasoning Effort: {{ effective_reasoning_effort }}\n"
+    "{%- for m in messages -%}"
+    "{%- if m.role == 'user' -%}<|user|>{{ m.content }}\n"
+    "{%- elif m.role == 'assistant' -%}<|assistant|>{{ m.content }}\n"
+    "{%- else -%}<|system|>{{ m.content }}\n"
+    "{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}";
+
+int test_jinja_capability_probe() {
+    // A stand-in for the artifact's renderer: it implements the template the source
+    // below describes, so the probe is tested against a template's behaviour rather
+    // than against a tokenizer.
+    const auto glm_like = [](const fi::ChatTemplateVariables& variables) {
+        std::string effort = "max";
+        if (variables.reasoning_effort &&
+            (*variables.reasoning_effort == "low" || *variables.reasoning_effort == "high")) {
+            effort = *variables.reasoning_effort;
+        }
+        return "Reasoning Effort: " + effort + "\nuser: hello\nassistant: <think>";
+    };
+    const sinfer::PromptCapabilities glm = fi::probe_jinja_capabilities(kEffortJinjaTemplate, glm_like);
+    int failures = check(glm.reasoning_effort.low && glm.reasoning_effort.high && glm.reasoning_effort.max,
+                         "the probe missed an effort the template names and honours");
+    failures += check(!glm.reasoning_effort.medium && !glm.reasoning_effort.xhigh && !glm.reasoning_effort.minimal,
+                      "the probe advertised an effort the template silently ignores");
+    failures += check(glm.reasoning_effort.default_effort == sinfer::ReasoningEffort::Max,
+                      "the probe did not read the template's default off the render it produces alone");
+    failures += check(glm.reasoning_turn, "a generation prompt ending inside <think> was not read as a reasoning turn");
+    failures += check(!glm.enable_thinking, "a template with no thinking switch was credited with one");
+
+    // Names the values, renders the same prompt for every one of them.
+    const auto decorative = [](const fi::ChatTemplateVariables&) {
+        return std::string("fixed");
+    };
+    const sinfer::PromptCapabilities ignored = fi::probe_jinja_capabilities(kEffortJinjaTemplate, decorative);
+    failures +=
+        check(!ignored.reasoning_effort.any(), "an effort variable that changes nothing was advertised as a setting");
+
+    // A thinking switch, driven the way the Qwen family's template drives it.
+    constexpr std::string_view toggle_source = "{%- if enable_thinking %}<think>{% else %}<think></think>{% endif -%}";
+    const auto toggle = [](const fi::ChatTemplateVariables& variables) {
+        return std::string("assistant: ") + (variables.enable_thinking.value_or(true) ? "<think>" : "<think></think>");
+    };
+    const sinfer::PromptCapabilities toggled = fi::probe_jinja_capabilities(toggle_source, toggle);
+    failures += check(toggled.enable_thinking && toggled.reasoning_turn && !toggled.reasoning_effort.any(),
+                      "a thinking switch was not read off the prompts it renders");
+
+    // Nothing renders: nothing is claimed, rather than something assumed.
+    const auto broken = [](const fi::ChatTemplateVariables&) -> std::string {
+        throw std::runtime_error("template error");
+    };
+    const sinfer::PromptCapabilities none = fi::probe_jinja_capabilities(kEffortJinjaTemplate, broken);
+    failures += check(!none.reasoning_effort.any() && !none.enable_thinking && !none.reasoning_turn,
+                      "a template that cannot be rendered was credited with capabilities");
+
+    failures += check(
+        fi::prompt_opens_reasoning("<|assistant|><think>") && fi::prompt_opens_reasoning("<|assistant|><think>\n") &&
+            !fi::prompt_opens_reasoning("<|assistant|><think></think>\n\n") && !fi::prompt_opens_reasoning(""),
+        "an open reasoning turn was not told from a closed one");
+    return failures;
+}
+
+int test_jinja_template_reasoning_effort() {
+    // The artifact's own tokenizer, so the prompt below is the text the model would
+    // be given, and its own Jinja rather than a hand-written reproduction.
+    const std::string& base = official_tokenizer_dir();
+    FrontendResources artifact;
+    artifact.tokenizer_json = read_file((base + "/tokenizer.json").c_str());
+    nlohmann::json config = nlohmann::json::parse(read_file((base + "/tokenizer_config.json").c_str()));
+    config["chat_template"] = std::string(kEffortJinjaTemplate);
+    artifact.tokenizer_config_json = config.dump();
+    artifact.chat_template_jinja = std::string(kEffortJinjaTemplate);
+    artifact.generation_config_json = read_file((base + "/generation_config.json").c_str());
+
+    const Frontend frontend = FrontendFactory::create_component(artifact, false);
+    const sinfer::PromptCapabilities capabilities = frontend.prompt_capabilities();
+    int failures = check(capabilities.reasoning_effort.low && capabilities.reasoning_effort.high &&
+                             capabilities.reasoning_effort.max && !capabilities.reasoning_effort.medium &&
+                             capabilities.reasoning_effort.default_effort == sinfer::ReasoningEffort::Max,
+                         "the frontend did not take its effort vocabulary from the artifact's own "
+                         "template");
+    failures += check(capabilities.reasoning_turn && !capabilities.enable_thinking,
+                      "a template that always thinks and offers no switch was described as one "
+                      "that can be switched");
+
+    const auto render = [&](std::optional<sinfer::ReasoningEffort> effort) {
+        sinfer::ChatMessage message;
+        message.role = sinfer::ChatRole::User;
+        message.parts.push_back(
+            sinfer::MessagePart{.kind = sinfer::MessagePartKind::Text, .text = "hello", .media = {}});
+        sinfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.reasoning_effort = effort;
+        const sinfer::family::PreparedPrompt prompt = frontend.prepare(std::move(input));
+        const sinfer::family::PreparedPromptData& data = FrontendFactory::inspect(prompt);
+        std::string text;
+        for (const std::string& piece : frontend.token_texts(data.token_ids)) {
+            text += piece;
+        }
+        return std::pair<std::string, bool>{text, data.starts_in_reasoning};
+    };
+
+    const auto [low_text, low_reasoning] = render(sinfer::ReasoningEffort::Low);
+    failures += check(low_text.find("Reasoning Effort: low") != std::string::npos,
+                      "the requested reasoning effort never reached the artifact's template");
+    failures += check(low_reasoning, "a prompt that ends inside <think> was not marked as starting in reasoning");
+    const auto [default_text, ignored_flag] = render(std::nullopt);
+    (void)ignored_flag;
+    failures += check(default_text.find("Reasoning Effort: max") != std::string::npos,
+                      "asking for no effort did not leave the template its own default");
+    failures += check(throws_invalid_argument([&] { (void)render(sinfer::ReasoningEffort::Medium); }),
+                      "an effort this template ignores was rendered as its default instead of "
+                      "being refused");
+
+    // Counting a prompt renders it the same way. It used to render only the
+    // hand-written templates, so counting one of these threw.
+    sinfer::ChatMessage counted;
+    counted.role = sinfer::ChatRole::User;
+    counted.parts.push_back(sinfer::MessagePart{.kind = sinfer::MessagePartKind::Text, .text = "hello", .media = {}});
+    sinfer::PromptInput count_input;
+    count_input.messages.push_back(std::move(counted));
+    count_input.options.reasoning_effort = sinfer::ReasoningEffort::Low;
+    std::uint32_t counted_tokens = 0;
+    try {
+        counted_tokens = frontend.count_tokens(std::move(count_input));
+    } catch (const std::exception& error) {
+        std::cerr << "count_tokens refused an artifact's own template: " << error.what() << '\n';
+    }
+    sinfer::ChatMessage prepared_message;
+    prepared_message.role = sinfer::ChatRole::User;
+    prepared_message.parts.push_back(
+        sinfer::MessagePart{.kind = sinfer::MessagePartKind::Text, .text = "hello", .media = {}});
+    sinfer::PromptInput prepared_input;
+    prepared_input.messages.push_back(std::move(prepared_message));
+    prepared_input.options.reasoning_effort = sinfer::ReasoningEffort::Low;
+    const sinfer::family::PreparedPrompt prompt = frontend.prepare(std::move(prepared_input));
+    failures += check(counted_tokens == FrontendFactory::inspect(prompt).token_ids.size() && counted_tokens != 0,
+                      "counting a prompt disagreed with preparing it");
+    return failures;
+}
+
 int test_rewrite_checkpoint_trace() {
     const std::string assistant_header = "<|im_start|>assistant\n";
     fi::ChatMessage first              = chat_message(sinfer::ChatRole::Assistant, "");
@@ -757,13 +929,23 @@ int test_rewrite_checkpoint_trace() {
 }
 
 int test_official_resource_guards() {
-    FrontendResources stale_pad     = resources();
-    nlohmann::json tokenizer_config = nlohmann::json::parse(stale_pad.tokenizer_config_json);
+    // Which token a checkpoint pads with says nothing about the text it tokenizes --
+    // the exporters of one checkpoint disagree, unsloth naming <|vision_pad|> where
+    // the official repositories name <|endoftext|> -- so it must be stated and that
+    // is all. What identifies a registered checkpoint is asserted directly, by its
+    // token domain.
+    FrontendResources exporter_pad = resources();
+    nlohmann::json tokenizer_config = nlohmann::json::parse(exporter_pad.tokenizer_config_json);
     tokenizer_config["pad_token"]   = "<|vision_pad|>";
-    stale_pad.tokenizer_config_json = tokenizer_config.dump();
-    int failures =
-        check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(stale_pad); }),
-              "stale Unsloth pad-token policy was accepted");
+    exporter_pad.tokenizer_config_json = tokenizer_config.dump();
+    int failures = check(!throws_invalid_argument([&] { (void)FrontendFactory::create_component(exporter_pad); }),
+                         "an exporter's own pad token was refused");
+    FrontendResources no_pad = resources();
+    tokenizer_config = nlohmann::json::parse(no_pad.tokenizer_config_json);
+    tokenizer_config.erase("pad_token");
+    no_pad.tokenizer_config_json = tokenizer_config.dump();
+    failures += check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(no_pad); }),
+                      "a tokenizer_config.json stating no pad token was accepted");
 
     FrontendResources mismatched       = resources();
     nlohmann::json mismatched_config   = nlohmann::json::parse(mismatched.tokenizer_config_json);
@@ -773,10 +955,16 @@ int test_official_resource_guards() {
         check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(mismatched); }),
               "different standalone and tokenizer-config chat templates were accepted");
 
+    // A template this family reproduces by no hand-written renderer is served as the
+    // artifact wrote it, through the tokenizer. It carries no reasoning turn and no
+    // switch, and being asked establishes that rather than a digest assuming it.
     FrontendResources unknown = resources("{{ messages }}");
-    failures +=
-        check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(unknown); }),
-              "unknown chat template was accepted");
+    const Frontend unknown_frontend = FrontendFactory::create_component(unknown, /*vision_enabled=*/false);
+    const sinfer::PromptCapabilities unknown_capabilities = unknown_frontend.prompt_capabilities();
+    failures += check(!unknown_capabilities.enable_thinking && !unknown_capabilities.reasoning_turn &&
+                          !unknown_capabilities.reasoning_effort.any(),
+                      "a template that offers neither a reasoning turn nor a switch was credited "
+                      "with one");
 
     const Frontend effort_frontend =
         FrontendFactory::create_component(resources(reasoning_effort_template_source()), false);
@@ -1363,6 +1551,7 @@ int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
+    failures += test_jinja_capability_probe();
     failures += test_official_tokenizer_merge();
     failures += test_transformers5_config_without_decoder();
     failures += test_repeated_special_tokens_scan_linearly();
@@ -1371,6 +1560,7 @@ int main() {
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
+    failures += test_jinja_template_reasoning_effort();
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);

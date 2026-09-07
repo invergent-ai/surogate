@@ -6,8 +6,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -70,6 +72,15 @@ struct ChatMessage {
                                                int* video_count   = nullptr) const;
 };
 
+/// The variables a template is rendered with beyond its messages. Each one is
+/// left undefined when unset, so a template that gates on `is defined` keeps its
+/// own default -- which is the only honest thing to do for a template this family
+/// did not write.
+struct ChatTemplateVariables {
+    std::optional<bool> enable_thinking;
+    std::optional<std::string> reasoning_effort;
+};
+
 struct ChatRenderOptions {
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
@@ -108,6 +119,9 @@ public:
 
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
 
+    /// The artifact's own Jinja, for the Jinja semantics only; empty otherwise.
+    [[nodiscard]] std::string_view jinja_source() const noexcept { return jinja_source_; }
+
     /// True when this template is reproduced by no hand-written renderer and must be
     /// rendered from its own Jinja. The frontend hands this to the tokenizer so the
     /// renderer is built exactly for the artifacts that need it.
@@ -128,5 +142,23 @@ private:
     std::string jinja_source_;
     std::string eos_token_;
 };
+
+/// Renders the template under test with the given variables, or throws the way the
+/// template does when it refuses them.
+using JinjaRenderProbe = std::function<std::string(const ChatTemplateVariables&)>;
+
+/// What an artifact's own Jinja can actually be asked for, established by rendering
+/// it rather than by reading its name. A template is credited with an effort only
+/// when it names that effort *and* rendering with it survives; the one whose render
+/// matches the undefined-variable render is its default. A name the template ignores
+/// is left unsupported, so a request for it is refused rather than served as
+/// something else.
+[[nodiscard]] PromptCapabilities probe_jinja_capabilities(std::string_view source,
+                                                          const JinjaRenderProbe& render);
+
+/// Whether a rendered prompt hands the model an open reasoning turn -- the
+/// generation prompt ends inside `<think>`. This is what decides whether the first
+/// token of the answer belongs to reasoning_content or to content.
+[[nodiscard]] bool prompt_opens_reasoning(std::string_view rendered) noexcept;
 
 } // namespace sinfer::family::frontend_internal

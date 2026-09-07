@@ -112,6 +112,42 @@ std::vector<std::string> effective_tool_jsons(const GenerationRequest& request) 
     return tools;
 }
 
+/// The template's own vocabulary, for an error that says what to ask for instead of
+/// only what not to. Empty when the loaded template chooses no effort at all.
+std::string supported_efforts(const sinfer::ReasoningEffortCapabilities& capabilities) {
+    std::string list;
+    for (const sinfer::ReasoningEffort effort : sinfer::kReasoningEfforts) {
+        if (!capabilities.supports(effort)) { continue; }
+        if (!list.empty()) { list += ", "; }
+        list += sinfer::reasoning_effort_name(effort);
+    }
+    return list;
+}
+
+/// The wire vocabulary and the template vocabulary are the same names. Which of them
+/// a given template honours is its capabilities' business, checked below -- nothing
+/// is remapped onto a neighbouring effort on the way, because a request for one
+/// setting answered at another is the silent-wrong this path exists to prevent.
+sinfer::ReasoningEffort to_template_effort(RequestedReasoningEffort requested) {
+    switch (requested) {
+    case RequestedReasoningEffort::Minimal:
+        return sinfer::ReasoningEffort::Minimal;
+    case RequestedReasoningEffort::Low:
+        return sinfer::ReasoningEffort::Low;
+    case RequestedReasoningEffort::Medium:
+        return sinfer::ReasoningEffort::Medium;
+    case RequestedReasoningEffort::High:
+        return sinfer::ReasoningEffort::High;
+    case RequestedReasoningEffort::XHigh:
+        return sinfer::ReasoningEffort::XHigh;
+    case RequestedReasoningEffort::Max:
+        return sinfer::ReasoningEffort::Max;
+    case RequestedReasoningEffort::None:
+        break;
+    }
+    throw std::logic_error("reasoning effort 'none' names no template effort");
+}
+
 } // namespace
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
@@ -122,6 +158,16 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .reasoning_effort  = std::nullopt,
         .preserve_thinking = request.preserve_thinking.value_or(server.preserve_thinking),
     };
+    // Asking a template that always thinks, and carries no switch, to stop thinking.
+    // It was accepted and dropped, and the answer came back with the reasoning in it;
+    // saying so is the only honest answer. Asking such a template *to* think is not
+    // refused -- it is already doing it.
+    if (request.enable_thinking && !*request.enable_thinking && !capabilities.enable_thinking &&
+        capabilities.reasoning_turn) {
+        invalid_prompt_option("the loaded chat template always opens a reasoning turn and has no "
+                              "switch to disable it",
+                              request.enable_thinking_param, "thinking_toggle_not_supported");
+    }
     if (!request.reasoning_effort) { return result; }
 
     const RequestedReasoningEffort requested = *request.reasoning_effort;
@@ -140,32 +186,15 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         return result;
     }
 
-    switch (requested) {
-    case RequestedReasoningEffort::Low:
-        result.reasoning_effort = sinfer::ReasoningEffort::Low;
-        break;
-    case RequestedReasoningEffort::Medium:
-        result.reasoning_effort = sinfer::ReasoningEffort::Medium;
-        break;
-    case RequestedReasoningEffort::XHigh:
-        result.reasoning_effort = sinfer::ReasoningEffort::XHigh;
-        break;
-    case RequestedReasoningEffort::Minimal:
-    case RequestedReasoningEffort::High:
-    case RequestedReasoningEffort::Max:
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
-    case RequestedReasoningEffort::None:
-        break;
-    }
-
+    result.reasoning_effort = to_template_effort(requested);
     if (!capabilities.reasoning_effort.supports(*result.reasoning_effort)) {
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+        const std::string accepted = supported_efforts(capabilities.reasoning_effort);
+        invalid_prompt_option(
+            "reasoning effort '" + std::string(requested_reasoning_effort_name(requested)) +
+                "' is not supported by the loaded chat template" +
+                (accepted.empty() ? std::string(", which chooses no reasoning effort")
+                                  : ", which accepts " + accepted),
+            request.reasoning_effort_param, "reasoning_effort_not_supported");
     }
     return result;
 }

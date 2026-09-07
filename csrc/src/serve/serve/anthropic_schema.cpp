@@ -460,8 +460,9 @@ void parse_thinking(const Json& body, GenerationRequest& out) {
     // Qwen template only exposes an on/off toggle, so any non-"disabled" mode maps
     // to thinking-on. Unknown future modes default to on rather than 400 so the
     // adapter tolerates Claude Code's evolving thinking vocabulary.
-    const std::string type = thinking.at("type").get<std::string>();
-    out.enable_thinking    = (type != "disabled");
+    const std::string type    = thinking.at("type").get<std::string>();
+    out.enable_thinking       = (type != "disabled");
+    out.enable_thinking_param = "thinking.type";
 }
 
 void parse_output_config(const Json& body, GenerationRequest& out) {

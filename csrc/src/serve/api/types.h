@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -373,33 +374,108 @@ struct ChatMessage {
     std::string tool_call_id;
 };
 
+// The effort vocabulary a chat template may offer. It is the union of what the
+// templates this engine serves accept, not one model's list: the Qwen family
+// names low/medium/xhigh, GLM names low/high/max. Which of them a loaded
+// template actually honours is `ReasoningEffortCapabilities`, derived from the
+// template itself rather than assumed here.
 enum class ReasoningEffort : std::uint8_t {
+    Minimal,
     Low,
     Medium,
+    High,
     XHigh,
+    Max,
+};
+
+[[nodiscard]] constexpr std::string_view reasoning_effort_name(ReasoningEffort effort) noexcept {
+    switch (effort) {
+    case ReasoningEffort::Minimal:
+        return "minimal";
+    case ReasoningEffort::Low:
+        return "low";
+    case ReasoningEffort::Medium:
+        return "medium";
+    case ReasoningEffort::High:
+        return "high";
+    case ReasoningEffort::XHigh:
+        return "xhigh";
+    case ReasoningEffort::Max:
+        return "max";
+    }
+    return {};
+}
+
+inline constexpr std::array<ReasoningEffort, 6> kReasoningEfforts{
+    ReasoningEffort::Minimal, ReasoningEffort::Low,   ReasoningEffort::Medium,
+    ReasoningEffort::High,    ReasoningEffort::XHigh, ReasoningEffort::Max,
 };
 
 struct ReasoningEffortCapabilities {
-    bool low    = false;
-    bool medium = false;
-    bool xhigh  = false;
+    bool minimal = false;
+    bool low     = false;
+    bool medium  = false;
+    bool high    = false;
+    bool xhigh   = false;
+    bool max     = false;
     std::optional<ReasoningEffort> default_effort;
 
     [[nodiscard]] constexpr bool supports(ReasoningEffort effort) const noexcept {
         switch (effort) {
+        case ReasoningEffort::Minimal:
+            return minimal;
         case ReasoningEffort::Low:
             return low;
         case ReasoningEffort::Medium:
             return medium;
+        case ReasoningEffort::High:
+            return high;
         case ReasoningEffort::XHigh:
             return xhigh;
+        case ReasoningEffort::Max:
+            return max;
         }
         return false;
+    }
+
+    constexpr void set(ReasoningEffort effort, bool supported) noexcept {
+        switch (effort) {
+        case ReasoningEffort::Minimal:
+            minimal = supported;
+            return;
+        case ReasoningEffort::Low:
+            low = supported;
+            return;
+        case ReasoningEffort::Medium:
+            medium = supported;
+            return;
+        case ReasoningEffort::High:
+            high = supported;
+            return;
+        case ReasoningEffort::XHigh:
+            xhigh = supported;
+            return;
+        case ReasoningEffort::Max:
+            max = supported;
+            return;
+        }
+    }
+
+    [[nodiscard]] constexpr bool any() const noexcept {
+        return minimal || low || medium || high || xhigh || max;
     }
 };
 
 struct PromptCapabilities {
+    /// The template carries a thinking switch this engine can drive. A template
+    /// that always thinks, or never does, has none -- which is a different fact
+    /// from whether it thinks, below.
     bool enable_thinking = false;
+    /// The generation prompt opens a reasoning turn. Together with the switch
+    /// above this separates "thinking can be turned off" from "thinking happens":
+    /// GLM-5.3-Flash always opens one and offers no switch, so a request that
+    /// asks for thinking off is refused rather than answered with thinking on.
+    bool reasoning_turn = false;
     ReasoningEffortCapabilities reasoning_effort;
 };
 

@@ -254,6 +254,74 @@ int test_reasoning_effort() {
     return failures;
 }
 
+/// A template whose effort vocabulary is not the Qwen family's. GLM-5.3-Flash's own
+/// template names low and high and falls back to max, and always opens a reasoning
+/// turn without offering a switch to close it.
+sinfer::PromptCapabilities glm_capabilities() {
+    sinfer::PromptCapabilities capabilities;
+    capabilities.reasoning_turn = true;
+    capabilities.reasoning_effort.low = true;
+    capabilities.reasoning_effort.high = true;
+    capabilities.reasoning_effort.max = true;
+    capabilities.reasoning_effort.default_effort = sinfer::ReasoningEffort::Max;
+    return capabilities;
+}
+
+int test_effort_vocabulary_is_the_templates() {
+    const Json base = {{"model", "m"}, {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    const auto request_with = [&](const char* field, const Json& value) {
+        Json body = base;
+        body[field] = value;
+        return parse_chat_completion_request(body, default_limits());
+    };
+
+    // The value the OpenAI vocabulary calls high, on a template that implements it.
+    // It used to be refused for every model, because the engine only knew three names.
+    const ResolvedPromptSemantics high =
+        resolve_prompt_semantics(request_with("reasoning_effort", "high"), default_server(), glm_capabilities());
+    int failures = check(high.reasoning_effort == sinfer::ReasoningEffort::High && high.enable_thinking,
+                         "an effort this template implements was not resolved to it");
+    const ResolvedPromptSemantics max =
+        resolve_prompt_semantics(request_with("reasoning_effort", "max"), default_server(), glm_capabilities());
+    failures += check(max.reasoning_effort == sinfer::ReasoningEffort::Max,
+                      "a template's own default effort was not accepted by name");
+
+    // A name from another template's vocabulary is refused, and the refusal says what
+    // this one takes instead -- nothing is quietly served at a neighbouring effort.
+    std::string message;
+    try {
+        (void)resolve_prompt_semantics(request_with("reasoning_effort", "xhigh"), default_server(), glm_capabilities());
+    } catch (const ApiException& error) {
+        message = error.error().message;
+    }
+    failures += check(message.find("accepts low, high, max") != std::string::npos,
+                      "the refusal did not name the efforts this template accepts");
+
+    // Thinking off, from a template that always thinks and carries no switch. It was
+    // accepted and dropped, and the answer came back with the reasoning in it.
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(request_with("enable_thinking", false),
+                                                         default_server(),
+                                                         glm_capabilities());
+                      }) == "thinking_toggle_not_supported",
+                      "a thinking switch this template does not have was accepted and ignored");
+    // Asking such a template to think is not an error: it already is.
+    failures += check(
+        api_code([&] {
+            (void)resolve_prompt_semantics(request_with("enable_thinking", true), default_server(), glm_capabilities());
+        }).empty(),
+        "asking a template that always thinks to think was refused");
+    // A template with no reasoning turn at all has nothing to disable, so the field
+    // stays harmless there rather than becoming a new way to fail.
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(request_with("enable_thinking", false),
+                                                         default_server(),
+                                                         sinfer::PromptCapabilities{});
+                      }).empty(),
+                      "disabling thinking was refused by a template that never thinks");
+    return failures;
+}
+
 int test_parse_parts_and_flatten() {
     int failures    = 0;
     const Json body = {
@@ -711,6 +779,7 @@ int main() {
     failures += test_parse_string_content();
     failures += test_preserve_thinking_options();
     failures += test_reasoning_effort();
+    failures += test_effort_vocabulary_is_the_templates();
     failures += test_parse_parts_and_flatten();
     failures += test_instruction_roles_preserved();
     failures += test_parse_media_in_translate();

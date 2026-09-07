@@ -675,10 +675,12 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
             bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
                         "chat_template_kwargs");
         }
-        out.enable_thinking = value.get<bool>();
+        out.enable_thinking       = value.get<bool>();
+        out.enable_thinking_param = "chat_template_kwargs.enable_thinking";
     }
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking = get_bool(body, "enable_thinking", false);
+        out.enable_thinking       = get_bool(body, "enable_thinking", false);
+        out.enable_thinking_param = "enable_thinking";
     }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);

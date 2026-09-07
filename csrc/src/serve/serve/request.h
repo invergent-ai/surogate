@@ -191,6 +191,9 @@ struct GenerationRequest {
     bool stream         = false;
     bool include_usage  = false;
     std::optional<bool> enable_thinking; // non-standard extension; falls back to server default
+    /// Where this request spelled the thinking switch, so a refusal points at the
+    /// field the client actually sent -- each wire has its own name for it.
+    std::string enable_thinking_param = "enable_thinking";
     std::optional<RequestedReasoningEffort> reasoning_effort;
     std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
