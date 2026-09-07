@@ -19,6 +19,14 @@ struct LoadProgress {
     std::function<void(std::string_view, std::uint64_t, std::uint64_t)> callback;
 };
 
+/// How much device memory the load may hold at once for objects it rearranges rather than
+/// copies. Their source bytes land in scratch and a kernel writes the real allocation, so the
+/// scratch is transient -- but anything created before the load (the expert slot pool) has to
+/// leave room for it, and on a 200 GB checkpoint the sum of every such object is ~9 GiB of pool
+/// nobody gets. The load therefore works in waves of at most this much, plus whatever single
+/// object exceeds it, and `projected_load_staging_bytes` projects the same figure.
+inline constexpr std::uint64_t kLoadStagingCapBytes = 1ULL << 30;
+
 struct MaterializationStats {
     std::uint64_t file_bytes              = 0;
     std::uint64_t h2d_bytes               = 0;

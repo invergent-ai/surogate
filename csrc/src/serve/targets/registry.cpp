@@ -146,13 +146,21 @@ std::size_t projected_load_staging_bytes(const artifact::Binder& binder,
                                          const artifact::MaterializationPlan& plan) {
     const artifact::Reader& reader = binder.reader();
     std::uint64_t staged           = 0;
+    std::uint64_t largest          = 0;
     for (const artifact::DeviceMaterialization& object : plan.device_objects) {
         const auto& descriptor = reader.objects().at(object.object.index);
         const auto* tensor     = std::get_if<artifact::TensorDescriptor>(&descriptor);
         if (tensor == nullptr || tensor->transform == artifact::PayloadTransform::None) { continue; }
-        for (const artifact::PayloadRun& run : reader.runs(descriptor)) { staged += run.bytes; }
+        std::uint64_t object_bytes = 0;
+        for (const artifact::PayloadRun& run : reader.runs(descriptor)) { object_bytes += run.bytes; }
+        staged += object_bytes;
+        largest = std::max(largest, object_bytes);
     }
-    return static_cast<std::size_t>(staged);
+    // The load holds a wave at a time, not the sum: at most the cap, and never less than the
+    // one object that has to fit whole (`artifact::kLoadStagingCapBytes`, and the wave
+    // partition in the materializer, which this must agree with).
+    return static_cast<std::size_t>(
+        std::max(largest, std::min<std::uint64_t>(artifact::kLoadStagingCapBytes, staged)));
 }
 
 namespace {

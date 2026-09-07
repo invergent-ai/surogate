@@ -66,10 +66,12 @@ struct CopyRange {
     std::uint64_t source_begin = 0;
     std::uint64_t source_end   = 0;
     std::byte* destination     = nullptr;
-    /// Offset into the transform scratch, for a range whose object is rearranged rather than
-    /// copied; `destination` is resolved from it once the scratch is allocated.
-    std::uint64_t staged_at = 0;
-    bool staged             = false;
+    /// For a range whose object is rearranged rather than copied: its offset within that
+    /// object's own staged block, and which transform owns it. `destination` is resolved from
+    /// the pair when the wave holding that transform allocates its scratch.
+    std::uint64_t staged_at   = 0;
+    bool staged               = false;
+    std::size_t transform_index = 0;
 };
 
 struct PendingTransform {
@@ -77,7 +79,7 @@ struct PendingTransform {
     /// The object's column permutation, if it has one; uploaded with the scratch.
     std::vector<std::int32_t> host_map;
     const std::int32_t* group_map = nullptr;
-    std::uint64_t source       = 0; // offset into the scratch
+    std::uint64_t source       = 0; // resolved to a scratch address when its wave runs
     std::byte* destination     = nullptr;
     std::uint64_t bytes        = 0;
     std::uint64_t stored       = 0;
@@ -225,7 +227,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             transforms.push_back(PendingTransform{
                 .transform   = transform,
                 .host_map    = tensor->group_map,
-                .source      = staged_bytes,
+                .source      = 0, // its wave's offset, then that wave's address
                 .destination = cursor_out,
                 .bytes       = run_bytes,
                 .stored      = placement.bytes,
@@ -246,10 +248,9 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 .source_end   = checked_add(run.offset, run.bytes,
                                             "artifact tensor source range overflows u64"),
                 .destination  = cursor_out == nullptr ? nullptr : cursor_out + within,
-                .staged_at    = cursor_out == nullptr
-                                    ? transforms.back().source + within
-                                    : 0,
+                .staged_at    = cursor_out == nullptr ? within : 0,
                 .staged       = cursor_out == nullptr,
+                .transform_index = transforms.empty() ? 0 : transforms.size() - 1,
             });
             within += run.bytes;
         }
@@ -284,23 +285,11 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             }
         }
     }
-    // Scratch for the objects that are rearranged rather than copied. It is transient: the reads
-    // land here, the rearranging writes their real allocations, and it is freed before serving.
-    std::unique_ptr<DeviceArena> staging;
     std::unique_ptr<DeviceArena> group_maps;
     if (staged_bytes != 0) {
-        staging = std::make_unique<DeviceArena>(static_cast<std::size_t>(staged_bytes));
-        auto* base = static_cast<std::byte*>(
-            staging->alloc_bytes(static_cast<std::size_t>(staged_bytes), 256).data);
-        for (CopyRange& range : ranges) {
-            if (range.staged) { range.destination = base + range.staged_at; }
-        }
-        for (PendingTransform& pending : transforms) { pending.source += 0; }
-        for (std::size_t i = 0; i < transforms.size(); ++i) {
-            transforms[i].source = reinterpret_cast<std::uint64_t>(base + transforms[i].source);
-        }
         // The column permutations, gathered into one small upload: one entry per 32 columns,
-        // shared by every row of an object, so a whole model's worth is a few kilobytes.
+        // shared by every row of an object, so a whole model's worth is a few kilobytes. These
+        // live for the whole load rather than per wave, being tiny.
         std::vector<std::int32_t> flat;
         for (const PendingTransform& pending : transforms) {
             flat.insert(flat.end(), pending.host_map.begin(), pending.host_map.end());
@@ -319,38 +308,89 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             }
         }
     }
-    std::sort(ranges.begin(), ranges.end(), [](const CopyRange& a, const CopyRange& b) {
-        return a.source == b.source ? a.source_begin < b.source_begin : a.source < b.source;
-    });
-    for (std::size_t i = 1; i < ranges.size(); ++i) {
-        // Two objects may legitimately read the same bytes of a GGUF -- a tied embedding and
-        // output head, say -- so overlap is only an error inside the artifact's own payload,
-        // whose objects the directory already requires to be disjoint and ordered.
-        if (ranges[i].source == ranges[i - 1].source && ranges[i].source == 0 &&
-            ranges[i].source_begin < ranges[i - 1].source_end) {
-            throw ArtifactError("materialization source ranges overlap");
+    // The load runs in passes: the objects copied straight to their allocations first, then the
+    // rearranged ones in waves that each hold at most `kLoadStagingCapBytes` of scratch (plus
+    // whatever single object is larger than that on its own). Every pass reads its own ranges in
+    // file order, so the bytes read are the same as one pass would read; what changes is that the
+    // scratch is a wave's worth rather than the whole model's -- ~9 GiB on a 200 GB checkpoint --
+    // which is memory anything created before the load, the expert slot pool above all, gets to
+    // keep. `projected_load_staging_bytes` projects the same figure.
+    struct Pass {
+        std::vector<CopyRange> ranges;
+        std::vector<std::size_t> transforms; // empty for the pass that copies straight through
+        std::uint64_t staging_bytes = 0;
+    };
+    std::vector<Pass> passes;
+    {
+        std::uint64_t largest = 0;
+        for (const PendingTransform& pending : transforms) {
+            largest = std::max(largest, pending.bytes);
+        }
+        const std::uint64_t cap = std::max<std::uint64_t>(largest, kLoadStagingCapBytes);
+        std::vector<std::uint64_t> offset_of(transforms.size(), 0);
+        std::vector<std::size_t> pass_of(transforms.size(), 0);
+        Pass direct;
+        passes.push_back(std::move(direct)); // pass 0 is always the straight copies
+        for (std::size_t t = 0; t < transforms.size(); ++t) {
+            const std::uint64_t need =
+                align_up(transforms[t].bytes, 256, "artifact staging overflow u64");
+            if (passes.size() == 1 || passes.back().staging_bytes + need > cap) {
+                passes.push_back(Pass{});
+            }
+            offset_of[t]         = passes.back().staging_bytes;
+            transforms[t].source = passes.back().staging_bytes;
+            pass_of[t]   = passes.size() - 1;
+            passes.back().transforms.push_back(t);
+            passes.back().staging_bytes += need;
+        }
+        for (const CopyRange& range : ranges) {
+            if (!range.staged) {
+                passes.front().ranges.push_back(range);
+                continue;
+            }
+            CopyRange copy = range;
+            copy.staged_at += offset_of[range.transform_index];
+            passes[pass_of[range.transform_index]].ranges.push_back(copy);
+        }
+        if (passes.front().ranges.empty()) { passes.erase(passes.begin()); }
+    }
+    for (Pass& pass : passes) {
+        std::sort(pass.ranges.begin(), pass.ranges.end(), [](const CopyRange& a, const CopyRange& b) {
+            return a.source == b.source ? a.source_begin < b.source_begin : a.source < b.source;
+        });
+        for (std::size_t i = 1; i < pass.ranges.size(); ++i) {
+            // Two objects may legitimately read the same bytes of a GGUF -- a tied embedding and
+            // output head, say -- so overlap is only an error inside the artifact's own payload,
+            // whose objects the directory already requires to be disjoint and ordered.
+            if (pass.ranges[i].source == pass.ranges[i - 1].source && pass.ranges[i].source == 0 &&
+                pass.ranges[i].source_begin < pass.ranges[i - 1].source_end) {
+                throw ArtifactError("materialization source ranges overlap");
+            }
         }
     }
 
     constexpr std::uint64_t alignment = Reader::direct_io_alignment;
-    std::vector<ReadSpan> read_spans;
-    read_spans.reserve(ranges.size());
+    // The read slots are host pinned buffers and are reused by every pass; size them from the
+    // whole load rather than from one pass, so a small final wave still reads in big requests.
     std::uint64_t aligned_read_bytes = 0;
-    for (const CopyRange& range : ranges) {
-        const std::uint64_t begin = align_down(range.source_begin, alignment);
-        if (read_spans.empty() || read_spans.back().source != range.source ||
-            begin > align_up(read_spans.back().end, alignment,
-                             "artifact direct I/O span overflows u64")) {
-            read_spans.push_back(ReadSpan{range.source, begin, range.source_end});
-        } else {
-            read_spans.back().end = std::max(read_spans.back().end, range.source_end);
+    for (const Pass& pass : passes) {
+        std::vector<ReadSpan> spans;
+        for (const CopyRange& range : pass.ranges) {
+            const std::uint64_t begin = align_down(range.source_begin, alignment);
+            if (spans.empty() || spans.back().source != range.source ||
+                begin > align_up(spans.back().end, alignment,
+                                 "artifact direct I/O span overflows u64")) {
+                spans.push_back(ReadSpan{range.source, begin, range.source_end});
+            } else {
+                spans.back().end = std::max(spans.back().end, range.source_end);
+            }
         }
-    }
-    for (const ReadSpan& span : read_spans) {
-        aligned_read_bytes = checked_add(
-            aligned_read_bytes,
-            align_up(span.end - span.begin, alignment, "artifact direct I/O span overflows u64"),
-            "artifact direct I/O byte count overflows u64");
+        for (const ReadSpan& span : spans) {
+            aligned_read_bytes = checked_add(
+                aligned_read_bytes,
+                align_up(span.end - span.begin, alignment, "artifact direct I/O span overflows u64"),
+                "artifact direct I/O byte count overflows u64");
+        }
     }
     const std::size_t slot_bytes =
         static_cast<std::size_t>(std::min<std::uint64_t>(kSlotBytes, aligned_read_bytes));
@@ -361,108 +401,147 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     for (std::size_t i = 0; i < slot_count; ++i) {
         slots.push_back(std::make_unique<Slot>(slot_bytes));
     }
-    out.stats_.peak_staging_bytes = static_cast<std::uint64_t>(slot_bytes) * slot_count;
+    std::uint64_t peak_staging = 0;
+    for (const Pass& pass : passes) { peak_staging = std::max(peak_staging, pass.staging_bytes); }
+    out.stats_.peak_staging_bytes =
+        static_cast<std::uint64_t>(slot_bytes) * slot_count + peak_staging;
 
-    std::size_t next_slot  = 0;
-    std::size_t next_range = 0;
-    const auto start       = std::chrono::steady_clock::now();
+    const auto start_time = std::chrono::steady_clock::now();
     if (progress != nullptr && progress->callback) { progress->callback("weights", 0, total); }
-    for (const ReadSpan& span : read_spans) {
-        for (std::uint64_t source = span.begin; source < span.end; source += slot_bytes) {
-            Slot& slot = *slots[next_slot++ % slot_count];
-            slot.wait();
-
-            const std::uint64_t remaining = span.end - source;
-            const std::size_t request     = static_cast<std::size_t>(std::min<std::uint64_t>(
-                slot_bytes,
-                align_up(remaining, alignment, "artifact direct I/O request overflows u64")));
-            auto destination =
-                std::span<std::byte>(static_cast<std::byte*>(slot.buffer.data()), request);
-            const std::size_t bytes_read = reader.read_direct(span.source, source, destination);
-            const std::uint64_t required = std::min<std::uint64_t>(request, remaining);
-            if (bytes_read < required) {
-                throw ArtifactError("direct artifact read ended before the planned tensor range");
-            }
-            out.stats_.file_bytes =
-                checked_add(out.stats_.file_bytes, bytes_read, "artifact read bytes overflow u64");
-            const std::uint64_t chunk_end =
-                checked_add(source, bytes_read, "artifact direct I/O result overflows u64");
-
-            // Offsets only order within a file, so both walks are gated on the source too:
-            // an external file's small offsets must not match ranges left in the artifact's.
-            while (next_range < ranges.size() &&
-                   (ranges[next_range].source < span.source ||
-                    (ranges[next_range].source == span.source &&
-                     ranges[next_range].source_end <= source))) {
-                ++next_range;
-            }
-            std::size_t range_index = next_range;
-            std::size_t resume       = ranges.size();
-            while (range_index < ranges.size() && ranges[range_index].source == span.source &&
-                   ranges[range_index].source_begin < chunk_end) {
-                const CopyRange& range         = ranges[range_index];
-                const std::uint64_t copy_begin = std::max(source, range.source_begin);
-                const std::uint64_t copy_end   = std::min(chunk_end, range.source_end);
-                if (copy_begin < copy_end) {
-                    const auto amount = static_cast<std::size_t>(copy_end - copy_begin);
-                    CUDA_CHECK(cudaMemcpyAsync(
-                        range.destination +
-                            static_cast<std::size_t>(copy_begin - range.source_begin),
-                        static_cast<std::byte*>(slot.buffer.data()) +
-                            static_cast<std::size_t>(copy_begin - source),
-                        amount, cudaMemcpyHostToDevice, device.load_stream));
-                    copied =
-                        checked_add(copied, amount, "artifact copied byte count overflows u64");
-                }
-                // Every range overlapping this chunk takes its slice, including ones that
-                // reach past it: two objects may read the same source bytes -- a tied
-                // embedding and output head do -- and stopping at the first unfinished range
-                // would leave the second one's earlier chunks uncopied.
-                if (range.source_end > chunk_end && resume == ranges.size()) {
-                    resume = range_index;
-                }
-                ++range_index;
-            }
-            // Resume at the first range this chunk did not finish. Ranges after it that the
-            // chunk did complete are skipped by the guard above on the next pass, because
-            // their source_end is behind the next chunk's start.
-            next_range = std::min(resume, range_index);
-            CUDA_CHECK(cudaEventRecord(slot.event, device.load_stream));
-            slot.pending = true;
-
-            if (progress != nullptr && progress->callback && copied != last_published &&
-                copied < total) {
-                last_published = copied;
-                progress->callback("weights", copied, total);
+    /// One pass: read every range it owns, in file order, through the slot ring.
+    const auto read_pass = [&](const std::vector<CopyRange>& pass_ranges) {
+        std::vector<ReadSpan> read_spans;
+        read_spans.reserve(pass_ranges.size());
+        for (const CopyRange& range : pass_ranges) {
+            const std::uint64_t begin = align_down(range.source_begin, alignment);
+            if (read_spans.empty() || read_spans.back().source != range.source ||
+                begin > align_up(read_spans.back().end, alignment,
+                                 "artifact direct I/O span overflows u64")) {
+                read_spans.push_back(ReadSpan{range.source, begin, range.source_end});
+            } else {
+                read_spans.back().end = std::max(read_spans.back().end, range.source_end);
             }
         }
-    }
-    for (const auto& slot : slots) { slot->wait(); }
-    CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
-    if (copied != total || next_range != ranges.size()) {
-        throw ArtifactError("direct materialization did not cover every tensor byte (copied " +
-                            std::to_string(copied) + " of " + std::to_string(total) +
-                            ", consumed " + std::to_string(next_range) + " of " +
-                            std::to_string(ranges.size()) + " ranges)");
-    }
-    for (const PendingTransform& pending : transforms) {
-        switch (pending.transform) {
-        case PayloadTransform::Q8ToW8RowSplit:
-            ops::detail::ggml::q8_0_to_w8_rowsplit_launch(
-                reinterpret_cast<const void*>(pending.source), pending.destination, pending.rows,
-                pending.columns, static_cast<std::size_t>(pending.stored), pending.group_map,
-                device.load_stream);
-            break;
-        case PayloadTransform::None:
-            throw ArtifactError("a pending transform must name one");
+        std::size_t next_slot  = 0;
+        std::size_t next_range = 0;
+        for (const ReadSpan& span : read_spans) {
+            for (std::uint64_t source = span.begin; source < span.end; source += slot_bytes) {
+                Slot& slot = *slots[next_slot++ % slot_count];
+                slot.wait();
+
+                const std::uint64_t remaining = span.end - source;
+                const std::size_t request     = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    slot_bytes,
+                    align_up(remaining, alignment, "artifact direct I/O request overflows u64")));
+                auto destination =
+                    std::span<std::byte>(static_cast<std::byte*>(slot.buffer.data()), request);
+                const std::size_t bytes_read = reader.read_direct(span.source, source, destination);
+                const std::uint64_t required = std::min<std::uint64_t>(request, remaining);
+                if (bytes_read < required) {
+                    throw ArtifactError("direct artifact read ended before the planned tensor range");
+                }
+                out.stats_.file_bytes = checked_add(out.stats_.file_bytes, bytes_read,
+                                                    "artifact read bytes overflow u64");
+                const std::uint64_t chunk_end =
+                    checked_add(source, bytes_read, "artifact direct I/O result overflows u64");
+
+                // Offsets only order within a file, so both walks are gated on the source too:
+                // an external file's small offsets must not match ranges left in the artifact's.
+                while (next_range < pass_ranges.size() &&
+                       (pass_ranges[next_range].source < span.source ||
+                        (pass_ranges[next_range].source == span.source &&
+                         pass_ranges[next_range].source_end <= source))) {
+                    ++next_range;
+                }
+                std::size_t range_index = next_range;
+                std::size_t resume      = pass_ranges.size();
+                while (range_index < pass_ranges.size() &&
+                       pass_ranges[range_index].source == span.source &&
+                       pass_ranges[range_index].source_begin < chunk_end) {
+                    const CopyRange& range         = pass_ranges[range_index];
+                    const std::uint64_t copy_begin = std::max(source, range.source_begin);
+                    const std::uint64_t copy_end   = std::min(chunk_end, range.source_end);
+                    if (copy_begin < copy_end) {
+                        const auto amount = static_cast<std::size_t>(copy_end - copy_begin);
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            range.destination +
+                                static_cast<std::size_t>(copy_begin - range.source_begin),
+                            static_cast<std::byte*>(slot.buffer.data()) +
+                                static_cast<std::size_t>(copy_begin - source),
+                            amount, cudaMemcpyHostToDevice, device.load_stream));
+                        copied =
+                            checked_add(copied, amount, "artifact copied byte count overflows u64");
+                    }
+                    // Every range overlapping this chunk takes its slice, including ones that
+                    // reach past it: two objects may read the same source bytes -- a tied
+                    // embedding and output head do -- and stopping at the first unfinished range
+                    // would leave the second one's earlier chunks uncopied.
+                    if (range.source_end > chunk_end && resume == pass_ranges.size()) {
+                        resume = range_index;
+                    }
+                    ++range_index;
+                }
+                // Resume at the first range this chunk did not finish. Ranges after it that the
+                // chunk did complete are skipped by the guard above on the next pass, because
+                // their source_end is behind the next chunk's start.
+                next_range = std::min(resume, range_index);
+                CUDA_CHECK(cudaEventRecord(slot.event, device.load_stream));
+                slot.pending = true;
+
+                if (progress != nullptr && progress->callback && copied != last_published &&
+                    copied < total) {
+                    last_published = copied;
+                    progress->callback("weights", copied, total);
+                }
+            }
         }
+        for (const auto& slot : slots) { slot->wait(); }
+        if (next_range != pass_ranges.size()) {
+            throw ArtifactError("direct materialization did not consume every range of a pass (" +
+                                std::to_string(next_range) + " of " +
+                                std::to_string(pass_ranges.size()) + ")");
+        }
+    };
+
+    for (Pass& pass : passes) {
+        // The wave's scratch, if it has one: the reads land here and the rearranging kernels
+        // write the real allocations, after which it goes back before the next wave asks.
+        std::unique_ptr<DeviceArena> staging;
+        if (pass.staging_bytes != 0) {
+            staging = std::make_unique<DeviceArena>(static_cast<std::size_t>(pass.staging_bytes));
+            auto* base = static_cast<std::byte*>(
+                staging->alloc_bytes(static_cast<std::size_t>(pass.staging_bytes), 256).data);
+            for (CopyRange& range : pass.ranges) { range.destination = base + range.staged_at; }
+            for (const std::size_t t : pass.transforms) {
+                transforms[t].source = reinterpret_cast<std::uint64_t>(base) +
+                                       transforms[t].source; // source holds the wave offset
+            }
+        }
+        read_pass(pass.ranges);
+        for (const std::size_t t : pass.transforms) {
+            const PendingTransform& pending = transforms[t];
+            switch (pending.transform) {
+            case PayloadTransform::Q8ToW8RowSplit:
+                ops::detail::ggml::q8_0_to_w8_rowsplit_launch(
+                    reinterpret_cast<const void*>(pending.source), pending.destination,
+                    pending.rows, pending.columns, static_cast<std::size_t>(pending.stored),
+                    pending.group_map, device.load_stream);
+                break;
+            case PayloadTransform::None:
+                throw ArtifactError("a pending transform must name one");
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
+        staging.reset();
     }
-    if (!transforms.empty()) { CUDA_CHECK(cudaStreamSynchronize(device.load_stream)); }
-    staging.reset();
     group_maps.reset();
+    if (copied != total) {
+        throw ArtifactError("direct materialization did not cover every tensor byte (copied " +
+                            std::to_string(copied) + " of " + std::to_string(total) + ")");
+    }
     out.stats_.h2d_bytes = copied;
     out.stats_.upload_seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     if (progress != nullptr && progress->callback) { progress->callback("weights", copied, total); }
     return out;
 }
