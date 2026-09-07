@@ -276,6 +276,7 @@ architecture.
 | **surogate** | **1** | 1 | **53.2** | **12.9** | **66.1** | **3.27 s** | `--host-moe-layers all --cpu-moe-share auto --max-num-batched-tokens 1024` (2026-09-07, the expert cache lifted into the family, on the per-object bank): the routed experts are repacked into a 191.7 GiB pinned bank in 55 s at load -- Q4G32AM planes for the Q4_K gate/up halves, Q5G32AM for the Q5_K down halves (exact repacks both), W8 for the three Q6_K down halves, each read by its own format -- and 83 % of every round's misses are computed on the 32 host cores (host 202 GB/s against 46 over PCIe, measured overlapped) with the rest gathered into a 456-slot pool. The server times each request at 18.8 tok/s of decode after a 3.27 s prompt; the prompt is one gather of every expert of every layer over the link. **+26 % decode, +25 % prefill over llama.cpp at 58 % of its TTFT**, at parity on the perplexity gate below. With the Q5_K halves held as W8 instead (220.5 GiB) it read 51.3 / 12.4 / 3.62 s; the all-W8 bank 40.9 / 9.9 / 4.64 s; chunk 512 on that bank 36.7 / 8.9 / 6.12 s; the row before the cache 7.5 / 1.8 / 29.54 s |
 | llama.cpp | **1** | 1 | 42.4 | 10.2 | 52.6 | 5.64 s | `-cmoe -t 32`: the same 172 GB off the card, the expert matmuls on 32 EPYC cores, the bytes from ordinary RAM. On the morning's binary, which streamed the experts over PCIe, it was ahead 5.7× with a fifth of our TTFT; by evening it is behind on all three columns |
 | **surogate** | **1** | 16 | **84.8** | **20.5** | **105.3** | **25.78 s** | the same cache on the per-object bank, `--max-num-seqs 16 --kv-capacity 11264 --max-num-batched-tokens 2048` (2026-09-07): a 456-slot pool sized automatically, 83 % of every round's misses on the host, **16 of 16 served, 0 expired**. **+48 % decode and +48 % prefill over llama.cpp at 28 % of its TTFT.** A 16-lane round routes to most of a layer's experts, so the split carries ~8 GB of bank bytes a round; the prompt rounds, which gather every expert over the link, are what queue, and a 2,048-token chunk lets several prompts share one gather. With the Q5_K halves held as W8 this read 80.3 / 19.4 / 28.50 s; on the all-W8 bank 66.4 / 16.0 / 31.82 s with 1 of 17 expired; at chunk 512 on that bank 57.4 / 13.9 / 38.23 s with 4 of 20 expired, a tie. The row before the cache read 7.4 / 1.8 / 9.2 / 91.35 s with 22 of 28 expired |
+| surogate `--spec mtp --draft-tokens 3` | **1** | 16 | 72.3 | 17.5 | 89.8 | 28.92 s | the head at sixteen users on one card (2026-09-07 11:12, card 4; its no-head pair the same hour, same settings, read 84.4 / 20.4 / 23.08 s): a prompt rides the mixed rounds under the head now, the head aligned over its columns and on every decode column, so the head costs 14 % of the decode here where a lone-prefill prompt path would have cost the row. `--max-num-seqs 16 --kv-capacity 11264 --max-num-batched-tokens 1024 --host-moe-layers all --cpu-moe-share auto`, 16 of 16 served |
 | llama.cpp | **1** | 16 | 57.4 | 13.9 | 71.3 | 90.73 s | `-cmoe -t 32 --kv-unified`, 16 of 16 served |
 
 **The single-card rows, and what changed between morning and afternoon.** Both engines keep
@@ -415,10 +416,12 @@ two on these salted prompts, and loses from four up. `--spec-max-lanes` (default
 width above which an MTP round runs narrow: one column per lane through the trunk, sampled as
 an ordinary round samples, the head aligned on it so its cache stays current, no proposals, the
 recurrent state updated in place with nothing to fold. It is never the wide verify's loss, and
-what remains between it and the no-head row at eight and sixteen users is the prompt path --
-a draft-head prompt runs as a lone flight through the stages, where the no-head engine batches
-eight prompts into one mixed round -- which is the next piece of work, not a property of the
-head.
+what remained between it and the no-head row at eight and sixteen users was the prompt path --
+a draft-head prompt ran as a lone flight through the stages, where the no-head engine batches
+eight prompts into one mixed round. Since 2026-09-07 11:00 a prompt rides the decode rounds
+under the head too (the decode lanes narrow, the head aligned over every prompt segment, the
+prompt's last token left to the final chunk); the eight-card rows above at two users and up
+were measured before that and wait for the eight cards to be free again to be re-measured.
 
 Read the two one-user numbers together rather than against each other. On this client -- a
 30-token prompt, so almost no prefill -- llama.cpp's steady-state decode is ahead of ours
