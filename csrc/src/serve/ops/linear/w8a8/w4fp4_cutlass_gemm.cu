@@ -29,7 +29,8 @@ using namespace cute;
 // each take 128 tokens), which is the tile vLLM's kernel runs.
 template <bool WithResidual, class Tile = Shape<_128, _128, _128>,
           class Scheduler = cutlass::gemm::StaticPersistentScheduler,
-          class EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto>
+          class EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto,
+          bool SwapAB = false>
 struct GemmDef {
     using OutElementType = cutlass::bfloat16_t;
     using CTAShape       = Tile;
@@ -42,7 +43,8 @@ struct GemmDef {
     using LayoutB        = cutlass::layout::ColumnMajor;
     static constexpr int AlignmentB = 32;
     using ElementC       = std::conditional_t<WithResidual, cutlass::bfloat16_t, void>;
-    using LayoutC        = cutlass::layout::RowMajor;
+    // Swapped, D is [rows, tokens] column-major: the same bytes as [tokens, rows] row-major.
+    using LayoutC        = std::conditional_t<SwapAB, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;
     using ElementCompute     = float;
     using ElementAccumulator = float;
@@ -95,23 +97,27 @@ int device_sm_count() {
 
 template <bool WithResidual, class Tile = Shape<_128, _128, _128>,
           class Scheduler = cutlass::gemm::StaticPersistentScheduler,
-          class EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto>
+          class EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto, bool SwapAB = false>
 bool launch(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
             const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom, const float* alpha_one,
             void* c_bf16, void* d_bf16, std::int32_t tokens, std::int32_t n, std::int32_t k,
             cudaStream_t stream, float alpha = 1.0f) {
-    using Def  = GemmDef<WithResidual, Tile, Scheduler, EpilogueTile>;
+    using Def  = GemmDef<WithResidual, Tile, Scheduler, EpilogueTile, SwapAB>;
     using Gemm = typename Def::Gemm;
     using Cfg  = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
     typename Gemm::Arguments args;
     args.mode          = cutlass::gemm::GemmUniversalMode::kGemm;
-    args.problem_shape = make_shape(static_cast<int>(tokens), static_cast<int>(n),
-                                    static_cast<int>(k), 1);
-    args.mainloop.ptr_A   = reinterpret_cast<cutlass::float_e2m1_t const*>(act_codes);
-    args.mainloop.ptr_B   = reinterpret_cast<cutlass::float_e2m1_t const*>(w_codes);
-    args.mainloop.ptr_SFA = reinterpret_cast<cutlass::float_ue4m3_t const*>(act_sf_atom);
-    args.mainloop.ptr_SFB = reinterpret_cast<cutlass::float_ue4m3_t const*>(w_sf_atom);
+    // Swapped: the weight is A (M = rows) and the activation B (N = tokens); the tile's 256
+    // rows then span weight rows, the activation is the operand every CTA re-reads, and D's
+    // column-major [rows, tokens] is the engine's token-major store.
+    const int rows_m = SwapAB ? n : tokens;
+    const int cols_n = SwapAB ? tokens : n;
+    args.problem_shape = make_shape(rows_m, cols_n, static_cast<int>(k), 1);
+    args.mainloop.ptr_A   = reinterpret_cast<cutlass::float_e2m1_t const*>(SwapAB ? w_codes : act_codes);
+    args.mainloop.ptr_B   = reinterpret_cast<cutlass::float_e2m1_t const*>(SwapAB ? act_codes : w_codes);
+    args.mainloop.ptr_SFA = reinterpret_cast<cutlass::float_ue4m3_t const*>(SwapAB ? w_sf_atom : act_sf_atom);
+    args.mainloop.ptr_SFB = reinterpret_cast<cutlass::float_ue4m3_t const*>(SwapAB ? act_sf_atom : w_sf_atom);
     if constexpr (WithResidual) {
         args.epilogue.ptr_C       = static_cast<cutlass::bfloat16_t const*>(c_bf16);
         args.epilogue.thread.beta = 1.0f;
@@ -124,11 +130,11 @@ bool launch(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
     args.epilogue.thread.alpha     = alpha;
     args.epilogue.thread.alpha_ptr = alpha_one;
     args.mainloop.dA =
-        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, {tokens, k, 1});
+        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, {rows_m, k, 1});
     args.mainloop.dB =
-        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, {n, k, 1});
+        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, {cols_n, k, 1});
     args.epilogue.dC =
-        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideC{}, {tokens, n, 1});
+        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideC{}, {rows_m, cols_n, 1});
     args.epilogue.dD         = args.epilogue.dC;
     args.mainloop.layout_SFA = Cfg::tile_atom_to_shape_SFA(args.problem_shape);
     args.mainloop.layout_SFB = Cfg::tile_atom_to_shape_SFB(args.problem_shape);
@@ -184,6 +190,8 @@ bool nvfp4_cutlass_gemm(const std::uint8_t* act_codes, const std::uint8_t* act_s
         case 1: return launch<true, Wide, Static>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
         case 2: return launch<true, Wide, StreamK, Shape<_64, _32>>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
         case 3: return launch<true, Narrow, StreamK>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
+        case 4: return launch<true, Wide, Static, cutlass::epilogue::collective::EpilogueTileAuto, true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
+        case 5: return launch<true, Narrow, Static, cutlass::epilogue::collective::EpilogueTileAuto, true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
         default: return launch<true, Narrow, Static>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
         }
     }
@@ -191,6 +199,8 @@ bool nvfp4_cutlass_gemm(const std::uint8_t* act_codes, const std::uint8_t* act_s
     case 1: return launch<false, Wide, Static>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
     case 2: return launch<false, Wide, StreamK, Shape<_64, _32>>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
     case 3: return launch<false, Narrow, StreamK>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
+    case 4: return launch<false, Wide, Static, cutlass::epilogue::collective::EpilogueTileAuto, true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
+    case 5: return launch<false, Narrow, Static, cutlass::epilogue::collective::EpilogueTileAuto, true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
     default: return launch<false, Narrow, Static>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
     }
 }

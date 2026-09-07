@@ -4,7 +4,6 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
-#include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_split.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"
@@ -87,20 +86,8 @@ void nvfp4_linear_add_w4a4_wide_gemm(const Weight& weight, Nvfp4W4a4Workspace wo
     if (!nvfp4_linear_add_w4a4_wide(weight, tokens)) {
         throw std::invalid_argument("nvfp4 linear_add: the wide GEMM does not serve this width");
     }
-    {
-        if (const int tile = nvfp4_cutlass_tile(); tile >= 0 &&
-            nvfp4_cutlass_gemm(workspace.codes, workspace.scales,
-                               static_cast<const std::uint8_t*>(weight.qdata),
-                               static_cast<const std::uint8_t*>(weight.scales),
-                               1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor),
-                               residual.data, residual.data, tokens, weight.n, weight.k, tile,
-                               stream)) {
-            return;
-        }
-        nvfp4_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.scales,
-                            static_cast<__nv_bfloat16*>(residual.data), weight.n, tokens, 1.0F,
-                            stream);
-    }
+    nvfp4_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.scales,
+                        static_cast<__nv_bfloat16*>(residual.data), weight.n, tokens, 1.0F, stream);
 }
 
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,

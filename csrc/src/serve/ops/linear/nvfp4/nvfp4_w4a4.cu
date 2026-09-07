@@ -4,7 +4,6 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_swiglu_quantize.cuh"
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
-#include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_split.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
@@ -185,14 +184,6 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     }
     if (nvfp4_cublaslt_route(tokens) || is_nvfp4_generic_problem(weight.n, weight.k)) {
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
-        if (const int tile = nvfp4_cutlass_tile(); tile >= 0 &&
-            nvfp4_cutlass_gemm(workspace.codes, workspace.scales,
-                               static_cast<const std::uint8_t*>(weight.qdata),
-                               static_cast<const std::uint8_t*>(weight.scales),
-                               1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor),
-                               nullptr, out.data, tokens, weight.n, weight.k, tile, stream)) {
-            return;
-        }
         nvfp4_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.scales,
                             static_cast<__nv_bfloat16*>(out.data), weight.n, tokens, 0.0F, stream);
         return;

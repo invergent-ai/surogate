@@ -19,9 +19,14 @@ constexpr std::int32_t kNvfp4CublasLtDefaultMinTokens = 64;
 
 bool nvfp4_cublaslt_route(std::int32_t tokens);
 
-/// SUROGATE_SERVE_NVFP4_CUTLASS=128|256|256sk|128sk: the wide W4A4 GEMMs go to the CUTLASS SM120
-/// block-scaled kernel at that tile (sk: stream-K scheduler) instead of cuBLASLt; -1 unset.
-int nvfp4_cutlass_tile();
+/// Which CUTLASS SM120 block-scaled kernel the wide W4A4 GEMMs take instead of cuBLASLt.
+/// Unset: the policy -- the 256x128x128 cooperative tile for a projection of `rows` >= 4096
+/// (gate/up, the GDN and attention query/key/value/z parents, down, out: +2.3 % on the 27B
+/// prompt round, exact), cuBLASLt below it (the narrow key/value slices, where a 256-row
+/// tile leaves most SMs idle). `SUROGATE_SERVE_NVFP4_CUTLASS=off` is cuBLASLt everywhere;
+/// 128|256|256sk|128sk|256swap|128swap forces one tile for every shape (sk: stream-K).
+/// Returns -1 for cuBLASLt, else the tile index `nvfp4_cutlass_gemm` takes.
+int nvfp4_cutlass_tile_for(std::int32_t rows, std::int32_t tokens);
 
 // Create this device's handle and workspace now. The state is otherwise built on first use,
 // and a first use inside a CUDA graph capture cannot cudaMalloc: capture fails with

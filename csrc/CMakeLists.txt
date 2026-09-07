@@ -906,6 +906,23 @@ set_target_properties(sinfer_nvfp4_tma PROPERTIES
 target_compile_options(sinfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_link_libraries(sinfer_nvfp4_tma PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
+# The CUTLASS SM120 block-scaled GEMM (the derived-FP4-plane route and the native NVFP4
+# route's opt-in). Compiled whole-program, not relocatable: under `-rdc=true` ptxas spills
+# the 256x128x128 cooperative kernel's main loop (~900 bytes a thread, 150 local-memory
+# instructions between the first and last MMA, a five-fold launch) and without it the loop
+# is clean (measured 2026-09-07 against flashinfer's build of the identical kernel).
+add_library(sinfer_nvfp4_cutlass STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu)
+sinfer_internal_includes(sinfer_nvfp4_cutlass)
+target_include_directories(sinfer_nvfp4_cutlass PRIVATE
+  ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
+set_target_properties(sinfer_nvfp4_cutlass PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+target_compile_options(sinfer_nvfp4_cutlass PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
+target_link_libraries(sinfer_nvfp4_cutlass PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
+
 # TensorRT-LLM's CUTLASS fused-MoE runner, vendored from FlashInfer 0.6.16.post3
 # (src/third_party/trtllm_moe, Apache-2.0; NOTICE there records provenance). It is the kernel
 # vLLM serves NVFP4 routed experts through on this hardware (design/35B_VLLM_KERNELS.md), built
@@ -1080,7 +1097,6 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/gdn_input_proj/gdn_projected_conv.cu
   ${SERVE_ROOT}/ops/linear/w8a8/w8a8_act_quant.cu
   ${SERVE_ROOT}/ops/linear/w8a8/w8a8_dispatch.cu
-  ${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu
   ${SERVE_ROOT}/ops/linear/w8a8/w4fp4_plane.cu
   ${SERVE_ROOT}/ops/linear/w8a8/w8fp8_plane.cu
   ${SERVE_ROOT}/ops/linear_swiglu/w8a8/w8a8_linear_swiglu.cu
@@ -1330,11 +1346,8 @@ set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # rest of the engine stays generic x86-64.
 set_source_files_properties(${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp PROPERTIES
   COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mf16c;-mfma")
-set_source_files_properties(${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu PROPERTIES
-    INCLUDE_DIRECTORIES "${SINFER_CUTLASS_INCLUDE};${cutlass_SOURCE_DIR}/tools/util/include"
-    COMPILE_OPTIONS "--expt-relaxed-constexpr")
 sinfer_cuda_archive(sinfer_ops)
-target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_trtllm_moe CUDA::cublasLt)
+target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_trtllm_moe CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.
 add_library(sinfer_text STATIC EXCLUDE_FROM_ALL

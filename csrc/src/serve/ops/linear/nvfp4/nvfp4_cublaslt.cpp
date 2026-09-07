@@ -1,4 +1,5 @@
 #include "ops/linear/nvfp4/nvfp4_cublaslt.h"
+#include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
 
 #include "core/device.h"
 #include "core/engine_context.h"
@@ -179,18 +180,34 @@ bool nvfp4_cublaslt_route(std::int32_t tokens) {
     return enabled && tokens >= min_tokens;
 }
 
-int nvfp4_cutlass_tile() {
+namespace {
+
+constexpr int kCutlassPolicy = -2;
+
+int cutlass_tile_setting() {
     static const int tile = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_NVFP4_CUTLASS");
-        if (raw == nullptr) { return -1; }
+        if (raw == nullptr || *raw == '\0') { return kCutlassPolicy; }
         const std::string_view value(raw);
+        if (value == "off" || value == "0" || value == "cublaslt") { return -1; }
         if (value == "128") { return 0; }
         if (value == "256") { return 1; }
         if (value == "256sk") { return 2; }
         if (value == "128sk") { return 3; }
-        return -1;
+        if (value == "256swap") { return 4; }
+        if (value == "128swap") { return 5; }
+        return kCutlassPolicy;
     }();
     return tile;
+}
+
+} // namespace
+
+int nvfp4_cutlass_tile_for(std::int32_t rows, std::int32_t tokens) {
+    const int setting = cutlass_tile_setting();
+    if (setting != kCutlassPolicy) { return setting; }
+    (void)tokens;
+    return rows >= 4096 ? 1 : -1;
 }
 
 void nvfp4_cublaslt_gemm(const Weight& weight, std::int32_t row_begin, std::int32_t rows,
@@ -205,12 +222,24 @@ void nvfp4_cublaslt_gemm(const Weight& weight, std::int32_t row_begin, std::int3
     if (weight.k <= 0 || (weight.k % 64) != 0 || tokens <= 0 || out_ld < rows) {
         throw std::invalid_argument("nvfp4 cuBLASLt: invalid problem");
     }
-    DeviceState& state = state_for_current_device();
-    const std::lock_guard<std::mutex> lock(state.mutex);
     const auto* weight_codes = static_cast<const std::uint8_t*>(weight.qdata) +
                                static_cast<std::size_t>(row_begin) * (weight.k / 2);
     const auto* weight_scales = static_cast<const std::uint8_t*>(weight.scales) +
                                 static_cast<std::size_t>(row_begin / 128) * (weight.k / 64) * 512;
+    // The CUTLASS route first, where the policy takes it: the same operands and layouts, a
+    // packed [rows, tokens] output (so only when the leading dimension is the slice's rows),
+    // beta 1 as the residual variant. A launch it cannot configure falls through to cuBLASLt.
+    if (const int tile = nvfp4_cutlass_tile_for(rows, tokens); tile >= 0 && out_ld == rows &&
+        (beta == 0.0F || beta == 1.0F)) {
+        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+        if (nvfp4_cutlass_gemm(activation_codes, activation_tiled_scales, weight_codes,
+                               weight_scales, alpha, beta == 1.0F ? out : nullptr, out, tokens,
+                               rows, weight.k, tile, stream)) {
+            return;
+        }
+    }
+    DeviceState& state = state_for_current_device();
+    const std::lock_guard<std::mutex> lock(state.mutex);
     const void* a_scale = weight_scales;
     const void* b_scale = activation_tiled_scales;
     const Plan& plan = plan_for(state, PlanKey{rows, weight.k, tokens, out_ld, beta != 0.0F},
