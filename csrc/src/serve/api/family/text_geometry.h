@@ -58,8 +58,46 @@ struct TextGeometry {
     /// The feed-forward width of the layers that are dense, where a mixture model has some.
     /// `intermediate` is the routed experts' width, which is what the post-mixer is sized from.
     std::int32_t dense_intermediate = 0;
+    /// The *second* attention geometry, for a family whose global layers are shaped
+    /// differently from its windowed ones. Gemma 4 attends through its window with 8 key/value
+    /// heads of 256 and over the whole context with 1 head of 512; the members above describe
+    /// the windowed layers, these the global ones.
+    ///
+    /// Zero means "not stated", and every family that attends one way leaves them zero, which
+    /// is what makes `head_dim_for` answer with the single geometry for all of them. Read
+    /// these through the `*_for(windowed)` accessors rather than directly: a site that reads
+    /// `head_dim` where it meant "this layer's head dim" is the failure this exists to
+    /// prevent, and it is silent -- a global layer's cache sized for a windowed one.
+    std::int32_t global_head_dim    = 0;
+    std::int32_t global_kv_heads    = 0;
+    /// How many of a global head's angle pairs carry a non-zero rope frequency. Gemma 4's
+    /// proportional rope rotates 64 of a 512-wide head's 256 pairs and leaves the rest at
+    /// zero, which is the identity -- so the head rotates over its whole width with an
+    /// inert tail, not over a contiguous prefix. Zero means every pair rotates.
+    std::int32_t global_rotary_angles = 0;
+    /// The per-token, per-layer input a family mixes into every block: how wide one layer's
+    /// slice is, and the vocabulary of the table it is looked up in. Zero for a family that
+    /// has none, which is every one here but Gemma 4's E-series.
+    std::int32_t per_layer_input_dim  = 0;
+    std::int32_t per_layer_vocab      = 0;
+    /// The feed-forward width of the layers that share their key/value planes, where a family
+    /// widens exactly those. Gemma 4's E2B holds 12,288 there against 6,144 elsewhere; its E4B
+    /// leaves the flag off and the two coincide. Zero means the model has one width.
+    std::int32_t shared_kv_intermediate = 0;
     float rms_epsilon               = 0.0F;
     float rope_theta                = 0.0F;
+    /// What the embedding lookup is multiplied by before the first block, where a family
+    /// scales it. Gemma's is `sqrt(hidden)` rounded to bf16 as the reference rounds it, which
+    /// is 62.0 at hidden 3840 and 73.5 at 5376 -- so a target serving two sizes cannot compile
+    /// it, and reads it from here. Zero means the target's own compiled value stands.
+    float embedding_scale           = 0.0F;
+    /// The bound logits are squashed to, `tanh(x / c) * c`, for a family that caps them.
+    /// Gemma 4 caps at 30. Zero means no cap, which is every other family here.
+    float logit_softcap             = 0.0F;
+    /// The rope base the *windowed* layers rotate at, where a family rotates its two kinds of
+    /// layer at different bases -- Gemma's windowed layers at 1e4 against 1e6 global, which is
+    /// `rope_theta` above. Zero means one base for every layer.
+    float sliding_rope_theta        = 0.0F;
 
     /// Which layers attend, for a family whose checkpoint chooses its own schedule instead of
     /// repeating a fixed interval. LFM2 attends at layers 2, 5, 8, 10, 12 and 14 of sixteen and
@@ -95,8 +133,117 @@ struct TextGeometry {
         return ((attention_layer_mask[word] >> (static_cast<unsigned>(layer) % 64U)) & 1U) != 0U;
     }
 
+    /// Which attending layers look through the window rather than at the whole context.
+    ///
+    /// A second mask, and for a reason the first one does not cover: Gemma 3 compiles this
+    /// schedule because its target serves one size, but a target serving two sizes cannot --
+    /// Gemma 4's 12B has 48 layers where its 31B has 60, and one compiled array cannot be
+    /// both. So the target reads it off the artifact, the way LFM2 reads which layers attend,
+    /// and for the same reason: the checkpoint states it and a period that had to be guessed
+    /// would be guessed wrong in silence.
+    ///
+    /// Not in the numeric override map, exactly as `attention_layer_mask` is not: a mask does
+    /// not survive a double, and the target builds this from the artifact's own objects
+    /// rather than from a number somebody would have to keep in step by hand.
+    std::array<std::uint64_t, 4> windowed_layer_mask{};
+    bool windowed_schedule_declared = false;
+
+    constexpr void declare_windowed_layer(std::int32_t layer) {
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        if (layer < 0 || word >= windowed_layer_mask.size()) {
+            throw std::out_of_range("TextGeometry window schedule layer is out of range");
+        }
+        windowed_layer_mask[word] |= std::uint64_t{1} << (static_cast<unsigned>(layer) % 64U);
+        windowed_schedule_declared = true;
+    }
+
+    /// Whether `layer` looks through the window by the declared schedule. Meaningful only
+    /// where one is declared; the runtime chooses between this and the compiled predicate.
+    [[nodiscard]] constexpr bool layer_is_windowed(std::int32_t layer) const noexcept {
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        if (layer < 0 || word >= windowed_layer_mask.size()) { return false; }
+        return ((windowed_layer_mask[word] >> (static_cast<unsigned>(layer) % 64U)) & 1U) != 0U;
+    }
+
+    /// Which layers hold key and value planes of their own.
+    ///
+    /// Gemma 4's E-series ends in a run of layers that project a query and nothing else: they
+    /// attend over an *earlier* layer's keys and values, the last one before the run that
+    /// attends the same way they do. E2B shares 20 of its 35 layers. Every other family here
+    /// gives every attending layer its own planes and leaves this undeclared, which is what
+    /// makes `layer_owns_kv` answer true for all of them.
+    ///
+    /// A mask rather than a count because the run is not the only thing that matters -- which
+    /// layer a sharer reads depends on the window schedule, so the two masks are read together.
+    std::array<std::uint64_t, 4> kv_owner_mask{};
+    bool kv_sharing_declared = false;
+
+    constexpr void declare_kv_owner(std::int32_t layer) {
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        if (layer < 0 || word >= kv_owner_mask.size()) {
+            throw std::out_of_range("TextGeometry key/value owner layer is out of range");
+        }
+        kv_owner_mask[word] |= std::uint64_t{1} << (static_cast<unsigned>(layer) % 64U);
+    }
+
+    /// Record that the model shares key/value planes at all. Separate from marking an owner,
+    /// because a model where *every* layer owns its planes still has to say so -- otherwise
+    /// an all-ones mask is indistinguishable from an undeclared one.
+    constexpr void declare_kv_sharing() { kv_sharing_declared = true; }
+
+    /// Whether `layer` writes its own keys and values. True everywhere no sharing is declared.
+    [[nodiscard]] constexpr bool layer_owns_kv(std::int32_t layer) const noexcept {
+        if (!kv_sharing_declared) { return true; }
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        if (layer < 0 || word >= kv_owner_mask.size()) { return false; }
+        return ((kv_owner_mask[word] >> (static_cast<unsigned>(layer) % 64U)) & 1U) != 0U;
+    }
+
     [[nodiscard]] constexpr std::int32_t query_size() const noexcept { return query_heads * head_dim; }
     [[nodiscard]] constexpr std::int32_t kv_size() const noexcept { return kv_heads * head_dim; }
+
+    /// Whether this model attends at two different head geometries. False for every family
+    /// but Gemma 4, and false for a Gemma 4 whose two geometries happen to coincide -- the
+    /// question a caller asks is "must I distinguish?", not "is a second one declared?".
+    [[nodiscard]] constexpr bool has_global_attention_geometry() const noexcept {
+        return global_head_dim > 0 && global_kv_heads > 0
+               && (global_head_dim != head_dim || global_kv_heads != kv_heads);
+    }
+
+    /// This layer's attention geometry, by whether the layer attends through the window.
+    /// A model that states one geometry answers with it either way, so a caller need not
+    /// know whether the family it is serving has two.
+    [[nodiscard]] constexpr std::int32_t head_dim_for(bool windowed) const noexcept {
+        return (windowed || global_head_dim <= 0) ? head_dim : global_head_dim;
+    }
+    [[nodiscard]] constexpr std::int32_t kv_heads_for(bool windowed) const noexcept {
+        return (windowed || global_kv_heads <= 0) ? kv_heads : global_kv_heads;
+    }
+    [[nodiscard]] constexpr std::int32_t query_size_for(bool windowed) const noexcept {
+        return query_heads * head_dim_for(windowed);
+    }
+    [[nodiscard]] constexpr std::int32_t kv_size_for(bool windowed) const noexcept {
+        return kv_heads_for(windowed) * head_dim_for(windowed);
+    }
+
+    /// This layer's feed-forward width. Wider on a layer that shares its key/value planes,
+    /// where the family widens those; the same everywhere else.
+    [[nodiscard]] constexpr std::int32_t intermediate_for(bool owns_kv) const noexcept {
+        return (owns_kv || shared_kv_intermediate <= 0) ? intermediate : shared_kv_intermediate;
+    }
+    /// The widest feed-forward any layer holds, which a shared plane must be sized for.
+    [[nodiscard]] constexpr std::int32_t maximum_intermediate() const noexcept {
+        return shared_kv_intermediate > intermediate ? shared_kv_intermediate : intermediate;
+    }
+    /// The widest of this model's attention geometries, which is what a buffer shared by
+    /// every layer has to be sized for.
+    [[nodiscard]] constexpr std::int32_t maximum_query_size() const noexcept {
+        return query_size_for(true) > query_size_for(false) ? query_size_for(true)
+                                                            : query_size_for(false);
+    }
+    [[nodiscard]] constexpr std::int32_t maximum_kv_size() const noexcept {
+        return kv_size_for(true) > kv_size_for(false) ? kv_size_for(true) : kv_size_for(false);
+    }
     [[nodiscard]] constexpr std::int32_t query_projection_rows() const noexcept { return 2 * query_size(); }
     [[nodiscard]] constexpr std::int32_t gdn_conv_state_width() const noexcept { return gdn_conv_kernel - 1; }
     [[nodiscard]] constexpr std::int32_t key_dim() const noexcept { return gdn_key_heads * gdn_key_head_dim; }
@@ -148,8 +295,17 @@ struct TextGeometry {
         SINFER_TEXT_GEOMETRY_TAKE(kda_gate_rank)
         SINFER_TEXT_GEOMETRY_TAKE(hc_streams)
         SINFER_TEXT_GEOMETRY_TAKE(dense_intermediate)
+        SINFER_TEXT_GEOMETRY_TAKE(global_head_dim)
+        SINFER_TEXT_GEOMETRY_TAKE(global_kv_heads)
+        SINFER_TEXT_GEOMETRY_TAKE(global_rotary_angles)
+        SINFER_TEXT_GEOMETRY_TAKE(per_layer_input_dim)
+        SINFER_TEXT_GEOMETRY_TAKE(per_layer_vocab)
+        SINFER_TEXT_GEOMETRY_TAKE(shared_kv_intermediate)
         SINFER_TEXT_GEOMETRY_TAKE(rms_epsilon)
         SINFER_TEXT_GEOMETRY_TAKE(rope_theta)
+        SINFER_TEXT_GEOMETRY_TAKE(embedding_scale)
+        SINFER_TEXT_GEOMETRY_TAKE(logit_softcap)
+        SINFER_TEXT_GEOMETRY_TAKE(sliding_rope_theta)
 #undef SINFER_TEXT_GEOMETRY_TAKE
         return g;
     }
@@ -193,11 +349,20 @@ struct TextGeometry {
             {"kda_gate_rank", &TextGeometry::kda_gate_rank},
             {"hc_streams", &TextGeometry::hc_streams},
             {"dense_intermediate", &TextGeometry::dense_intermediate},
+            {"global_head_dim", &TextGeometry::global_head_dim},
+            {"global_kv_heads", &TextGeometry::global_kv_heads},
+            {"global_rotary_angles", &TextGeometry::global_rotary_angles},
+            {"per_layer_input_dim", &TextGeometry::per_layer_input_dim},
+            {"per_layer_vocab", &TextGeometry::per_layer_vocab},
+            {"shared_kv_intermediate", &TextGeometry::shared_kv_intermediate},
         };
         struct FloatMember { std::string_view name; float TextGeometry::* value; };
         static constexpr FloatMember kFloats[] = {
             {"rms_epsilon", &TextGeometry::rms_epsilon},
             {"rope_theta", &TextGeometry::rope_theta},
+            {"embedding_scale", &TextGeometry::embedding_scale},
+            {"logit_softcap", &TextGeometry::logit_softcap},
+            {"sliding_rope_theta", &TextGeometry::sliding_rope_theta},
         };
         for (const IntMember& m : kInts) {
             if (const auto it = declared.find(std::string(m.name)); it != declared.end()) {

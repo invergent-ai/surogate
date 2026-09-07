@@ -26,6 +26,32 @@ __device__ __forceinline__ float swiglu_clamped(float gate, float up, float limi
     return silu(gate) * up;
 }
 
+/// The tanh approximation of GELU, which is what `gelu_pytorch_tanh` names and what every
+/// Gemma is trained with. Not interchangeable with the erf form at this precision: the two
+/// differ by ~1e-3 around |x| = 2, which is where a gated activation spends most of its mass.
+__device__ __forceinline__ float gelu_tanh(float x) {
+    constexpr float kSqrt2OverPi = 0.7978845608028654f;
+    const float inner            = kSqrt2OverPi * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.0f + tanhf(inner));
+}
+
+/// One expert's gated activation: the gate through `Activation`, times the linear half, with
+/// the clamp a checkpoint may have been trained under.
+///
+/// The kind is a compile-time constant of the registered geometry, so this collapses to the one
+/// activation that mixture uses. SiLU is what every routed mixture here ran until Gemma 4, whose
+/// experts are GELU-gated like the rest of the model -- serving them through SiLU is serving a
+/// different function, not a rounding difference.
+__device__ __forceinline__ float gated_clamped(float gate, float up, float limit,
+                                               GatedActivation activation) {
+    if (limit > 0.0f) {
+        gate = fminf(gate, limit);
+        up   = fminf(fmaxf(up, -limit), limit);
+    }
+    const float gated = activation == GatedActivation::GeluTanh ? gelu_tanh(gate) : silu(gate);
+    return gated * up;
+}
+
 __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 __device__ __forceinline__ float softplus(float x) { return (x > 20.0f) ? x : log1pf(expf(x)); }

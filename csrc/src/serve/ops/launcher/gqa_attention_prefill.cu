@@ -228,6 +228,37 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
     });
 }
 
+/// The prompt route over a cache that is already populated: the same launch minus the append.
+///
+/// A layer that shares an earlier layer's keys and values reads them and writes nothing. It is
+/// the append that is optional here, not the attention -- the metadata, the mask and the
+/// geometry dispatch are the ones any layer uses.
+void gqa_attention_prompt_cached_launch(const Tensor& q, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        float scale, PagedKVBatchLayerView cache, Tensor& out,
+                                        cudaStream_t stream, std::int32_t sliding_window,
+                                        GqaBlockMask selection) {
+    const auto launch = [&]<bool Masked>() {
+        const GqaPrefillBatchMetadata<Masked> metadata{
+            .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
+            .valid_columns =
+                Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+            .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
+            .table_stride = cache.block_tables.ne[0],
+            .window       = sliding_window,
+        };
+        gqa_dispatch_geometry(q.ne[0], q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+            gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                                metadata, out, stream, selection);
+        });
+    };
+    if (valid_columns.data == nullptr) {
+        launch.template operator()<false>();
+    } else {
+        launch.template operator()<true>();
+    }
+}
+
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,

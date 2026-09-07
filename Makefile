@@ -27,10 +27,16 @@ ifneq ($(wildcard $(PIP_NCCL)/lib/libnccl.so.2),)
 NCCL_CMAKE_FLAGS := -DNCCL_INCLUDE_DIR=$(PIP_NCCL)/include -DNCCL_LIB_DIR=$(PIP_NCCL)/lib
 endif
 
-.PHONY: all build export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all regression-smoke regression-update-baseline regression-gpu help info format format-check format-cpp format-py lint-py
+.PHONY: all build build-all export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all regression-smoke regression-update-baseline regression-gpu help info format format-check format-cpp format-py lint-py
 
 # Default target
 all: build
+
+# Trainer and serving engine in one command. They are separate targets because they
+# are separate builds -- different build dirs, and `make build` deliberately does not
+# pay for the engine -- but a tree that both trains and serves needs both, and asking
+# people to remember two commands is how one of them goes missing.
+build-all: build serve-build
 
 # Configure the build
 configure:
@@ -64,6 +70,11 @@ serve-build: serve-configure
 		--target surogate-engine-cli surogate-engine surogate-embed _surogate_serve
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so surogate/ 2>/dev/null || true
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so .venv/lib/python3.12/site-packages/surogate/ 2>/dev/null || true
+	# The module holds no device code of its own any more; libsinfer.so does, and
+	# the module finds it through $$ORIGIN. Copying one without the other leaves an
+	# import error about a missing library.
+	cp -f $(SERVE_BUILD_DIR)/libsinfer.so surogate/ 2>/dev/null || true
+	cp -f $(SERVE_BUILD_DIR)/libsinfer.so .venv/lib/python3.12/site-packages/surogate/ 2>/dev/null || true
 
 # Build the engine *and* every registered test binary. The tests are excluded from `all`,
 # so naming the aggregate is what makes them exist; without it ctest reports "Not Run"

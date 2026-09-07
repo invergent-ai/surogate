@@ -110,7 +110,6 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     BlockType bt = BlockType::Dense;  // default: allocate everything
     bool is_hybrid = false;
     bool is_qwen3_5 = false;
-    bool is_qwen3_5 = false;
     if (mConfig.model_config) {
         auto contains_ci = [](std::string_view haystack, std::string_view needle) {
             std::string h(haystack);

@@ -195,11 +195,30 @@ int marlin_min_band_tokens() noexcept {
     return floor_tokens;
 }
 
+/// The tile Marlin actually requires in *both* dimensions, against the 64 this once admitted.
+///
+/// The vendored kernel tiles N in 128-row blocks. A weight whose `n` is a whole number of 64s
+/// but not of 128s was accepted here and then computed wrongly -- not approximately, but
+/// orthogonally. Measured against `transformers` on Gemma 4's 26B-A4B feed-forward
+/// (n = 2,112 = 33 x 64 = 16.5 x 128, k = 2,816), either side of the Marlin band's lower edge
+/// at `marlin_min_band_tokens() == 17`:
+///
+///     t = 16 (w8_dispatch)  cosine 0.999806
+///     t = 17 (Marlin)       cosine 0.000693
+///
+/// Two shapes whose n *is* a multiple of 128 are correct through the same band at the same
+/// widths -- the 12B's 15,360 and a 1,024-row fixture -- so the row tile is the discriminator.
+/// Gemma 4's mixture violates it once in each dimension, which is why fixing only the rows
+/// moved the error without removing it: its gate/up is 2,112 x 2,816 (n fails) and its down
+/// projection 2,816 x 2,112 (k fails). Shapes whose both extents are whole 128s -- the 12B's
+/// 15,360 x 3,840 and a 1,024 x 512 fixture -- are correct through the same band.
+constexpr int kMarlinTile = 128;
+
 MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream) {
     if (!g_enabled || weight.qtype != QType::W8G32_F16S ||
         weight.layout != QuantLayout::RowSplit || weight.scale_dtype != DType::FP16 ||
         weight.group != 32 || weight.qdata == nullptr || weight.scales == nullptr ||
-        (weight.k % 64) != 0 || (weight.n % 64) != 0) {
+        (weight.k % kMarlinTile) != 0 || (weight.n % kMarlinTile) != 0) {
         return {};
     }
 

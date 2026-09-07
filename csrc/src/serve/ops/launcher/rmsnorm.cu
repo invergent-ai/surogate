@@ -103,6 +103,22 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     rmsnorm_launch(x, weight, eps, unit_offset, z, GatedRmsGate::Silu, out, stream);
 }
 
+void rmsnorm_unweighted_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
+    const std::int32_t d = x.ne[0];
+    if (d <= 0) { throw std::invalid_argument("rmsnorm: ne[0] must be positive"); }
+    const std::int64_t rows = out.numel() / d;
+    if (rows > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("rmsnorm: row count exceeds CUDA grid limit");
+    }
+    const auto x_addr = reinterpret_cast<std::uintptr_t>(x.data);
+    const auto o_addr = reinterpret_cast<std::uintptr_t>(out.data);
+    // No weight in the alignment test, because there is no weight to read.
+    const bool aligned2 = ((x_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
+    launch_rmsnorm<RmsEpilogue::Unweighted>(x, Tensor{}, nullptr, out, d, rows, eps, aligned2,
+                                            stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                     const Tensor* z, GatedRmsGate gate, Tensor& out, cudaStream_t stream) {
     const std::int32_t d = x.ne[0];

@@ -558,17 +558,25 @@ bool names_literal(std::string_view source, std::string_view value) {
 
 } // namespace
 
-bool prompt_opens_reasoning(std::string_view rendered) noexcept {
-    constexpr std::string_view kOpen = "<think>";
-    std::size_t end                  = rendered.size();
+bool prompt_opens_reasoning(std::string_view rendered, std::string_view open) noexcept {
+    if (open.empty()) { return false; }
+    // The marker is trimmed for the same reason the prompt is: a template writes the
+    // whitespace around it as an escape, and Gemma 4's opener carries a trailing newline
+    // that the render has and the comparison must not require.
+    while (!open.empty() && std::isspace(static_cast<unsigned char>(open.back())) != 0) {
+        open.remove_suffix(1);
+    }
+    if (open.empty()) { return false; }
+    std::size_t end = rendered.size();
     while (end > 0 && std::isspace(static_cast<unsigned char>(rendered[end - 1])) != 0) { --end; }
     const std::string_view trimmed = rendered.substr(0, end);
-    return trimmed.size() >= kOpen.size() &&
-           trimmed.compare(trimmed.size() - kOpen.size(), kOpen.size(), kOpen) == 0;
+    return trimmed.size() >= open.size() &&
+           trimmed.compare(trimmed.size() - open.size(), open.size(), open) == 0;
 }
 
 PromptCapabilities probe_jinja_capabilities(std::string_view source,
-                                            const JinjaRenderProbe& render) {
+                                            const JinjaRenderProbe& render,
+                                            const ReasoningSyntax& reasoning) {
     PromptCapabilities result;
     if (!render) { return result; }
     const auto attempt = [&](const ChatTemplateVariables& variables) -> std::optional<std::string> {
@@ -586,7 +594,7 @@ PromptCapabilities probe_jinja_capabilities(std::string_view source,
     // at all is credited with nothing rather than guessed at.
     const std::optional<std::string> base = attempt({});
     if (!base) { return result; }
-    result.reasoning_turn = prompt_opens_reasoning(*base);
+    result.reasoning_turn = prompt_opens_reasoning(*base, reasoning.open);
 
     if (mentions_variable(source, "enable_thinking")) {
         const std::optional<std::string> on  = attempt({.enable_thinking = true});

@@ -97,6 +97,35 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
         return ConverterTarget("qwen3_5_moe",
                                "surogate.serve.convert.qwen3_5_moe.convert",
                                "Qwen3.6-35B-A3B", gguf_repack=True)
+    # Gemma 4. Its five published checkpoints share `model_type` across three architectures,
+    # so the shape of the model decides the target rather than its name: the mixture is told
+    # by `enable_moe_block`, and the E-series from the dense sizes by the two things only it
+    # carries. Nothing here reads the architecture string, because all three spell it the same.
+    if (
+        model_type in ("gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text")
+        and hidden > 0
+        and layers > 0
+        and config.get("enable_moe_block")
+        and int(config.get("num_experts", 0) or 0) > 0
+    ):
+        return ConverterTarget("gemma4_moe", "surogate.serve.convert.gemma4_moe.convert",
+                               "Gemma 4 mixture", gguf_repack=True)
+    if (
+        model_type in ("gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text")
+        and hidden > 0
+        and layers > 0
+        and not config.get("enable_moe_block")
+    ):
+        # The E-series and the dense sizes share `model_type` and are different
+        # architectures: the E-series carries per-layer input embeddings and a tail of
+        # layers holding only a query projection. Either marker sends it to its own target.
+        e_series = (int(config.get("num_kv_shared_layers", 0) or 0) > 0
+                    or int(config.get("hidden_size_per_layer_input", 0) or 0) > 0)
+        if e_series:
+            return ConverterTarget("gemma4_e", "surogate.serve.convert.gemma4_e.convert",
+                                   "Gemma 4 E-series", gguf_repack=True)
+        return ConverterTarget("gemma4", "surogate.serve.convert.gemma4.convert", "Gemma 4",
+                               gguf_repack=True)
     return None
 
 
@@ -230,13 +259,20 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
     # Every target reads its GGUF where it lies: the bridge dequantises only what a value
     # transform forces, not the whole checkpoint.
-    repack_targets = {"qwen3", "llama", "gemma3", "qwen3_5", "qwen3_5_moe", "qwen3_moe"}
+    # Who repacks is the converter's own answer, not a list kept beside it: a converter that
+    # accepts `--gguf-repack` can read its GGUF where it lies, and one that cannot says so by
+    # not having the flag. A hand-kept set here was what stopped the three Gemma 4 targets
+    # repacking after their converters had grown the flag.
     converter_key = serve_gguf.gguf_converter_key(gguf_path, reader)
-    planner = _repack_planner(root, converter_key) if target_key in repack_targets else None
-    # No-MTP variant (PATCHES.md #15): community exports may strip nextn.
+    converts_in_place = "--gguf-repack" in _converter_options(
+        root, f"surogate.serve.convert.{converter_key}.convert"
+    )
+    planner = _repack_planner(root, converter_key) if converts_in_place else None
+    # No-MTP variant (PATCHES.md #15): community exports may strip nextn. Whether the
+    # converter has the flag at all is asked the same way, at the call.
     arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
     nextn = reader.kv(f"{arch}.nextn_predict_layers", 0)
-    no_mtp = target_key in repack_targets and int(nextn or 0) == 0
+    no_mtp = int(nextn or 0) == 0
     work = cache_dir() / f"gguf-bridge-{fp}"
     try:
         model_dir = serve_gguf.build_hf_dir_from_gguf(
@@ -333,6 +369,23 @@ def _gguf_geometry(recipe_module, inventory_module, gguf_path: Path):
     return recipe_module.geometry_from_config(config)
 
 
+def _gguf_synthesised_config(gguf_path: Path) -> dict:
+    """The `config.json` the bridge will write, read early so a repack can be planned
+    against the objects the conversion is actually going to produce."""
+    from surogate.serve.gguf import bridge as serve_gguf
+    from surogate.serve.gguf.lean import LeanGguf
+
+    with LeanGguf(gguf_path) as reader:
+        arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
+        config = serve_gguf.synthesised_config(reader, arch)
+    if config is None:
+        raise SystemExit(
+            f"surogate serve: {gguf_path.name} states no config this engine can synthesise, "
+            "so a repack cannot be planned against it."
+        )
+    return config
+
+
 def _repack_planner(root: Path, target_key: str):
     """Repack plan via the named vendored converter's registered recipes."""
     def plan(gguf_path: Path, candidates: dict[str, str]) -> dict[str, str]:
@@ -345,6 +398,10 @@ def _repack_planner(root: Path, target_key: str):
             REPACKABLE_TYPES,
             GgufRepackSource,
         )
+        # The one definition, rather than whichever converters happen to re-export it: a
+        # recipe module that reads its sources without naming this helper is not thereby
+        # un-plannable.
+        from surogate.serve.convert.common.recipe import expression_sources
         inventory = importlib.import_module(f"surogate.serve.convert.{target_key}.inventory")
         # Every converter keeps its recipes in `recipe.py`, so there is one place to look.
         recipe = importlib.import_module(f"surogate.serve.convert.{target_key}.recipe")
@@ -357,6 +414,18 @@ def _repack_planner(root: Path, target_key: str):
                 inventory.build_tensor_specs(geometry)
                 if hasattr(inventory, "build_tensor_specs")
                 else inventory.active_specs(mtp=True, vision=True, geometry=geometry)[0]
+            )
+        elif hasattr(inventory, "stored_objects"):
+            # A converter that derives its objects from the declaration takes the config
+            # itself, not a geometry: `stored_objects` decides what the artifact holds --
+            # a tied head is one object fewer -- and `tensor_specs` shapes them. This is
+            # the same pair `convert.py` computes, so the plan describes what will be written.
+            config = _gguf_synthesised_config(gguf_path)
+            recipes_by_name = {r.object_name: r for r in recipe.build_recipes(config)}
+            tensor_specs = inventory.tensor_specs(
+                inventory.stored_objects(
+                    config, tied_output_head=recipe.tied_output_head(config)
+                )
             )
         else:
             recipes_by_name = recipe.RECIPES_BY_NAME
@@ -403,14 +472,14 @@ def _repack_planner(root: Path, target_key: str):
             # straight from the file.
             keep: set[str] = set()
             for name in covered:
-                for src in recipe.expression_sources(recipes_by_name[name].expression):
+                for src in expression_sources(recipes_by_name[name].expression):
                     found = spelled(src.name, kept)
                     if found is not None:
                         keep.add(found)
             for name, tensor_recipe in recipes_by_name.items():
                 if name in covered:
                     continue
-                for src in recipe.expression_sources(tensor_recipe.expression):
+                for src in expression_sources(tensor_recipe.expression):
                     found = spelled(src.name, kept)
                     if found is not None:
                         keep.discard(found)

@@ -454,6 +454,10 @@ struct GgmlMoeCodec {
     /// each; Q8_0 is 32, so four lanes do. The body's packed loop derives its lane split from
     /// this, so both fall out of the same code.
     static constexpr int kGroupK = block_values(type);
+    /// `ggml-blocks-v1` stores K exactly -- a superblock format carries its scales inside the
+    /// block and the layout requires K to be a whole number of blocks -- so a stored row is as
+    /// wide as the math reads. The row-split codecs pad to 128 and say so.
+    static constexpr int kStoredKAlignment = 1;
     // Both projections take the body's generic packed-word8 loop, the one written against
     // load_eight; the two specialised D3 shapes assume a plane layout this format does not have.
     static constexpr bool kPackedWord8         = true;

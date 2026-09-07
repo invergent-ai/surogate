@@ -20,6 +20,14 @@ struct DecoderStateSpec {
     std::uint32_t capacity                  = 0;
     std::int32_t kv_heads                   = 0;
     std::int32_t attention_head_dim         = 0;
+    // The second attention geometry, for a family whose global layers are shaped
+    // differently from its windowed ones (Gemma 4: 8 key/value heads of 256 through the
+    // window, 1 head of 512 over the whole context). Zero leaves the cache homogeneous,
+    // which is every other family. `global_geometry_layers` indexes the full-attention
+    // layers, the same numbering `kv_skip_layers` uses.
+    std::int32_t global_kv_heads            = 0;
+    std::int32_t global_attention_head_dim  = 0;
+    std::vector<std::uint32_t> global_geometry_layers;
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
     // QSA indexer keys per full-attention layer (0 = none): one BF16 plane of this width
@@ -59,6 +67,12 @@ struct PagedKVCacheLayout {
     // layers at the model dtype (--kv-cache-dtype-skip-layers), so the pool is
     // not necessarily homogeneous; dtype above is the cache's nominal setting.
     std::vector<DType> layer_dtypes;
+    // Head geometry per full-attention layer, for the same reason and in the same shape:
+    // a family may attend at two geometries, so `kv_heads`/`head_dim` above are the
+    // nominal (windowed) setting and these are what each layer's planes were sized to.
+    // Empty means homogeneous, which is what every family but Gemma 4 leaves it.
+    std::vector<std::int32_t> layer_kv_heads;
+    std::vector<std::int32_t> layer_head_dim;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
 };
@@ -117,9 +131,21 @@ private:
     std::int32_t quant_group_  = 0;
     std::int32_t indexer_head_dim_ = 0;
     std::vector<DType> layer_dtypes_;
+    std::vector<std::int32_t> layer_kv_heads_;
+    std::vector<std::int32_t> layer_head_dim_;
 
     [[nodiscard]] DType layer_dtype(std::uint32_t layer) const noexcept {
         return layer < layer_dtypes_.size() ? layer_dtypes_[layer] : dtype_;
+    }
+
+    /// This layer's head geometry. Falls back to the nominal setting, so a homogeneous
+    /// cache -- which is every family but Gemma 4 -- answers exactly as it did before the
+    /// vectors existed.
+    [[nodiscard]] std::int32_t layer_kv_heads(std::uint32_t layer) const noexcept {
+        return layer < layer_kv_heads_.size() ? layer_kv_heads_[layer] : kv_heads_;
+    }
+    [[nodiscard]] std::int32_t layer_head_dim(std::uint32_t layer) const noexcept {
+        return layer < layer_head_dim_.size() ? layer_head_dim_[layer] : head_dim_;
     }
 };
 

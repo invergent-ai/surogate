@@ -75,6 +75,38 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
     });
 }
 
+/// The small-T route over a populated cache, across a batch of sequences.
+///
+/// `gqa_attention_cached_small_t_launch` below serves one sequence by wrapping its view in a
+/// single-row batch; this is the form a decode round of several sequences needs, and it is the
+/// append launcher with the cached input mode in place of the key/value pointers.
+void gqa_attention_cached_batch_small_t_launch(const Tensor& q, const Tensor& pos,
+                                               const Tensor& valid_columns,
+                                               const Tensor& table_rows, float scale,
+                                               PagedKVBatchLayerView cache,
+                                               GqaExecutionEnvelope envelope,
+                                               std::int32_t column_begin, std::int32_t width,
+                                               Tensor& partial_acc, Tensor& partial_m,
+                                               Tensor& partial_l, Tensor& out,
+                                               cudaStream_t stream, GqaBlockMask selection) {
+    const GqaCachedInput input{};
+    const GqaSmallTInvocation invocation{
+        .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
+        .table_rows    = &table_rows,
+        .selection     = selection,
+        .full_width    = q.ne[2],
+        .column_begin  = column_begin,
+        .width         = width,
+        .batch_size    = q.ne[3],
+        .sliding_window = envelope.sliding_window,
+    };
+    gqa_dispatch_geometry(q.ne[0], q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+        gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
+                                                   envelope, partial_acc, partial_m, partial_l,
+                                                   out, stream);
+    });
+}
+
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
                                          const PagedKVLayerView& cache,
                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,

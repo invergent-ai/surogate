@@ -36,6 +36,17 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 // Target-private compatibility vocabulary for the mechanically preserved fixed schedule. It is
 // data-only: TextContext is constructed on the stack for one schedule recording/execution and owns
 // neither weights nor device state.
+/// A target's compiled softcap, or zero where it declares none. `if constexpr` only discards
+/// a branch in a template, which is why this is one.
+template <class Config>
+[[nodiscard]] constexpr float logit_softcap_of() {
+    if constexpr (requires { Config::logit_softcap; }) {
+        return Config::logit_softcap;
+    } else {
+        return 0.0F;
+    }
+}
+
 struct ModelConfig {
     // The geometry, as data. Every member still defaults to the target's compiled `TextConfig`,
     // so nothing about a registered model changes; what changes is that the runtime now reads
@@ -66,6 +77,9 @@ struct ModelConfig {
     int mtp_mlp_gateup_rows = TextConfig::mtp_mlp_gate_up_rows;
     float rms_eps           = TextConfig::rms_epsilon;
     float rope_theta        = TextConfig::rope_theta;
+    /// The bound the head's logits are squashed to, or zero for a family that does not cap
+    /// them -- which is every one here but Gemma 4, whose published configs all say 30.
+    float logit_softcap     = logit_softcap_of<TextConfig>();
     int mtp_layers          = TextConfig::mtp_layers;
 
     /// The schedule the artifact declared, if it declared one. A family that repeats a fixed
@@ -73,6 +87,130 @@ struct ModelConfig {
     /// `TextConfig`, exactly as it did when they were static.
     std::array<std::uint64_t, 4> attention_mask{};
     bool schedule_declared = false;
+
+    /// The *second* attention geometry, and which layers attend at it.
+    ///
+    /// Gemma 4 attends through its window with 8 key/value heads of 256 and over the whole
+    /// context with 1 head of 512, so `n_kv`, `head_dim`, `q_size` and `kv_size` above
+    /// describe only half its layers. Every other family leaves these zero and the
+    /// `layer_*` accessors below then answer with the single geometry, unchanged.
+    ///
+    /// The window schedule is a second mask for the same reason the first one exists, and a
+    /// stronger one: a target serving two sizes cannot compile it, because Gemma 4's 12B has
+    /// 48 layers and its 31B has 60.
+    int global_n_kv      = 0;
+    int global_head_dim  = 0;
+    /// Which layers hold key/value planes of their own, for a model whose tail shares them.
+    /// Undeclared means every attending layer owns its planes, which is every family but the
+    /// Gemma 4 E-series.
+    std::array<std::uint64_t, 4> kv_owner_mask{};
+    bool kv_sharing_declared = false;
+    /// How many of a global head's pairs carry a real rope angle. Zero means all of them.
+    int global_rotary_angles = 0;
+    std::array<std::uint64_t, 4> windowed_mask{};
+    bool window_declared = false;
+
+    /// Whether `layer` looks through the window. Layers of a model that declares no window
+    /// schedule are all global, which is what makes the accessors below answer with the one
+    /// geometry for every family but Gemma 4.
+    [[nodiscard]] bool layer_windowed(int layer) const noexcept {
+        if (!window_declared) { return false; }
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        if (layer < 0 || word >= windowed_mask.size()) { return false; }
+        return ((windowed_mask[word] >> (static_cast<unsigned>(layer) % 64U)) & 1U) != 0U;
+    }
+
+    /// This layer's attention geometry. A model with one geometry answers the same for every
+    /// layer, so a caller need not know whether the family it serves has two.
+    [[nodiscard]] int layer_head_dim(int layer) const noexcept {
+        return (global_head_dim <= 0 || layer_windowed(layer)) ? head_dim : global_head_dim;
+    }
+    [[nodiscard]] int layer_n_kv(int layer) const noexcept {
+        return (global_n_kv <= 0 || layer_windowed(layer)) ? n_kv : global_n_kv;
+    }
+    [[nodiscard]] int layer_q_size(int layer) const noexcept { return n_q * layer_head_dim(layer); }
+    [[nodiscard]] int layer_kv_size(int layer) const noexcept {
+        return layer_n_kv(layer) * layer_head_dim(layer);
+    }
+
+    /// Whether this layer writes its own keys and values, rather than reading an earlier
+    /// layer's.
+    [[nodiscard]] bool layer_owns_kv(int layer) const noexcept {
+        if (!kv_sharing_declared) { return true; }
+        const auto word = static_cast<std::size_t>(layer) / 64U;
+        if (layer < 0 || word >= kv_owner_mask.size()) { return false; }
+        return ((kv_owner_mask[word] >> (static_cast<unsigned>(layer) % 64U)) & 1U) != 0U;
+    }
+
+    /// The key/value plane this layer attends over.
+    ///
+    /// Its own where it has one. Where it does not, the plane of the last *owning* layer
+    /// before it that attends the same way -- windowed layers share a windowed layer's keys
+    /// and global layers a global one's, because the two see different spans and a shared
+    /// layer applies its own mask over what it reads. That is the reference's rule
+    /// (`store_full_length_kv` marks the last non-sharing layer of each `layer_type`), and
+    /// getting it wrong is a layer attending over the wrong history rather than an error.
+    [[nodiscard]] int kv_plane_index(int layer) const {
+        if (!kv_sharing_declared) { return full_idx(layer); }
+        int source = layer;
+        if (!layer_owns_kv(layer)) {
+            const bool windowed = layer_windowed(layer);
+            source              = -1;
+            for (int earlier = layer - 1; earlier >= 0; --earlier) {
+                if (layer_owns_kv(earlier) && is_full(earlier) &&
+                    layer_windowed(earlier) == windowed) {
+                    source = earlier;
+                    break;
+                }
+            }
+            if (source < 0) {
+                throw std::logic_error(
+                    "a layer shares key/value planes but no earlier layer of its own "
+                    "attention kind owns any");
+            }
+        }
+        int index = 0;
+        for (int earlier = 0; earlier < source; ++earlier) {
+            index += (is_full(earlier) && layer_owns_kv(earlier)) ? 1 : 0;
+        }
+        return index;
+    }
+
+    /// How many key/value planes the cache holds: one per owning attention layer.
+    [[nodiscard]] int n_kv_planes() const {
+        if (!kv_sharing_declared) { return n_full(); }
+        int count = 0;
+        for (int layer = 0; layer < n_layers; ++layer) {
+            count += (is_full(layer) && layer_owns_kv(layer)) ? 1 : 0;
+        }
+        return count;
+    }
+
+    /// The rotation this layer applies: how wide it is, and how many of its pairs are real.
+    ///
+    /// A global Gemma 4 head rotates over its **whole** 512 width with only its first 64
+    /// pairs carrying an angle -- the pairs are (i, i + 256) either way, and narrowing the
+    /// rotation instead would pair each channel with a different partner.
+    [[nodiscard]] int layer_rotary_dim(int layer) const noexcept {
+        return (global_head_dim <= 0 || layer_windowed(layer)) ? rotary_dim : global_head_dim;
+    }
+    [[nodiscard]] int layer_rotary_pairs(int layer) const noexcept {
+        if (global_head_dim <= 0 || layer_windowed(layer)) { return rotary_dim / 2; }
+        return global_rotary_angles > 0 ? global_rotary_angles : global_head_dim / 2;
+    }
+
+    /// The widest of the model's geometries, which is what a plane every layer shares has to
+    /// be sized for. Equal to the single geometry wherever there is only one.
+    [[nodiscard]] int max_head_dim() const noexcept {
+        return global_head_dim > head_dim ? global_head_dim : head_dim;
+    }
+    [[nodiscard]] int max_n_kv() const noexcept { return global_n_kv > n_kv ? global_n_kv : n_kv; }
+    [[nodiscard]] int max_q_size() const noexcept { return n_q * max_head_dim(); }
+    [[nodiscard]] int max_kv_size() const noexcept {
+        const int windowed = n_kv * head_dim;
+        const int global   = global_n_kv * global_head_dim;
+        return global > windowed ? global : windowed;
+    }
 
     /// Whether `layer` attends. No longer static: for a family whose checkpoint picks its own
     /// layer kinds -- LFM2 attends at six irregular layers of sixteen, and at different ones
@@ -146,10 +284,24 @@ struct ModelConfig {
           mtp_mlp_gateup_rows(geometry.mtp_mlp_gate_up_rows()),
           rms_eps(geometry.rms_epsilon),
           rope_theta(geometry.rope_theta),
+          logit_softcap(geometry.logit_softcap),
           mtp_layers(geometry.mtp_layers) {
         if (geometry.attention_schedule_declared) {
             attention_mask    = geometry.attention_layer_mask;
             schedule_declared = true;
+        }
+        if (geometry.has_global_attention_geometry()) {
+            global_n_kv          = geometry.global_kv_heads;
+            global_head_dim      = geometry.global_head_dim;
+            global_rotary_angles = geometry.global_rotary_angles;
+        }
+        if (geometry.windowed_schedule_declared) {
+            windowed_mask   = geometry.windowed_layer_mask;
+            window_declared = true;
+        }
+        if (geometry.kv_sharing_declared) {
+            kv_owner_mask       = geometry.kv_owner_mask;
+            kv_sharing_declared = true;
         }
     }
 };
@@ -319,6 +471,18 @@ public:
     void set_ple_state(NgramPleStatePool* pool) noexcept { ple_state_ = pool; }
     // Column facts for the layer prologue, staged by each forward entry before its layers.
     PrologueColumns prologue_{};
+    /// This round's token ids. A per-layer input is an embedding lookup, so the block's
+    /// epilogue needs them, and nothing else inside the layer loop carries them: `prologue_`
+    /// is built only for a target that declares a *layer prologue*, which is a different
+    /// feature and a different set of targets.
+    Tensor active_ids_{};
+    /// The model's embedded input, as it stood before the first block.
+    ///
+    /// Gemma 4's E-series projects *this* into every layer's per-layer input -- once, from the
+    /// token embedding -- not the running residual, which is what the reference's
+    /// `project_per_layer_inputs(inputs_embeds, ...)` takes. A copy, because the layers write
+    /// the residual in place.
+    Tensor active_embedded_{};
     NgramPleStatePool* ple_state_ = nullptr;
 
     // Prefill CUDA graphs (PATCHES.md #27): non-null routes eligible prefill
@@ -476,7 +640,10 @@ private:
                               std::span<const ShortConvSegment> segments,
                               std::int32_t prefill_columns, std::int32_t batch,
                               const Tensor& valid, const Tensor& decode_slots);
-    void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
+    /// Keep the embedded input for a family whose blocks read it. A no-op for the rest.
+    void capture_per_layer_source(const Tensor& x, cudaStream_t stream);
+
+    void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, int layer, Phase phase);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);

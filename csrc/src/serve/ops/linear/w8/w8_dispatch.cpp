@@ -324,6 +324,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     //
     // A shape that lands here works but is not tuned. Measure it and give it an entry above.
     if ((k % kW8MmaScaleRowAlignmentK) != 0) { return launch_w8_simt_r8_c4; }
+    if ((n % kW8MmaRowAlignmentN) != 0) { return launch_w8_simt_r8_c4; }
     if (t <= 16) { return launch_w8_simt_r8_c4; }
     if (t <= 128) { return launch_w8_mma_r32_c128; }
     return launch_w8_mma_r64_c128;

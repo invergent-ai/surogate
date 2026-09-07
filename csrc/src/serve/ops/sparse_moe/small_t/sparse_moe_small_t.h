@@ -44,7 +44,26 @@ struct SparseMoeSmallTWorkspace {
     Tensor scratch;
 };
 
-inline constexpr std::int32_t kSparseMoeRouterPartitions = 4;
+/// How many CTAs cover one router row in S1, by the width they have to cover.
+///
+/// S1 gives each thread four consecutive channels and each warp 128, so a partition must be a
+/// whole number of warps: `hidden` has to divide by `partitions * 128`. Four for every mixture
+/// whose width is a multiple of 512, which is every one this engine served until Gemma 4 --
+/// whose 2,816 is 11 x 256 and takes two. Fixed at four it was a compile-time refusal of the
+/// whole geometry, which is a strange way for an engine to say "this width is not a power of
+/// two".
+///
+/// Fewer partitions means a wider CTA (11 warps rather than 5.5) and fewer of them, which is
+/// the same total work; the partition count exists to give the router enough blocks to fill the
+/// device, and at `router_rows * partitions` blocks even two is 256 for a 128-expert mixture.
+[[nodiscard]] constexpr std::int32_t sparse_moe_router_partitions(std::int32_t hidden) noexcept {
+    for (const std::int32_t partitions : {4, 2, 1}) {
+        if (hidden % (partitions * 128) == 0) { return partitions; }
+    }
+    // Refused by the body's own static_assert, which names the width; returning one here keeps
+    // the host-side workspace arithmetic total rather than dividing by zero on the way to it.
+    return 1;
+}
 
 template <class Arena>
 SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena,
@@ -58,7 +77,7 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena,
     // S1 uses [T,router_rows,4] partial router scores. After S2, each token reuses its
     // [paths,intermediate] region for the routed and shared SwiGLU activations.
     const std::int64_t partials = static_cast<std::int64_t>(geometry.router_rows()) *
-                                  kSparseMoeRouterPartitions;
+                                  sparse_moe_router_partitions(geometry.hidden);
     const std::int64_t activations =
         static_cast<std::int64_t>(geometry.paths()) * geometry.intermediate;
     const std::int32_t per_token = static_cast<std::int32_t>(std::max(partials, activations));
@@ -75,8 +94,8 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena,
                                                                   QType routed_down);
 
 void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& x,
-                               const SparseMoeWeights& weights, Tensor& destination,
-                               const SparseMoeSmallTPlan& plan,
+                               const Tensor& router_x, const SparseMoeWeights& weights,
+                               Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook = nullptr);
 

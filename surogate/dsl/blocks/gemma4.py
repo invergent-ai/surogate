@@ -27,7 +27,15 @@ from ..modules import (
     _resolve_rotary_dim,
 )
 from ..activations import Activation
-from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
+from ..block_schema import (
+    BlockSchema,
+    DistributionDecl,
+    EPTopology,
+    RoutingSchema,
+    ServeObject,
+    SlotDecl,
+    StreamingHint,
+)
 from ..dim import B, T
 from ..mlp import MLPConfig
 
@@ -96,8 +104,29 @@ GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
     "mlp_down": "mlp_down",
     # --- post_ff_layernorm (standalone rmsnorm) ---
     "post_ff_layernorm_weight": "ln_post_ff_weight",
+    # --- the mixture's three: one over the dense branch, two around the routed one ---
+    "post_ff_layernorm_1_weight": "ln_post_ff_1_weight",
+    "pre_ff_layernorm_2_weight": "ln_pre_ff_2_weight",
+    "post_ff_layernorm_2_weight": "ln_post_ff_2_weight",
+    "post_ff_layernorm_1_y": "ln_post_ff_1",
+    "pre_ff_layernorm_2_y": "ln_pre_ff_2",
+    "post_ff_layernorm_2_y": "ln_post_ff_2",
     "post_ff_layernorm_y": "ln_post_ff",
     "post_ff_layernorm_rstd": "ln_post_ff_rstd",
+    # --- moe (Gemma4MoEExperts) -> strip the submodule's prefix ---
+    # The declaration resolves a serve object's components against parameter names, and the
+    # names it sees are the block's -- `moe_experts_gate_up`, not the module's local
+    # `experts_gate_up`. Every other routed family here strips the prefix the same way.
+    "moe_router_weight": "router_weight",
+    "moe_router_scale": "router_scale",
+    "moe_per_expert_scale": "per_expert_scale",
+    "moe_experts_gate_up": "experts_gate_up",
+    "moe_experts_down": "experts_down",
+    # The per-expert scale's gather and the weights it produces.
+    "moe_per_expert_scale_table": "per_expert_scale_table",
+    "moe_routing_scale_3d": "routing_scale_3d",
+    "moe_routing_scale": "routing_scale",
+    "moe_routing_weights_scaled": "routing_weights_scaled",
     # --- res_att (canonical residual-after-attention slot) ---
     "res_att": "res_att",
     # --- per-layer input gating ---
@@ -141,7 +170,124 @@ _GEMMA4_GELU_MLP_CONFIG = MLPConfig(
 )
 
 
-def _gemma4_dense_schema(block_family: str, *, shared_kv: bool = False) -> BlockSchema:
+#: How a serving artifact stores one Gemma 4 block.
+#:
+#: **No norm carries ``unfold_unit_offset``, and that is the difference from Gemma 3.**
+#: ``Gemma4RMSNorm`` initialises its weight to *ones* and applies ``normed * w``, where
+#: Gemma 3 initialises to zeros and applies ``normed * (1 + w)``
+#: (``modeling_gemma4_unified.py:164``). The 12B checkpoint agrees and leaves no room for
+#: doubt: ``input_layernorm`` averages 6.62 and the final norm reaches 604, nothing
+#: centred on zero. Copying Gemma 3's declaration here would apply ``1 + w`` to a weight
+#: that is already the full scale, and nothing would raise.
+#:
+#: Q, K and V stay separate for the same reason they do on Gemma 3: per-head norm and
+#: rope both want their operand contiguous, and each object names its own slice of the
+#: fused training parameter rather than claiming the whole matrix.
+_GEMMA4_ATTENTION_SHARED: tuple[ServeObject, ...] = (
+    ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",)),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ln_post_attn_weight",)),
+    ServeObject("pre_feedforward_norm", "bf16", ("C",), ("ln2_weight",)),
+    ServeObject("post_feedforward_norm", "bf16", ("C",), ("ln_post_ff_weight",)),
+)
+
+#: The feed-forward, and the scalar the block ends on.
+#:
+#: ``layer_scalar`` is a per-layer buffer Gemma 4 multiplies the block's whole output by
+#: (``hidden_states *= self.layer_scalar``). It is not decoration: measured across the
+#: 12B's 48 layers it ranges 0.0053 to 0.918 and is never 1.0, so an artifact that omits
+#: it serves a model whose every block is mis-scaled.
+_GEMMA4_FEEDFORWARD_SHARED: tuple[ServeObject, ...] = (
+    ServeObject("mlp/gate", "quantised", ("M", "C"), ("mlp_gate_weight",)),
+    ServeObject("mlp/up", "quantised", ("M", "C"), ("mlp_up_weight",)),
+    ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
+    ServeObject("layer_scalar", "bf16", (1,), ("layer_scalar",)),
+)
+
+#: Per-layer input gating, which only the E-series carries. Declared here because the
+#: E-series runs these same block classes; every shape resolves to 0 on a checkpoint
+#: without ``hidden_size_per_layer_input`` and the object walk drops them.
+_GEMMA4_PER_LAYER_INPUT: tuple[ServeObject, ...] = (
+    ServeObject("per_layer_input/gate", "quantised", ("PliDim", "C"), ("pli_gate_weight",)),
+    ServeObject("per_layer_input/projection", "quantised", ("C", "PliDim"), ("pli_proj_weight",)),
+    ServeObject("per_layer_input/norm", "bf16", ("PliHidden",), ("pli_norm_weight",)),
+    # This layer's slice of the two tensors the model holds stacked: the second embedding
+    # table and the projection that mixes the hidden state into it. Cut per layer because
+    # every op that reads a slice needs it contiguous, and a slice of the stacked form is
+    # strided for any prompt longer than one token; see `_per_layer_input_slice`.
+    ServeObject("per_layer_input/embedding", "quantised", ("PliVocab", "PliDim"),
+                ("pli_embedding",), transform="per_layer_input_slice"),
+    ServeObject("per_layer_input/input_projection", "quantised", ("PliDim", "C"),
+                ("pli_model_proj",), transform="per_layer_input_slice"),
+)
+
+#: A windowed layer: `head_size` heads, its own key *and* value projections.
+_GEMMA4_SLIDING_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    *_GEMMA4_ATTENTION_SHARED,
+    ServeObject("attention/query", "quantised", ("AttnDim", "C"), ("qkv_weight.q",)),
+    ServeObject("attention/key", "quantised", ("KvDim", "C"), ("qkv_weight.k",)),
+    ServeObject("attention/value", "quantised", ("KvDim", "C"), ("qkv_weight.v",)),
+    ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",)),
+    ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",)),
+    ServeObject("attention/output", "quantised", ("C", "AttnDim"), ("out_weight",)),
+    *_GEMMA4_FEEDFORWARD_SHARED,
+    *_GEMMA4_PER_LAYER_INPUT,
+)
+
+#: A global layer, which is the same block at a *different head geometry*: `global_head_dim`
+#: wide with its own key/value head count, and under ``attention_k_eq_v`` no value
+#: projection at all -- the value is the key projection's raw output, RMS-normalised
+#: without a weight. ``GlobalValueDim`` is what states that: zero on a k_eq_v checkpoint,
+#: which drops the object, and the full key width on one that ships `v_proj`.
+_GEMMA4_GLOBAL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    *_GEMMA4_ATTENTION_SHARED,
+    ServeObject("attention/query", "quantised", ("GlobalAttnDim", "C"), ("qkv_weight.q",)),
+    ServeObject("attention/key", "quantised", ("GlobalKvDim", "C"), ("qkv_weight.k",)),
+    ServeObject("attention/value", "quantised", ("GlobalValueDim", "C"), ("qkv_weight.v",)),
+    ServeObject("attention/query_norm", "bf16", ("GlobalHeadDim",), ("q_norm_weight",)),
+    ServeObject("attention/key_norm", "bf16", ("GlobalHeadDim",), ("k_norm_weight",)),
+    ServeObject("attention/output", "quantised", ("C", "GlobalAttnDim"), ("out_weight",)),
+    *_GEMMA4_FEEDFORWARD_SHARED,
+    *_GEMMA4_PER_LAYER_INPUT,
+)
+
+
+#: A layer that shares another layer's key and value projections.
+#:
+#: It holds a query projection and nothing else on the key/value side -- no `k_proj`, no
+#: `v_proj`, no key norm -- because it reads a *source* layer's cached keys and values
+#: instead. The published E2B checkpoint does still ship those three tensors on its shared
+#: layers, and they are vestigial: `transformers` builds no such module for them
+#: (`Gemma4TextAttention.__init__` creates them only `if not self.is_kv_shared_layer`). The
+#: declaration is what settles it, and it declares a Q-only attention.
+#:
+#: The feed-forward is `SharedKvM` rather than `M`: `use_double_wide_mlp` widens exactly the
+#: shared layers, so E2B's are 12,288 against its others' 6,144. E4B leaves the flag off and
+#: the two widths coincide.
+def _gemma4_shared_kv_serve_objects(head_dim: str, attn_dim: str) -> tuple[ServeObject, ...]:
+    return (
+        *_GEMMA4_ATTENTION_SHARED,
+        ServeObject("attention/query", "quantised", (attn_dim, "C"), ("self_attn_q_weight",)),
+        ServeObject("attention/query_norm", "bf16", (head_dim,), ("q_norm_weight",)),
+        ServeObject("attention/output", "quantised", ("C", attn_dim), ("out_weight",)),
+        ServeObject("mlp/gate", "quantised", ("SharedKvM", "C"), ("mlp_gate_weight",)),
+        ServeObject("mlp/up", "quantised", ("SharedKvM", "C"), ("mlp_up_weight",)),
+        ServeObject("mlp/down", "quantised", ("C", "SharedKvM"), ("mlp_down_weight",)),
+        ServeObject("layer_scalar", "bf16", (1,), ("layer_scalar",)),
+        *_GEMMA4_PER_LAYER_INPUT,
+    )
+
+
+_GEMMA4_SHARED_KV_SLIDING_SERVE_OBJECTS = _gemma4_shared_kv_serve_objects("HeadDim", "AttnDim")
+_GEMMA4_SHARED_KV_GLOBAL_SERVE_OBJECTS = _gemma4_shared_kv_serve_objects(
+    "GlobalHeadDim", "GlobalAttnDim")
+
+
+def _gemma4_dense_schema(
+    block_family: str,
+    *,
+    shared_kv: bool = False,
+    serve_objects: tuple[ServeObject, ...] = (),
+) -> BlockSchema:
     attn_weight = (
         SlotDecl("self_attn_q_weight", kind="param", shape=("AttnDim", "C"))
         if shared_kv
@@ -158,11 +304,80 @@ def _gemma4_dense_schema(block_family: str, *, shared_kv: bool = False) -> Block
             SlotDecl("res_att", shape=("B", "T", "C")),
             SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
         ),
+        serve_objects=serve_objects,
         attrs={"block_family": block_family, "shared_kv": shared_kv},
     )
 
 
-def _gemma4_moe_schema(block_family: str) -> BlockSchema:
+#: How a serving artifact stores one Gemma 4 *mixture* layer.
+#:
+#: The attention half is the dense target's. The feed-forward half is not: a mixture layer runs
+#: a dense MLP **and** routed experts over the same input and sums them, so it holds both, and
+#: it norms each branch before the sum -- `post_feedforward_norm_dense` over the dense output,
+#: `pre_`/`post_feedforward_norm_routed` around the routed one -- before the block's own
+#: `post_feedforward_norm` over their sum.
+#:
+#: The router is unlike any other here. It normalises its input with **no weight at all**, then
+#: scales by a learned per-channel vector times `hidden^-0.5`, softmaxes, takes the top k,
+#: renormalises the winners, and multiplies them by a learned **per-expert** scale. Both scales
+#: are stored; neither is optional.
+#:
+#: The experts arrive already stacked: the checkpoint holds `gate_up_proj` as one
+#: `[experts, 2 * moe_intermediate, hidden]` tensor and `down_proj` as
+#: `[experts, hidden, moe_intermediate]`, which is the layout the engine's expert bank wants,
+#: so neither is restacked.
+_GEMMA4_MOE_FEEDFORWARD: tuple[ServeObject, ...] = (
+    ServeObject("mlp/gate", "quantised", ("M", "C"), ("mlp_gate_weight",)),
+    ServeObject("mlp/up", "quantised", ("M", "C"), ("mlp_up_weight",)),
+    ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
+    ServeObject("post_feedforward_norm_dense", "bf16", ("C",), ("ln_post_ff_1_weight",)),
+    ServeObject("pre_feedforward_norm_routed", "bf16", ("C",), ("ln_pre_ff_2_weight",)),
+    ServeObject("post_feedforward_norm_routed", "bf16", ("C",), ("ln_post_ff_2_weight",)),
+    ServeObject("moe/router", "bf16", ("E", "C"), ("router_weight",)),
+    ServeObject("moe/router_scale", "bf16", ("C",), ("router_scale",)),
+    # FP32, where every other norm-shaped vector here is BF16. This one multiplies the routing
+    # weights, so it changes what an expert is *worth* to a token, and eight of 128 experts
+    # decide a layer's output -- the same reason GLM-5.3 stores its router bias FP32.
+    ServeObject("moe/per_expert_scale", "fp32", ("E",), ("per_expert_scale",)),
+    # The training parameter is expert-major `[E, 2M, C]`; the artifact stores the same
+    # numbers as rows, which is a contiguous reshape rather than a permutation -- the same
+    # `flatten_experts` every other routed target here uses, and the same two object names,
+    # so one expert-bank binder reads all of them.
+    ServeObject("moe/routed_gate_up", "quantised", ("RoutedGateUpRows", "C"),
+                ("experts_gate_up",), transform="flatten_experts", residency="auto"),
+    ServeObject("moe/routed_down", "quantised", ("RoutedDownRows", "MoeM"),
+                ("experts_down",), transform="flatten_experts", residency="auto"),
+    ServeObject("layer_scalar", "bf16", (1,), ("layer_scalar",)),
+    *_GEMMA4_PER_LAYER_INPUT,
+)
+
+#: A windowed mixture layer, and a global one. The attention differs exactly as it does on the
+#: dense target; the feed-forward is the same either way.
+_GEMMA4_MOE_SLIDING_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    *_GEMMA4_ATTENTION_SHARED,
+    ServeObject("attention/query", "quantised", ("AttnDim", "C"), ("qkv_weight.q",)),
+    ServeObject("attention/key", "quantised", ("KvDim", "C"), ("qkv_weight.k",)),
+    ServeObject("attention/value", "quantised", ("KvDim", "C"), ("qkv_weight.v",)),
+    ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",)),
+    ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",)),
+    ServeObject("attention/output", "quantised", ("C", "AttnDim"), ("out_weight",)),
+    *_GEMMA4_MOE_FEEDFORWARD,
+)
+
+_GEMMA4_MOE_GLOBAL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    *_GEMMA4_ATTENTION_SHARED,
+    ServeObject("attention/query", "quantised", ("GlobalAttnDim", "C"), ("qkv_weight.q",)),
+    ServeObject("attention/key", "quantised", ("GlobalKvDim", "C"), ("qkv_weight.k",)),
+    ServeObject("attention/value", "quantised", ("GlobalValueDim", "C"), ("qkv_weight.v",)),
+    ServeObject("attention/query_norm", "bf16", ("GlobalHeadDim",), ("q_norm_weight",)),
+    ServeObject("attention/key_norm", "bf16", ("GlobalHeadDim",), ("k_norm_weight",)),
+    ServeObject("attention/output", "quantised", ("C", "GlobalAttnDim"), ("out_weight",)),
+    *_GEMMA4_MOE_FEEDFORWARD,
+)
+
+
+def _gemma4_moe_schema(block_family: str, *,
+                       serve_objects: tuple[ServeObject, ...] = ()) -> BlockSchema:
     return BlockSchema(
         slots=(
             SlotDecl("qkv_weight", kind="param", shape=("QKV", "C")),
@@ -178,7 +393,7 @@ def _gemma4_moe_schema(block_family: str) -> BlockSchema:
             SlotDecl(
                 "experts_gate_up",
                 kind="param",
-                shape=("E", "2M", "C"),
+                shape=("E", "MoeTwoM", "C"),
                 residency="auto",
                 distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
                 grouped=True,
@@ -187,7 +402,7 @@ def _gemma4_moe_schema(block_family: str) -> BlockSchema:
             SlotDecl(
                 "experts_down",
                 kind="param",
-                shape=("E", "C", "M"),
+                shape=("E", "C", "MoeM"),
                 residency="auto",
                 distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
                 grouped=True,
@@ -200,6 +415,7 @@ def _gemma4_moe_schema(block_family: str) -> BlockSchema:
         ),
         routing=RoutingSchema(kind="topk_softmax", topk="num_experts_per_tok", norm_topk_prob=True),
         ep_topology=EPTopology(ep_size_param="ep_size"),
+        serve_objects=serve_objects,
         attrs={"block_family": block_family},
     )
 
@@ -326,7 +542,7 @@ class Gemma4SlidingBlock(nn.Block):
     """Sliding-window attention + GeLU-gated MLP. Optional per-layer input gating."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
-    schema = _gemma4_dense_schema("gemma4_sliding")
+    schema = _gemma4_dense_schema("gemma4_sliding", serve_objects=_GEMMA4_SLIDING_SERVE_OBJECTS)
 
     def __init__(
         self,
@@ -414,7 +630,8 @@ class Gemma4SlidingMoEBlock(nn.Block):
     """Sliding attention + parallel MLP/MoE. For 26B-A4B sliding layers."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
-    schema = _gemma4_moe_schema("gemma4_sliding_moe")
+    schema = _gemma4_moe_schema("gemma4_sliding_moe",
+                                serve_objects=_GEMMA4_MOE_SLIDING_SERVE_OBJECTS)
 
     def __init__(
         self,
@@ -436,6 +653,10 @@ class Gemma4SlidingMoEBlock(nn.Block):
         self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
         self.E = num_experts
         self.K_exp = num_experts_per_tok
+        # The routed experts' width, beside `M`, which `_make_dims` set to the *dense*
+        # feed-forward's. Both are real on this block and neither derives the other.
+        self.MoeM = moe_intermediate_size
+        self.MoeTwoM = 2 * moe_intermediate_size
 
         self.input_layernorm = RMSNorm(d_model, eps=eps)
         self.self_attn = Gemma4Attention(
@@ -479,7 +700,8 @@ class Gemma4FullMoEBlock(nn.Block):
     """Full attention (k_eq_v) + parallel MLP/MoE. For 26B-A4B full layers."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
-    schema = _gemma4_moe_schema("gemma4_full_moe")
+    schema = _gemma4_moe_schema("gemma4_full_moe",
+                                serve_objects=_GEMMA4_MOE_GLOBAL_SERVE_OBJECTS)
 
     def __init__(
         self,
@@ -507,6 +729,10 @@ class Gemma4FullMoEBlock(nn.Block):
             self.QKV = (num_query_heads + 2 * num_kv_heads) * head_size
         self.E = num_experts
         self.K_exp = num_experts_per_tok
+        # The routed experts' width, beside `M`, which `_make_dims` set to the *dense*
+        # feed-forward's. Both are real on this block and neither derives the other.
+        self.MoeM = moe_intermediate_size
+        self.MoeTwoM = 2 * moe_intermediate_size
 
         self.input_layernorm = RMSNorm(d_model, eps=eps)
         self.self_attn = Gemma4Attention(
@@ -551,7 +777,7 @@ class Gemma4FullBlock(nn.Block):
     """Full attention (optional k_eq_v) + GeLU-gated MLP. Optional per-layer input gating."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
-    schema = _gemma4_dense_schema("gemma4_full")
+    schema = _gemma4_dense_schema("gemma4_full", serve_objects=_GEMMA4_GLOBAL_SERVE_OBJECTS)
 
     def __init__(
         self,
@@ -723,3 +949,38 @@ class Gemma4SharedKVBlock(nn.Block):
         if self.PLI_D > 0:
             residual = _per_layer_input_phase(self, residual, per_layer_input)
         return _finalize(self, residual)
+
+
+# ============================================================================
+# Serve views of the shared-KV block
+# ============================================================================
+#
+# One class runs both kinds of shared-KV layer -- the model builder instantiates
+# `Gemma4SharedKVBlock` with whichever head width the layer's attention type calls for -- but a
+# serving artifact needs to know which it is, because the two hold different shapes: a shared
+# sliding layer's query is `AttnDim` rows and a shared global layer's is `GlobalAttnDim`.
+#
+# The artifact inventory resolves an object's shape from *model-wide* symbols and picks the
+# object list by block name, so the two need two names and two schemas. These subclasses carry
+# nothing but that schema; they are never instantiated, and training goes on using the base
+# class. `_serve_blocks_` maps the schedule's names onto them.
+
+
+class Gemma4SharedKVSlidingBlock(Gemma4SharedKVBlock):
+    """A shared-KV layer that attends through the window, at `head_size`."""
+
+    schema = _gemma4_dense_schema(
+        "gemma4_shared_kv_sliding",
+        shared_kv=True,
+        serve_objects=_GEMMA4_SHARED_KV_SLIDING_SERVE_OBJECTS,
+    )
+
+
+class Gemma4SharedKVGlobalBlock(Gemma4SharedKVBlock):
+    """A shared-KV layer that attends over the whole context, at `global_head_dim`."""
+
+    schema = _gemma4_dense_schema(
+        "gemma4_shared_kv_full",
+        shared_kv=True,
+        serve_objects=_GEMMA4_SHARED_KV_GLOBAL_SERVE_OBJECTS,
+    )

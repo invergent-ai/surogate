@@ -47,3 +47,41 @@ PY
   grep -q 'attribute_index_tok' "$header" || {
     echo "patch_minja: the numeric attribute patch did not apply" >&2; exit 1; }
 fi
+
+# 3. Adjacent string literals. Jinja2 concatenates `"a" "b"` the way Python does, and Gemma 4's
+#    E-series template writes a long `raise_exception(...)` message that way -- three literals on
+#    three lines inside one call. minja's constant parser takes the first and then finds a string
+#    where it expects `,` or `)`, so the whole template fails to *parse*, at load, even for a
+#    request that never renders it.
+if ! grep -q 'adjacent string literal' "$header"; then
+  python3 - "$header" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+old = """      if (*it == '"' || *it == '\\'') {
+        auto str = parseString();
+        if (str) return std::make_shared<Value>(*str);
+      }
+"""
+new = """      if (*it == '"' || *it == '\\'') {
+        auto str = parseString();
+        if (str) {
+          // Jinja2 concatenates an adjacent string literal, as Python does. Consume the run.
+          for (;;) {
+            auto mark = it;
+            consumeSpaces();
+            if (it == end || (*it != '"' && *it != '\\'')) { it = mark; break; }
+            auto next = parseString();
+            if (!next) { it = mark; break; }
+            *str += *next;
+          }
+          return std::make_shared<Value>(*str);
+        }
+      }
+"""
+assert text.count(old) == 1, "patch_minja: the string-literal anchor was not found"
+open(path, "w").write(text.replace(old, new))
+PY
+  grep -q 'adjacent string literal' "$header" || {
+    echo "patch_minja: the adjacent string literal patch did not apply" >&2; exit 1; }
+fi

@@ -21,10 +21,46 @@ enum class RmsEpilogue {
     /// straight on a residual instead of through a plane and a second kernel.
     OffsetAdd,
     PlainAdd,
+    /// No gain at all: `out = x * inv`. Gemma 4 normalises its attention *value* with
+    /// `RMSNorm(..., with_scale=False)` -- a norm that has no weight to read, not one whose
+    /// weight happens to be ones. There is no tensor behind it, which is why this is an
+    /// epilogue rather than a caller passing a ones vector it would have to keep somewhere.
+    ///
+    /// Not interchangeable with `l2norm`, which is the other weightless normalisation here:
+    /// that divides by `sqrt(sum)` where this divides by `sqrt(mean + eps)`, and its eps sits
+    /// inside a different expression.
+    Unweighted,
 };
 
 /// Epilogues that read the second per-element operand `z`: the gated ones
 /// multiply by an activation of it, the accumulating ones add it.
+/// Epilogues that read a per-channel gain. All but the weightless one -- and the
+/// distinction has to be a compile-time trait rather than a null check, because a kernel
+/// that indexed `weight[pair]` for `Unweighted` would read whatever pointer the caller
+/// passed for a tensor that does not exist.
+template <RmsEpilogue Epilogue>
+inline constexpr bool kRmsEpilogueReadsWeight = Epilogue != RmsEpilogue::Unweighted;
+
+/// The gain for one BF16 pair, or one, for an epilogue that has no weight.
+template <RmsEpilogue Epilogue>
+__device__ __forceinline__ float2 rmsnorm_gain2(const __nv_bfloat162* weight, int pair) {
+    if constexpr (kRmsEpilogueReadsWeight<Epilogue>) {
+        return __bfloat1622float2(weight[pair]);
+    } else {
+        return float2{1.0F, 1.0F};
+    }
+}
+
+/// The same, one channel at a time, for the generic path.
+template <RmsEpilogue Epilogue>
+__device__ __forceinline__ float rmsnorm_gain(const __nv_bfloat16* weight, std::int64_t index) {
+    if constexpr (kRmsEpilogueReadsWeight<Epilogue>) {
+        return __bfloat162float(weight[index]);
+    } else {
+        return 1.0F;
+    }
+}
+
 template <RmsEpilogue Epilogue>
 inline constexpr bool kRmsEpilogueReadsOperand =
     Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::GatedSigmoid ||
@@ -88,7 +124,7 @@ __launch_bounds__(Block) __global__
         const int pair = lane + k * kWarpSize;
         if (pair < pairs) {
             const float2 xf = __bfloat1622float2(values[k]);
-            const float2 wf = __bfloat1622float2(weight[pair]);
+            const float2 wf = rmsnorm_gain2<Epilogue>(weight, pair);
             float2 zf{0.0f, 0.0f};
             if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
                 zf = __bfloat1622float2(z[row_base + pair]);
@@ -128,8 +164,8 @@ __launch_bounds__(Block) __global__
     float inv                   = lane == 0 ? rsqrtf(sum * (1.0f / 128.0f) + eps) : 0.0f;
     inv                         = __shfl_sync(kFullWarpMask, inv, 0);
 
-    const float2 w0 = __bfloat1622float2(weight[pair0]);
-    const float2 w1 = __bfloat1622float2(weight[pair1]);
+    const float2 w0 = rmsnorm_gain2<Epilogue>(weight, pair0);
+    const float2 w1 = rmsnorm_gain2<Epilogue>(weight, pair1);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
     if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
@@ -183,7 +219,7 @@ __launch_bounds__(Block) __global__
         if (k < pairs_per_thread) {
             const int pair  = static_cast<int>(threadIdx.x) + k * Block;
             const float2 xf = __bfloat1622float2(values[k]);
-            const float2 wf = __bfloat1622float2(weight[pair]);
+            const float2 wf = rmsnorm_gain2<Epilogue>(weight, pair);
             float2 zf{0.0f, 0.0f};
             if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
                 zf = __bfloat1622float2(z[row_base + pair]);
@@ -224,8 +260,8 @@ __launch_bounds__(512) __global__
     __syncthreads();
     const float inv = inv_shared;
 
-    const float2 w0 = __bfloat1622float2(weight[pair0]);
-    const float2 w1 = __bfloat1622float2(weight[pair1]);
+    const float2 w0 = rmsnorm_gain2<Epilogue>(weight, pair0);
+    const float2 w1 = rmsnorm_gain2<Epilogue>(weight, pair1);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
     if constexpr (kRmsEpilogueReadsOperand<Epilogue>) {
@@ -269,7 +305,7 @@ __launch_bounds__(256) __global__
     for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
         const std::int64_t index = base + i;
         const float xv           = __bfloat162float(x[index]);
-        const float wv           = __bfloat162float(weight[i]);
+        const float wv           = rmsnorm_gain<Epilogue>(weight, i);
         float zv                 = 0.0f;
         if constexpr (kRmsEpilogueReadsOperand<Epilogue>) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));

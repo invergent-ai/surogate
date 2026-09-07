@@ -3,10 +3,12 @@
 
 namespace {
 
-constexpr int kRouterPartitions = kSparseMoeRouterPartitions;
+constexpr int kRouterPartitions = sparse_moe_router_partitions(kHidden);
 // S1 covers one router partition with one CTA: each thread owns four consecutive values.
 constexpr int kRouterWarps = kHidden / (kRouterPartitions * 32 * 4);
-static_assert(kHidden % (kRouterPartitions * 32 * 4) == 0);
+static_assert(kHidden % (kRouterPartitions * 32 * 4) == 0,
+              "this mixture's hidden width is not a whole number of 128-channel warps at any "
+              "supported partition count; S1 cannot cover a router row with it");
 // S2 keeps a token's router logits in shared memory; the single-batch kernel serves token
 // counts that fit, larger counts run in batches of kS2BatchTokens.
 constexpr int kS2SingleMaxTokens = (46 * 1024) / (kRouterRows * 4 + kTopK * 4);
@@ -67,7 +69,8 @@ template <int Tokens>
 __global__ void
 sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __restrict__ token_ids,
                              float* __restrict__ token_alpha, float* __restrict__ shared_scale,
-                             const float* __restrict__ router_bias) {
+                             const float* __restrict__ router_bias,
+                             const float* __restrict__ per_expert_scale) {
     static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
     __shared__ float scores[Tokens][kRouterRows];
     __shared__ float selected_logits[Tokens][kTopK];
@@ -86,10 +89,12 @@ sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __re
 
     const int resident_warps = static_cast<int>(blockDim.x) >> 5;
     for (int token = tid >> 5; token < Tokens; token += resident_warps) {
-        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated>(scores[token], token_ids + token * kTopK,
+        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated,
+                                     kPerExpertScaled>(scores[token], token_ids + token * kTopK,
                                                       token_alpha + token * kTopK,
                                                       shared_scale + token,
-                                                      selected_logits[token], router_bias, kRoutedScale);
+                                                      selected_logits[token], router_bias, kRoutedScale,
+                                                      per_expert_scale);
     }
 }
 
@@ -98,7 +103,8 @@ __global__ void sparse_moe_small_t_s2_two_batch_kernel(const float* __restrict__
                                                        int* __restrict__ token_ids,
                                                        float* __restrict__ token_alpha,
                                                        float* __restrict__ shared_scale,
-                                                       const float* __restrict__ router_bias) {
+                                                       const float* __restrict__ router_bias,
+                                                       const float* __restrict__ per_expert_scale) {
     static_assert(Tokens > kS2SingleMaxTokens && Tokens <= kSparseMoeSmallTMax);
     constexpr int kBatchTokens = kS2BatchTokens;
     __shared__ float scores[kBatchTokens][kRouterRows];
@@ -128,10 +134,12 @@ __global__ void sparse_moe_small_t_s2_two_batch_kernel(const float* __restrict__
         __syncthreads();
         if (warp < batch_tokens) {
             const int token = token_begin + warp;
-            sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated>(scores[warp], token_ids + token * kTopK,
+            sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated,
+                                         kPerExpertScaled>(scores[warp], token_ids + token * kTopK,
                                                           token_alpha + token * kTopK,
                                                           shared_scale + token,
-                                                          selected_logits[warp], router_bias, kRoutedScale);
+                                                          selected_logits[warp], router_bias, kRoutedScale,
+                                                          per_expert_scale);
         }
         __syncthreads();
     }
@@ -148,17 +156,19 @@ void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* parti
 
 template <int Tokens>
 void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha,
-               float* shared_scale, const float* router_bias, cudaStream_t stream) {
+               float* shared_scale, const float* router_bias, const float* per_expert_scale,
+               cudaStream_t stream) {
     constexpr int kThreads = (Tokens < 32 ? Tokens : 32) * 32;
     if constexpr (Tokens <= kS2SingleMaxTokens) {
         CUDA_CHECK(pdl::launch_dependent({dim3(1), dim3(kThreads), 0, stream},
                                          sparse_moe_small_t_s2_kernel<Tokens>, partial_scores,
-                                         token_ids, token_alpha, shared_scale, router_bias));
+                                         token_ids, token_alpha, shared_scale, router_bias,
+                                         per_expert_scale));
     } else {
         CUDA_CHECK(pdl::launch_dependent({dim3(1), dim3(kThreads), 0, stream},
                                          sparse_moe_small_t_s2_two_batch_kernel<Tokens>,
                                          partial_scores, token_ids, token_alpha, shared_scale,
-                                         router_bias));
+                                         router_bias, per_expert_scale));
     }
 }
 
@@ -328,18 +338,23 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 } // namespace
 
-void small_t_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
-                    const SparseMoeSmallTPlan& plan, const SparseMoeSmallTWorkspace& workspace,
-                    cudaStream_t stream, const SparseMoeRoundHook* hook) {
+// Every mixture here but Gemma 4 projects the router and the experts from the same tokens, and
+// passes the same tensor twice. Gemma 4 does not: its router reads the post-attention residual
+// normalised with no weight and scaled by a learned per-channel vector, its experts the same
+// residual through `pre_feedforward_layernorm_2`. Two projections of one token.
+void small_t_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
+                    Tensor& destination, const SparseMoeSmallTPlan& plan,
+                    const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
+                    const SparseMoeRoundHook* hook) {
     dispatch_tokens(plan.tokens, [&]<int Tokens>() {
-        launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
+        launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(router_x.data),
                           static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
                           static_cast<float*>(workspace.scratch.data), stream);
         launch_s2<Tokens>(static_cast<const float*>(workspace.scratch.data),
                           static_cast<int*>(workspace.token_ids.data),
                           static_cast<float*>(workspace.token_alpha.data),
                           static_cast<float*>(workspace.shared_scale.data), weights.router_bias,
-                          stream);
+                          weights.per_expert_scale, stream);
     });
     if (hook != nullptr && hook->resolve != nullptr) {
         hook->resolve(hook->context, workspace.token_ids, workspace.token_alpha, x, destination,

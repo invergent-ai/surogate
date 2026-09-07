@@ -59,15 +59,30 @@ struct TextAttentionProjectionRoots {
     Tensor value;
 };
 
+/// The projection's planes at explicitly given widths, for a model whose layers do not all
+/// attend at the same one. Gemma 4's windowed layers project 4,096 query rows and its global
+/// layers 8,192, so a round asks for this layer's and the *plan* reserves the widest.
+template <class Allocator>
+TextAttentionProjectionRoots text_attention_projection(Allocator& allocator, std::int32_t hidden,
+                                                       std::int32_t query_rows,
+                                                       std::int32_t kv_rows,
+                                                       std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, hidden, tokens),
+        matrix(allocator, DType::BF16, query_rows, tokens),
+        matrix(allocator, DType::BF16, query_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
+    };
+}
+
+/// The same, sized from the geometry. At the *widest* of its attention geometries, because
+/// this is what the capacity planner measures and one plan serves every layer; a model with
+/// one geometry is unaffected, its maximum being its only size.
 template <class Allocator>
 TextAttentionProjectionRoots text_attention_projection(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
-    return {
-        matrix(allocator, DType::BF16, geometry.hidden, tokens),
-        matrix(allocator, DType::BF16, geometry.query_size(), tokens),
-        matrix(allocator, DType::BF16, geometry.query_size(), tokens),
-        matrix(allocator, DType::BF16, geometry.kv_size(), tokens),
-        matrix(allocator, DType::BF16, geometry.kv_size(), tokens),
-    };
+    return text_attention_projection(allocator, geometry.hidden, geometry.maximum_query_size(),
+                                     geometry.maximum_kv_size(), tokens);
 }
 
 struct TextAttentionResultRoots {
@@ -77,12 +92,19 @@ struct TextAttentionResultRoots {
 };
 
 template <class Allocator>
-TextAttentionResultRoots text_attention_results(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+TextAttentionResultRoots text_attention_results(Allocator& allocator, std::int32_t query_rows,
+                                                std::int32_t kv_rows, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, geometry.query_size(), tokens),
-        matrix(allocator, DType::BF16, geometry.kv_size(), tokens),
-        matrix(allocator, DType::BF16, geometry.query_size(), tokens),
+        matrix(allocator, DType::BF16, query_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
+        matrix(allocator, DType::BF16, query_rows, tokens),
     };
+}
+
+template <class Allocator>
+TextAttentionResultRoots text_attention_results(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return text_attention_results(allocator, geometry.maximum_query_size(),
+                                  geometry.maximum_kv_size(), tokens);
 }
 
 struct GdnControlRoots {

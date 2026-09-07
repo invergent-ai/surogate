@@ -205,8 +205,8 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
     return false;
 }
 
-void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor* q, Tensor* k,
-                    cudaStream_t stream) {
+void launch_generic(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
+                    Tensor* q, Tensor* k, cudaStream_t stream) {
     constexpr int block = 128;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
@@ -214,24 +214,28 @@ void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor
         static_cast<const std::int32_t*>(positions.data), positions.ne[1],
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
-        theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens, token_stride(q),
-        token_stride(k));
+        active_pairs, theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens,
+        token_stride(q), token_stride(k));
 }
 
 } // namespace
 
-void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                 cudaStream_t stream) {
-    if (!launch_fixed_pair(positions, rotary_dim, theta, q, k, stream)) {
-        launch_generic(positions, rotary_dim, theta, &q, &k, stream);
+void rope_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
+                 Tensor& q, Tensor& k, cudaStream_t stream) {
+    // The fixed kernels rotate every pair of their rotation, so they serve only a rotation
+    // with no inert tail. A partial one goes to the generic kernel, which reads both numbers.
+    const bool whole = active_pairs == rotary_dim / 2;
+    if (!whole || !launch_fixed_pair(positions, rotary_dim, theta, q, k, stream)) {
+        launch_generic(positions, rotary_dim, active_pairs, theta, &q, &k, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
-void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                        cudaStream_t stream) {
-    if (!launch_fixed_single_dispatch(positions, rotary_dim, theta, x, stream)) {
-        launch_generic(positions, rotary_dim, theta, &x, nullptr, stream);
+void rope_single_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
+                        Tensor& x, cudaStream_t stream) {
+    const bool whole = active_pairs == rotary_dim / 2;
+    if (!whole || !launch_fixed_single_dispatch(positions, rotary_dim, theta, x, stream)) {
+        launch_generic(positions, rotary_dim, active_pairs, theta, &x, nullptr, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

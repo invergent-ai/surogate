@@ -59,12 +59,25 @@ std::int32_t require_tensor(const Tensor& tensor, std::int32_t hidden, const cha
     return tensor.ne[1];
 }
 
+/// How wide a stored row is for `layout`, against how wide the math reads.
+///
+/// `row-split-k128-v1` pads K up to 128 (`row_split_geometry`), so a weight of width 704 is
+/// stored 768 wide and its `padded_shape[1]` says so. Every mixture registered before Gemma 4
+/// had expert widths that were multiples of 128, so the two always coincided and this check
+/// could compare `padded_shape[1]` to `k` directly. The GGML superblock and NVFP4 layouts store
+/// K exactly and keep the two equal.
+std::int32_t stored_columns(QuantLayout layout, std::int32_t k) {
+    if (layout != QuantLayout::RowSplit) { return k; }
+    return static_cast<std::int32_t>(round_up<std::int64_t>(k, 128));
+}
+
 void require_matrix_metadata(const Weight& weight, std::int32_t n, std::int32_t k,
                              const char* name) {
     if (weight.ndim != 2 || weight.n != n || weight.k != k || weight.shape[0] != n ||
         weight.shape[1] != k || weight.shape[2] != 1 || weight.shape[3] != 1 ||
-        weight.padded_shape[0] != n || weight.padded_shape[1] != k || weight.padded_shape[2] != 1 ||
-        weight.padded_shape[3] != 1) {
+        weight.padded_shape[0] != n ||
+        weight.padded_shape[1] != stored_columns(weight.layout, k) ||
+        weight.padded_shape[2] != 1 || weight.padded_shape[3] != 1) {
         throw std::invalid_argument(std::string("sparse_moe: invalid shape for ") + name);
     }
 }
@@ -122,8 +135,13 @@ QuantGeometry quant_geometry(QType qtype) {
 void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, const char* name,
                        std::vector<AddressRange>& ranges) {
     require_matrix_metadata(weight, n, k, name);
-    const QuantGeometry geometry       = quant_geometry(weight.qtype);
-    const std::size_t groups           = static_cast<std::size_t>(n) * k / geometry.group_size;
+    const QuantGeometry geometry = quant_geometry(weight.qtype);
+    // The planes are sized and addressed by what the layout *stores*, which is the padded width
+    // where the layout pads. Sizing them from `k` would under-count the payload -- so the
+    // capacity check would pass on a truncated buffer -- and would hand the overlap check a
+    // range shorter than the one the kernels read.
+    const std::size_t stored           = static_cast<std::size_t>(stored_columns(weight.layout, k));
+    const std::size_t groups           = static_cast<std::size_t>(n) * stored / geometry.group_size;
     const std::size_t code_bytes       = groups * geometry.code_bytes_per_group;
     const std::size_t high_bytes       = groups * geometry.high_bytes_per_group;
     const std::size_t scale_bytes      = groups * geometry.scale_bytes_per_group;
@@ -181,6 +199,23 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
         throw std::invalid_argument(
             "sparse_moe: this mixture's router is a softmax over the logits and has no bias to "
             "rank with; passing one means the caller expects a router this geometry is not");
+    }
+    if (geometry.per_expert_scaled) {
+        if (weights.per_expert_scale == nullptr) {
+            throw std::invalid_argument(
+                "sparse_moe: this mixture scales its renormalised routing weights by a learned "
+                "per-expert vector and cannot weight its winners without it");
+        }
+        ranges.push_back(address_range(weights.per_expert_scale,
+                                       static_cast<std::size_t>(geometry.experts) * sizeof(float),
+                                       "per_expert_scale"));
+    } else if (weights.per_expert_scale != nullptr) {
+        // Not a harmless extra pointer: nothing would read it, so the round would weight its
+        // experts by the checkpoint's routing weights alone and say nothing about the tensor it
+        // ignored.
+        throw std::invalid_argument(
+            "sparse_moe: this mixture's router has no per-expert scale; passing one means the "
+            "caller expects a router this geometry is not");
     }
     if (geometry.has_shared()) {
         if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
@@ -321,6 +356,13 @@ SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights) {
         .shared_gated        = weights.shared_gated,
         .shared_intermediate = shared ? weights.shared_down.k : 0,
         .swiglu_limit        = weights.swiglu_limit,
+        // The gate is the caller's statement, like the clamp and the routed scale: no shape
+        // carries it, and a checkpoint served through the wrong one computes a different
+        // function silently. `require_registered` is what makes the statement checkable -- a
+        // geometry whose numbers match a registered mixture but whose gate does not is refused.
+        .activation          = weights.activation,
+        // The per-expert scale, like the router bias, states itself by being there.
+        .per_expert_scaled   = weights.per_expert_scale != nullptr,
     };
     require_registered(geometry);
     return geometry;
@@ -413,6 +455,13 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
                 const SparseMoeRoundHook& hook) {
+    // One tensor for both projections, which is what every mixture but Gemma 4 does.
+    sparse_moe(x, x, weights, epilogue, destination, workspace, stream, hook);
+}
+
+void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
+                SparseMoeEpilogue epilogue, Tensor& destination, WorkspaceArena& workspace,
+                cudaStream_t stream, const SparseMoeRoundHook& hook) {
     const SparseMoeRoundHook* round_hook = hook.resolve != nullptr ? &hook : nullptr;
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
@@ -422,9 +471,18 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     if (require_tensor(destination, geometry.hidden, "destination") != tokens) {
         throw std::invalid_argument("sparse_moe: x and destination token counts must match");
     }
+    const bool separate_router_input = router_x.data != x.data;
+    if (require_tensor(router_x, geometry.hidden, "router_x") != tokens) {
+        throw std::invalid_argument("sparse_moe: x and router_x token counts must match");
+    }
     std::vector<AddressRange> ranges;
     ranges.reserve(16);
     ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    // The common call passes one tensor twice, and two identical ranges are not an overlap to
+    // report -- so it is named only when it is a buffer of its own.
+    if (separate_router_input) {
+        ranges.push_back(address_range(router_x.data, router_x.bytes(), "router_x"));
+    }
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     validate_weights(weights, geometry, ranges);
 
@@ -480,8 +538,8 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, geometry, plan.slice_tokens,
                                                           plan.routed_trtllm, plan.routed_int8);
-        detail::sparse_moe_prefill_launch(geometry, x, weights, destination, plan, views, stream,
-                                          round_hook);
+        detail::sparse_moe_prefill_launch(geometry, x, router_x, weights, destination, plan,
+                                          views, stream, round_hook);
         return;
     }
     if (use_small_t) {
@@ -492,10 +550,11 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
                 detail::resolve_sparse_moe_small_t_plan(geometry, slice, gate_up, down);
             const detail::SparseMoeSmallTWorkspace views =
                 detail::allocate_sparse_moe_small_t_workspace(workspace, geometry, slice);
-            const Tensor x_slice     = x.slice(1, offset, slice);
-            Tensor destination_slice = destination.slice(1, offset, slice);
-            detail::sparse_moe_small_t_launch(geometry, x_slice, weights, destination_slice, plan,
-                                              views, stream, round_hook);
+            const Tensor x_slice      = x.slice(1, offset, slice);
+            const Tensor router_slice = router_x.slice(1, offset, slice);
+            Tensor destination_slice  = destination.slice(1, offset, slice);
+            detail::sparse_moe_small_t_launch(geometry, x_slice, router_slice, weights,
+                                              destination_slice, plan, views, stream, round_hook);
             offset += slice;
         }
         return;
@@ -503,10 +562,11 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     const detail::SparseMoeDecodeWorkspace views =
         detail::allocate_sparse_moe_decode_workspace(workspace, geometry);
     for (std::int32_t token = 0; token < tokens; ++token) {
-        const Tensor x_column     = x.slice(1, token, 1);
-        Tensor destination_column = destination.slice(1, token, 1);
-        detail::sparse_moe_decode_launch(geometry, x_column, weights, destination_column, views,
-                                         stream, round_hook);
+        const Tensor x_column      = x.slice(1, token, 1);
+        const Tensor router_column = router_x.slice(1, token, 1);
+        Tensor destination_column  = destination.slice(1, token, 1);
+        detail::sparse_moe_decode_launch(geometry, x_column, router_column, weights,
+                                         destination_column, views, stream, round_hook);
     }
 }
 

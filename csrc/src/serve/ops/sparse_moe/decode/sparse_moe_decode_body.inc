@@ -64,11 +64,14 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
 __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int* __restrict__ ids,
                                           float* __restrict__ alpha,
                                           float* __restrict__ shared_scale,
-                                          const float* __restrict__ router_bias) {
+                                          const float* __restrict__ router_bias,
+                                          const float* __restrict__ per_expert_scale) {
     __shared__ float selected_logits[kTopK];
     if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated>(
-        scores, ids, alpha, shared_scale, selected_logits, router_bias, kRoutedScale);
+    sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated,
+                                 kPerExpertScaled>(
+        scores, ids, alpha, shared_scale, selected_logits, router_bias, kRoutedScale,
+        per_expert_scale);
 }
 
 /// An expert's gate/up block stores the gate rows first in every groupwise-int and W8 artifact.
@@ -79,12 +82,15 @@ struct Q4Codec {
     static constexpr bool kGateRowsFirst = true;
     static constexpr int kGroupK         = 64;
     static constexpr bool kD3PackedWord8 = true;
+    /// Row-split storage pads K to 128; see `kStoredGroups`.
+    static constexpr int kStoredKAlignment = 128;
 };
 
 struct Q5Codec {
     static constexpr bool kGateRowsFirst = true;
     static constexpr int kGroupK       = 64;
     static constexpr bool kPackedWord8 = true;
+    static constexpr int kStoredKAlignment = 128;
 
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
@@ -103,6 +109,7 @@ struct Q6Codec {
     static constexpr bool kGateRowsFirst = true;
     static constexpr int kGroupK       = 64;
     static constexpr bool kPackedWord8 = true;
+    static constexpr int kStoredKAlignment = 128;
 
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
@@ -135,6 +142,8 @@ template <int kGroupsPerRow>
 struct Nvfp4CodecFor {
     static constexpr bool kGateRowsFirst        = false;
     static constexpr int kGroupK                = 16;
+    /// `BlockScaleK16M128x4` stores K exactly; it does not pad to 128.
+    static constexpr int kStoredKAlignment      = 1;
     static constexpr bool kPackedWord8          = true;
     // D3 has two specialised transaction shapes (Q4's four-group word and W8's one value per
     // lane); NVFP4 uses neither and takes the generic packed branch below.
@@ -174,6 +183,7 @@ struct Nvfp4CodecFor {
 struct W8Codec {
     static constexpr bool kGateRowsFirst        = true;
     static constexpr int kGroupK                = 32;
+    static constexpr int kStoredKAlignment      = 128;
     static constexpr bool kD3SingleValuePerLane = true;
     static constexpr bool kD3PackedWord8        = false;
     static constexpr bool kPackedWord8          = false;
@@ -194,12 +204,29 @@ struct W8Codec {
     }
 };
 
+/// How wide a stored row is, against how wide the math reads.
+///
+/// `row-split-k128-v1` pads K up to 128 and stores `padded / group` groups per row
+/// (`row_split_geometry` in `artifact/storage_layouts.cpp`), so a row's stride is the *padded*
+/// width while the dot product still reads only the real one. Every mixture registered before
+/// Gemma 4 had feed-forward widths that were multiples of 128 -- 512, 640, 768, 2048 -- so the
+/// two coincided and nothing here distinguished them. Gemma 4's routed experts are 704 wide,
+/// which is 5.5 x 128: the artifact holds 24 groups per row where the width is 22, and a stride
+/// of 22 reads every row after the first from the middle of its predecessor.
+///
+/// The GGML superblock and NVFP4 layouts store K exactly, so their alignment is one. The
+/// constant rides on the codec because the layout does.
+template <class Codec, int K>
+inline constexpr int kStoredGroups =
+    ((K + Codec::kStoredKAlignment - 1) / Codec::kStoredKAlignment) * Codec::kStoredKAlignment /
+    Codec::kGroupK;
+
 template <class Codec, int K>
 __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const std::uint8_t* high,
                                              const std::uint8_t* scales, int row0, int row1,
                                              const __nv_bfloat16* x, int k_begin, int k_end,
                                              float& result0, float& result1) {
-    constexpr int kGroups = K / Codec::kGroupK;
+    constexpr int kGroups = kStoredGroups<Codec, K>;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     float acc0            = 0.0f;
     float acc1            = 0.0f;
@@ -341,7 +368,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
         dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
                                        x_shared, 0, kHidden, gate, up);
     }
-    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = swiglu_clamped(gate, up, kSwigluLimit); }
+    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = gated_clamped(gate, up, kSwigluLimit, kActivation); }
 }
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive>
@@ -414,7 +441,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
         if (lane == 0) {
             token_activations[(static_cast<std::int64_t>(token) * kPaths + path) *
                                   kIntermediate +
-                              j] = swiglu_clamped(gate, up, kSwigluLimit);
+                              j] = gated_clamped(gate, up, kSwigluLimit, kActivation);
         }
         if constexpr (Adaptive) { __syncthreads(); }
     }
@@ -425,7 +452,7 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
                                               const std::uint8_t* scales, int row_base,
                                               const float* x, int first_group, int last_group,
                                               float (&result)[Rows]) {
-    constexpr int kGroups = kIntermediate / Codec::kGroupK;
+    constexpr int kGroups = kStoredGroups<Codec, kIntermediate>;
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     float acc[Rows];
 #pragma unroll
@@ -701,7 +728,8 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
     auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
     sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale,
-                                                   weights.router_bias);
+                                                   weights.router_bias,
+                                                   weights.per_expert_scale);
     CUDA_CHECK(cudaGetLastError());
     // The round hook sees the final ids before the expert kernels; its launches sit between
     // D2 and D3 on the stream, so D3's programmatic wait resolves against them.
@@ -980,10 +1008,14 @@ void decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destinati
     }
 }
 
-void decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
-                   const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
-                   const SparseMoeRoundHook* hook) {
-    launch_d1(x, weights.router_shared_gate, workspace, stream);
+// Every mixture here but Gemma 4 projects the router and the experts from the same tokens, and
+// passes the same tensor twice. Gemma 4 does not: its router reads the post-attention residual
+// normalised with no weight and scaled by a learned per-channel vector, its experts the same
+// residual through `pre_feedforward_layernorm_2`. Two projections of one token.
+void decode_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
+                   Tensor& destination, const SparseMoeDecodeWorkspace& workspace,
+                   cudaStream_t stream, const SparseMoeRoundHook* hook) {
+    launch_d1(router_x, weights.router_shared_gate, workspace, stream);
     launch_d2_d3(x, weights, destination, workspace, stream, hook);
     launch_d4_dependent(weights, destination, workspace, stream);
 }

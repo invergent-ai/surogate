@@ -40,4 +40,25 @@ void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
 void rmsnorm_add(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
                  cudaStream_t stream);
 
+/**
+ * The same normalisation with no gain at all:
+ *
+ *   inv_r      = 1 / sqrt((1/D) * sum_d x[d,r]^2 + eps)
+ *   ideal[d,r] = x[d,r] * inv_r.
+ *
+ * There is no weight, rather than a weight of ones: Gemma 4 normalises its attention value
+ * with `RMSNorm(dim, with_scale=False)`, which owns no parameter, and a caller would
+ * otherwise have to keep a ones vector somewhere on the device for a kernel to multiply by.
+ *
+ * This is *not* `l2norm`, which is the other weightless normalisation in this directory:
+ * that one divides by `sqrt(sum_d x^2 + eps)` where this divides by `sqrt(mean_d x^2 + eps)`,
+ * so they differ by `sqrt(D)` and place their eps differently.
+ *
+ * `x` and `out` are same-shaped contiguous BF16 tensors and eps is positive and finite. Input
+ * and output must not overlap. The oracle evaluates `ideal` naively in FP64 from the
+ * represented input; output storage rounding belongs to the Op's numerical criterion. There
+ * is no workspace or persistent state side effect.
+ */
+void rmsnorm_unweighted(const Tensor& x, float eps, Tensor& out, cudaStream_t stream);
+
 } // namespace sinfer::ops

@@ -31,7 +31,16 @@ struct Geometry {
     int axes;
     int tokens;
     float theta;
+    /// How many of the rotation's pairs carry a real angle; 0 means all of them. A partial
+    /// rotation is Gemma 4's proportional rope: 64 pairs of a 512-wide head rotate and the
+    /// remaining 192 are left exactly as they were.
+    int active_pairs = 0;
 };
+
+/// The pairs a geometry actually rotates.
+int active_pairs_of(const Geometry& geometry) {
+    return geometry.active_pairs > 0 ? geometry.active_pairs : geometry.rotary_dim / 2;
+}
 
 std::size_t dense_elements(int head_dim, int heads, int tokens) {
     return static_cast<std::size_t>(head_dim) * static_cast<std::size_t>(heads) *
@@ -79,10 +88,11 @@ std::vector<int> make_positions(int axes, int tokens, int first_position) {
 std::vector<double> rope_oracle(const std::vector<float>& input, const std::vector<int>& positions,
                                 const Geometry& geometry, int heads) {
     std::vector<double> output(input.begin(), input.end());
-    const int half = geometry.rotary_dim / 2;
+    const int half   = geometry.rotary_dim / 2;
+    const int active = active_pairs_of(geometry);
     for (int token = 0; token < geometry.tokens; ++token) {
         for (int head = 0; head < heads; ++head) {
-            for (int pair = 0; pair < half; ++pair) {
+            for (int pair = 0; pair < active; ++pair) {
                 int axis        = 0;
                 double exponent = 0.0;
                 if (geometry.axes == 2) {
@@ -263,7 +273,8 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
     q_tensor.nb[2] = static_cast<std::int64_t>(q_stride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(k_stride) * sizeof(std::uint16_t);
 
-    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor, nullptr);
+    ops::rope(position_tensor, geometry.rotary_dim, active_pairs_of(geometry), geometry.theta,
+              q_tensor, k_tensor, nullptr);
     cuda_synchronize();
 
     const auto q_got        = from_device<std::uint16_t>(q_device.data(), q_storage.size());
@@ -312,7 +323,8 @@ int run_single_case(const Geometry& geometry, int heads, int first_position, int
     Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
     Tensor tensor(device.data(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
     tensor.nb[2] = static_cast<std::int64_t>(token_stride) * sizeof(std::uint16_t);
-    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, tensor, nullptr);
+    ops::rope(position_tensor, geometry.rotary_dim, active_pairs_of(geometry), geometry.theta,
+              tensor, nullptr);
     cuda_synchronize();
 
     const auto got          = from_device<std::uint16_t>(device.data(), storage.size());
@@ -446,6 +458,23 @@ int main() {
     failures += run_pair_case({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);
     failures +=
         run_single_case({"35b dflash context k", 128, 128, 1, 128, kTextTheta}, 8, 131'072, 16);
+
+    // Gemma 4's global attention: a 512-wide head rotating over its whole width with only its
+    // first 64 pairs carrying an angle. The other 192 pairs must come back bit-for-bit
+    // unchanged -- the oracle leaves them alone and the comparison is the same one, so a
+    // kernel that rotated them, or that left the angle cache uninitialised past pair 127
+    // (which a 128-thread block filling one pair per thread would do), fails here.
+    failures += run_pair_case({"gemma4 global decode", 512, 512, 1, 1, kTextTheta, 64}, 16, 1, 31);
+    failures +=
+        run_pair_case({"gemma4 global prefill", 512, 512, 1, 128, kTextTheta, 64}, 16, 1, 4096);
+    failures += run_pair_case({"gemma4 global strided", 512, 512, 1, 7, kTextTheta, 64}, 16, 1,
+                              65'536, 16, 8);
+    failures += run_single_case({"gemma4 global k", 512, 512, 1, 64, kTextTheta, 64}, 1, 8192);
+    // The 31B's global geometry: same head, four key/value heads.
+    failures +=
+        run_pair_case({"gemma4-31b global", 512, 512, 1, 33, kTextTheta, 64}, 32, 4, 1024);
+    // And the windowed half, which rotates in full at the local base.
+    failures += run_pair_case({"gemma4 windowed", 256, 256, 1, 64, 1.0e4F}, 16, 8, 512);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;

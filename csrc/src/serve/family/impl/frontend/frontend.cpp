@@ -36,9 +36,8 @@ using Json   = nlohmann::json;
 using Clock  = std::chrono::steady_clock;
 namespace fi = frontend_internal;
 
-constexpr std::size_t kPatchFeatures   = 1536;
-constexpr std::string_view kThinkClose = "</think>";
-constexpr double kRescaleFactor        = 1.0 / 255.0;
+constexpr std::size_t kPatchFeatures = 1536;
+constexpr double kRescaleFactor       = 1.0 / 255.0;
 constexpr double kVideoFps             = 2.0;
 constexpr int kVideoMinFrames          = 4;
 constexpr int kVideoMaxFrames          = 768;
@@ -228,6 +227,45 @@ std::optional<std::string> stated_chat_template(const Json& tokenizer_config) {
     throw std::invalid_argument(
         "tokenizer_config.json.chat_template is a list with no \"default\" entry (" + names +
         "); the checkpoint does not say which template it serves");
+}
+
+/// The reasoning markers a checkpoint states, or the `<think>` pair when it states none.
+///
+/// `response_template.fields.thinking` is how the published Gemma 4 files spell it, beside
+/// the regexes their own parser uses; only the two markers are read here. A checkpoint that
+/// states the pair is also saying the *model* writes them -- the template leaves the span for
+/// the model to open -- which is what `model_opens` records.
+fi::ReasoningSyntax reasoning_syntax(const FrontendResources& resources) {
+    fi::ReasoningSyntax syntax;
+    if (resources.tokenizer_config_json.empty()) { return syntax; }
+    Json config;
+    try {
+        config = Json::parse(resources.tokenizer_config_json);
+    } catch (const std::exception&) {
+        // Malformed is reported by `validate_tokenizer_config`, whose message says what is
+        // wrong with the file; repeating a worse one from here would only obscure it.
+        return syntax;
+    }
+    if (!config.is_object() || !config.contains("response_template")) { return syntax; }
+    const Json& response = config.at("response_template");
+    if (!response.is_object() || !response.contains("fields")) { return syntax; }
+    const Json& fields = response.at("fields");
+    if (!fields.is_object() || !fields.contains("thinking")) { return syntax; }
+    const Json& thinking = fields.at("thinking");
+    if (!thinking.is_object() || !thinking.contains("open") || !thinking.contains("close")) {
+        return syntax;
+    }
+    const Json& open  = thinking.at("open");
+    const Json& close = thinking.at("close");
+    if (!open.is_string() || !close.is_string()) { return syntax; }
+    const std::string opened = open.get<std::string>();
+    const std::string closed = close.get<std::string>();
+    // Both, or neither: half a pair would open a span nothing closes.
+    if (opened.empty() || closed.empty()) { return syntax; }
+    syntax.open        = opened;
+    syntax.close       = closed;
+    syntax.model_opens = true;
+    return syntax;
 }
 
 void validate_tokenizer_config(const FrontendResources& resources) {
@@ -561,6 +599,8 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
 }
 
 struct DecoderState {
+    /// The markers this stream is being read against, from the artifact.
+    fi::ReasoningSyntax reasoning;
     std::string utf8_pending;
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
@@ -657,31 +697,53 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
-    if (!state.in_reasoning) {
+    // Which marker ends the span the stream is in. A model that writes its own opener is
+    // watched for one while in content; a model handed an open turn by its prompt is not, and
+    // its opener never reaches the output, so for every family served before Gemma 4 this is
+    // empty in content and the stream reaches `feed_content` exactly as it always did.
+    const std::string_view marker =
+        state.in_reasoning          ? std::string_view(state.reasoning.close)
+        : state.reasoning.model_opens ? std::string_view(state.reasoning.open)
+                                      : std::string_view{};
+    if (marker.empty()) {
         feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
         return;
     }
 
     state.think_marker_pending.append(text);
-    const std::size_t marker = state.think_marker_pending.find(kThinkClose);
-    if (marker != std::string::npos) {
-        feed_channel(state, OutputChannel::Reasoning,
-                     std::string_view(state.think_marker_pending).substr(0, marker), policy,
-                     emitted, committed_tokens, best_match);
-        close_channel(state, OutputChannel::Reasoning, emitted);
-        std::string content = state.think_marker_pending.substr(marker + kThinkClose.size());
+    const std::size_t at = state.think_marker_pending.find(marker);
+    if (at != std::string::npos) {
+        const std::string_view before =
+            std::string_view(state.think_marker_pending).substr(0, at);
+        if (state.in_reasoning) {
+            feed_channel(state, OutputChannel::Reasoning, before, policy, emitted,
+                         committed_tokens, best_match);
+            close_channel(state, OutputChannel::Reasoning, emitted);
+            state.strip_content_leading = true;
+        } else {
+            feed_content(state, std::string(before), policy, emitted, committed_tokens,
+                         best_match);
+        }
+        std::string rest = state.think_marker_pending.substr(at + marker.size());
         state.think_marker_pending.clear();
-        state.in_reasoning          = false;
-        state.strip_content_leading = true;
-        feed_content(state, std::move(content), policy, emitted, committed_tokens, best_match);
+        state.in_reasoning = !state.in_reasoning;
+        // The remainder may hold the marker that ends the span just entered -- an empty
+        // thought channel is `open` immediately followed by `close` -- so it is fed rather
+        // than published.
+        feed_decoded_text(state, rest, policy, emitted, committed_tokens, best_match);
         return;
     }
 
-    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, kThinkClose, true);
+    const std::size_t hold = longest_suffix_prefix(state.think_marker_pending, marker, true);
     const std::size_t safe = state.think_marker_pending.size() - hold;
-    feed_channel(state, OutputChannel::Reasoning,
-                 std::string_view(state.think_marker_pending).substr(0, safe), policy, emitted,
-                 committed_tokens, best_match);
+    const std::string_view ready =
+        std::string_view(state.think_marker_pending).substr(0, safe);
+    if (state.in_reasoning) {
+        feed_channel(state, OutputChannel::Reasoning, ready, policy, emitted, committed_tokens,
+                     best_match);
+    } else {
+        feed_content(state, std::string(ready), policy, emitted, committed_tokens, best_match);
+    }
     state.think_marker_pending.erase(0, safe);
 }
 
@@ -719,6 +781,14 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
         state.think_marker_pending.clear();
         close_channel(state, OutputChannel::Reasoning, emitted);
     } else {
+        // Held back in case it grew into an opening marker, and it did not. Content, not
+        // something to drop: watching for an opener must not cost the last few bytes of an
+        // answer that never had one.
+        if (!state.think_marker_pending.empty()) {
+            std::string tail = std::move(state.think_marker_pending);
+            state.think_marker_pending.clear();
+            feed_content(state, std::move(tail), policy, emitted, committed_tokens, nullptr);
+        }
         close_channel(state, OutputChannel::Content, emitted);
     }
     state.stop_pending = {};
@@ -759,9 +829,16 @@ public:
                                              // build it exactly when this frontend has no hand-written
                                              // reproduction of the template to fall back on.
                                              .render_chat_template = chat_template.rendered_by_tokenizer()})),
-          processor(processor_options(resources)), vision_enabled(options.vision_enabled),
+          processor(processor_options(resources)), reasoning(reasoning_syntax(resources)),
+          vision_enabled(options.vision_enabled),
           has_chat_template(!resources.chat_template_jinja.empty() ||
                             !options.chat_template_override.empty()) {
+        if (const char* probe = std::getenv("SUROGATE_SERVE_TRACE_REASONING"); probe != nullptr) {
+            std::fprintf(stderr,
+                         "[reasoning] config_bytes=%zu open=%s close=%s model_opens=%d\n",
+                         resources.tokenizer_config_json.size(), reasoning.open.c_str(),
+                         reasoning.close.c_str(), static_cast<int>(reasoning.model_opens));
+        }
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }
@@ -791,7 +868,8 @@ public:
                                                    return tokenizer->render_chat_template(
                                                        {{"user", "hello"}},
                                                        /*add_generation_prompt=*/true, variables);
-                                               })
+                                               },
+                                               reasoning)
                 : chat_template.capabilities();
         if (registered_checkpoint && options.registered_tokenizer) {
             validate_registered_tokenizer(*tokenizer);
@@ -853,6 +931,7 @@ public:
     /// What the loaded template can actually be asked for. The hand-written
     /// templates state it; an artifact's own Jinja is asked, by rendering it.
     PromptCapabilities capabilities;
+    fi::ReasoningSyntax reasoning;
     bool vision_enabled = true;
     /// Whether anything was compiled above. A checkpoint with no template is a base model, and
     /// only the raw-prompt path can serve it.
@@ -862,10 +941,15 @@ public:
 class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
-         bool starts_in_reasoning)
+         bool starts_in_reasoning, fi::ReasoningSyntax reasoning)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           preserve_special(output.raw || output.preserve_special_tokens) {
         state.in_reasoning = starts_in_reasoning && !output.raw;
+        // The raw path publishes the stream as the model wrote it, markers included, so it
+        // is given no pair to act on.
+        if (!output.raw) { state.reasoning = std::move(reasoning); }
+        // `preview_state` is assigned from `state` wholesale before it is fed, so it inherits
+        // both the pair and the channel without being told.
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
@@ -1164,14 +1248,22 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
     } else {
-        fi::RenderedChat rendered = impl_->render_chat(messages, options);
         // `SUROGATE_SERVE_RAW_PROMPT`: a lone text-only user message is the prompt itself, no
         // template around it. Measurement only -- it is how a perplexity run scores raw text
         // the way llama-perplexity does, since a chat turn changes what the model predicts.
+        //
+        // Decided *before* rendering, not after. Rendering a chat is what throws "No chat
+        // template loaded", and a base model -- `google/gemma-4-12B` is one -- has no template
+        // by definition. Asking for the raw prompt and then failing to render the template it
+        // is bypassing left exactly the checkpoints this flag exists to measure unmeasurable.
         static const bool raw_prompt = std::getenv("SUROGATE_SERVE_RAW_PROMPT") != nullptr;
-        if (raw_prompt && messages.size() == 1 && messages.front().role == ChatRole::User) {
-            rendered      = fi::RenderedChat{};
+        const bool raw_single =
+            raw_prompt && messages.size() == 1 && messages.front().role == ChatRole::User;
+        fi::RenderedChat rendered;
+        if (raw_single) {
             rendered.text = messages.front().rendered_content();
+        } else {
+            rendered = impl_->render_chat(messages, options);
         }
         // The artifact's own template is not reproduced here, so what it did with the
         // request is read off the prompt it produced: a prompt that ends inside
@@ -1179,8 +1271,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         // vocabulary for asking. GLM-5.3-Flash always opens one and was answering
         // with its reasoning in `content` because this was assumed instead.
         if (impl_->tokenizer->renders_chat_template()) {
-            opens_reasoning =
-                options.add_generation_prompt && fi::prompt_opens_reasoning(rendered.text);
+            opens_reasoning = options.add_generation_prompt &&
+                              fi::prompt_opens_reasoning(rendered.text, impl_->reasoning.open);
         }
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
@@ -1300,7 +1392,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
-        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning));
+        impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning,
+        impl_->reasoning));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

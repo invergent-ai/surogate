@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ops/common/math.h"
 
 #include <cuda_runtime.h>
 
@@ -58,6 +59,16 @@ struct SparseMoeGeometry {
     /// a training-time stability device, so a checkpoint trained under it produces activations
     /// that reach it and serving without the clamp is serving a different function.
     float swiglu_limit = 0.0F;
+    /// Which gate the experts put their first half through. SiLU for every mixture this engine
+    /// served before Gemma 4, whose experts are GELU-gated (`gelu_pytorch_tanh`) like the rest
+    /// of that model. Part of the geometry rather than the weights because the kernels compile
+    /// it away, and part of the *identity* because a checkpoint served through the other gate
+    /// computes a different function and says nothing about it.
+    GatedActivation activation = GatedActivation::Silu;
+    /// Whether the router weights its winners by a learned per-expert scale after the
+    /// renormalisation. Gemma 4 does and nothing else here does. Derived from the weights, like
+    /// `gating` is from the router bias: the tensor's presence is the statement.
+    bool per_expert_scaled = false;
 
     [[nodiscard]] constexpr bool has_shared() const noexcept { return shared_intermediate > 0; }
     /// The router carries one row per expert, plus the shared expert's gate where it has one.
@@ -101,12 +112,24 @@ inline constexpr SparseMoeGeometry kSparseMoeQwen3MoeGeometry{
 inline constexpr SparseMoeGeometry kSparseMoeGlm53Geometry{
     4096, 288, 8, 2048, SparseMoeGating::SigmoidBiasTopK, 2.5F, /*shared_gated=*/false, 2048,
     /*swiglu_limit=*/10.0F};
+/// Gemma 4 26B-A4B: 128 experts, top-8, FFN 704, hidden 2,816, no always-on expert, and the two
+/// things no other registered mixture has -- **GELU-gated** experts, and a router that scales
+/// its renormalised winners by a learned per-expert vector.
+///
+/// Its dense feed-forward is not here and does not belong here: Gemma 4 runs one on *every*
+/// layer, beside the experts rather than instead of them, so it is the layer's own projection
+/// and not a shared expert of this mixture. `shared_intermediate` stays zero, which is what
+/// says every token is routed and nothing is always on.
+inline constexpr SparseMoeGeometry kSparseMoeGemma4Geometry{
+    2816, 128, 8, 704, SparseMoeGating::SoftmaxTopK, 1.0F, /*shared_gated=*/true,
+    /*shared_intermediate=*/0, /*swiglu_limit=*/0.0F, GatedActivation::GeluTanh,
+    /*per_expert_scaled=*/true};
 
 /// Every mixture this op serves. One list, so registering a geometry is one line here and one
 /// kernel-body instantiation per route rather than a predicate repeated in five places.
-inline constexpr std::array<SparseMoeGeometry, 4> kSparseMoeGeometries{
+inline constexpr std::array<SparseMoeGeometry, 5> kSparseMoeGeometries{
     kSparseMoeQwen36Geometry, kSparseMoeFlashNextGeometry, kSparseMoeQwen3MoeGeometry,
-    kSparseMoeGlm53Geometry};
+    kSparseMoeGlm53Geometry, kSparseMoeGemma4Geometry};
 
 struct SparseMoeWeights {
     Weight router_shared_gate;
@@ -126,6 +149,18 @@ struct SparseMoeWeights {
     /// The SwiGLU clamp the mixture was trained under, or zero for none. Unreadable from any
     /// shape, like the two above; it must match the registered geometry's.
     float swiglu_limit = 0.0F;
+    /// Which gate the experts put their first half through. Unreadable from any shape, like
+    /// the clamp and the routed scale above; it must match the registered geometry's, and a
+    /// mismatch is refused rather than served as a different function.
+    GatedActivation activation = GatedActivation::Silu;
+    /// Device FP32 [experts]: the learned scale each expert's renormalised routing weight is
+    /// multiplied by, or null where the mixture has none.
+    ///
+    /// Its presence is what says the mixture has one, exactly as `router_bias`'s says which
+    /// gating it uses. Applied *after* the winners are renormalised, so it changes what an
+    /// expert is worth without changing which experts are chosen -- the opposite of what
+    /// `router_bias` does, and the reason the two cannot share a field.
+    const float* per_expert_scale = nullptr;
     Weight routed_gate_up;
     Weight routed_down;
     Weight shared_gate_up;
@@ -259,5 +294,22 @@ struct SparseMoeRoundHook {
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
                 const SparseMoeRoundHook& hook);
+
+/**
+ * As above, with the router reading `router_x` where the experts read `x`.
+ *
+ * Every mixture here but one projects both from the same tokens, and passing the same tensor
+ * twice is exactly the call above. Gemma 4 does not: its router reads the post-attention
+ * residual normalised with *no weight at all* and scaled by a learned per-channel vector, while
+ * its experts read the same residual through `pre_feedforward_layernorm_2`. They are two
+ * different projections of one token, and folding either norm into the other's weights would
+ * either quantise a per-channel factor into a group-scaled bank or hide the router the
+ * checkpoint states -- so the op takes both.
+ *
+ * `router_x` has `x`'s shape and dtype and must be disjoint from every other buffer here.
+ */
+void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
+                SparseMoeEpilogue epilogue, Tensor& destination, WorkspaceArena& workspace,
+                cudaStream_t stream, const SparseMoeRoundHook& hook);
 
 } // namespace sinfer::ops

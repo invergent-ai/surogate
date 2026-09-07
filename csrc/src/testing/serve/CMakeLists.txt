@@ -163,6 +163,11 @@ sinfer_add_test(sinfer_w8_quant_planes_test
   SOURCES ops/test_w8_quant_planes.cpp
   LIBRARIES sinfer_ops)
 set_tests_properties(sinfer_w8_quant_planes_test PROPERTIES SKIP_RETURN_CODE 77)
+# Pure host: the route selector takes n, k and T and returns a launcher, so this needs no
+# device and catches an alignment regression before a checkpoint does.
+sinfer_add_test(sinfer_w8_route_selection_test
+  SOURCES ops/test_w8_route_selection.cpp
+  LIBRARIES sinfer_ops)
 sinfer_add_test(sinfer_qwen3_5_4b_prefix_real_test
   SOURCES targets/qwen3_5/test_engine_prefix_real_4b.cpp
   LIBRARIES sinfer_engine)
@@ -275,6 +280,7 @@ set(sinfer_op_tests
   gated_delta_net
   causal_conv1d_silu
   layer_norm
+  logit_softcap
   embedding
   argmax
   gdn_gating

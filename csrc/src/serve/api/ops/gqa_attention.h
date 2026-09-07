@@ -131,4 +131,18 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
                           GqaBlockMask selection = {});
 
+/**
+ * A3 across a batch of sequences: A1's shapes and execution envelope, over a cache this call
+ * does not write.
+ *
+ * This is what a layer that shares an earlier layer's keys and values runs. Gemma 4's E-series
+ * ends in a run of them -- twenty of E2B's thirty-five -- and they hold a query projection and
+ * nothing else, so there is no key or value to append and the planes they read belong to
+ * another layer. Every route A1 can take is available here; the only difference is the append.
+ */
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor& valid_columns,
+                          const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
+                          GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                          cudaStream_t stream, GqaBlockMask selection = {});
+
 } // namespace sinfer::ops

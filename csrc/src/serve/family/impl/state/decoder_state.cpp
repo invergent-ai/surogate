@@ -19,7 +19,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::uint32_t physical_page_groups,
                               const std::vector<std::uint32_t>& skip_layers,
                               std::int32_t indexer_head_dim, bool elastic = false,
-                              std::uint32_t physical_page_cap = 0, bool overcommit = false) {
+                              std::uint32_t physical_page_cap = 0, bool overcommit = false,
+                              std::int32_t global_kv_heads = 0,
+                              std::int32_t global_head_dim = 0,
+                              const std::vector<std::uint32_t>& global_layers = {}) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -66,13 +69,38 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
     std::vector<DType> layer_dtypes(layers, dtype);
     for (const std::uint32_t skipped : skip_layers) { layer_dtypes[skipped] = DType::BF16; }
+    // A second attention geometry sizes the planes of the layers that use it. The plane
+    // *count* per layer is unchanged, so the stride the views index with is untouched --
+    // only the extent of each plane differs, which is what makes this a contained change.
+    std::vector<std::int32_t> layer_kv_heads(layers, kv_heads);
+    std::vector<std::int32_t> layer_head_dim(layers, head_dim);
+    const bool second_geometry = global_kv_heads > 0 && global_head_dim > 0;
+    for (const std::uint32_t global : global_layers) {
+        if (global >= layers) {
+            throw std::invalid_argument("the global attention geometry names layer " +
+                                        std::to_string(global) + ", but the model has " +
+                                        std::to_string(layers) + " full-attention layers");
+        }
+        if (!second_geometry) {
+            throw std::invalid_argument(
+                "layers are named as using the global attention geometry, but none is stated");
+        }
+        if (grouped && global_head_dim % quant_group != 0) {
+            throw std::invalid_argument(
+                "the global attention geometry's head dim is not a multiple of the KV quant group");
+        }
+        layer_kv_heads[global] = global_kv_heads;
+        layer_head_dim[global] = global_head_dim;
+    }
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const DType layer_dtype = layer_dtypes[layer];
-        pool_spec.planes.push_back({layer_dtype, head_dim, kv_heads, 256});
-        pool_spec.planes.push_back({layer_dtype, head_dim, kv_heads, 256});
+        const std::int32_t heads = layer_kv_heads[layer];
+        const std::int32_t width = layer_head_dim[layer];
+        pool_spec.planes.push_back({layer_dtype, width, heads, 256});
+        pool_spec.planes.push_back({layer_dtype, width, heads, 256});
         if (grouped) {
-            pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
-            pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+            pool_spec.planes.push_back({DType::FP16, width / quant_group, heads, 256});
+            pool_spec.planes.push_back({DType::FP16, width / quant_group, heads, 256});
         }
         // The indexer plane is always BF16 and one head: the selection reads raw keys and a
         // quantized cache would change which cells the model attends to, not just their values.
@@ -90,6 +118,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .quant_group  = quant_group,
         .indexer_head_dim = indexer_head_dim,
         .layer_dtypes = std::move(layer_dtypes),
+        .layer_kv_heads = second_geometry ? std::move(layer_kv_heads)
+                                          : std::vector<std::int32_t>{},
+        .layer_head_dim = second_geometry ? std::move(layer_head_dim)
+                                          : std::vector<std::int32_t>{},
     };
 }
 
@@ -101,7 +133,9 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 spec.kv_table_rows, spec.text_physical_page_groups,
                                 spec.kv_skip_layers, spec.indexer_head_dim, spec.elastic_kv,
-                                spec.text_physical_page_cap, spec.elastic_kv_overcommit);
+                                spec.text_physical_page_cap, spec.elastic_kv_overcommit,
+                                spec.global_kv_heads, spec.global_attention_head_dim,
+                                spec.global_geometry_layers);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
@@ -118,7 +152,8 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
     : pool_(backing, layout.pool, elastic), layers_(layout.layers), max_context_(layout.max_context),
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
       quant_group_(layout.quant_group), indexer_head_dim_(layout.indexer_head_dim),
-      layer_dtypes_(layout.layer_dtypes) {}
+      layer_dtypes_(layout.layer_dtypes), layer_kv_heads_(layout.layer_kv_heads),
+      layer_head_dim_(layout.layer_head_dim) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
@@ -155,8 +190,8 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
         .v_scale_pages = grouped ? pool_.plane(base + 3) : Tensor(),
         .indexer_pages = indexer_head_dim_ > 0 ? pool_.plane(base + (grouped ? 4ULL : 2ULL)) : Tensor(),
         .block_table   = block_table,
-        .head_dim      = head_dim_,
-        .num_kv_heads  = kv_heads_,
+        .head_dim      = layer_head_dim(layer),
+        .num_kv_heads  = layer_kv_heads(layer),
         .dtype         = layer_dtype(layer),
         .quant_group   = quant_group_,
     };
@@ -178,8 +213,8 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .v_scale_pages = grouped ? pool_.plane(base + 3) : Tensor(),
         .indexer_pages = indexer_head_dim_ > 0 ? pool_.plane(base + (grouped ? 4ULL : 2ULL)) : Tensor(),
         .block_tables  = pool_.block_tables(),
-        .head_dim      = head_dim_,
-        .num_kv_heads  = kv_heads_,
+        .head_dim      = layer_head_dim(layer),
+        .num_kv_heads  = layer_kv_heads(layer),
         .dtype         = layer_dtype(layer),
         .quant_group   = quant_group_,
     };
