@@ -781,8 +781,8 @@ if(SUROGATE_BUILD_SERVE)
         message(STATUS "serve: requires CUDA >= 13.1; targets disabled")
     else()
         enable_language(C)  # utf8proc
-        set(SINFER_ROOT ${CMAKE_SOURCE_DIR}/src/serve)
-        set(SUROGATE_VENDOR_DIR ${CMAKE_SOURCE_DIR}/src/third_party)
+        set(SINFER_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/serve)
+        set(SUROGATE_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party)
         set(SINFER_JSON_INCLUDE "${json_SOURCE_DIR}/single_include")
         set(SINFER_BUILD_MEDIA_ACQUIRE ON)
         set(SINFER_BUILD_PROMPT_INPUT ON)
@@ -808,7 +808,7 @@ if(SUROGATE_BUILD_SERVE)
         if(NOT LIBCURL_FOUND)
             message(STATUS "serve: pkg-config/libcurl not found; serve targets disabled")
         endif()
-        set(SERVE_ROOT ${CMAKE_SOURCE_DIR}/src/serve)
+        set(SERVE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/serve)
         if(LIBCURL_FOUND)
 
         # ---- serve engine libraries (formerly src/serve/src/CMakeLists.txt) ----
@@ -1385,12 +1385,12 @@ add_library(sinfer_engine STATIC EXCLUDE_FROM_ALL
 # to it for SentencePiece checkpoints (Llama 2, TinyLlama, Gemma), whose scheme
 # its own byte-level BPE cannot represent. Pure C++ with no CUDA dependency.
 target_sources(sinfer_engine PRIVATE
-  ${CMAKE_SOURCE_DIR}/src/tokenizer/tokenizer.cpp
-  ${CMAKE_SOURCE_DIR}/src/tokenizer/tok_profile.cpp
-  ${CMAKE_SOURCE_DIR}/src/tokenizer/unicode.cpp
-  ${CMAKE_SOURCE_DIR}/src/tokenizer/unicode_data.cpp)
-target_include_directories(sinfer_engine PRIVATE ${CMAKE_SOURCE_DIR}/src
-                                                 ${CMAKE_SOURCE_DIR}/src/tokenizer
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer/tokenizer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer/tok_profile.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer/unicode.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer
                                                  ${minja_SOURCE_DIR}/include
                                                  ${fmt_SOURCE_DIR}/include)
 target_compile_definitions(sinfer_engine PRIVATE FMT_HEADER_ONLY=1)
@@ -1484,7 +1484,7 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
         # from _surogate (arch gating + payload + lifecycle isolation).
         if(PYTHON_BINDING)
             nanobind_add_module(_surogate_serve NOSTRIP
-                ${CMAKE_SOURCE_DIR}/src/binding/py_serve.cpp)
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/binding/py_serve.cpp)
             target_include_directories(_surogate_serve PRIVATE
                 ${SERVE_ROOT} ${SINFER_JSON_INCLUDE})
             target_link_libraries(_surogate_serve PRIVATE
