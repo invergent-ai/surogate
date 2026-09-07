@@ -84,6 +84,9 @@ class ObservedScope:
 
     quantised: frozenset[str] = frozenset()
     plain: frozenset[str] = frozenset()
+    #: The quantised modules whose codes are packed (`weight_packed`: NVFP4), as against the
+    #: ones that keep a full-width weight beside a scale (FP8 and its kin).
+    packed: frozenset[str] = frozenset()
 
     @property
     def modules(self) -> frozenset[str]:
@@ -95,7 +98,21 @@ class ObservedScope:
         This is what replaces a hand-measured table of exception layers: the same question,
         asked of the file rather than of a note about the file.
         """
-        source = self.quantised if quantised else self.plain
+        return self.layers_of_kind(suffix, "quantised" if quantised else "plain")
+
+    def layers_of_kind(self, suffix: str, kind: str) -> tuple[int, ...]:
+        """As `layers_of`, by kind: "plain" (a bare weight), "packed" (NVFP4 codes),
+        "scaled" (quantised but not packed: FP8 and its kin), or "quantised" (either)."""
+        if kind == "plain":
+            source = self.plain
+        elif kind == "packed":
+            source = self.packed
+        elif kind == "scaled":
+            source = self.quantised - self.packed
+        elif kind == "quantised":
+            source = self.quantised
+        else:
+            raise ValueError(f"unknown module kind {kind!r}")
         out = set()
         for module in source:
             match = _TEXT_LAYER.match(module)
@@ -208,15 +225,18 @@ def observed_scope(names: Iterable[str]) -> ObservedScope:
     """
     quantised: set[str] = set()
     plain: set[str] = set()
+    packed: set[str] = set()
     for name in names:
         for suffix in _QUANTISED_SUFFIXES:
             if name.endswith("." + suffix):
                 quantised.add(name[: -len(suffix) - 1])
+                if suffix == "weight_packed":
+                    packed.add(name[: -len(suffix) - 1])
                 break
         else:
             if name.endswith(".weight"):
                 plain.add(name[: -len(".weight")])
-    return ObservedScope(frozenset(quantised), frozenset(plain - quantised))
+    return ObservedScope(frozenset(quantised), frozenset(plain - quantised), frozenset(packed))
 
 
 def disagreement(declared: DeclaredScope, observed: ObservedScope) -> ScopeDisagreement:

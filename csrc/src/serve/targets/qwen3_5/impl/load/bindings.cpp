@@ -723,18 +723,25 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         const artifact::TensorPlacement vision_placement =
             features.vision ? artifact::TensorPlacement::Device
                             : artifact::TensorPlacement::ValidateOnly;
-        out.vision_backbone =
-            family::bind_vision_backbone<VisionConfig>(binder, vision_placement);
-        out.vision_merger_input =
-            family::bind_vision_merger_input<VisionConfig>(binder, vision_placement);
-        out.vision_merger_fc2 = artifact::bind_tensor(
+        // The tower is per-checkpoint the way the text stack is: the 0.8B ships 12 layers
+        // of 768, the 2B and 4B 24 of 1024, the 27B 27 of 1152. The compiled config is one
+        // of those; the artifact's `vision_geometry` member states the checkpoint's own,
+        // and the merger always projects into the text width bound above.
+        out.vision_geometry = family::VisionGeometry::declared<VisionConfig>(
+            binder.reader().vision_geometry());
+        out.vision_geometry.output_hidden = g.hidden;
+        const family::VisionGeometry& vg  = out.vision_geometry;
+        out.vision_backbone     = family::bind_vision_backbone(binder, vision_placement, vg);
+        out.vision_merger_input = family::bind_vision_merger_input(binder, vision_placement, vg);
+        out.vision_merger_fc2   = artifact::bind_tensor(
             binder, "vision/merger/fc2", NumericFormat::W8G32_F16S,
-            {VisionConfig::output_hidden, VisionConfig::merger_hidden}, vision_placement);
-        out.vision_merger_fc2_bias =
-            artifact::bind_tensor(binder, "vision/merger/fc2_bias", NumericFormat::BF16,
-                                  {VisionConfig::output_hidden}, vision_placement);
-        out.vision_merger_norm =
-            family::bind_vision_merger_norm<VisionConfig>(binder, vision_placement);
+            {static_cast<std::uint64_t>(vg.output_hidden),
+             static_cast<std::uint64_t>(vg.merger_hidden())},
+            vision_placement);
+        out.vision_merger_fc2_bias = artifact::bind_tensor(
+            binder, "vision/merger/fc2_bias", NumericFormat::BF16,
+            {static_cast<std::uint64_t>(vg.output_hidden)}, vision_placement);
+        out.vision_merger_norm = family::bind_vision_merger_norm(binder, vision_placement, vg);
     }
 
     load_plan.materialization = binder.finish();
@@ -855,15 +862,16 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 
     if (plan.features.vision && plan.has_vision) {
-        auto& vision  = runtime.vision.emplace();
-        vision.common = family::materialize_vision_common<VisionConfig>(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
+        const family::VisionGeometry& vg = plan.vision_geometry;
+        runtime.vision_geometry          = vg;
+        auto& vision                     = runtime.vision.emplace();
+        vision.common = family::materialize_vision_common(
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm, vg);
         vision.merger_fc2 = artifact::materialized_weight(
-            backing, plan.vision_merger_fc2, NumericFormat::W8G32_F16S,
-            VisionConfig::output_hidden, VisionConfig::merger_hidden);
+            backing, plan.vision_merger_fc2, NumericFormat::W8G32_F16S, vg.output_hidden,
+            vg.merger_hidden());
         vision.merger_fc2_bias = artifact::materialized_tensor(
-            backing, plan.vision_merger_fc2_bias, NumericFormat::BF16,
-            {VisionConfig::output_hidden});
+            backing, plan.vision_merger_fc2_bias, NumericFormat::BF16, {vg.output_hidden});
     }
 }
 

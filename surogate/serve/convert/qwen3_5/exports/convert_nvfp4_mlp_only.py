@@ -66,6 +66,8 @@ class ConversionPreflight:
     official_dir: Path
     quantized_dir: Path
     config_summary: dict[str, object]
+    #: The official checkpoint's config, which states the geometry the artifact declares.
+    config: dict[str, object]
     official_source: family_recipe.SourcePreflight
     quantized_source: family_recipe.SourcePreflight
     resources: tuple[family_conversion.ResourcePayload, ...]
@@ -75,7 +77,7 @@ class ConversionPreflight:
 
 def _tools_root() -> Path:
     """`serve/tools/`, which holds the fixtures a conversion reads (the draft-head ranking)."""
-    return Path(__file__).resolve().parents[2] / "tools"
+    return Path(__file__).resolve().parents[3] / "tools"
 
 
 def _validate_index(model_dir: Path) -> None:
@@ -235,7 +237,7 @@ def preflight_conversion(
     with ShardReader(quantized) as quantized_reader:
         quantized_source = recipe.preflight_quantized_metadata(quantized_reader)
 
-    resources = family_convert.load_resources(official)
+    resources = family_convert.load_resources(official, GEOMETRY)
     resource_map = {resource.name: resource.data for resource in resources}
     object_plan = build_object_plan(resource_map)
     ranking = _tools_root() / draft_head.DEFAULT_RANKING
@@ -244,6 +246,7 @@ def preflight_conversion(
         official_dir=official,
         quantized_dir=quantized,
         config_summary=official_summary,
+        config=official_config,
         official_source=official_source,
         quantized_source=quantized_source,
         resources=resources,
@@ -392,6 +395,10 @@ def convert(
             output,
             ArtifactIdentity(EXPORT.MODEL_ID, EXPORT.WEIGHTS_ID),
             preflight.object_plan.specs,
+            geometry=family_convert.geometry_block(preflight.config),
+            vision_geometry=(family_convert.vision_geometry_block(preflight.config)
+                             if family_convert.carries_vision(preflight.object_plan.specs)
+                             else None),
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError(

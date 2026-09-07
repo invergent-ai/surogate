@@ -150,6 +150,9 @@ struct BindingPlan {
     bool has_mtp = false;
     MtpPlan mtp;
 
+    /// The tower the vision objects were bound against: the compiled tower with the
+    /// artifact's `vision_geometry` laid over it, projecting into the text width above.
+    family::VisionGeometry vision_geometry;
     family::VisionBackbonePlanFor<VisionConfig> vision_backbone;
     family::VisionMergerInputPlan vision_merger_input;
     artifact::ObjectHandle vision_merger_fc2;

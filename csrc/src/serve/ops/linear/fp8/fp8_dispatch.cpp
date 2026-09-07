@@ -94,6 +94,10 @@ bool interval_uses_a8(Fp8Problem problem, LinearPolicy policy, std::int32_t min_
 
 } // namespace
 
+bool fp8_linear_serves(std::int32_t output_rows, std::int32_t input_rows) noexcept {
+    return is_fp8_linear_problem(output_rows, input_rows);
+}
+
 std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                                 LinearPolicy policy, std::int32_t min_tokens,
                                                 std::int32_t max_tokens) {

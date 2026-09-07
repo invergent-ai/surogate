@@ -29,6 +29,14 @@ struct Variant {
     using VisionWeights                  = family::VisionWeightsFor<detail::VisionConfig>;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
+    /// The ordinary decode graphs of the native GGUF route need ~18 MiB a lane on the 27B
+    /// (1.16 GiB for 64 lanes, measured 2026-09-07), where the family's default is 12; every
+    /// other profile's fit the default (the all-NVFP4 27B: 1.3 GiB for 128 lanes), and on a
+    /// 27B card the difference is KV (24 MiB x 128 lanes reserved 3 GiB and cost ~100k tokens).
+    [[nodiscard]] static constexpr std::size_t
+    ordinary_graph_allowance_per_lane_bytes(WeightsProfile profile) {
+        return (profile == WeightsProfile::GroupwiseInt ? 24ULL : 12ULL) * 1024ULL * 1024ULL;
+    }
     static constexpr float attention_scale                     = kAttentionScale;
     static constexpr float gdn_scale                           = kGdnScale;
     static constexpr std::uint32_t prefill_chunk_alignment     = kPrefillChunkAlignment;

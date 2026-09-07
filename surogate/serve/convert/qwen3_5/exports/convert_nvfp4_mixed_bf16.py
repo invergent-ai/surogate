@@ -57,6 +57,8 @@ class ConversionPreflight:
     base_dir: Path
     nvfp4_dir: Path
     config_summary: dict[str, object]
+    #: The base checkpoint's config, which states the geometry the artifact declares.
+    config: dict[str, object]
     base_source: family_recipe.SourcePreflight
     nvfp4_dtype_counts: dict[str, int]
     resources: tuple[family_conversion.ResourcePayload, ...]
@@ -66,7 +68,7 @@ class ConversionPreflight:
 
 def _tools_root() -> Path:
     """`serve/tools/`, which holds the fixtures a conversion reads (the draft-head ranking)."""
-    return Path(__file__).resolve().parents[2] / "tools"
+    return Path(__file__).resolve().parents[3] / "tools"
 
 
 def _validate_index(model_dir: Path) -> None:
@@ -189,9 +191,8 @@ def preflight_conversion(
     nvfp4 = Path(nvfp4_model_dir)
     _validate_index(base)
     _validate_index(nvfp4)
-    base_summary = family_convert.validate_config(
-        family_conversion.load_json(base / "config.json")
-    )
+    base_config = family_conversion.load_json(base / "config.json")
+    base_summary = family_convert.validate_config(base_config)
     nvfp4_summary = _validate_nvfp4_config(
         family_conversion.load_json(nvfp4 / "config.json")
     )
@@ -216,6 +217,7 @@ def preflight_conversion(
         base_dir=base,
         nvfp4_dir=nvfp4,
         config_summary=base_summary,
+        config=base_config,
         base_source=base_source,
         nvfp4_dtype_counts=nvfp4_dtype_counts,
         resources=resources,
@@ -381,6 +383,10 @@ def convert(
             output,
             ArtifactIdentity(EXPORT.MODEL_ID, EXPORT.WEIGHTS_ID),
             preflight.object_plan.specs,
+            geometry=family_convert.geometry_block(preflight.config),
+            vision_geometry=(family_convert.vision_geometry_block(preflight.config)
+                             if family_convert.carries_vision(preflight.object_plan.specs)
+                             else None),
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError(

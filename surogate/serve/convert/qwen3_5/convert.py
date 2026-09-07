@@ -332,6 +332,43 @@ def load_resources(model_dir: str | Path,
     return family_conversion.load_resources(model_dir, inventory.RESOURCE_SPECS)
 
 
+def vision_geometry_block(config: Mapping[str, object]) -> dict[str, float] | None:
+    """The artifact's `vision_geometry` member: the tower's dimensions, keyed the way the
+    engine's `VisionGeometry` names them.
+
+    The tower is per-checkpoint the way the text stack is (the 0.8B ships 12 layers of 768,
+    the 2B and 4B 24 of 1024, the 27B 27 of 1152) and the target compiles one of them; an
+    artifact that leaves this unstated binds its tower against that one. `None` for a
+    text-only checkpoint. RoPE theta and the norm epsilon are not in the checkpoint's vision
+    config and stay the compiled values, which every tower of the family shares.
+    """
+    vision = config.get("vision_config")
+    if vision is None:
+        return None
+    hidden = int(vision["hidden_size"])
+    heads = int(vision["num_heads"])
+    patch_dim = (int(vision["in_channels"]) * int(vision["temporal_patch_size"])
+                 * int(vision["patch_size"]) * int(vision["patch_size"]))
+    return {
+        "layers": int(vision["depth"]),
+        "hidden": hidden,
+        "intermediate": int(vision["intermediate_size"]),
+        "heads": heads,
+        "patch_dim": patch_dim,
+        "merge": int(vision["spatial_merge_size"]),
+        "position_embeddings": int(vision["num_position_embeddings"]),
+        # Every tower shipped so far rotates the whole head.
+        "rotary_dim": hidden // heads,
+        "output_hidden": int(vision["out_hidden_size"]),
+    }
+
+
+def carries_vision(object_specs) -> bool:
+    """Whether an object plan holds the tower, so the artifact declares its geometry only
+    when there is one to bind."""
+    return any(spec.name.startswith("vision/") for spec in object_specs)
+
+
 def _load_pinned_resources(model_dir: str | Path,
                            expected: Mapping[str, str]) -> tuple[ResourcePayload, ...]:
     """Load exactly the pinned frontend of one generation, refusing any substitution."""
@@ -661,6 +698,8 @@ def convert(
             ArtifactIdentity(inventory.model_id_for(geometry), inventory.WEIGHTS_ID),
             preflight.object_plan.specs,
             geometry=geometry_block(preflight.config),
+            vision_geometry=(vision_geometry_block(preflight.config)
+                             if carries_vision(preflight.object_plan.specs) else None),
             external=external,
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
@@ -834,7 +873,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     _export = inventory.export_for(profile, inventory.geometry_from_config(_config))
     if _export.exceptions:
         from surogate.serve.convert.common import quant_scope as _qs
-        _observed = _qs.observed_scope(family_conversion.checkpoint_tensor_names(_model))
+        # The table describes the quantised release; a two-role profile names it separately
+        # from the unquantised base, and scanning the base read every MLP as an exception.
+        _quantized = Path(args.quantized_model) if args.quantized_model else _model
+        _observed = _qs.observed_scope(family_conversion.checkpoint_tensor_names(_quantized))
         _differ = inventory.exception_disagreement(_export, _observed)
         if _differ:
             _detail = "; ".join(

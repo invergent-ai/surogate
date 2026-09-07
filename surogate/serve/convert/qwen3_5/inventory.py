@@ -388,13 +388,20 @@ def exception_disagreement(export: "Export", observed) -> dict[str, tuple[tuple[
     Returns {role: (declared_by_the_table, found_in_the_file)} for the roles that differ.
     """
     out: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
-    for role, (_width, layers) in export.exceptions.items():
+    for role, (width, layers) in export.exceptions.items():
         modules = _ROLE_MODULES.get(role)
         if modules is None:
             continue
+        # What an exception layer looks like in the file follows the width the table gives
+        # it: NVFP4 codes are packed, FP8 keeps a full-width weight beside its scale (the
+        # scanner files both under "quantised"), and anything else is a bare weight. The
+        # check used to look among the bare weights whatever the width, so an FP8 exception
+        # was never found and every such table was refused.
+        lowered = str(width).lower()
+        kind = "packed" if "nvfp4" in lowered else "scaled" if "fp8" in lowered else "plain"
         found: set[int] = set()
         for module in modules:
-            found.update(observed.layers_of(module, quantised=False))
+            found.update(observed.layers_of_kind(module, kind))
         if tuple(sorted(found)) != tuple(sorted(layers)):
             out[role] = (tuple(sorted(layers)), tuple(sorted(found)))
     return out

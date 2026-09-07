@@ -857,7 +857,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes =
-                checked_mul(ordinary_graph_allowance_per_lane_bytes<Variant>(),
+                checked_mul(ordinary_graph_allowance_per_lane_bytes<Variant>(impl->weights_profile),
                             impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);

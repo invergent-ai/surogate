@@ -180,6 +180,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         return detail::nvfp4_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                              min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16S:
+        // As for W8: a shape the route's table does not serve takes no workspace from it. The
+        // profile is sized for what it binds, and a plan also asks for shapes it may never run
+        // -- an adapter's split of a fused gate/up parent projects the halves on their own,
+        // and the table holds the parent, not the half. Such a weight is refused where it runs.
+        if (!detail::fp8_linear_serves(output_rows, input_rows)) { return 0; }
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
     case QType::FP8_E4M3FN_BLK128_F32S:

@@ -245,10 +245,15 @@ inline void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stre
 }
 
 /// Device memory reserved per decode lane for the ordinary (non-speculative) CUDA graphs:
-/// the family's 12 MiB unless the variant declares a larger footprint.
+/// the family's 12 MiB unless the variant declares a larger footprint -- as a constant, or as
+/// a function of the weights profile, since the graphs of one route (the native GGUF
+/// K-quants) are not the graphs of another and the allowance is KV the other would have had.
 template <class Variant>
-[[nodiscard]] constexpr std::size_t ordinary_graph_allowance_per_lane_bytes() {
-    if constexpr (requires { Variant::ordinary_graph_allowance_per_lane_bytes; }) {
+[[nodiscard]] constexpr std::size_t
+ordinary_graph_allowance_per_lane_bytes(typename Variant::WeightsProfile profile) {
+    if constexpr (requires { Variant::ordinary_graph_allowance_per_lane_bytes(profile); }) {
+        return Variant::ordinary_graph_allowance_per_lane_bytes(profile);
+    } else if constexpr (requires { Variant::ordinary_graph_allowance_per_lane_bytes; }) {
         return Variant::ordinary_graph_allowance_per_lane_bytes;
     } else {
         return 12ULL * 1024ULL * 1024ULL;

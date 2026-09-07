@@ -27,6 +27,7 @@ from . import fp8_embedding
 from . import recipe_nvfp4_mlp_only as mixed_recipe
 from . import recipe_nvfp4_all as recipe
 
+from .. import convert as family_convert
 from .. import inventory as family_inventory
 from .. import draft_head
 
@@ -52,7 +53,7 @@ class ConversionPreflight:
 
 def _tools_root() -> Path:
     # As in convert_nvfp4: DEFAULT_RANKING is relative to surogate/serve/tools.
-    return Path(__file__).resolve().parents[2] / "tools"
+    return Path(__file__).resolve().parents[3] / "tools"
 
 
 def _resources_from_artifact(path: Path) -> tuple:
@@ -125,11 +126,16 @@ def convert(
             draft_head.materialize_draft_head_token_ids(preflight.draft)
         )
     }
+    source_config = family_conversion.load_json(preflight.model_dir / "config.json")
     with ShardReader(preflight.model_dir) as reader:
         with ArtifactWriter(
             output,
             ArtifactIdentity(EXPORT.MODEL_ID, EXPORT.WEIGHTS_ID),
             preflight.object_plan.specs,
+            geometry=family_convert.geometry_block(source_config),
+            vision_geometry=(family_convert.vision_geometry_block(source_config)
+                             if family_convert.carries_vision(preflight.object_plan.specs)
+                             else None),
         ) as writer:
             for index, spec in enumerate(EXPORT.OBJECT_SPECS, start=1):
                 payload: bytes | Iterable[bytes]
