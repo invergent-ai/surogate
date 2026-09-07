@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -204,6 +205,14 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                       options.pipeline_stage_first, options.pipeline_stage_last,
                                       options.host_moe_layers, options.gpu_layers, planes,
                                       options.load_progress);
+    // What the pool will insist on, for a stage planner deciding how much to offload; zero
+    // where nothing is banked, and set on every plan so a candidate never inherits the last.
+    family::ExpertCache::configure_pool_floor(
+        banks_experts(options)
+            ? family::ExpertCache::pool_floor_bytes(ops::kSparseMoeGlm53Geometry,
+                                                    detail::TextConfig::layers + 1,
+                                                    options.expert_slots)
+            : 0);
     if (banks_experts(options)) {
         // What the runtime will derive from the resident weights once they are on the device,
         // and the weights themselves, which at pool-sizing time are still in the artifact: an
@@ -265,6 +274,22 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                 std::max(planner.capacity_curve().minimum_device_reservation_bytes +
                              options.kv_capacity.automatic_headroom_bytes,
                          family::ExpertCache::load_staging());
+            if (std::getenv("SUROGATE_SERVE_PIPELINE_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                             "pipeline-trace: device %d pool floor %.2f GiB = derived+weights "
+                             "%.2f + max(KV minimum %.2f + headroom %.2f, load staging %.2f)\n",
+                             device.device,
+                             static_cast<double>(runtime_floor) / (1024.0 * 1024.0 * 1024.0),
+                             static_cast<double>(family::ExpertCache::derived_reserve()) /
+                                 (1024.0 * 1024.0 * 1024.0),
+                             static_cast<double>(
+                                 planner.capacity_curve().minimum_device_reservation_bytes) /
+                                 (1024.0 * 1024.0 * 1024.0),
+                             static_cast<double>(options.kv_capacity.automatic_headroom_bytes) /
+                                 (1024.0 * 1024.0 * 1024.0),
+                             static_cast<double>(family::ExpertCache::load_staging()) /
+                                 (1024.0 * 1024.0 * 1024.0));
+            }
             family::ExpertCache::configure(options, runtime_floor, detail::TextConfig::experts);
             (void)family::ExpertCache::for_current_device(
                 ops::kSparseMoeGlm53Geometry, geometry.layers + geometry.mtp_layers);

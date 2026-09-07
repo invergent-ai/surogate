@@ -106,6 +106,14 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         targets::projected_derived_residency_bytes(binder, plan.materialization,
                                                        Package::linear_policy) +
         static_cast<std::size_t>(plan.materialization.device_capacity_bytes));
+    // What the pool will insist on where experts are banked, for a stage planner deciding how
+    // much to offload; zero otherwise, set on every plan.
+    family::ExpertCache::configure_pool_floor(
+        options.host_moe_layers != 0 || options.gpu_layers != 0
+            ? family::ExpertCache::pool_floor_bytes(ops::kSparseMoeFlashNextGeometry,
+                                                    detail::TextConfig::expert_layers,
+                                                    options.expert_slots)
+            : 0);
     // ...and what the load holds only while it runs, which is the pool's other neighbour.
     family::ExpertCache::configure_load_staging(
         targets::projected_load_staging_bytes(binder, plan.materialization));

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <optional>
 #include <api/family/text_geometry.h>
+#include "family/impl/moe/expert_cache.h"
 
 #include "targets/registry.h"
 
@@ -16,6 +17,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <limits>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -512,6 +514,10 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
         runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
         projected_derived_residency_bytes(binder, plan.materialization(),
                                           target_linear_policy<Target>()));
+    // A stage that banks experts needs a pool beside its KV, and the pool sizes itself from
+    // what the weights and the runtime leave: a fit that ignored it offloaded one layer,
+    // fit the KV exactly, and left the bank a pool of nothing (which a Q4 bank refuses).
+    fit.budget_bytes = subtract_saturating(fit.budget_bytes, family::ExpertCache::pool_floor());
     if (max_context == 0) { return fit; }
     EngineOptions sized = stage;
     sized.max_context   = max_context;
@@ -561,19 +567,42 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
     // uneven split is most of them, and is the whole point: a layer moved off a card that had
     // room costs PCIe on every token it serves and buys nothing.
     const bool automatic = options.host_moe_layers == EngineOptions::kHostMoeLayersAuto;
-    const std::uint64_t wanted = static_cast<std::uint64_t>(options.max_concurrency) *
-                                 static_cast<std::uint64_t>(out.max_context);
+    // What a stage must hold: every lane at the ceiling under an automatic KV capacity, and
+    // under an explicit one exactly that -- an explicit capacity never resolves to more, so
+    // measuring it against the product offloaded every mixture layer of every stage.
+    const std::uint64_t wanted = std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(options.max_concurrency) *
+            static_cast<std::uint64_t>(out.max_context),
+        options.kv_capacity.mode == KvCapacityMode::Explicit
+            ? static_cast<std::uint64_t>(options.kv_capacity.explicit_tokens)
+            : std::numeric_limits<std::uint64_t>::max());
     for (std::size_t s = 0; s < count; ++s) {
         DeviceContext probe(stage_options[s].device);
         EngineOptions stage = stage_options[s];
         if (automatic) { stage.host_moe_layers = 0; }
         // A stage that cannot hold even the minimum pool does not return a small number, it
         // refuses -- which under `auto` is one more reason to offload a layer, not an error.
+        static const bool trace = std::getenv("SUROGATE_SERVE_PIPELINE_TRACE") != nullptr;
         const auto fit_or_zero = [&](const EngineOptions& candidate) {
             try {
-                return stage_fit<Target>(reader, candidate, weights_profile, geometry, probe,
-                                         out.max_context);
-            } catch (const std::invalid_argument&) {
+                const StageFit fit = stage_fit<Target>(reader, candidate, weights_profile,
+                                                       geometry, probe, out.max_context);
+                if (trace) {
+                    std::fprintf(stderr,
+                                 "pipeline-trace: stage %zu host_moe_layers=%u fits: budget %.2f "
+                                 "GiB after weights, %u KV tokens (%.2f GiB free now)\n",
+                                 s, candidate.host_moe_layers,
+                                 static_cast<double>(fit.budget_bytes) / (1024.0 * 1024.0 * 1024.0),
+                                 fit.kv_tokens,
+                                 static_cast<double>(current_free_device_bytes()) /
+                                     (1024.0 * 1024.0 * 1024.0));
+                }
+                return fit;
+            } catch (const std::invalid_argument& error) {
+                if (trace) {
+                    std::fprintf(stderr, "pipeline-trace: stage %zu host_moe_layers=%u refused: %s\n",
+                                 s, candidate.host_moe_layers, error.what());
+                }
                 return StageFit{};
             }
         };

@@ -296,6 +296,15 @@ std::unordered_map<int, std::size_t>& configured_runtime_floor() {
     static std::unordered_map<int, std::size_t> floors;
     return floors;
 }
+std::unordered_map<int, std::size_t>& configured_pool_floor() {
+    static std::unordered_map<int, std::size_t> floors;
+    return floors;
+}
+/// Two GiB, not one: the floor's largest term is a projection of the load's staging that is
+/// exact for the arena and blind to the allocator's granularity, the input maps and whatever
+/// else the load carves; on GLM's card one GiB left a pool that fit the weights by a few
+/// hundred MiB and refused a 2,048-token chunk.
+constexpr std::size_t kPoolMarginBytes = std::size_t{2} << 30;
 std::unordered_map<int, std::uint32_t>& configured_cpu_min_tokens() {
     static std::unordered_map<int, std::uint32_t> configured;
     return configured;
@@ -1214,11 +1223,7 @@ struct ExpertCache::Impl {
                 it != configured_runtime_floor().end()) {
                 floor = it->second;
             }
-            // Two GiB, not one: the floor's largest term is a projection of the load's
-            // staging that is exact for the arena and blind to the allocator's granularity,
-            // the input maps and whatever else the load carves; on GLM's card one GiB left a
-            // pool that fit the weights by a few hundred MiB and refused a 2,048-token chunk.
-            constexpr std::size_t kMargin = std::size_t{2} << 30;
+            constexpr std::size_t kMargin = kPoolMarginBytes;
             const std::size_t after_floor = free > floor + kMargin ? free - floor - kMargin : 0;
             const std::size_t budget      = std::min(free / 2, after_floor);
             const auto whole_model =
@@ -1498,6 +1503,14 @@ ExpertCache& ExpertCache::for_current_device(const ops::SparseMoeGeometry& geome
     for (const Entry& entry : registry) {
         if (entry.device == device && entry.cache->impl_->geometry == geometry &&
             entry.cache->impl_->layers == layers) {
+            // A cache that could not size its pool is not a verdict for the device's life: a
+            // pipeline preflight asks for it once per candidate placement, and the first
+            // candidate is the one that leaves the least room. Nothing was allocated on that
+            // path, so the derivation runs again against whatever floor is configured now.
+            if (!entry.cache->impl_->enabled) {
+                std::lock_guard<std::mutex> config(config_mutex());
+                entry.cache->impl_->create(device);
+            }
             return *entry.cache;
         }
     }
@@ -1558,6 +1571,33 @@ std::size_t ExpertCache::derived_reserve() {
     std::lock_guard<std::mutex> lock(config_mutex());
     const auto it = configured_derived_reserve().find(device);
     return it == configured_derived_reserve().end() ? 0 : it->second;
+}
+
+void ExpertCache::configure_pool_floor(std::size_t bytes) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(config_mutex());
+    configured_pool_floor()[device] = bytes;
+}
+
+std::size_t ExpertCache::pool_floor() {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(config_mutex());
+    const auto it = configured_pool_floor().find(device);
+    return it == configured_pool_floor().end() ? 0 : it->second;
+}
+
+std::size_t ExpertCache::pool_floor_bytes(const ops::SparseMoeGeometry& geometry,
+                                          std::int32_t layers, std::uint32_t requested_slots) {
+    // The derivation below never settles under one layer's experts, and an explicit request
+    // is honoured as given: the larger of the two is what the placement must leave.
+    const std::int32_t slots =
+        std::max(static_cast<std::int32_t>(std::min<std::uint32_t>(requested_slots, 1U << 30)),
+                 geometry.experts);
+    return ops::expert_slot_pool_bytes(geometry, slots) +
+           ops::expert_slot_directory_bytes(layers, geometry.experts, slots) +
+           ops::expert_miss_list_bytes(geometry.experts) + kPoolMarginBytes;
 }
 
 void ExpertCache::configure_load_staging(std::size_t bytes) {
