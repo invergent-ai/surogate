@@ -74,17 +74,27 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
             "not carry; put the model's mtp-*.gguf beside the shards (or under MTP/) and convert "
             "again");
     }
-    // The Q4 bank is the default. It halves the bytes every miss moves over PCIe and through
-    // host DRAM against the W8 planes, and on the board's single-card shape that is 27.3
-    // against 20.2 tok/s (2026-09-04, GGUF-native artifact, GPU 0). --host-expert-bank w8
-    // keeps the 8-bit planes for a run that would rather spend the host RAM.
-    const bool bank_q4 = options.host_expert_bank != EngineOptions::HostExpertBank::W8;
-    if (bank_q4) {
-        std::fprintf(stderr, "qwen4exp: host expert bank Q4G32AM (59 %% of the W8 bytes; "
-                             "requantised while loading; --host-expert-bank w8 restores W8)\n");
-    }
+    // A narrow bank is what this target's single-card rows live on: it halves the bytes every
+    // miss moves over PCIe and through host DRAM against W8 planes, and that was 27.3 against
+    // 20.2 tok/s (2026-09-04, GGUF-native artifact, GPU 0). Which planes is per object by
+    // default: Q4G32AM where the file stores a half 4-bit affine (this checkpoint's gate and
+    // up experts, Q4_K -- an exact repack), W8 where it is wider (its down experts, Q5_1 and
+    // Q8_0, which a Q4 bank would requantise to four bits). `--host-expert-bank q4` asks for
+    // four bits throughout and `w8` for eight.
+    const family::BankPlanes planes =
+        options.host_expert_bank == EngineOptions::HostExpertBank::Q4   ? family::BankPlanes::Q4
+        : options.host_expert_bank == EngineOptions::HostExpertBank::W8 ? family::BankPlanes::W8
+                                                                        : family::BankPlanes::Auto;
+    std::fprintf(stderr, "qwen4exp: host expert bank %s\n",
+                 planes == family::BankPlanes::Q4
+                     ? "Q4G32AM planes throughout (a requantisation for any half the file "
+                       "stores wider than four bits)"
+                 : planes == family::BankPlanes::W8
+                     ? "W8 planes throughout"
+                     : "Q4G32AM planes for the 4-bit halves, W8 for the wider ones "
+                       "(--host-expert-bank w8|q4 forces one)");
     auto plan = detail::bind_artifact(binder, features, options.pipeline_stage_first,
-                                      options.pipeline_stage_last, bank_q4, options.load_progress);
+                                      options.pipeline_stage_last, planes, options.load_progress);
     // What the runtime will derive from the resident weights once they are on the device: the
     // registry subtracts it from free memory before it resolves the KV capacity, so a pool that
     // sizes itself before that point has to leave it as well.

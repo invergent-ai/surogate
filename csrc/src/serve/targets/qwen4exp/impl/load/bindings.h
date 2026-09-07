@@ -44,13 +44,6 @@ inline constexpr std::size_t kTextLayers          = TextConfig::layers;
 inline constexpr std::size_t kFullAttentionLayers = TextConfig::full_attention_layers();
 inline constexpr std::size_t kGdnLayers           = TextConfig::gdn_layers();
 
-/// How the pinned expert bank holds the routed experts.
-enum class HostBankMode : std::uint8_t {
-    Native,   ///< the artifact's own bytes: W8 planes from a converted one, blocks from a GGUF
-    DecodeW8, ///< a GGUF's blocks decoded into W8 planes on the way into pinned memory
-    Q4,       ///< W8 planes requantised to Q4G32AM on the way in
-};
-
 struct HyperConnectionPlan {
     artifact::ObjectHandle norm;
     artifact::ObjectHandle down;
@@ -62,10 +55,16 @@ struct MoePlan {
     artifact::ObjectHandle router_shared_gate;
     artifact::ObjectHandle routed_gate_up; ///< host resident
     artifact::ObjectHandle routed_down;    ///< host resident
-    /// What the artifact says those two hold. A GGUF-native artifact stores the file's own
-    /// GGML blocks; a converted one stores W8 row-split planes.
+    /// What the bank will present for those two. A GGUF-native artifact stores the file's own
+    /// GGML blocks, and the bank either keeps them or decodes them into planes; a converted one
+    /// stores W8 row-split planes already.
     artifact::NumericFormat routed_gate_up_format = artifact::NumericFormat::W8G32_F16S;
     artifact::NumericFormat routed_down_format    = artifact::NumericFormat::W8G32_F16S;
+    /// Which half the bank holds as Q4G32AM planes. Independent, because the two halves of a
+    /// K_XL mixture are routinely stored at different widths and only a 4-bit affine source
+    /// reaches Q4G32AM without loss (`family::BankPlanes`).
+    bool routed_gate_up_q4 = false;
+    bool routed_down_q4    = false;
     artifact::ObjectHandle shared_gate_up;
     artifact::ObjectHandle shared_down;
 };
@@ -141,7 +140,6 @@ struct BindingPlan {
     family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
-    bool host_bank_q4 = false; // the routed expert objects are requantised to Q4G32AM
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
     HyperConnectionPlan output_mix;
@@ -176,7 +174,8 @@ struct ArtifactLoadPlan {
 /// pipeline stage.
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
                                int stage_first = 0, int stage_last = 0,
-                               bool host_bank_q4 = false, LoadProgress progress = {});
+                               family::BankPlanes bank_planes = family::BankPlanes::Auto,
+                               LoadProgress progress = {});
 
 /// Per-block hyper-connection weights ride on the projection payloads the family hands to the
 /// Variant at the norm hooks, so the Variant can mix before its projection.
@@ -207,7 +206,10 @@ struct GdnProjectionPayload {
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
     ops::HyperConnectionWeights mix;
-    bool host_bank_q4  = false; // the routed objects are Q4G32AM (slot cache required)
+    /// Which routed halves are Q4G32AM planes: such a Weight is a base pointer and a shape,
+    /// readable by the expert cache alone (the slot cache is then required).
+    bool host_gate_up_q4 = false;
+    bool host_down_q4    = false;
     std::int32_t layer = -1; // text layer index (the expert slot cache keys its tables by it)
     // Host virtual addresses of the routed expert objects (the Weights above hold the
     // device-mapped aliases); the CPU expert compute reads the planes through these.

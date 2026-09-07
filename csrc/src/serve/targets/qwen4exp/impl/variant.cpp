@@ -282,8 +282,8 @@ void Variant::prepare_expert_split(const ModelView& model) {
         const SparseMoePayload& payload = gdn.post_mixer;
         if (payload.layer < 0 || payload.host_gate_up == nullptr) { continue; }
         cache.prepare_split(family::BankedMixture{payload.layer, TextConfig::expert_layers,
-                                                  &payload.op, payload.host_bank_q4,
-                                                  payload.host_bank_q4, payload.host_gate_up,
+                                                  &payload.op, payload.host_gate_up_q4,
+                                                  payload.host_down_q4, payload.host_gate_up,
                                                   payload.host_down});
         return;
     }
@@ -578,7 +578,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         // Routed experts come from the device slot pool, and the misses the split hands the
         // host come back as a partial the combine adds (family/impl/moe/expert_cache.h).
         cache.run(family::BankedMixture{weights.layer, TextConfig::expert_layers, &weights.op,
-                                        weights.host_bank_q4, weights.host_bank_q4,
+                                        weights.host_gate_up_q4, weights.host_down_q4,
                                         weights.host_gate_up, weights.host_down},
                   hidden, output, workspace, stream);
     } else {
