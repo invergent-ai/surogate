@@ -11,6 +11,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace sinfer::ops::detail {
@@ -180,8 +181,14 @@ bool nvfp4_cublaslt_route(std::int32_t tokens) {
 
 int nvfp4_cutlass_tile() {
     static const int tile = [] {
-        const int requested = env_int("SUROGATE_SERVE_NVFP4_CUTLASS", 0);
-        return requested == 128 ? 0 : requested == 256 ? 1 : -1;
+        const char* raw = std::getenv("SUROGATE_SERVE_NVFP4_CUTLASS");
+        if (raw == nullptr) { return -1; }
+        const std::string_view value(raw);
+        if (value == "128") { return 0; }
+        if (value == "256") { return 1; }
+        if (value == "256sk") { return 2; }
+        if (value == "128sk") { return 3; }
+        return -1;
     }();
     return tile;
 }

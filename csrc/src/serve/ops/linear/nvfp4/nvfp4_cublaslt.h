@@ -19,8 +19,8 @@ constexpr std::int32_t kNvfp4CublasLtDefaultMinTokens = 64;
 
 bool nvfp4_cublaslt_route(std::int32_t tokens);
 
-/// SUROGATE_SERVE_NVFP4_CUTLASS=128|256: the wide W4A4 GEMMs go to the CUTLASS SM120
-/// block-scaled kernel at that tile instead of cuBLASLt (-1 when unset: cuBLASLt).
+/// SUROGATE_SERVE_NVFP4_CUTLASS=128|256|256sk|128sk: the wide W4A4 GEMMs go to the CUTLASS SM120
+/// block-scaled kernel at that tile (sk: stream-K scheduler) instead of cuBLASLt; -1 unset.
 int nvfp4_cutlass_tile();
 
 // Create this device's handle and workspace now. The state is otherwise built on first use,

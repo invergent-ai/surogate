@@ -34,7 +34,8 @@ bool w4fp4_cutlass_gemm_store(const std::uint8_t* act_codes, const std::uint8_t*
 // The same GEMM for the engine's native NVFP4 route: alpha by value (the product of the
 // per-tensor divisors, so nothing is folded), both operands already in the atom layout, and
 // a tile choice -- 0 = 128x128x128, 1 = 256x128x128 (two consumer warpgroups over the
-// tokens, the shape vLLM's CUTLASS kernel runs on this card). `residual_bf16` null stores,
+// tokens), 2 = 256x128x128 with the stream-K scheduler (vLLM's kernel on this card, from
+// its name: tile, cooperative schedule, stream-K), 3 = 128x128x128 stream-K. `residual_bf16` null stores,
 // otherwise D = acc + residual in place. Returns false when the launch could not be
 // configured (caller falls back).
 bool nvfp4_cutlass_gemm(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
