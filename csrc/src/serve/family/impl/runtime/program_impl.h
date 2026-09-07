@@ -287,7 +287,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
       round_host(sizeof(TokenId) + sizeof(float)),
       ordinary_host(
-          plan.speculative_backend == SpeculativeBackend::None
+          plan.speculative_backend != SpeculativeBackend::DFlash
               ? std::make_optional<PinnedHostBuffer>(sizeof(family::OrdinaryDecodeIngress) +
                                                      sizeof(family::OrdinaryDecodeEgress))
               : std::nullopt),
@@ -370,7 +370,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (io.mtp_decode.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("MTP decode frame does not match the sequence plan");
     }
-    if (io.ordinary.has_value() != (speculative_backend == SpeculativeBackend::None)) {
+    if (io.ordinary.has_value() != (speculative_backend != SpeculativeBackend::DFlash)) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
     if (io.dflash_prefill.has_value() != (speculative_backend == SpeculativeBackend::DFlash)) {
@@ -2560,14 +2560,24 @@ std::string ProgramImplCore::last_mixed_round_description(std::size_t row) const
 }
 
 bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
-    if (speculative_backend != SpeculativeBackend::None || prefill_lane >= max_concurrency) {
+    if (speculative_backend == SpeculativeBackend::DFlash || prefill_lane >= max_concurrency) {
         return false;
     }
     const RequestControl& request = requests[prefill_lane];
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return false; }
     const RequestControl::Prefill& staged = *request.prefill;
-    return !staged.vision && !staged.prepare_mtp && staged.mtp_bridge == MtpBridgeMode::None &&
-           staged.cursor < staged.prompt_tokens && requests[prefill_lane].prefill->prompt.token_ids.size() != 0;
+    if (staged.vision || staged.mtp_bridge != MtpBridgeMode::None ||
+        staged.cursor >= staged.prompt_tokens || staged.prompt.token_ids.empty()) {
+        return false;
+    }
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        // Under the draft head a mixed round takes a prompt up to, never through, its last
+        // token: that column pairs with the token the prompt's final chunk samples, and the
+        // final chunk -- the lone step, as before -- pairs it, proposes, and hands the lane
+        // its first drafts.
+        return staged.prepare_mtp && staged.cursor + 1 < staged.prompt_tokens;
+    }
+    return !staged.prepare_mtp;
 }
 
 runtime::RoundHandle
@@ -2576,9 +2586,14 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                                        std::span<const runtime::RoundBudget> budgets) {
     // No decode lanes is allowed: the round is then a batched prefill step (pipeline stages
     // use it so a prompt's chunk is an asynchronous round like any other).
-    if (speculative_backend != SpeculativeBackend::None || budgets.size() != lanes.size() ||
-        prefill_lanes.empty() || prefill_lanes.size() > runtime::kMaximumMixedPrefills) {
-        throw std::invalid_argument("mixed round requires plain decode lanes and prefill lanes");
+    // Under the draft head the decode lanes run as a narrow round's do -- one column each,
+    // the head aligned on it, nothing proposed -- and the head is aligned over every prompt
+    // segment as well, so a prompt rides the decode rounds instead of running alone.
+    const bool head = speculative_backend == SpeculativeBackend::Mtp;
+    if (speculative_backend == SpeculativeBackend::DFlash || budgets.size() != lanes.size() ||
+        prefill_lanes.empty() || prefill_lanes.size() > runtime::kMaximumMixedPrefills ||
+        (head && (!io.mtp_decode || decoder->mtp_cache() == nullptr))) {
+        throw std::invalid_argument("mixed round requires plain or MTP decode lanes and prefill lanes");
     }
     for (std::size_t i = 0; i < prefill_lanes.size(); ++i) {
         const std::uint32_t lane = prefill_lanes[i];
@@ -2592,8 +2607,12 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             throw std::logic_error("mixed round requires active prefill lanes");
         }
         const RequestControl::Prefill& entry = *request.prefill;
-        if (entry.vision || entry.prepare_mtp || entry.cursor >= entry.prompt_tokens ||
-            entry.mtp_bridge != MtpBridgeMode::None) {
+        const SequenceState& staged_sequence = sequences[lane];
+        if (entry.vision || entry.prepare_mtp != head || entry.cursor >= entry.prompt_tokens ||
+            entry.mtp_bridge != MtpBridgeMode::None ||
+            (head && (entry.cursor + 1 >= entry.prompt_tokens || !staged_sequence.kv ||
+                      !staged_sequence.kv->backend ||
+                      staged_sequence.kv->backend->bound_row() < 0))) {
             throw std::logic_error("mixed round does not support this staged prefill");
         }
     }
@@ -2617,7 +2636,9 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         if (request.lifecycle != Lifecycle::Active ||
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
             sequence.kv->text.bound_row() < 0 || sequence.execution_frontier >= capacity ||
-            sequence.ledger_frontier != sequence.execution_frontier + 1) {
+            sequence.ledger_frontier != sequence.execution_frontier + 1 ||
+            (head && (!sequence.kv->backend || sequence.kv->backend->bound_row() < 0 ||
+                      sequence.mtp_kv_valid != sequence.execution_frontier))) {
             throw std::logic_error("mixed round row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -2654,7 +2675,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 std::fprintf(stderr, "lora-debug: row=%zu lane=%u slot=%d\n", row,
                              static_cast<unsigned>(sequence.lane), request.lora_slot);
             }
-            materialize_sequence_kv(sequence, frontier + 1, 0);
+            materialize_sequence_kv(sequence, frontier + 1, head ? frontier + 1 : 0);
         }
         // Mixed-round graphs (PATCHES.md #30) pad the decode batch to its
         // bucket by duplicating row 0: a pad column recomputes that lane's
@@ -2690,9 +2711,16 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
         std::uint32_t window_left = mixed_chunk_cap;
         std::size_t staged_count  = 0;
-        for (std::size_t i = 0; i < prefill_lanes.size() && window_left > 0; ++i) {
+        // A fixed-tail draft head aligns through the card's one per-sequence KV view, so under
+        // such a head a round takes one prompt; a trunk-block head addresses each segment by
+        // its own row and takes them all.
+        const std::size_t segment_limit =
+            head && !mtp_block_is_trunk_layer<Variant>() ? 1 : prefill_lanes.size();
+        for (std::size_t i = 0; i < segment_limit && window_left > 0; ++i) {
             const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
-            const std::uint32_t want = entry.prompt_tokens - entry.cursor;
+            // Under the head the prompt's last token is the final chunk's (see
+            // mixed_round_supported).
+            const std::uint32_t want = entry.prompt_tokens - entry.cursor - (head ? 1U : 0U);
             nominals[i]              = std::min(window_left, want);
             window_left -= nominals[i];
             ++staged_count;
@@ -2715,9 +2743,9 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 : 0U;
         const std::uint32_t graph_nominal =
             std::min(graph_cap, staged.prompt_tokens - staged.cursor);
-        const bool graph_planned = !kNoMixedGraph && staged_count == 1 && staged.use_graph &&
-                                   prefill_graphs.has_value() && batch_bucket == rows &&
-                                   graph_nominal > 0;
+        const bool graph_planned = !kNoMixedGraph && !head && staged_count == 1 &&
+                                   staged.use_graph && prefill_graphs.has_value() &&
+                                   batch_bucket == rows && graph_nominal > 0;
         if (graph_planned) {
             nominals[0]  = graph_nominal; // the graph's chunk, eager fallback included
             staged_count = 1;
@@ -2726,10 +2754,20 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
         mark_workspace_usage(workspace_plan.text_prefill);
         mark_workspace_usage(workspace_plan.ordinary_round);
+        if (head) {
+            mark_workspace_usage(workspace_plan.mtp_prefill);
+            mark_workspace_usage(workspace_plan.mtp_round);
+        }
 
+        // The first staged prompt owns the card's per-sequence views, the head's included: a
+        // trunk-block head addresses every segment through the batch view and its own row, a
+        // fixed-tail head through this view alone, which is why such a head takes one segment
+        // a round (see the window above).
         schedule::TextContext card(device, model, work, text_kv_view(prefill_sequence),
                                    decoder->linear_attention, io, prefill_hidden, prefill_chunk,
-                                   staged.cursor, {}, &decoder->text_kv, decoder->mtp_cache());
+                                   staged.cursor,
+                                   head ? mtp_kv_view(prefill_sequence) : family::PagedKVCacheView{},
+                                   &decoder->text_kv, decoder->mtp_cache());
         card.set_ple_state(&decoder->ple);
         card.set_stage(stage);
         card.set_sampling(static_cast<const ops::SamplingConfig*>(
@@ -2857,7 +2895,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 SequenceState& sequence              = sequences[prefill_lanes[i]];
                 const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
                 // Each prompt's chunk must own the KV it is about to write.
-                materialize_sequence_kv(sequence, entry.cursor + nominals[i], 0);
+                materialize_sequence_kv(sequence, entry.cursor + nominals[i],
+                                        head ? entry.cursor + nominals[i] : 0);
                 segments[i] = schedule::TextContext::MixedPrefillSegment{
                     .ids = std::span<const TokenId>(entry.prompt.token_ids)
                                .subspan(entry.cursor, nominals[i]),
@@ -2865,7 +2904,13 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                     .kv_table_row = sequence.kv->text.bound_row(),
                     .state_slot   = static_cast<std::int32_t>(
                         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency)),
-                    .finalize = false,
+                    .finalize         = false,
+                    .mtp_kv_table_row = head && stage_holds_head()
+                                            ? sequence.kv->backend->bound_row()
+                                            : -1,
+                    .mtp_shifted_ids  = head ? std::span<const TokenId>(entry.prompt.token_ids)
+                                                   .subspan(entry.cursor + 1, nominals[i])
+                                             : std::span<const TokenId>{},
                 };
             }
             chunk = card.mixed_chunk_multi(
@@ -2888,6 +2933,38 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             CUDA_CHECK(cudaMemcpyAsync(ordinary_host_egress, ordinary.egress.data,
                                        sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                        device.stream));
+            if (head && stage_holds_head()) {
+                // The head, aligned on every decode column with the token just sampled from
+                // it, so its cache stays current for the round that is narrow no longer: the
+                // narrow round's alignment step, over the ordinary frame's buffers read as
+                // width-one views. The valid-column and row vectors ride the MTP frame's,
+                // filled through its pinned ingress.
+                family::MtpDecodeState& frame = *io.mtp_decode;
+                const std::int32_t wide       = ordinary.hidden.ne[0];
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    mtp_host_ingress->target_valid_columns[row] = 1;
+                    mtp_host_ingress->mtp_kv_table_rows[row] =
+                        sequences[lanes[row]].kv->backend->bound_row();
+                }
+                const std::size_t column_ids = lanes.size() * sizeof(std::int32_t);
+                CUDA_CHECK(cudaMemcpyAsync(frame.target_valid_columns.data,
+                                           mtp_host_ingress->target_valid_columns.data(), column_ids,
+                                           cudaMemcpyHostToDevice, device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(frame.mtp_kv_table_rows.data,
+                                           mtp_host_ingress->mtp_kv_table_rows.data(), column_ids,
+                                           cudaMemcpyHostToDevice, device.stream));
+                Tensor alignment_ids   = Tensor(ordinary.sampled_tokens.data, DType::I32, {1, rows});
+                Tensor alignment_input = Tensor(ordinary.hidden.data, DType::BF16, {wide, 1, rows});
+                Tensor alignment_pos   = Tensor(ordinary.cache_positions.data, DType::I32, {1, rows});
+                Tensor alignment_rope  = Tensor(ordinary.rope_positions.data, DType::I32, {1, rows});
+                Tensor alignment_valid = frame.target_valid_columns.slice(0, 0, rows);
+                Tensor alignment_rows  = frame.mtp_kv_table_rows.slice(0, 0, rows);
+                Tensor alignment_out   = Tensor(frame.alignment_hidden.data, DType::BF16, {wide, 1, rows});
+                card.mtp_forward_decode_batch(
+                    alignment_ids, alignment_input, alignment_pos, alignment_rope, alignment_valid,
+                    alignment_rows, mtp_gqa_envelopes(maximum_frontier, draft_window, capacity).batch,
+                    alignment_out);
+            }
         }
         // The round is enqueued; consume_mixed_round synchronises and commits it.
         mixed_in_flight_.valid        = true;
@@ -2935,7 +3012,49 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         round_trace_state(decoder->linear_attention, device.stream, "post-round");
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const bool head = speculative_backend == SpeculativeBackend::Mtp;
+        if (head) {
+            // Under the draft head the decode rows resolve as a narrow round's do: one token
+            // licensed per lane, nothing proposed, the recurrent state updated in place with
+            // nothing to fold. The stage with the head decides and exports the decision; the
+            // others wait, pending with nothing produced, for the driver to bring it.
+            outcome_export_.clear();
+            if (stage_holds_head()) {
+                outcome_export_.resize(lanes.size() * sizeof(SpeculativeOutcome));
+            }
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                SequenceState& sequence = sequences[lanes[row]];
+                RequestControl& request = requests[lanes[row]];
+                std::uint32_t produced  = 0;
+                if (stage_holds_head()) {
+                    const TokenId token = ordinary_host_egress->sampled_tokens[row];
+                    validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+                    SpeculativeOutcome& outcome = request.outcome;
+                    outcome                     = SpeculativeOutcome{};
+                    outcome.licensed_count      = 1;
+                    outcome.accepted_drafts     = 0;
+                    outcome.next_extent         = 0;
+                    outcome.licensed_tokens[0]  = token;
+                    std::memcpy(outcome_export_.data() + row * sizeof(SpeculativeOutcome),
+                                &outcome, sizeof(SpeculativeOutcome));
+                    request.speculative_stats.fallback_steps += 1;
+                    produced = 1;
+                    if (round_trace_enabled()) {
+                        std::fprintf(stderr, "round-trace: sampled mixed lane=%u pos=%zu token=%d (head)\n",
+                                     sequence.lane, sequence.ledger.size(), token);
+                    }
+                }
+                request.pending   = PendingCandidate{.kind           = PendingKind::Speculative,
+                                                     .base_E         = sequence.execution_frontier,
+                                                     .base_S         = sequence.ledger_frontier,
+                                                     .prompt_tokens  = 0,
+                                                     .produced       = produced,
+                                                     .in_place_state = true};
+                request.lifecycle = Lifecycle::Pending;
+                request.timings.decode_seconds += seconds;
+            }
+        }
+        for (std::size_t row = 0; !head && row < lanes.size(); ++row) {
             SequenceState& sequence    = sequences[lanes[row]];
             RequestControl& request    = requests[lanes[row]];
             const std::uint32_t base_E = sequence.execution_frontier;
@@ -2981,6 +3100,9 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                                                 .prefix_reuse_path    = entry.reuse};
             entry.cursor += processed;
             sequence.text_kv_valid = entry.cursor;
+            // The head's KV followed the trunk's through the segment (on the stage that
+            // holds the head; the others keep the count, as the lone chunk does).
+            if (head) { sequence.mtp_kv_valid = entry.cursor; }
             result.prefills[i]     = runtime::PrefillStepResult{
                     .summary = summary, .processed_prompt_tokens = processed};
             if (entry.use_graph && graph_hit) {

@@ -2337,11 +2337,52 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     if (batch > 0) {
         Tensor xf_decode = xf.slice(1, prefill_cols, batch);
         Tensor xl_decode = xl.slice(1, prefill_cols, batch);
-        CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data,
-                                   static_cast<std::size_t>(cfg_.hidden) * batch * 2,
+        // The decode columns' boundary hidden, as wide as the round's: the residual where a
+        // trunk-block draft head widened it. This copied the model width of it, so a lane's
+        // tail hidden -- what a zero-suffix reuse samples from, and what the head aligns on
+        // below -- was short by the rest under such a head.
+        if (decode.hidden.ne[0] != xf.ne[0] || decode.hidden.ne[1] != batch) {
+            throw std::logic_error("mixed chunk decode hidden does not match the round's width");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data, xf_decode.bytes(),
                                    cudaMemcpyDeviceToDevice, s));
         Tensor logits_decode = decode.logits;
         ops::linear(xl_decode, *lm_head_, logits_decode, s);
+    }
+
+    // The draft head over each segment's columns, so a round under the head keeps the head's
+    // KV as current as the trunk's. The columns pair with the prompt's next tokens (the ids
+    // shifted by one), never with a sampled one: a mixed round stops a token short of a
+    // prompt's end, and the prompt's final chunk pairs its last column with the token it
+    // samples and proposes from it. The head's row scalar is stream-ordered per segment, as
+    // the trunk's is above.
+    for (std::size_t sg = 0; sg < segments.size(); ++sg) {
+        const MixedPrefillSegment& segment = segments[sg];
+        if (segment.mtp_kv_table_row < 0) { continue; }
+        const int len = static_cast<int>(segment.ids.size());
+        if (segment.finalize || segment.mtp_shifted_ids.size() != static_cast<std::size_t>(len)) {
+            throw std::invalid_argument(
+                "mixed chunk head alignment needs one shifted id per column and no finalizer");
+        }
+        if (!mtp_kv_.valid()) {
+            throw std::logic_error("mixed chunk head alignment without the head's KV");
+        }
+        if constexpr (!mtp_block_is_trunk_layer<Variant>()) {
+            // The fixed tail appends and attends through the card's per-sequence view: one
+            // segment, the sequence that view belongs to.
+            if (segments.size() != 1) {
+                throw std::logic_error("a fixed-tail draft head aligns one mixed segment a round");
+            }
+        }
+        auto alignment_scope = work_.scope();
+        Tensor shifted       = work_.alloc(DType::I32, {len});
+        copy_i32(segment.mtp_shifted_ids.data(), shifted, s);
+        ops::set_i32_scalar(io_.backend_kv_table_row, segment.mtp_kv_table_row, s);
+        Tensor segment_hidden    = xf.slice(1, segment_begin[sg], len);
+        Tensor segment_positions = positions.slice(0, segment_begin[sg], len);
+        const auto seen          = static_cast<std::uint32_t>(segment.kv_base + len);
+        mtp_prefill_chunk(shifted, segment_hidden, nullptr, segment_positions, segment_positions,
+                          ops::GqaExecutionEnvelope{seen, seen}, false, nullptr, nullptr, nullptr);
     }
 
     // Every segment that finishes samples in this round. Their last hidden columns are
@@ -2756,9 +2797,11 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
 
     if (batch == 0) { return; }
     Tensor xf_decode = xf.slice(1, prefill_cols, batch);
-        Tensor xl_decode = xl.slice(1, prefill_cols, batch);
-    CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data,
-                               static_cast<std::size_t>(cfg_.hidden) * batch * 2,
+    Tensor xl_decode = xl.slice(1, prefill_cols, batch);
+    if (decode.hidden.ne[0] != xf.ne[0] || decode.hidden.ne[1] != batch) {
+        throw std::logic_error("mixed graph decode hidden does not match the round's width");
+    }
+    CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data, xf_decode.bytes(),
                                cudaMemcpyDeviceToDevice, s));
     Tensor logits_decode = decode.logits;
     ops::linear(xl_decode, *lm_head_, logits_decode, s);

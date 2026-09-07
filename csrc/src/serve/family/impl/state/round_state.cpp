@@ -54,7 +54,10 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     validate_spec(spec);
     RoundStateLayout layout;
     layout.spec = spec;
-    if (!spec.enable_mtp && !spec.enable_dflash) {
+    // The ordinary frame carries every round that samples one token per lane: the ordinary
+    // round, and the mixed round -- which runs under the draft head too, its decode lanes
+    // one column each, so the frame exists there as well. DFlash never mixes.
+    if (!spec.enable_dflash) {
         OrdinaryDecodeStateLayout& ordinary = layout.ordinary.emplace();
         ordinary.ingress =
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");

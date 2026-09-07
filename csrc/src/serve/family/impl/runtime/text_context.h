@@ -369,6 +369,11 @@ public:
         std::int32_t kv_table_row; // its paged-KV row; negative keeps the row the caller staged
         std::int32_t state_slot;   // its GDN/conv state slot
         bool finalize;             // sample after this chunk
+        // The draft head, aligned over this chunk's columns on the stage that holds it: the
+        // head's paged-KV row, and the prompt's next token per column (the ids shifted by
+        // one). A negative row leaves the head out of the round.
+        std::int32_t mtp_kv_table_row = -1;
+        std::span<const int> mtp_shifted_ids{};
     };
     // Staging for the segments that finish in this round: their last hidden columns are
     // gathered into `hidden`, one lm_head produces `logits`, and the batched sampler writes
