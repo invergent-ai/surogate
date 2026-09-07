@@ -4,10 +4,43 @@ from __future__ import annotations
 
 from .. import nn
 from ..attention import AttentionConfig
-from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
+from ..block_schema import (
+    BlockSchema,
+    DistributionDecl,
+    EPTopology,
+    RoutingSchema,
+    ServeObject,
+    SlotDecl,
+    StreamingHint,
+)
 from ..dim import B, Dim, T
 from ..modules import GenericGQAttention, MoEExpertsGated, MoESharedExpert, RMSNorm
 from .common import MOE_BLOCK_NAME_REMAP
+
+
+#: How a serving artifact stores this block.
+#:
+#: The attention half is classic Qwen3's, object for object: one fused q|k|v parent with no
+#: output-gate rows, per-head q and k norms, and an output projection. The tail is where it
+#: differs -- a routed mixture with no always-on expert, so the router is the experts and
+#: nothing else. The hybrid MoE family fuses a shared expert's gate onto the router as an extra
+#: row; this one has no shared expert to fuse, and saying so is what lets the engine size a
+#: token's paths correctly.
+_QWEN3_MOE_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",)),
+    ServeObject("attention/query_key_value", "quantised", ("QKV", "C"), ("qkv_weight",)),
+    ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",)),
+    ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",)),
+    ServeObject("attention/output", "quantised", ("C", "AttnDim"), ("out_weight",)),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ln2_weight",)),
+    # The training parameter is expert-major `[E, 2M, C]`; the artifact stores the same numbers
+    # as rows, which is a contiguous reshape rather than a permutation.
+    ServeObject("moe/router", "bf16", ("E", "C"), ("router_weight",)),
+    ServeObject("moe/routed_gate_up", "quantised", ("RoutedGateUpRows", "C"),
+                ("experts_gate_up",), transform="flatten_experts", residency="auto"),
+    ServeObject("moe/routed_down", "quantised", ("RoutedDownRows", "M"),
+                ("experts_down",), transform="flatten_experts", residency="auto"),
+)
 
 
 class Qwen3MoEBlock(nn.Block):
@@ -49,6 +82,7 @@ class Qwen3MoEBlock(nn.Block):
         ),
         ep_topology=EPTopology(ep_size_param="ep_size"),
         attrs={"block_family": "qwen3_moe"},
+        serve_objects=_QWEN3_MOE_SERVE_OBJECTS,
     )
 
     def __init__(

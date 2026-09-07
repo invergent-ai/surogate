@@ -13,9 +13,13 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <mutex>
+#include <optional>
+#include <queue>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -120,6 +124,28 @@ struct Tokenizer::Impl {
     // Whether byte-level pre-tokenizer is active
     bool byte_level = false;
 
+    // SentencePiece scheme (Metaspace + byte fallback), as Llama 2, TinyLlama and
+    // the Gemma family use. It is not the same BPE as the GPT-2 byte-level one:
+    // there is no pre-tokenizer regex and no byte-level alphabet. The word mark
+    // takes the place of a space, and what the merges cannot place is spelled one
+    // raw byte at a time through the vocabulary's <0xNN> entries.
+    //
+    // The scheme is decided by the tokenizer.json, never by the architecture:
+    // model_type "llama" covers both Llama 2, which is SentencePiece, and
+    // Llama 3, which is byte-level, so keying on it would be wrong half the time.
+    bool spm = false;
+    std::string spm_replacement;              // the word mark, U+2581 in practice
+    bool spm_prepend            = false;      // normalizer opens the text with one
+    bool spm_strip_leading_space = false;     // decoder removes the one it added
+    std::unordered_map<Rank, uint8_t> spm_byte_of_token;  // <0xNN> -> the byte
+    // "left right" -> its position in the merges list. The byte-level path takes
+    // the vocabulary id as the merge rank, which holds when ids were assigned in
+    // merge order. A SentencePiece conversion orders ids by piece score instead,
+    // so the two disagree -- "\xe2\x96\x81\xe2\x96\x81" sits at id 259 and would
+    // be merged before pairs the training actually learned first. The merges list
+    // is the authority here.
+    std::unordered_map<std::string, int> spm_merge_rank;
+
     // Normalizer type
     enum class Normalizer {
         NONE,
@@ -162,7 +188,7 @@ struct Tokenizer::Impl {
     // Render the chat template with the given messages and options.
     std::string render_chat_template(const nlohmann::ordered_json& messages,
                                      bool add_generation_prompt,
-                                     std::optional<bool> enable_thinking = std::nullopt) const {
+                                     const ChatTemplateVariables& variables = {}) const {
         if (!chat_tmpl_root) {
             throw std::runtime_error("No chat template loaded.");
         }
@@ -170,11 +196,15 @@ struct Tokenizer::Impl {
             {"messages", messages},
             {"add_generation_prompt", add_generation_prompt},
         });
-        // Only define enable_thinking when explicitly requested. The template
-        // gates on `enable_thinking is defined`, so leaving it unset preserves
-        // the template's own default behavior for non-training callers.
-        if (enable_thinking.has_value()) {
-            ctx_json["enable_thinking"] = *enable_thinking;
+        // Only define a variable when the caller asked for it. The templates gate
+        // on `is defined`, so leaving one unset preserves the template's own
+        // default -- which is the only correct rendering of a template that was
+        // written elsewhere.
+        if (variables.enable_thinking.has_value()) {
+            ctx_json["enable_thinking"] = *variables.enable_thinking;
+        }
+        if (variables.reasoning_effort.has_value()) {
+            ctx_json["reasoning_effort"] = *variables.reasoning_effort;
         }
         auto context = minja::Context::make(ctx_json);
         context->set("bos_token", bos_token_str);
@@ -204,14 +234,14 @@ struct Tokenizer::Impl {
     std::string render_prefix(const std::vector<ChatMessage>& messages,
                               size_t count,
                               bool add_generation_prompt,
-                              std::optional<bool> enable_thinking = std::nullopt) const {
+                              const ChatTemplateVariables& variables = {}) const {
         TokTimer _t(tok_profile().render_ns);
         if (tok_profile_enabled()) tok_profile().renders.fetch_add(1, std::memory_order_relaxed);
         nlohmann::ordered_json arr = nlohmann::ordered_json::array();
         for (size_t k = 0; k < count && k < messages.size(); ++k) {
             arr.push_back({{"role", messages[k].role}, {"content", messages[k].content}});
         }
-        return render_chat_template(arr, add_generation_prompt, enable_thinking);
+        return render_chat_template(arr, add_generation_prompt, variables);
     }
 
     void build_lookup() {
@@ -252,10 +282,174 @@ struct Tokenizer::Impl {
         }
     }
 
+    // Metaspace normalisation: open the text with the word mark, then let the
+    // mark stand in for every space. This is what makes a word-initial piece
+    // distinguishable from the same letters mid-word, which is the whole point
+    // of the scheme.
+    std::string spm_normalize(const std::string& text) const {
+        std::string out;
+        out.reserve(text.size() + spm_replacement.size());
+        // Text that already opens with a space carries its own word mark once the
+        // substitution below runs, so prepending a second one would encode a
+        // space the caller never wrote. This is SentencePiece's dummy-prefix
+        // suppression, and it is observable: " leading space" is "\xe2\x96\x81leading"
+        // and not "\xe2\x96\x81\xe2\x96\x81leading".
+        const bool opens_with_mark =
+            text.rfind(' ', 0) == 0 ||
+            (!spm_replacement.empty() && text.rfind(spm_replacement, 0) == 0);
+        if (spm_prepend && !opens_with_mark) out += spm_replacement;
+        for (char c : text) {
+            if (c == ' ') {
+                out += spm_replacement;
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+    // SentencePiece BPE.
+    //
+    // The byte-level path seeds its merges with single BYTES, which is right when
+    // every byte is itself a vocabulary entry. Here it is not: the word mark is
+    // three bytes and no two of them form a token, so a byte-seeded merge can
+    // never build "\xe2\x96\x81" and spells it as three byte-fallback ids
+    // instead. Seed with whole characters, then merge by the same lowest-rank
+    // rule.
+    void spm_encode(const std::string& text, std::vector<int32_t>& out) const {
+        // Symbols are spans of `text`, not copies. Every merge joins neighbours,
+        // so a merged symbol is always a contiguous substring of the input and a
+        // {begin, length} pair describes it for free.
+        struct Symbol {
+            std::int32_t prev;
+            std::int32_t next;
+            std::uint32_t begin;
+            std::uint32_t length; // zero once merged away
+        };
+        std::vector<Symbol> symbols;
+        for (size_t i = 0; i < text.size();) {
+            const size_t len   = std::min(unicode_len_utf8(text[i]), text.size() - i);
+            const auto index   = static_cast<std::int32_t>(symbols.size());
+            symbols.push_back({index - 1, -1, static_cast<std::uint32_t>(i),
+                               static_cast<std::uint32_t>(len)});
+            if (index > 0) { symbols[static_cast<size_t>(index) - 1].next = index; }
+            i += len;
+        }
+        if (symbols.empty()) return;
+
+        const auto rank_of = [&](std::uint32_t begin, std::uint32_t length) -> std::optional<Rank> {
+            const auto* first = reinterpret_cast<const uint8_t*>(text.data()) + begin;
+            const std::vector<uint8_t> key(first, first + length);
+            const auto found = encoder.find(key);
+            if (found == encoder.end()) return std::nullopt;
+            return found->second;
+        };
+
+        // The merge table is keyed on "left\0right". Building that key into one
+        // reused buffer keeps the hot path free of allocation.
+        std::string key;
+        const auto merge_rank = [&](std::int32_t left, std::int32_t right) -> std::optional<int> {
+            const Symbol& l = symbols[static_cast<size_t>(left)];
+            const Symbol& r = symbols[static_cast<size_t>(right)];
+            key.assign(text, l.begin, l.length);
+            key.push_back('\x00');
+            key.append(text, r.begin, r.length);
+            const auto found = spm_merge_rank.find(key);
+            if (found == spm_merge_rank.end()) return std::nullopt;
+            return found->second;
+        };
+
+        // Merge the pair the training learned earliest, then only reconsider the
+        // two pairs that merge created. Rescanning every pair after every merge
+        // is what made this quadratic: an 8k-token prompt took ~29 s, against
+        // ~30 ms for the same text through the reference tokenizer.
+        //
+        // Ties go to the leftmost pair, which is what a left-to-right scan for a
+        // strictly smaller rank picked before; here the heap orders by rank and
+        // then by position, which is the same choice.
+        struct Candidate {
+            int rank;
+            std::uint32_t begin;
+            std::int32_t left;
+            std::int32_t right;
+            std::uint32_t left_length;
+            std::uint32_t right_length;
+        };
+        const auto later = [](const Candidate& a, const Candidate& b) {
+            if (a.rank != b.rank) { return a.rank > b.rank; }
+            return a.begin > b.begin;
+        };
+        std::priority_queue<Candidate, std::vector<Candidate>, decltype(later)> pending(later);
+
+        const auto offer = [&](std::int32_t left, std::int32_t right) {
+            if (left < 0 || right < 0) { return; }
+            const auto rank = merge_rank(left, right);
+            if (!rank.has_value()) { return; }
+            const Symbol& l = symbols[static_cast<size_t>(left)];
+            pending.push({*rank, l.begin, left, right, l.length,
+                          symbols[static_cast<size_t>(right)].length});
+        };
+        for (std::int32_t i = 0; symbols[static_cast<size_t>(i)].next >= 0;
+             i = symbols[static_cast<size_t>(i)].next) {
+            offer(i, symbols[static_cast<size_t>(i)].next);
+        }
+
+        while (!pending.empty()) {
+            const Candidate best = pending.top();
+            pending.pop();
+            Symbol& left = symbols[static_cast<size_t>(best.left)];
+            Symbol& right = symbols[static_cast<size_t>(best.right)];
+            // A candidate goes stale when either side has since been merged.
+            // Checking the lengths it was queued with is enough to tell.
+            if (left.next != best.right || left.length != best.left_length ||
+                right.length != best.right_length || left.length == 0 || right.length == 0) {
+                continue;
+            }
+            left.length += right.length;
+            left.next = right.next;
+            if (right.next >= 0) { symbols[static_cast<size_t>(right.next)].prev = best.left; }
+            right.length = 0;
+            offer(left.prev, best.left);
+            offer(best.left, left.next);
+        }
+
+        for (std::int32_t i = 0; i >= 0; i = symbols[static_cast<size_t>(i)].next) {
+            const Symbol& symbol = symbols[static_cast<size_t>(i)];
+            const auto rank      = rank_of(symbol.begin, symbol.length);
+            if (rank.has_value()) {
+                out.push_back(static_cast<int32_t>(*rank));
+                continue;
+            }
+            // What the merges could not place is spelled one raw byte at a time.
+            for (std::uint32_t b = 0; b < symbol.length; ++b) {
+                const auto byte = static_cast<unsigned char>(text[symbol.begin + b]);
+                char named[7];
+                std::snprintf(named, sizeof(named), "<0x%02X>", byte);
+                const std::vector<uint8_t> key_bytes(named, named + std::strlen(named));
+                const auto found = encoder.find(key_bytes);
+                if (found == encoder.end()) {
+                    throw std::runtime_error(
+                        std::string("Tokenizer::encode: vocabulary defines no <0xNN> token for byte ") +
+                        named);
+                }
+                out.push_back(static_cast<int32_t>(found->second));
+            }
+        }
+    }
+
     // Encode ordinary text (no special token handling).
     std::vector<int32_t> encode_ordinary_impl(const std::string& text) const {
         std::vector<int32_t> result;
         if (text.empty()) return result;
+
+        // SentencePiece has no pre-tokenizer: BPE runs over the whole normalised
+        // chunk, and the vocabulary's keys are the pieces themselves rather than
+        // a byte-level re-encoding of them.
+        if (spm) {
+            TokTimer _t(tok_profile().bpe_ns);
+            spm_encode(spm_normalize(text), result);
+            return result;
+        }
 
         // Pre-tokenize: split by regex patterns.
         // unicode_regex_split already applies byte-level encoding (GPT-2 style)
@@ -339,20 +533,33 @@ Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
 
 Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     namespace fs = std::filesystem;
-    auto dir = fs::path(model_dir);
+    const auto dir = fs::path(model_dir);
 
-    auto tokenizer_json_path = dir / "tokenizer.json";
-    if (!fs::exists(tokenizer_json_path)) {
+    const auto slurp = [](const fs::path& path) -> std::string {
+        if (!fs::exists(path)) return {};
+        std::ifstream f(path);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+
+    Sources sources;
+    sources.tokenizer_json = slurp(dir / "tokenizer.json");
+    if (sources.tokenizer_json.empty()) {
         throw std::runtime_error(fmt::format("tokenizer.json not found in {}", model_dir));
+    }
+    sources.model_config_json     = slurp(dir / "config.json");
+    sources.tokenizer_config_json = slurp(dir / "tokenizer_config.json");
+    sources.chat_template_jinja   = slurp(dir / "chat_template.jinja");
+    return from_sources(sources);
+}
+
+Tokenizer Tokenizer::from_sources(const Sources& sources) {
+    if (sources.tokenizer_json.empty()) {
+        throw std::runtime_error("Tokenizer::from_sources: tokenizer_json is required");
     }
 
     // Parse tokenizer.json using fast (unordered) JSON — ~100x faster than ordered_json
     // for the 10+ MB file with 150k+ vocab entries.
-    fast_json data;
-    {
-        std::ifstream f(tokenizer_json_path);
-        data = fast_json::parse(f);
-    }
+    const fast_json data = fast_json::parse(sources.tokenizer_json);
 
     Tokenizer tok;
     auto& impl = *tok.impl_;
@@ -423,19 +630,99 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         }
     }
 
+    // ---- SentencePiece (Metaspace + byte fallback) ----
+    // Read off the tokenizer.json rather than the architecture: model_type
+    // "llama" is Llama 2 (SentencePiece) and Llama 3 (byte-level) both.
+    std::function<void(const json&)> scan_normalizer = [&](const json& node) {
+        if (!node.is_object() || !node.contains("type")) return;
+        const std::string type = node.at("type").get<std::string>();
+        if (type == "Sequence" && node.contains("normalizers")) {
+            for (const auto& sub : node.at("normalizers")) scan_normalizer(sub);
+            return;
+        }
+        if (type == "Prepend") {
+            impl.spm_prepend = true;
+            if (node.contains("prepend")) impl.spm_replacement = node.at("prepend").get<std::string>();
+        } else if (type == "Replace" && node.contains("pattern") && node.contains("content")) {
+            const auto& pattern = node.at("pattern");
+            if (pattern.is_object() && pattern.contains("String") &&
+                pattern.at("String").get<std::string>() == " ") {
+                impl.spm_replacement = node.at("content").get<std::string>();
+            }
+        }
+    };
+    if (data.contains("normalizer") && !data["normalizer"].is_null()) {
+        scan_normalizer(data["normalizer"]);
+    }
+    const bool declares_byte_fallback =
+        data.contains("model") && data["model"].contains("byte_fallback") &&
+        data["model"]["byte_fallback"].is_boolean() && data["model"]["byte_fallback"].get<bool>();
+    if (!impl.spm_replacement.empty() || declares_byte_fallback) {
+        impl.spm        = true;
+        impl.byte_level = false;
+        if (model.contains("merges") && model["merges"].is_array()) {
+            int rank = 0;
+            for (const auto& entry : model["merges"]) {
+                std::string left;
+                std::string right;
+                if (entry.is_string()) {
+                    const std::string pair = entry.get<std::string>();
+                    const size_t gap       = pair.find(' ');
+                    if (gap == std::string::npos) continue;
+                    left  = pair.substr(0, gap);
+                    right = pair.substr(gap + 1);
+                } else if (entry.is_array() && entry.size() == 2) {
+                    left  = entry[0].get<std::string>();
+                    right = entry[1].get<std::string>();
+                } else {
+                    continue;
+                }
+                impl.spm_merge_rank.emplace(left + '\x00' + right, rank++);
+            }
+        }
+        if (impl.spm_replacement.empty()) impl.spm_replacement = "\xe2\x96\x81";  // U+2581
+        // A SentencePiece conversion states its prefix in the post-processor
+        // rather than in tokenizer_config: TinyLlama sets no add_bos_token and
+        // still opens every sequence with <s>. Reading only the config would
+        // hand the model a prompt shape it never saw in training.
+        if (data.contains("post_processor") && !data["post_processor"].is_null()) {
+            const auto& post = data["post_processor"];
+            if (post.value("type", std::string()) == "TemplateProcessing" &&
+                post.contains("single") && post["single"].is_array() &&
+                !post["single"].empty() && post["single"][0].contains("SpecialToken")) {
+                impl.add_bos = true;
+            }
+        }
+        // The decoder strips the space the Prepend put there.
+        impl.spm_strip_leading_space = impl.spm_prepend;
+        // <0xNN> -> the byte it stands for, so decode can spell it back out.
+        for (const auto& [token, rank] : impl.encoder) {
+            const std::string text(token.begin(), token.end());
+            if (text.size() != 6 || text[0] != '<' || text[1] != '0' || text[2] != 'x' ||
+                text[5] != '>') {
+                continue;
+            }
+            const auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                return -1;
+            };
+            const int hi = hex(text[3]);
+            const int lo = hex(text[4]);
+            if (hi < 0 || lo < 0) continue;
+            impl.spm_byte_of_token[rank] = static_cast<uint8_t>(hi * 16 + lo);
+        }
+    }
+
     // ---- Pre-tokenizer: detect from model architecture (config.json) ----
     // Like llama.cpp, we use hard-coded regex patterns per architecture.
     // Each pattern has a matching hand-optimized C++ implementation in unicode.cpp,
     // so no regex engine is needed.
     std::string architecture;
-    auto model_config_path = dir / "config.json";
-    if (fs::exists(model_config_path)) {
-        fast_json model_config;
-        {
-            std::ifstream f(model_config_path);
-            model_config = fast_json::parse(f);
-        }
-        architecture = model_config.value("model_type", "");
+    if (!sources.model_config_json.empty()) {
+        const fast_json model_config = fast_json::parse(sources.model_config_json);
+        architecture                 = model_config.value("model_type", "");
     }
 
     if (architecture == "qwen2" || architecture == "qwen3" || architecture == "qwen3_moe" ||
@@ -529,13 +816,8 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     }
 
     // ---- Load tokenizer_config.json for extra metadata ----
-    auto config_path = dir / "tokenizer_config.json";
-    if (fs::exists(config_path)) {
-        fast_json config;
-        {
-            std::ifstream f(config_path);
-            config = fast_json::parse(f);
-        }
+    if (!sources.tokenizer_config_json.empty()) {
+        const fast_json config = fast_json::parse(sources.tokenizer_config_json);
 
         // BOS/EOS/PAD token resolution
         auto resolve_token_id = [&](const fast_json& config, const std::string& key) -> int32_t {
@@ -575,14 +857,17 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
             impl.unk_id = resolve_token_id(config, "unk_token");
         }
 
-        impl.add_bos = config.value("add_bos_token", false);
+        // Defaults to whatever the post-processor already established: a
+        // SentencePiece conversion states its prefix there and says nothing here,
+        // and reading the absent key as "false" would drop the BOS it asked for.
+        impl.add_bos = config.value("add_bos_token", impl.add_bos);
         impl.add_eos = config.value("add_eos_token", false);
 
         // Load chat template (Jinja2 string) — parse directly, skip capability probing.
         // A standalone chat_template.jinja takes precedence (HF convention): some
         // checkpoints set the config field to "{% include 'chat_template.jinja' %}",
         // which minja cannot resolve.
-        if (!fs::exists(dir / "chat_template.jinja") && config.contains("chat_template") &&
+        if (sources.chat_template_jinja.empty() && config.contains("chat_template") &&
             config["chat_template"].is_string()) {
             std::string tmpl_str = config["chat_template"].get<std::string>();
             impl.template_uses_strftime = tmpl_str.find("strftime_now") != std::string::npos;
@@ -601,10 +886,8 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
 
     // If no chat template in tokenizer_config.json, check for chat_template.jinja file
     if (!impl.chat_tmpl_root) {
-        auto jinja_path = dir / "chat_template.jinja";
-        if (fs::exists(jinja_path)) {
-            std::ifstream f(jinja_path);
-            std::string tmpl_str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (!sources.chat_template_jinja.empty()) {
+            const std::string tmpl_str = sources.chat_template_jinja;
             impl.template_uses_strftime = tmpl_str.find("strftime_now") != std::string::npos;
             impl.chat_tmpl_root = minja::Parser::parse(tmpl_str,
                                                        {
@@ -723,7 +1006,8 @@ std::vector<std::vector<int32_t>> Tokenizer::encode_batch(const std::vector<std:
     return results;
 }
 
-std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
+std::string Tokenizer::decode(const std::vector<int32_t>& ids,
+                              bool strip_leading_space) const {
     // Accumulate byte-level-encoded text in segments, decode each segment
     // when we hit a special token (which is stored as plain text, not byte-level).
     std::string result;
@@ -751,6 +1035,15 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
             continue;
         }
 
+        // A <0xNN> token stands for one raw byte, not for its own spelling.
+        if (impl_->spm) {
+            auto bit = impl_->spm_byte_of_token.find(uid);
+            if (bit != impl_->spm_byte_of_token.end()) {
+                byte_level_buf.push_back(static_cast<char>(bit->second));
+                continue;
+            }
+        }
+
         // Regular token — byte-level encoded
         auto it = impl_->decoder.find(uid);
         if (it != impl_->decoder.end()) {
@@ -759,6 +1052,28 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     }
 
     flush_byte_level();
+
+    if (impl_->spm) {
+        // Undo the normalizer: the word mark becomes a space again, and the one
+        // the Prepend added comes back off.
+        const std::string& mark = impl_->spm_replacement;
+        std::string undone;
+        undone.reserve(result.size());
+        for (size_t i = 0; i < result.size();) {
+            if (!mark.empty() && result.compare(i, mark.size(), mark) == 0) {
+                undone.push_back(' ');
+                i += mark.size();
+            } else {
+                undone.push_back(result[i]);
+                ++i;
+            }
+        }
+        if (strip_leading_space && impl_->spm_strip_leading_space && !undone.empty() &&
+            undone.front() == ' ') {
+            undone.erase(undone.begin());
+        }
+        result = std::move(undone);
+    }
     return result;
 }
 
@@ -798,6 +1113,10 @@ std::string Tokenizer::decode_single_token(int32_t id) const {
 int32_t Tokenizer::vocab_size() const {
     return impl_->vocab_size_;
 }
+bool Tokenizer::adds_bos() const {
+    return impl_->add_bos && impl_->bos_id >= 0;
+}
+
 int32_t Tokenizer::bos_token_id() const {
     return impl_->bos_id;
 }
@@ -823,7 +1142,15 @@ std::string Tokenizer::special_token(const std::string& name) const {
 std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
                                            bool add_generation_prompt,
                                            std::optional<bool> enable_thinking) const {
-    return impl_->render_prefix(messages, messages.size(), add_generation_prompt, enable_thinking);
+    return apply_chat_template(messages,
+                               add_generation_prompt,
+                               ChatTemplateVariables{.enable_thinking = enable_thinking});
+}
+
+std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
+                                           bool add_generation_prompt,
+                                           const ChatTemplateVariables& variables) const {
+    return impl_->render_prefix(messages, messages.size(), add_generation_prompt, variables);
 }
 
 std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,
@@ -886,11 +1213,11 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
         // MUST use the same mode, or the byte-diff that defines the trainable span
         // misaligns — which previously trained the model to emit reasoning after an
         // already-closed think block (i.e. to "think" in no-think mode).
-        std::optional<bool> enable_thinking = (messages[i + 1].content.find("</think>") != std::string::npos);
+        const ChatTemplateVariables variables{.enable_thinking =
+                                                  (messages[i + 1].content.find("</think>") != std::string::npos)};
 
         // 1. Render up to user_i with gen_prompt=true → prefix/chrome segment
-        std::string render_with_user =
-            impl_->render_prefix(messages, i + 1, /*add_generation_prompt=*/true, enable_thinking);
+        std::string render_with_user = impl_->render_prefix(messages, i + 1, /*add_generation_prompt=*/true, variables);
 
         if (render_with_user.size() > prev_render.size()) {
             std::string chrome = render_with_user.substr(prev_render.size());
@@ -900,7 +1227,7 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
 
         // 2. Render up to asst_i with gen_prompt=false → response segment
         std::string render_with_asst =
-            impl_->render_prefix(messages, i + 2, /*add_generation_prompt=*/false, enable_thinking);
+            impl_->render_prefix(messages, i + 2, /*add_generation_prompt=*/false, variables);
 
         if (render_with_asst.size() > render_with_user.size()) {
             std::string response = render_with_asst.substr(render_with_user.size());

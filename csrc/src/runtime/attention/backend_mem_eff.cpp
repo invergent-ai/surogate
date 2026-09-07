@@ -179,7 +179,7 @@ public:
         args.seqstart_k_ptr = p.cu_seqlens;
         args.seqlen_k_ptr = nullptr;
 
-        args.causal = true;
+        args.causal = p.causal;
         args.window_size = std::max(p.window_size, 0);
         args.softmax_scale = p.softmax_scale > 0.0f ? p.softmax_scale : (1.0f / std::sqrt(static_cast<float>(Hs)));
         args.stream = p.stream;
@@ -429,7 +429,7 @@ public:
         args.cu_seqlens_q_ptr = p.cu_seqlens;
         args.cu_seqlens_k_ptr = p.cu_seqlens;
 
-        args.causal = true;
+        args.causal = p.causal;
         args.window_size = std::max(p.window_size, 0);
         args.softmax_scale = p.softmax_scale > 0.0f ? p.softmax_scale : (1.0f / std::sqrt(static_cast<float>(Hs)));
         args.num_splits_key = 1;

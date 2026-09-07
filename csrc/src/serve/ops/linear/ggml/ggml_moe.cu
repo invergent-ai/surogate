@@ -1,0 +1,131 @@
+// Ported from llama.cpp (ggml/src/ggml-cuda), MIT License, Copyright (c) 2023-2026 The ggml
+// authors. The block layouts and the vec-dot arithmetic are kept verbatim so that a GGUF's
+// K-quant tensors are served as the bytes the file holds; only the surrounding names change.
+#include "ops/linear/ggml/ggml_moe.h"
+
+#include "ops/linear/ggml/ggml_mmvq.cuh"
+#include "ops/linear/ggml/ggml_moe_codec.cuh"
+
+#include <stdexcept>
+
+namespace sinfer::ops::detail::ggml {
+namespace {
+
+// One CTA per (row block, slot); one warp per token within it. Ported from llama.cpp's
+// mul_mat_vec_q_id: the only difference from the plain GEMV is where the weight starts, which
+// the id lookup decides per (token, slot) rather than the block index.
+template <GgmlType type, int RowsPerBlock>
+__global__ void moe_gemv_kernel(const void* __restrict__ vx, const block_q8_1* __restrict__ vy,
+                                const std::int32_t* __restrict__ ids, float* __restrict__ dst,
+                                const int k, const int rows, const int tokens, const int slots,
+                                const int ids_stride) {
+    constexpr int qk  = Traits<type>::qk;
+    constexpr int qi  = Traits<type>::qi;
+    constexpr int vdr = Traits<type>::vdr;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = Traits<type>::vec_dot;
+
+    const int token = static_cast<int>(threadIdx.y);
+    if (token >= tokens) { return; }
+    const int row0            = RowsPerBlock * static_cast<int>(blockIdx.x);
+    const int slot            = static_cast<int>(blockIdx.y);
+    const int blocks_per_row  = k / qk;
+    constexpr int per_iter    = vdr * kWarpSize / qi;
+
+    const int expert = ids[slot + token * ids_stride];
+    if (expert < 0) { return; } // a slot a token did not use
+
+    const std::int64_t expert_stride = static_cast<std::int64_t>(rows) * blocks_per_row;
+    const std::int64_t kbx_offset    = expert * expert_stride + static_cast<std::int64_t>(row0) * blocks_per_row;
+    const block_q8_1* y              = vy + static_cast<std::int64_t>(token) * (k / QK8_1);
+
+    float tmp[RowsPerBlock] = {0.0f};
+    for (int kbx = static_cast<int>(threadIdx.x) / (qi / vdr); kbx < blocks_per_row; kbx += per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (static_cast<int>(threadIdx.x) % (qi / vdr));
+#pragma unroll
+        for (int i = 0; i < RowsPerBlock; ++i) {
+            if (RowsPerBlock == 1 || row0 + i < rows) {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby],
+                                         static_cast<int>(kbx_offset + i * blocks_per_row + kbx), kqs);
+            }
+        }
+    }
+    float* out = dst + (static_cast<std::int64_t>(token) * slots + slot) * rows + row0;
+#pragma unroll
+    for (int i = 0; i < RowsPerBlock; ++i) {
+        const float total = warp_sum(tmp[i]);
+        if (static_cast<int>(threadIdx.x) == i && (RowsPerBlock == 1 || row0 + i < rows)) {
+            out[i] = total;
+        }
+    }
+}
+
+template <GgmlType type>
+void launch(const void* blocks, std::int32_t rows, std::int32_t k, const block_q8_1* y,
+            const std::int32_t* ids, std::int32_t tokens, std::int32_t slots,
+            std::int32_t ids_stride, float* out, cudaStream_t stream) {
+    constexpr int kRows = 1;
+    const dim3 block(kWarpSize, static_cast<unsigned>(tokens));
+    const dim3 grid(static_cast<unsigned>((rows + kRows - 1) / kRows), static_cast<unsigned>(slots));
+    moe_gemv_kernel<type, kRows><<<grid, block, 0, stream>>>(blocks, y, ids, out, k, rows, tokens,
+                                                             slots, ids_stride);
+}
+
+template <GgmlType type>
+__global__ void codec_decode_kernel(const std::uint8_t* __restrict__ blocks,
+                                    float* __restrict__ out) {
+    // One CTA per 256 values, whatever the block size: a superblock is exactly that, and the
+    // plain 32-value types put eight blocks under one CTA with four lanes each. The codec's
+    // `load_eight` addresses a block and a lane within it, so the split happens here.
+    constexpr int kValues        = block_values(type);
+    constexpr int kBlocksPerCta  = QK_K / kValues;
+    constexpr int kLanesPerBlock = kValues / 8;
+    const int lane               = static_cast<int>(threadIdx.x);
+    const std::int64_t block =
+        static_cast<std::int64_t>(blockIdx.x) * kBlocksPerCta + lane / kLanesPerBlock;
+    float w[8];
+    GgmlMoeCodec<type>::load_eight(blocks, nullptr, nullptr, block, lane % kLanesPerBlock, w);
+    float* dst = out + static_cast<std::int64_t>(blockIdx.x) * QK_K + lane * 8;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) { dst[l] = w[l]; }
+}
+
+template <GgmlType type>
+void launch_codec(const void* blocks, std::int64_t superblocks, float* out, cudaStream_t stream) {
+    codec_decode_kernel<type><<<static_cast<unsigned>(superblocks), 32, 0, stream>>>(
+        static_cast<const std::uint8_t*>(blocks), out);
+}
+
+} // namespace
+
+void moe_codec_decode_launch(GgmlType type, const void* blocks, std::int64_t superblocks,
+                             float* out, cudaStream_t stream) {
+    switch (type) {
+#define SINFER_CODEC_CASE(NAME)                                                                    \
+    case GgmlType::NAME: launch_codec<GgmlType::NAME>(blocks, superblocks, out, stream); return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_CODEC_CASE)
+#undef SINFER_CODEC_CASE
+    }
+    throw std::invalid_argument("ggml moe codec: unknown GGML type");
+}
+
+void moe_gemv_launch(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
+                     const block_q8_1* y, const std::int32_t* ids, std::int32_t tokens,
+                     std::int32_t slots, std::int32_t ids_stride, float* out, cudaStream_t stream) {
+    if (blocks == nullptr || y == nullptr || ids == nullptr || out == nullptr || rows <= 0 ||
+        k <= 0 || (k % block_values(type)) != 0 || tokens <= 0 || slots <= 0 || tokens > 32) {
+        throw std::invalid_argument("ggml moe_gemv: [experts, rows, k] with k a whole number of "
+                                    "blocks and at most 32 tokens");
+    }
+    switch (type) {
+#define SINFER_MOE_GEMV_CASE(NAME)                                                                 \
+    case GgmlType::NAME:                                                                           \
+        launch<GgmlType::NAME>(blocks, rows, k, y, ids, tokens, slots, ids_stride, out, stream);    \
+        return;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_MOE_GEMV_CASE)
+#undef SINFER_MOE_GEMV_CASE
+    }
+    throw std::invalid_argument("ggml moe_gemv: unknown GGML type");
+}
+
+} // namespace sinfer::ops::detail::ggml

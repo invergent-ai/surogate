@@ -121,6 +121,7 @@ Follow these guides to run your first training:
 ## Learn More
 
 - **[How Surogate Works](about/how-it-works.md)**: Deep dive into the C++/CUDA engine and multi-threaded scheduler.
+- **[Inference & Serving](inference/index.md)**: The serving engine, supported quantizations, and the OpenAI-compatible API.
 - **[Examples Library](examples/index.md)**: Pre-built configurations for Qwen, Llama, and MoE models.
 - **[User Guides](guides/configuration.md)**: Advanced documentation on precision, memory, scaling, and more.
 - **[Technical Reference](reference/config.md)**: Comprehensive CLI and API reference.

@@ -36,3 +36,12 @@ jackalope/dist/
 .superpowers/
 watch-out/
 watch-run.yaml*
+csrc/build*
+models/**
+design/
+
+.env
+
+# `surogate quantize`'s toolchain: fetched from a pinned llama.cpp and installed here by the
+# build (csrc/cmake/llama_cpp_quantizer.cmake). A build product, not source.
+surogate/serve/_llama_cpp/

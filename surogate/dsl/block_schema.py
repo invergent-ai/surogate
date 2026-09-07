@@ -10,7 +10,98 @@ DistributionKind = Literal["replicated", "sharded_dim", "expert_parallel", "rout
 Residency = Literal["auto", "gpu", "cpu_pinned_stream", "cpu_pageable", "nvme_offload"]
 SlotKind = Literal["activation", "param", "scratch", "param_grad", "activation_grad"]
 Lifetime = Literal["op", "layer", "block", "model", "persistent"]
-RoutingKind = Literal["none", "topk_softmax", "topk_sigmoid", "expert_choice"]
+RoutingKind = Literal[
+    "none",
+    "topk_softmax",
+    "topk_sigmoid",
+    # DeepSeek-V4: scores are `sqrt(softplus(logits))`, selected on
+    # `score + e_score_correction_bias`, renormalised over the winners.
+    "topk_sqrtsoftplus",
+    # DeepSeek-V4 bootstrap layers: expert *selection* is a frozen
+    # `tid2eid[input_ids]` lookup; the learned gate still supplies the weights.
+    "hash_topk",
+    "expert_choice",
+]
+#: Numeric format a serving artifact stores a weight in. The declaration already
+#: carries format policy — `quantizable=False` on router and shared-expert weights
+#: is exactly this decision — so naming the serving format here keeps one source of
+#: truth rather than restating the geometry in a converter.
+#: `quantised` means the export profile chooses the width — the 35B stores routed
+#: experts Q4, their down projections Q5 and the output head Q6 where the 0.8B
+#: stores all three W8. The declaration fixes only what the *model* fixes: a norm
+#: is never quantised, a weight may be. This is the same distinction `quantizable`
+#: already draws on parameters.
+ServeFormat = Literal["quantised", "w8", "bf16", "fp32", "i32", "raw"]
+
+
+@dataclass(frozen=True)
+class ServeObject:
+    """One object as a serving artifact stores it.
+
+    A serving artifact does not store a model the way training holds it: weights
+    are quantised, laid out for the kernels that read them, and fused — a serve
+    target binds one `attention/query_key_gate_value` where the declaration has
+    four projections. Those are real decisions, but they are decisions *about this
+    model*, which is why they belong beside the parameters they describe rather
+    than in a converter that restates the geometry to express them.
+
+    `components` names the declared parameters this object is built from, in row
+    order, which is what lets an adapter trained on one logical projection be
+    placed on the right rows of a fused tensor. `transform` names the repacking
+    the converter applies when the composition is not a plain concatenation — the
+    algorithm stays in the converter; only its identity is declared here.
+    """
+
+    name: str
+    format: ServeFormat = "bf16"
+    shape: tuple[str | int, ...] = ()
+    components: tuple[str, ...] = ()
+    transform: str | None = None
+    residency: Residency = "gpu"
+    #: Layers this object exists on: every layer, or only the ones running this
+    #: mixer. `None` means "wherever the block it belongs to runs".
+    scope: Literal["block", "model"] = "block"
+    #: What a target must implement to consume this object; see `ServeSection`.
+    capability: str = "text"
+    #: The checkpoint tensor, relative to the section's `hf_prefix`, for an object the
+    #: training graph has no parameter for (a draft head's own norms and projection).
+    #: An object names either components or a source, never both.
+    #:
+    #: Several tensors, row-concatenated in the order given, when the object fuses what
+    #: the checkpoint keeps apart — a scorer's `q | k | v`. Each is then a
+    #: `(name, shape)` pair, because only the object's total rows are declared above and
+    #: the split between the parts is not derivable from it.
+    source: str | tuple[str, ...] | tuple[tuple[str, tuple[str | int, ...]], ...] | None = None
+
+
+@dataclass(frozen=True)
+class ServeSection:
+    """A sub-stack a serving artifact stores under its own prefix.
+
+    A served checkpoint is not only the text stack: it carries a speculative
+    draft head, and on some targets a vision tower and a DFlash stack. Those are
+    model components, not policy, and the declaration is the single source of
+    truth for what an artifact contains — so they are declared here rather than
+    left for a converter to know about.
+
+    `repeat` names the config key holding the sub-stack's layer count; `1` means
+    the section is not indexed and its objects sit directly under the prefix.
+    """
+
+    prefix: str
+    objects: tuple["ServeObject", ...] = ()
+    repeat: str | int = 1
+    #: What a target must implement to consume this section. A target that does
+    #: not is not merely uninterested — the engine refuses to load an artifact
+    #: holding objects no binder consumes — so the section is declared and simply
+    #: not exported for it.
+    capability: str = "text"
+    #: Where the checkpoint keeps this section: `hf_prefix` roots its `source` objects,
+    #: `hf_layer` roots the block objects it replays (`mtp.layers.0` for a draft head's
+    #: decoder layer, `{index}` for a section that repeats), so their components resolve
+    #: through the same block mapping the text layers use.
+    hf_prefix: str = ""
+    hf_layer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +173,10 @@ class BlockSchema:
     slots: tuple[SlotDecl, ...] = ()
     routing: RoutingSchema | None = None
     ep_topology: EPTopology | None = None
+    #: How a serving artifact stores this block's weights. Empty for blocks no
+    #: serve target covers; a serve target's object inventory is emitted from
+    #: these rather than restating the geometry in a converter.
+    serve_objects: tuple[ServeObject, ...] = ()
     attrs: dict[str, Any] = field(default_factory=dict)
 
     def get_slot(self, name: str) -> SlotDecl | None:

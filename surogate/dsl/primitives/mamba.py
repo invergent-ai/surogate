@@ -114,6 +114,7 @@ def mamba_gated_rmsnorm(
     eps: float = 1e-5,
     group_size: int = 0,
     norm_before_gate: bool = False,
+    gate_activation: str = "silu",
 ) -> Tensor["*", C]:
     """Gated RMSNorm for Mamba2.
 
@@ -130,6 +131,7 @@ def mamba_gated_rmsnorm(
         eps: Epsilon for numerical stability
         group_size: Group size for group normalization (0 for full dim)
         norm_before_gate: If True, normalize before gating
+        gate_activation: Activation applied to the gate ("silu" or "sigmoid")
 
     Returns:
         Gated normalized output

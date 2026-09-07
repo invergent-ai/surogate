@@ -5,12 +5,100 @@ from __future__ import annotations
 from .. import nn
 from ..modules import Embedding, LMHead, RMSNormPlus1
 from ..modules.attention import _resolve_rotary_dim
-from ..blocks.qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
+from ..block_schema import ServeObject, ServeSection
+from ..blocks.qwen3_5_moe import (
+    _MOE_ATTENTION_BLOCK_OBJECTS,
+    _MOE_SERVE_OBJECTS,
+    Qwen3_5MoEAttentionBlock,
+    Qwen3_5MoELinearBlock,
+)
+from .qwen3_5 import (
+    QWEN3_5_VISION_HEAD_OBJECTS,
+    QWEN3_5_VISION_MERGER_OBJECTS,
+    QWEN3_5_VISION_SERVE_SECTION,
+    capture_vision_geometry,
+)
 from ..hf import build_norm_mappings, expand_module_mapping
 from ..models.qwen3_5 import _parse_qwen3_5_layer_types
 from ..blocks.qwen3_5 import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
+
+#: Everything outside the layer stack. The vision tower's head and merger objects
+#: come from the shared Qwen3.6 vision declaration; its encoder blocks are a
+#: repeated section.
+QWEN3_5_MOE_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",), scope="model"),
+    ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
+    ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",), scope="model"),
+    ServeObject("text/draft_head", "quantised", ("DraftVocab", "C"), scope="model"),
+    ServeObject("text/draft_head_token_ids", "i32", ("DraftVocab",), scope="model"),
+    *QWEN3_5_VISION_HEAD_OBJECTS,
+    *QWEN3_5_VISION_MERGER_OBJECTS,
+)
+
+#: The MTP head. Its one decoder layer is a MoE layer here, not a dense one, which
+#: is the only difference from the dense family's section.
+QWEN3_5_MOE_MTP_SERVE_SECTION = ServeSection(
+    prefix="mtp/",
+    hf_prefix="mtp.",
+    hf_layer="mtp.layers.0",
+    objects=(
+        ServeObject("input_projection", "quantised", ("C", "TwoC"), source="fc.weight"),
+        ServeObject("embedding_norm", "bf16", ("C",), source="pre_fc_norm_embedding.weight"),
+        ServeObject("hidden_norm", "bf16", ("C",), source="pre_fc_norm_hidden.weight"),
+        *(
+            ServeObject("layer/" + o.name, o.format, o.shape, o.components,
+                        transform=o.transform)
+            for o in _MOE_ATTENTION_BLOCK_OBJECTS
+        ),
+        ServeObject("final_norm", "bf16", ("C",), source="norm.weight"),
+    ),
+)
+
+#: DFlash: a small dense stack that scores draft continuations. It comes from its
+#: own checkpoint rather than this model's config, so its geometry is declared as
+#: constants on the model below. That checkpoint keeps its tensors at the root and
+#: the training graph has no scorer, so the section names them directly rather than
+#: through parameters that do not exist.
+QWEN3_5_MOE_DFLASH_SERVE_SECTION = ServeSection(
+    prefix="dflash/layers/",
+    hf_prefix="layers.{index}.",
+    objects=(
+        ServeObject("input_norm", "bf16", ("C",), source="input_layernorm.weight"),
+        ServeObject("attention/query_key_value", "quantised", ("DflashQkvRows", "C"),
+                    source=(("self_attn.q_proj.weight", ("DflashAttnCols", "C")),
+                            ("self_attn.k_proj.weight", ("DflashKvRows", "C")),
+                            ("self_attn.v_proj.weight", ("DflashKvRows", "C")))),
+        ServeObject("attention/query_norm", "bf16", ("DflashHeadDim",),
+                    source="self_attn.q_norm.weight"),
+        ServeObject("attention/key_norm", "bf16", ("DflashHeadDim",),
+                    source="self_attn.k_norm.weight"),
+        ServeObject("attention/output", "quantised", ("C", "DflashAttnCols"),
+                    source="self_attn.o_proj.weight"),
+        ServeObject("post_attention_norm", "bf16", ("C",),
+                    source="post_attention_layernorm.weight"),
+        ServeObject("mlp/gate_up", "quantised", ("DflashGateUpRows", "C"),
+                    source=(("mlp.gate_proj.weight", ("DflashFfn", "C")),
+                            ("mlp.up_proj.weight", ("DflashFfn", "C")))),
+        ServeObject("mlp/down", "quantised", ("C", "DflashFfn"),
+                    source="mlp.down_proj.weight"),
+    ),
+    repeat="dflash_layers",
+    capability="dflash",
+)
+
+QWEN3_5_MOE_DFLASH_HEAD_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("dflash/feature_projection", "quantised", ("C", "DflashFeatureRows"), scope="model",
+                capability="dflash", source="fc.weight"),
+    ServeObject("dflash/context_norm", "bf16", ("C",), scope="model", capability="dflash",
+                source="hidden_norm.weight"),
+)
+
+QWEN3_5_MOE_DFLASH_TAIL_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("dflash/final_norm", "bf16", ("C",), scope="model", capability="dflash",
+                source="norm.weight"),
+)
 
 def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
     """HF mappings for Qwen3.5 / Qwen3.6 MoE experts (batched HF layout).
@@ -107,6 +195,33 @@ def _build_qwen3_5_moe_block_mappings(layer_prefix: str) -> dict[str, object]:
 )
 class Qwen3_5MoECausalModel(nn.Model):
     """Qwen3.5 MoE text model for ``Qwen3_5MoeForCausalLM``."""
+
+    #: The complete served artifact: text stack (block schemas), the MTP head, the
+    #: vision tower and the DFlash scorer. DFlash geometry comes from its own
+    #: checkpoint rather than this config, so it is declared here.
+    _serve_objects_ = (
+        *QWEN3_5_MOE_MODEL_SERVE_OBJECTS,
+        *QWEN3_5_MOE_DFLASH_HEAD_OBJECTS,
+        *QWEN3_5_MOE_DFLASH_TAIL_OBJECTS,
+    )
+    _serve_sections_ = (
+        QWEN3_5_MOE_MTP_SERVE_SECTION,
+        QWEN3_5_VISION_SERVE_SECTION,
+        QWEN3_5_MOE_DFLASH_SERVE_SECTION,
+    )
+    _serve_blocks_ = {
+        "attention": Qwen3_5MoEAttentionBlock,
+        "mamba": Qwen3_5MoELinearBlock,
+    }
+    draft_head_vocab = 131072
+    dflash_layers = 6
+    dflash_head_dim = 128
+    dflash_qkv_rows = 6144
+    dflash_attn_cols = 4096
+    dflash_kv_rows = 1024
+    dflash_gate_up_rows = 12288
+    dflash_ffn = 6144
+    dflash_feature_rows = 16384
 
     _name_remap_ = QWEN3_5_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_qwen3_5_moe_block_mappings("model.layers.{layer}")
@@ -344,6 +459,33 @@ def _build_qwen3_5_moe_conditional_block_mappings(layer_prefix: str) -> dict[str
 class Qwen3_5MoEConditionalModel(nn.Model):
     """Qwen3.5 MoE text model for ``Qwen3_5MoeForConditionalGeneration``."""
 
+    #: The complete served artifact: text stack (block schemas), the MTP head, the
+    #: vision tower and the DFlash scorer. DFlash geometry comes from its own
+    #: checkpoint rather than this config, so it is declared here.
+    _serve_objects_ = (
+        *QWEN3_5_MOE_MODEL_SERVE_OBJECTS,
+        *QWEN3_5_MOE_DFLASH_HEAD_OBJECTS,
+        *QWEN3_5_MOE_DFLASH_TAIL_OBJECTS,
+    )
+    _serve_sections_ = (
+        QWEN3_5_MOE_MTP_SERVE_SECTION,
+        QWEN3_5_VISION_SERVE_SECTION,
+        QWEN3_5_MOE_DFLASH_SERVE_SECTION,
+    )
+    _serve_blocks_ = {
+        "attention": Qwen3_5MoEAttentionBlock,
+        "mamba": Qwen3_5MoELinearBlock,
+    }
+    draft_head_vocab = 131072
+    dflash_layers = 6
+    dflash_head_dim = 128
+    dflash_qkv_rows = 6144
+    dflash_attn_cols = 4096
+    dflash_kv_rows = 1024
+    dflash_gate_up_rows = 12288
+    dflash_ffn = 6144
+    dflash_feature_rows = 16384
+
     _name_remap_ = QWEN3_5_VL_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_qwen3_5_moe_conditional_block_mappings(
         "model.language_model.layers.{layer}",
@@ -404,6 +546,8 @@ class Qwen3_5MoEConditionalModel(nn.Model):
         self.full_attention_interval = full_attention_interval
         self.chunk_size = chunk_size
         self.use_visual_inputs = bool(use_visual_inputs)
+        for _key, _value in capture_vision_geometry(use_visual_inputs).items():
+            setattr(self, _key, _value)
 
         # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads

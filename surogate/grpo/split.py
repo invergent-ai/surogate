@@ -26,6 +26,7 @@ import asyncio
 import ctypes
 import multiprocessing as mp
 import multiprocessing.connection
+import logging
 import os
 import signal
 import sys
@@ -304,6 +305,27 @@ def grpo_split(
             _reap_survivors(psutil.Process().children(recursive=True))
         except Exception as e:
             logger.warning(f"Survivor reap failed during shutdown: {e}")
+
+        # Leave without running interpreter finalization -- on the clean path.
+        #
+        # The trainer is a daemon thread and may still be winding down -- the join
+        # above waits two seconds and then says so. If it holds the stderr buffer's
+        # lock when CPython finalizes, the interpreter aborts with
+        # `_enter_buffered_busy` and the process exits 134, so a run that finished
+        # every step and wrote every checkpoint reports itself as crashed. Every
+        # subprocess has been reaped by this point and the only work left is
+        # finalization itself, so flush what we own and go.
+        #
+        # An abort does not take this door: the raise below is what turns a dead
+        # component into a non-zero exit, and exiting 0 here would hide it.
+        if not abort.reason:
+            logging.shutdown()
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            os._exit(0)
 
     # After teardown, not instead of it: the finally block above reaps the vLLM
     # process trees, and exiting early would strand them holding GPUs. Raising

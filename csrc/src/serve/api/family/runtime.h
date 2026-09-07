@@ -1,0 +1,284 @@
+#pragma once
+
+#include "api/types.h"
+#include "core/paged_kv_cache.h"
+#include "runtime/contract/transient_region.h"
+#include "runtime/contract/types.h"
+#include "runtime/contract/round_lifecycle.h"
+#include <api/family/text_geometry.h>
+#include <api/family/prepared_prompt.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+
+namespace sinfer {
+struct DeviceContext;
+}
+
+namespace sinfer::family {
+
+/// Which mixer a family's non-attending layers run.
+///
+/// Every hybrid target here ran a gated delta net, so that stayed implicit. LFM2's non-attending
+/// layers run a short convolution instead -- three taps, a gate applied outside, no recurrent
+/// state at all -- which is a different mixer in the same slot of the same schedule, not a
+/// differently-shaped one. A target names its kind; one that names nothing gets the delta net,
+/// so nothing about the registered targets changes.
+enum class LinearMixer : std::uint8_t {
+    GatedDelta,
+    ShortConv,
+    /// Kimi Delta Attention: the gated delta net's recurrence with the forget gate per key
+    /// channel rather than per head. Everything around it -- the fused q|k|v, the causal
+    /// convolution, the gated output norm, the output projection -- is the delta net's, so a
+    /// target that runs it takes the same leaves and only the gate is wider.
+    KimiDelta,
+};
+
+/// Whether a mixer's forget gate is one value per value head or one per key channel of it.
+/// The control projection writes that many rows and the recurrence reads them.
+[[nodiscard]] constexpr bool linear_mixer_gate_is_per_channel(LinearMixer mixer) noexcept {
+    return mixer == LinearMixer::KimiDelta;
+}
+
+enum class TextPhase {
+    Prefill,
+    Verify,
+};
+
+struct GraphExecutionProfile {
+    std::uint32_t min            = 0;
+    std::uint32_t max            = 0;
+    std::uint32_t topology_class = 0;
+};
+
+namespace detail {
+template <class Variant>
+struct SequencePlanImpl;
+template <class Variant>
+struct SequencePlannerImpl;
+template <class Variant>
+struct RequestPlanImpl;
+template <class Variant>
+struct RequestBasePlanImpl;
+template <class Variant>
+class ProgramImpl;
+} // namespace detail
+
+template <class Variant>
+class SequencePlanner;
+
+// These are the complete family execution types. Exact packages bind them to a private Variant;
+// target selection remains outside this layer and happens once in the closed Engine registry.
+template <class Variant>
+class SequencePlan {
+public:
+    SequencePlan(SequencePlan&&) noexcept;
+    SequencePlan& operator=(SequencePlan&&) noexcept;
+    ~SequencePlan();
+
+    SequencePlan(const SequencePlan&)            = delete;
+    SequencePlan& operator=(const SequencePlan&) = delete;
+
+    [[nodiscard]] std::uint32_t capacity() const noexcept;
+    [[nodiscard]] std::uint32_t kv_capacity() const noexcept;
+    [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
+    [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
+    [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
+    [[nodiscard]] std::size_t request_transient_capacity_bytes() const noexcept;
+
+public:
+    // Family-private construction/storage seam; exact packages expose only the completed alias.
+    explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept;
+    std::unique_ptr<detail::SequencePlanImpl<Variant>> impl_;
+
+    template <class V>
+    friend class SequencePlanner;
+    template <class V>
+    friend class detail::ProgramImpl;
+};
+
+template <class Variant>
+class SequencePlanner {
+public:
+    SequencePlanner(SequencePlanner&&) noexcept;
+    SequencePlanner& operator=(SequencePlanner&&) noexcept;
+    ~SequencePlanner();
+
+    SequencePlanner(const SequencePlanner&)            = delete;
+    SequencePlanner& operator=(const SequencePlanner&) = delete;
+
+    [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
+    [[nodiscard]] SequencePlan<Variant> finalize(std::uint32_t main_page_groups) &&;
+
+public:
+    explicit SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl) noexcept;
+    std::unique_ptr<detail::SequencePlannerImpl<Variant>> impl_;
+
+    template <class V>
+    friend SequencePlanner<V> make_sequence_planner(DeviceContext&, const EngineOptions&,
+                                                    typename V::WeightsProfile,
+                                                    const TextGeometry&);
+};
+
+template <class Variant>
+class RequestBasePlan {
+public:
+    RequestBasePlan(RequestBasePlan&&) noexcept;
+    RequestBasePlan& operator=(RequestBasePlan&&) noexcept;
+    ~RequestBasePlan();
+
+    RequestBasePlan(const RequestBasePlan&)            = delete;
+    RequestBasePlan& operator=(const RequestBasePlan&) = delete;
+
+    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+
+public:
+    explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
+    std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl_;
+};
+
+template <class Variant>
+class RequestPlan {
+public:
+    RequestPlan(RequestPlan&&) noexcept;
+    RequestPlan& operator=(RequestPlan&&) noexcept;
+    ~RequestPlan();
+
+    RequestPlan(const RequestPlan&)            = delete;
+    RequestPlan& operator=(const RequestPlan&) = delete;
+
+    [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+
+public:
+    // Family-private construction/storage seam. This header is repository-internal; exact
+    // packages expose only the completed alias and never inspect this pointer.
+    explicit RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept;
+    std::unique_ptr<detail::RequestPlanImpl<Variant>> impl_;
+};
+
+template <class Variant>
+class Program {
+public:
+    ~Program() noexcept;
+
+    Program(const Program&)            = delete;
+    Program& operator=(const Program&) = delete;
+    Program(Program&&)                 = delete;
+    Program& operator=(Program&&)      = delete;
+
+    // Engine-internal fixed-lane execution surface. The public Engine owns scheduling; Program
+    // owns target state images and executes one immutable decode batch membership.
+    [[nodiscard]] RequestBasePlan<Variant>
+    plan_request_base(const PreparedPrompt& prompt,
+                      const runtime::ResolvedExecutionOptions& options);
+    [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
+                                                             const PreparedPrompt& prompt,
+                                                             const RequestBasePlan<Variant>& base);
+    [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
+                                      const RequestPlan<Variant>& plan) const noexcept;
+    [[nodiscard]] bool
+    can_admit_lane_after_retained_eviction(std::uint32_t lane,
+                                           const RequestPlan<Variant>& plan) const noexcept;
+    [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
+    [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
+                                                                PreparedPrompt&& prompt,
+                                                                RequestPlan<Variant>&& plan,
+                                                                runtime::TransientRegion transient,
+                                                                bool defer_first_chunk = false);
+    [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    decode_batch(std::span<const std::uint32_t> lanes,
+                 std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::MixedRoundResult
+    advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes, std::span<const std::uint32_t> lanes,
+                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept;
+    // One line describing the most recent mixed round for a given decode row:
+    // the band its graph was keyed on, the batch maximum frontier, and the
+    // row's own frontier. Used by the executor's corruption attribution.
+    [[nodiscard]] std::string last_mixed_round_description(std::size_t row) const;
+    void set_round_burst_limit(std::uint32_t limit) noexcept;
+    void resolve_prefill_lane(std::uint32_t lane, bool terminal);
+    void resolve_pending_batch(std::span<const std::uint32_t> lanes,
+                               std::span<const std::uint32_t> accepted_tokens,
+                               std::span<const std::uint8_t> terminal,
+                               std::span<const std::uint8_t> cancelled);
+    void abort_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
+    void evict_retained_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+
+    [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] PagedKVOccupancy kv_occupancy() const noexcept;
+    /// Blocks until an elastic Main pool has no map or unmap work pending (no-op otherwise).
+    void kv_settle() noexcept;
+    /// True while the device this program's elastic pool lives on is short of KV memory:
+    /// the executor gives up its retained (prefix-cache) lanes until it clears.
+    [[nodiscard]] bool kv_under_pressure() const noexcept;
+    /// Round boundary on the executor thread: gives back the reserve if another engine on the
+    /// device asked, and reports whether the device is under pressure.
+    bool kv_service_pressure() noexcept;
+    void reset_memory_peaks() noexcept;
+    /// Pipeline stage before the last: the pinned buffer holding the residual it exports
+    /// (the next stage's `pipeline_import_pinned`); null for a whole-model program.
+    [[nodiscard]] const void* stage_export_buffer() const noexcept;
+    /// Pipeline stage after the first: its own pinned import buffer; null otherwise.
+    [[nodiscard]] void* stage_import_buffer() const noexcept;
+    /// Bytes of the boundary buffers ([residual, boundary columns] BF16); 0 for a whole model.
+    [[nodiscard]] std::size_t stage_boundary_bytes() const noexcept;
+    [[nodiscard]] std::int32_t stage_boundary_columns() const noexcept;
+    /// Pipeline driver: overwrite the placeholder tokens a head-less stage recorded this round.
+    void replace_pending_tokens(std::span<const std::uint32_t> lanes, std::span<const TokenId> tokens);
+    /// Pipeline driver: the decode round in two halves — enqueue without synchronising, then
+    /// synchronise and commit (the RoundLifecycle seam); at most one round in flight.
+    [[nodiscard]] runtime::RoundHandle launch_decode_round(std::span<const std::uint32_t> lanes,
+                                                           std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound consume_decode_round(runtime::RoundHandle handle);
+    [[nodiscard]] runtime::RoundHandle launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
+                                                          std::span<const std::uint32_t> lanes,
+                                                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::MixedRoundResult consume_mixed_round(runtime::RoundHandle handle);
+    /// Pipeline driver, speculative rounds. A decode round licenses up to `width` tokens per
+    /// lane. The stage with the head decides the round -- the licensed tokens and the next
+    /// drafts, per lane -- and hands that decision out as bytes the stages without the head
+    /// adopt before every stage folds on it; a lane's draft state after a prefill crosses the
+    /// same way. The bytes are the family's own record and opaque to the driver.
+    [[nodiscard]] std::uint32_t speculative_round_width() const noexcept;
+    /// Decode lanes in flight this round, across every group of a pipeline: an MTP round
+    /// verifies drafts only within the run's width limit and runs its narrow round otherwise.
+    void set_round_width_hint(std::uint32_t lanes) noexcept;
+    /// Whether an MTP round of `lanes` rows would run narrow under the current width hint.
+    [[nodiscard]] bool speculative_round_is_narrow(std::size_t lanes) const noexcept;
+    [[nodiscard]] std::span<const std::byte> speculative_outcome() const noexcept;
+    void adopt_speculative_outcome(std::span<const std::uint32_t> lanes,
+                                   std::span<const std::byte> outcome);
+    [[nodiscard]] std::span<const std::byte> lane_draft_state(std::uint32_t lane) const;
+    void adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state);
+
+private:
+    explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
+    std::unique_ptr<detail::ProgramImpl<Variant>> impl_;
+
+    template <class V>
+    friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
+                                                      typename V::WeightsProfile, SequencePlan<V>&&,
+                                                      DeviceContext&);
+};
+
+template <class Variant>
+[[nodiscard]] SequencePlanner<Variant>
+make_sequence_planner(DeviceContext& device, const EngineOptions& options,
+                      typename Variant::WeightsProfile weights_profile,
+                      const TextGeometry& geometry);
+
+template <class Variant>
+[[nodiscard]] std::unique_ptr<Program<Variant>>
+create_program(const typename Variant::ModelView& model,
+               typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
+               DeviceContext& device);
+
+} // namespace sinfer::family

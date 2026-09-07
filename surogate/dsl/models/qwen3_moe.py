@@ -7,6 +7,7 @@ from ..modules import Embedding, LMHead, RMSNorm
 from ..blocks.qwen3_moe import Qwen3MoEBlock
 from ..hf import build_attn_mappings, build_moe_mappings, build_norm_mappings
 from ..modules.attention import Qwen3Attention
+from ..block_schema import ServeObject
 from ..blocks.common import STANDARD_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
@@ -30,6 +31,22 @@ from ..specs import ActivationScope
 )
 class Qwen3MoEModel(nn.Model):
     """Qwen3 Mixture of Experts model."""
+
+    #: The endpoints; per-layer objects come from the block schema. Qwen3-MoE does not tie its
+    #: output head, so the head is its own object.
+    _serve_objects_ = (
+        ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",),
+                    scope="model"),
+        ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
+        ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",),
+                    scope="model"),
+    )
+    #: One block type on every layer: the mixture is on all of them.
+    _serve_blocks_ = {"moe": Qwen3MoEBlock}
+
+    @staticmethod
+    def _serve_block_schedule_(config: dict) -> list[str]:
+        return ["moe"] * int(config["n_layers"])
 
     _name_remap_ = STANDARD_MODEL_NAME_REMAP
     _hf_block_mappings_ = {

@@ -5,6 +5,7 @@ from __future__ import annotations
 from .. import nn
 from ..modules import Embedding, LMHead, RMSNorm
 from ..blocks.llama import LlamaBlock
+from ..block_schema import ServeObject
 from ..hf import build_dense_block_mappings
 from ..blocks.common import STANDARD_MODEL_NAME_REMAP
 from ..specs import ActivationScope
@@ -34,6 +35,24 @@ class LlamaModel(nn.Model):
         "lm_head": "lm_head.weight",
     }
 
+    #: The rest of the artifact: per-layer objects come from the block schema, these
+    #: are the endpoints. A checkpoint that ties its output head to the embedding maps
+    #: `lm_head` to the embedding tensor; that is a property of the checkpoint, so the
+    #: recipe reads it from the config rather than the declaration stating it twice.
+    _serve_objects_ = (
+        ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",),
+                    scope="model"),
+        ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
+        ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",),
+                    scope="model"),
+    )
+    #: One block type on every layer. Named so the object walk has a schedule to read.
+    _serve_blocks_ = {"dense": LlamaBlock}
+
+    @staticmethod
+    def _serve_block_schedule_(config: dict) -> list[str]:
+        return ["dense"] * int(config["n_layers"])
+
     def __init__(
         self,
         vocab_size: int = 32000,
@@ -43,7 +62,7 @@ class LlamaModel(nn.Model):
         num_kv_heads: int = 8,
         d_ff: int = 11008,
         max_seq: int = 4096,
-        head_size: int = 128,
+        head_size: int = 0,
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -57,7 +76,14 @@ class LlamaModel(nn.Model):
         self.head_size = head_size
         self.eps = eps
 
+        # A checkpoint predating the explicit `head_dim` key (TinyLlama, Llama 2)
+        # omits it, so the head dim is derived. Surface the resolved value rather
+        # than the argument: the serve contract reads these attributes off the
+        # instance, and would otherwise take the default over the truth.
         self.D = head_size if head_size > 0 else d_model // num_query_heads
+        self.head_size = self.D
+        # Llama rotates the whole head.
+        self.rotary_dim = self.D
 
         self.embedding = Embedding(vocab_size, d_model)
         self.blocks = nn.BlockStack(
@@ -66,7 +92,7 @@ class LlamaModel(nn.Model):
             d_model=d_model,
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
-            head_size=head_size,
+            head_size=self.D,
             d_ff=d_ff,
             max_seq=max_seq,
             eps=eps,

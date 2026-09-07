@@ -489,6 +489,8 @@ def _serialize_hf_spec(spec: Any) -> Any:
             payload["num_experts"] = spec.num_experts
         if spec.fuse_gate_up:
             payload["fuse_gate_up"] = spec.fuse_gate_up
+        if getattr(spec, "up_pattern", ""):
+            payload["up_pattern"] = spec.up_pattern
         return payload
     raise DSLError(
         ErrorCode.E010,
@@ -1696,6 +1698,10 @@ def compile_model_spec(
             _important_int_attrs = {"d_ff"}
             _important_float_attrs = {
                 "routed_scaling_factor",
+                # Gemma scales its embedding lookup by sqrt(hidden). The serving
+                # engine has to apply the same factor, and reading it off the
+                # declaration is what stops the two from drifting apart.
+                "embedding_scale",
                 "sliding_rope_theta",
                 "sliding_partial_rotary_factor",
                 "full_rope_theta",
@@ -2333,16 +2339,32 @@ def compile_model_for_hf(
 
     # Build config from HF config using the mapping
     def _get_hf_value(config_dict: dict[str, Any], key: str) -> Any | None:
-        if key in config_dict:
-            return config_dict[key]
-        if "." not in key:
-            return None
-        cur: Any = config_dict
-        for part in key.split("."):
-            if not isinstance(cur, dict) or part not in cur:
-                return None
-            cur = cur[part]
-        return cur
+        """One config value, by key, dotted path, or `a|b` alternatives.
+
+        Alternatives exist because a family renames a field and both spellings stay
+        in the wild: LFM2 states its FFN width as `block_ff_dim`, while the same
+        quantity is `intermediate_size` elsewhere. Mapping to a single name meant
+        reading the absent one, silently keeping the declaration's default, and
+        building a model a third narrower than the checkpoint it was about to load.
+        The first alternative that is present wins.
+        """
+        for alternative in key.split("|"):
+            alternative = alternative.strip()
+            if not alternative:
+                continue
+            if alternative in config_dict:
+                return config_dict[alternative]
+            if "." not in alternative:
+                continue
+            cur: Any = config_dict
+            for part in alternative.split("."):
+                if not isinstance(cur, dict) or part not in cur:
+                    cur = None
+                    break
+                cur = cur[part]
+            if cur is not None:
+                return cur
+        return None
 
     config = {}
     if spec.hf_config:

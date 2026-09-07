@@ -673,12 +673,9 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             if (spec->fuse_gate_up) {
                 // Load gate_proj and up_proj for each expert and fuse into gate_up format
                 // gate_up layout: [up; gate] per expert, so first D rows are up, next D rows are gate
-                std::string gate_pattern = spec->source;
-                std::string up_pattern = spec->source;
-                std::size_t pos = up_pattern.find("gate_proj");
-                if (pos != std::string::npos) {
-                    up_pattern.replace(pos, 9, "up_proj");
-                }
+                const std::string gate_pattern = spec->source;
+                const std::string up_pattern =
+                    MappingSpec::derive_up_pattern(spec->source, spec->up_source);
 
                 // Expert tensor shape: [2*D, C] where D = intermediate_size
                 // Each sub-tensor (gate/up) has shape [D, C]
@@ -945,12 +942,9 @@ void DslModel::export_weights(const std::string& file_name, NCCLCommunicator& co
             if (spec->fuse_gate_up) {
                 // Export fused gate_up tensor as separate gate_proj and up_proj per expert
                 // Layout: [E, 2*D, C] where first D rows are up, next D rows are gate
-                std::string gate_pattern = spec->source;
-                std::string up_pattern = spec->source;
-                std::size_t pos = up_pattern.find("gate_proj");
-                if (pos != std::string::npos) {
-                    up_pattern.replace(pos, 9, "up_proj");
-                }
+                const std::string gate_pattern = spec->source;
+                const std::string up_pattern =
+                    MappingSpec::derive_up_pattern(spec->source, spec->up_source);
 
                 const long fused_rows = param.Rank >= 2 ? param.Sizes[1] : 1;
                 const long D = fused_rows / 2;

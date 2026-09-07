@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 from .. import nn
+from ..blocks.qwen3_5 import (
+    Qwen3_5AttentionBlock,
+    Qwen3_5LinearBlock,
+    _DENSE_ATTENTION_OBJECTS,
+    _DENSE_MLP_OBJECTS,
+    _DENSE_NORM_OBJECTS,
+)
+from ..block_schema import ServeObject, ServeSection
 from ..modules import Embedding, LMHead, RMSNormPlus1
 from ..modules.attention import _resolve_rotary_dim
 from ..blocks.qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
@@ -10,6 +18,136 @@ from ..hf import build_mlp_mappings, build_norm_mappings
 from ..blocks.qwen3_5 import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
+
+#: Model-level objects as a serving artifact stores them; the per-layer ones live
+#: on the block schemas. Draft-head and MTP objects are not listed: they belong to
+#: a speculative-decoding head the declaration does not describe.
+QWEN3_5_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",), scope="model"),
+    ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
+    ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",), scope="model"),
+    # The speculative draft head projects onto a subset of the vocabulary and
+    # carries the token ids of that subset. It is a serving component with no
+    # counterpart in the training graph, so it declares no source parameters.
+    ServeObject("text/draft_head", "quantised", ("DraftVocab", "C"), scope="model"),
+    ServeObject("text/draft_head_token_ids", "i32", ("DraftVocab",), scope="model"),
+)
+
+#: Serving carries the vision tower on every target, so it is declared here rather
+#: than left to each converter. The geometry is this model's own — the towers
+#: differ (0.8B is 12 layers of 768, the 2B and 4B are 24 of 1024) — which is why
+#: a builder that hardcodes one family's tower cannot serve them all.
+
+
+#: The multi-token-prediction head: an embedding/hidden norm pair, a projection
+#: that folds the two together, and one decoder layer identical in shape to a
+#: text attention block — which is why it reuses the same object declarations
+#: rather than restating them.
+QWEN3_5_MTP_SERVE_SECTION = ServeSection(
+    prefix="mtp/",
+    hf_prefix="mtp.",
+    hf_layer="mtp.layers.0",
+    objects=(
+        ServeObject("input_projection", "quantised", ("C", "TwoC"), source="fc.weight"),
+        ServeObject("embedding_norm", "bf16", ("C",), source="pre_fc_norm_embedding.weight"),
+        ServeObject("hidden_norm", "bf16", ("C",), source="pre_fc_norm_hidden.weight"),
+        *(
+            ServeObject("layer/" + o.name, o.format, o.shape, o.components, transform=o.transform)
+            for o in (*_DENSE_NORM_OBJECTS[:1], *_DENSE_ATTENTION_OBJECTS,
+                      *_DENSE_NORM_OBJECTS[1:], *_DENSE_MLP_OBJECTS)
+        ),
+        ServeObject("final_norm", "bf16", ("C",), source="norm.weight"),
+    ),
+)
+
+
+def capture_vision_geometry(vision_config: dict | bool | None) -> dict[str, int]:
+    """Vision-tower geometry, so the declaration describes the whole served model.
+
+    The tower is not part of the training graph here, but a served artifact carries
+    it, and the single source of truth for what an artifact contains has to be able
+    to say so. `use_visual_inputs` already receives the entire `vision_config`; this
+    keeps its geometry instead of collapsing it to a flag.
+    """
+
+    if not isinstance(vision_config, dict):
+        return {}
+    hidden = int(vision_config.get("hidden_size", 0))
+    patch = int(vision_config.get("patch_size", 0))
+    temporal = int(vision_config.get("temporal_patch_size", 1))
+    channels = int(vision_config.get("in_channels", 3))
+    merge = int(vision_config.get("spatial_merge_size", 1))
+    heads = int(vision_config.get("num_heads", 0))
+    return {
+        "vision_layers": int(vision_config.get("depth", 0)),
+        "vision_hidden": hidden,
+        "vision_intermediate": int(vision_config.get("intermediate_size", 0)),
+        "vision_heads": heads,
+        "vision_patch_rows": patch * patch * channels * temporal,
+        "vision_position_embeddings": int(vision_config.get("num_position_embeddings", 0)),
+        "vision_qkv_rows": 3 * hidden,
+        "vision_merger_hidden": hidden * merge * merge,
+        "vision_out_hidden": int(vision_config.get("out_hidden_size", 0)),
+    }
+
+
+#: The vision tower, identical across every target that carries one: a patch
+#: embedding, a position table, `vision_layers` encoder blocks and a merger that
+#: projects into the text width. Formats are left to the export profile except the
+#: norms and biases, which are never quantised.
+QWEN3_5_VISION_SERVE_SECTION_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("attention/qkv", "quantised", ("VisionQkvRows", "VisionHidden")),
+    ServeObject("attention/qkv_bias", "bf16", ("VisionQkvRows",)),
+    ServeObject("attention/output", "quantised", ("VisionHidden", "VisionHidden")),
+    ServeObject("attention/output_bias", "bf16", ("VisionHidden",)),
+    ServeObject("mlp/fc1", "quantised", ("VisionIntermediate", "VisionHidden")),
+    ServeObject("mlp/fc1_bias", "bf16", ("VisionIntermediate",)),
+    ServeObject("mlp/fc2", "quantised", ("VisionHidden", "VisionIntermediate")),
+    ServeObject("mlp/fc2_bias", "bf16", ("VisionHidden",)),
+    ServeObject("norm1/weight", "bf16", ("VisionHidden",)),
+    ServeObject("norm1/bias", "bf16", ("VisionHidden",)),
+    ServeObject("norm2/weight", "bf16", ("VisionHidden",)),
+    ServeObject("norm2/bias", "bf16", ("VisionHidden",)),
+)
+
+QWEN3_5_VISION_HEAD_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("vision/patch_embedding", "quantised", ("VisionHidden", "VisionPatchRows"),
+                scope="model", capability="vision"),
+    ServeObject("vision/patch_embedding_bias", "bf16", ("VisionHidden",), scope="model",
+                capability="vision"),
+    ServeObject("vision/position_embedding", "bf16",
+                ("VisionPositionEmbeddings", "VisionHidden"), scope="model",
+                capability="vision"),
+)
+
+QWEN3_5_VISION_MERGER_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("vision/merger/fc1", "quantised", ("VisionMergerHidden", "VisionMergerHidden"),
+                scope="model", capability="vision"),
+    ServeObject("vision/merger/fc1_bias", "bf16", ("VisionMergerHidden",), scope="model",
+                capability="vision"),
+    ServeObject("vision/merger/fc2", "quantised", ("C", "VisionMergerHidden"),
+                scope="model", capability="vision"),
+    ServeObject("vision/merger/fc2_bias", "bf16", ("C",), scope="model", capability="vision"),
+    ServeObject("vision/merger/norm/weight", "bf16", ("VisionHidden",), scope="model",
+                capability="vision"),
+    ServeObject("vision/merger/norm/bias", "bf16", ("VisionHidden",), scope="model",
+                capability="vision"),
+)
+
+QWEN3_5_VISION_SERVE_SECTION = ServeSection(
+    prefix="vision/layers/",
+    objects=QWEN3_5_VISION_SERVE_SECTION_OBJECTS,
+    repeat="vision_layers",
+    capability="vision",
+)
+
+# Serving always carries the tower, so the model-level object list gains its head
+# and merger. Declared after both halves exist so the ordering stays readable.
+QWEN3_5_MODEL_SERVE_OBJECTS = (
+    *QWEN3_5_MODEL_SERVE_OBJECTS,
+    *QWEN3_5_VISION_HEAD_OBJECTS,
+    *QWEN3_5_VISION_MERGER_OBJECTS,
+)
 
 def _parse_qwen3_5_layer_types(
     layer_types: list[str] | None,
@@ -125,6 +263,18 @@ def _build_qwen3_5_conditional_block_mappings(layer_prefix: str) -> dict[str, ob
 )
 class Qwen3_5CausalModel(nn.Model):
     """Qwen3.5 dense text model for ``Qwen3_5ForCausalLM``."""
+
+    #: The complete artifact this model is served as: per-layer objects come from
+    #: the block schemas, these are the rest. `draft_head_vocab` is the size of the
+    #: vocabulary subset the speculative head predicts over — a property of the
+    #: served model, so it is declared rather than hardcoded in a converter.
+    _serve_objects_ = QWEN3_5_MODEL_SERVE_OBJECTS
+    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION, QWEN3_5_VISION_SERVE_SECTION)
+    _serve_blocks_ = {
+        "attention": Qwen3_5AttentionBlock,
+        "mamba": Qwen3_5LinearBlock,
+    }
+    draft_head_vocab = 131072
 
     _name_remap_ = QWEN3_5_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_qwen3_5_block_mappings("model.layers.{layer}")
@@ -309,6 +459,18 @@ class Qwen3_5CausalModel(nn.Model):
 class Qwen3_5ConditionalModel(nn.Model):
     """Qwen3.5 dense text model for ``Qwen3_5ForConditionalGeneration``."""
 
+    #: The complete artifact this model is served as: per-layer objects come from
+    #: the block schemas, these are the rest. `draft_head_vocab` is the size of the
+    #: vocabulary subset the speculative head predicts over — a property of the
+    #: served model, so it is declared rather than hardcoded in a converter.
+    _serve_objects_ = QWEN3_5_MODEL_SERVE_OBJECTS
+    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION, QWEN3_5_VISION_SERVE_SECTION)
+    _serve_blocks_ = {
+        "attention": Qwen3_5AttentionBlock,
+        "mamba": Qwen3_5LinearBlock,
+    }
+    draft_head_vocab = 131072
+
     _name_remap_ = QWEN3_5_VL_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_qwen3_5_conditional_block_mappings(
         "model.language_model.layers.{layer}",
@@ -362,6 +524,8 @@ class Qwen3_5ConditionalModel(nn.Model):
         self.full_attention_interval = full_attention_interval
         self.chunk_size = chunk_size
         self.use_visual_inputs = bool(use_visual_inputs)
+        for _key, _value in capture_vision_geometry(use_visual_inputs).items():
+            setattr(self, _key, _value)
 
         # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads

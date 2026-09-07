@@ -155,6 +155,24 @@ __global__ void silu_backward_kernel(T* dinp, const T* inp, const T* dout, long 
 }
 
 template <typename T>
+__global__ void sigmoid_forward_kernel(T* out, const T* inp, long n) {
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float x = to_float(inp[idx]);
+    out[idx] = from_float<T>(sigmoid<T>(x));
+}
+
+template <typename T>
+__global__ void sigmoid_backward_kernel(T* dinp, const T* inp, const T* dout, long n) {
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float x = to_float(inp[idx]);
+    float dy = to_float(dout[idx]);
+    float s = sigmoid<T>(x);
+    dinp[idx] = from_float<T>(dy * s * (1.0f - s));
+}
+
+template <typename T>
 __global__ void gelu_backward_kernel(T* dinp, const T* inp, const T* dout, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -228,6 +246,24 @@ void launch_silu_backward(T* dinp, const T* inp, const T* dout, long n, cudaStre
 }
 
 template <typename T>
+void launch_sigmoid_forward(T* out, const T* inp, long n, cudaStream_t stream) {
+    if (n == 0) return;
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    sigmoid_forward_kernel<T><<<grid, block, 0, stream>>>(out, inp, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+void launch_sigmoid_backward(T* dinp, const T* inp, const T* dout, long n, cudaStream_t stream) {
+    if (n == 0) return;
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    sigmoid_backward_kernel<T><<<grid, block, 0, stream>>>(dinp, inp, dout, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
 void launch_gelu_backward(T* dinp, const T* inp, const T* dout, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
@@ -276,6 +312,22 @@ void silu_backward(float* dinp, const float* inp, const float* dout, long n, cud
 
 void silu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream) {
     launch_silu_backward(dinp, inp, dout, n, stream);
+}
+
+void sigmoid_forward(float* out, const float* inp, long n, cudaStream_t stream) {
+    launch_sigmoid_forward(out, inp, n, stream);
+}
+
+void sigmoid_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream) {
+    launch_sigmoid_forward(out, inp, n, stream);
+}
+
+void sigmoid_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream) {
+    launch_sigmoid_backward(dinp, inp, dout, n, stream);
+}
+
+void sigmoid_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream) {
+    launch_sigmoid_backward(dinp, inp, dout, n, stream);
 }
 
 void softplus_forward(float* out, const float* inp, long n, cudaStream_t stream) {

@@ -1,0 +1,208 @@
+// surogate vendor patch (PATCHES.md #25): cutlass sm_120a blockscaled NVFP4
+// GEMM instantiations (see w4fp4_cutlass_gemm.h). Isolated TU: cutlass is
+// header-only and heavy; nothing else includes it.
+
+#include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
+
+#include <cuda_bf16.h>
+#include <type_traits>
+
+#include "cutlass/arch/arch.h"
+#include "cutlass/cutlass.h"
+#include "cutlass/detail/sm100_blockscaled_layout.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/gemm.h"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler.hpp"
+#include "cutlass/kernel_hardware_info.h"
+#include "cutlass/util/packed_stride.hpp"
+
+namespace sinfer::ops::detail {
+namespace {
+
+using namespace cute;
+
+// CTA 128x128x128 measured best at the 4B shapes (679-813 TF/s); the 27B's prompt rounds are
+// measured on both this and 256x128x128 (the cooperative schedule's two consumer warpgroups
+// each take 128 tokens), which is the tile vLLM's kernel runs.
+template <bool WithResidual, class Tile = Shape<_128, _128, _128>,
+          class Scheduler = cutlass::gemm::StaticPersistentScheduler,
+          class EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto,
+          bool SwapAB = false>
+struct GemmDef {
+    using OutElementType = cutlass::bfloat16_t;
+    using CTAShape       = Tile;
+    using Arch           = cutlass::arch::Sm120;
+    using ClusterShape   = Shape<_1, _1, _1>;
+    using ElementA       = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using LayoutA        = cutlass::layout::RowMajor;
+    static constexpr int AlignmentA = 32;
+    using ElementB       = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+    using LayoutB        = cutlass::layout::ColumnMajor;
+    static constexpr int AlignmentB = 32;
+    using ElementC       = std::conditional_t<WithResidual, cutlass::bfloat16_t, void>;
+    // Swapped, D is [rows, tokens] column-major: the same bytes as [tokens, rows] row-major.
+    using LayoutC        = std::conditional_t<SwapAB, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
+    static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<OutElementType>::value;
+    using ElementCompute     = float;
+    using ElementAccumulator = float;
+    using OperatorClass      = cutlass::arch::OpClassBlockScaledTensorOp;
+    using FusionOperation =
+        cutlass::epilogue::fusion::LinearCombination<OutElementType, float, ElementC, float>;
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        Arch, cutlass::arch::OpClassTensorOp, CTAShape, ClusterShape, EpilogueTile,
+        ElementAccumulator, ElementCompute,
+        ElementC, LayoutC, AlignmentC, OutElementType, LayoutC, AlignmentC,
+        cutlass::epilogue::TmaWarpSpecialized, FusionOperation>::CollectiveOp;
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        Arch, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,
+        ElementAccumulator, CTAShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+    using GemmKernel =
+        cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
+                                             CollectiveEpilogue, Scheduler>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
+
+// Stream-K keeps partial tiles and barriers in device memory. One buffer per device, taken
+// the first time a stream-K launch runs eagerly; a launch that needs it inside a graph
+// capture, or needs more, reports false and the caller's own route runs instead.
+constexpr std::size_t kStreamKWorkspaceBytes = std::size_t{64} << 20;
+void* streamk_workspace(std::size_t needed, cudaStream_t stream) {
+    static thread_local void* buffer = nullptr;
+    if (needed > kStreamKWorkspaceBytes) { return nullptr; }
+    if (buffer == nullptr) {
+        cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capturing) != cudaSuccess ||
+            capturing != cudaStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        if (cudaMalloc(&buffer, kStreamKWorkspaceBytes) != cudaSuccess) { buffer = nullptr; }
+    }
+    return buffer;
+}
+
+int device_sm_count() {
+    static const int count = [] {
+        int device = 0;
+        cudaGetDevice(&device);
+        return cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device);
+    }();
+    return count;
+}
+
+template <bool WithResidual, class Tile = Shape<_128, _128, _128>,
+          class Scheduler = cutlass::gemm::StaticPersistentScheduler,
+          class EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto, bool SwapAB = false>
+bool launch(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
+            const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom, const float* alpha_one,
+            void* c_bf16, void* d_bf16, std::int32_t tokens, std::int32_t n, std::int32_t k,
+            cudaStream_t stream, float alpha = 1.0f) {
+    using Def  = GemmDef<WithResidual, Tile, Scheduler, EpilogueTile, SwapAB>;
+    using Gemm = typename Def::Gemm;
+    using Cfg  = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+    typename Gemm::Arguments args;
+    args.mode          = cutlass::gemm::GemmUniversalMode::kGemm;
+    // Swapped: the weight is A (M = rows) and the activation B (N = tokens); the tile's 256
+    // rows then span weight rows, the activation is the operand every CTA re-reads, and D's
+    // column-major [rows, tokens] is the engine's token-major store.
+    const int rows_m = SwapAB ? n : tokens;
+    const int cols_n = SwapAB ? tokens : n;
+    args.problem_shape = make_shape(rows_m, cols_n, static_cast<int>(k), 1);
+    args.mainloop.ptr_A   = reinterpret_cast<cutlass::float_e2m1_t const*>(SwapAB ? w_codes : act_codes);
+    args.mainloop.ptr_B   = reinterpret_cast<cutlass::float_e2m1_t const*>(SwapAB ? act_codes : w_codes);
+    args.mainloop.ptr_SFA = reinterpret_cast<cutlass::float_ue4m3_t const*>(SwapAB ? w_sf_atom : act_sf_atom);
+    args.mainloop.ptr_SFB = reinterpret_cast<cutlass::float_ue4m3_t const*>(SwapAB ? act_sf_atom : w_sf_atom);
+    if constexpr (WithResidual) {
+        args.epilogue.ptr_C       = static_cast<cutlass::bfloat16_t const*>(c_bf16);
+        args.epilogue.thread.beta = 1.0f;
+    } else {
+        args.epilogue.ptr_C = nullptr;
+    }
+    args.epilogue.ptr_D            = static_cast<cutlass::bfloat16_t*>(d_bf16);
+    // A device pointer when the caller has one (the folded plane's constant one); otherwise the
+    // value itself, which a graph capture can carry.
+    args.epilogue.thread.alpha     = alpha;
+    args.epilogue.thread.alpha_ptr = alpha_one;
+    args.mainloop.dA =
+        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideA{}, {rows_m, k, 1});
+    args.mainloop.dB =
+        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideB{}, {cols_n, k, 1});
+    args.epilogue.dC =
+        cutlass::make_cute_packed_stride(typename Gemm::GemmKernel::StrideC{}, {rows_m, cols_n, 1});
+    args.epilogue.dD         = args.epilogue.dC;
+    args.mainloop.layout_SFA = Cfg::tile_atom_to_shape_SFA(args.problem_shape);
+    args.mainloop.layout_SFB = Cfg::tile_atom_to_shape_SFB(args.problem_shape);
+    args.hw_info.cluster_shape          = dim3(1, 1, 1);
+    args.hw_info.cluster_shape_fallback = dim3(1, 1, 1);
+    args.hw_info.device_id              = 0;
+    args.hw_info.sm_count               = device_sm_count();
+
+    // One adapter per instantiation: initialize validates and sets kernel
+    // attributes once; per-call updates go through initialize with a null
+    // workspace (StaticPersistentScheduler needs none).
+    static thread_local Gemm gemm;
+    if (gemm.can_implement(args) != cutlass::Status::kSuccess) { return false; }
+    void* workspace = nullptr;
+    if constexpr (std::is_same_v<Scheduler, cutlass::gemm::StreamKScheduler>) {
+        workspace = streamk_workspace(Gemm::get_workspace_size(args), stream);
+        if (workspace == nullptr) { return false; }
+    }
+    if (gemm.initialize(args, workspace, stream) != cutlass::Status::kSuccess) { return false; }
+    return gemm.run(stream) == cutlass::Status::kSuccess;
+}
+
+} // namespace
+
+bool w4fp4_cutlass_gemm_store(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
+                              const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom,
+                              const float* alpha_one, void* out_bf16, std::int32_t tokens,
+                              std::int32_t n, std::int32_t k, cudaStream_t stream) {
+    return launch<false>(act_codes, act_sf_atom, w_codes, w_sf_atom, alpha_one, nullptr, out_bf16,
+                         tokens, n, k, stream);
+}
+
+bool w4fp4_cutlass_gemm_residual(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
+                                 const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom,
+                                 const float* alpha_one, void* residual_bf16, std::int32_t tokens,
+                                 std::int32_t n, std::int32_t k, cudaStream_t stream) {
+    return launch<true>(act_codes, act_sf_atom, w_codes, w_sf_atom, alpha_one, residual_bf16,
+                        residual_bf16, tokens, n, k, stream);
+}
+
+bool nvfp4_cutlass_gemm(const std::uint8_t* act_codes, const std::uint8_t* act_sf_atom,
+                        const std::uint8_t* w_codes, const std::uint8_t* w_sf_atom, float alpha,
+                        void* residual_bf16, void* out_bf16, std::int32_t tokens, std::int32_t n,
+                        std::int32_t k, int tile, cudaStream_t stream) {
+    using Wide    = Shape<_256, _128, _128>;
+    using Narrow  = Shape<_128, _128, _128>;
+    using Static  = cutlass::gemm::StaticPersistentScheduler;
+    using StreamK = cutlass::gemm::StreamKScheduler;
+    void* c = residual_bf16;
+    void* d = residual_bf16 != nullptr ? residual_bf16 : out_bf16;
+    if (residual_bf16 != nullptr) {
+        switch (tile) {
+        case 1: return launch<true, Wide, Static>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
+        case 2: return launch<true, Wide, StreamK, Shape<_64, _32>>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
+        case 3: return launch<true, Narrow, StreamK>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
+        case 4: return launch<true, Wide, Static, cutlass::epilogue::collective::EpilogueTileAuto, true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
+        case 5: return launch<true, Narrow, Static, cutlass::epilogue::collective::EpilogueTileAuto, true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
+        default: return launch<true, Narrow, Static>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, c, d, tokens, n, k, stream, alpha);
+        }
+    }
+    switch (tile) {
+    case 1: return launch<false, Wide, Static>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
+    case 2: return launch<false, Wide, StreamK, Shape<_64, _32>>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
+    case 3: return launch<false, Narrow, StreamK>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
+    case 4: return launch<false, Wide, Static, cutlass::epilogue::collective::EpilogueTileAuto, true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
+    case 5: return launch<false, Narrow, Static, cutlass::epilogue::collective::EpilogueTileAuto, true>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
+    default: return launch<false, Narrow, Static>(act_codes, act_sf_atom, w_codes, w_sf_atom, nullptr, nullptr, d, tokens, n, k, stream, alpha);
+    }
+}
+
+} // namespace sinfer::ops::detail

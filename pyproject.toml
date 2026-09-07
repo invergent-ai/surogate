@@ -63,16 +63,42 @@ minimum-version = "build-system.requires"
 metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
 wheel.py-api = "cp312"
 wheel.packages = ["surogate"]
-build.targets = ["_surogate"]
+# The products of this build, all four of them EXCLUDE_FROM_ALL in csrc/CMakeLists.txt:
+# naming them here is what makes `uv build --wheel` produce them rather than only the
+# training extension module. `sinfer`/`sinfer-serve` are the CMake target names of
+# surogate-engine-cli and surogate-engine; libsinfer.so comes with them, and holds the
+# device code all three binaries and the serve module share.
+build.targets = [
+    "_surogate",
+    "llama-quantize",
+    "sinfer",
+    "sinfer-serve",
+    "surogate-embed",
+    "_surogate_serve",
+]
+# Install this project's own components and nothing else. Two reasons, both load-bearing:
+# ggml installs 23 public headers and a CMake package config whether or not anyone asked,
+# which a Python wheel has no use for; and llama.cpp's `tools/` -- which upstream's own gate
+# makes us enable to get `llama-quantize` at all -- carries install rules for targets this
+# build never asked for, so a component-less install dies on a missing libmtmd.a.
+install.components = ["surogate", "quantizer", "serve"]
 build-dir = "build/{wheel_tag}"
 cmake.build-type = "Release"
 
 [tool.scikit-build.cmake.define]
+# `surogate quantize` ships with the wheel, so the quantiser is built and installed with it.
+# Without this the command exists in the package and has nothing to run.
+SUROGATE_BUILD_QUANTIZER = "ON"
 PYTHON_BINDING = "ON"
 # USE_CUFILE / REQUIRE_CUFILE are deliberately not set here: they default to ON in
 # csrc/CMakeLists.txt. An explicit USE_CUFILE = "OFF" here is what silently shipped
 # every released wheel without GPUDirect Storage.
 CMAKE_CUDA_ARCHITECTURES = {env="CUDAARCHS"}
+# The wheel serves as well as trains, so a build host without FFmpeg or libcurl must fail
+# here rather than publish a package whose `surogate serve` exits 127. Note this governs
+# only the host libraries: the serve engine's device code is built for
+# SUROGATE_SERVE_CUDA_ARCHS (120a), independently of CUDAARCHS above.
+SUROGATE_REQUIRE_SERVE = "ON"
 
 [tool.uv]
 prerelease = "allow"

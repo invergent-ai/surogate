@@ -39,6 +39,9 @@ class AttentionConfig:
     # Attention masking
     sliding_window: int = 0
     window_per_layer: bool = False
+    #: Decoders mask the future; encoders do not. An embedding model or a
+    #: vision tower sets this False and every row then sees every column.
+    causal: bool = True
 
     # Biases
     qkv_bias: bool = False

@@ -5,6 +5,7 @@ from __future__ import annotations
 from .. import nn
 from ..modules import Embedding, LMHead, RMSNorm
 from ..blocks.qwen3 import Qwen3Block
+from ..block_schema import ServeObject
 from ..hf import build_dense_block_mappings
 from ..modules.attention import Qwen3Attention
 from ..blocks.common import STANDARD_MODEL_NAME_REMAP
@@ -37,6 +38,24 @@ class Qwen3Model(nn.Model):
         "lm_head": "lm_head.weight",
     }
 
+    #: The rest of the artifact: per-layer objects come from the block schema, these
+    #: are the endpoints. A checkpoint that ties its output head to the embedding maps
+    #: `lm_head` to the embedding tensor; that is a property of the checkpoint, so the
+    #: recipe reads it from the config rather than the declaration stating it twice.
+    _serve_objects_ = (
+        ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",),
+                    scope="model"),
+        ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
+        ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",),
+                    scope="model"),
+    )
+    #: One block type on every layer. Named so the object walk has a schedule to read.
+    _serve_blocks_ = {"dense": Qwen3Block}
+
+    @staticmethod
+    def _serve_block_schedule_(config: dict) -> list[str]:
+        return ["dense"] * int(config["n_layers"])
+
     def __init__(
         self,
         vocab_size: int = 151936,
@@ -60,6 +79,9 @@ class Qwen3Model(nn.Model):
         self.d_ff = d_ff
         self.max_seq = max_seq
         self.head_size = head_size
+        # Qwen3 rotates the whole head (no partial_rotary_factor), which the
+        # serve contract reads off the declaration rather than re-deriving.
+        self.rotary_dim = self.head_size
         self.eps = eps
         self.use_qkv_bias = use_qkv_bias
         self.use_qk_norm = use_qk_norm

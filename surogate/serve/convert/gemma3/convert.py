@@ -1,0 +1,803 @@
+"""Convert a Hugging Face `Gemma3ForCausalLM` checkpoint into one `.sinfer` artifact.
+
+Canonical invocation::
+
+    python -m surogate.serve.convert.gemma3.convert \
+      --model ~/.cache/huggingface/hub/models--google--gemma-3-270m-it/snapshots/<rev> \
+      --out /tmp/gemma3-270m.sinfer
+
+This is the Llama recipe with the differences Gemma 3 actually has.  Four are
+structural and live in `inventory.py`: four sandwich norms per layer, Q/K/V and
+gate/up kept separate rather than fused, per-head query and key norms, and a
+head that is tied to the embedding and therefore *not stored* — `text/output_head`
+is a role `inventory.ALIAS_SPECS` puts on `text/token_embedding`, and
+`targets/gemma3/impl/load/bindings.cpp` fills both from the one table.  Three
+more are properties of the numbers rather than of the object list, and each is
+silent when wrong:
+
+* **The norms are zero-centred and pass through untouched.**  `Gemma3RMSNorm`
+  is `x_normed * (1 + w)`, so a Gemma checkpoint stores `w`, not the scale.  The
+  DSL declares every norm object with `transform="unfold_unit_offset"` and states
+  the invariant the transform names: the artifact holds the *unfolded* `w`
+  because the runtime re-applies the one itself.  A safetensors checkpoint
+  already holds `w`, so this converter copies.  The subtraction that name
+  suggests belongs to the GGUF path — `convert/gemma_embedding/` reads the folded
+  `1 + w` and takes a one off every norm on the way in.  Getting this backwards
+  in either direction is quiet: the artifact would hold `1 + w`, the runtime
+  would make it `2 + w`, and nothing would raise.
+
+* **The embedding is stored unscaled.**  Gemma multiplies the looked-up row by
+  `sqrt(hidden)` before the first block; the engine carries that factor as
+  `config.h::embedding_scale` (25.29822 for hidden 640), so folding it in here
+  would apply it twice.
+
+* **The local/global schedule and the attention scale are compile-time constants
+  in the engine.**  `config.h` bakes in `sliding_window 512`, the schedule itself
+  as `kWindowedAttention` (one bool per layer), the two rope bases, and
+  `kAttentionScale = 0.0625` — which is `query_pre_attn_scalar ** -0.5` for a
+  scalar of 256, *not* `1/sqrt(head_dim)` in general (Gemma3-27B has scalar 168
+  against head_dim 128).  So the converter resolves the checkpoint's own schedule
+  — from `layer_types` or from a `sliding_window_pattern` period, whichever the
+  export wrote — and refuses one that disagrees, rather than letting an artifact
+  load and be served with the wrong masks and rope bases.
+
+Two facts about the release shape the code below.  It is a single unsharded
+`model.safetensors` with no index, like the TinyLlama and Qwen3 releases.  And
+unlike them it *does* publish `chat_template.jinja` as a file of its own — the
+fallback that lifts the template out of `tokenizer_config.json` is kept anyway,
+because the engine cross-checks the two and a Gemma release that shipped only
+the config would otherwise be refused for a file it does not need.
+
+`config.json` here declares `model_type: "gemma3_text"`, which the DSL registers
+against `Gemma3TextModel` — the *bare backbone* EmbeddingGemma publishes, with
+root-level tensors and no head.  The architecture, not the model type, is what
+separates the two, so `architectures[0]` is what this converter matches on.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+
+from surogate.serve.artifact.container import (
+    ArtifactIdentity,
+    ArtifactObject,
+    ArtifactWriter,
+)
+from surogate.serve.convert.common.quantize import pick_device
+from surogate.serve.convert.common.gguf_repack import (
+    GgufRepackSource,
+    RepackError,
+    half_names,
+)
+from surogate.serve.convert.common.safetensors import ShardReader
+from surogate.serve.convert.common import conversion as family_conversion
+from surogate.serve.convert.common import official_resources
+from surogate.serve.convert.common.recipe import (
+    SourcePreflight,
+    TensorRecipe,
+    expression_sources,
+    materialize_recipe,
+)
+from surogate.serve.convert.common.recipe import (
+    validate_recipe_coverage as _validate_recipe_coverage,
+)
+
+from . import inventory
+from .recipe import (
+    build_recipes,
+    geometry_from_config,
+    open_reader,
+    preflight_sources,
+    validate_recipe_coverage,
+)
+
+RECIPE_ID = "gemma3-v1"
+
+ResourcePayload = family_conversion.ResourcePayload
+ObjectPlan = family_conversion.ObjectPlan
+
+#: Members of `config.json` that must hold for the registered target, and that
+#: every exporter writes. Geometry is read out of the file rather than asserted
+#: against a second copy of itself; these are the members that are not geometry,
+#: plus the architecture identity.
+#:
+#: `hidden_activation`, not `hidden_act`: Gemma 3 spells it the long way, and the
+#: value is the tanh approximation of GELU rather than SiLU.
+#:
+#: This table is checked with `check_members`, whose test is
+#: `actual.get(name) != value` — an absent key reads as `None` and so is a
+#: mismatch for every entry whose expected value is not `None`. That is what
+#: "required" means here, and it is why the table below has to stay disjoint from
+#: this one: a key named in both is required, and the optional table never gets a
+#: say.
+_REQUIRED_CONFIG = {
+    "architectures": ["Gemma3ForCausalLM"],
+    "hidden_activation": "gelu_pytorch_tanh",
+    "attention_bias": False,
+    "rms_norm_eps": 1e-6,
+    "rope_scaling": None,
+}
+
+#: Members only some exporter versions write, with the value an absent key
+#: asserts: present-and-wrong is refused, absent is tolerated
+#: (`check_optional_members`). Nothing here may also appear above.
+#:
+#: `use_bidirectional_attention` separates a generative Gemma 3 from the encoder
+#: backbone that shares the declaration; the engine is causal, and the key
+#: post-dates the first Gemma 3 exports, which is exactly the case this table
+#: exists for. The two softcapping members are absent from older configs and
+#: inactive when absent; the engine implements neither, so a checkpoint that set
+#: one would be served without it. `attention_dropout` is inference-inert but
+#: names a checkpoint trained with a dropout the engine cannot reproduce.
+_OPTIONAL_CONFIG = {
+    "use_bidirectional_attention": False,
+    "attn_logit_softcapping": None,
+    "final_logit_softcapping": None,
+    "attention_dropout": 0.0,
+}
+
+#: What the engine holds as compile-time constants in
+#: `csrc/src/serve/targets/gemma3/impl/config.h`. A checkpoint that disagrees
+#: with any of them would load and be served wrong, so it is refused here.
+#:
+#: The local/global schedule is *not* here. It used to be, as
+#: `"_sliding_window_pattern": 6`, and that entry refused every newer
+#: `transformers` export: those state the schedule as a `layer_types` list and
+#: write no period at all, so `check_members` saw an absent key and called it a
+#: mismatch. `check_layer_schedule` below subsumes it — it accepts either
+#: spelling, resolves the per-layer schedule the way the DSL does, and compares
+#: the result against the array the header states.
+_ENGINE_CONSTANTS = {
+    "sliding_window": inventory.SLIDING_WINDOW,
+    "rope_theta": 1000000.0,
+    "rope_local_base_freq": 10000.0,
+    # kAttentionScale = 0.0625 = 256 ** -0.5. Not the same thing as
+    # 1/sqrt(head_dim) in general, even though it coincides here.
+    "query_pre_attn_scalar": 256,
+    "max_position_embeddings": 32768,
+}
+
+
+# ---------------------------------------------------------------------------
+# checkpoint geometry
+# ---------------------------------------------------------------------------
+
+
+def check_optional_members(
+    scope: str,
+    actual: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> None:
+    """Require the named members only where the exporter wrote them."""
+
+    mismatches = [
+        f"{scope}.{name}: expected {value!r}, got {actual[name]!r}"
+        for name, value in expected.items()
+        if name in actual and actual[name] != value
+    ]
+    if mismatches:
+        raise ValueError("checkpoint config mismatch:\n  " + "\n  ".join(mismatches))
+
+
+def resolve_layer_schedule(
+    config: Mapping[str, object],
+    geometry: inventory.Geometry,
+) -> list[str]:
+    """The checkpoint's own local/global schedule, one entry per layer.
+
+    Gemma 3 states this two ways and a given export writes only one of them. The
+    original configs carry a *period* — `sliding_window_pattern`, written
+    `_sliding_window_pattern` by the exporter of the day — and layer `i` is
+    global when `(i + 1) % period == 0`, so the last layer is. Newer
+    `transformers` exports resolve that themselves and ship a `layer_types` list
+    instead, with no period anywhere in the file. Both are valid and both have to
+    land on the same schedule.
+
+    The rule is not restated here: `surogate/dsl/models/gemma3.py` already owns
+    it, and a second copy is a second thing to get wrong. Entries come back as
+    the DSL names them — `"sliding"` or `"full"`.
+    """
+
+    # Imported inside the function: the DSL package pulls in the training stack,
+    # and a converter that fails to import because of it would be worse than the
+    # duplication this avoids.
+    from surogate.dsl.models.gemma3 import (  # noqa: PLC2701 - one rule, one owner
+        _parse_gemma3_layer_types,
+    )
+
+    layer_types = config.get("layer_types")
+    # Both spellings are live. `Gemma3TextConfig.__post_init__` reads
+    # `sliding_window_pattern` as a back-compat kwarg and keeps it as
+    # `_sliding_window_pattern`, so Hub configs written before that move carry the
+    # plain name and ones written since carry the underscored one —
+    # gemma-3-270m-it carries `_sliding_window_pattern: 6`. `or`, not a `.get`
+    # default: a config that states the plain key as `null` would otherwise
+    # shadow the underscored one that holds the value.
+    period = config.get("sliding_window_pattern") or config.get("_sliding_window_pattern")
+    if not layer_types and not period:
+        raise ValueError(
+            "config.json states no attention schedule: neither a layer_types "
+            "list nor a sliding_window_pattern / _sliding_window_pattern period. "
+            "Gemma 3 alternates windowed against global attention and the engine "
+            "bakes the resolved schedule in, so it cannot be guessed"
+        )
+    return _parse_gemma3_layer_types(
+        list(layer_types) if layer_types else None,
+        geometry.layers,
+        int(period) if period else 0,
+    )
+
+
+def check_layer_schedule(config: Mapping[str, object], geometry: inventory.Geometry) -> None:
+    """The schedule the engine bakes in, against the one the checkpoint states.
+
+    The target header states the schedule as data — `config.h::kWindowedAttention`,
+    one bool per layer, read through `is_windowed_attention(layer)` — and
+    `inventory.WINDOWED_ATTENTION` is this side's copy of it. A checkpoint that
+    disagreed would be served with the wrong mask and the wrong rope base on
+    every layer where they differ, and nothing downstream would notice: a
+    windowed layer and a global one store identical objects.
+    """
+
+    resolved = resolve_layer_schedule(config, geometry)
+    expected = ["sliding" if windowed else "full" for windowed in inventory.WINDOWED_ATTENTION]
+    disagreeing = [
+        layer for layer, (got, want) in enumerate(zip(resolved, expected)) if got != want
+    ]
+    if disagreeing:
+        detail = ", ".join(
+            f"{layer}: checkpoint {resolved[layer]}, target {expected[layer]}"
+            for layer in disagreeing[:8]
+        )
+        raise ValueError(
+            "checkpoint attention schedule disagrees with the one "
+            "csrc/src/serve/targets/gemma3/impl/config.h states as "
+            f"kWindowedAttention; {len(disagreeing)} of {geometry.layers} layers "
+            f"disagree ({detail}"
+            f"{', ...' if len(disagreeing) > 8 else ''})"
+        )
+
+
+def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, dict]:
+    """Validate the checkpoint and summarize it for the conversion report."""
+
+    family_conversion.check_members("config", config, _REQUIRED_CONFIG)
+    check_optional_members("config", config, _OPTIONAL_CONFIG)
+    family_conversion.check_members("config", config, _ENGINE_CONSTANTS)
+    geometry = geometry_from_config(config)
+    # Any size of the family converts: the artifact states its own dimensions and the engine
+    # binds against those, so what has to hold is that the checkpoint is self-consistent.
+    if geometry.query_heads % geometry.kv_heads != 0:
+        raise ValueError(
+            f"query heads ({geometry.query_heads}) must be a multiple of key/value heads "
+            f"({geometry.kv_heads})"
+        )
+    if geometry.hidden <= 0 or geometry.layers <= 0 or geometry.intermediate <= 0:
+        raise ValueError(f"checkpoint geometry has a non-positive dimension: {geometry}")
+    check_layer_schedule(config, geometry)
+    text = {
+        name: config[name]
+        for name in (
+            "num_hidden_layers",
+            "hidden_size",
+            "intermediate_size",
+            "vocab_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "rms_norm_eps",
+            "rope_theta",
+            "rope_local_base_freq",
+            "sliding_window",
+            # Whichever spelling this export used; newer ones write neither and
+            # state `layer_types` instead. The report records what was read
+            # rather than a normalisation of it.
+            "sliding_window_pattern",
+            "_sliding_window_pattern",
+            "layer_types",
+            "query_pre_attn_scalar",
+            "max_position_embeddings",
+            "attention_bias",
+        )
+        if name in config
+    }
+    # Recorded as derived: the checkpoint omits the key and the architecture ties.
+    text["tie_word_embeddings"] = tied_output_head(config)
+    summary = {
+        "architecture": config["architectures"][0],
+        "model_type": config["model_type"],
+        "text": text,
+        "attention": {
+            "query_size": geometry.query_size,
+            "kv_size": geometry.kv_size,
+            "fused_rows": None,  # Q, K and V are stored as three objects
+            "output_gate": False,
+            "qk_norm": True,
+            "global_layers": list(inventory.GLOBAL_ATTENTION_LAYERS),
+            # The resolved schedule, so the report says which layers were served
+            # windowed whichever way the checkpoint spelled it.
+            "layer_schedule": resolve_layer_schedule(config, geometry),
+        },
+        "norms": {
+            "per_layer": 4,
+            "unit_offset": True,
+            "stored": "w (unfolded); the runtime applies 1 + w",
+        },
+        # sqrt(hidden), applied by the engine and not folded into the embedding.
+        "embedding_scale": float(geometry.hidden) ** 0.5,
+        "vision": None,  # Gemma3ForCausalLM is text-only
+        "mtp_num_hidden_layers": 0,
+    }
+    return geometry, summary
+
+
+def tied_output_head(config: Mapping[str, object]) -> bool:
+    """Whether the head reads the embedding table.
+
+    Defaults to true, where the Llama and Qwen3 converters default to false.
+    That is not a style difference: `Gemma3TextConfig` ties by default, this
+    checkpoint writes no `tie_word_embeddings` key at all, and it ships no
+    `lm_head.weight` — so reading the key with a false default would send the
+    recipe looking for a tensor that does not exist.
+    """
+
+    return bool(config.get("tie_word_embeddings", True))
+
+# ---------------------------------------------------------------------------
+# frontend resources
+# ---------------------------------------------------------------------------
+
+
+def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
+    """The four text frontend files, in inventory order.
+
+    Gemma 3 ships `tokenizer.json` — the fast-tokenizer serialization of its
+    SentencePiece vocabulary — beside the `tokenizer.model` the tokenizer was
+    originally distributed as. The engine binds the former even now that it hands
+    SentencePiece checkpoints to the project tokenizer, because the scheme, the
+    vocabulary and the added tokens are all read out of the JSON; the `.model`
+    holds the same vocabulary in a format nothing here reads, so it is not
+    carried and an artifact carrying it would be refused.
+
+    **The chat template travels the other way round here**, and it is the one
+    place this converter rewrites a checkpoint file rather than copying it.
+    TinyLlama and Qwen state the template only inside `tokenizer_config.json`,
+    and their converters synthesize `chat_template.jinja` from it.  Gemma 3 is
+    the newer `transformers` convention: the template is a file of its own and
+    `tokenizer_config.json` carries no `chat_template` key at all.  The engine
+    requires both and requires them equal —
+    `family/impl/frontend/frontend.cpp` throws
+    "tokenizer_config.json.chat_template must contain the loaded chat template"
+    on an artifact that omits the key — so a byte-for-byte copy of this
+    checkpoint's `tokenizer_config.json` would be refused at load.  The template
+    is therefore carried into the config, by a minimal textual insertion that
+    leaves every other byte of the file untouched.  Both directions of the
+    synthesis are kept: a Gemma release that states the template only in the
+    config still converts.
+    """
+
+    root = Path(model_dir)
+    template = official_resources.chat_template_bytes(root)
+    payloads: list[ResourcePayload] = []
+    for spec in inventory.RESOURCE_SPECS:
+        filename = spec.name.removeprefix("frontend/")
+        path = root / filename
+        if filename == "chat_template.jinja":
+            # A base model has none; the artifact simply does not carry the object.
+            if template is None:
+                continue
+            data = template
+        elif filename == "tokenizer_config.json":
+            data = (path.read_bytes() if template is None
+                    else official_resources.tokenizer_config_with_template(
+                        path.read_bytes(), template))
+        elif path.exists():
+            data = path.read_bytes()
+        elif filename == "generation_config.json":
+            data = family_conversion._synthesize_generation_config(root)  # noqa: SLF001
+        elif filename == "tokenizer.json":
+            raise FileNotFoundError(
+                "checkpoint is missing tokenizer.json; a Gemma release that ships "
+                "only the SentencePiece tokenizer.model must be converted to the "
+                "fast-tokenizer serialization before it can be bound"
+            )
+        else:
+            raise FileNotFoundError(f"checkpoint is missing {filename}")
+        if not data:
+            raise ValueError(f"frontend resource {filename} is empty")
+        payloads.append(ResourcePayload(spec.name, data))
+    return tuple(payloads)
+
+
+
+
+# ---------------------------------------------------------------------------
+# conversion
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ConversionPreflight:
+    model_dir: Path
+    geometry: inventory.Geometry
+    config_summary: dict
+    recipes: tuple[TensorRecipe, ...]
+    source: SourcePreflight
+    resources: tuple[ResourcePayload, ...]
+    object_plan: ObjectPlan
+    #: What this checkpoint stores, which is one object short of the declaration
+    #: when the head is tied. The writer walks this, not the module-level list.
+    object_specs: tuple[inventory.StoredObjectSpec, ...]
+    tied_output_head: bool
+
+    @property
+    def recipes_by_name(self) -> dict[str, TensorRecipe]:
+        return {recipe.object_name: recipe for recipe in self.recipes}
+
+
+def preflight_inventory(*, tied_output_head: bool = True) -> None:
+    """The inventory the recipe and the writer agree to produce.
+
+    The embedding, thirteen objects a layer, the final norm — and the output head
+    only where the checkpoint unties it. A tied checkpoint stores the head as a
+    role on `text/token_embedding` (`inventory.ALIAS_SPECS`), so it is one object
+    short of the declaration, which is the count `TENSOR_SPECS` still carries.
+    """
+
+    declared_tensors = 1 + inventory.LAYERS * inventory.LAYER_OBJECT_COUNT + 2
+    if len(inventory.TENSOR_SPECS) != declared_tensors:
+        raise ValueError(
+            f"registered inventory holds {len(inventory.TENSOR_SPECS)} tensors, "
+            f"expected {declared_tensors}"
+        )
+    stored_tensors, object_specs = inventory.active_specs(tied_output_head=tied_output_head)
+    expected_stored = declared_tensors - (1 if tied_output_head else 0)
+    if len(stored_tensors) != expected_stored:
+        raise ValueError(
+            f"stored inventory holds {len(stored_tensors)} tensors, "
+            f"expected {expected_stored}"
+        )
+    if len(inventory.RESOURCE_SPECS) != 4:
+        raise ValueError("registered inventory does not hold the four text resources")
+    if len(object_specs) != expected_stored + 4:
+        raise ValueError("registered object inventory is incomplete")
+    validate_recipe_coverage(
+        build_recipes(tied_output_head=tied_output_head),
+        tied_output_head=tied_output_head,
+    )
+
+
+def build_object_plan(
+    resources: Mapping[str, bytes],
+    *,
+    tied_output_head: bool = True,
+    native=None,
+    object_specs=None,
+) -> ObjectPlan:
+    """`native` names the objects a GGUF serves as it stores them."""
+    preflight_inventory(tied_output_head=tied_output_head)
+    if object_specs is None:
+        _, object_specs = inventory.active_specs(tied_output_head=tied_output_head)
+    if native:
+        object_specs = GgufRepackSource.native_specs(object_specs, native)
+    return family_conversion.build_object_plan(object_specs, resources)
+
+
+
+def geometry_block(preflight: "ConversionPreflight") -> dict[str, float]:
+    """The artifact's `geometry` member: the dimensions the engine reads at load, which is
+    what lets one target serve every size of this family."""
+    geometry = preflight.geometry
+    text = preflight.config_summary["text"]
+    return {
+        "hidden": geometry.hidden,
+        "layers": geometry.layers,
+        "intermediate": geometry.intermediate,
+        "output_rows": geometry.vocab,
+        "token_domain": geometry.vocab,
+        "query_heads": geometry.query_heads,
+        "kv_heads": geometry.kv_heads,
+        "head_dim": geometry.head_dim,
+        "rotary_dim": geometry.head_dim,
+        "rms_epsilon": float(text["rms_norm_eps"]),
+        "rope_theta": float(text["rope_theta"]),
+        "sliding_window": int(text["sliding_window"]),
+    }
+
+
+def plan_repack(repack, recipes_by_name, tensor_specs, native=None) -> tuple[str, ...]:
+    """Objects the repack source covers; verifies the map is not over-broad.
+
+    Every recipe left on the materialize path must find its sources in the bridged
+    checkpoint, so a mapped source consumed by an un-planned recipe is a hard error.
+    """
+    if repack is None:
+        return ()
+    planned = repack.plan(recipes_by_name, tensor_specs)
+    covered = set(planned) | set(native or ())
+    stray = {
+        source.name
+        for name, tensor_recipe in recipes_by_name.items()
+        if name not in covered
+        for source in expression_sources(tensor_recipe.expression)
+        if source.name in repack.sources
+    }
+    if stray:
+        raise RepackError(
+            "repack map names sources still needed by materialized recipes: "
+            + ", ".join(sorted(stray))
+        )
+    return planned
+
+
+def preflight_conversion(
+    model_dir: str | Path,
+    repack=None,
+    planned: tuple[str, ...] = (),
+    *,
+    native=None,
+    object_specs=None,
+) -> ConversionPreflight:
+    model = Path(model_dir)
+    config = family_conversion.load_json(model / "config.json")
+    geometry, summary = validate_config(config)
+    # What the checkpoint says about its own quantisation: refused where the serving path
+    # cannot honour it, reported where the declaration disagrees with the checkpoint's own
+    # tensors. A claim about a file is not the file.
+    _scope = family_conversion.honour_declared_scope(config, geometry, model, what=family_conversion.checkpoint_label(model))
+    if _scope:
+        print(_scope, flush=True)
+    # Whether the head is its own object is a property of the checkpoint, not of
+    # the target, so both the recipe and the object list are built for the
+    # checkpoint in hand rather than the module-level ones being used blind.
+    tied = tied_output_head(config)
+    preflight_inventory(tied_output_head=tied)
+    recipes = build_recipes(geometry, tied_output_head=tied)
+    stored_specs, active_object_specs = inventory.active_specs(tied_output_head=tied)
+    _validate_recipe_coverage(recipes, stored_specs)
+    # Repacked objects read the GGUF directly; only what remains needs a bridged source.
+    remaining = tuple(r for r in recipes if r.object_name not in planned) if planned else recipes
+    source_preflight = preflight_sources(model, remaining)
+    resources = load_resources(model)
+    if object_specs is not None:
+        active_object_specs = object_specs
+    plan = build_object_plan(
+        {item.name: item.data for item in resources}, tied_output_head=tied,
+        native=native, object_specs=object_specs,
+    )
+    object_specs = active_object_specs
+    return ConversionPreflight(
+        model_dir=model,
+        geometry=geometry,
+        config_summary=summary,
+        recipes=recipes,
+        source=source_preflight,
+        resources=resources,
+        object_plan=plan,
+        object_specs=object_specs,
+        tied_output_head=tied,
+    )
+
+
+def materialize_tensor(
+    spec: inventory.TensorSpec,
+    reader: ShardReader,
+    recipes: Mapping[str, TensorRecipe],
+) -> torch.Tensor:
+    tensor = materialize_recipe(recipes[spec.name], reader)
+    if spec.format == inventory.BF16 and tensor.dtype != torch.bfloat16:
+        tensor = tensor.to(torch.bfloat16)
+    if tuple(tensor.shape) != spec.shape:
+        raise ValueError(
+            f"{spec.name}: materialized shape {tuple(tensor.shape)} != {spec.shape}"
+        )
+    return tensor
+
+
+def encode_tensor_payload(
+    tensor: torch.Tensor,
+    spec: inventory.TensorSpec,
+    device: str | torch.device,
+) -> bytes:
+    return family_conversion.encode_tensor_payload(tensor, spec, device)
+
+
+def build_conversion_report(
+    *,
+    model_dir: str | Path,
+    out_path: str | Path,
+    arguments: Mapping[str, object],
+    config_summary: Mapping[str, object],
+    source_preflight: SourcePreflight,
+    objects: Sequence[ArtifactObject],
+    elapsed_seconds: float,
+    final_bytes: int,
+    device: torch.device,
+) -> dict:
+    repo_root = Path(__file__).resolve().parents[4]
+    return {
+        "identity": {
+            "model_id": inventory.MODEL_ID,
+            "weights_id": inventory.WEIGHTS_ID,
+        },
+        "target_key": inventory.TARGET_KEY,
+        "recipe_id": RECIPE_ID,
+        "source": {"model_path": str(Path(model_dir).resolve())},
+        "arguments": dict(arguments),
+        "config_summary": dict(config_summary),
+        "source_preflight": {
+            "recipes": source_preflight.recipe_count,
+            "tensors": source_preflight.source_tensor_count,
+            "shards": source_preflight.source_shard_count,
+            "dtypes": dict(source_preflight.source_dtype_counts),
+        },
+        "converter": {
+            "revision": family_conversion.converter_revision(repo_root),
+            "environment": family_conversion.environment(device),
+        },
+        "objects": family_conversion.object_statistics(objects),
+        "elapsed_seconds": elapsed_seconds,
+        "artifact": {"path": str(Path(out_path)), "bytes": final_bytes},
+    }
+
+
+def convert(
+    model_dir: str | Path,
+    out_path: str | Path,
+    *,
+    device: str | torch.device = "cuda",
+    gguf_repack: str | Path | None = None,
+) -> Path:
+    """Run the complete conversion and return the conversion-report path."""
+
+    started = time.perf_counter()
+    model = Path(model_dir)
+    output = Path(out_path)
+    requested_device = str(device)
+    resolved_device = pick_device(device)
+    repack = GgufRepackSource(gguf_repack) if gguf_repack else None
+
+    # Planning must not run the full preflight: that validates every source, including the
+    # ones the bridge deliberately did not write because the repack covers them.
+    config = family_conversion.load_json(model / "config.json")
+    geometry, _ = validate_config(config)
+    tied = tied_output_head(config)
+    recipes_by_name = {
+        r.object_name: r for r in build_recipes(geometry, tied_output_head=tied)
+    }
+    stored_specs, object_specs = inventory.active_specs(tied_output_head=tied)
+    native = repack.plan_native(recipes_by_name, stored_specs) if repack is not None else {}
+    halves = (repack.plan_native_halves(recipes_by_name, stored_specs)
+              if repack is not None else {})
+    planned = plan_repack(repack, recipes_by_name, stored_specs, set(native) | set(halves))
+    repacked_names = frozenset(planned)
+    if halves:
+        object_specs = GgufRepackSource.native_half_specs(object_specs, halves)
+        print(f"native K-quant halves: {len(halves)} fused parents stored as typed pairs",
+              flush=True)
+    external = ()
+    native_runs: dict = {}
+    if native and repack is not None and os.environ.get("SUROGATE_GGUF_COPY", "0") == "0":
+        native_runs = {
+            spec.name: repack.runs_for_native(spec, recipes_by_name[spec.name], None)
+            for spec in GgufRepackSource.native_specs(stored_specs, native)
+            if spec.name in native
+        }
+        external = ((str(Path(repack.gguf_path).resolve()),
+                     Path(repack.gguf_path).stat().st_size),)
+        not_copied = sum(sum(r[2] for r in runs) for runs in native_runs.values())
+        print(f"native K-quants: {len(native_runs)} objects read from the GGUF in place "
+              f"({not_copied / 1e9:.2f} GB not copied)", flush=True)
+    if native:
+        object_specs = GgufRepackSource.native_specs(object_specs, native, native_runs)
+        if not native_runs:
+            print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
+                  flush=True)
+
+    preflight = preflight_conversion(
+        model, repack, planned + tuple(native) + tuple(halves),
+        native=native, object_specs=object_specs,
+    )
+    print(
+        f"preflight complete: {len(preflight.object_plan.objects)} objects, "
+        f"{preflight.source.source_tensor_count} source tensors, "
+        f"device={resolved_device}",
+        flush=True,
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    resources = {item.name: item.data for item in preflight.resources}
+    recipes = preflight.recipes_by_name
+    with open_reader(model) as reader:
+        with ArtifactWriter(
+            output,
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            preflight.object_plan.specs,
+            geometry=geometry_block(preflight),
+            external=external,
+        ) as writer:
+            if writer.objects != preflight.object_plan.objects:
+                raise RuntimeError("writer object plan differs from completed preflight")
+            total = len(preflight.object_specs)
+            half_lookup: dict[str, tuple[str, slice]] = {}
+            for parent, runs in halves.items():
+                first = 0
+                for name, (_, rows) in zip(half_names(parent), runs):
+                    half_lookup[name] = (parent, slice(first, first + rows))
+                    first += rows
+            for index, spec in enumerate(preflight.object_specs, start=1):
+                if isinstance(spec, inventory.ResourceSpec):
+                    # A base model carries no chat template, and the plan drops the object
+                    # rather than storing an empty one.
+                    if spec.name not in resources:
+                        continue
+                    payload = resources[spec.name]
+                elif repack is not None and spec.name in half_lookup:
+                    parent, row_slice = half_lookup[spec.name]
+                    payload = repack.payload_for_native(spec, recipes[parent], None,
+                                                        row_slice=row_slice)
+                elif repack is not None and spec.name in native_runs:
+                    # Read from the GGUF where it lies; the artifact carries no bytes for it.
+                    continue
+                elif repack is not None and spec.name in native:
+                    payload = repack.payload_for_native(spec, recipes[spec.name], None)
+                elif repack is not None and spec.name in repacked_names:
+                    payload = repack.payload_for(spec, recipes[spec.name], None)
+                else:
+                    tensor = materialize_tensor(spec, reader, recipes)
+                    payload = encode_tensor_payload(tensor, spec, resolved_device)
+                    del tensor
+                writer.write(spec.name, payload)
+                del payload
+                if index % 25 == 0 or index == total:
+                    print(f"[{index}/{total}] {spec.name}", flush=True)
+
+    elapsed = time.perf_counter() - started
+    final_bytes = output.stat().st_size
+    report = build_conversion_report(
+        model_dir=model,
+        out_path=output,
+        arguments={
+            "model": str(model_dir),
+            "out": str(out_path),
+            "device": requested_device,
+        },
+        config_summary=preflight.config_summary,
+        source_preflight=preflight.source,
+        objects=preflight.object_plan.objects,
+        elapsed_seconds=elapsed,
+        final_bytes=final_bytes,
+        device=resolved_device,
+    )
+    report_path = Path(str(output) + ".conversion.json")
+    with report_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    print(
+        f"complete: {final_bytes} bytes in {elapsed:.1f}s; report={report_path}",
+        flush=True,
+    )
+    return report_path
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--gguf-repack", type=Path, default=None,
+                        help="repack map: objects this GGUF serves as it stores them")
+    args = parser.parse_args(argv)
+    convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack)
+
+
+if __name__ == "__main__":
+    main()

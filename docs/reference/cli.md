@@ -175,6 +175,33 @@ Options:
 - `--checkpoint-dir <path>`: required, path to a LoRA checkpoint directory (e.g. `output/step_00000050`)
 - `--output <path>`: required, output directory for the merged model
 
+### `quantize`
+
+Quantize a checkpoint into a GGUF the engine serves. A downloaded model already is a GGUF and
+needs nothing; this is for a model trained here, which has none. It runs after `merge`.
+
+```bash
+surogate quantize \
+    --model ./merged_q35 \
+    --output ./merged_q35-Q4_K_M.gguf \
+    --type q4_k_m
+```
+
+The quantisation arithmetic is llama.cpp's, in two passes: the checkpoint becomes a BF16 GGUF,
+which is then quantised to the requested type. The intermediate is deleted unless kept, and it
+is two bytes a parameter, so the space beside `--output` is checked first.
+
+Options:
+
+- `--model <path>`: required, a Hugging Face checkpoint directory or an unquantised `.gguf`
+- `--output <path>`: required, output `.gguf` path
+- `--type <name>`: quantization type, default `q4_k_m`
+- `--threads <int>`: quantizer threads, default the CPU count
+- `--imatrix <file>`: importance matrix passed to the quantizer; the IQ types require one
+- `--keep-intermediate`: keep the BF16 GGUF the first pass writes
+- `--llama-cpp <dir>`: llama.cpp checkout to drive (default `$SUROGATE_LLAMA_CPP`, else vendored)
+- `--build`: build the quantizer if it is missing, instead of failing with the command to run
+
 ## Notes
 
 - The top-level CLI prints system diagnostics at startup (GPU, CUDA, etc.).

@@ -104,6 +104,13 @@ surogate merge --base-model ./path/to/start_checkpoint \
   --checkpoint-dir ./out_dpo/step_00000040 --output ./out_dpo_eval
 ```
 
+To serve it quantized, turn the merged checkpoint into a GGUF first:
+
+```bash
+surogate quantize --model ./out_dpo_eval --output ./out_dpo_eval-Q4_K_M.gguf --type q4_k_m
+surogate serve ./out_dpo_eval-Q4_K_M.gguf --port 8080
+```
+
 ## Tips
 
 - **`dpo_beta`** is the main knob. Too high overfits the preference (and can hurt

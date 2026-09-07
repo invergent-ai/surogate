@@ -1691,6 +1691,15 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         }
     }
 
+    // Causal masking. The DSL always emits this attribute for flash_attention;
+    // it went unread here until the vision tower's declared ``causal=False``
+    // was found to be training causally anyway.
+    if (auto* causal_attr = find_attr(op.attrs, "causal")) {
+        if (auto v = attr_bool(*causal_attr)) {
+            attrs.causal = *v;
+        }
+    }
+
     if (auto* mrope_attr = find_attr(op.attrs, "mrope_section")) {
         if (auto list = attr_list_int(*mrope_attr)) {
             if (list->size() >= 3) {
@@ -2016,6 +2025,15 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                 attrs.norm_before_gate = *v;
             } else if (auto v_int = attr_int(*attr)) {
                 attrs.norm_before_gate = (*v_int != 0);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "gate_activation")) {
+            if (auto v = attr_string(*attr)) {
+                if (*v != "silu" && *v != "sigmoid") {
+                    throw std::runtime_error("mamba_gated_rmsnorm: unsupported gate_activation '" + *v +
+                                             "' (expected 'silu' or 'sigmoid')");
+                }
+                attrs.gate_activation = *v;
             }
         }
         // n_groups for gated rmsnorm (passed directly from graph builder)

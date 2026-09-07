@@ -1,0 +1,66 @@
+#include "ops/linear_swiglu/linear_swiglu_test_common.h"
+
+#include <array>
+#include <exception>
+#include <iostream>
+
+int main() {
+    using namespace sinfer;
+    using namespace sinfer::test::linear_swiglu;
+
+    try {
+        // One public numerical case begins each materially distinct W8 implementation interval;
+        // selected endpoints exercise exact-T and predicated tails without inspecting selectors.
+        constexpr std::array<std::int32_t, 25> kTokenCases{
+            1,   2,   6,   32,  33,  40,  41,  48,  49,  65,  81,  97,  129,
+            193, 241, 256, 257, 265, 289, 321, 385, 449, 513, 560, 561,
+        };
+        int failures = run_profile(
+            "LinearSwiGLU W8_A16",
+            {QType::W8G32_F16S, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
+        // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp (1024 -> 2x3584).
+        constexpr std::array<std::int32_t, 8> kQ08TokenCases{1, 2, 6, 17, 33, 65, 129, 257};
+        failures += run_profile(
+            "LinearSwiGLU W8_A16 q08",
+            {QType::W8G32_F16S, 7168, 1024, 3584, 1607U, ActivationCompute::A16}, kQ08TokenCases);
+        // surogate vendor patch (PATCHES.md #17): the W8A8-int IMMA path
+        // engages at T >= 512 under AllowA8; 511 confirms the A16 fallback.
+        constexpr std::array<std::int32_t, 4> kA8TokenCases{511, 512, 1024, 1912};
+        failures += run_profile(
+            "LinearSwiGLU W8_A8 q08",
+            {QType::W8G32_F16S, 7168, 1024, 3584, 1613U, ActivationCompute::A8}, kA8TokenCases);
+        failures += run_profile(
+            "LinearSwiGLU W8_A8 35b",
+            {QType::W8G32_F16S, 12288, 2048, 6144, 1619U, ActivationCompute::A8}, kA8TokenCases);
+
+        // The three geometries the plan registers that nothing here exercised.
+        // The public op is what run_profile drives, so these are both their
+        // first numerical coverage and the check that the wrapper's own shape
+        // gate -- a separate list, deliberately wider because it spans codecs
+        // this plan does not serve -- still accepts everything the plan admits.
+        // That pair of lists drifting is exactly how the residual-projection op
+        // came to admit a geometry in its plan and refuse it in its wrapper.
+        constexpr std::array<std::int32_t, 8> kRegisteredTokenCases{1, 2, 6, 17, 33, 65, 129, 257};
+        // qwen3.5-4b mlp (2560 -> 2x9216): no exact-T bakes, so decode plus the
+        // runtime-shaped MMA bands.
+        failures += run_profile(
+            "LinearSwiGLU W8_A16 q4b",
+            {QType::W8G32_F16S, 18432, 2560, 9216, 1623U, ActivationCompute::A16},
+            kRegisteredTokenCases);
+        // qwen3-0.6b mlp (1024 -> 2x3072): shares the 0.8b's k, differs in rows.
+        failures += run_profile(
+            "LinearSwiGLU W8_A16 q3_06b",
+            {QType::W8G32_F16S, 6144, 1024, 3072, 1627U, ActivationCompute::A16},
+            kRegisteredTokenCases);
+        // tinyllama-1.1b mlp (2048 -> 2x5632).
+        failures += run_profile(
+            "LinearSwiGLU W8_A16 tinyllama",
+            {QType::W8G32_F16S, 11264, 2048, 5632, 1629U, ActivationCompute::A16},
+            kRegisteredTokenCases);
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU W8_A16 correctness\n";
+        return failures == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "LinearSwiGLU W8_A16 test failed: " << error.what() << '\n';
+        return 1;
+    }
+}

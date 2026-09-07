@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from .. import nn
-from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
+from ..block_schema import (
+    BlockSchema,
+    DistributionDecl,
+    EPTopology,
+    RoutingSchema,
+    ServeObject,
+    SlotDecl,
+    StreamingHint,
+)
 from ..modules import (
     GatedDeltaNetMixer,
     MoEExpertsGated,
@@ -13,7 +21,12 @@ from ..modules import (
     _resolve_rotary_dim,
 )
 from ..dim import B, Dim, T
-from .qwen3_5 import QWEN3_5_ATTN_BLOCK_REMAP, QWEN3_5_LINEAR_BLOCK_REMAP
+from .qwen3_5 import (
+    _DENSE_ATTENTION_OBJECTS,
+    _DENSE_NORM_OBJECTS,
+    QWEN3_5_ATTN_BLOCK_REMAP,
+    QWEN3_5_LINEAR_BLOCK_REMAP,
+)
 
 
 QWEN3_5_MOE_ATTN_BLOCK_REMAP: dict[str, str] = {
@@ -65,6 +78,47 @@ QWEN3_5_MOE_LINEAR_BLOCK_REMAP: dict[str, str] = {
 }
 
 
+#: The MoE tail as a serving artifact stores it. `router_shared_gate` fuses the
+#: routed router with the shared expert's single gate row, which is why it has one
+#: row more than the declaration's router. Widths are the profile's choice: the 35B
+#: stores routed experts Q4 and their down projections Q5.
+_MOE_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("moe/router_shared_gate", "bf16", ("RouterRows", "C"),
+                ("router_weight", "shared_expert_gate_proj_weight")),
+    # The training parameter is expert-major `[E, 2M, C]`; the artifact stores the same
+    # numbers as rows, which is a contiguous reshape rather than a permutation.
+    ServeObject("moe/routed_gate_up", "quantised", ("RoutedGateUpRows", "C"),
+                ("experts_gate_up",), transform="flatten_experts", residency="auto"),
+    ServeObject("moe/routed_down", "quantised", ("RoutedDownRows", "M"),
+                ("experts_down",), transform="flatten_experts", residency="auto"),
+    ServeObject("moe/shared_gate_up", "quantised", ("SharedGateUpRows", "C"),
+                ("shared_expert_gate", "shared_expert_up")),
+    ServeObject("moe/shared_down", "quantised", ("C", "SharedM"), ("shared_expert_down",)),
+)
+
+#: Gated delta net for this family, which fuses the two scalar-per-head projections
+#: the dense targets keep apart.
+_MOE_GDN_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("gdn/a_log", "fp32", ("Hv",), ("lin_A_log",), transform="log_negate"),
+    ServeObject("gdn/dt_bias", "fp32", ("Hv",), ("lin_dt_bias",)),
+    ServeObject("gdn/convolution", "bf16", ("ConvK", "ConvDim"), ("lin_conv_weight",),
+                transform="transpose_taps"),
+    ServeObject("gdn/a_b_projection", "bf16", ("TwoHv", "C"),
+                ("lin_in_proj_a_weight", "lin_in_proj_b_weight")),
+    ServeObject("gdn/query_key_value_z", "quantised", ("GdnFusedRows", "C"),
+                ("lin_in_proj_qkv_weight", "lin_in_proj_z_weight")),
+    ServeObject("gdn/norm", "bf16", ("Vd",), ("lin_norm_weight",)),
+    ServeObject("gdn/output", "quantised", ("C", "ValueDim"), ("lin_out_weight",)),
+)
+
+_MOE_ATTENTION_BLOCK_OBJECTS = (
+    _DENSE_NORM_OBJECTS[0], *_DENSE_ATTENTION_OBJECTS, _DENSE_NORM_OBJECTS[1], *_MOE_SERVE_OBJECTS,
+)
+_MOE_LINEAR_BLOCK_OBJECTS = (
+    _DENSE_NORM_OBJECTS[0], *_MOE_GDN_SERVE_OBJECTS, _DENSE_NORM_OBJECTS[1], *_MOE_SERVE_OBJECTS,
+)
+
+
 def _qwen3_5_moe_schema(block_family: str, *, has_linear_mixer: bool = False) -> BlockSchema:
     slots: tuple[SlotDecl, ...] = (
         SlotDecl("router_weight", kind="param", shape=("E", "C"), distribution=DistributionDecl.router_replicated()),
@@ -98,6 +152,9 @@ def _qwen3_5_moe_schema(block_family: str, *, has_linear_mixer: bool = False) ->
             shared_experts="shared_expert_intermediate",
         ),
         ep_topology=EPTopology(ep_size_param="ep_size"),
+        serve_objects=(
+            _MOE_LINEAR_BLOCK_OBJECTS if has_linear_mixer else _MOE_ATTENTION_BLOCK_OBJECTS
+        ),
         attrs={"block_family": block_family},
     )
 

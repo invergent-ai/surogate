@@ -1,0 +1,113 @@
+#pragma once
+
+// Shared Qwen3.6 GQA dimensions and leaf PTX helpers used by the independently tuned
+// BF16 and INT8 prompt kernels. This file deliberately owns no staging policy,
+// shared-memory arena, warp schedule, or kernel body.
+
+#include "ops/common/math.cuh"
+#include "ops/common/mma.cuh"
+#include "ops/common/warp.cuh"
+#include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/kernel/paged_kv_address.cuh"
+
+#include <cuda_bf16.h>
+
+#include <cstdint>
+
+namespace sinfer::ops {
+
+inline constexpr int kGqaPrefillBr      = 64;
+// Keys per tile. 64 up to a 256-wide head, which is the tile the warp schedule was
+// tuned against. A 512-wide head -- a latent attention served absorbed, where the
+// query attends over the latent itself -- doubles every row of the arena, and the
+// arena is already at the card's opt-in limit at 256; sixteen keys per tile is
+// what keeps it there. Every constant the kernel derives from the tile (score
+// n-tiles, PV contraction steps) divides at 16, and the head dimension stays the
+// template parameter it always was.
+template <int HeadDim>
+inline constexpr int kGqaPrefillBcFor = HeadDim > 256 ? 16 : 64;
+inline constexpr int kGqaPrefillBc       = kGqaPrefillBcFor<256>;
+inline constexpr int kGqaPrefillThreads  = 128;
+
+// Dynamic shared-memory arena of the BF16 prompt kernel: one Q tile plus the K
+// and V tiles it streams over, all bf16. The head dimension is a template
+// parameter rather than a file constant, so a launcher asks for the arena of the
+// geometry it is about to launch: 96 KiB at head dim 256, 48 KiB at 128.
+template <int HeadDim>
+inline constexpr int kGqaPrefillSmemBytes =
+    (kGqaPrefillBr + 2 * kGqaPrefillBcFor<HeadDim>) * HeadDim *
+    static_cast<int>(sizeof(__nv_bfloat16));
+
+// The 256-wide arena is the one every shipped geometry runs in and the one the
+// warp schedule was tuned against; it must stay at 96 KiB, which is above the
+// 48 KiB default ceiling and below the 100 KiB SM120 opt-in limit.
+static_assert(kGqaPrefillSmemBytes<256> == 98304);
+// The 512-wide arena may not exceed it either: 101,376 bytes is what the card opts in to.
+static_assert(kGqaPrefillSmemBytes<512> == 98304);
+
+struct GqaPrefillDirectMetadata {
+    const std::int32_t* table;
+    /// Causal sliding window, zero for unbounded. A query at absolute position i
+    /// admits keys j with `i - j < sliding_window`.
+    std::int32_t window = 0;
+
+    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
+
+    __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+};
+
+template <bool Masked>
+struct GqaPrefillBatchMetadata {
+    const std::int32_t* tables;
+    const std::int32_t* valid_columns;
+    const std::int32_t* table_rows;
+    std::int32_t table_stride;
+    /// Causal sliding window, zero for unbounded. See GqaPrefillDirectMetadata.
+    std::int32_t window = 0;
+
+    __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
+        if constexpr (Masked) {
+            const std::int32_t valid = valid_columns[0];
+            return valid <= 0 ? 0 : (valid < width ? valid : width);
+        }
+        return width;
+    }
+
+    __device__ __forceinline__ const std::int32_t* block_table() const {
+        return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+};
+
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token) {
+    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(Geometry::HeadDim) *
+                                              (static_cast<std::int64_t>(q_head) +
+                                               static_cast<std::int64_t>(Geometry::QHeads) * token);
+}
+
+template <typename Geometry>
+__device__ __forceinline__ void gqa_prefill_zero_output_rows(__nv_bfloat16* out, int q_head,
+                                                             int row_begin, int row_end, int tid,
+                                                             int threads) {
+    if (row_begin >= row_end) { return; }
+    constexpr int D    = Geometry::HeadDim;
+    const int elements = (row_end - row_begin) * D;
+    for (int element = tid; element < elements; element += threads) {
+        const int row = row_begin + element / D;
+        const int d   = element - (row - row_begin) * D;
+        out[gqa_prefill_q_index<Geometry>(q_head, d, row)] = __float2bfloat16(0.0f);
+    }
+}
+
+// XOR-swizzled b16 element address. INT8 operands use the same layout by packing
+// two consecutive signed bytes into each b16 lane before ldmatrix.
+__device__ __forceinline__ int gqa_prefill_swz(int row, int col) {
+    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+}
+
+__device__ __forceinline__ unsigned gqa_prefill_swz_addr(unsigned lane_base, unsigned ck,
+                                                         unsigned as, unsigned r) {
+    return lane_base + ((ck | as) ^ r);
+}
+
+} // namespace sinfer::ops

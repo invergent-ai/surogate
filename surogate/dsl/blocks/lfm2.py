@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .. import nn
 from ..attention import AttentionConfig
-from ..block_schema import BlockSchema, SlotDecl
+from ..block_schema import BlockSchema, ServeObject, SlotDecl
 from ..mlp import MLPConfig
 from ..modules import GenericGQAttention, GenericMLP, Lfm2ShortConv, RMSNorm
 from .common import STANDARD_MODEL_NAME_REMAP
@@ -85,6 +85,42 @@ LFM2_CONV_BLOCK_REMAP: dict[str, str] = {
 }
 
 
+#: How a serving artifact stores an LFM2 layer.
+#
+# Both layer kinds carry the same two norms and the same SwiGLU MLP; they differ
+# only in the mixer between them, which is what makes this the same hybrid shape
+# the Qwen 3.5 family already serves -- attention on some layers, another operator
+# on the rest.
+_LFM2_SHARED_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("input_norm", "bf16", ("C",), ("operator_norm_weight",)),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ffn_norm_weight",)),
+    # Gate before up, whatever order the checkpoint fused them in: the slice names
+    # say which half is which, and the SwiGLU kernel reads gate rows first.
+    ServeObject("mlp/gate_up", "quantised", ("TwoM", "C"),
+                ("mlp_up_weight.gate", "mlp_up_weight.up")),
+    ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
+)
+
+_LFM2_ATTENTION_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("attention/query_key_value", "quantised", ("QKV", "C"), ("qkv_weight",)),
+    ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",)),
+    ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",)),
+    ServeObject("attention/output", "quantised", ("C", "QuerySize"), ("out_weight",)),
+)
+
+#: The short-conv mixer: `out_proj(C * conv(B * x))` where B, C and x are the three
+#: equal parts of one projection. The parts stay fused -- the kernel slices them,
+#: and keeping them together is one weight to read rather than three.
+_LFM2_CONV_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("conv/in_proj", "quantised", ("ThreeC", "C"), ("conv_in_proj_weight",)),
+    # The checkpoint holds the depthwise taps as [C, 1, K]; the kernel reads them
+    # tap-major, the same repacking the linear-attention convolution needs.
+    ServeObject("conv/convolution", "bf16", ("ShortConvK", "C"), ("conv_weight",),
+                transform="transpose_taps"),
+    ServeObject("conv/out_proj", "quantised", ("C", "C"), ("conv_out_proj_weight",)),
+)
+
+
 class Lfm2AttentionBlock(nn.Block):
     """LFM2 full-attention decoder layer."""
 
@@ -101,6 +137,10 @@ class Lfm2AttentionBlock(nn.Block):
             SlotDecl("operator_out", shape=("B", "T", "C")),
             SlotDecl("res_ffn", shape=("B", "T", "C")),
             SlotDecl("mlp_down", shape=("B", "T", "C")),
+        ),
+        serve_objects=(
+            *_LFM2_SHARED_OBJECTS,
+            *_LFM2_ATTENTION_OBJECTS,
         ),
         attrs={"block_family": "lfm2_attention"},
     )
@@ -156,6 +196,10 @@ class Lfm2ConvBlock(nn.Block):
             SlotDecl("operator_out", shape=("B", "T", "C")),
             SlotDecl("res_ffn", shape=("B", "T", "C")),
             SlotDecl("mlp_down", shape=("B", "T", "C")),
+        ),
+        serve_objects=(
+            *_LFM2_SHARED_OBJECTS,
+            *_LFM2_CONV_OBJECTS,
         ),
         attrs={"block_family": "lfm2_conv"},
     )

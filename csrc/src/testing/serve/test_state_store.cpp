@@ -1,0 +1,208 @@
+#include "core/device.h"
+#include "core/linear_attention_state.h"
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <iostream>
+#include <utility>
+#include <vector>
+
+namespace {
+
+struct PlannedState {
+    sinfer::LinearAttentionStatePoolLayout layout;
+    std::size_t bytes = 0;
+};
+
+PlannedState plan_state(std::uint32_t layers, std::int32_t conv_channels, std::int32_t conv_width,
+                        std::int32_t value_heads, std::int32_t value_head_dim,
+                        std::int32_t key_head_dim, std::int32_t slot_count = 1,
+                        sinfer::DType conv_dtype = sinfer::DType::BF16) {
+    sinfer::LayoutBuilder builder;
+    auto layout = sinfer::plan_linear_attention_state_pool(
+        builder, sinfer::LinearAttentionStatePoolSpec{.layers         = layers,
+                                                      .conv_channels  = conv_channels,
+                                                      .conv_width     = conv_width,
+                                                      .value_heads    = value_heads,
+                                                      .value_head_dim = value_head_dim,
+                                                      .key_head_dim   = key_head_dim,
+                                                      .slot_count     = slot_count,
+                                                      .conv_dtype     = conv_dtype});
+    return PlannedState{std::move(layout), builder.finish(256)};
+}
+
+int fail(const char* message) {
+    std::cerr << message << '\n';
+    return 1;
+}
+
+bool cuda_unavailable(cudaError_t err) {
+    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
+}
+
+int expect_size(std::size_t actual, std::size_t expected, const char* label) {
+    if (actual == expected) { return 0; }
+    std::cerr << label << " expected " << expected << ", got " << actual << '\n';
+    return 1;
+}
+
+int check_shape(const sinfer::Tensor& tensor, const std::int32_t (&expected)[4],
+                const char* label) {
+    int failures = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (tensor.ne[i] != expected[i]) {
+            ++failures;
+            std::cerr << label << ".ne[" << i << "] expected " << expected[i] << ", got "
+                      << tensor.ne[i] << '\n';
+        }
+    }
+    return failures;
+}
+
+int expect_device_byte(const sinfer::Tensor& tensor, unsigned char expected, const char* label) {
+    // Everything this file writes is queued on the context's stream, which is
+    // created cudaStreamNonBlocking and so is not ordered against the legacy null
+    // stream this read uses. Synchronise the device rather than relying on the
+    // caller to have done it.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<unsigned char> host(tensor.bytes());
+    CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
+    for (unsigned char value : host) {
+        if (value != expected) {
+            std::cerr << label << " expected byte 0x" << std::hex << static_cast<int>(expected)
+                      << ", got 0x" << static_cast<int>(value) << std::dec << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+} // namespace
+
+int main() {
+    int count                   = 0;
+    const cudaError_t count_err = cudaGetDeviceCount(&count);
+    if (cuda_unavailable(count_err)) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    if (count_err != cudaSuccess) {
+        std::cerr << "cudaGetDeviceCount failed: " << cudaGetErrorString(count_err) << '\n';
+        return 1;
+    }
+    if (count == 0) {
+        std::cout << "SKIP: no CUDA devices\n";
+        return 77;
+    }
+
+    int failures = 0;
+    sinfer::DeviceContext ctx(0);
+    auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
+    sinfer::DeviceArena state_arena(state_plan.bytes);
+    CUDA_CHECK(cudaMemsetAsync(state_arena.base(), 0x4a, state_arena.capacity(), ctx.stream));
+    sinfer::LinearAttentionStatePool state({state_arena.base(), state_arena.capacity()},
+                                           state_plan.layout);
+
+    failures += expect_size(state.layer_count(), 3, "state.layer_count");
+    failures += expect_size(state.slot_count(), 1, "state.slot_count");
+    failures += expect_size(state.conv.size(), 3, "state.conv.size");
+    failures += expect_size(state.recurrent.size(), 3, "state.recurrent.size");
+    failures += expect_size(state.spec.conv_width, 3, "state.conv_width");
+    failures += expect_size(state.conv_slot_stride_elements(), 30, "state.conv slot stride");
+    failures +=
+        expect_size(state.recurrent_slot_stride_elements(), 120, "state recurrent slot stride");
+    for (std::size_t layer = 0; layer < state.layer_count(); ++layer) {
+        failures += check_shape(state.conv[layer], {10, 3, 1, 1}, "state.conv");
+        failures += check_shape(state.recurrent[layer], {6, 5, 4, 1}, "state.recurrent");
+        failures += check_shape(state.conv_slot(static_cast<std::uint32_t>(layer), 0),
+                                {10, 3, 1, 1}, "state.conv_slot");
+        failures += check_shape(state.recurrent_slot(static_cast<std::uint32_t>(layer), 0),
+                                {6, 5, 4, 1}, "state.recurrent_slot");
+        if (state.conv[layer].dtype != sinfer::DType::BF16) {
+            ++failures;
+            std::cerr << "conv dtype is not BF16\n";
+        }
+        // The recurrent state is bf16 since 7fc710a5 ("store GDN recurrent state
+        // in bf16, compute unchanged"), like the convolution state above it.
+        if (state.recurrent[layer].dtype != sinfer::DType::BF16) {
+            ++failures;
+            std::cerr << "recurrent dtype is not BF16\n";
+        }
+        if (state.conv[layer].data == state.recurrent[layer].data) {
+            ++failures;
+            std::cerr << "conv/recurrent alias for layer " << layer << '\n';
+        }
+        failures += expect_device_byte(state.conv[layer], 0x4a, "constructor-mutated conv");
+        failures +=
+            expect_device_byte(state.recurrent[layer], 0x4a, "constructor-mutated recurrent");
+    }
+    if (state.conv[0].data == state.conv[1].data ||
+        state.recurrent[0].data == state.recurrent[1].data) {
+        ++failures;
+        std::cerr << "state layers alias\n";
+    }
+
+    // The fills above and the pool's own work must share a stream: ctx.stream is
+    // created cudaStreamNonBlocking, so it does not order against the legacy null
+    // stream a plain cudaMemset uses. Mixing the two let copy_slot read a slot
+    // before its fill had landed -- which showed up as a slot that "was not
+    // copied" while its neighbours were.
+    state.zero_slot(0, ctx.stream);
+    ctx.synchronize();
+    failures += expect_device_byte(state.conv[0], 0, "zeroed conv");
+    failures += expect_device_byte(state.recurrent[1], 0, "zeroed recurrent");
+
+    auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
+    sinfer::DeviceArena slotted_arena(slotted_plan.bytes);
+    CUDA_CHECK(cudaMemsetAsync(slotted_arena.base(), 0, slotted_arena.capacity(), ctx.stream));
+    sinfer::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
+                                             slotted_plan.layout);
+    failures += expect_size(slotted.slot_count(), 3, "slotted.slot_count");
+    failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
+    failures += check_shape(slotted.recurrent[0], {6, 5, 4, 3}, "slotted.recurrent");
+    failures += check_shape(slotted.conv_slot(0, 2), {10, 3, 1, 1}, "slotted.conv_slot");
+    failures += check_shape(slotted.recurrent_slot(0, 2), {6, 5, 4, 1}, "slotted.recurrent_slot");
+
+    sinfer::Tensor conv0             = slotted.conv_slot(0, 0);
+    sinfer::Tensor conv1             = slotted.conv_slot(0, 1);
+    sinfer::Tensor recurrent0        = slotted.recurrent_slot(0, 0);
+    sinfer::Tensor recurrent1        = slotted.recurrent_slot(0, 1);
+    sinfer::Tensor conv1_layer1      = slotted.conv_slot(1, 1);
+    sinfer::Tensor recurrent1_layer1 = slotted.recurrent_slot(1, 1);
+    CUDA_CHECK(cudaMemsetAsync(conv0.data, 0x7a, conv0.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(conv1.data, 0x6b, conv1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent0.data, 0x5c, recurrent0.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent1.data, 0x4d, recurrent1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(conv1_layer1.data, 0x3c, conv1_layer1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes(), ctx.stream));
+
+    slotted.copy_slot(1, 2, ctx.stream);
+    ctx.synchronize();
+    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "copied conv slot");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "copied recurrent slot");
+    failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "copied conv layer1");
+    failures += expect_device_byte(slotted.recurrent_slot(1, 2), 0x2d, "copied recurrent layer1");
+
+    slotted.zero_slot(0, ctx.stream);
+    ctx.synchronize();
+    failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "zeroed conv slot0");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 0), 0, "zeroed recurrent slot0");
+    failures += expect_device_byte(slotted.conv_slot(0, 1), 0x6b, "zero kept conv slot1");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 1), 0x4d, "zero kept recurrent slot1");
+    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "zero kept conv slot2");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "zero kept recurrent slot2");
+
+    auto fp32_conv_plan = plan_state(1, 7, 2, 2, 3, 4, 2, sinfer::DType::FP32);
+    sinfer::DeviceArena fp32_conv_arena(fp32_conv_plan.bytes);
+    sinfer::LinearAttentionStatePool fp32_conv({fp32_conv_arena.base(), fp32_conv_arena.capacity()},
+                                               fp32_conv_plan.layout);
+    if (fp32_conv.conv[0].dtype != sinfer::DType::FP32) {
+        ++failures;
+        std::cerr << "FP32 conv geometry did not retain its dtype\n";
+    }
+    failures += check_shape(fp32_conv.conv[0], {7, 2, 2, 1}, "fp32_conv.conv");
+    failures += check_shape(fp32_conv.recurrent[0], {4, 3, 2, 2}, "fp32_conv.recurrent");
+
+    return failures == 0 ? 0 : fail("linear attention state pool test failed");
+}

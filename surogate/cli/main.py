@@ -33,6 +33,13 @@ from surogate.cli._jackalope import maybe_exec_jackalope
 
 maybe_exec_jackalope()
 
+# `surogate serve ...` execs the native serving engine (see
+# design/serve-engine-plan.md). Intercepted here, before CUDA-touching imports,
+# so the serving process carries no Python CUDA context. Never returns for serve.
+from surogate.cli.serve import maybe_exec_serve
+
+maybe_exec_serve()
+
 from surogate.utils.banner import print_banner
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info, print_system_diagnostics
@@ -54,6 +61,7 @@ COMMAND_MAPPING: dict[str, str] = {
     "distill-capture": "surogate.cli.distill_capture",
     "transplant-tokenizer": "surogate.cli.transplant",
     "merge": "surogate.cli.merge",
+    "quantize": "surogate.cli.quantize",
     "debug": "surogate.cli.debug",
 }
 
@@ -157,6 +165,12 @@ def parse_args():
     from surogate.cli.merge import prepare_command_parser as merge_prepare_command_parser
 
     merge_prepare_command_parser(subparsers.add_parser("merge", help="Merge a LoRA checkpoint into the base model"))
+    # quantize command
+    from surogate.cli.quantize import prepare_command_parser as quantize_prepare_command_parser
+
+    quantize_prepare_command_parser(
+        subparsers.add_parser("quantize", help="Quantize a trained checkpoint into a GGUF the engine serves")
+    )
 
     # debug command
     from surogate.cli.debug import prepare_command_parser as debug_prepare_command_parser
@@ -167,6 +181,12 @@ def parse_args():
     # entry exists only so it shows up in `surogate --help`. add_help=False so its
     # own `--help` passes through to the dashboard binary.
     subparsers.add_parser("jackalope", help="Launch the jackalope live-training dashboard (TUI)", add_help=False)
+
+    # serve is intercepted before argparse (see maybe_exec_serve); this entry
+    # exists only so it shows up in `surogate --help`.
+    subparsers.add_parser(
+        "serve", help="Serve a model over OpenAI-/Anthropic-compatible HTTP (native engine)", add_help=False
+    )
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:

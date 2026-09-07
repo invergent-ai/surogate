@@ -91,6 +91,23 @@ option(USE_NVML "Enable nvml support for detailed GPU stats reporting" ON)
 option(PYTHON_BINDING "Build python bindings" ON)
 option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
+# Serve engine (csrc/src/serve; third-party provenance in src/serve/NOTICE):
+# first-class targets in this project, EXCLUDE_FROM_ALL so `make build` cost
+# is unchanged. Build with e.g. `cmake --build <dir> --target
+# surogate-engine-cli`. Deps (json, cutlass) come from this file's
+# FetchContent; serve targets are pinned to sm_120a.
+option(SUROGATE_BUILD_SERVE "Expose the serve engine targets" ON)
+option(SUROGATE_SERVE_TESTS "Expose the serve engine test targets" OFF)
+option(SUROGATE_SERVE_BENCH "Expose the serve engine bench targets" OFF)
+set(SUROGATE_SERVE_CUDA_ARCHS "120a" CACHE STRING
+    "CUDA architectures for the serve engine targets (RTX consumer set)")
+# A build machine missing FFmpeg or libcurl drops the serve targets with a status
+# line, which is right for a training-only tree and wrong for a wheel: it would
+# publish a package whose `surogate serve` exits 127 and say nothing. The wheel
+# build turns this on (pyproject.toml) so a missing host dependency fails the
+# build instead of silently shipping a trainer.
+option(SUROGATE_REQUIRE_SERVE "Fail the build if the serve engine cannot be built" OFF)
+
 FetchContent_Declare(
         json
         URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
@@ -101,6 +118,20 @@ FetchContent_Declare(
         cudnn-fe
         GIT_REPOSITORY https://github.com/NVIDIA/cudnn-frontend.git
         GIT_TAG v1.18.0
+        EXCLUDE_FROM_ALL
+)
+
+# The Gemma tokenizer. The checkpoint ships tokenizer.model beside
+# tokenizer.json, and upstream SentencePiece reproduces HF's ids exactly on it
+# (verified over 414 cases: whitespace runs, emoji, CJK, Cyrillic, long inputs
+# and 400 random mixed-alphabet strings). Hand-writing a 514,906-merge BPE with
+# byte fallback to match would be strictly worse and far easier to get subtly
+# wrong.
+FetchContent_Declare(
+        sentencepiece
+        QUIET
+        GIT_REPOSITORY https://github.com/google/sentencepiece.git
+        GIT_TAG v0.2.1
         EXCLUDE_FROM_ALL
 )
 
@@ -133,6 +164,9 @@ FetchContent_Declare(
         GIT_TAG main
         SOURCE_SUBDIR _none
         EXCLUDE_FROM_ALL
+        # minja has Jinja2's `defined` test but not `undefined`, which the Qwen3.5-family chat
+        # templates open with; cmake/patch_minja.sh adds it (idempotent).
+        PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_minja.sh
 )
 
 # Catch2 for tests
@@ -190,6 +224,11 @@ FetchContent_Declare(
 )
 
 find_package(CUDAToolkit COMPONENTS cuBLAS REQUIRED)
+
+set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+set(SPM_BUILD_TEST OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(sentencepiece)
 
 FetchContent_MakeAvailable(json)
 FetchContent_MakeAvailable(cudnn-fe)
@@ -266,7 +305,8 @@ endif ()
 set(NCCL_INCLUDE_DIR $ENV{NCCL_INCLUDE_DIR} CACHE PATH "Folder containing NCCL headers")
 set(NCCL_LIB_DIR $ENV{NCCL_LIB_DIR} CACHE PATH "Folder containing NCCL library")
 find_path(NCCL_INCLUDE_DIRS NAMES nccl.h HINTS ${NCCL_INCLUDE_DIR} REQUIRED)
-find_library(NCCL_LIBRARIES NAMES nccl HINTS ${NCCL_LIB_DIR} REQUIRED)
+# pip's nvidia-nccl ships only the runtime libnccl.so.2 (no dev symlink), so accept it by name.
+find_library(NCCL_LIBRARIES NAMES libnccl.so.2 nccl NAMES_PER_DIR HINTS ${NCCL_LIB_DIR} REQUIRED)
 message(STATUS "Using nccl: ${NCCL_LIBRARIES}")
 add_library(nvidia::nccl SHARED IMPORTED)
 set_property(TARGET nvidia::nccl PROPERTY IMPORTED_LOCATION "${NCCL_LIBRARIES}")
@@ -674,6 +714,15 @@ if (NOT SKBUILD)
 endif ()
 
 
+# The quantiser `surogate quantize` drives. Built here rather than by a separate command
+# because a step someone has to remember is a step that does not happen: the wheel, the Docker
+# image and every CI job drive this file, so building it here is what makes it automatic.
+# Off by default for an ordinary trainer build, which has no use for it.
+option(SUROGATE_BUILD_QUANTIZER "Fetch and build llama-quantize for `surogate quantize`" OFF)
+if (SUROGATE_BUILD_QUANTIZER)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/llama_cpp_quantizer.cmake)
+endif()
+
 if (PYTHON_BINDING)
     find_package(Python COMPONENTS Interpreter Development.Module OPTIONAL_COMPONENTS Development.SABIModule)
     FetchContent_MakeAvailable(nanobind)
@@ -702,8 +751,12 @@ if (PYTHON_BINDING)
             INSTALL_RPATH_USE_LINK_PATH FALSE
     )
 
+    # COMPONENT is what keeps the wheel to this project's own products: the build
+    # installs by component (pyproject.toml), so llama.cpp's and ggml's install rules
+    # -- which reference tools nobody asked to build -- never run.
     install(TARGETS _surogate surogate-common
             LIBRARY DESTINATION surogate
+            COMPONENT surogate
     )
 endif ()
 
@@ -731,4 +784,884 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     )
     add_test(NAME integration-tests COMMAND integration-tests)
+endif()
+
+if(SUROGATE_BUILD_SERVE)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+        if(SUROGATE_REQUIRE_SERVE)
+            message(FATAL_ERROR "serve: requires CUDA >= 13.1, found ${CMAKE_CUDA_COMPILER_VERSION}.")
+        else()
+            message(STATUS "serve: requires CUDA >= 13.1; targets disabled")
+        endif()
+    else()
+        enable_language(C)  # utf8proc
+        set(SINFER_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/serve)
+        set(SUROGATE_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party)
+        set(SINFER_JSON_INCLUDE "${json_SOURCE_DIR}/single_include")
+        set(SINFER_BUILD_MEDIA_ACQUIRE ON)
+        set(SINFER_BUILD_PROMPT_INPUT ON)
+        set(SINFER_BUILD_SERVE ON)
+        # Host deps are best-effort: a training-only machine without
+        # pkg-config/libcurl must still configure — serve targets drop out
+        # with a status message instead of failing the build.
+        find_package(PkgConfig QUIET)
+        option(SINFER_ENABLE_FFMPEG "Serve: build media decoding against FFmpeg" ON)
+        if(SINFER_ENABLE_FFMPEG AND PkgConfig_FOUND)
+            pkg_check_modules(FFMPEG IMPORTED_TARGET
+                libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+            if(NOT FFMPEG_FOUND)
+                if(SUROGATE_REQUIRE_SERVE)
+                    message(FATAL_ERROR "serve: FFmpeg dev libraries not found (libavformat/libavcodec/libavutil/libswscale). "
+                    "Install them, or configure with -DSINFER_ENABLE_FFMPEG=OFF to serve without media decoding.")
+                else()
+                    message(STATUS "serve: FFmpeg dev libraries not found; media-decode stub")
+                endif()
+                set(SINFER_ENABLE_FFMPEG OFF)
+            endif()
+        else()
+            set(SINFER_ENABLE_FFMPEG OFF)
+        endif()
+        if(PkgConfig_FOUND)
+            pkg_check_modules(LIBCURL IMPORTED_TARGET libcurl>=7.85)
+        endif()
+        if(NOT LIBCURL_FOUND)
+            if(SUROGATE_REQUIRE_SERVE)
+                message(FATAL_ERROR "serve: pkg-config and libcurl>=7.85 are required by the serve engine and were not found.")
+            else()
+                message(STATUS "serve: pkg-config/libcurl not found; serve targets disabled")
+            endif()
+        endif()
+        set(SERVE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/serve)
+        if(LIBCURL_FOUND)
+
+        # ---- serve engine libraries (formerly src/serve/src/CMakeLists.txt) ----
+function(sinfer_internal_includes target)
+  target_include_directories(${target} PRIVATE
+    ${SERVE_ROOT}
+    ${SUROGATE_VENDOR_DIR}
+    ${SUROGATE_VENDOR_DIR}/utf8proc
+    ${SINFER_JSON_INCLUDE})
+  # Serve targets build for the RTX arch set (default 120a; sm_89 compiles
+  # via the upstream port guards, execution pending Ada hardware). Features
+  # above a device's capability gate off at runtime (FP8 plane needs sm_89+,
+  # the fp4 profile needs sm_120a). PIC everywhere so the archives can link
+  # into the _surogate_serve Python module as well as the executables.
+  set_target_properties(${target} PROPERTIES
+      CUDA_ARCHITECTURES "${SUROGATE_SERVE_CUDA_ARCHS}"
+      POSITION_INDEPENDENT_CODE ON)
+endfunction()
+
+function(sinfer_cuda_archive target)
+  set_target_properties(${target} PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+endfunction()
+
+# Device/tensor/layout/graph primitives and the model-independent request runtime.
+add_library(sinfer_core STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/core/arena.cu
+  ${SERVE_ROOT}/core/sleep.cu
+  ${SERVE_ROOT}/core/elastic_kv_region.cu
+  ${SERVE_ROOT}/core/engine_context.cpp
+  ${SERVE_ROOT}/core/device.cu
+  ${SERVE_ROOT}/core/device_footprint.cpp
+  ${SERVE_ROOT}/core/dtype.cpp
+  ${SERVE_ROOT}/core/host_worker_pool.cpp
+  ${SERVE_ROOT}/core/numa.cpp
+  ${SERVE_ROOT}/core/gdn_replay_records.cpp
+  ${SERVE_ROOT}/core/cyclic_kv_cache.cpp
+  ${SERVE_ROOT}/core/paged_kv_cache.cpp
+  ${SERVE_ROOT}/core/linear_attention_state.cpp
+  ${SERVE_ROOT}/core/ngram_ple_state.cpp
+  ${SERVE_ROOT}/core/layout.cpp
+  ${SERVE_ROOT}/core/tensor.cpp
+  ${SERVE_ROOT}/core/decode_graph.cpp
+  ${SERVE_ROOT}/runtime/engine/admission_policy.cpp
+  ${SERVE_ROOT}/runtime/engine/kv_capacity.cpp
+  ${SERVE_ROOT}/runtime/engine/public_types.cpp
+  ${SERVE_ROOT}/runtime/engine/request_memory.cpp)
+sinfer_internal_includes(sinfer_core)
+sinfer_cuda_archive(sinfer_core)
+target_link_libraries(sinfer_core PUBLIC CUDA::cudart CUDA::cuda_driver CUDA::nvtx3 Threads::Threads ${CMAKE_DL_LIBS})
+# libnuma places the host buffers of an offloaded model (core/numa.*). Optional: without it the
+# engine warns and the operator must run under `numactl --interleave=all` on a multi-socket host.
+find_library(NUMA_LIBRARY NAMES numa)
+if(NUMA_LIBRARY)
+  target_link_libraries(sinfer_core PUBLIC ${NUMA_LIBRARY})
+  message(STATUS "libnuma: ${NUMA_LIBRARY} (host buffer placement enabled)")
+else()
+  message(STATUS "libnuma not found: host buffer placement disabled; run multi-socket hosts under numactl --interleave=all")
+endif()
+
+# Generic .sinfer framing, binding, and direct final materialization.
+add_library(sinfer_artifact STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/artifact/reader.cpp
+  ${SERVE_ROOT}/artifact/storage_layouts.cpp
+  ${SERVE_ROOT}/artifact/binder.cpp
+  ${SERVE_ROOT}/artifact/materializer.cpp
+  ${SERVE_ROOT}/artifact/typed_binding.cpp
+  # The one rearranging the materializer does itself: Q8_0 blocks into the row-split planes,
+  # so a weight whose kernels want planes can still be read from the GGUF.
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_repack.cu)
+sinfer_internal_includes(sinfer_artifact)
+target_link_libraries(sinfer_artifact PUBLIC sinfer_core)
+
+# The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
+# producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
+# discard that contract, so this self-contained kernel is intentionally compiled in a
+# non-RDC archive and called through a host launcher from sinfer_ops.
+# surogate vendor patch (csrc/src/serve/PATCHES.md): the W4A4 TMA kernels are
+# sm_120-only hardware (TMA + cluster + block-scaled FP4 MMA). Port builds for
+# other architectures link a loud-failure stub instead.
+if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+  add_library(sinfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
+    ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
+else()
+  add_library(sinfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma_stub.cpp)
+endif()
+sinfer_internal_includes(sinfer_nvfp4_tma)
+set_target_properties(sinfer_nvfp4_tma PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+target_compile_options(sinfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+target_link_libraries(sinfer_nvfp4_tma PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
+
+# The CUTLASS SM120 block-scaled GEMM (the derived-FP4-plane route and the native NVFP4
+# route's opt-in). Compiled whole-program, not relocatable: under `-rdc=true` ptxas spills
+# the 256x128x128 cooperative kernel's main loop (~900 bytes a thread, 150 local-memory
+# instructions between the first and last MMA, a five-fold launch) and without it the loop
+# is clean (measured 2026-09-07 against flashinfer's build of the identical kernel).
+add_library(sinfer_nvfp4_cutlass STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu)
+sinfer_internal_includes(sinfer_nvfp4_cutlass)
+target_include_directories(sinfer_nvfp4_cutlass PRIVATE
+  ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
+set_target_properties(sinfer_nvfp4_cutlass PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+target_compile_options(sinfer_nvfp4_cutlass PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--expt-relaxed-constexpr>)
+target_link_libraries(sinfer_nvfp4_cutlass PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
+
+# TensorRT-LLM's CUTLASS fused-MoE runner, vendored from FlashInfer 0.6.16.post3
+# (src/third_party/trtllm_moe, Apache-2.0; NOTICE there records provenance). It is the kernel
+# vLLM serves NVFP4 routed experts through on this hardware (design/35B_VLLM_KERNELS.md), built
+# with FlashInfer's own flag set so the instantiations it generated for architecture 120 apply
+# unchanged. sm_120-only, non-RDC, like the W4A4 TMA archive above; other architectures link a
+# loud-failure stub.
+set(TRTLLM_MOE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/trtllm_moe)
+if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+  file(GLOB TRTLLM_MOE_GENERATED ${TRTLLM_MOE_ROOT}/cutlass_instantiations/120/gemm_grouped/120/*.generated.cu)
+  add_library(sinfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
+    # TensorRT-LLM's own error, logging and formatting runtime: the kernels' TLLM_CHECK macros
+    # raise and log through it, so the library does not link without these four.
+    ${TRTLLM_MOE_ROOT}/nv_internal/cpp/common/tllmException.cpp
+    ${TRTLLM_MOE_ROOT}/nv_internal/cpp/common/logger.cpp
+    ${TRTLLM_MOE_ROOT}/nv_internal/cpp/common/stringUtils.cpp
+    ${TRTLLM_MOE_ROOT}/nv_internal/cpp/common/envUtils.cpp
+    # The runner's constructor builds a DeepSeek block-scale GEMM runner and its LoRA hook
+    # unconditionally, so both are needed at link even though the routed-NVFP4 profile takes
+    # neither path.
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
+    ${TRTLLM_MOE_ROOT}/fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu
+    ${TRTLLM_MOE_GENERATED}
+    ${SERVE_ROOT}/ops/sparse_moe/trtllm/trtllm_moe.cu)
+  target_compile_definitions(sinfer_trtllm_moe PRIVATE
+    COMPILE_BLACKWELL_TMA_GEMMS COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
+    ENABLE_BF16 ENABLE_FP8 ENABLE_FP4 USING_OSS_CUTLASS_MOE_GEMM CUTLASS_ENABLE_GDC_FOR_SM100=1
+    FLASHINFER_ENABLE_BF16 FLASHINFER_ENABLE_F16 FLASHINFER_ENABLE_FP8_E4M3
+    FLASHINFER_ENABLE_FP8_E5M2 FLASHINFER_ENABLE_FP8_E8M0 FLASHINFER_ENABLE_FP4_E2M1)
+  target_compile_options(sinfer_trtllm_moe PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false>
+    $<$<COMPILE_LANGUAGE:CUDA>:--threads=${SUROGATE_NVCC_THREADS}>
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+else()
+  add_library(sinfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/sparse_moe/trtllm/trtllm_moe_stub.cpp)
+endif()
+sinfer_internal_includes(sinfer_trtllm_moe)
+target_include_directories(sinfer_trtllm_moe PRIVATE
+  ${TRTLLM_MOE_ROOT}
+  ${TRTLLM_MOE_ROOT}/nv_internal
+  ${TRTLLM_MOE_ROOT}/nv_internal/include
+  ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/cutlass_extensions/include
+  ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include
+  ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels
+  ${TRTLLM_MOE_ROOT}/cutlass_instantiations/120
+  ${TRTLLM_MOE_ROOT}/flashinfer_include
+  ${cutlass_SOURCE_DIR}/include
+  ${cutlass_SOURCE_DIR}/tools/util/include
+  # cutlass's host-compiled headers reach for libcudacxx; nvcc finds CCCL itself, g++ does not.
+  ${CUDAToolkit_INCLUDE_DIRS}/cccl)
+set_target_properties(sinfer_trtllm_moe PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+  CUDA_STANDARD 17
+  CXX_STANDARD 17)
+target_link_libraries(sinfer_trtllm_moe PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
+
+# Shared mathematical Ops. The list is intentionally explicit: adding a
+# source is a build-boundary decision, not an accidental recursive-glob side effect.
+add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/ops/launcher/add_bias.cu
+  ${SERVE_ROOT}/ops/launcher/argmax.cu
+  ${SERVE_ROOT}/ops/launcher/cast.cu
+  ${SERVE_ROOT}/ops/launcher/causal_conv1d.cu
+  ${SERVE_ROOT}/ops/launcher/embed_gather.cu
+  ${SERVE_ROOT}/ops/launcher/encoder_attention.cu
+  ${SERVE_ROOT}/ops/launcher/gdn_gating.cu
+  # One translation unit per registered GQA shape, named for the shape. The
+  # registry in ops/kernel/gqa_attention_geometry.cuh generates the dispatch and
+  # the extern declarations; a registered shape missing its file here is an
+  # undefined reference at link.
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q4.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q8.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_32q16.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q1.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_16q1.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_16q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_32q4.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_8q1.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_8q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa128_16q8.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa128_32q4.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa64_32q4.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa64_32q8.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_4q1.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_64q64.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_64q1.cu
+  ${SERVE_ROOT}/ops/launcher/gelu.cu
+  ${SERVE_ROOT}/ops/launcher/lora_batched.cu
+  ${SERVE_ROOT}/ops/launcher/lora_fused.cu
+  ${SERVE_ROOT}/ops/launcher/gelu_and_mul.cu
+  ${SERVE_ROOT}/ops/launcher/bidirectional_gqa_attention.cu
+  ${SERVE_ROOT}/ops/launcher/swa.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_prefill.cu
+  ${SERVE_ROOT}/ops/launcher/kv_cache_append_prefix.cu
+  ${SERVE_ROOT}/ops/launcher/l2norm.cu
+  ${SERVE_ROOT}/ops/launcher/layer_norm.cu
+  ${SERVE_ROOT}/ops/launcher/mtp_pack.cu
+  ${SERVE_ROOT}/ops/launcher/mtp_round.cu
+  ${SERVE_ROOT}/ops/launcher/speculative_round.cu
+  ${SERVE_ROOT}/ops/launcher/position.cu
+  ${SERVE_ROOT}/ops/launcher/mask_columns.cu
+  ${SERVE_ROOT}/ops/launcher/prepare_ragged_prefix.cu
+  ${SERVE_ROOT}/ops/launcher/prepare_masked_block.cu
+  ${SERVE_ROOT}/ops/launcher/residual_add.cu
+  ${SERVE_ROOT}/ops/launcher/rmsnorm.cu
+  ${SERVE_ROOT}/ops/launcher/logit_softcap.cu
+  ${SERVE_ROOT}/ops/launcher/next_token_nll.cu
+  ${SERVE_ROOT}/ops/launcher/sampled_logprob.cu
+  ${SERVE_ROOT}/ops/launcher/short_conv.cu
+  ${SERVE_ROOT}/ops/launcher/rope.cu
+  ${SERVE_ROOT}/ops/launcher/sampling.cu
+  ${SERVE_ROOT}/ops/launcher/scalar.cu
+  ${SERVE_ROOT}/ops/launcher/scatter.cu
+  ${SERVE_ROOT}/ops/launcher/sigmoid_gate_mul.cu
+  ${SERVE_ROOT}/ops/launcher/mean_pool.cu
+  ${SERVE_ROOT}/ops/launcher/scale.cu
+  ${SERVE_ROOT}/ops/launcher/silu_and_mul.cu
+${SERVE_ROOT}/ops/launcher/head_linear.cu
+  ${SERVE_ROOT}/ops/launcher/vision_attention.cu
+  ${SERVE_ROOT}/ops/launcher/vision_pos_embed.cu
+  # Gated DeltaNet Linear Attention core.
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/replay.cpp
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/recurrent.cu
+  ${SERVE_ROOT}/ops/linear_attention/kimi_delta_net/kimi_delta_net.cpp
+  ${SERVE_ROOT}/ops/linear_attention/kimi_delta_net/recurrent.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/launch.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/output.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/attn_input_proj/fp8/fp8_attn_input_decode.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/fp8/fp8_attn_input_small_t.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_decode.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_gemm_simt.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_input_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_input_small_t.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_conv_fused.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/gdn_projected_conv.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w8a8_act_quant.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w8a8_dispatch.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w4fp4_plane.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w8fp8_plane.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/w8a8/w8a8_linear_swiglu.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/w8/w8_gdn_input_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/w8/w8_gdn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/w8/w8_gdn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+  ${SERVE_ROOT}/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_gemv.cu
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_small_t.cu
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_format.cpp
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_gemv.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_generic.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_small_t.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_a16_mma.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_a8.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/fp8_block/fp8_block.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_cublaslt.cpp
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_cublaslt_finish.cu
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_format.cpp
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_gemv.cu
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_small_t.cu
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4.cu
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_cublaslt.cpp
+  ${SERVE_ROOT}/ops/linear/q4/q4_small_t_mma.cu
+  ${SERVE_ROOT}/ops/linear/q4/q4_rowsplit_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/q4/q4_rowsplit_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear/q4/q4_rowsplit_gemv.cu
+  ${SERVE_ROOT}/ops/linear/q4/q4_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_q8_1.cu
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_mmvq.cu
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_linear.cu
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_embedding.cu
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_dequant.cu
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_moe.cu
+  ${SERVE_ROOT}/ops/linear/ggml/ggml_host_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/ggml/ggml_gdn_input.cu
+  ${SERVE_ROOT}/ops/linear/q5/q5_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/q5/q5_rowsplit_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/q5/q5_rowsplit_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear/q5/q5_rowsplit_gemv.cu
+  ${SERVE_ROOT}/ops/linear_add/bf16/bf16_linear_add_decode.cu
+  ${SERVE_ROOT}/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_add/bf16/bf16_linear_add_small_t.cu
+  ${SERVE_ROOT}/ops/linear_add/bf16/bf16_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu
+  ${SERVE_ROOT}/ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
+  ${SERVE_ROOT}/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+  ${SERVE_ROOT}/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_add/fp8/fp8_linear_add_decode.cu
+  ${SERVE_ROOT}/ops/linear_add/fp8/fp8_linear_add_small_t.cu
+  ${SERVE_ROOT}/ops/linear_add/fp8/fp8_linear_add_a8.cu
+  ${SERVE_ROOT}/ops/linear_add/fp8/fp8_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_add/q5/q5_linear_add_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_add/q5/q5_linear_add_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear_add/q5/q5_linear_add_gemv.cu
+  ${SERVE_ROOT}/ops/linear_add/q5/q5_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_add/w8/w8_linear_add_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_add/w8/w8_linear_add_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear_add/w8/w8_linear_add_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/linear_add/w8/w8_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/q4/q4_linear_swiglu_gemv.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
+  ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+  ${SERVE_ROOT}/ops/linear_swiglu/fp8/fp8_linear_swiglu_decode.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/fp8/fp8_linear_swiglu_small_t.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.cpp
+  ${SERVE_ROOT}/ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/w8/w8_linear_swiglu_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/w8/w8_linear_swiglu_plan.cpp
+  ${SERVE_ROOT}/ops/linear/q6/q6_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/q6/q6_rowsplit_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/q6/q6_rowsplit_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_decode.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_repack.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_plane.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_small_t.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_decode.cu
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_gemm_concat.cu
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_plan.cpp
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_repack.cu
+  ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
+  ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
+  ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_cublaslt.cpp
+  ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
+  ${SERVE_ROOT}/ops/hyper_connection/manifold.cu
+  ${SERVE_ROOT}/ops/ngram_ple/ngram_ple.cu
+  ${SERVE_ROOT}/ops/qsa_indexer/qsa_indexer.cu
+  ${SERVE_ROOT}/ops/expert_slot_cache/expert_slot_cache.cu
+  ${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp
+  ${SERVE_ROOT}/ops/linear/linear.cpp
+  ${SERVE_ROOT}/ops/wrapper/add_bias.cpp
+  ${SERVE_ROOT}/ops/wrapper/argmax.cpp
+  ${SERVE_ROOT}/ops/wrapper/cast.cpp
+  ${SERVE_ROOT}/ops/wrapper/causal_conv1d_silu.cpp
+  ${SERVE_ROOT}/ops/wrapper/embedding.cpp
+  ${SERVE_ROOT}/ops/wrapper/gdn_gating.cpp
+  ${SERVE_ROOT}/ops/wrapper/gdn_gating_proj.cpp
+  ${SERVE_ROOT}/ops/wrapper/gdn_input_proj.cpp
+  ${SERVE_ROOT}/ops/wrapper/encoder_attention.cpp
+  ${SERVE_ROOT}/ops/wrapper/gelu.cpp
+  ${SERVE_ROOT}/ops/wrapper/gelu_mul.cpp
+  ${SERVE_ROOT}/ops/wrapper/bidirectional_gqa_attention.cpp
+  ${SERVE_ROOT}/ops/wrapper/swa.cpp
+  ${SERVE_ROOT}/ops/wrapper/gqa_attention.cpp
+  ${SERVE_ROOT}/ops/wrapper/kv_cache_append_prefix.cpp
+  ${SERVE_ROOT}/ops/wrapper/attn_input_proj.cpp
+  ${SERVE_ROOT}/ops/wrapper/l2norm.cpp
+  ${SERVE_ROOT}/ops/wrapper/layer_norm.cpp
+  ${SERVE_ROOT}/ops/wrapper/linear_add.cpp
+  ${SERVE_ROOT}/ops/wrapper/lora.cpp
+  ${SERVE_ROOT}/ops/wrapper/lora_store.cpp
+    ${SERVE_ROOT}/ops/wrapper/linear_pair.cpp
+  ${SERVE_ROOT}/ops/wrapper/linear_swiglu.cpp
+  ${SERVE_ROOT}/ops/wrapper/linear_swiglu_down_add.cpp
+  ${SERVE_ROOT}/ops/wrapper/mtp_pack.cpp
+  ${SERVE_ROOT}/ops/wrapper/mtp_round.cpp
+  ${SERVE_ROOT}/ops/wrapper/speculative_round.cpp
+  ${SERVE_ROOT}/ops/wrapper/position.cpp
+  ${SERVE_ROOT}/ops/wrapper/mask_columns.cpp
+  ${SERVE_ROOT}/ops/wrapper/prepare_ragged_prefix.cpp
+  ${SERVE_ROOT}/ops/wrapper/prepare_masked_block.cpp
+  ${SERVE_ROOT}/ops/wrapper/residual_add.cpp
+  ${SERVE_ROOT}/ops/wrapper/rmsnorm.cpp
+  ${SERVE_ROOT}/ops/wrapper/logit_softcap.cpp
+  ${SERVE_ROOT}/ops/wrapper/next_token_nll.cpp
+  ${SERVE_ROOT}/ops/wrapper/sampled_logprob.cpp
+  ${SERVE_ROOT}/ops/wrapper/short_conv.cpp
+  ${SERVE_ROOT}/ops/wrapper/rope.cpp
+  ${SERVE_ROOT}/ops/wrapper/sampling.cpp
+  ${SERVE_ROOT}/ops/wrapper/scalar.cpp
+  ${SERVE_ROOT}/ops/wrapper/scatter.cpp
+  ${SERVE_ROOT}/ops/wrapper/sigmoid_mul.cpp
+  ${SERVE_ROOT}/ops/wrapper/mean_pool.cpp
+  ${SERVE_ROOT}/ops/wrapper/scale.cpp
+  ${SERVE_ROOT}/ops/wrapper/silu_mul.cpp
+${SERVE_ROOT}/ops/wrapper/head_linear.cpp
+  ${SERVE_ROOT}/ops/wrapper/sparse_moe.cpp
+  ${SERVE_ROOT}/ops/wrapper/vision_attention.cpp
+  ${SERVE_ROOT}/ops/wrapper/vision_pos_embed.cpp)
+
+set_source_files_properties(
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_repack.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_repack.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
+
+set_source_files_properties(
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  PROPERTIES COMPILE_OPTIONS
+  "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
+# Vendor-tuned CPU GEMM, optional and injected by path. Both live outside the
+# tree as reference checkouts rather than vendored dependencies, so a build with
+# neither must still work -- the encoder's own AVX-512 microkernel is always
+# there. Which one a *run* uses is decided from the CPU vendor at runtime, not
+# here: a binary built on one machine has to choose sensibly on another.
+set(SINFER_ZENDNN_DIR "" CACHE PATH "ZenDNN install prefix (AMD Zen)")
+set(SINFER_ONEDNN_DIR "" CACHE PATH "oneDNN install prefix (Intel; what OpenVINO's CPU plugin uses)")
+
+add_library(sinfer_encoder STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/encoder/gemma_embedding.cpp
+  ${SERVE_ROOT}/encoder/gemma_tokenizer.cpp
+  ${SERVE_ROOT}/encoder/cpu/cpu_ops.cpp
+  ${SERVE_ROOT}/encoder/cpu/cpu_gemma_embedding.cpp
+)
+sinfer_internal_includes(sinfer_encoder)
+find_package(OpenMP REQUIRED)
+target_link_libraries(sinfer_encoder PRIVATE OpenMP::OpenMP_CXX)
+target_compile_options(sinfer_encoder PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fopenmp>)
+target_include_directories(sinfer_encoder PRIVATE ${sentencepiece_SOURCE_DIR}/src)
+target_link_libraries(sinfer_encoder PUBLIC sinfer_core sinfer_ops sinfer_artifact
+                                     PRIVATE sentencepiece-static)
+if(SINFER_ZENDNN_DIR)
+  target_compile_definitions(sinfer_encoder PRIVATE SINFER_WITH_ZENDNN)
+  # ZenDNN's public header includes aocl-utils for cache/CPU identification, so
+  # that dependency's headers and library come along with it.
+  # ZenDNN's public headers reach into its own dependencies -- aocl-utils for
+  # CPU identification, AOCL-DLP for the BLAS backend -- so their include
+  # directories travel with it.
+  target_include_directories(sinfer_encoder PRIVATE
+    ${SINFER_ZENDNN_DIR}/include
+    ${SINFER_ZENDNN_DIR}/../deps/aoclutils/include
+    ${SINFER_ZENDNN_DIR}/../deps/aocldlp/include
+    ${SINFER_ZENDNN_DIR}/../deps/onednn/include)
+  target_link_libraries(sinfer_encoder PRIVATE ${SINFER_ZENDNN_DIR}/lib/libzendnnl_archive.a)
+  foreach(extra aoclutils/lib/libaoclutils.a aocldlp/lib/libaocl-dlp.a onednn/lib/libdnnl.a)
+    if(EXISTS ${SINFER_ZENDNN_DIR}/../deps/${extra})
+      target_link_libraries(sinfer_encoder PRIVATE ${SINFER_ZENDNN_DIR}/../deps/${extra})
+    endif()
+  endforeach()
+  message(STATUS "CPU encoder: ZenDNN at ${SINFER_ZENDNN_DIR}")
+endif()
+if(SINFER_ONEDNN_DIR)
+  # oneDNN's own threading runtime is OpenMP, so its symbols come with it. That
+  # is the whole of its integration: one header directory, one archive and this.
+  find_package(OpenMP REQUIRED)
+  target_compile_definitions(sinfer_encoder PRIVATE SINFER_WITH_ONEDNN)
+  target_include_directories(sinfer_encoder PRIVATE ${SINFER_ONEDNN_DIR}/include)
+  target_link_libraries(sinfer_encoder PRIVATE ${SINFER_ONEDNN_DIR}/lib/libdnnl.a
+                                               OpenMP::OpenMP_CXX)
+  message(STATUS "CPU encoder: oneDNN at ${SINFER_ONEDNN_DIR}")
+endif()
+
+# The encoder server is a product binary, not a test fixture: `surogate serve
+# --embed` execs it, so it has to exist after `make serve-build` like the engine
+# does. Same source as the old serve_tests target, which is now gone.
+add_executable(surogate-embed EXCLUDE_FROM_ALL ${SERVE_ROOT}/encoder/embedding_server.cpp)
+target_include_directories(surogate-embed PRIVATE
+  ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
+# Links sinfer_shared, with the other three products, once that target exists below.
+
+sinfer_internal_includes(sinfer_ops)
+# surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a
+# blockscaled NVFP4 GEMM TU. Points at the flashinfer-shipped cutlass by
+# default; vendoring a snapshot is tracked.
+# cutlass comes from the main project's FetchContent (v4.6.1).
+set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
+# The CPU expert-compute kernels carry their own AVX-512 code path (runtime-detected); the
+# rest of the engine stays generic x86-64.
+set_source_files_properties(${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp PROPERTIES
+  COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mf16c;-mfma")
+sinfer_cuda_archive(sinfer_ops)
+target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_trtllm_moe CUDA::cublasLt)
+
+# Product-independent text and media mechanisms.
+add_library(sinfer_text STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/text/unicode.cpp
+  ${SUROGATE_VENDOR_DIR}/utf8proc/utf8proc.c)
+sinfer_internal_includes(sinfer_text)
+
+# surogate vendor patch (csrc/src/serve/PATCHES.md): stub decode without FFmpeg.
+if(SINFER_ENABLE_FFMPEG)
+  add_library(sinfer_media_decode STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/media/decode/decode.cpp)
+  sinfer_internal_includes(sinfer_media_decode)
+  target_link_libraries(sinfer_media_decode PRIVATE PkgConfig::FFMPEG)
+else()
+  add_library(sinfer_media_decode STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/media/decode/decode_stub.cpp)
+  sinfer_internal_includes(sinfer_media_decode)
+endif()
+
+if(SINFER_BUILD_MEDIA_ACQUIRE)
+  # Product-only path/data/HTTP acquisition. No target package links this library.
+  add_library(sinfer_media_acquire STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/product/media_acquire/acquire.cpp)
+  sinfer_internal_includes(sinfer_media_acquire)
+  target_link_libraries(sinfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+endif()
+
+if(SINFER_BUILD_PROMPT_INPUT)
+  # Owning command-line message input shared by product entry points and target diagnostics.
+  add_library(sinfer_product_prompt_input STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/product/prompt_input/prompt_input.cpp)
+  sinfer_internal_includes(sinfer_product_prompt_input)
+  target_link_libraries(sinfer_product_prompt_input PRIVATE sinfer_media_acquire)
+endif()
+
+if(SINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(sinfer_product_load_progress STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/product/load_progress/load_progress.cpp)
+  sinfer_internal_includes(sinfer_product_load_progress)
+  # The cards a process may touch: narrows CUDA_VISIBLE_DEVICES before the first CUDA call.
+  add_library(sinfer_product_cuda_visibility STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/product/cuda_visibility/cuda_visibility.cpp)
+  sinfer_internal_includes(sinfer_product_cuda_visibility)
+endif()
+
+# One cold closed registry plus the opaque public product Engine. Family and exact-target
+# directories contribute their sources directly to this single compile owner below.
+add_library(sinfer_engine STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/targets/registry.cpp
+  ${SERVE_ROOT}/runtime/contract/sampling.cpp
+  ${SERVE_ROOT}/runtime/engine/engine.cpp)
+# The project's tokenizer, shared with training. The serving frontend delegates
+# to it for SentencePiece checkpoints (Llama 2, TinyLlama, Gemma), whose scheme
+# its own byte-level BPE cannot represent. Pure C++ with no CUDA dependency.
+target_sources(sinfer_engine PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer/tokenizer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer/tok_profile.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer/unicode.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                                                 ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer
+                                                 ${minja_SOURCE_DIR}/include
+                                                 ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_engine PRIVATE FMT_HEADER_ONLY=1)
+
+sinfer_internal_includes(sinfer_engine)
+target_include_directories(sinfer_engine PUBLIC ${SERVE_ROOT})
+
+add_subdirectory(${SERVE_ROOT}/family serve_family EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3 serve_t_qwen3 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/lfm2 serve_t_lfm2 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/glm5_next serve_t_glm5_next EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/llama serve_t_llama EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/gemma3 serve_t_gemma3 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/gemma4 serve_t_gemma4 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/gemma4_e serve_t_gemma4_e EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/gemma4_moe serve_t_gemma4_moe EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_moe serve_t_qwen3_moe EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_5 serve_t_qwen3_5 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_moe serve_t_qwen3_5_moe EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen4exp serve_t_qwen4exp EXCLUDE_FROM_ALL)
+
+target_link_libraries(sinfer_engine
+  PRIVATE
+    sinfer_artifact
+    sinfer_core
+    sinfer_ops
+    sinfer_text
+    sinfer_media_decode)
+add_library(sinfer::engine ALIAS sinfer_engine)
+
+if(SINFER_BUILD_SERVE)
+  # HTTP protocol/product adapter. No serving header is part of the public API.
+  add_library(sinfer_serve STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/serve/openai_schema.cpp
+    ${SERVE_ROOT}/serve/responses_schema.cpp
+    ${SERVE_ROOT}/serve/anthropic_schema.cpp
+    ${SERVE_ROOT}/serve/response_store.cpp
+    ${SERVE_ROOT}/serve/lora_registry.cpp
+    ${SERVE_ROOT}/serve/output_parsers.cpp
+    ${SERVE_ROOT}/serve/tool_call_parser.cpp
+    ${SERVE_ROOT}/serve/translate.cpp
+    ${SERVE_ROOT}/serve/console_log.cpp
+    ${SERVE_ROOT}/serve/generation_service.cpp
+    ${SERVE_ROOT}/serve/model_scheduler.cpp
+    ${SERVE_ROOT}/serve/request_log.cpp
+    ${SERVE_ROOT}/serve/http_server.cpp
+    ${SERVE_ROOT}/serve/responses_http.cpp
+    ${SERVE_ROOT}/serve/serve_options.cpp)
+  sinfer_internal_includes(sinfer_serve)
+  target_include_directories(sinfer_serve PRIVATE
+    ${SUROGATE_VENDOR_DIR}/cpp-httplib)
+  target_link_libraries(sinfer_serve
+    PUBLIC sinfer_engine Threads::Threads
+    PRIVATE sinfer_media_acquire CUDA::cudart)
+endif()
+
+
+        # ---- one shared library behind every serve product ----
+# surogate-engine, surogate-engine-cli, surogate-embed and the _surogate_serve
+# module are the same engine behind different front doors. Linked against the
+# archives, each embedded its own copy of the device code: 490 MB of fatbin per
+# product and 2.0 GB for the four, which a wheel would carry four times over.
+# They link this instead, so the fatbin exists once -- in the package, and in
+# csrc/build-serve, where it also cuts the link time of a serve rebuild.
+#
+# Membership is asked of the build rather than restated here: these archives are
+# gated on architecture, on host libraries and on SINFER_BUILD_APPS, and a list
+# that names a target this configuration did not define is a configure error.
+set(SINFER_SHARED_ARCHIVES "")
+foreach(candidate IN ITEMS
+    sinfer_engine sinfer_core sinfer_ops sinfer_artifact sinfer_text sinfer_encoder
+    sinfer_nvfp4_tma sinfer_nvfp4_cutlass sinfer_trtllm_moe sinfer_media_decode
+    sinfer_serve sinfer_media_acquire sinfer_product_prompt_input
+    sinfer_product_load_progress sinfer_product_cuda_visibility)
+  if(TARGET ${candidate})
+    list(APPEND SINFER_SHARED_ARCHIVES ${candidate})
+  endif()
+endforeach()
+
+add_library(sinfer_shared SHARED ${SERVE_ROOT}/shared_library.cpp)
+set_target_properties(sinfer_shared PROPERTIES
+  OUTPUT_NAME sinfer
+  # The library has no CUDA sources of its own, and every archive resolved its
+  # device symbols when it was created (sinfer_cuda_archive above). Asking for a
+  # second device link here does not just waste a step: CMake runs it as a host
+  # `gcc -c`, and the whole-archive block below reaches it as input files.
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+  POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(sinfer_shared PRIVATE
+  SINFER_BUILD_CUDA_ARCHS="${SUROGATE_SERVE_CUDA_ARCHS}")
+target_include_directories(sinfer_shared PUBLIC ${SERVE_ROOT})
+# The products compile serve headers that reach for cuda_runtime.h, and call the
+# runtime themselves. They used to inherit that from whichever archive they linked
+# (sinfer_encoder -> sinfer_core -> CUDA::cudart); the archives are private to the
+# shared library now, so the requirement lives here.
+target_link_libraries(sinfer_shared PUBLIC CUDA::cudart)
+
+# Each archive goes in whole exactly once. CMake's WHOLE_ARCHIVE link feature cannot
+# do that here: most of these archives are reached again through another's
+# INTERFACE_LINK_LIBRARIES, and the feature repeats the item on every path that
+# reaches it -- an archive pulled in whole twice is a link full of duplicate
+# definitions. So the whole-archive block is spelled out as link options, where the
+# list is exactly the list. Whole is not optional either: the library has no callers
+# of its own, so an ordinary link would resolve nothing and produce an empty .so.
+set(SINFER_SHARED_WHOLE "LINKER:--push-state,--whole-archive")
+foreach(archive IN LISTS SINFER_SHARED_ARCHIVES)
+  list(APPEND SINFER_SHARED_WHOLE "$<TARGET_FILE:${archive}>")
+endforeach()
+list(APPEND SINFER_SHARED_WHOLE "LINKER:--pop-state")
+target_link_options(sinfer_shared PRIVATE ${SINFER_SHARED_WHOLE})
+add_dependencies(sinfer_shared ${SINFER_SHARED_ARCHIVES})
+# Linked as targets too, for their usage requirements: cudart, FFmpeg, libcurl,
+# sentencepiece, numa, Threads. Their objects are all in by this point, so the
+# archives themselves resolve nothing further and cost nothing.
+target_link_libraries(sinfer_shared PRIVATE ${SINFER_SHARED_ARCHIVES})
+add_library(sinfer::shared ALIAS sinfer_shared)
+
+
+        # ---- serve executables (formerly src/serve/apps/CMakeLists.txt) ----
+add_executable(sinfer EXCLUDE_FROM_ALL   # surogate vendor patch (csrc/src/serve/PATCHES.md): product binary names.
+  ${SERVE_ROOT}/cli/main.cpp
+  ${SERVE_ROOT}/cli/options.cpp)
+target_include_directories(sinfer PRIVATE
+  ${SERVE_ROOT}
+  ${SERVE_ROOT}
+  ${SUROGATE_VENDOR_DIR})
+target_link_libraries(sinfer PRIVATE sinfer_shared)
+
+add_executable(sinfer-serve EXCLUDE_FROM_ALL ${SERVE_ROOT}/server/main.cpp)
+target_include_directories(sinfer-serve PRIVATE
+  ${SINFER_JSON_INCLUDE}
+  ${SERVE_ROOT}
+  ${SERVE_ROOT}
+  ${SUROGATE_VENDOR_DIR}
+  ${SUROGATE_VENDOR_DIR}/cpp-httplib)
+target_link_libraries(sinfer-serve PRIVATE sinfer_shared)
+target_link_libraries(surogate-embed PRIVATE sinfer_shared)
+
+# surogate vendor patch (csrc/src/serve/PATCHES.md): the product binaries carry
+# surogate's name; SInfer attribution lives in NOTICE, not in process names.
+set_target_properties(sinfer PROPERTIES OUTPUT_NAME surogate-engine-cli)
+set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
+
+
+        if(SUROGATE_SERVE_TESTS)
+            enable_testing()
+            add_subdirectory(src/testing/serve serve_tests EXCLUDE_FROM_ALL)
+        endif()
+        if(SUROGATE_SERVE_BENCH)
+            add_subdirectory(src/testing/serve/bench serve_bench EXCLUDE_FROM_ALL)
+        endif()
+        # Python binding for the serve engine: a SEPARATE extension module
+        # from _surogate (arch gating + payload + lifecycle isolation).
+        if(PYTHON_BINDING)
+            nanobind_add_module(_surogate_serve NOSTRIP
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/binding/py_serve.cpp)
+            target_include_directories(_surogate_serve PRIVATE
+                ${SERVE_ROOT} ${SINFER_JSON_INCLUDE})
+            target_link_libraries(_surogate_serve PRIVATE sinfer_shared)
+            set_target_properties(_surogate_serve PROPERTIES EXCLUDE_FROM_ALL TRUE)
+        endif()
+
+        # ---- packaging ----
+        # What an installed wheel needs for `surogate serve` to work the way it
+        # works in a source tree: the three product binaries, the shared library
+        # holding their device code, and the Python module. The binaries go under
+        # the package rather than into the venv's bin/ for the same reason the
+        # quantiser does (csrc/cmake/llama_cpp_quantizer.cmake) -- a serving engine
+        # is an implementation detail of `surogate serve`, not a command of its
+        # own -- and surogate/cli/serve.py looks there.
+        set(SUROGATE_SERVE_INSTALL_DIR "surogate/serve/_bin")
+        if(SKBUILD)
+            # libsinfer.so sits at the package root beside libsurogate-common.so;
+            # $ORIGIN/../.. is what takes the binaries there from _bin, and the
+            # nvidia/* wheels are three levels further up from the same point.
+            set(SINFER_BIN_RPATH_LIST
+                "$ORIGIN"
+                "$ORIGIN/../.."
+                "$ORIGIN/../../../nvidia/cuda_runtime/lib"
+                "$ORIGIN/../../../nvidia/cublas/lib"
+                "$ORIGIN/../../../nvidia/cudnn/lib")
+            list(JOIN SINFER_BIN_RPATH_LIST ":" SINFER_BIN_RPATH)
+            set(SINFER_LIB_RPATH_LIST
+                "$ORIGIN"
+                "$ORIGIN/../nvidia/cuda_runtime/lib"
+                "$ORIGIN/../nvidia/cublas/lib"
+                "$ORIGIN/../nvidia/cudnn/lib")
+            list(JOIN SINFER_LIB_RPATH_LIST ":" SINFER_LIB_RPATH)
+
+            set_target_properties(sinfer sinfer-serve surogate-embed PROPERTIES
+                INSTALL_RPATH "${SINFER_BIN_RPATH}"
+                BUILD_WITH_INSTALL_RPATH OFF
+                INSTALL_RPATH_USE_LINK_PATH FALSE)
+            set_target_properties(sinfer_shared PROPERTIES
+                INSTALL_RPATH "${SINFER_LIB_RPATH}"
+                BUILD_WITH_INSTALL_RPATH OFF
+                INSTALL_RPATH_USE_LINK_PATH FALSE)
+            install(TARGETS sinfer sinfer-serve surogate-embed
+                    RUNTIME DESTINATION ${SUROGATE_SERVE_INSTALL_DIR}
+                    COMPONENT serve)
+            install(TARGETS sinfer_shared
+                    LIBRARY DESTINATION surogate
+                    COMPONENT serve)
+            if(PYTHON_BINDING)
+                set_target_properties(_surogate_serve PROPERTIES
+                    INSTALL_RPATH "${SINFER_LIB_RPATH}"
+                    BUILD_WITH_INSTALL_RPATH OFF
+                    INSTALL_RPATH_USE_LINK_PATH FALSE)
+                install(TARGETS _surogate_serve
+                        LIBRARY DESTINATION surogate
+                        COMPONENT serve)
+            endif()
+        else()
+            install(TARGETS sinfer sinfer-serve surogate-embed sinfer_shared
+                    RUNTIME DESTINATION bin
+                    LIBRARY DESTINATION lib
+                    COMPONENT serve)
+        endif()
+
+        endif()  # LIBCURL_FOUND
+    endif()
 endif()

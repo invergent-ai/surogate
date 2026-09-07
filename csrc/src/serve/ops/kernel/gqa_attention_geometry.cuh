@@ -1,0 +1,299 @@
+#pragma once
+
+// Grouped-query head geometries served by the decode and prefill kernels.
+//
+// A geometry is a SHAPE, not a model. Head dimension, query-head count and
+// KV-head count are all compile-time parameters, and registration below names
+// the shape rather than the checkpoint that first needed it — Qwen, Gemma, GLM
+// and Kimi do not share a head dimension, so anything that bakes one in stops
+// at the first non-Qwen architecture. Adding an architecture means adding a
+// registration line whose shape is not already present; it must never mean
+// editing a kernel.
+//
+// An unregistered shape is a hard error, never a silent fallback onto another
+// shape's kernel: that kernel bakes the head counts into its addressing, so
+// serving one shape with another's kernel reads the wrong strides — wrong
+// numbers and out-of-bounds loads, not merely a slower path. Registering a
+// shape whose decode translation unit is missing is a link error; serving a
+// shape nobody registered throws at the dispatcher.
+
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+namespace sinfer::ops {
+
+template <int HeadDimValue, int QHeadsValue, int KVHeadsValue, int DecodeSplitScaleValue>
+struct GqaGeometry {
+    static_assert(HeadDimValue > 0 && HeadDimValue % 16 == 0,
+                  "head dimension must be a positive multiple of 16");
+    static_assert(QHeadsValue > 0 && KVHeadsValue > 0);
+    static_assert(QHeadsValue % KVHeadsValue == 0,
+                  "query heads must group evenly onto KV heads");
+    static_assert(DecodeSplitScaleValue > 0);
+
+    static constexpr int HeadDim          = HeadDimValue;
+    static constexpr int QHeads           = QHeadsValue;
+    static constexpr int KVHeads          = KVHeadsValue;
+    static constexpr int GroupSize        = QHeads / KVHeads;
+    static constexpr int DecodeSplitScale = DecodeSplitScaleValue;
+    static constexpr int DecodeSplits     = 85 * DecodeSplitScale;
+};
+
+/// Whether a key at absolute position `key` is inside a query's causal window.
+/// `window <= 0` is unbounded. The bound is `qabs - key < window`, i.e. exactly
+/// `window` keys including the query's own -- FlashAttention's
+/// `window_size = (window - 1, 0)`, which is what vLLM passes for Gemma 3.
+__device__ __forceinline__ bool gqa_within_window(int qabs, int key, int window) {
+    return window <= 0 || (qabs - key) < window;
+}
+
+// ---- Registered shapes ------------------------------------------------------
+//
+// Named <head dim>_<query heads>q<KV heads>. The comment records which
+// checkpoints happen to use the shape today; the name does not depend on it.
+
+using Gqa256_24q4  = GqaGeometry<256, 24, 4, 1>; // qwen3.8-27b
+using Gqa256_16q2  = GqaGeometry<256, 16, 2, 2>; // qwen3.6-35b-a3b
+using Gqa256_8q2   = GqaGeometry<256, 8, 2, 2>;  // qwen3.5-0.8b
+using Gqa256_16q4  = GqaGeometry<256, 16, 4, 2>; // qwen3.5-4b, qwen3.5-2b
+using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of twelve)
+using Gqa128_16q8  = GqaGeometry<128, 16, 8, 1>; // qwen3-0.6b (the first 128-wide head)
+// Qwen3-30B-A3B: 32 query heads over 4 KV heads at head dim 128. DecodeSplitScale 1 for the
+// reason the other four-KV-head shapes take it -- four KV heads reach the registry's modal
+// KVHeads*DecodeSplits at scale 1, and the grid takes its parallelism from that dimension.
+using Gqa128_32q4  = GqaGeometry<128, 32, 4, 1>; // qwen3-30b-a3b
+// DecodeSplitScale 1: the grid is (KVHeads, splits, batch) and the registry's
+// modal KVHeads*DecodeSplits is about 340, which four KV heads reach at scale 1 --
+// the same reasoning, and the same answer, as the other four-KV-head shape above.
+using Gqa64_32q4   = GqaGeometry<64, 32, 4, 1>;  // tinyllama-1.1b (the first 64-wide head)
+// DecodeSplitScale 1 for the same reason as the shape above: eight KV heads reach the
+// registry's modal KVHeads*DecodeSplits on their own, and the grid takes its parallelism from
+// that dimension before it needs to take any from the keys.
+using Gqa64_32q8   = GqaGeometry<64, 32, 8, 1>;  // lfm2-1.2b
+// DecodeSplitScale 4: one KV head is the narrowest plane registered, and the grid
+// takes its parallelism from that dimension. At scale 1 it would ask for 85 CTAs,
+// a half-empty wave; 4 restores the registry's modal 340 by splitting the keys
+// instead, which is the dimension a multi-query shape has left.
+// Its DecodeSplitScale of 4 makes the lowest tier target 16 keys per split
+// against a 32-key tile, so a split stages a whole tile to admit half of it.
+// Flooring the target at the tile was measured and is a small loss: with one KV
+// head the grid is (KVHeads, splits, batch), so the split count *is* the
+// parallelism, and halving it halves the CTAs on a 170-SM part for staging the
+// floor was meant to save -- 413.4 to 410.3 tok/s at an 8k context, both arms
+// interleaved twice. The scale is buying grid width, and that is worth more
+// here than tile-sized splits.
+using Gqa256_4q1   = GqaGeometry<256, 4, 1, 4>;  // gemma-3-270m (the first MQA shape)
+// GLM-5.3-Flash's latent attention, expanded. Its `kv_b` gives every query head its own key and
+// value, so the served shape is plain multi-head attention -- 64 over 64 -- rather than a
+// grouped one; the compression lives in the projections before it, not in the head counts.
+// DecodeSplitScale 1: sixty-four KV heads are already far past the registry's modal
+// KVHeads*DecodeSplits, and the grid takes its parallelism from that dimension first.
+using Gqa256_64q64 = GqaGeometry<256, 64, 64, 1>; // glm-5.3-flash
+// GLM-5.3-Flash's latent attention, absorbed: the query is folded through `k_b` into the
+// 512-wide latent and attends over that latent directly, so the cache holds one 512-wide head
+// per token where the expanded form above holds sixty-four of 256 -- sixty-four times less.
+// DecodeSplitScale 4 for the reason the other single-KV-head shape gives: the grid takes its
+// parallelism from the keys, because the heads offer none.
+using Gqa512_64q1  = GqaGeometry<512, 64, 1, 4>;  // glm-5.3-flash, absorbed
+// Gemma 4 attends at two geometries in one model, so each size registers a pair. The windowed
+// layers are ordinary GQA at 256; the global ones are 512 wide with far fewer key/value heads,
+// because a global layer's cache is paid for over the whole context where a windowed layer's is
+// bounded by its window.
+//
+// DecodeSplitScale follows the registry's own rule rather than the head counts' apparent size:
+// 1 where the KV heads already give the grid its parallelism, 4 where a single-digit head count
+// does not and the split has to come from the keys.
+using Gqa256_16q8  = GqaGeometry<256, 16, 8, 1>;  // gemma-4-12b + 26b-a4b, windowed
+using Gqa512_16q1  = GqaGeometry<512, 16, 1, 4>;  // gemma-4-12b, global
+// The 26B-A4B shares the 12B's windowed geometry and gives its global layers two key/value
+// heads where the 12B has one. Split 2, by the rule above: two heads give the grid some
+// parallelism of its own, where one gives none.
+using Gqa512_16q2  = GqaGeometry<512, 16, 2, 2>;  // gemma-4-26b-a4b, global
+using Gqa256_32q16 = GqaGeometry<256, 32, 16, 1>; // gemma-4-31b, windowed
+using Gqa512_32q4  = GqaGeometry<512, 32, 4, 2>;  // gemma-4-31b, global
+// The E-series pair, whose query count is half the dense sizes' and whose key/value count is
+// one or two. DecodeSplitScale 4 where a single key/value head offers the grid no parallelism
+// of its own, 2 where there are two of them.
+using Gqa256_8q1   = GqaGeometry<256, 8, 1, 4>;  // gemma-4-e2b, windowed
+using Gqa512_8q1   = GqaGeometry<512, 8, 1, 4>;  // gemma-4-e2b, global
+using Gqa512_8q2   = GqaGeometry<512, 8, 2, 2>;  // gemma-4-e4b, global
+
+// The registry. Every dispatcher below and in the launchers is generated from
+// this list, so a registration line is the whole of adding a shape — with the
+// one exception the linker enforces: the small-T decode launcher is instantiated
+// one geometry per translation unit, so a new entry also needs its
+// ops/launcher/gqa_attention_decode_<name>.cu and a CMake source line. Omitting
+// them is an undefined reference at link time, which is the intended failure.
+#define SINFER_GQA_FOR_EACH_GEOMETRY(X)                                                            \
+    X(Gqa256_24q4)                                                                                 \
+    X(Gqa256_16q2)                                                                                 \
+    X(Gqa256_8q2)                                                                                  \
+    X(Gqa256_16q4)                                                                                 \
+    X(Gqa256_24q2)                                                                                 \
+    X(Gqa128_16q8)                                                                                 \
+    X(Gqa128_32q4)                                                                                 \
+    X(Gqa64_32q4)                                                                                 \
+    X(Gqa64_32q8)                                                                                 \
+    X(Gqa256_4q1)                                                                                  \
+    X(Gqa256_64q64)                                                                                \
+    X(Gqa512_64q1)                                                                                 \
+    X(Gqa256_16q8)                                                                                 \
+    X(Gqa512_16q1)                                                                                 \
+    X(Gqa512_16q2)                                                                                 \
+    X(Gqa256_32q16)                                                                                \
+    X(Gqa512_32q4)                                                                                 \
+    X(Gqa256_8q1)                                                                                  \
+    X(Gqa512_8q1)                                                                                  \
+    X(Gqa512_8q2)
+
+namespace detail {
+
+// Sentinel closing the comma-separated pack the registry expands into. Its
+// zero head counts match no registered shape.
+struct GqaGeometryListEnd {
+    static constexpr int HeadDim = 0;
+    static constexpr int QHeads  = 0;
+    static constexpr int KVHeads = 0;
+};
+
+// Registered shapes must be distinct in (HeadDim, QHeads, KVHeads). The head counts alone are
+// not enough: TinyLlama attends with 32 query heads over 4 KV heads at a head dimension of 64,
+// and Qwen3-30B-A3B does the same at 128. Every dispatcher therefore carries the width.
+template <class... Geometries>
+constexpr bool gqa_shapes_are_distinct() {
+    constexpr int kCount = sizeof...(Geometries);
+    constexpr int dims[kCount]  = {Geometries::HeadDim...};
+    constexpr int qs[kCount]    = {Geometries::QHeads...};
+    constexpr int kvs[kCount]   = {Geometries::KVHeads...};
+    for (int i = 0; i < kCount; ++i) {
+        for (int j = i + 1; j < kCount; ++j) {
+            if (dims[i] == dims[j] && qs[i] == qs[j] && kvs[i] == kvs[j]) { return false; }
+        }
+    }
+    return true;
+}
+
+#define SINFER_GQA_LIST_GEOMETRY(Name) Name,
+static_assert(gqa_shapes_are_distinct<SINFER_GQA_FOR_EACH_GEOMETRY(
+                  SINFER_GQA_LIST_GEOMETRY) GqaGeometryListEnd>(),
+              "two registered geometries share a (head dim, query heads, KV heads) shape");
+#undef SINFER_GQA_LIST_GEOMETRY
+
+// A dispatcher that knows only some of the triple passes 0 for the rest, which
+// prints as "any": the shape is unregistered whatever the missing field held.
+[[noreturn]] inline void throw_unregistered_geometry(std::int64_t head_dim, std::int64_t q_heads,
+                                                     std::int64_t kv_heads) {
+    const auto field = [](std::int64_t value) {
+        return value > 0 ? std::to_string(value) : std::string("any");
+    };
+    throw std::invalid_argument("gqa_attention: unregistered head geometry (head dim " +
+                                field(head_dim) + ", " + field(q_heads) + " query heads over " +
+                                field(kv_heads) +
+                                " KV heads); register the shape in gqa_attention_geometry.cuh");
+}
+
+} // namespace detail
+
+// Invokes `visitor.template operator()<Geometry>()` for the registered shape
+// matching (head_dim, q_heads, kv_heads) exactly. At most one arm can match, so
+// the order of the registry does not affect the result; an unregistered shape
+// throws rather than reaching a kernel built for a different shape.
+template <typename Visitor>
+decltype(auto) gqa_dispatch_geometry(std::int64_t head_dim, std::int64_t q_heads,
+                                     std::int64_t kv_heads, Visitor&& visitor) {
+#define SINFER_GQA_DISPATCH_ARM(Name)                                                              \
+    if (head_dim == Name::HeadDim && q_heads == Name::QHeads && kv_heads == Name::KVHeads) {       \
+        return visitor.template operator()<Name>();                                                \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_DISPATCH_ARM)
+#undef SINFER_GQA_DISPATCH_ARM
+    detail::throw_unregistered_geometry(head_dim, q_heads, kv_heads);
+}
+
+// Head-count-only dispatch, for the capacity and workspace paths whose public
+// signatures carry no head dimension.
+//
+// NOTE: the (query heads, KV heads) pair is *not* unique across the registry, and the
+// assertion above does not make it so -- it enforces distinct (head dim, query heads, KV
+// heads) triples. TinyLlama and Qwen3-30B-A3B both attend 32 over 4, at 64 and 128; Gemma 4
+// adds 16 over 8 at 256 beside Qwen3-0.6B's at 128, and 32 over 4 at 512. So this overload
+// resolves to whichever registered shape appears first and may hand back a different head
+// dimension than the launcher will use. Every live caller passes the head dimension to the
+// three-argument form above; nothing calls this today, and a new caller must not without
+// first making the pair decide the shape.
+template <typename Visitor>
+decltype(auto) gqa_dispatch_geometry(std::int64_t q_heads, std::int64_t kv_heads,
+                                     Visitor&& visitor) {
+#define SINFER_GQA_DISPATCH_ARM(Name)                                                              \
+    if (q_heads == Name::QHeads && kv_heads == Name::KVHeads) {                                    \
+        return visitor.template operator()<Name>();                                                \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_DISPATCH_ARM)
+#undef SINFER_GQA_DISPATCH_ARM
+    detail::throw_unregistered_geometry(0, q_heads, kv_heads);
+}
+
+// KV-only dispatch, for the cache-append kernels: they touch the head dimension
+// and the KV head count and nothing else, so every registered shape carrying
+// that pair generates identical code and the first match is taken. A pair no
+// registered shape carries throws rather than being appended with another
+// shape's strides.
+template <typename Visitor>
+decltype(auto) gqa_dispatch_kv_geometry(std::int64_t head_dim, std::int64_t kv_heads,
+                                        Visitor&& visitor) {
+#define SINFER_GQA_DISPATCH_KV_ARM(Name)                                                           \
+    if (head_dim == Name::HeadDim && kv_heads == Name::KVHeads) {                                  \
+        return visitor.template operator()<Name>();                                                \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_DISPATCH_KV_ARM)
+#undef SINFER_GQA_DISPATCH_KV_ARM
+    detail::throw_unregistered_geometry(head_dim, 0, kv_heads);
+}
+
+// Whether any registered shape carries this (head dim, KV head count) pair, for
+// callers validating a KV tensor ahead of the append dispatch above.
+inline bool gqa_kv_shape_is_registered(std::int64_t head_dim, std::int64_t kv_heads) {
+#define SINFER_GQA_KV_MATCH(Name)                                                                  \
+    if (head_dim == Name::HeadDim && kv_heads == Name::KVHeads) { return true; }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_KV_MATCH)
+#undef SINFER_GQA_KV_MATCH
+    return false;
+}
+
+// Whether the registry carries this exact shape, for callers that hold all three numbers --
+// the head dimension comes off the query tensor -- and need to refuse one it does not.
+inline bool gqa_shape_is_registered(std::int64_t head_dim, std::int64_t q_heads,
+                                    std::int64_t kv_heads) {
+#define SINFER_GQA_SHAPE_MATCH(Name)                                                               \
+    if (head_dim == Name::HeadDim && q_heads == Name::QHeads && kv_heads == Name::KVHeads) {       \
+        return true;                                                                               \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_SHAPE_MATCH)
+#undef SINFER_GQA_SHAPE_MATCH
+    return false;
+}
+
+// The KV-head count of the registered shape serving `head_dim` and `q_heads`. A query count can
+// be registered against more than one KV count (16 queries over 2 or 4 KV heads; 24 over 4 or
+// 2), which is why callers pass the head count of whatever KV source they hold; pass 0 when
+// holding none, which resolves only a count that is unique at that width. Unresolvable
+// combinations throw.
+inline std::int64_t gqa_registered_kv_heads(std::int64_t head_dim, std::int64_t q_heads,
+                                            std::int64_t source_kv_heads) {
+    std::int64_t sole_match = 0;
+    int matches             = 0;
+#define SINFER_GQA_KV_ARM(Name)                                                                    \
+    if (head_dim == Name::HeadDim && q_heads == Name::QHeads) {                                    \
+        if (source_kv_heads == Name::KVHeads) { return Name::KVHeads; }                            \
+        sole_match = Name::KVHeads;                                                                \
+        ++matches;                                                                                 \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_KV_ARM)
+#undef SINFER_GQA_KV_ARM
+    if (matches == 1) { return sole_match; }
+    detail::throw_unregistered_geometry(head_dim, q_heads, source_kv_heads);
+}
+
+} // namespace sinfer::ops

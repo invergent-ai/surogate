@@ -280,6 +280,7 @@ struct CompiledAttrs {
     bool use_conv_bias = true;
     std::string activation;  // for mamba_conv1d (e.g., "silu")
     bool norm_before_gate = false;
+    std::string gate_activation = "silu";  // mamba_gated_rmsnorm gate activation ("silu" or "sigmoid")
     int repeat_factor = 1;
 
     // Gated delta rule specific
@@ -309,6 +310,11 @@ struct CompiledAttrs {
     // Non-zero means: use this exact value as the softmax scale (e.g.,
     // Gemma4 passes 1.0 because QK-norm provides the implicit scaling).
     float softmax_scale = 0.0f;
+
+    // Causal masking for the flash_attention op. A decoder wants the default;
+    // an encoder -- a vision tower, an embedding model -- declares
+    // ``causal=False`` in the DSL and every row must then see every column.
+    bool causal = true;
 
     // LoRA slices declared by the DSL for this op's weight input. Populated
     // from the weight TensorInfo::lora_targets during graph compilation.

@@ -1,0 +1,194 @@
+#include "family/impl/runtime/instance.h"
+#include "family/impl/runtime/schedule.h"
+
+#include "api/ops/sampling.h"
+#include "api/ops/position.h"
+#include "api/ops/scatter.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
+
+#include "api/ops/lora_store.h"
+#include "api/ops/sampled_logprob.h"
+
+namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
+namespace {
+
+auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
+                         ops::GqaExecutionEnvelope envelope) {
+    return [&state, batch_size, envelope] {
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency)) {
+            throw std::logic_error("ordinary decode batch state is incomplete");
+        }
+
+        family::OrdinaryDecodeState& ordinary = state.frame;
+        CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
+                                   sizeof(family::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
+                                   state.execution.device.stream));
+
+        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                         &state.text_cache);
+        card.set_ple_state(state.execution.ple);
+        if (std::getenv("SUROGATE_SERVE_TRACE_STAGE") != nullptr) {
+            std::fprintf(stderr, "stage-trace: a decode round carries stage [%d, %d)\n",
+                         state.execution.stage.first, state.execution.stage.last);
+        }
+        card.set_stage(state.execution.stage);
+
+        Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
+        Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);
+        Tensor rope_positions  = ordinary.rope_positions.slice(0, 0, batch_size);
+        Tensor kv_rows         = ordinary.text_kv_table_rows.slice(0, 0, batch_size);
+        Tensor lanes           = ordinary.lanes.slice(0, 0, batch_size);
+        // Publish the round's adapter selection for the projection hooks. The slot
+        // vector is frame-resident and the scratch store-resident, so a captured
+        // graph records their addresses once and replays against what this round
+        // staged. Cleared after the card runs, so a later round without adapters
+        // cannot inherit these ids.
+        Tensor lora_slots     = ordinary.lora_slots.slice(0, 0, batch_size);
+        const bool lora_round = ops::lora_active();
+        if (lora_round) {
+            ops::LoraRound round;
+            round.slots   = &lora_slots;
+            round.scratch      = ops::lora_store_for_current_device().scratch(batch_size);
+            round.uniform_cell = ops::lora_store_for_current_device().uniform_cell();
+            ops::lora_set_round(round);
+        }
+        Tensor hidden          = ordinary.hidden.slice(1, 0, batch_size);
+        Tensor logits          = ordinary.logits.slice(1, 0, batch_size);
+        Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, batch_size);
+
+        card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
+                                   envelope, hidden, logits);
+        if (lora_round) { ops::lora_clear_round(); }
+        if (!card.stage_finishes()) { return; } // a pipeline stage without the head: nothing to sample
+        ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
+        ops::sample(logits, sampled, state.execution.model.geometry.token_domain,
+                    ordinary.sampling, cache_positions,
+                    ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
+        // The chosen token's probability under the whole vocabulary, for the same
+        // round and inside the same capture. It reads the logits once more -- a
+        // fraction of a percent of what the head that produced them cost -- so it
+        // runs unconditionally rather than behind a flag that would have to be
+        // decided before the first graph was recorded.
+        Tensor sampled_logprobs = ordinary.sampled_logprobs.slice(0, 0, batch_size);
+        ops::sampled_logprob(logits, sampled, sampled_logprobs,
+                             state.execution.model.geometry.token_domain, ordinary.sampling,
+                             state.execution.device.stream);
+        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
+                                   sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+                                   state.execution.device.stream));
+    };
+}
+
+// Round chaining (PATCHES.md #32): the same round without the ingress H2D —
+// the frame already holds the chained tokens/positions — and with chain ops
+// at the tail: the sampled tokens become the next round's inputs and the
+// positions advance, all in stream order, so consecutive rounds replay
+// back-to-back with no host staging between them.
+auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                 ops::GqaExecutionEnvelope envelope) {
+    return [&state, batch_size, envelope] {
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+            state.chain_one.data == nullptr) {
+            throw std::logic_error("chained decode batch state is incomplete");
+        }
+
+        family::OrdinaryDecodeState& ordinary = state.frame;
+        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                         &state.text_cache);
+        card.set_ple_state(state.execution.ple);
+        if (std::getenv("SUROGATE_SERVE_TRACE_STAGE") != nullptr) {
+            std::fprintf(stderr, "stage-trace: a decode round carries stage [%d, %d)\n",
+                         state.execution.stage.first, state.execution.stage.last);
+        }
+        card.set_stage(state.execution.stage);
+
+        Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
+        Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);
+        Tensor rope_positions  = ordinary.rope_positions.slice(0, 0, batch_size);
+        Tensor kv_rows         = ordinary.text_kv_table_rows.slice(0, 0, batch_size);
+        Tensor lanes           = ordinary.lanes.slice(0, 0, batch_size);
+        // Publish the round's adapter selection for the projection hooks. The slot
+        // vector is frame-resident and the scratch store-resident, so a captured
+        // graph records their addresses once and replays against what this round
+        // staged. Cleared after the card runs, so a later round without adapters
+        // cannot inherit these ids.
+        Tensor lora_slots     = ordinary.lora_slots.slice(0, 0, batch_size);
+        const bool lora_round = ops::lora_active();
+        if (lora_round) {
+            ops::LoraRound round;
+            round.slots   = &lora_slots;
+            round.scratch      = ops::lora_store_for_current_device().scratch(batch_size);
+            round.uniform_cell = ops::lora_store_for_current_device().uniform_cell();
+            ops::lora_set_round(round);
+        }
+        Tensor hidden          = ordinary.hidden.slice(1, 0, batch_size);
+        Tensor logits          = ordinary.logits.slice(1, 0, batch_size);
+        Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, batch_size);
+
+        card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
+                                   envelope, hidden, logits);
+        if (lora_round) { ops::lora_clear_round(); }
+        if (!card.stage_finishes()) { return; } // a pipeline stage without the head: nothing to sample
+        ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
+        ops::sample(logits, sampled, state.execution.model.geometry.token_domain,
+                    ordinary.sampling, cache_positions,
+                    ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
+        // The chosen token's probability under the whole vocabulary, for the same
+        // round and inside the same capture. It reads the logits once more -- a
+        // fraction of a percent of what the head that produced them cost -- so it
+        // runs unconditionally rather than behind a flag that would have to be
+        // decided before the first graph was recorded.
+        Tensor sampled_logprobs = ordinary.sampled_logprobs.slice(0, 0, batch_size);
+        ops::sampled_logprob(logits, sampled, sampled_logprobs,
+                             state.execution.model.geometry.token_domain, ordinary.sampling,
+                             state.execution.device.stream);
+        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
+                                   sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+                                   state.execution.device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(tokens.data, sampled.data,
+                                   static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToDevice, state.execution.device.stream));
+        ops::offset_i32_positions(cache_positions, state.chain_one, cache_positions,
+                                  state.execution.device.stream);
+        ops::offset_i32_positions(rope_positions, state.chain_one, rope_positions,
+                                  state.execution.device.stream);
+    };
+}
+
+} // namespace
+
+void capture_ordinary_decode_batch_chained(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                           ops::GqaExecutionEnvelope envelope,
+                                           DecodeGraphDefinition& definition) {
+    auto body = ordinary_batch_body_chained(state, batch_size, envelope);
+    capture_graph(state, definition, body);
+}
+
+void ordinary_decode_batch_chained(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                   ops::GqaExecutionEnvelope envelope,
+                                   DecodeGraphExecutable* executable) {
+    auto body = ordinary_batch_body_chained(state, batch_size, envelope);
+    run_prepared(state, executable, body);
+}
+
+void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                   ops::GqaExecutionEnvelope envelope,
+                                   DecodeGraphDefinition& definition) {
+    auto body = ordinary_batch_body(state, batch_size, envelope);
+    capture_graph(state, definition, body);
+}
+
+void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
+                           ops::GqaExecutionEnvelope envelope, DecodeGraphExecutable* executable) {
+    auto body = ordinary_batch_body(state, batch_size, envelope);
+    run_prepared(state, executable, body);
+}
+
+} // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule

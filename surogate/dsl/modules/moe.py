@@ -326,10 +326,15 @@ class Gemma4MoEExperts(Module):
         self.scalar_root_size = float(d_model) ** -0.5
 
         self.C = Dim("C")
-        self.M = Dim("M")
+        # The routed experts' width, which on this family is *not* the block's `M`: a Gemma 4
+        # mixture layer runs a 2,112-wide dense feed-forward beside 704-wide experts, and a
+        # shape written as `M` here resolves to the dense width wherever the two are read from
+        # one flat table -- sizing every expert three times over, in the artifact and in the
+        # training graph both.
+        self.MoeM = Dim("MoeM")
         self.E = Dim("E")
         self.K = Dim("K")
-        self.MUp = 2 * self.M
+        self.MoeTwoM = 2 * self.MoeM
 
     def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
@@ -349,7 +354,7 @@ class Gemma4MoEExperts(Module):
         tracer.register_param("per_expert_scale", ("E",), quantizable=False)
         tracer.register_param(
             "experts_gate_up",
-            ("E", "MUp", "C"),
+            ("E", "MoeTwoM", "C"),
             offload_group="moe_experts",
             lora_targets=[
                 LoRATarget(
@@ -361,7 +366,7 @@ class Gemma4MoEExperts(Module):
         )
         tracer.register_param(
             "experts_down",
-            ("E", "C", "M"),
+            ("E", "C", "MoeM"),
             offload_group="moe_experts",
             lora_targets=[
                 LoRATarget(
@@ -392,6 +397,21 @@ class Gemma4MoEExperts(Module):
             save=True,
             share_policy="fft_share",
         )
+        # The gathered per-expert scale, and the weights it produces. Saved like
+        # `routing_weights` itself: `moe_unpermute` consumes the *scaled* weights, so those
+        # are what its backward needs.
+        tracer.register_activation(
+            "routing_scale",
+            ("B * T", "K"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "routing_weights_scaled",
+            ("B * T", "K"),
+            save=True,
+            share_policy="fft_share",
+        )
         tracer.register_activation(
             "permuted_input",
             ("B * T * K", "C"),
@@ -407,7 +427,7 @@ class Gemma4MoEExperts(Module):
         )
         tracer.register_activation(
             "expert_gate_up",
-            ("B * T * K", "MUp"),
+            ("B * T * K", "MoeTwoM"),
             save=True,
             share_policy="fft_share",
         )
@@ -458,13 +478,42 @@ class Gemma4MoEExperts(Module):
             indices_name=tracer.prefixed("routing_indices"),
         )
 
-        # 4. Per-expert scale: routing_weights *= per_expert_scale[indices]
-        # This is applied after topk normalization. The moe_unpermute step
-        # already multiplies by routing_weights, so we scale them here.
-        # The per_expert_scale is a [E] vector; we gather by routing_indices [B*T, K].
-        # For now, pass per_expert_scale as a parameter and let the runtime
-        # handle the gather+mul. We encode this as a custom attr on moe_topk.
-        # TODO: Add explicit per_expert_scale gather+mul if runtime doesn't support it.
+        # 4. Per-expert scale: `top_k_weights * per_expert_scale[top_k_index]`.
+        #
+        # After the renormalisation and before the experts are weighted, which is where
+        # `Gemma4TextRouter.forward` puts it and the only place it does anything: applied
+        # before the `normalize=True` above, the denominator would divide it straight back
+        # out and the parameter would be inert.
+        #
+        # A gather and a multiply out of ops that already exist, rather than a new input on
+        # `moe_topk` beside `correction_bias`. Those two are not the same shape of thing -- a
+        # correction bias steers *which* experts are chosen and is dropped from the weight,
+        # this scales what a chosen expert is *worth* -- and expressing it here means the
+        # executor needs to learn nothing, while `per_expert_scale` gets its gradient through
+        # `embedding_backward` the way any other learnable table does.
+        #
+        # `embedding` takes a rank-two table, so the [E] parameter is viewed as [E, 1] and the
+        # gathered [B*T, K, 1] viewed back down.
+        expert_scale_table = g.view(
+            tracer.prefixed("per_expert_scale"),
+            shape=[_n_experts, 1],
+            out_name=tracer.prefixed("per_expert_scale_table"),
+        )
+        gathered_scale = g.embedding(
+            routing_indices,
+            expert_scale_table,
+            out_name=tracer.prefixed("routing_scale_3d"),
+        )
+        gathered_scale = g.view(
+            gathered_scale,
+            shape=["B * T", "K"],
+            out_name=tracer.prefixed("routing_scale"),
+        )
+        routing_weights = g.mul(
+            routing_weights,
+            gathered_scale,
+            out_name=tracer.prefixed("routing_weights_scaled"),
+        )
 
         # -- graph: expert computation ---------------------------------------
         permuted_input, scatter_indices = g.moe_permute(

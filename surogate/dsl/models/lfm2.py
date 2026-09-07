@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .. import nn
+from ..block_schema import ServeObject
 from ..blocks.lfm2 import LFM2_MODEL_NAME_REMAP, Lfm2AttentionBlock, Lfm2ConvBlock
 from ..hf import fuse, tied_to
 from ..modules import Embedding, LMHead, RMSNorm
@@ -50,6 +51,16 @@ def _resolve_lfm2_layer_types(
     return block_types
 
 
+#: What a serving artifact holds beside the layers. LFM2 ties its output head to
+#: the embedding, so the head is not a tensor of its own -- the declaration says
+#: so with `tied_to` and the converter reads one weight for both.
+LFM2_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("text/token_embedding", "bf16", ("Vocab", "C"), ("embedding",), scope="model"),
+    ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
+    ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",), scope="model"),
+)
+
+
 @nn.hf_config(
     architecture="Lfm2ForCausalLM",
     model_type="lfm2",
@@ -57,7 +68,11 @@ def _resolve_lfm2_layer_types(
     n_layers="num_hidden_layers",
     num_query_heads="num_attention_heads",
     num_kv_heads="num_key_value_heads",
-    d_ff="intermediate_size",
+    # LFM2 states its FFN width as `block_ff_dim` and has no `intermediate_size`.
+    # Reading the absent key left d_ff at its default, which the auto-adjust below
+    # then took to 5632 where the checkpoint's own tensors are 8192 wide -- so every
+    # MLP was declared a third too narrow, for training as well as serving.
+    d_ff="block_ff_dim|intermediate_size",
     vocab_size="vocab_size",
     max_seq="max_position_embeddings",
     eps="norm_eps",
@@ -70,8 +85,32 @@ def _resolve_lfm2_layer_types(
     layer_types="layer_types",
     tie_word_embeddings="tie_word_embeddings",
 )
+
+
 class Lfm2Model(nn.Model):
     """LFM2 hybrid model with full-attention and short-conv decoder layers."""
+
+    _serve_objects_ = LFM2_MODEL_SERVE_OBJECTS
+    _serve_blocks_ = {
+        "attention": Lfm2AttentionBlock,
+        "conv": Lfm2ConvBlock,
+    }
+
+    @staticmethod
+    def _serve_block_schedule_(config: dict) -> list[str]:
+        """Which mixer runs at each layer.
+
+        LFM2 names its attention layers outright rather than by a period, so the
+        interval rule the other hybrids use cannot describe it -- `full_attn_idxs`
+        is a list, and a checkpoint may also carry `layer_types` instead. Both are
+        read here, which is why this hook exists.
+        """
+        layers = int(config["n_layers"])
+        types = config.get("layer_types")
+        if types:
+            return ["attention" if t == "full_attention" else "conv" for t in types]
+        attention = set(config.get("full_attn_idxs") or range(layers))
+        return ["attention" if i in attention else "conv" for i in range(layers)]
 
     _name_remap_ = LFM2_MODEL_NAME_REMAP
     _hf_block_mappings_ = {

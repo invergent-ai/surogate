@@ -1465,6 +1465,7 @@ class GraphBuilder:
         eps: float = 1e-5,
         n_groups: int = 1,
         norm_before_gate: bool = False,
+        gate_activation: str = "silu",
         out_name: str | None = None,
     ) -> GraphRef:
         """Gated RMSNorm for Mamba2.
@@ -1476,6 +1477,7 @@ class GraphBuilder:
             eps: Epsilon for numerical stability
             n_groups: Number of groups for normalization (1 = full dim)
             norm_before_gate: If True, normalize before gating
+            gate_activation: Activation applied to the gate ("silu" or "sigmoid")
 
         Returns:
             Gated normalized output
@@ -1494,6 +1496,7 @@ class GraphBuilder:
                     "eps": eps,
                     "n_groups": n_groups,
                     "norm_before_gate": norm_before_gate,
+                    "gate_activation": gate_activation,
                 },
             )
         )

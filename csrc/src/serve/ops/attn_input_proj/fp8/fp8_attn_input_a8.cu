@@ -1,0 +1,95 @@
+#include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
+#include "ops/kernel/func_attribute.cuh"
+#include "ops/linear/fp8/fp8_cublaslt.h"
+
+#include "core/device.h"
+#include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
+#include "ops/linear/fp8/fp8_a8_schedule.cuh"
+#include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_output.cuh"
+
+#include <cuda_bf16.h>
+
+#include <cstdint>
+
+namespace sinfer::ops::detail {
+namespace {
+
+using Geometry = Fp8AttnInputGeometry;
+using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
+
+static_assert((kFp8AttnInputQueryRows % Schedule::kBlockRows) == 0);
+static_assert((kFp8AttnInputKeyRows % Schedule::kBlockRows) == 0);
+static_assert((kFp8AttnInputGateRows % Schedule::kBlockRows) == 0);
+
+template <class Sched, bool FullTokens>
+void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                Fp8A8Workspace workspace, std::int32_t tokens, cudaStream_t stream) {
+    constexpr int kRowTiles = Geometry::kOutputRows / Sched::kBlockRows;
+    const int token_tiles   = (tokens + Sched::kBlockTokens - 1) / Sched::kBlockTokens;
+    const int blocks        = kRowTiles * token_tiles;
+    const Fp8AttentionInputOutput output{
+        static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data),
+        static_cast<__nv_bfloat16*>(v.data),
+    };
+
+    if constexpr (Sched::kSharedBytes > 48 * 1024) {
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+            fp8_mma_kernel<Geometry, Sched, FullTokens, Fp8IdentityEpilogue,
+                           Fp8AttentionInputOutput>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes));
+    }
+    fp8_mma_kernel<Geometry, Sched, FullTokens>
+        <<<blocks, Sched::kThreads, Sched::kSharedBytes, stream>>>(
+            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{},
+            output);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+static_assert(kFp8AttnInputCublasLtStagingRows == kFp8AttnInputQueryRows &&
+                  kFp8AttnInputQueryRows >= kFp8AttnInputGateRows &&
+                  kFp8AttnInputQueryRows >= kFp8AttnInputKeyRows,
+              "the cuBLASLt staging must cover the largest attention segment");
+
+void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                              Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    if (workspace.staging != nullptr && fp8_cublaslt_route(x.ne[1])) {
+        const std::int32_t tokens = x.ne[1];
+        const auto* row_scales    = static_cast<const __nv_bfloat16*>(weight.scales);
+        const struct { std::int32_t begin, rows; Tensor* out; } segments[] = {
+            {0, kFp8AttnInputQueryRows, &q},
+            {kFp8AttnInputQueryRows, kFp8AttnInputKeyRows, &k},
+            {kFp8AttnInputQueryRows + kFp8AttnInputKeyRows, kFp8AttnInputGateRows, &gate},
+            {kFp8AttnInputQueryRows + kFp8AttnInputKeyRows + kFp8AttnInputGateRows,
+             kFp8AttnInputKeyRows, &v},
+        };
+        for (const auto& segment : segments) {
+            fp8_cublaslt_gemm(weight, segment.begin, segment.rows, workspace.codes,
+                              workspace.staging, tokens, stream);
+            fp8_cublaslt_finish(workspace.staging, row_scales, segment.begin, segment.rows,
+                                workspace.scales, tokens,
+                                static_cast<__nv_bfloat16*>(segment.out->data), segment.rows,
+                                false, stream);
+        }
+        return;
+    }
+    if (x.ne[1] <= 32) {
+        if ((x.ne[1] % Fp8LinearA8BatchSchedule::kBlockTokens) == 0) {
+            launch_mma<Fp8LinearA8BatchSchedule, true>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        } else {
+            launch_mma<Fp8LinearA8BatchSchedule, false>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        }
+    } else if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
+        launch_mma<Schedule, true>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    } else {
+        launch_mma<Schedule, false>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    }
+}
+
+} // namespace sinfer::ops::detail

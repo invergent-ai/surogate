@@ -60,6 +60,23 @@ struct MappingSpec {
 
     /// For StackExperts: fuse gate+up projections into interleaved gate_up format.
     bool fuse_gate_up = false;
+    /// The up-projection pattern for a fused stack_experts mapping. Empty keeps
+    /// the default derivation (the literal "gate_proj" in `source` replaced by
+    /// "up_proj"); checkpoints that name the pair otherwise -- LFM2-MoE uses
+    /// w1/w3 -- state it explicitly rather than have the loader guess.
+    std::string up_source;
+
+    /// The up-projection pattern a fused stack_experts mapping should read.
+    /// One definition because three call sites need it -- the mapping table and
+    /// both loader paths -- and they must not drift.
+    [[nodiscard]] static std::string derive_up_pattern(const std::string& gate_pattern,
+                                                       const std::string& declared_up) {
+        if (!declared_up.empty()) { return declared_up; }
+        std::string up = gate_pattern;
+        const std::size_t pos = up.find("gate_proj");
+        if (pos != std::string::npos) { up.replace(pos, 9, "up_proj"); }
+        return up;
+    }
 
     /// For StackExperts: number of experts (0 = auto-detect from config).
     int num_experts = 0;

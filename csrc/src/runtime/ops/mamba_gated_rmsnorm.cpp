@@ -103,15 +103,20 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
     const float eps = op.attrs.eps;
     const int groups = op.attrs.n_groups > 0 ? op.attrs.n_groups : 1;
     const bool norm_before_gate = op.attrs.norm_before_gate;
+    const bool sigmoid_gate = (op.attrs.gate_activation == "sigmoid");
     if (groups <= 0 || (D % groups) != 0) {
         throw std::runtime_error("mamba_gated_rmsnorm: invalid groups=" + std::to_string(groups) +
                                  " for D=" + std::to_string(D));
     }
 
-    // 1. silu_gate = silu(gate)
-    Tensor silu_gate = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_silu_gate");
-    mTemps.push_back(silu_gate);
-    silu_forward(silu_gate, gate, n, mRunState.MainStream);
+    // 1. act_gate = act(gate); act = silu (default) or sigmoid (e.g. Qwen3.8 Flash-Next)
+    Tensor act_gate = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_act_gate");
+    mTemps.push_back(act_gate);
+    if (sigmoid_gate) {
+        sigmoid_forward(act_gate, gate, n, mRunState.MainStream);
+    } else {
+        silu_forward(act_gate, gate, n, mRunState.MainStream);
+    }
 
     Tensor out_t;
     bool out_is_ref = false;
@@ -136,36 +141,36 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
 
     Tensor normed_or_gated;
     if (norm_before_gate) {
-        // Qwen3.5 style: out = RMSNorm(x) * silu(gate)
+        // Qwen3.5 style: out = RMSNorm(x) * act(gate)
         Tensor normed = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_normed");
         mTemps.push_back(normed);
         mamba_group_rmsnorm_forward(normed, rstd, x, weight, eps, B, T, D, groups, mRunState.MainStream);
         if (x.DType == ETensorDType::BF16) {
             elementwise_mul(out_t.get<nv_bfloat16>(),
                             normed.get<nv_bfloat16>(),
-                            silu_gate.get<nv_bfloat16>(),
+                            act_gate.get<nv_bfloat16>(),
                             n,
                             mRunState.MainStream);
         } else if (x.DType == ETensorDType::FP16) {
-            elementwise_mul(out_t.get<half>(), normed.get<half>(), silu_gate.get<half>(), n, mRunState.MainStream);
+            elementwise_mul(out_t.get<half>(), normed.get<half>(), act_gate.get<half>(), n, mRunState.MainStream);
         } else {
-            elementwise_mul(out_t.get<float>(), normed.get<float>(), silu_gate.get<float>(), n, mRunState.MainStream);
+            elementwise_mul(out_t.get<float>(), normed.get<float>(), act_gate.get<float>(), n, mRunState.MainStream);
         }
         normed_or_gated = normed;  // Save normalized x for backward.
     } else {
-        // Mamba default: out = RMSNorm(x * silu(gate))
+        // Mamba default: out = RMSNorm(x * act(gate))
         Tensor gated = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_gated");
         mTemps.push_back(gated);
         if (x.DType == ETensorDType::BF16) {
             elementwise_mul(gated.get<nv_bfloat16>(),
                             x.get<nv_bfloat16>(),
-                            silu_gate.get<nv_bfloat16>(),
+                            act_gate.get<nv_bfloat16>(),
                             n,
                             mRunState.MainStream);
         } else if (x.DType == ETensorDType::FP16) {
-            elementwise_mul(gated.get<half>(), x.get<half>(), silu_gate.get<half>(), n, mRunState.MainStream);
+            elementwise_mul(gated.get<half>(), x.get<half>(), act_gate.get<half>(), n, mRunState.MainStream);
         } else {
-            elementwise_mul(gated.get<float>(), x.get<float>(), silu_gate.get<float>(), n, mRunState.MainStream);
+            elementwise_mul(gated.get<float>(), x.get<float>(), act_gate.get<float>(), n, mRunState.MainStream);
         }
         mamba_group_rmsnorm_forward(out_t, rstd, gated, weight, eps, B, T, D, groups, mRunState.MainStream);
         normed_or_gated = gated;  // Save norm input for backward.
@@ -204,7 +209,7 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
     // Outputs: d_x [..., D], d_gate [..., D], d_weight [D]
     //
     // Saved input[5] is:
-    // - norm_before_gate=False: gated = x * silu(gate) (norm input)
+    // - norm_before_gate=False: gated = x * act(gate) (norm input)
     // - norm_before_gate=True : normed = RMSNorm(x) (pre-gate normalized output)
     //
     // For robustness, backward recomputes rstd/normed_or_gated from x/gate/weight instead of
@@ -230,15 +235,20 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
     const float eps = op.attrs.eps;
     const int groups = op.attrs.n_groups > 0 ? op.attrs.n_groups : 1;
     const bool norm_before_gate = op.attrs.norm_before_gate;
+    const bool sigmoid_gate = (op.attrs.gate_activation == "sigmoid");
     if (groups <= 0 || (D % groups) != 0) {
         throw std::runtime_error("mamba_gated_rmsnorm_backward: invalid groups=" + std::to_string(groups) +
                                  " for D=" + std::to_string(D));
     }
 
     // Common gate activation for both branches
-    Tensor silu_gate = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_silu_gate");
-    mTemps.push_back(silu_gate);
-    silu_forward(silu_gate, gate, n, mRunState.MainStream);
+    Tensor act_gate = mRunState.temp_alloc(x.DType, x_shape, "mamba_gated_rmsnorm_act_gate");
+    mTemps.push_back(act_gate);
+    if (sigmoid_gate) {
+        sigmoid_forward(act_gate, gate, n, mRunState.MainStream);
+    } else {
+        silu_forward(act_gate, gate, n, mRunState.MainStream);
+    }
 
     // Recompute normalization intermediates (rstd + branch-specific tensor) to avoid
     // relying on saved transient buffers.
@@ -262,23 +272,23 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
                                     groups,
                                     mRunState.MainStream);
     } else {
-        // recomputed_normed_or_gated := gated = x * silu(gate)
+        // recomputed_normed_or_gated := gated = x * act(gate)
         if (x.DType == ETensorDType::BF16) {
             elementwise_mul(recomputed_normed_or_gated.get<nv_bfloat16>(),
                             x.get<nv_bfloat16>(),
-                            silu_gate.get<nv_bfloat16>(),
+                            act_gate.get<nv_bfloat16>(),
                             n,
                             mRunState.MainStream);
         } else if (x.DType == ETensorDType::FP16) {
             elementwise_mul(recomputed_normed_or_gated.get<half>(),
                             x.get<half>(),
-                            silu_gate.get<half>(),
+                            act_gate.get<half>(),
                             n,
                             mRunState.MainStream);
         } else {
             elementwise_mul(recomputed_normed_or_gated.get<float>(),
                             x.get<float>(),
-                            silu_gate.get<float>(),
+                            act_gate.get<float>(),
                             n,
                             mRunState.MainStream);
         }
@@ -305,20 +315,20 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
     mTemps.push_back(d_weight_fp32);
 
     if (norm_before_gate) {
-        // Forward: out = RMSNorm(x) * silu(gate), saved normed_or_gated = RMSNorm(x)
-        // d_normed = d_out * silu(gate)
+        // Forward: out = RMSNorm(x) * act(gate), saved normed_or_gated = RMSNorm(x)
+        // d_normed = d_out * act(gate)
         Tensor d_normed = mRunState.temp_alloc(d_out.DType, x_shape, "mamba_gated_rmsnorm_backward_d_normed");
         mTemps.push_back(d_normed);
         if (d_out.DType == ETensorDType::BF16) {
             elementwise_mul(d_normed.get<nv_bfloat16>(),
                             d_out.get<nv_bfloat16>(),
-                            silu_gate.get<nv_bfloat16>(),
+                            act_gate.get<nv_bfloat16>(),
                             n,
                             mRunState.MainStream);
         } else if (d_out.DType == ETensorDType::FP16) {
-            elementwise_mul(d_normed.get<half>(), d_out.get<half>(), silu_gate.get<half>(), n, mRunState.MainStream);
+            elementwise_mul(d_normed.get<half>(), d_out.get<half>(), act_gate.get<half>(), n, mRunState.MainStream);
         } else {
-            elementwise_mul(d_normed.get<float>(), d_out.get<float>(), silu_gate.get<float>(), n, mRunState.MainStream);
+            elementwise_mul(d_normed.get<float>(), d_out.get<float>(), act_gate.get<float>(), n, mRunState.MainStream);
         }
         // d_x, d_weight via RMSNorm backward on x.
         mamba_group_rmsnorm_backward_dx(d_x,
@@ -341,7 +351,7 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
                                                   groups,
                                                   mRunState.MainStream);
 
-        // d_gate = silu_backward(d_out * normed, gate)
+        // d_gate = act_backward(d_out * normed, gate)
         Tensor d_out_times_normed =
             mRunState.temp_alloc(d_out.DType, x_shape, "mamba_gated_rmsnorm_backward_d_out_times_normed");
         mTemps.push_back(d_out_times_normed);
@@ -364,9 +374,13 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
                             n,
                             mRunState.MainStream);
         }
-        silu_backward(d_gate, gate, d_out_times_normed, n, mRunState.MainStream);
+        if (sigmoid_gate) {
+            sigmoid_backward(d_gate, gate, d_out_times_normed, n, mRunState.MainStream);
+        } else {
+            silu_backward(d_gate, gate, d_out_times_normed, n, mRunState.MainStream);
+        }
     } else {
-        // Forward: out = RMSNorm(gated), gated = x * silu(gate), saved normed_or_gated = gated
+        // Forward: out = RMSNorm(gated), gated = x * act(gate), saved normed_or_gated = gated
         Tensor d_gated = mRunState.temp_alloc(d_out.DType, x_shape, "mamba_gated_rmsnorm_backward_d_gated");
         mTemps.push_back(d_gated);
         mamba_group_rmsnorm_backward_dx(d_gated,
@@ -389,20 +403,20 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
                                                   groups,
                                                   mRunState.MainStream);
 
-        // d_x = d_gated * silu(gate)
+        // d_x = d_gated * act(gate)
         if (d_out.DType == ETensorDType::BF16) {
             elementwise_mul(d_x.get<nv_bfloat16>(),
                             d_gated.get<nv_bfloat16>(),
-                            silu_gate.get<nv_bfloat16>(),
+                            act_gate.get<nv_bfloat16>(),
                             n,
                             mRunState.MainStream);
         } else if (d_out.DType == ETensorDType::FP16) {
-            elementwise_mul(d_x.get<half>(), d_gated.get<half>(), silu_gate.get<half>(), n, mRunState.MainStream);
+            elementwise_mul(d_x.get<half>(), d_gated.get<half>(), act_gate.get<half>(), n, mRunState.MainStream);
         } else {
-            elementwise_mul(d_x.get<float>(), d_gated.get<float>(), silu_gate.get<float>(), n, mRunState.MainStream);
+            elementwise_mul(d_x.get<float>(), d_gated.get<float>(), act_gate.get<float>(), n, mRunState.MainStream);
         }
 
-        // d_gate = silu_backward(d_gated * x, gate)
+        // d_gate = act_backward(d_gated * x, gate)
         Tensor d_gated_times_x =
             mRunState.temp_alloc(d_out.DType, x_shape, "mamba_gated_rmsnorm_backward_d_gated_times_x");
         mTemps.push_back(d_gated_times_x);
@@ -421,7 +435,11 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
                             n,
                             mRunState.MainStream);
         }
-        silu_backward(d_gate, gate, d_gated_times_x, n, mRunState.MainStream);
+        if (sigmoid_gate) {
+            sigmoid_backward(d_gate, gate, d_gated_times_x, n, mRunState.MainStream);
+        } else {
+            silu_backward(d_gate, gate, d_gated_times_x, n, mRunState.MainStream);
+        }
     }
 
     auto copy_or_accumulate = [&](const TensorRef& out_ref, const Tensor& src, bool allow_accumulate) {
@@ -524,7 +542,7 @@ std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& c
     outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // dgate
     outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");  // dweight
 
-    AttrMap attrs = copy_attrs(fwd.attrs, {"eps", "n_groups", "norm_before_gate"}, "mamba_gated_rmsnorm");
+    AttrMap attrs = copy_attrs(fwd.attrs, {"eps", "n_groups", "norm_before_gate", "gate_activation"}, "mamba_gated_rmsnorm");
 
     ops.push_back(make_operation("mamba_gated_rmsnorm_backward_" + std::to_string(ctx.op_counter++),
                                  "mamba_gated_rmsnorm_backward",
@@ -541,7 +559,7 @@ std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& c
 // Upper bound for dispatch_mamba_gated_rmsnorm_backward. Worst case covers
 // both norm_before_gate branches (they allocate disjoint extras, so the
 // larger decides the peak). Per-call temps:
-//   silu_gate                 <input dtype>  B*T*D
+//   act_gate                 <input dtype>  B*T*D
 //   recomputed_rstd           FP32           B*T*groups
 //   recomputed_normed_or_gated <input dtype>  B*T*D
 //   d_x, d_gate               <out dtype>    B*T*D each
@@ -565,7 +583,7 @@ long mamba_gated_rmsnorm_backward_stack_bound(const CompiledOp& op, const Buffer
     const long BTD = B * T * D;
 
     long bytes = 0;
-    bytes += align_stack_bytes(BTD * input_bytes);      // silu_gate
+    bytes += align_stack_bytes(BTD * input_bytes);      // act_gate
     bytes += align_stack_bytes(B * T * groups * FP32);  // recomputed_rstd
     bytes += align_stack_bytes(BTD * input_bytes);      // recomputed_normed_or_gated
     bytes += align_stack_bytes(BTD * input_bytes) * 2;  // d_x, d_gate

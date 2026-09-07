@@ -1,0 +1,362 @@
+#pragma once
+
+// Typed Qwen3.6 phase-root allocation clusters shared by the real schedule and its startup
+// WorkspaceLayoutBuilder simulation. Child Op scratch remains owned by each Op capacity query.
+
+#include <api/family/text_geometry.h>
+
+#include "core/arena.h"
+#include "core/layout.h"
+
+#include <cstdint>
+
+#include "family/impl/runtime/residual_policy.h"
+
+namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::workspace_recipe {
+
+template <class Allocator>
+Tensor matrix(Allocator& allocator, DType dtype, std::int32_t rows, std::int32_t tokens) {
+    return allocator.alloc(dtype, {rows, tokens});
+}
+
+template <class Allocator>
+Tensor vector(Allocator& allocator, DType dtype, std::int32_t elements) {
+    return allocator.alloc(dtype, {elements});
+}
+
+struct TextPrefillRoots {
+    Tensor ids;
+    Tensor positions;
+    Tensor rope_positions;
+    Tensor residual;
+    Tensor scatter_indices;
+};
+
+template <class Allocator>
+TextPrefillRoots text_prefill_roots(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens,
+                                    std::int32_t rope_axes, std::int32_t scatter_tokens) {
+    TextPrefillRoots out;
+    out.ids       = vector(allocator, DType::I32, tokens);
+    out.positions = vector(allocator, DType::I32, tokens);
+    if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
+    out.residual = matrix(allocator, DType::BF16, geometry.residual, tokens);
+    if (scatter_tokens != 0) {
+        out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
+    }
+    return out;
+}
+
+template <class Allocator>
+Tensor visual_scatter_indices(Allocator& allocator, std::int32_t tokens) {
+    return vector(allocator, DType::I32, tokens);
+}
+
+struct TextAttentionProjectionRoots {
+    Tensor hidden;
+    Tensor query;
+    Tensor gate;
+    Tensor key;
+    Tensor value;
+};
+
+/// The projection's planes at explicitly given widths, for a model whose layers do not all
+/// attend at the same one. Gemma 4's windowed layers project 4,096 query rows and its global
+/// layers 8,192, so a round asks for this layer's and the *plan* reserves the widest.
+template <class Allocator>
+TextAttentionProjectionRoots text_attention_projection(Allocator& allocator, std::int32_t hidden,
+                                                       std::int32_t query_rows,
+                                                       std::int32_t kv_rows,
+                                                       std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, hidden, tokens),
+        matrix(allocator, DType::BF16, query_rows, tokens),
+        matrix(allocator, DType::BF16, query_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
+    };
+}
+
+/// The same, sized from the geometry. At the *widest* of its attention geometries, because
+/// this is what the capacity planner measures and one plan serves every layer; a model with
+/// one geometry is unaffected, its maximum being its only size.
+template <class Allocator>
+TextAttentionProjectionRoots text_attention_projection(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return text_attention_projection(allocator, geometry.hidden, geometry.maximum_query_size(),
+                                     geometry.maximum_kv_size(), tokens);
+}
+
+struct TextAttentionResultRoots {
+    Tensor normalized_query;
+    Tensor normalized_key;
+    Tensor attention;
+};
+
+template <class Allocator>
+TextAttentionResultRoots text_attention_results(Allocator& allocator, std::int32_t query_rows,
+                                                std::int32_t kv_rows, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, query_rows, tokens),
+        matrix(allocator, DType::BF16, kv_rows, tokens),
+        matrix(allocator, DType::BF16, query_rows, tokens),
+    };
+}
+
+template <class Allocator>
+TextAttentionResultRoots text_attention_results(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return text_attention_results(allocator, geometry.maximum_query_size(),
+                                  geometry.maximum_kv_size(), tokens);
+}
+
+struct GdnControlRoots {
+    Tensor hidden;
+    Tensor g;
+    Tensor beta;
+};
+
+/// The forget gate's rows. One per value head for the delta net; one per key channel of every
+/// head for Kimi Delta Attention, which is the whole difference between the two recurrences and
+/// therefore between the two control projections.
+[[nodiscard]] constexpr std::int32_t gdn_gate_rows(const family::TextGeometry& geometry,
+                                                   family::LinearMixer mixer) {
+    return family::linear_mixer_gate_is_per_channel(mixer) ? geometry.value_dim()
+                                                           : geometry.gdn_value_heads;
+}
+
+template <class Allocator>
+GdnControlRoots gdn_control(Allocator& allocator, const family::TextGeometry& geometry,
+                            std::int32_t tokens, family::LinearMixer mixer) {
+    return {
+        matrix(allocator, DType::BF16, geometry.hidden, tokens),
+        matrix(allocator, DType::FP32, gdn_gate_rows(geometry, mixer), tokens),
+        matrix(allocator, DType::FP32, geometry.gdn_value_heads, tokens),
+    };
+}
+
+struct GdnProjectionRoots {
+    Tensor output_gate;
+    Tensor query;
+    Tensor key;
+    Tensor value;
+};
+
+template <class Allocator>
+GdnProjectionRoots gdn_projection(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, geometry.value_dim(), tokens),
+        matrix(allocator, DType::BF16, geometry.key_dim(), tokens),
+        matrix(allocator, DType::BF16, geometry.key_dim(), tokens),
+        matrix(allocator, DType::BF16, geometry.value_dim(), tokens),
+    };
+}
+
+struct GdnPrefillConvRoots {
+    Tensor projected;
+    Tensor convolved;
+};
+
+template <class Allocator>
+GdnPrefillConvRoots gdn_prefill_conv(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, geometry.convolution_dim(), tokens),
+        matrix(allocator, DType::BF16, geometry.convolution_dim(), tokens),
+    };
+}
+
+template <class Allocator>
+Tensor gdn_recurrent_output(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return matrix(allocator, DType::BF16, geometry.value_dim(), tokens);
+}
+
+template <class Allocator>
+Tensor gdn_normalized_output(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return matrix(allocator, DType::BF16, geometry.value_dim(), tokens);
+}
+
+/// The short-convolution mixer's two roots: the projection's three stacked parts, and the
+/// convolved value the output projection reads. Both are per-round, neither is state.
+struct ShortConvRoots {
+    Tensor projected;
+    Tensor convolved;
+};
+
+template <class Allocator>
+ShortConvRoots short_conv(Allocator& allocator, const family::TextGeometry& geometry,
+                          std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, 3 * geometry.hidden, tokens),
+        matrix(allocator, DType::BF16, geometry.hidden, tokens),
+    };
+}
+
+template <class Allocator>
+Tensor post_mixer_hidden(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return matrix(allocator, DType::BF16, geometry.hidden, tokens);
+}
+
+struct MtpStemRoots {
+    Tensor embedding;
+    Tensor normalized_embedding;
+    Tensor normalized_hidden;
+    Tensor packed_input;
+    Tensor residual;
+    Tensor attention_hidden;
+};
+
+template <class Allocator>
+MtpStemRoots mtp_stem(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens, bool allocate_embedding) {
+    MtpStemRoots out;
+    if (allocate_embedding) {
+        out.embedding = matrix(allocator, DType::BF16, geometry.hidden, tokens);
+    }
+    out.normalized_embedding = matrix(allocator, DType::BF16, geometry.hidden, tokens);
+    out.normalized_hidden    = matrix(allocator, DType::BF16, geometry.hidden, tokens);
+    out.packed_input         = matrix(allocator, DType::BF16, geometry.mtp_input_rows(), tokens);
+    out.residual             = matrix(allocator, DType::BF16, geometry.hidden, tokens);
+    out.attention_hidden     = matrix(allocator, DType::BF16, geometry.hidden, tokens);
+    return out;
+}
+
+/// A trunk-block draft head needs only the embedding and the wide residual it folds into: the
+/// block that follows allocates through the trunk's own recipes, and the fold's own scratch is
+/// the target's business.
+struct MtpTrunkRoots {
+    Tensor embedding;
+    Tensor residual;
+};
+
+template <class Allocator>
+MtpTrunkRoots mtp_trunk_stem(Allocator& allocator, const family::TextGeometry& geometry,
+                             std::int32_t tokens, bool allocate_embedding) {
+    MtpTrunkRoots out;
+    if (allocate_embedding) {
+        out.embedding = matrix(allocator, DType::BF16, geometry.hidden, tokens);
+    }
+    out.residual = matrix(allocator, DType::BF16, geometry.residual, tokens);
+    return out;
+}
+
+struct MtpAttentionProjectionRoots {
+    Tensor query;
+    Tensor key;
+    Tensor gate;
+    Tensor value;
+};
+
+template <class Allocator>
+MtpAttentionProjectionRoots mtp_attention_projection(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, geometry.query_size(), tokens),
+        matrix(allocator, DType::BF16, geometry.kv_size(), tokens),
+        matrix(allocator, DType::BF16, geometry.query_size(), tokens),
+        matrix(allocator, DType::BF16, geometry.kv_size(), tokens),
+    };
+}
+
+struct MtpAttentionResultRoots {
+    Tensor normalized_query;
+    Tensor normalized_key;
+    Tensor attention;
+};
+
+template <class Allocator>
+MtpAttentionResultRoots mtp_attention_results(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, geometry.query_size(), tokens),
+        matrix(allocator, DType::BF16, geometry.kv_size(), tokens),
+        matrix(allocator, DType::BF16, geometry.query_size(), tokens),
+    };
+}
+
+struct MtpPostAttentionRoots {
+    Tensor output;
+    Tensor post_mixer_hidden;
+};
+
+template <class Allocator>
+MtpPostAttentionRoots mtp_post_attention(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, geometry.hidden, tokens),
+        matrix(allocator, DType::BF16, geometry.hidden, tokens),
+    };
+}
+
+struct DFlashContextRoots {
+    Tensor projected;
+    Tensor normalized;
+};
+
+template <class Config, class Allocator>
+DFlashContextRoots dflash_context(Allocator& allocator, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+    };
+}
+
+struct DFlashContextLayerRoots {
+    Tensor key_raw;
+    Tensor value;
+    Tensor key;
+};
+
+template <class Config, class Allocator>
+DFlashContextLayerRoots dflash_context_layer(Allocator& allocator, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+    };
+}
+
+struct DFlashProposalRoots {
+    Tensor ids;
+    Tensor positions;
+    Tensor residual;
+};
+
+template <class Config, class Allocator>
+DFlashProposalRoots dflash_proposal(Allocator& allocator, std::int32_t tokens) {
+    return {
+        vector(allocator, DType::I32, tokens),
+        vector(allocator, DType::I32, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+    };
+}
+
+struct DFlashAttentionRoots {
+    Tensor hidden;
+    Tensor query_raw;
+    Tensor key_raw;
+    Tensor value;
+    Tensor query;
+    Tensor key;
+    Tensor attention;
+};
+
+template <class Config, class Allocator>
+DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size, tokens),
+    };
+}
+
+struct DFlashMlpRoots {
+    Tensor hidden;
+    Tensor intermediate;
+};
+
+template <class Config, class Allocator>
+DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::intermediate, tokens),
+    };
+}
+
+} // namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::workspace_recipe

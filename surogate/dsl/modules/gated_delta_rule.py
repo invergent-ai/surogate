@@ -44,6 +44,7 @@ class GatedDeltaNetMixer(Module):
         linear_num_value_heads: int = 32,
         chunk_size: int = 64,
         eps: float = 1e-6,
+        gate_activation: str = "silu",
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -54,6 +55,12 @@ class GatedDeltaNetMixer(Module):
         self.linear_num_value_heads = linear_num_value_heads
         self.chunk_size = chunk_size
         self.eps = eps
+        if gate_activation not in ("silu", "sigmoid"):
+            raise ValueError(
+                f"GatedDeltaNetMixer: unsupported gate_activation '{gate_activation}' "
+                "(expected 'silu' or 'sigmoid')"
+            )
+        self.gate_activation = gate_activation
 
         if linear_num_value_heads % linear_num_key_heads != 0:
             raise ValueError(
@@ -236,6 +243,7 @@ class GatedDeltaNetMixer(Module):
             eps=self.eps,
             n_groups=1,
             norm_before_gate=True,
+            gate_activation=self.gate_activation,
             out_name=tracer.prefixed("gated_flat"),
         )
         gated = g.view(

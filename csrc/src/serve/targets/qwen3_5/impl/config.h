@@ -1,0 +1,113 @@
+#pragma once
+
+#include <api/family/frontend.h>
+#include <api/family/hybrid_topology.h>
+#include <api/family/vision.h>
+
+#include <cstdint>
+
+namespace sinfer::targets::qwen3_5::detail {
+
+struct TextConfig {
+    static constexpr int hidden       = 2048;
+    static constexpr int layers       = 24;
+    static constexpr int intermediate = 6144;
+
+    // The output matrix is padded for the selected kernels. Only token IDs in
+    // [0, token_domain) are tokenizer-addressable and valid sampling results.
+    static constexpr int output_rows  = 248320;
+    static constexpr int token_domain = static_cast<int>(family::kTokenDomain);
+
+    static constexpr int gdn_conv_kernel      = 4;
+    static constexpr int gdn_conv_state_width = gdn_conv_kernel - 1;
+    static constexpr int gdn_key_heads        = 16;
+    static constexpr int gdn_key_head_dim     = 128;
+    static constexpr int gdn_value_heads      = 16;
+    static constexpr int gdn_value_head_dim   = 128;
+
+    static constexpr int query_heads = 8;
+    static constexpr int kv_heads    = 2;
+    static constexpr int head_dim    = 256;
+    static constexpr int rotary_dim  = 64;
+
+    static constexpr int full_attention_interval = family::kHybridAttentionInterval;
+    static constexpr float rms_epsilon           = 1.0e-6F;
+    static constexpr float rope_theta            = 1.0e7F;
+
+    static constexpr int key_dim               = gdn_key_heads * gdn_key_head_dim;
+    static constexpr int value_dim             = gdn_value_heads * gdn_value_head_dim;
+    static constexpr int convolution_dim       = 2 * key_dim + value_dim;
+    static constexpr int query_size            = query_heads * head_dim;
+    static constexpr int kv_size               = kv_heads * head_dim;
+    static constexpr int query_projection_rows = 2 * query_size;
+
+    static constexpr int mtp_layers               = 1;
+    static constexpr int mtp_input_rows           = 2 * hidden;
+    static constexpr int mtp_attention_input_rows = 2 * query_size + 2 * kv_size;
+    static constexpr int mtp_mlp_gate_up_rows     = 2 * intermediate;
+
+    [[nodiscard]] static constexpr bool is_full_attention(int layer) {
+        return family::is_full_attention_layer(layer);
+    }
+
+    [[nodiscard]] static constexpr int full_attention_layers() {
+        return family::full_attention_layers(layers);
+    }
+
+    [[nodiscard]] static constexpr int gdn_layers() { return family::gdn_layers(layers); }
+
+    [[nodiscard]] static constexpr int full_attention_index(int layer) {
+        return family::full_attention_index(layer);
+    }
+
+    [[nodiscard]] static constexpr int gdn_index(int layer) { return family::gdn_index(layer); }
+};
+
+static_assert(TextConfig::full_attention_layers() == 6);
+static_assert(TextConfig::gdn_layers() == 18);
+
+/// The family's vision tower. Only some checkpoints ship one -- the 0.8B does not, and the
+/// community GGUF exports drop it everywhere -- so an artifact is probed for it rather than
+/// assumed to have it. Its dimensions are the same wherever it appears, and they are not
+/// derivable from a text-only `config.json`, which is why this block is written out.
+struct VisionConfig {
+    static constexpr int layers              = 24;
+    static constexpr int hidden              = 1024;
+    static constexpr int intermediate        = 4096;
+    static constexpr int heads               = 16;
+    static constexpr int head_dim            = hidden / heads;
+    static constexpr int patch_dim           = 3 * 2 * 16 * 16;
+    static constexpr int merge               = 2;
+    static constexpr int merge_unit          = merge * merge;
+    static constexpr int merger_hidden       = hidden * merge_unit;
+    static constexpr int position_embeddings = 48 * 48;
+    static constexpr int rotary_dim          = head_dim;
+    static constexpr float rope_theta        = 10'000.0F;
+    static constexpr float norm_epsilon      = 1.0e-6F;
+    static constexpr int output_hidden       = TextConfig::hidden;
+};
+
+static_assert(VisionConfig::hidden % VisionConfig::heads == 0);
+static_assert(VisionConfig::merger_hidden == 4096);
+
+struct DFlashConfig {
+    static constexpr bool supported     = false;
+    static constexpr int local_layers   = 0;
+    static constexpr int local_capacity = 0;
+    static constexpr int kv_heads       = 0;
+    static constexpr int head_dim       = 0;
+    static constexpr int feature_rows   = 0;
+    static constexpr int hidden         = 0;
+    static constexpr int intermediate   = 0;
+    static constexpr int query_size     = 0;
+    static constexpr int kv_size        = 0;
+};
+
+inline constexpr float kAttentionScale                   = 0.0625F;
+inline constexpr float kGdnScale                         = 0.08838834764831845F;
+inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+inline constexpr std::uint32_t kNativeContext            = 262144;
+
+} // namespace sinfer::targets::qwen3_5::detail

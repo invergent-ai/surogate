@@ -36,14 +36,38 @@ struct ChatMessage {
     std::string content;
 };
 
+// Template variables beyond the messages and the generation prompt. Each is left
+// undefined in the render when unset, so a template that gates on `is defined`
+// keeps its own default. Both names are the ones the model cards use:
+// enable_thinking for the Qwen family's switch, reasoning_effort for the templates
+// that choose an effort instead (GLM names low/high/max, Qwen low/medium/xhigh).
+struct ChatTemplateVariables {
+    std::optional<bool> enable_thinking;
+    std::optional<std::string> reasoning_effort;
+};
+
 class Tokenizer {
 public:
     ~Tokenizer();
     Tokenizer(Tokenizer&&) noexcept;
     Tokenizer& operator=(Tokenizer&&) noexcept;
 
+    // The files a tokenizer is built from, already in memory. `tokenizer_json` is
+    // required; the rest may be empty. This is what lets a caller that holds the
+    // resources rather than a directory -- the serving engine reads them out of
+    // its model artifact -- build the same tokenizer without staging temp files.
+    struct Sources {
+        std::string tokenizer_json;
+        std::string model_config_json;      // config.json: names the pre-tokenizer family
+        std::string tokenizer_config_json;  // specials, chat template
+        std::string chat_template_jinja;    // standalone template, if the checkpoint ships one
+    };
+
     // Load from a HuggingFace model directory (reads tokenizer.json + tokenizer_config.json)
     static Tokenizer from_pretrained(const std::string& model_dir);
+
+    // Same, from sources already in memory.
+    static Tokenizer from_sources(const Sources& sources);
 
     // Encode text to token IDs. Special tokens in the text are NOT encoded unless
     // they appear in allowed_special.
@@ -59,8 +83,11 @@ public:
     std::vector<std::vector<int32_t>> encode_batch(const std::vector<std::string>& texts,
                                                    bool add_special_tokens = false) const;
 
-    // Decode token IDs back to text.
-    std::string decode(const std::vector<int32_t>& ids) const;
+    // Decode token IDs back to text. `strip_leading_space` undoes the word mark
+    // the normalizer prepends, which is only correct for a whole sequence -- a
+    // caller decoding one token at a time must pass false or every word loses the
+    // space in front of it.
+    std::string decode(const std::vector<int32_t>& ids, bool strip_leading_space = true) const;
 
     // Single token encode/decode.
     int32_t encode_single_token(const std::string& token_bytes) const;
@@ -69,6 +96,9 @@ public:
     // Vocabulary info.
     int32_t vocab_size() const;
     int32_t bos_token_id() const;
+    // Whether this checkpoint opens a sequence with its BOS, from either
+    // tokenizer_config's add_bos_token or the tokenizer.json post-processor.
+    bool adds_bos() const;
     int32_t eos_token_id() const;
     int32_t pad_token_id() const;
 
@@ -89,6 +119,12 @@ public:
     std::string apply_chat_template(const std::vector<ChatMessage>& messages,
                                     bool add_generation_prompt = false,
                                     std::optional<bool> enable_thinking = std::nullopt) const;
+
+    // Same, with every template variable this renderer can set. The overload above
+    // is the thinking switch on its own, which is all the training paths ask for.
+    std::string apply_chat_template(const std::vector<ChatMessage>& messages,
+                                    bool add_generation_prompt,
+                                    const ChatTemplateVariables& variables) const;
 
     // Convenience: apply_chat_template + encode_with_special_tokens in one call.
     std::vector<int32_t> apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,

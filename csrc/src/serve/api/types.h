@@ -1,0 +1,726 @@
+#pragma once
+
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace sinfer {
+
+namespace ops {
+class EngineOpsContext;
+} // namespace ops
+
+using TokenId = std::int32_t;
+
+// surogate vendor patch (PATCHES.md #29): raised 8 -> 16 for the multi-user
+// campaign. Every exact-T decode table and the conv-fused GDN path cover
+// T<=16; 32 needs the T=17..32 route coverage first.
+inline constexpr std::uint32_t kMaximumConcurrency = 128; // #79: 64 left a third of a 100-user load queued
+// Aggregate encoded image/video payload retained by one prompt, independent of item count.
+inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
+inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
+inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+
+enum class KvCacheStorage : std::uint8_t {
+    BFloat16,
+    Int8Group64,
+    Fp8E4M3,
+    /// Resolved per target once its geometry is known: BFloat16 where every layer is
+    /// attention, Fp8E4M3 where linear-attention layers carry the stack. Measured on the
+    /// perplexity gate (2026-09-04): e4m3's three mantissa bits put ~2 % of noise on every
+    /// K and V, which a pure-attention Qwen3-0.6B pays as +1.5 % (Q4_K_M) and +2.6 %
+    /// (IQ4_XS) of perplexity against llama.cpp's f16 cache -- both rows match llama.cpp
+    /// once the cache is BF16 -- while a 3:1 GDN stack pays 0.4 % (27B) to nothing (35B,
+    /// 0.8B) and keeps the halved cache.
+    Auto,
+};
+
+enum class KvCapacityMode : std::uint8_t {
+    Explicit,
+    Automatic,
+};
+
+inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+
+struct KvCapacityPolicy {
+    KvCapacityMode mode                  = KvCapacityMode::Explicit;
+    std::uint32_t explicit_tokens        = 2048;
+    std::size_t automatic_headroom_bytes = 0;
+
+    [[nodiscard]] static constexpr KvCapacityPolicy
+    explicit_capacity(std::uint32_t tokens) noexcept {
+        return KvCapacityPolicy{KvCapacityMode::Explicit, tokens, 0};
+    }
+
+    [[nodiscard]] static constexpr KvCapacityPolicy
+    automatic(std::size_t headroom_bytes = kDefaultKvCapacityHeadroomBytes) noexcept {
+        return KvCapacityPolicy{KvCapacityMode::Automatic, 0, headroom_bytes};
+    }
+};
+
+enum class ProposalHead : std::uint8_t {
+    Full,
+    Optimized,
+};
+
+enum class SpeculativeBackend : std::uint8_t {
+    None,
+    Mtp,
+    DFlash,
+};
+
+/// `SpeculativeOptions::max_lanes` meaning "verify at any width".
+inline constexpr std::uint32_t kSpeculateAtAnyWidth = 0xFFFFFFFFu;
+/// The width a round may reach and still verify drafts, when the run does not say. A verify
+/// puts the draft window plus one columns per lane through every mixture layer, and each
+/// column routes to its own experts: on a placement bound by expert bytes the head pays only
+/// while the batch is narrow. Measured on GLM-5.3-Flash over eight cards (2026-09-07): +23 %
+/// at one lane, break-even at two on the board's salted prompts, -47 % at sixteen. One lane,
+/// then: the round where the head pays, and the only width at which two verifying flights can
+/// never be in flight together on a pipeline.
+inline constexpr std::uint32_t kDefaultSpeculationLanes = 1;
+
+struct SpeculativeOptions {
+    SpeculativeBackend backend = SpeculativeBackend::None;
+    std::uint32_t draft_tokens = 0;
+    ProposalHead proposal_head = ProposalHead::Full;
+    /// Widest round (decode lanes in flight) that still verifies drafts; wider rounds run the
+    /// head's narrow round -- one column per lane through the trunk, the head aligned and
+    /// proposing as usual -- so a draft head never costs a throughput-bound batch. 0 takes
+    /// `kDefaultSpeculationLanes`; `kSpeculateAtAnyWidth` verifies always.
+    std::uint32_t max_lanes = 0;
+};
+
+struct LoadProgress {
+    std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
+};
+
+struct EngineOptions {
+    std::filesystem::path artifact_path;
+    int device                         = 0;
+    // Pipeline parallelism (phase 3): more than one device splits the model into that many
+    // layer-range stages, one per device in this order (the first is also `device`).
+    std::vector<int> devices;
+    // Pipeline parallelism (phase 3): this engine instance runs layers [pipeline_stage_first,
+    // pipeline_stage_last) of the model (0/0 = the whole model); a stage after the first reads
+    // the residual from `pipeline_import_pinned` (the previous stage's export buffer, sized
+    // for `pipeline_boundary_columns` columns) and a stage before the last exports its own.
+    int pipeline_stage_first           = 0;
+    int pipeline_stage_last            = 0;
+    const void* pipeline_import_pinned = nullptr;
+    std::uint32_t pipeline_boundary_columns = 0;
+    // Host expert pools per NUMA node (each device's stage uses the pool of its socket) instead
+    // of one pool over every core; set by the pipeline constructor.
+    bool cpu_moe_pool_per_socket       = false;
+    std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
+    // --chat-template: a Jinja template that replaces the artifact's. Empty keeps the
+    // artifact's, which is the only one whose agreement with tokenizer_config.json the
+    // loader can check -- an override is the operator taking that responsibility.
+    std::string chat_template_override;
+
+    /// One adapted projection, decoded to BF16 on the host by the serve layer.
+    /// The target's binding code matches these by (layer, module) and hands them
+    /// to the device store keyed by the base weight they adapt; nothing below the
+    /// target needs to know PEFT's naming.
+    struct LoraModulePayload {
+        std::int32_t slot    = 0;     ///< bank slot this adapter occupies
+        std::int32_t layer   = -1;    ///< text layer index parsed from the module name
+        std::string module;           ///< "q_proj", "o_proj", ...
+        std::int32_t rank    = 0;
+        std::int32_t in_dim  = 0;
+        std::int32_t out_dim = 0;
+        float scale          = 1.0F;  ///< PEFT alpha/r
+        std::vector<std::uint16_t> a; ///< [rank, in_dim] BF16
+        std::vector<std::uint16_t> b; ///< [out_dim, rank] BF16
+    };
+    std::vector<LoraModulePayload> lora_payloads;
+    /// Bank geometry: how many adapters may be resident at once and the widest
+    /// rank any of them may have. Every bank is padded to these, so they fix the
+    /// launch geometry the projection hooks and a captured graph both need.
+    std::uint32_t lora_slots    = 0;
+    std::uint32_t lora_max_rank = 0;
+    /// Prepare the adapter machinery even with no adapters named: banks are
+    /// preallocated and the delta kernels captured, so adapters loaded later
+    /// through the runtime endpoints work under the graphs recorded at startup.
+    bool lora_enable = false;
+    /// Route the long-lived device arenas through VMM-backed regions so the
+    /// engine can sleep (release VRAM, addresses stable) and wake fast.
+    bool sleep_enable = false;
+    /// The engine's op-layer state home (owned by the Engine; internal). The
+    /// executor's worker thread binds it so op planes and adapter banks resolve
+    /// per engine, which is what lets several engines share one process.
+    ops::EngineOpsContext* ops_context = nullptr;
+    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Storage of the pinned host expert bank. Q4G32AM (4-bit affine groups requantised from
+    // the artifact's W8 at load) is 59 % of the bytes and near-exact for Q4_K-derived experts,
+    // but needs the expert slot cache (the zero-copy kernels read W8 only) — so Auto picks Q4
+    // exactly when `expert_slots > 0` and W8 otherwise; an explicit choice always wins (an
+    // explicit Q4 without the slot cache is refused).
+    enum class HostExpertBank : std::uint8_t { Auto, W8, Q4 };
+    HostExpertBank host_expert_bank    = HostExpertBank::Auto;
+    // Experts of this many mixture layers live in pinned, device-mapped host memory instead of
+    // on the card, and the kernels read them zero-copy over PCIe. A whole-model figure: each
+    // pipeline stage offloads the mixture layers it runs, counting from the first. 0 keeps
+    // every expert resident; a number at or above the layer count offloads all of them. This is
+    // what lets a model far larger than the cards load at all, at PCIe speed -- distinct from
+    // `cpu_moe_share`, which is about where the arithmetic runs rather than where the bytes
+    // live. Targets without a host bank refuse it rather than ignoring it.
+    /// `--host-moe-layers auto`: let the pipeline constructor decide, per stage, the fewest
+    /// mixture layers that stage must move to host memory for the run's lanes to fit. A stage
+    /// that already fits offloads nothing, which is the point -- offloading a layer that did
+    /// not need to move costs PCIe on every token it serves and buys nothing.
+    static constexpr std::uint32_t kHostMoeLayersAuto = 0xFFFFFFFEU;
+    std::uint32_t host_moe_layers      = 0;
+    // Layers whose weights stay on the card, counted from the first, as llama.cpp's `-ngl`
+    // counts them. Every later layer is read from pinned host memory in its entirety --
+    // attention and norms as well as any mixture -- so this is the coarse dial and
+    // `host_moe_layers` the surgical one. 0 means what it has always meant: every layer
+    // resident. A dense layer on the host crosses PCIe for every byte on every token, where an
+    // offloaded mixture crosses only the experts a token routes to, so prefer the latter where
+    // a model has one.
+    std::uint32_t gpu_layers           = 0;
+    // Expert slot cache for targets that stream MoE experts from the host: number of device
+    // expert slots (0 = experts are read from the host bank in place). Targets without a
+    // host bank ignore it.
+    std::uint32_t expert_slots         = 0;
+    // Fraction [0,1] of a round's missing experts computed on the host instead of fetched into
+    // the slot cache (0 = everything is fetched; -1 = measure host vs PCIe rates at startup and
+    // match them). Needs expert_slots > 0.
+    float cpu_moe_share                = 0.0F;
+    // Rounds narrower than this many columns keep every miss on the GPU (the host round-trip
+    // costs more than it saves); 0 = the target's default.
+    std::uint32_t cpu_moe_min_tokens   = 0;
+    // Fraction [0,1] of a *prefill* round's missing experts computed on the host (batched
+    // kernel). -1 = default: 0.5 whenever the CPU split is on; 0 keeps the full gather for
+    // prefill. Needs expert_slots > 0.
+    float cpu_moe_prefill_share        = -1.0F;
+    std::uint32_t max_concurrency      = 1;
+    std::uint32_t max_pending_requests = 16;
+    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t prefill_chunk        = 1024;
+
+    // Auto: e4m3 where linear-attention layers carry the stack -- it halves the
+    // cache for the same token count (measured exactly 2x capacity on the 27B) at
+    // a few percent of throughput, and the headroom it returns is what keeps large
+    // lane counts off the memory cliff -- and BF16 where every layer is attention,
+    // where e4m3 costs 1.5-2.6 % of perplexity (see KvCacheStorage::Auto).
+    KvCacheStorage kv_cache            = KvCacheStorage::Auto;
+    // Full-attention layer indices kept at the model dtype when kv_cache is
+    // quantized. Linear-attention layers hold no KV planes, so they are never
+    // candidates and need not be listed.
+    std::vector<std::uint32_t> kv_cache_skip_layers;
+    // Rewrite checkpoints keep a second GDN state per lane so an edited last
+    // turn can resume from its prefix instead of re-prefilling it. That is one
+    // full state slot per lane, allocated up front — 72 MiB per lane on the
+    // 27B, where disabling it took the KV cache from 92,096 to 206,976 tokens
+    // at 48 lanes. Off by default: ordinary multi-turn append never uses it,
+    // and the memory is throughput. A product with edit-and-resend turns
+    // opts in with --rewrite-checkpoints.
+    bool rewrite_checkpoints           = false;
+    // The Main KV pool's planes are demand-mapped (core/elastic_kv_region.h): the pool keeps
+    // its planned size as a virtual span and only the pages in use, plus a small reserve,
+    // hold physical memory. On by default: throughput parity with the arena pool, measured
+    // (design/INFERENCE.md, 2026-09-02); false puts the planes back in the arena.
+    bool elastic_kv                    = true;
+    // With elastic_kv: the pool's physical cap is a guaranteed floor (one full-context request
+    // under automatic sizing) and every page past it is admitted through a device-wide gate
+    // on free memory, so co-resident engines share the device's idle KV.
+    bool elastic_kv_overcommit         = false;
+    SpeculativeOptions speculative;
+    std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
+    // Zero selects a bounded worker count from the detected host concurrency.
+    std::uint32_t media_preprocess_threads = 0;
+    bool enable_vision                     = false;
+    bool use_cuda_graph                    = true;
+    LoadProgress load_progress;
+};
+
+enum class SamplingMode : std::uint8_t {
+    Thinking,
+    NonThinking,
+};
+
+// Immutable model-owned values used when a request does not override a sampling field. Seed is
+// deliberately excluded: it is an execution choice rather than a model recommendation.
+struct SamplingPreset {
+    float temperature       = 0.0F;
+    std::int32_t top_k      = 0;
+    float top_p             = 1.0F;
+    float min_p             = 0.0F;
+    float presence_penalty  = 0.0F;
+    float frequency_penalty = 0.0F;
+};
+
+struct ModelSamplingDefaults {
+    SamplingPreset thinking;
+    SamplingPreset non_thinking;
+
+    [[nodiscard]] constexpr const SamplingPreset& for_mode(SamplingMode mode) const noexcept {
+        return mode == SamplingMode::Thinking ? thinking : non_thinking;
+    }
+};
+
+// Public request-side overrides. std::nullopt means "use the registered model/mode default";
+// explicit zero remains a real override (including temperature=0 for exact argmax).
+struct SamplingOverrides {
+    std::optional<float> temperature;
+    std::optional<float> repetition_penalty;
+    std::optional<std::int32_t> top_k;
+    std::optional<float> top_p;
+    std::optional<float> min_p;
+    std::optional<float> presence_penalty;
+    std::optional<float> frequency_penalty;
+    std::optional<std::uint64_t> seed;
+};
+
+// Complete parameters after Engine resolution. Target runtimes consume only this type.
+struct ResolvedSamplingParameters {
+    float temperature       = 0.0F;
+    std::int32_t top_k      = 0;
+    float top_p             = 1.0F;
+    float min_p             = 0.0F;
+    float presence_penalty  = 0.0F;
+    float frequency_penalty = 0.0F;
+    /// Multiplicative penalty on already-seen tokens; 1 disables it.
+    float repetition_penalty = 1.0F;
+    std::uint64_t seed      = 0;
+};
+
+enum class OutputChannel : std::uint8_t {
+    Content,
+    Reasoning,
+};
+
+struct StopString {
+    std::string text;
+    OutputChannel channel  = OutputChannel::Content;
+    bool include_in_output = false;
+};
+
+struct StopPolicy {
+    std::vector<TokenId> token_ids;
+    std::vector<StopString> strings;
+    bool include_model_defaults = true;
+    bool publish_stop_token     = false;
+};
+
+struct ExecutionOptions {
+    SamplingOverrides sampling;
+    std::uint32_t requested_output_tokens = 0;
+    bool allow_prefix_reuse               = true;
+    /// Bank slot of the LoRA adapter this request selected, -1 for the base
+    /// model. A slot rather than a name: the round stages an integer per lane,
+    /// and every token of the batch may carry a different one.
+    std::int32_t lora_slot = -1;
+    /// The fewest tokens this request must produce before a stop token may be
+    /// drawn, and the ids barred until it has. The caller resolves which ids those
+    /// are -- the model's own stops, plus any the request added -- because the
+    /// round only knows numbers.
+    std::uint32_t min_tokens              = 0;
+    std::array<TokenId, 4> stop_barrier{};
+    std::uint32_t stop_barrier_count      = 0;
+};
+
+struct OutputOptions {
+    bool raw                     = false;
+    bool preserve_special_tokens = false;
+};
+
+struct RequestOptions {
+    ExecutionOptions execution;
+    StopPolicy stop;
+    OutputOptions output;
+};
+
+enum class MediaKind : std::uint8_t {
+    Image,
+    Video,
+};
+
+struct OwnedMedia {
+    MediaKind kind = MediaKind::Image;
+    std::vector<std::uint8_t> bytes;
+    std::string media_type;
+    std::string source_name;
+};
+
+struct ToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json;
+};
+
+// Wire-independent conversation authority. Protocol adapters preserve these roles and their
+// ordering; a target frontend owns any model-specific role lowering.
+enum class ChatRole : std::uint8_t {
+    System,
+    Developer,
+    User,
+    Assistant,
+    Tool,
+};
+
+enum class MessagePartKind : std::uint8_t {
+    Text,
+    Media,
+};
+
+struct MessagePart {
+    MessagePartKind kind = MessagePartKind::Text;
+    std::string text;
+    OwnedMedia media;
+};
+
+struct ChatMessage {
+    ChatRole role = ChatRole::User;
+    std::vector<MessagePart> parts;
+    std::string reasoning_content;
+    std::vector<ToolCall> tool_calls;
+    std::string tool_call_id;
+};
+
+// The effort vocabulary a chat template may offer. It is the union of what the
+// templates this engine serves accept, not one model's list: the Qwen family
+// names low/medium/xhigh, GLM names low/high/max. Which of them a loaded
+// template actually honours is `ReasoningEffortCapabilities`, derived from the
+// template itself rather than assumed here.
+enum class ReasoningEffort : std::uint8_t {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+};
+
+[[nodiscard]] constexpr std::string_view reasoning_effort_name(ReasoningEffort effort) noexcept {
+    switch (effort) {
+    case ReasoningEffort::Minimal:
+        return "minimal";
+    case ReasoningEffort::Low:
+        return "low";
+    case ReasoningEffort::Medium:
+        return "medium";
+    case ReasoningEffort::High:
+        return "high";
+    case ReasoningEffort::XHigh:
+        return "xhigh";
+    case ReasoningEffort::Max:
+        return "max";
+    }
+    return {};
+}
+
+inline constexpr std::array<ReasoningEffort, 6> kReasoningEfforts{
+    ReasoningEffort::Minimal, ReasoningEffort::Low,   ReasoningEffort::Medium,
+    ReasoningEffort::High,    ReasoningEffort::XHigh, ReasoningEffort::Max,
+};
+
+struct ReasoningEffortCapabilities {
+    bool minimal = false;
+    bool low     = false;
+    bool medium  = false;
+    bool high    = false;
+    bool xhigh   = false;
+    bool max     = false;
+    std::optional<ReasoningEffort> default_effort;
+
+    [[nodiscard]] constexpr bool supports(ReasoningEffort effort) const noexcept {
+        switch (effort) {
+        case ReasoningEffort::Minimal:
+            return minimal;
+        case ReasoningEffort::Low:
+            return low;
+        case ReasoningEffort::Medium:
+            return medium;
+        case ReasoningEffort::High:
+            return high;
+        case ReasoningEffort::XHigh:
+            return xhigh;
+        case ReasoningEffort::Max:
+            return max;
+        }
+        return false;
+    }
+
+    constexpr void set(ReasoningEffort effort, bool supported) noexcept {
+        switch (effort) {
+        case ReasoningEffort::Minimal:
+            minimal = supported;
+            return;
+        case ReasoningEffort::Low:
+            low = supported;
+            return;
+        case ReasoningEffort::Medium:
+            medium = supported;
+            return;
+        case ReasoningEffort::High:
+            high = supported;
+            return;
+        case ReasoningEffort::XHigh:
+            xhigh = supported;
+            return;
+        case ReasoningEffort::Max:
+            max = supported;
+            return;
+        }
+    }
+
+    [[nodiscard]] constexpr bool any() const noexcept {
+        return minimal || low || medium || high || xhigh || max;
+    }
+};
+
+struct PromptCapabilities {
+    /// The template carries a thinking switch this engine can drive. A template
+    /// that always thinks, or never does, has none -- which is a different fact
+    /// from whether it thinks, below.
+    bool enable_thinking = false;
+    /// The generation prompt opens a reasoning turn. Together with the switch
+    /// above this separates "thinking can be turned off" from "thinking happens":
+    /// GLM-5.3-Flash always opens one and offers no switch, so a request that
+    /// asks for thinking off is refused rather than answered with thinking on.
+    bool reasoning_turn = false;
+    ReasoningEffortCapabilities reasoning_effort;
+};
+
+struct PromptOptions {
+    bool add_generation_prompt = true;
+    bool enable_thinking       = true;
+    std::optional<ReasoningEffort> reasoning_effort;
+    bool preserve_thinking = false;
+    bool add_vision_id     = false;
+    std::vector<std::string> tool_jsons;
+};
+
+struct PromptInput {
+    std::vector<ChatMessage> messages;
+    PromptOptions options;
+};
+
+enum class RequestErrorKind : std::uint8_t {
+    ContextLengthExceeded,
+    MediaBudgetExceeded,
+    Overloaded,
+    QueueTimeout,
+    Cancelled,
+    Unavailable,
+};
+
+class RequestError final : public std::invalid_argument {
+public:
+    RequestError(RequestErrorKind kind, std::string message)
+        : std::invalid_argument(std::move(message)), kind_(kind) {}
+
+    [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
+
+private:
+    RequestErrorKind kind_;
+};
+
+struct PromptSummary {
+    std::uint32_t prompt_tokens = 0;
+    bool has_media              = false;
+};
+
+struct PromptPreparationStats {
+    double seconds                       = 0.0;
+    double media_preprocess_seconds      = 0.0;
+    double media_preprocess_work_seconds = 0.0;
+    double tokenize_seconds              = 0.0;
+    std::size_t media_items              = 0;
+    std::size_t media_bytes              = 0;
+    std::uint64_t raw_patches            = 0;
+    std::uint64_t vision_tokens          = 0;
+    std::size_t patch_bytes              = 0;
+    std::size_t media_cache_hits         = 0;
+    std::size_t media_cache_misses       = 0;
+    std::size_t media_singleflight_waits = 0;
+    std::size_t built_patch_bytes        = 0;
+    std::size_t reused_patch_bytes       = 0;
+};
+
+struct MediaCacheSummary {
+    std::size_t capacity_bytes       = 0;
+    std::size_t live_capacity_bytes  = 0;
+    std::size_t retained_bytes       = 0;
+    std::size_t live_bytes           = 0;
+    std::size_t entries              = 0;
+    std::size_t inflight             = 0;
+    std::size_t queued_tasks         = 0;
+    std::size_t active_tasks         = 0;
+    std::uint32_t preprocess_threads = 0;
+    std::uint64_t hits               = 0;
+    std::uint64_t misses             = 0;
+    std::uint64_t singleflight_waits = 0;
+    std::uint64_t evictions          = 0;
+    std::uint64_t oversize_bypasses  = 0;
+};
+
+enum class FinishReason : std::uint8_t {
+    None,
+    OutputLimit,
+    ContextCapacity,
+    StopToken,
+    StopString,
+    Cancelled,
+};
+
+struct OutputDelta {
+    OutputChannel channel = OutputChannel::Content;
+    std::string text;
+};
+
+class OutputSink {
+public:
+    virtual ~OutputSink()                   = default;
+    virtual void publish(OutputDelta delta) = 0;
+};
+
+class CancellationView {
+public:
+    CancellationView() = default;
+    explicit CancellationView(std::function<bool()> requested);
+
+    [[nodiscard]] bool requested() const;
+
+private:
+    std::function<bool()> requested_;
+};
+
+// Deadline and cancellation apply to all host-side prompt preparation work. Empty values mean
+// unbounded preparation.
+struct PreparationControl {
+    std::chrono::steady_clock::time_point deadline;
+    CancellationView cancellation;
+};
+
+struct GenerationTimings {
+    double prepare_seconds     = 0.0;
+    double first_token_seconds = 0.0;
+    double vision_seconds      = 0.0;
+    double prefill_seconds     = 0.0;
+    double decode_seconds      = 0.0;
+    double total_seconds       = 0.0;
+};
+
+struct SpeculativeStats {
+    SpeculativeBackend backend    = SpeculativeBackend::None;
+    bool enabled                  = false;
+    std::uint32_t draft_window    = 0;
+    std::uint64_t rounds          = 0;
+    std::uint64_t drafted_tokens  = 0;
+    std::uint64_t accepted_tokens = 0;
+    std::uint64_t fallback_steps  = 0;
+    std::vector<std::uint64_t> accepted_per_position;
+};
+
+enum class PrefixReusePath : std::uint8_t {
+    FullReset,
+    AppendAtFrontier,
+    RestoreTurnCheckpoint,
+    RestoreResponseCheckpoint,
+};
+
+struct GenerationResult {
+    PromptSummary prompt;
+    std::vector<TokenId> generated_token_ids;
+    /// The log-probability of each generated token under the full vocabulary at
+    /// the position that produced it, temperature-scaled the way the sampler saw
+    /// it. Same length as `generated_token_ids`, or empty when nothing produced
+    /// them; an individual entry is NaN when its route could not.
+    std::vector<float> token_logprobs;
+    std::string content;
+    std::string reasoning;
+    std::uint32_t reasoning_tokens     = 0;
+    FinishReason finish_reason         = FinishReason::None;
+    std::uint32_t reused_prompt_tokens = 0;
+    PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    GenerationTimings timings;
+    SpeculativeStats speculative;
+};
+
+struct ArenaMemorySummary {
+    std::size_t capacity_bytes  = 0;
+    std::size_t used_bytes      = 0;
+    std::size_t peak_used_bytes = 0;
+};
+
+struct MemorySummary {
+    int device                                = 0;
+    std::uint32_t max_context                 = 0;
+    KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
+    std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
+    std::uint32_t kv_capacity_page_groups     = 0;
+    std::uint32_t kv_capacity_max_page_groups = 0;
+    KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
+    ArenaMemorySummary weights;
+    ArenaMemorySummary sequence;
+    ArenaMemorySummary workspace;
+    ArenaMemorySummary request_transient;
+    std::size_t minimum_runtime_reservation_bytes = 0;
+    std::size_t kv_capacity_increment_bytes       = 0;
+    std::size_t runtime_reservation_bytes         = 0;
+    std::size_t available_after_weights_bytes     = 0;
+    std::size_t available_after_startup_bytes     = 0;
+    std::size_t kv_capacity_headroom_bytes        = 0;
+    std::size_t planned_slack_bytes               = 0;
+    std::size_t workspace_logical_peak_bytes      = 0;
+    std::size_t cuda_graph_allowance_bytes        = 0;
+    std::size_t cuda_graph_observed_bytes         = 0;
+    std::size_t kv_payload_bytes                  = 0;
+};
+
+// Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
+// interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
+struct RuntimeStats {
+    // Actual prompt tokens evaluated by prefill; resident prefix hits are excluded.
+    std::uint64_t computed_prefill_tokens = 0;
+    // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
+    std::uint64_t committed_decode_tokens = 0;
+    // Decode batch executions and the sum of their batch sizes.
+    std::uint64_t decode_rounds         = 0;
+    std::uint64_t decode_row_rounds     = 0;
+    std::uint32_t running_requests      = 0;
+    std::uint32_t prefilling_requests   = 0;
+    std::uint32_t decode_ready_requests = 0;
+    std::uint32_t waiting_requests      = 0;
+    std::uint32_t kv_pages_mapped       = 0; ///< pages physically resident (see PagedKVOccupancy)
+    // Main KV pool physical occupancy, read on the executor thread at the boundary that published
+    // this snapshot -- never by asking the engine, which would queue behind a whole round.
+    // `kv_pages_in_use` is live demand; `kv_pages_resident_at_granule` is what a demand-mapped
+    // (CUDA VMM) pool could not have released, a mapping granule staying resident while any one
+    // of its pages is live.
+    std::uint32_t kv_pages                     = 0;
+    std::uint32_t kv_pages_entitled            = 0;
+    std::uint32_t kv_pages_in_use              = 0;
+    std::uint32_t kv_granule_pages             = 0;
+    std::uint32_t kv_pages_resident_at_granule = 0;
+    std::size_t kv_page_bytes                  = 0;
+};
+
+struct LoadSummary {
+    std::string target;
+    std::string model_id;
+    std::string weights_id;
+    double load_seconds                = 0.0;
+    double upload_seconds              = 0.0;
+    std::uint64_t artifact_bytes_read  = 0;
+    std::uint64_t host_to_device_bytes = 0;
+    std::uint64_t peak_staging_bytes   = 0;
+    std::size_t tensor_count           = 0;
+    std::size_t resource_count         = 0;
+};
+
+} // namespace sinfer

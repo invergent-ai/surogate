@@ -1,0 +1,260 @@
+#include "ops/linear/nvfp4/nvfp4_cublaslt.h"
+#include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
+
+#include "core/device.h"
+#include "core/engine_context.h"
+
+#include <cublasLt.h>
+
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+namespace sinfer::ops::detail {
+namespace {
+
+constexpr std::size_t kWorkspaceBytes = std::size_t{32} << 20;
+
+void check(cublasStatus_t status, const char* what) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string("nvfp4 cuBLASLt ") + what + ": status " +
+                                 std::to_string(static_cast<int>(status)));
+    }
+}
+
+std::int32_t env_int(const char* name, std::int32_t fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') { return fallback; }
+    const long parsed = std::strtol(raw, nullptr, 10);
+    return parsed > 0 ? static_cast<std::int32_t>(parsed) : fallback;
+}
+
+struct PlanKey {
+    std::int32_t rows;
+    std::int32_t k;
+    std::int32_t tokens;
+    std::int32_t out_ld;
+    bool accumulate;
+
+    bool operator==(const PlanKey& other) const {
+        return rows == other.rows && k == other.k && tokens == other.tokens &&
+               out_ld == other.out_ld && accumulate == other.accumulate;
+    }
+};
+
+struct PlanKeyHash {
+    std::size_t operator()(const PlanKey& key) const {
+        std::size_t h = static_cast<std::size_t>(key.rows);
+        h = h * 1315423911u + static_cast<std::size_t>(key.k);
+        h = h * 1315423911u + static_cast<std::size_t>(key.tokens);
+        h = h * 1315423911u + static_cast<std::size_t>(key.out_ld);
+        return h * 1315423911u + static_cast<std::size_t>(key.accumulate);
+    }
+};
+
+// One descriptor set per problem shape; the scale pointers are rebound per call because
+// they follow the weight, not the shape.
+struct Plan {
+    cublasLtMatmulDesc_t op    = nullptr;
+    cublasLtMatrixLayout_t a   = nullptr;
+    cublasLtMatrixLayout_t b   = nullptr;
+    cublasLtMatrixLayout_t c   = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+};
+
+struct DeviceState {
+    cublasLtHandle_t handle = nullptr;
+    void* workspace         = nullptr;
+    std::unordered_map<PlanKey, Plan, PlanKeyHash> plans;
+    std::mutex mutex;
+};
+
+// Homed per engine (core/engine_context.h), not per process: two models in one process must
+// not share a workspace. The mutex below only serializes the enqueue; the matmuls then run
+// concurrently on the engines' own streams, and a stream-K algorithm keeps its cross-CTA
+// barrier flags in the workspace, so one buffer for both wedged the device under multi-model
+// load -- one engine's kernel spinning on a flag the other's had overwritten. Still keyed by
+// device inside: pipeline stages on several devices each run this route.
+struct PlaneState {
+    std::mutex mutex;
+    std::unordered_map<int, std::unique_ptr<DeviceState>> by_device;
+    ~PlaneState() {
+        // The device buffers go back. The cuBLASLt objects are left to the library: destroying
+        // a handle during static teardown of the process-default context races the driver's
+        // own shutdown, and an engine's handful of descriptors is not worth that.
+        for (auto& [device, state] : by_device) {
+            (void)device;
+            if (state->workspace != nullptr) { (void)cudaFree(state->workspace); }
+        }
+    }
+};
+
+DeviceState& state_for_current_device() {
+    PlaneState& plane = engine_slot<PlaneState>();
+    int device        = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    const std::lock_guard<std::mutex> lock(plane.mutex);
+    auto& slot = plane.by_device[device];
+    if (!slot) {
+        auto state = std::make_unique<DeviceState>();
+        check(cublasLtCreate(&state->handle), "create");
+        CUDA_CHECK(cudaMalloc(&state->workspace, kWorkspaceBytes));
+        slot = std::move(state);
+    }
+    return *slot;
+}
+
+// The heuristic validates the whole descriptor, so the scale pointers must be bound before
+// it runs; they are rebound per call anyway.
+const Plan& plan_for(DeviceState& state, const PlanKey& key, const void* a_scale,
+                     const void* b_scale) {
+    const auto found = state.plans.find(key);
+    if (found != state.plans.end()) { return found->second; }
+    Plan plan;
+    check(cublasLtMatmulDescCreate(&plan.op, CUBLAS_COMPUTE_32F, CUDA_R_32F), "desc");
+    const cublasOperation_t trans_a = CUBLAS_OP_T;
+    const cublasOperation_t trans_b = CUBLAS_OP_N;
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSA, &trans_a,
+                                         sizeof(trans_a)),
+          "transa");
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_TRANSB, &trans_b,
+                                         sizeof(trans_b)),
+          "transb");
+    const cublasLtMatmulMatrixScale_t mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode,
+                                         sizeof(mode)),
+          "a scale mode");
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode,
+                                         sizeof(mode)),
+          "b scale mode");
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale,
+                                         sizeof(a_scale)),
+          "a scale pointer");
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale,
+                                         sizeof(b_scale)),
+          "b scale pointer");
+    // A is the weight [rows x k] with k contiguous, read transposed; B the activation codes
+    // [tokens x k] with k contiguous; C/D the token-major output.
+    check(cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_4F_E2M1, key.k, key.rows, key.k), "a");
+    check(cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_4F_E2M1, key.k, key.tokens, key.k), "b");
+    check(cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16BF, key.rows, key.tokens, key.out_ld),
+          "c");
+    cublasLtMatmulPreference_t preference = nullptr;
+    check(cublasLtMatmulPreferenceCreate(&preference), "preference");
+    const std::size_t workspace_bytes = kWorkspaceBytes;
+    check(cublasLtMatmulPreferenceSetAttribute(preference,
+                                               CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &workspace_bytes, sizeof(workspace_bytes)),
+          "workspace");
+    cublasLtMatmulHeuristicResult_t result{};
+    int found_count = 0;
+    check(cublasLtMatmulAlgoGetHeuristic(state.handle, plan.op, plan.a, plan.b, plan.c, plan.c,
+                                         preference, 1, &result, &found_count),
+          "heuristic");
+    cublasLtMatmulPreferenceDestroy(preference);
+    if (found_count == 0) {
+        throw std::runtime_error("nvfp4 cuBLASLt: no algorithm for rows=" +
+                                 std::to_string(key.rows) + " k=" + std::to_string(key.k) +
+                                 " tokens=" + std::to_string(key.tokens));
+    }
+    plan.algo = result.algo;
+    return state.plans.emplace(key, plan).first->second;
+}
+
+} // namespace
+
+void nvfp4_cublaslt_prewarm() { (void)state_for_current_device(); }
+
+bool nvfp4_cublaslt_route(std::int32_t tokens) {
+    static const bool enabled = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_NVFP4_CUBLASLT");
+        return raw == nullptr || *raw == '\0' || std::strcmp(raw, "0") != 0;
+    }();
+    static const std::int32_t min_tokens =
+        env_int("SUROGATE_SERVE_NVFP4_CUBLASLT_MIN_TOKENS", kNvfp4CublasLtDefaultMinTokens);
+    return enabled && tokens >= min_tokens;
+}
+
+namespace {
+
+constexpr int kCutlassPolicy = -2;
+
+int cutlass_tile_setting() {
+    static const int tile = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_NVFP4_CUTLASS");
+        if (raw == nullptr || *raw == '\0') { return kCutlassPolicy; }
+        const std::string_view value(raw);
+        if (value == "off" || value == "0" || value == "cublaslt") { return -1; }
+        if (value == "128") { return 0; }
+        if (value == "256") { return 1; }
+        if (value == "256sk") { return 2; }
+        if (value == "128sk") { return 3; }
+        if (value == "256swap") { return 4; }
+        if (value == "128swap") { return 5; }
+        return kCutlassPolicy;
+    }();
+    return tile;
+}
+
+} // namespace
+
+int nvfp4_cutlass_tile_for(std::int32_t rows, std::int32_t tokens) {
+    const int setting = cutlass_tile_setting();
+    if (setting != kCutlassPolicy) { return setting; }
+    (void)tokens;
+    return rows >= 4096 ? 1 : -1;
+}
+
+void nvfp4_cublaslt_gemm(const Weight& weight, std::int32_t row_begin, std::int32_t rows,
+                         const std::uint8_t* activation_codes,
+                         const std::uint8_t* activation_tiled_scales, __nv_bfloat16* out,
+                         std::int32_t out_ld, std::int32_t tokens, float beta,
+                         cudaStream_t stream) {
+    if (row_begin < 0 || rows <= 0 || (row_begin % 128) != 0 || (rows % 128) != 0 ||
+        row_begin + rows > weight.n) {
+        throw std::invalid_argument("nvfp4 cuBLASLt: row slice must be 128-aligned");
+    }
+    if (weight.k <= 0 || (weight.k % 64) != 0 || tokens <= 0 || out_ld < rows) {
+        throw std::invalid_argument("nvfp4 cuBLASLt: invalid problem");
+    }
+    const auto* weight_codes = static_cast<const std::uint8_t*>(weight.qdata) +
+                               static_cast<std::size_t>(row_begin) * (weight.k / 2);
+    const auto* weight_scales = static_cast<const std::uint8_t*>(weight.scales) +
+                                static_cast<std::size_t>(row_begin / 128) * (weight.k / 64) * 512;
+    // The CUTLASS route first, where the policy takes it: the same operands and layouts, a
+    // packed [rows, tokens] output (so only when the leading dimension is the slice's rows),
+    // beta 1 as the residual variant. A launch it cannot configure falls through to cuBLASLt.
+    if (const int tile = nvfp4_cutlass_tile_for(rows, tokens); tile >= 0 && out_ld == rows &&
+        (beta == 0.0F || beta == 1.0F)) {
+        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+        if (nvfp4_cutlass_gemm(activation_codes, activation_tiled_scales, weight_codes,
+                               weight_scales, alpha, beta == 1.0F ? out : nullptr, out, tokens,
+                               rows, weight.k, tile, stream)) {
+            return;
+        }
+    }
+    DeviceState& state = state_for_current_device();
+    const std::lock_guard<std::mutex> lock(state.mutex);
+    const void* a_scale = weight_scales;
+    const void* b_scale = activation_tiled_scales;
+    const Plan& plan = plan_for(state, PlanKey{rows, weight.k, tokens, out_ld, beta != 0.0F},
+                                a_scale, b_scale);
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &a_scale,
+                                         sizeof(a_scale)),
+          "a scale pointer");
+    check(cublasLtMatmulDescSetAttribute(plan.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &b_scale,
+                                         sizeof(b_scale)),
+          "b scale pointer");
+    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    check(cublasLtMatmul(state.handle, plan.op, &alpha, weight_codes, plan.a, activation_codes,
+                         plan.b, &beta, out, plan.c, out, plan.c, &plan.algo, state.workspace,
+                         kWorkspaceBytes, stream),
+          "matmul");
+}
+
+} // namespace sinfer::ops::detail

@@ -1,0 +1,74 @@
+#pragma once
+
+#include "core/gdn_replay_records.h"
+#include "core/linear_attention_state.h"
+#include "core/tensor.h"
+
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include "core/limits.h"
+
+#include <cstdint>
+
+namespace sinfer::ops::detail::gated_delta_net {
+
+struct alignas(8) GdnReplayFoldKernelRow {
+    std::int32_t linear_state_slot;
+    std::int32_t commit_columns;
+};
+
+// One entry per replaying lane. The fold kernel indexes it with blockIdx.y, so the only
+// thing the width costs is kernel-parameter space: kMaximumBatchColumns rows is 1 KiB of the
+// 32 KiB a launch may carry (#85).
+struct alignas(16) GdnReplayFoldKernelRows {
+    GdnReplayFoldKernelRow row[kMaximumBatchColumns];
+};
+
+void launch_recurrent_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                           const Tensor& beta, float scale, Tensor& ssm_state, Tensor& out,
+                           cudaStream_t stream);
+
+void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                      const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
+                      Tensor& out, cudaStream_t stream);
+
+void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                            const Tensor& beta, float scale, bool normalize_qk,
+                            const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                            cudaStream_t stream);
+
+void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                               const Tensor& beta, float scale, bool normalize_qk,
+                               Tensor& ssm_states, const Tensor& valid_columns,
+                               const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
+                               Tensor& out, cudaStream_t stream);
+
+/// The same kernel with a diagonal forget gate: Kimi Delta Attention's snapshot form. It lives
+/// here because the loop, the tiling and every lane helper it uses are this file's; only the
+/// transition and the gate's layout differ, and both are selected by a template parameter.
+void kda_launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   bool normalize_qk, Tensor& ssm_states,
+                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                   const Tensor& snapshot_base_slots, Tensor& out,
+                                   cudaStream_t stream);
+
+void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                             const Tensor& beta, float scale, const Tensor& ssm_states,
+                             const Tensor& valid_columns, const Tensor& initial_state_slots,
+                             Tensor& key_record, Tensor& value_record, Tensor& gate_record,
+                             Tensor& out, cudaStream_t stream);
+
+void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
+                        const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                        cudaStream_t stream);
+
+std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens);
+
+void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                    const Tensor& beta, float scale, const Tensor& ssm_state_in,
+                    Tensor& ssm_state_out, Tensor& out, void* workspace,
+                    std::size_t workspace_bytes, cudaStream_t stream);
+
+} // namespace sinfer::ops::detail::gated_delta_net

@@ -63,7 +63,13 @@ class GRPOInferenceConfig:
         enable_eplb: Enable expert parallel load balancer (EPLB). Passed to vLLM as `--enable-eplb`.
     """
 
-    # VLLM server configuration
+    # Which engine serves the rollouts. "surogate" is this repository's own serving
+    # engine and the default: it speaks the same OpenAI surface plus the token-in
+    # and tokenize routes the multi-turn client needs. "vllm" remains available for
+    # comparison and for anything the engine does not serve yet.
+    backend: Literal["surogate", "vllm"] = "surogate"
+
+    # Server configuration
     host: str | None = None
     port: int | None = 8000
 
@@ -110,6 +116,7 @@ class GRPOInferenceConfig:
     enable_eplb: bool | None = False
 
     def __init__(self, cfg: DictDefault):
+        self.backend = cfg.get("backend", self.backend)
         self.host = cfg.get("host", self.host)
         self.port = cfg.get("port", self.port)
         self.model = cfg.get("model", self.model)
