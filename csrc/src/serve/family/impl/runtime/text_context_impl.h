@@ -2399,6 +2399,15 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         // the row scalar below and ignores it).
         ScopedValue<family::PagedKVCacheView> segment_view(mtp_kv_, segment.mtp_kv);
         auto alignment_scope = work_.scope();
+        // SUROGATE_SERVE_PREFILL_TIMING=1: the alignment's host time and stream time, per segment.
+        static const bool timing = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
+        const auto host_begin = std::chrono::steady_clock::now();
+        cudaEvent_t begin_event{}, end_event{};
+        if (timing) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&begin_event, cudaEventDefault));
+            CUDA_CHECK(cudaEventCreateWithFlags(&end_event, cudaEventDefault));
+            CUDA_CHECK(cudaEventRecord(begin_event, s));
+        }
         Tensor shifted       = work_.alloc(DType::I32, {count});
         copy_i32(segment.mtp_shifted_ids.data(), shifted, s);
         ops::set_i32_scalar(io_.backend_kv_table_row, segment.mtp_kv_table_row, s);
@@ -2407,6 +2416,20 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         const auto seen          = static_cast<std::uint32_t>(segment.kv_base + count);
         mtp_prefill_chunk(shifted, segment_hidden, nullptr, segment_positions, segment_positions,
                           ops::GqaExecutionEnvelope{seen, seen}, false, nullptr, nullptr, nullptr);
+        if (timing) {
+            const double host_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - host_begin).count();
+            CUDA_CHECK(cudaEventRecord(end_event, s));
+            CUDA_CHECK(cudaEventSynchronize(end_event));
+            float stream_ms = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&stream_ms, begin_event, end_event));
+            std::fprintf(stderr,
+                         "mtp-timing: mixed alignment of %d columns (base %d): host %.1f ms to "
+                         "enqueue, %.1f ms on the stream\n",
+                         count, segment.kv_base, host_ms, stream_ms);
+            CUDA_CHECK(cudaEventDestroy(begin_event));
+            CUDA_CHECK(cudaEventDestroy(end_event));
+        }
     }
 
     // Every segment that finishes samples in this round. Their last hidden columns are

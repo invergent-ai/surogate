@@ -2887,8 +2887,18 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 SequenceState& sequence              = sequences[prefill_lanes[i]];
                 const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
                 // Each prompt's chunk must own the KV it is about to write.
-                materialize_sequence_kv(sequence, entry.cursor + nominals[i],
-                                        head ? entry.cursor + nominals[i] : 0);
+                {
+                    static const bool timing =
+                        std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
+                    const auto t0 = Clock::now();
+                    materialize_sequence_kv(sequence, entry.cursor + nominals[i],
+                                            head ? entry.cursor + nominals[i] : 0);
+                    if (timing) {
+                        std::fprintf(stderr, "mtp-timing: materialize KV through %u (head %d): %.1f ms\n",
+                                     entry.cursor + nominals[i], int(head),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    }
+                }
                 segments[i] = schedule::TextContext::MixedPrefillSegment{
                     .ids = std::span<const TokenId>(entry.prompt.token_ids)
                                .subspan(entry.cursor, nominals[i]),
