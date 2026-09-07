@@ -41,13 +41,21 @@ __device__ __forceinline__ SparseMoeRankedValue sparse_moe_warp_best(SparseMoeRa
 // renormalises them with a softmax, and -- where the mixture has an always-on expert -- reads
 // its gate from logit `Experts`. A routed-only router has exactly `Experts` rows, so there is no
 // such logit to read and `HasShared` is what says so; `shared_scale` is then untouched.
+//
+// Softmaxing every expert, taking the top k and renormalising the winners -- which is how
+// Gemma 4's reference writes it -- is arithmetically this: the shared denominator cancels, so
+// the winners' renormalised softmax is the softmax over the winners alone. `PerExpertScaled` is
+// the one thing that reference adds that this did not already compute.
 template <int Experts, int TopK, bool HasShared = true,
-          SparseMoeGating Gating = SparseMoeGating::SoftmaxTopK, bool SharedGated = true>
+          SparseMoeGating Gating = SparseMoeGating::SoftmaxTopK, bool SharedGated = true,
+          bool PerExpertScaled = false>
 __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores, int* ids,
                                                              float* alpha, float* shared_scale,
                                                              float* selected_logits,
                                                              const float* router_bias = nullptr,
-                                                             float routed_scale = 1.0f) {
+                                                             float routed_scale = 1.0f,
+                                                             const float* per_expert_scale
+                                                                 = nullptr) {
     static_assert(Experts % 32 == 0 && TopK >= 1 && TopK <= 32);
     constexpr int kPerLane = Experts / 32;
     const int lane         = static_cast<int>(threadIdx.x) & 31;
@@ -103,6 +111,13 @@ __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores
         float denominator = warp_reduce_sum(exponential);
         denominator       = __shfl_sync(kFullWarpMask, denominator, 0);
         if (lane < TopK) { alpha[lane] = exponential / denominator; }
+    }
+    if constexpr (PerExpertScaled) {
+        // Gemma 4's router multiplies each winner's renormalised weight by a learned scale of
+        // that expert's own. It runs after the renormalisation and only there: applied before
+        // it, the denominator would divide it straight back out and the tensor would do
+        // nothing -- which is what a checkpoint served without this looks like from the outside.
+        if (lane < TopK) { alpha[lane] *= per_expert_scale[ids[lane]]; }
     }
     if constexpr (HasShared) {
         // An ungated shared expert is added with weight one, and its router has no row to read:

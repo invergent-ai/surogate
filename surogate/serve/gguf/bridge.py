@@ -76,6 +76,12 @@ def read_gguf_summary(gguf_path: Path, reader=None) -> dict:
         "num_key_value_heads": _arch_kv(reader, arch, "attention.head_count_kv", 0),
         "tensor_count": len(reader.tensors),
         "quant_types": sorted({t.type_name for t in reader.tensors}),
+        # What tells one architecture string's variants apart. Gemma 4 gives its dense pair,
+        # its E-series and its mixture one `general.architecture`, exactly as their HF configs
+        # give them one `model_type`, so the routing needs the shape and not the name.
+        "num_experts": _arch_kv(reader, arch, "expert_count", 0),
+        "per_layer_input_dim": _arch_kv(reader, arch, "embedding_length_per_layer_input", 0),
+        "kv_shared_layers": _arch_kv(reader, arch, "attention.shared_kv_layers", 0),
     }
     del reader
     return summary
@@ -98,6 +104,43 @@ _HF_ALIAS_FIXUPS: dict[str, tuple[tuple[str, str], ...]] = {
     "qwen3moe": (("self_attn.q_layernorm", "self_attn.q_norm"),
                  ("self_attn.k_layernorm", "self_attn.k_norm"),
                  ("block_sparse_moe.gate", "mlp.gate")),
+    # Gemma 4. One architecture string covers the dense pair, the E-series and the mixture, so
+    # these fixups serve all three targets.
+    "gemma4": (("self_attn.q_layernorm", "self_attn.q_norm"),
+               ("self_attn.k_layernorm", "self_attn.k_norm"),
+               # The router is `router.proj`, where the generic map reaches it by Mixtral's
+               # `block_sparse_moe.gate`.
+               ("block_sparse_moe.gate", "router.proj"),
+               # The expert bank hangs off the layer, not off `mlp`: `experts.gate_up_proj`,
+               # not `mlp.experts.gate_up_proj`.
+               ("mlp.experts.", "experts."),
+               ),
+}
+
+
+#: Tensors a GGUF carries beside a weight, under a `.scale` suffix gguf-py's name map does not
+#: emit -- it enumerates `.weight` and `.bias` only.
+#:
+#: Gemma 4's mixture needs both. Its router applies a learned per-channel scale to its input,
+#: and its experts a learned per-expert scale to the finished routing weights; llama.cpp stores
+#: the first beside the router projection and the second beside the *down* experts, which is
+#: the same association the safetensors converter derives. Neither is optional: without the
+#: per-expert scale every token's experts are weighted wrongly by up to a tenth.
+#: Checkpoint entries that carry no `.weight`, by architecture.
+#:
+#: Gemma 4 has three. `layer_scalar` is an `nn.Buffer` of one element. The two expert banks are
+#: stacked parameters -- `[experts, 2 * intermediate, hidden]` and `[experts, hidden,
+#: intermediate]` -- stored under their bare names. Everything else in the model, its per-head
+#: norms and its router projection included, does carry the suffix, so this is a list and not a
+#: rule about shapes.
+_BARE_HF_NAMES: dict[str, tuple[str, ...]] = {
+    "gemma4": ("layer_scalar", "experts.gate_up_proj", "experts.down_proj"),
+}
+
+
+_SCALE_SIDECARS: dict[str, tuple[tuple[str, str], ...]] = {
+    "gemma4": (("blk.{bid}.ffn_gate_inp.scale", "model.layers.{bid}.router.scale"),
+               ("blk.{bid}.ffn_down_exps.scale", "model.layers.{bid}.router.per_expert_scale")),
 }
 
 
@@ -147,6 +190,16 @@ def _hf_name_map(arch: str, n_layers: int) -> dict[str, str]:
             hf_base = hf_base.replace(wrong, right)
         for suffix in (".weight", ".bias"):
             out[gguf_base + suffix] = hf_base + suffix
+        # Some checkpoint entries are not `.weight` at all: a buffer, or a stacked parameter
+        # the checkpoint stores under its bare name. The generic loop appends a suffix to
+        # every base, so those are corrected here rather than guessed at.
+        if any(hf_base.endswith(bare) for bare in _BARE_HF_NAMES.get(arch, ())):
+            for suffix in (".weight", ".bias"):
+                out.pop(gguf_base + suffix, None)
+            out[gguf_base + ".weight"] = hf_base
+    for gguf_template, hf_template in _SCALE_SIDECARS.get(arch, ()):
+        for layer in range(n_layers):
+            out[gguf_template.format(bid=layer)] = hf_template.format(bid=layer)
     return out
 
 
@@ -162,6 +215,19 @@ def _family_or_generic(fam, gguf_name: str, n_main: int, name_map: dict[str, str
     without a single hand-written line.
     """
     return fam.hf_name_for(gguf_name, n_main) or name_map.get(gguf_name)
+
+
+def _first_scalar(value, default: int) -> int:
+    """One number from a key that may be a scalar or a per-layer array."""
+    if isinstance(value, (list, tuple)):
+        return int(value[0]) if len(value) else int(default)
+    try:
+        import numpy as np
+        if isinstance(value, np.ndarray):
+            return int(value.flat[0]) if value.size else int(default)
+    except Exception:
+        pass
+    return int(value or default)
 
 
 def _rounded_eps(value: float) -> float:
@@ -212,9 +278,12 @@ def synthesised_config(reader, arch: str) -> dict | None:
         **special,
         "hidden_size": hidden,
         "num_hidden_layers": layers,
-        "intermediate_size": int(kv("feed_forward_length", 0) or 0),
+        "intermediate_size": _first_scalar(kv("feed_forward_length", 0), 0),
         "num_attention_heads": heads,
-        "num_key_value_heads": int(kv("attention.head_count_kv", heads) or heads),
+        # A family may state this per layer -- Gemma 4 does, because its windowed and global
+        # layers differ -- so take the first entry here and let the architecture's own branch
+        # below say what each geometry is.
+        "num_key_value_heads": _first_scalar(kv("attention.head_count_kv", heads), heads),
         "head_dim": int(kv("attention.key_length", 0) or 0) or hidden // heads,
         "vocab_size": vocab,
         "max_position_embeddings": int(kv("context_length", 0) or 0),
@@ -275,7 +344,138 @@ def synthesised_config(reader, arch: str) -> dict | None:
                 "use_bidirectional_attention": False,
                 "attn_logit_softcapping": None,
                 "final_logit_softcapping": None}
+    if arch == "gemma4":
+        return _gemma4_config(reader, kv, common, layers, heads)
     return None
+
+
+def _as_list(value, layers: int) -> list:
+    """A per-layer GGUF array as a list, or a scalar broadcast over the layers.
+
+    Gemma 4 states several quantities per layer where every other family states one: which
+    layers look through the window, how many key/value heads each has, and -- on the E-series --
+    how wide each feed-forward is. A scalar means "the same everywhere", which is what the
+    dense sizes say about their key/value count and what E2B does not.
+    """
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    try:
+        import numpy as np
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+    except Exception:
+        pass
+    return [value] * layers
+
+
+#: What ends a Gemma 4 turn. `tokenizer.ggml.eos_token_id` names one token; the family stops
+#: on three, and llama.cpp names the same three outright (its end-of-generation list, with the
+#: entries commented `gemma4`). The chat template closes every assistant turn with `<turn|>`,
+#: so a run seeded with `<eos>` alone never stops: the model answers, opens a fresh thought
+#: channel and answers again until the token budget runs out.
+_GEMMA4_EOG_TOKENS = ("<eos>", "<turn|>", "<|tool_response>")
+
+
+def _gemma4_eos_ids(reader, stated: int):
+    """The turn-ending ids this file actually carries, or the one it stated.
+
+    Looked up by name in the file's own vocabulary rather than assumed: a token this export
+    does not have is one it cannot stop on, and inventing an id would stop on whatever else
+    happens to sit at that index.
+    """
+    field = reader.get_field("tokenizer.ggml.tokens")
+    if field is None:
+        return stated
+    index = {str(token): i for i, token in enumerate(field.contents())}
+    ids = [index[name] for name in _GEMMA4_EOG_TOKENS if name in index]
+    if stated not in ids:
+        ids.insert(0, stated)
+    return ids if len(ids) > 1 else stated
+
+
+def _gemma4_config(reader, kv, common: dict, layers: int, heads: int) -> dict:
+    """A Gemma 4 config from the GGUF's own metadata.
+
+    Almost nothing here is inferred, which is the difference from Gemma 3 above: llama.cpp
+    writes Gemma 4's window schedule as a per-layer boolean array rather than leaving a period
+    to be assumed, and it writes both attention geometries -- `key_length` for the global
+    layers, `key_length_swa` for the windowed ones -- beside a per-layer key/value head count.
+    So the schedule and the two geometries are read, not derived.
+
+    One field is not in the file and is taken as an architecture constant: the global layers'
+    `partial_rotary_factor`. llama.cpp states `rope.dimension_count` as the whole 512-wide head
+    because its proportional rope appends zero frequencies rather than rotating a prefix, which
+    is the same thing said differently and cannot be inverted to the factor. Every published
+    Gemma 4 states 0.25.
+    """
+    windowed = [bool(x) for x in _as_list(kv("attention.sliding_window_pattern", True), layers)]
+    kv_heads = [int(x) for x in _as_list(kv("attention.head_count_kv", 1), layers)]
+    ffn = [int(x) for x in _as_list(kv("feed_forward_length", 0), layers)]
+    global_head = int(kv("attention.key_length", 0) or 0)
+    window_head = int(kv("attention.key_length_swa", 0) or 0) or global_head
+    # The two key/value counts, taken from the layers that actually use each geometry rather
+    # than from a single number that cannot describe both.
+    window_kv = next((n for n, w in zip(kv_heads, windowed) if w), kv_heads[0])
+    global_kv = next((n for n, w in zip(kv_heads, windowed) if not w), window_kv)
+    experts = int(kv("expert_count", 0) or 0)
+    per_layer_input = int(kv("embedding_length_per_layer_input", 0) or 0)
+    shared_kv = int(kv("attention.shared_kv_layers", 0) or 0)
+    # `attention_k_eq_v` is a property of the tensors, not of the metadata: a global layer that
+    # reuses its key projection as its value ships no `attn_v`. The 12B ships one on 40 of its
+    # 48 layers and the 8 without are exactly the global ones.
+    #
+    # Only the layers that *own* their key and value can be asked. A shared-KV layer ships no
+    # `attn_v` either, for an unrelated reason -- it reads an earlier layer's planes -- and
+    # counting one of those reads the E-series as `k_eq_v` when it is not: E2B's globals at 19,
+    # 24, 29 and 34 all sit inside its twenty shared layers, so the question was being answered
+    # by a layer that has no answer. Its owning globals (4, 9, 14) each ship a value, and the
+    # published config agrees: `attention_k_eq_v` is false for the E-series and true for the
+    # dense sizes. Read wrongly, three value projections vanish from the artifact and those
+    # layers attend to their keys instead -- fluent, confident and wrong.
+    owns_kv = layers - shared_kv
+    k_eq_v = any(not w and reader.tensor(f"blk.{i}.attn_v.weight") is None
+                 for i, w in enumerate(windowed[:owns_kv]))
+    # The E-series widens exactly the layers that share their key/value planes, which llama.cpp
+    # states as a feed-forward length that differs layer by layer. E2B does; E4B does not.
+    dense_ffn = ffn[0] if ffn else 0
+    double_wide = bool(ffn) and max(ffn) > min(ffn)
+    text = {
+        **common,
+        "eos_token_id": _gemma4_eos_ids(reader, int(common["eos_token_id"])),
+        "model_type": "gemma4_text",
+        "architectures": ["Gemma4ForCausalLM"],
+        "hidden_activation": "gelu_pytorch_tanh",
+        "intermediate_size": dense_ffn,
+        "num_key_value_heads": window_kv,
+        "num_global_key_value_heads": global_kv,
+        "head_dim": window_head,
+        "global_head_dim": global_head,
+        "layer_types": ["sliding_attention" if w else "full_attention" for w in windowed],
+        "sliding_window": int(kv("attention.sliding_window", 0) or 0),
+        "attention_k_eq_v": k_eq_v,
+        "final_logit_softcapping": float(kv("final_logit_softcapping", 0.0) or 0.0) or None,
+        "attn_logit_softcapping": None,
+        "rope_parameters": {
+            "full_attention": {
+                "rope_theta": float(kv("rope.freq_base", 1.0e6) or 1.0e6),
+                "rope_type": "proportional",
+                "partial_rotary_factor": 0.25,
+            },
+            "sliding_attention": {
+                "rope_theta": float(kv("rope.freq_base_swa", 1.0e4) or 1.0e4),
+                "rope_type": "default",
+            },
+        },
+        "enable_moe_block": experts > 0,
+        "num_experts": experts,
+        "top_k_experts": int(kv("expert_used_count", 0) or 0),
+        "moe_intermediate_size": int(kv("expert_feed_forward_length", 0) or 0),
+        "hidden_size_per_layer_input": per_layer_input,
+        "vocab_size_per_layer_input": common["vocab_size"] if per_layer_input else 0,
+        "num_kv_shared_layers": shared_kv,
+        "use_double_wide_mlp": double_wide,
+    }
+    return text
 
 
 def _has_export_transform(arch: str, hf_name: str) -> bool:
@@ -485,9 +685,14 @@ def build_hf_dir_from_gguf(
                 "decode (--spec mtp) will be unavailable for it."
             )
     name_map = _hf_name_map(arch, n_layers)
-    export_heads = int(_arch_kv(reader, arch, "attention.head_count", 0) or 0)
-    export_kv_heads = int(_arch_kv(reader, arch, "attention.head_count_kv", export_heads)
-                          or export_heads)
+    # These feed one thing only -- `_invert_export_transform`'s Llama Q/K unpermute -- and a
+    # family that states them per layer, as Gemma 4 does for its two attention geometries, has
+    # no such transform to invert. So one number is enough, and where the file states a list
+    # `_first_scalar` takes its head rather than failing on a key this arch never reads.
+    export_heads = _first_scalar(_arch_kv(reader, arch, "attention.head_count", 0), 0)
+    export_kv_heads = _first_scalar(
+        _arch_kv(reader, arch, "attention.head_count_kv", export_heads), export_heads
+    )
 
     # Pre-walk: collect candidates, let the converter's recipes pick the
     # subset it will repack; everything else takes the dequant path below.
@@ -606,8 +811,14 @@ def build_hf_dir_from_gguf(
                 indent=1,
             )
         )
+        # Name the types the file actually holds. This said "Q8_0" from when that was the
+        # only one repacked, and went on saying it for every K-quant since -- a Gemma 4 QAT
+        # export is Q4_0 throughout, and the line called all 328 of them Q8_0.
+        kinds = sorted({entry.get("type", "?") for entry in repack_sources.values()
+                        if isinstance(entry, dict)})
         echo(
-            f"surogate serve: {len(repack_sources)} Q8_0 tensors marked for "
+            f"surogate serve: {len(repack_sources)} "
+            f"{'/'.join(kinds) if kinds else 'quantised'} tensors marked for "
             f"bit-exact repack (dequantized only {len(weight_map)})"
         )
     return work_dir
@@ -663,6 +874,20 @@ def gguf_target_key(gguf_path: Path, reader=None):
         return "llama"
     if arch == "gemma3" and hidden > 0 and layers > 0:
         return "gemma3"
+    # Gemma 4. llama.cpp gives all five published checkpoints one architecture string, exactly
+    # as their HF configs give them one `model_type`, so the shape of the model picks the
+    # target here for the same reasons it does in `ingest.converter_for_config`: a mixture and
+    # an E-series are different architectures wearing the same name, and deriving either from
+    # the dense blocks builds an artifact that is wrong rather than absent.
+    if arch == "gemma4" and hidden > 0 and layers > 0:
+        experts = int(s.get("num_experts") or 0)
+        if experts > 0:
+            return "gemma4_moe"
+        # The E-series is told from the dense sizes by the two things only it carries: a
+        # per-layer input embedding, and a tail of layers that project a query and nothing else.
+        if int(s.get("per_layer_input_dim") or 0) > 0 or int(s.get("kv_shared_layers") or 0) > 0:
+            return "gemma4_e"
+        return "gemma4"
     if arch == "qwen4exp":
         # Qwen3.8-Flash-Next: converted straight from the GGUF (no HF bridge).
         return "qwen4exp"

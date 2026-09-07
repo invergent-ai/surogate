@@ -10,6 +10,16 @@
 
 namespace sinfer::ops {
 
+/// Which gate a gated feed-forward puts its first half through. Named here rather than beside
+/// one op because both the GPU expert kernels and the host offload path read it, and they must
+/// read the same one.
+enum class GatedActivation : unsigned char {
+    /// `silu(gate) * up`. Every routed mixture this engine served before Gemma 4.
+    Silu,
+    /// `gelu_tanh(gate) * up`, the `gelu_pytorch_tanh` every Gemma is trained with.
+    GeluTanh,
+};
+
 template <class T>
 SINFER_KERNEL_HD constexpr T div_up(T x, T d) {
     static_assert(std::is_integral_v<T>, "div_up requires an integral type");

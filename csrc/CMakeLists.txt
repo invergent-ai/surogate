@@ -1001,6 +1001,14 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   # the extern declarations; a registered shape missing its file here is an
   # undefined reference at link.
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q4.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q8.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_32q16.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q1.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_16q1.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_16q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_32q4.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_8q1.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_8q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
@@ -1032,6 +1040,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/prepare_masked_block.cu
   ${SERVE_ROOT}/ops/launcher/residual_add.cu
   ${SERVE_ROOT}/ops/launcher/rmsnorm.cu
+  ${SERVE_ROOT}/ops/launcher/logit_softcap.cu
   ${SERVE_ROOT}/ops/launcher/next_token_nll.cu
   ${SERVE_ROOT}/ops/launcher/sampled_logprob.cu
   ${SERVE_ROOT}/ops/launcher/short_conv.cu
@@ -1247,6 +1256,7 @@ ${SERVE_ROOT}/ops/launcher/head_linear.cu
   ${SERVE_ROOT}/ops/wrapper/prepare_masked_block.cpp
   ${SERVE_ROOT}/ops/wrapper/residual_add.cpp
   ${SERVE_ROOT}/ops/wrapper/rmsnorm.cpp
+  ${SERVE_ROOT}/ops/wrapper/logit_softcap.cpp
   ${SERVE_ROOT}/ops/wrapper/next_token_nll.cpp
   ${SERVE_ROOT}/ops/wrapper/sampled_logprob.cpp
   ${SERVE_ROOT}/ops/wrapper/short_conv.cpp
@@ -1423,6 +1433,9 @@ add_subdirectory(${SERVE_ROOT}/targets/lfm2 serve_t_lfm2 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/glm5_next serve_t_glm5_next EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/llama serve_t_llama EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/gemma3 serve_t_gemma3 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/gemma4 serve_t_gemma4 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/gemma4_e serve_t_gemma4_e EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/gemma4_moe serve_t_gemma4_moe EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_moe serve_t_qwen3_moe EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5 serve_t_qwen3_5 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_moe serve_t_qwen3_5_moe EXCLUDE_FROM_ALL)

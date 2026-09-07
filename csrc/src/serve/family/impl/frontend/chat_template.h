@@ -143,6 +143,24 @@ private:
     std::string eos_token_;
 };
 
+/// How a model marks its reasoning span, as the artifact states it.
+///
+/// The default is the `<think>` pair, which is what every family served before Gemma 4
+/// used and what a checkpoint that states nothing still means. A checkpoint that states
+/// `response_template.fields.thinking` in its `tokenizer_config.json` -- Gemma 4 does, in
+/// its own vocabulary -- is read instead, so the spelling belongs to the model rather than
+/// to this file.
+struct ReasoningSyntax {
+    std::string open  = "<think>";
+    std::string close = "</think>";
+    /// Whether the *model* writes the opening marker. Qwen's template opens the span in the
+    /// prompt and hands the model an already-open turn, so the opener never appears in the
+    /// output; Gemma 4's generation prompt stops at the turn header and the model writes
+    /// `<|channel>thought` itself. Only the second kind needs the decoder to watch for an
+    /// opening marker mid-stream, and only a checkpoint that states its pair gets that.
+    bool model_opens = false;
+};
+
 /// Renders the template under test with the given variables, or throws the way the
 /// template does when it refuses them.
 using JinjaRenderProbe = std::function<std::string(const ChatTemplateVariables&)>;
@@ -154,11 +172,14 @@ using JinjaRenderProbe = std::function<std::string(const ChatTemplateVariables&)
 /// is left unsupported, so a request for it is refused rather than served as
 /// something else.
 [[nodiscard]] PromptCapabilities probe_jinja_capabilities(std::string_view source,
-                                                          const JinjaRenderProbe& render);
+                                                          const JinjaRenderProbe& render,
+                                                          const ReasoningSyntax& reasoning);
 
-/// Whether a rendered prompt hands the model an open reasoning turn -- the
-/// generation prompt ends inside `<think>`. This is what decides whether the first
-/// token of the answer belongs to reasoning_content or to content.
-[[nodiscard]] bool prompt_opens_reasoning(std::string_view rendered) noexcept;
+/// Whether a rendered prompt hands the model an open reasoning turn -- the generation
+/// prompt ends on the opening marker. This is what decides whether the first token of the
+/// answer belongs to reasoning_content or to content. A model that opens its own span
+/// answers false here and is caught in the stream instead.
+[[nodiscard]] bool prompt_opens_reasoning(std::string_view rendered,
+                                          std::string_view open) noexcept;
 
 } // namespace sinfer::family::frontend_internal

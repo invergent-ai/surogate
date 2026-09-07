@@ -66,6 +66,12 @@ _MODES = {
 }
 
 
+# Where the wheel puts the product binaries (csrc/CMakeLists.txt, install component
+# `serve`). An installed package has no csrc/ to look in, and the engine is not a
+# command of its own, so it is not on PATH either -- this is the only place it is.
+_INSTALLED_BIN_DIR = Path(__file__).resolve().parent.parent / "serve" / "_bin"
+
+
 def _resolve_binary(mode: str) -> str | None:
     name, env_var = _MODES[mode]
     env = os.environ.get(env_var)
@@ -76,6 +82,9 @@ def _resolve_binary(mode: str) -> str | None:
         cand = root / "csrc" / "build-serve" / name
         if cand.is_file():
             return str(cand)
+    cand = _INSTALLED_BIN_DIR / name
+    if cand.is_file():
+        return str(cand)
     return shutil.which(name)
 
 
@@ -111,7 +120,8 @@ def maybe_exec_serve() -> None:
         name = _MODES[mode][0]
         sys.stderr.write(
             f"surogate serve: the serving engine is not built ({name} not found).\n"
-            "Build it first:  make serve-build   (from the surogate repo root)\n"
+            "Build it first:  make serve-build   (or `make build-all` for trainer and engine)\n"
+            "An installed wheel ships it; a source tree builds it into csrc/build-serve.\n"
         )
         sys.exit(127)
 

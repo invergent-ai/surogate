@@ -182,8 +182,8 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                                                                    QType routed_down);
 
 void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
-                               const SparseMoeWeights& weights, Tensor& destination,
-                               const SparseMoePrefillPlan& plan,
+                               const Tensor& router_x, const SparseMoeWeights& weights,
+                               Tensor& destination, const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook = nullptr);
 

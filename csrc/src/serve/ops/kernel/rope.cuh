@@ -22,7 +22,10 @@ enum class RopeKernelMode : std::int32_t {
     Vision2D64,
 };
 
-inline constexpr int kRopeMaxHalf = 128;
+/// The widest rotation the generic kernel caches angles for, in pairs. 256 because Gemma 4's
+/// global heads are 512 wide and rotate over their whole width; the cache is two float arrays,
+/// so this is 2 KiB of shared memory.
+inline constexpr int kRopeMaxHalf = 256;
 
 static __device__ __constant__ float kTextRopeInvFrequency[32] = {
     1.000000000e+00F, 6.042963902e-01F, 3.651741273e-01F, 2.206734069e-01F, 1.333521432e-01F,
@@ -241,7 +244,8 @@ __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, i
 static __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
                                            __nv_bfloat16* q, __nv_bfloat16* k,
                                            std::int32_t head_dim, std::int32_t rotary_dim,
-                                           float theta, std::int32_t q_heads, std::int32_t k_heads,
+                                           std::int32_t active_pairs, float theta,
+                                           std::int32_t q_heads, std::int32_t k_heads,
                                            std::int32_t tokens, std::int64_t q_token_stride,
                                            std::int64_t k_token_stride) {
     const int token = static_cast<int>(blockIdx.x);
@@ -249,8 +253,20 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
     const int half = rotary_dim / 2;
     __shared__ float cos_cache[kRopeMaxHalf];
     __shared__ float sin_cache[kRopeMaxHalf];
-    if (threadIdx.x < static_cast<unsigned>(half)) {
-        const int pair = static_cast<int>(threadIdx.x);
+    // Strided, not one thread per pair: a 512-wide head has 256 pairs and the block is 128
+    // threads, so a single-thread-per-pair fill would leave half the angles uninitialised.
+    for (int pair = static_cast<int>(threadIdx.x); pair < half;
+         pair += static_cast<int>(blockDim.x)) {
+        // Pairs past `active_pairs` carry a zero frequency, which is an exact identity:
+        // cos 1 and sin 0 leave both halves bit-for-bit unchanged. That is how Gemma 4's
+        // proportional rope is defined -- 64 real angles for a 512-wide head, then 192 zeros
+        // *appended*, so the head rotates over its whole width with an inert tail rather than
+        // over a contiguous prefix.
+        if (pair >= active_pairs) {
+            cos_cache[pair] = 1.0F;
+            sin_cache[pair] = 0.0F;
+            continue;
+        }
         if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
                                                        &sin_cache[pair], &cos_cache[pair]);

@@ -3,6 +3,23 @@
 
 namespace {
 
+/// The stored width of a row, against the width the math reads.
+///
+/// `row-split-k128-v1` pads K up to 128 and stores `padded / group` groups per row, so a
+/// 704-wide expert's scale row is 48 bytes and not 44. Every mixture registered before Gemma 4
+/// had widths that were multiples of 128, so the two coincided and every stride here could be
+/// written against the logical width. They no longer coincide, and the failure is not a wrong
+/// number: at 22 groups the second row's scales land 4 bytes short of where they are, the
+/// `groups_per_row % 8` predicate picks the 8-byte staging path, and the load faults on an
+/// address that is only 4-byte aligned. At the stored 24 the 16-byte path is taken and the
+/// addresses are right -- correct *and* the faster branch.
+///
+/// Strides use this. Loop bounds keep the logical width, so the zero padding is never read.
+/// The GGML superblock layouts store K exactly and are left alone.
+constexpr int kStoredIntermediate = ((kIntermediate + 127) / 128) * 128;
+constexpr int kStoredHidden       = ((kHidden + 127) / 128) * 128;
+
+
 constexpr int kSparseMoeRouterScoreRows = (kRouterRows + 3) / 4 * 4;
 constexpr int kRouterBM      = 16;
 constexpr int kRouterBN      = 64;
@@ -115,7 +132,8 @@ __global__ void sparse_moe_prefill_select_count_kernel(const float* __restrict__
                                                        float* __restrict__ shared_scale,
                                                        int* __restrict__ local_rank,
                                                        int* __restrict__ tile_counts, int tokens,
-                                                       const float* __restrict__ router_bias) {
+                                                       const float* __restrict__ router_bias,
+                                                       const float* __restrict__ per_expert_scale) {
     __shared__ int counts[kExperts];
     __shared__ float selected_logits[kSparseMoeRouteTileTokens][kTopK];
     const int tid  = static_cast<int>(threadIdx.x);
@@ -126,10 +144,11 @@ __global__ void sparse_moe_prefill_select_count_kernel(const float* __restrict__
 
     const int token = static_cast<int>(blockIdx.x) * kSparseMoeRouteTileTokens + warp;
     if (token < tokens) {
-        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated>(
+        sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated,
+                                     kPerExpertScaled>(
             scores + static_cast<std::int64_t>(token) * kSparseMoeRouterScoreRows,
             ids + token * kTopK, alpha + token * kTopK, shared_scale + token,
-            selected_logits[warp], router_bias, kRoutedScale);
+            selected_logits[warp], router_bias, kRoutedScale, per_expert_scale);
         __syncwarp();
         if (lane == 0) {
 #pragma unroll
@@ -331,7 +350,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
     const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ activation) {
     constexpr int ExpertThreads = ExpertWarps * 32;
-    constexpr int GroupsPerRow  = kHidden / 64;
+    constexpr int GroupsPerRow  = kStoredHidden / 64;
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
     constexpr int WarpNT        = WarpCols / 8;
     static_assert(ExpertBN % ExpertWarps == 0 && WarpCols % 8 == 0);
@@ -513,15 +532,15 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
                     const int local_col1 = local_col0 + 1;
                     if (local_col0 < cols) {
                         activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][0], acc[mi + 2][ni][0], kSwigluLimit));
+                            __float2bfloat16_rn(gated_clamped(acc[mi][ni][0], acc[mi + 2][ni][0], kSwigluLimit, kActivation));
                         activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][2], acc[mi + 2][ni][2], kSwigluLimit));
+                            __float2bfloat16_rn(gated_clamped(acc[mi][ni][2], acc[mi + 2][ni][2], kSwigluLimit, kActivation));
                     }
                     if (local_col1 < cols) {
                         activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][1], acc[mi + 2][ni][1], kSwigluLimit));
+                            __float2bfloat16_rn(gated_clamped(acc[mi][ni][1], acc[mi + 2][ni][1], kSwigluLimit, kActivation));
                         activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][3], acc[mi + 2][ni][3], kSwigluLimit));
+                            __float2bfloat16_rn(gated_clamped(acc[mi][ni][3], acc[mi + 2][ni][3], kSwigluLimit, kActivation));
                     }
                 }
             }
@@ -563,7 +582,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
     const int b_koff             = ((lane >> 3) & 1) << 3;
     const int gid                = lane >> 2;
     const int lid                = lane & 3;
-    constexpr int groups_per_row = kHidden / 32;
+    constexpr int groups_per_row = kStoredHidden / 32;
 
     const int column_iterations = Routed ? (count + kExpertBN - 1) / kExpertBN : 1;
     for (int iteration = 0; iteration < column_iterations; ++iteration) {
@@ -713,15 +732,15 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
                 const int local_col1 = local_col0 + 1;
                 if (local_col0 < cols) {
                     activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                        __float2bfloat16_rn(swiglu_clamped(acc[mi][0], acc[mi + 2][0], kSwigluLimit));
+                        __float2bfloat16_rn(gated_clamped(acc[mi][0], acc[mi + 2][0], kSwigluLimit, kActivation));
                     activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                        __float2bfloat16_rn(swiglu_clamped(acc[mi][2], acc[mi + 2][2], kSwigluLimit));
+                        __float2bfloat16_rn(gated_clamped(acc[mi][2], acc[mi + 2][2], kSwigluLimit, kActivation));
                 }
                 if (local_col1 < cols) {
                     activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                        __float2bfloat16_rn(swiglu_clamped(acc[mi][1], acc[mi + 2][1], kSwigluLimit));
+                        __float2bfloat16_rn(gated_clamped(acc[mi][1], acc[mi + 2][1], kSwigluLimit, kActivation));
                     activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                        __float2bfloat16_rn(swiglu_clamped(acc[mi][3], acc[mi + 2][3], kSwigluLimit));
+                        __float2bfloat16_rn(gated_clamped(acc[mi][3], acc[mi + 2][3], kSwigluLimit, kActivation));
                 }
             }
         }
@@ -929,15 +948,15 @@ sparse_moe_prefill_ggml_gate_up_kernel(
                     const int local_col1 = local_col0 + 1;
                     if (local_col0 < cols) {
                         activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][0], acc[mi + 2][ni][0], kSwigluLimit));
+                            __float2bfloat16_rn(gated_clamped(acc[mi][ni][0], acc[mi + 2][ni][0], kSwigluLimit, kActivation));
                         activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][2], acc[mi + 2][ni][2], kSwigluLimit));
+                            __float2bfloat16_rn(gated_clamped(acc[mi][ni][2], acc[mi + 2][ni][2], kSwigluLimit, kActivation));
                     }
                     if (local_col1 < cols) {
                         activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][1], acc[mi + 2][ni][1], kSwigluLimit));
+                            __float2bfloat16_rn(gated_clamped(acc[mi][ni][1], acc[mi + 2][ni][1], kSwigluLimit, kActivation));
                         activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                            __float2bfloat16_rn(swiglu_clamped(acc[mi][ni][3], acc[mi + 2][ni][3], kSwigluLimit));
+                            __float2bfloat16_rn(gated_clamped(acc[mi][ni][3], acc[mi + 2][ni][3], kSwigluLimit, kActivation));
                     }
                 }
             }
@@ -1193,15 +1212,15 @@ sparse_moe_prefill_ggml_i8_gate_up_kernel(
                 const int col1       = col0 + 1;
                 if (local_col0 < cols) {
                     activation[static_cast<std::int64_t>(col0) * kIntermediate + row0] =
-                        __float2bfloat16_rn(swiglu_clamped(acc[mi][0], acc[mi + 2][0], kSwigluLimit));
+                        __float2bfloat16_rn(gated_clamped(acc[mi][0], acc[mi + 2][0], kSwigluLimit, kActivation));
                     activation[static_cast<std::int64_t>(col0) * kIntermediate + row1] =
-                        __float2bfloat16_rn(swiglu_clamped(acc[mi][2], acc[mi + 2][2], kSwigluLimit));
+                        __float2bfloat16_rn(gated_clamped(acc[mi][2], acc[mi + 2][2], kSwigluLimit, kActivation));
                 }
                 if (local_col1 < cols) {
                     activation[static_cast<std::int64_t>(col1) * kIntermediate + row0] =
-                        __float2bfloat16_rn(swiglu_clamped(acc[mi][1], acc[mi + 2][1], kSwigluLimit));
+                        __float2bfloat16_rn(gated_clamped(acc[mi][1], acc[mi + 2][1], kSwigluLimit, kActivation));
                     activation[static_cast<std::int64_t>(col1) * kIntermediate + row1] =
-                        __float2bfloat16_rn(swiglu_clamped(acc[mi][3], acc[mi + 2][3], kSwigluLimit));
+                        __float2bfloat16_rn(gated_clamped(acc[mi][3], acc[mi + 2][3], kSwigluLimit, kActivation));
                 }
             }
         }
@@ -1312,7 +1331,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ output) {
     constexpr int ExpertThreads = ExpertWarps * 32;
-    constexpr int GroupsPerRow  = kIntermediate / 64;
+    constexpr int GroupsPerRow  = kStoredIntermediate / 64;
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][ExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertStages][kExpertBM * 32];
@@ -1526,7 +1545,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_
     const int b_koff             = ((lane >> 3) & 1) << 3;
     const int gid                = lane >> 2;
     const int lid                = lane & 3;
-    constexpr int groups_per_row = kIntermediate / 32;
+    constexpr int groups_per_row = kStoredIntermediate / 32;
 
     const int column_iterations = Routed ? (count + kExpertBN - 1) / kExpertBN : 1;
     for (int iteration = 0; iteration < column_iterations; ++iteration) {
@@ -1776,9 +1795,14 @@ trtllm_moe::Nvfp4RoutedExperts trtllm_experts(const SparseMoeWeights& weights) {
     return experts;
 }
 
-void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
-                    const SparseMoePrefillPlan& plan, const SparseMoePrefillWorkspace& workspace,
-                    cudaStream_t stream, const SparseMoeRoundHook* hook) {
+// Every mixture here but Gemma 4 projects the router and the experts from the same tokens, and
+// passes the same tensor twice. Gemma 4 does not: its router reads the post-attention residual
+// normalised with no weight and scaled by a learned per-channel vector, its experts the same
+// residual through `pre_feedforward_layernorm_2`. Two projections of one token.
+void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
+                    Tensor& destination, const SparseMoePrefillPlan& plan,
+                    const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
+                    const SparseMoeRoundHook* hook) {
     if (x.ne[1] != plan.tokens || destination.ne[1] != plan.tokens || plan.slice_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: launch plan does not match tensors");
     }
@@ -1820,9 +1844,11 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
     for (std::int32_t token0 = 0; token0 < plan.tokens; token0 += plan.slice_tokens) {
         const std::int32_t tokens =
             std::min(plan.slice_tokens, static_cast<std::int32_t>(plan.tokens - token0));
-        const Tensor input_slice = x.slice(1, token0, tokens);
+        const Tensor input_slice  = x.slice(1, token0, tokens);
+        const Tensor router_slice = router_x.slice(1, token0, tokens);
         Tensor output_slice      = destination.slice(1, token0, tokens);
         const auto* input        = static_cast<const __nv_bfloat16*>(input_slice.data);
+        const auto* router_input = static_cast<const __nv_bfloat16*>(router_slice.data);
         auto* output             = static_cast<__nv_bfloat16*>(output_slice.data);
         const int route_tiles =
             (tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
@@ -1834,13 +1860,13 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
 
         sparse_moe_prefill_router_mma_kernel<<<dim3((kRouterRows + kRouterBM - 1) / kRouterBM,
                                                     (tokens + kRouterBN - 1) / kRouterBN),
-                                               kRouterThreads, 0, stream>>>(input, router, scores,
-                                                                            tokens);
+                                               kRouterThreads, 0, stream>>>(router_input, router,
+                                                                            scores, tokens);
         CUDA_CHECK(cudaGetLastError());
 
         sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
             scores, ids, alpha, shared_scale, packed_index, tile_counts, tokens,
-            weights.router_bias);
+            weights.router_bias, weights.per_expert_scale);
         CUDA_CHECK(cudaGetLastError());
         if (hook != nullptr && hook->resolve != nullptr) {
             const Tensor slice_ids(ids, DType::I32, {assignments});

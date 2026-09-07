@@ -81,16 +81,23 @@ inline float fp16_to_float(std::uint16_t h) {
 constexpr std::size_t kQ5Bytes = 20;
 
 inline float silu(float v) { return v / (1.0F + std::exp(-v)); }
-// The SwiGLU the GPU expert kernels apply (ops/common/math.cuh `swiglu_clamped`): both halves
-// bounded before the product where the geometry states a limit, the plain product otherwise.
-// GLM-5.3 states 10; a host round that skipped it would compute a different function from the
-// device round it stands in for, and the split's shadow check would say so on every layer.
-inline float swiglu(float gate, float up, float limit) {
+inline float gelu_tanh(float v) {
+    constexpr float kSqrt2OverPi = 0.7978845608028654F;
+    return 0.5F * v * (1.0F + std::tanh(kSqrt2OverPi * (v + 0.044715F * v * v * v)));
+}
+// The gated activation the GPU expert kernels apply (ops/common/math.cuh `gated_clamped`): both
+// halves bounded before the product where the geometry states a limit, the plain product
+// otherwise, and the gate through whichever function the geometry names. GLM-5.3 states a limit
+// of 10 and Gemma 4 a GELU gate; a host round that got either wrong would compute a different
+// function from the device round it stands in for, and the split's shadow check would say so on
+// every layer.
+inline float swiglu(float gate, float up, float limit,
+                    GatedActivation activation = GatedActivation::Silu) {
     if (limit > 0.0F) {
         gate = std::min(gate, limit);
         up   = std::min(std::max(up, -limit), limit);
     }
-    return silu(gate) * up;
+    return (activation == GatedActivation::GeluTanh ? gelu_tanh(gate) : silu(gate)) * up;
 }
 
 /// Quantises `count` floats (a multiple of 32) into int8 groups with one float scale each.
@@ -900,6 +907,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
     const int hidden       = geometry.hidden;
     const int intermediate = geometry.intermediate;
     const float limit      = geometry.swiglu_limit;
+    const auto activation  = geometry.activation;
     const Scratch s        = carve_scratch(geometry, scratch);
     for (int i = 0; i < hidden; ++i) { s.x_float[i] = bf16_to_float(x_column[i]); }
     quantise_groups(s.x_float, hidden, s.xq, s.xs);
@@ -935,7 +943,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                        bank.gate_up_ggml, hidden, 1);
             float g = 0.0F, u = 0.0F;
             dot_two_rows(s.wq, s.ws, s.wq + hidden, s.ws + groups_h, s.xq, s.xs, hidden, g, u);
-            s.h[j] = swiglu(g, u, limit);
+            s.h[j] = swiglu(g, u, limit, activation);
         }
     } else if (bank.gate_up_format == ExpertBankFormat::Q4G32AM) {
         // Reference path for the Q4 bank: the scalar Q4 dot is the oracle the SIMD kernels are
@@ -954,7 +962,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                 gate4 + static_cast<std::size_t>(intermediate + j) * (hidden / 2),
                 gsc + (intermediate + j) * groups_h, gmn + (intermediate + j) * groups_h, s.xq,
                 s.xs, hidden);
-            s.h[j] = swiglu(g, u, limit);
+            s.h[j] = swiglu(g, u, limit, activation);
         }
     } else if (bank.gate_up_format == ExpertBankFormat::Q5G32AM) {
         // Reference path for the Q5 bank: the scalar Q5 dot is the oracle the SIMD kernels are
@@ -973,7 +981,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                 gate5 + static_cast<std::size_t>(intermediate + j) * (groups_h * kQ5Bytes),
                 gsc + (intermediate + j) * groups_h, gmn + (intermediate + j) * groups_h, s.xq,
                 s.xs, hidden);
-            s.h[j] = swiglu(g, u, limit);
+            s.h[j] = swiglu(g, u, limit, activation);
         }
     } else {
         const std::size_t gate_row_codes  = static_cast<std::size_t>(hidden);
@@ -988,7 +996,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                          gate_codes + (intermediate + j) * gate_row_codes,
                          gate_scales + (intermediate + j) * gate_row_scales, s.xq, s.xs, hidden, g,
                          u);
-            s.h[j] = swiglu(g, u, limit);
+            s.h[j] = swiglu(g, u, limit, activation);
         }
     }
     quantise_groups(s.h, intermediate, s.hq, s.hs);
@@ -1287,6 +1295,7 @@ struct CpuExpertPool::Impl {
         const int hidden       = geometry.hidden;
         const int intermediate = geometry.intermediate;
         const float limit      = geometry.swiglu_limit;
+    const auto activation  = geometry.activation;
         const int groups_h     = hidden / kGroup;
         const int groups_i     = intermediate / kGroup;
         if (ph == 0) {
@@ -1372,8 +1381,8 @@ struct CpuExpertPool::Impl {
                             xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
                             xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga,
                             ua, gb, ub);
-                        h[ia * intermediate + j] = swiglu(ga, ua, limit);
-                        h[ib * intermediate + j] = swiglu(gb, ub, limit);
+                        h[ia * intermediate + j] = swiglu(ga, ua, limit, activation);
+                        h[ib * intermediate + j] = swiglu(gb, ub, limit, activation);
                     }
                     if (i < g1) {
                         const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1384,7 +1393,7 @@ struct CpuExpertPool::Impl {
                                         xs.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         xc.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         hidden, ga, ua);
-                        h[ia * intermediate + j] = swiglu(ga, ua, limit);
+                        h[ia * intermediate + j] = swiglu(ga, ua, limit, activation);
                     }
                 }
                 return;
@@ -1422,8 +1431,8 @@ struct CpuExpertPool::Impl {
                             xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
                             xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga,
                             ua, gb, ub);
-                        h[ia * intermediate + j] = swiglu(ga, ua, limit);
-                        h[ib * intermediate + j] = swiglu(gb, ub, limit);
+                        h[ia * intermediate + j] = swiglu(ga, ua, limit, activation);
+                        h[ib * intermediate + j] = swiglu(gb, ub, limit, activation);
                     }
                     if (i < g1) {
                         const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1434,7 +1443,7 @@ struct CpuExpertPool::Impl {
                                         xs.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         xc.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         hidden, ga, ua);
-                        h[ia * intermediate + j] = swiglu(ga, ua, limit);
+                        h[ia * intermediate + j] = swiglu(ga, ua, limit, activation);
                     }
                 }
                 return;
@@ -1467,8 +1476,8 @@ struct CpuExpertPool::Impl {
                         dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(b) * bb, hidden, xa, sa, xb, sb, ga, gb);
                         dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(blocks + b) * bb, hidden, xa, sa, xb, sb, ua, ub);
                         for (int r = 0; r < kTileRows; ++r) {
-                            h[ia * intermediate + j0 + b * kTileRows + r] = swiglu(ga[r], ua[r], limit);
-                            if (i + 1 < g1) { h[ib * intermediate + j0 + b * kTileRows + r] = swiglu(gb[r], ub[r], limit); }
+                            h[ia * intermediate + j0 + b * kTileRows + r] = swiglu(ga[r], ua[r], limit, activation);
+                            if (i + 1 < g1) { h[ib * intermediate + j0 + b * kTileRows + r] = swiglu(gb[r], ub[r], limit, activation); }
                         }
                     }
                 }
@@ -1490,15 +1499,15 @@ struct CpuExpertPool::Impl {
                                             xq.data() + static_cast<std::size_t>(jb.token) * hidden,
                                             xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
                                             xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga, ua, gb, ub);
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j]     = swiglu(ga, ua, limit);
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]) * intermediate + j] = swiglu(gb, ub, limit);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j]     = swiglu(ga, ua, limit, activation);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]) * intermediate + j] = swiglu(gb, ub, limit, activation);
                 }
                 if (i < g1) {
                     const CpuExpertJob& ja = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(i)])];
                     float ga = 0.0F, ua = 0.0F;
                     dot_two_rows(gc, gs, uc, us, xq.data() + static_cast<std::size_t>(ja.token) * hidden,
                                  xs.data() + static_cast<std::size_t>(ja.token) * groups_h, hidden, ga, ua);
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j] = swiglu(ga, ua, limit);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j] = swiglu(ga, ua, limit, activation);
                 }
             }
             return;

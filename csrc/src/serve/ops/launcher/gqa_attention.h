@@ -66,6 +66,22 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& position
 // `selection`: a window that defaults to 0 reads as "unbounded" but means "the caller
 // forgot", and the two are indistinguishable at the call site. Making it positional
 // turns an unforwarded window into a compile error instead of silent wrong attention.
+void gqa_attention_cached_batch_small_t_launch(const Tensor& q, const Tensor& pos,
+                                               const Tensor& valid_columns,
+                                               const Tensor& table_rows, float scale,
+                                               PagedKVBatchLayerView cache,
+                                               GqaExecutionEnvelope envelope,
+                                               std::int32_t column_begin, std::int32_t width,
+                                               Tensor& partial_acc, Tensor& partial_m,
+                                               Tensor& partial_l, Tensor& out,
+                                               cudaStream_t stream, GqaBlockMask selection = {});
+
+void gqa_attention_prompt_cached_launch(const Tensor& q, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        float scale, PagedKVBatchLayerView cache, Tensor& out,
+                                        cudaStream_t stream, std::int32_t sliding_window,
+                                        GqaBlockMask selection = {});
+
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,

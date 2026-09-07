@@ -3422,7 +3422,14 @@ NB_MODULE(_surogate, m) {
              "Batch-encode multiple texts in parallel.\n\n"
              "Parameters:\n- texts: List of input texts.\n"
              "- add_special_tokens: If True, prepend BOS / append EOS as configured.")
-        .def("decode", &tokenizer::Tokenizer::decode, nb::arg("ids"), "Decode token IDs back to text.")
+        .def("decode",
+             &tokenizer::Tokenizer::decode,
+             nb::arg("ids"),
+             nb::arg("strip_leading_space") = true,
+             "Decode token IDs back to text.\n\n"
+             "Parameters:\n- ids: Token IDs to decode.\n"
+             "- strip_leading_space: Undo the word mark the normalizer prepends. Correct for a\n"
+             "  whole sequence; a caller decoding one token at a time must pass False.")
         .def("encode_single_token",
              &tokenizer::Tokenizer::encode_single_token,
              nb::arg("token_bytes"),

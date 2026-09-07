@@ -36,8 +36,26 @@ namespace sinfer::ops {
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
           cudaStream_t stream);
 
+/**
+ * The same, with only the first `active_pairs` pairs rotated and the rest left exactly as they
+ * are. `active_pairs == rotary_dim / 2` is the form above.
+ *
+ * This is a *partial* rotation over the whole head, which is not the same thing as a narrower
+ * one. Gemma 4's global layers rotate 64 pairs of a 512-wide head: the pairs are still
+ * (i, i + 256), so the rotated and unrotated channels interleave at stride 256. A rotary_dim
+ * of 128 would pair i with i+64 -- different partners, and wrong in a way that still produces
+ * plausible text.
+ *
+ * The inert pairs are an exact identity, not an approximation: cos 1 and sin 0 leave both
+ * halves bit-for-bit unchanged.
+ */
+void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta, Tensor& q,
+          Tensor& k, cudaStream_t stream);
+
 // Single-tensor form with the same formula and storage contract. The head count comes directly
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);
+void rope(const Tensor& positions, int rotary_dim, int active_pairs, float theta, Tensor& x,
+          cudaStream_t stream);
 
 } // namespace sinfer::ops

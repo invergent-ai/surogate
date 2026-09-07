@@ -39,16 +39,65 @@ namespace {
 [[nodiscard]] inline std::int32_t geometry_full_attention_layers(const family::TextGeometry& g) {
     std::int32_t count = 0;
     for (std::int32_t layer = 0; layer < g.layers; ++layer) {
-        count += (g.attention_schedule_declared ? g.layer_attends(layer)
-                                                : TextConfig::is_full_attention(static_cast<int>(layer)))
-                     ? 1
-                     : 0;
+        const bool attends =
+            g.attention_schedule_declared
+                ? g.layer_attends(layer)
+                : TextConfig::is_full_attention(static_cast<int>(layer));
+        // A layer that shares an earlier layer's keys and values holds no planes of its own,
+        // so it is not one of the cache's layers. The Gemma 4 E-series ends in a run of
+        // twenty such layers out of thirty-five; sizing the pool for all of them would
+        // reserve 57 % more cache than the model can use.
+        count += (attends && g.layer_owns_kv(layer)) ? 1 : 0;
     }
     return count;
 }
 
 [[nodiscard]] inline std::int32_t geometry_gdn_layers(const family::TextGeometry& g) {
     return g.layers - geometry_full_attention_layers(g);
+}
+
+/// Whether this layer looks through the window, from the artifact's schedule where it
+/// declares one and from the target's compiled predicate otherwise -- the same precedence
+/// `geometry_full_attention_layers` uses, and it has to be the same: a layer counted as
+/// windowed here and global there is a layer whose cache is sized for the wrong geometry.
+///
+/// A target with no window at all has no such predicate and every layer is global, which is
+/// what the `requires` probe answers for every family but Gemma.
+///
+/// A template over the config, not a plain function: `if constexpr` only discards a branch in
+/// a template, so a non-template probe would still type-check `TextConfig::is_windowed_attention`
+/// and fail to compile for every target that has no window.
+template <class Config = TextConfig>
+[[nodiscard]] inline bool geometry_layer_is_windowed(const family::TextGeometry& g,
+                                                     std::int32_t layer) {
+    if (g.windowed_schedule_declared) { return g.layer_is_windowed(layer); }
+    if constexpr (requires { Config::is_windowed_attention(0); }) {
+        return Config::is_windowed_attention(static_cast<int>(layer));
+    } else {
+        return false;
+    }
+}
+
+/// The full-attention layers that attend at the *second* geometry, in the numbering the KV
+/// pool uses -- which counts only attending layers, so it is not the model layer index on a
+/// hybrid stack. Empty unless the model states two geometries, which is every family but
+/// Gemma 4.
+[[nodiscard]] inline std::vector<std::uint32_t>
+geometry_global_geometry_layers(const family::TextGeometry& g) {
+    std::vector<std::uint32_t> out;
+    if (!g.has_global_attention_geometry()) { return out; }
+    std::uint32_t kv_layer = 0;
+    for (std::int32_t layer = 0; layer < g.layers; ++layer) {
+        const bool attends =
+            g.attention_schedule_declared
+                ? g.layer_attends(layer)
+                : TextConfig::is_full_attention(static_cast<int>(layer));
+        // Owners only, in the same order and by the same rule the pool is built with.
+        if (!attends || !g.layer_owns_kv(layer)) { continue; }
+        if (!geometry_layer_is_windowed(g, layer)) { out.push_back(kv_layer); }
+        ++kv_layer;
+    }
+    return out;
 }
 
 } // namespace
@@ -211,6 +260,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .capacity                  = plan.capacity,
                      .kv_heads                  = plan.geometry.kv_heads,
                      .attention_head_dim        = plan.geometry.head_dim,
+                     .global_kv_heads           = plan.geometry.global_kv_heads,
+                     .global_attention_head_dim = plan.geometry.global_head_dim,
+                     .global_geometry_layers    = geometry_global_geometry_layers(plan.geometry),
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
                      .kv_skip_layers            = plan.kv_skip_layers,
@@ -462,6 +514,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, family::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+        // The embedded input a per-layer-input family keeps beside the residual. The layers
+        // write the residual in place, so `capture_per_layer_source` copies the embedding once
+        // and holds it from the round's arena for the whole layer loop -- and nothing booked
+        // it, so the plan was one residual-width plane short of what the round allocates, at
+        // every column. Live, not scratch: the epilogue of the *last* layer still reads it.
+        if constexpr (ResidualHooks<Variant>::per_layer_inputs) {
+            matrix(layout, DType::BF16, plan.geometry.residual, last);
+        }
         if constexpr (ResidualHooks<Variant>::prologue) {
             // The staged column facts (ids are the caller's) and the prologue's own scratch.
             matrix(layout, DType::I32, 1, last);
@@ -483,6 +543,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             (void)path;
         }
         post_mixer_stage(layout, first, last, phase);
+        // The block's tail, where a family that folds a per-layer input runs one. The policy
+        // and the target have both had this figure all along; nothing asked for it, so a
+        // Gemma 4 E-series booked nothing for the epilogue's three GEMMs and its six planes.
+        // A BF16 artifact survived that because its W8 linears take no transient storage and
+        // leave the layout's booking for them unspent; a GGUF-served one spends it and the
+        // arena came up short by a constant, at startup, before the first token.
+        if constexpr (ResidualHooks<Variant>::per_layer_inputs) {
+            scratch(layout, ResidualHooks<Variant>::layer_epilogue_workspace_capacity_bytes(
+                                plan.geometry, first, last));
+        }
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {

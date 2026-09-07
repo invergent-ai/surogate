@@ -359,6 +359,9 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     };
     std::optional<ConstructedTarget> constructed;
     dispatch.template operator()<Gemma3, LoadedGemma3, Gemma3Instance>(constructed);
+    dispatch.template operator()<Gemma4, LoadedGemma4, Gemma4Instance>(constructed);
+    dispatch.template operator()<Gemma4E, LoadedGemma4E, Gemma4EInstance>(constructed);
+    dispatch.template operator()<Gemma4Moe, LoadedGemma4Moe, Gemma4MoeInstance>(constructed);
     dispatch.template operator()<Glm5Next, LoadedGlm5Next, Glm5NextInstance>(constructed);
     dispatch.template operator()<Lfm2, LoadedLfm2, Lfm2Instance>(constructed);
     dispatch.template operator()<Llama, LoadedLlama, LlamaInstance>(constructed);

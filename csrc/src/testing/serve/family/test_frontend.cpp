@@ -726,7 +726,7 @@ int test_jinja_capability_probe() {
         }
         return "Reasoning Effort: " + effort + "\nuser: hello\nassistant: <think>";
     };
-    const sinfer::PromptCapabilities glm = fi::probe_jinja_capabilities(kEffortJinjaTemplate, glm_like);
+    const sinfer::PromptCapabilities glm = fi::probe_jinja_capabilities(kEffortJinjaTemplate, glm_like, {});
     int failures = check(glm.reasoning_effort.low && glm.reasoning_effort.high && glm.reasoning_effort.max,
                          "the probe missed an effort the template names and honours");
     failures += check(!glm.reasoning_effort.medium && !glm.reasoning_effort.xhigh && !glm.reasoning_effort.minimal,
@@ -740,7 +740,7 @@ int test_jinja_capability_probe() {
     const auto decorative = [](const fi::ChatTemplateVariables&) {
         return std::string("fixed");
     };
-    const sinfer::PromptCapabilities ignored = fi::probe_jinja_capabilities(kEffortJinjaTemplate, decorative);
+    const sinfer::PromptCapabilities ignored = fi::probe_jinja_capabilities(kEffortJinjaTemplate, decorative, {});
     failures +=
         check(!ignored.reasoning_effort.any(), "an effort variable that changes nothing was advertised as a setting");
 
@@ -749,7 +749,7 @@ int test_jinja_capability_probe() {
     const auto toggle = [](const fi::ChatTemplateVariables& variables) {
         return std::string("assistant: ") + (variables.enable_thinking.value_or(true) ? "<think>" : "<think></think>");
     };
-    const sinfer::PromptCapabilities toggled = fi::probe_jinja_capabilities(toggle_source, toggle);
+    const sinfer::PromptCapabilities toggled = fi::probe_jinja_capabilities(toggle_source, toggle, {});
     failures += check(toggled.enable_thinking && toggled.reasoning_turn && !toggled.reasoning_effort.any(),
                       "a thinking switch was not read off the prompts it renders");
 
@@ -757,14 +757,23 @@ int test_jinja_capability_probe() {
     const auto broken = [](const fi::ChatTemplateVariables&) -> std::string {
         throw std::runtime_error("template error");
     };
-    const sinfer::PromptCapabilities none = fi::probe_jinja_capabilities(kEffortJinjaTemplate, broken);
+    const sinfer::PromptCapabilities none = fi::probe_jinja_capabilities(kEffortJinjaTemplate, broken, {});
     failures += check(!none.reasoning_effort.any() && !none.enable_thinking && !none.reasoning_turn,
                       "a template that cannot be rendered was credited with capabilities");
 
     failures += check(
-        fi::prompt_opens_reasoning("<|assistant|><think>") && fi::prompt_opens_reasoning("<|assistant|><think>\n") &&
-            !fi::prompt_opens_reasoning("<|assistant|><think></think>\n\n") && !fi::prompt_opens_reasoning(""),
+        fi::prompt_opens_reasoning("<|assistant|><think>", "<think>") &&
+            fi::prompt_opens_reasoning("<|assistant|><think>\n", "<think>") &&
+            !fi::prompt_opens_reasoning("<|assistant|><think></think>\n\n", "<think>") &&
+            !fi::prompt_opens_reasoning("", "<think>"),
         "an open reasoning turn was not told from a closed one");
+    // A family whose opener is not `<think>` is read against its own, and one that carries
+    // trailing whitespace is matched without it: Gemma 4's is `<|channel>thought\n`.
+    failures += check(
+        fi::prompt_opens_reasoning("<|turn>model\n<|channel>thought\n", "<|channel>thought\n") &&
+            !fi::prompt_opens_reasoning("<|turn>model\n", "<|channel>thought\n") &&
+            !fi::prompt_opens_reasoning("<|assistant|><think>", "<|channel>thought\n"),
+        "an opener the artifact states was not the one the prompt was read against");
     return failures;
 }
 

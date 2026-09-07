@@ -6,7 +6,8 @@ Supports Gemma4ForCausalLM (text-only) and Gemma4ForConditionalGeneration
 Key architectural features:
   - Mixed attention: 5:1 sliding-to-full pattern (configurable via layer_types)
   - Sandwich norms: 4 RMSNorm per layer (pre/post attention, pre/post MLP)
-  - QKV-norm: Q/K with (1+weight) scale, V with RMS-only normalization
+  - QKV-norm: Q/K scaled by the norm weight itself (Gemma 4 stores the full scale,
+    unlike Gemma 3's 1+weight), V normalised with no learnable scale at all
   - Different head_dim per layer type: head_dim for sliding, global_head_dim for full
   - Different RoPE per layer type: default@10K for sliding, proportional@1M for full
   - GeLU-gated MLP (gelu_pytorch_tanh activation)
@@ -26,12 +27,79 @@ from ..blocks.gemma4 import (
     Gemma4FullBlock,
     Gemma4FullMoEBlock,
     Gemma4SharedKVBlock,
+    Gemma4SharedKVGlobalBlock,
+    Gemma4SharedKVSlidingBlock,
     Gemma4SlidingBlock,
     Gemma4SlidingMoEBlock,
 )
 from ..hf import fuse
+from ..block_schema import ServeObject
 from ..blocks.gemma4 import GEMMA4_MODEL_NAME_REMAP
 from ..specs import ActivationScope
+
+
+#: Model-level objects as a serving artifact stores them; the per-layer ones are declared
+#: on the block schemas.
+#:
+#: No ``unfold_unit_offset`` on the final norm, for the reason the block objects state: a
+#: Gemma 4 norm weight is the full scale, not one less than it.
+#:
+#: The output head is declared even where the checkpoint ties it to the embedding — the
+#: declaration maps ``lm_head`` either way and the converter resolves the source through
+#: ``tied_output_head``, which every published Gemma 4 sets.
+GEMMA4_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",), scope="model"),
+    ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
+    ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",), scope="model"),
+    # The E-series' per-layer input stack. Only its norm is model-wide: the second embedding
+    # table and the projection that mixes the hidden state into it are held stacked by the
+    # checkpoint and stored cut per layer, beside the rest of the layer's per-layer input
+    # objects. The shape resolves to 0 on a checkpoint without `hidden_size_per_layer_input`,
+    # which drops it.
+    ServeObject("text/per_layer_projection_norm", "bf16", ("PliDim",),
+                ("pli_proj_norm",), scope="model"),
+)
+
+#: Which block runs where, by the name `_serve_blocks_` gives it.
+#:
+#: The two shared-KV entries are serve views of one runtime class; see the note beside them in
+#: `blocks/gemma4.py`. They differ in the head width their objects are shaped against, which is
+#: the whole reason the schedule names them apart.
+_GEMMA4_SERVE_BLOCKS = {
+    "sliding": Gemma4SlidingBlock,
+    "full": Gemma4FullBlock,
+    "shared_kv_sliding": Gemma4SharedKVSlidingBlock,
+    "shared_kv_full": Gemma4SharedKVGlobalBlock,
+    "moe_sliding": Gemma4SlidingMoEBlock,
+    "moe_full": Gemma4FullMoEBlock,
+}
+
+#: Which of those attend through the sliding window.
+_GEMMA4_WINDOWED_BLOCKS = ("sliding", "shared_kv_sliding", "moe_sliding")
+
+
+def _gemma4_serve_schedule(config: dict) -> list[str]:
+    """The layer schedule for the artifact inventory.
+
+    The graph calls a mixture layer "sliding" like any other and tells the two apart by the
+    class it instantiates; an inventory has only the name, so here the mixture layers get
+    names of their own. Without that a 26B-A4B would inventory `mlp/gate` for a layer whose
+    feed-forward is a dense one *beside* 128 routed experts, and the artifact would be wrong
+    rather than absent. The layer indices are untouched — same derivation, different labels.
+    """
+    if config.get("enable_moe_block") and config.get("num_kv_shared_layers"):
+        raise NotImplementedError(
+            "no published Gemma 4 both routes experts and shares key/value layers; a "
+            "checkpoint that does needs its own block vocabulary before it can be served"
+        )
+    schedule = _gemma4_block_schedule(
+        _parse_gemma4_layer_types(list(config["layer_types"]) if config.get("layer_types") else None,
+                                  config["n_layers"]),
+        int(config.get("num_kv_shared_layers", 0) or 0),
+    )
+    if not config.get("enable_moe_block"):
+        return schedule
+    return [f"moe_{name}" for name in schedule]
 
 
 def _round_bf16_scalar(value: float) -> float:
@@ -72,6 +140,24 @@ def _parse_gemma4_layer_types(
     return out
 
 
+def _gemma4_block_schedule(base_types: list[str], num_kv_shared_layers: int) -> list[str]:
+    """Which block runs at each layer, given the attention schedule.
+
+    The last ``num_kv_shared_layers`` layers keep their attention type but drop their own
+    key/value projections, reading an earlier layer's instead, so they are a different
+    block with a different set of weights. One derivation, called by the model builder and
+    by ``_serve_block_schedule_`` both: a serving artifact that indexed its layers
+    differently from the graph would load and be quietly wrong.
+    """
+    if num_kv_shared_layers <= 0:
+        return list(base_types)
+    first_shared = len(base_types) - num_kv_shared_layers
+    return [
+        t if i < first_shared else ("shared_kv_full" if t == "full" else "shared_kv_sliding")
+        for i, t in enumerate(base_types)
+    ]
+
+
 def _gemma4_layer_mappings(layer_prefix: str, *, k_eq_v: bool = False) -> dict[str, object]:
     """HF weight mappings for per-layer Gemma4 block parameters."""
     if k_eq_v:
@@ -93,6 +179,13 @@ def _gemma4_layer_mappings(layer_prefix: str, *, k_eq_v: bool = False) -> dict[s
         "ln_post_attn_weight": f"{layer_prefix}.post_attention_layernorm.weight",
         "ln2_weight": f"{layer_prefix}.pre_feedforward_layernorm.weight",
         "ln_post_ff_weight": f"{layer_prefix}.post_feedforward_layernorm.weight",
+        # A mixture layer runs its dense feed-forward and its routed experts in parallel and
+        # norms each branch before summing them, so it holds three norms a dense layer has
+        # none of. They are absent from a dense checkpoint and the declaration simply does not
+        # ask for them there.
+        "ln_post_ff_1_weight": f"{layer_prefix}.post_feedforward_layernorm_1.weight",
+        "ln_pre_ff_2_weight": f"{layer_prefix}.pre_feedforward_layernorm_2.weight",
+        "ln_post_ff_2_weight": f"{layer_prefix}.post_feedforward_layernorm_2.weight",
         # Attention
         "qkv_weight": qkv_mapping,
         "out_weight": f"{layer_prefix}.self_attn.o_proj.weight",
@@ -103,6 +196,15 @@ def _gemma4_layer_mappings(layer_prefix: str, *, k_eq_v: bool = False) -> dict[s
         "mlp_gate_weight": f"{layer_prefix}.mlp.gate_proj.weight",
         "mlp_up_weight": f"{layer_prefix}.mlp.up_proj.weight",
         "mlp_down_weight": f"{layer_prefix}.mlp.down_proj.weight",
+        # The mixture layer's router and its stacked experts. The module states these
+        # paths as `{prefix}`-relative defaults; the prefix a Gemma 4 mixture gives them is
+        # the layer itself, so they are restated here concretely for the same reason the
+        # rest of this table is -- the declaration resolves one flat mapping, not a graph.
+        "router_weight": f"{layer_prefix}.router.proj.weight",
+        "router_scale": f"{layer_prefix}.router.scale",
+        "per_expert_scale": f"{layer_prefix}.router.per_expert_scale",
+        "experts_gate_up": f"{layer_prefix}.experts.gate_up_proj",
+        "experts_down": f"{layer_prefix}.experts.down_proj",
         # Per-layer scaling buffer
         "layer_scalar": f"{layer_prefix}.layer_scalar",
         # Per-layer input gating (PLI)
@@ -182,7 +284,7 @@ def _build_gemma4_model(
     enable_moe_block=False,
     num_experts=0,
     top_k_experts=0,
-    moe_intermediate_size=0,
+    moe_d_ff=0,
     num_kv_shared_layers=0,
     use_double_wide_mlp=False,
 ):
@@ -235,16 +337,7 @@ def _build_gemma4_model(
                     kv_sharing_map[i] = j
                     break
 
-    # Build final block_types: shared layers split by base attention type
-    cls.block_types = []
-    for i, t in enumerate(base_types):
-        if i >= first_shared_idx and num_kv_shared_layers > 0:
-            if t == "full":
-                cls.block_types.append("shared_kv_full")
-            else:
-                cls.block_types.append("shared_kv_sliding")
-        else:
-            cls.block_types.append(t)
+    cls.block_types = _gemma4_block_schedule(base_types, num_kv_shared_layers)
 
     cls.n_sliding_blocks = sum(1 for t in cls.block_types if t == "sliding")
     cls.n_full_blocks = sum(1 for t in cls.block_types if t == "full")
@@ -269,7 +362,7 @@ def _build_gemma4_model(
                         sliding_window=sliding_window,
                         num_experts=num_experts,
                         num_experts_per_tok=top_k_experts,
-                        moe_intermediate_size=moe_intermediate_size,
+                        moe_intermediate_size=moe_d_ff,
                         eps=eps,
                     ),
                 )
@@ -311,7 +404,7 @@ def _build_gemma4_model(
                         k_eq_v=k_eq_v,
                         num_experts=num_experts,
                         num_experts_per_tok=top_k_experts,
-                        moe_intermediate_size=moe_intermediate_size,
+                        moe_intermediate_size=moe_d_ff,
                         eps=eps,
                     ),
                 )
@@ -504,7 +597,7 @@ def _gemma4_forward(model, token_ids, position_ids, targets):
     enable_moe_block="enable_moe_block",
     num_experts="num_experts",
     top_k_experts="top_k_experts",
-    moe_intermediate_size="moe_intermediate_size",
+    moe_d_ff="moe_intermediate_size",
     num_kv_shared_layers="num_kv_shared_layers",
     use_double_wide_mlp="use_double_wide_mlp",
 )
@@ -517,6 +610,11 @@ class Gemma4CausalModel(nn.Model):
         "model",
     )
     _hf_k_eq_v_overrides_ = _build_gemma4_k_eq_v_overrides("model.layers.{layer}")
+    #: Per-layer serve objects live on the block schemas; these are outside the stack.
+    _serve_objects_ = GEMMA4_MODEL_SERVE_OBJECTS
+    _serve_blocks_ = _GEMMA4_SERVE_BLOCKS
+    _serve_windowed_blocks_ = _GEMMA4_WINDOWED_BLOCKS
+    _serve_block_schedule_ = staticmethod(_gemma4_serve_schedule)
 
     def __init__(
         self,
@@ -545,7 +643,7 @@ class Gemma4CausalModel(nn.Model):
         enable_moe_block: bool = False,
         num_experts: int = 0,
         top_k_experts: int = 0,
-        moe_intermediate_size: int = 0,
+        moe_d_ff: int = 0,
         num_kv_shared_layers: int = 0,
         use_double_wide_mlp: bool = False,
     ):
@@ -577,7 +675,7 @@ class Gemma4CausalModel(nn.Model):
             enable_moe_block=enable_moe_block,
             num_experts=num_experts or 0,
             top_k_experts=top_k_experts or 0,
-            moe_intermediate_size=moe_intermediate_size or 0,
+            moe_d_ff=moe_d_ff or 0,
             num_kv_shared_layers=num_kv_shared_layers,
             use_double_wide_mlp=use_double_wide_mlp,
         )
@@ -614,7 +712,7 @@ _GEMMA4_TEXT_CONFIG_MAPPING = dict(
     enable_moe_block="text_config.enable_moe_block",
     num_experts="text_config.num_experts",
     top_k_experts="text_config.top_k_experts",
-    moe_intermediate_size="text_config.moe_intermediate_size",
+    moe_d_ff="text_config.moe_intermediate_size",
     num_kv_shared_layers="text_config.num_kv_shared_layers",
     use_double_wide_mlp="text_config.use_double_wide_mlp",
 )
@@ -634,6 +732,11 @@ class Gemma4ConditionalModel(nn.Model):
         "model.language_model",
     )
     _hf_k_eq_v_overrides_ = _build_gemma4_k_eq_v_overrides("model.language_model.layers.{layer}")
+    #: Per-layer serve objects live on the block schemas; these are outside the stack.
+    _serve_objects_ = GEMMA4_MODEL_SERVE_OBJECTS
+    _serve_blocks_ = _GEMMA4_SERVE_BLOCKS
+    _serve_windowed_blocks_ = _GEMMA4_WINDOWED_BLOCKS
+    _serve_block_schedule_ = staticmethod(_gemma4_serve_schedule)
 
     def __init__(
         self,
@@ -662,7 +765,7 @@ class Gemma4ConditionalModel(nn.Model):
         enable_moe_block: bool = False,
         num_experts: int = 0,
         top_k_experts: int = 0,
-        moe_intermediate_size: int = 0,
+        moe_d_ff: int = 0,
         num_kv_shared_layers: int = 0,
         use_double_wide_mlp: bool = False,
     ):
@@ -694,7 +797,7 @@ class Gemma4ConditionalModel(nn.Model):
             enable_moe_block=enable_moe_block,
             num_experts=num_experts or 0,
             top_k_experts=top_k_experts or 0,
-            moe_intermediate_size=moe_intermediate_size or 0,
+            moe_d_ff=moe_d_ff or 0,
             num_kv_shared_layers=num_kv_shared_layers,
             use_double_wide_mlp=use_double_wide_mlp,
         )

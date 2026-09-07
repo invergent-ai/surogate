@@ -46,7 +46,9 @@ namespace sinfer::ops::detail {
     constexpr SparseMoeGating kGating     = kGeometry.gating;                          \
     constexpr float kRoutedScale          = kGeometry.routed_scale;                    \
     constexpr bool kSharedGated           = kGeometry.shared_gated;                    \
-    constexpr float kSwigluLimit          = kGeometry.swiglu_limit;
+    constexpr float kSwigluLimit          = kGeometry.swiglu_limit;                    \
+    constexpr GatedActivation kActivation = kGeometry.activation;                      \
+    constexpr bool kPerExpertScaled       = kGeometry.per_expert_scaled;
 
 namespace geometry_qwen36 {
 SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen36Geometry)
@@ -68,25 +70,34 @@ SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeGlm53Geometry)
 #include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
 } // namespace geometry_glm53
 
+namespace geometry_gemma4 {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeGemma4Geometry)
+#include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
+} // namespace geometry_gemma4
+
 void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
-                               const SparseMoeWeights& weights, Tensor& destination,
-                               const SparseMoePrefillPlan& plan,
+                               const Tensor& router_x, const SparseMoeWeights& weights,
+                               Tensor& destination, const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook) {
     if (geometry == kSparseMoeQwen36Geometry) {
-        geometry_qwen36::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
+        geometry_qwen36::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     if (geometry == kSparseMoeFlashNextGeometry) {
-        geometry_flash_next::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
+        geometry_flash_next::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     if (geometry == kSparseMoeQwen3MoeGeometry) {
-        geometry_qwen3_moe::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
+        geometry_qwen3_moe::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     if (geometry == kSparseMoeGlm53Geometry) {
-        geometry_glm53::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
+        geometry_glm53::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeGemma4Geometry) {
+        geometry_gemma4::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled prefill kernels");

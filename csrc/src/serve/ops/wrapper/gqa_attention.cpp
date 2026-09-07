@@ -56,14 +56,23 @@ void require_kv_heads(std::int32_t head_dim, std::int32_t kv_heads, const char* 
     }
 }
 
-// 1/sqrt(head_dim), the only softmax scale the kernels implement: the scale is
-// folded into their exp2 and never read from the caller beyond this check.
+// The softmax scale, which the kernels do read from the caller: the decode kernels multiply
+// each score by it and the prefill kernels fold it into their exp2 as `scale * Log2E`. This
+// check used to demand exactly `1/sqrt(head_dim)` on the grounds that the kernels ignored the
+// argument, and that had stopped being true.
+//
+// It is not merely a widening. `1/sqrt(head_dim)` is the convention, not a law: Gemma 4 sets
+// its scale to **1.0** and relies on its query/key norm to deliver unit-RMS operands, so a
+// check that insisted on the convention refused a model the kernels can serve exactly. What
+// remains is what the kernels actually require -- a finite, positive number -- because a
+// zero or a NaN here is a caller bug that would otherwise surface as a uniform or an empty
+// attention distribution rather than as an error.
 void require_scale(float scale, std::int32_t head_dim, const char* op) {
-    const float expected = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    if (!std::isfinite(scale) || std::abs(scale - expected) > 1.0e-6f) {
-        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(" +
-                                    std::to_string(head_dim) + ") = " + std::to_string(expected) +
-                                    " for this head geometry, not " + std::to_string(scale));
+    (void)head_dim;
+    if (!std::isfinite(scale) || scale <= 0.0f) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": softmax scale must be finite and positive, not " +
+                                    std::to_string(scale));
     }
 }
 
@@ -372,6 +381,27 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 }
 
+void launch_cached_chunked_batch_small_t(const Tensor& q, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        float scale, PagedKVBatchLayerView cache,
+                                        GqaExecutionEnvelope envelope, WorkspaceArena& workspace,
+                                        Tensor& out, cudaStream_t stream,
+                                        GqaBlockMask selection = {}) {
+    const std::int32_t width  = q.ne[2];
+    const std::int32_t step   = detail::gqa_attention_small_t_max_width(q.ne[1], cache.num_kv_heads);
+    const std::int32_t count  = std::min(width, step);
+    const std::int32_t splits = detail::gqa_attention_split_capacity(
+        q.ne[0], q.ne[1], cache.num_kv_heads, count, cache.dtype, envelope);
+    SmallTWorkspace partial =
+        allocate_small_t_workspace(workspace, q.ne[0], q.ne[1], count, splits, q.ne[3]);
+    for (std::int32_t begin = 0; begin < width; begin += count) {
+        const std::int32_t chunk = std::min(count, width - begin);
+        detail::gqa_attention_cached_batch_small_t_launch(
+            q, positions, valid_columns, table_rows, scale, cache, envelope, begin, chunk,
+            partial.acc, partial.m, partial.l, out, stream, selection);
+    }
+}
+
 void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, float scale,
                                    const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
@@ -538,6 +568,40 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
         throw std::invalid_argument("gqa_kv_append: T exceeds KV cache capacity");
     }
     detail::gqa_kv_append_launch(k, v, positions, cache, stream);
+}
+
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor& valid_columns,
+                          const Tensor& kv_table_rows, float scale, PagedKVBatchLayerView cache,
+                          GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                          cudaStream_t stream, GqaBlockMask selection) {
+    constexpr const char* op = "gqa_attention_cached";
+    validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
+                                       envelope, scale, op);
+    const std::int32_t width = q.ne[2];
+    const std::int32_t batch = q.ne[3];
+    require_registered_shape(q.ne[0], q.ne[1], cache.num_kv_heads, op);
+
+    auto scope = workspace.scope();
+    const detail::GqaAttentionRoute route =
+        detail::gqa_attention_resolve_route(q.ne[1], cache.num_kv_heads, width, batch, envelope);
+    if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
+        launch_cached_chunked_batch_small_t(q, positions, valid_columns, kv_table_rows, scale,
+                                            cache, envelope, workspace, out, stream, selection);
+        return;
+    }
+    if (route == detail::GqaAttentionRoute::SmallT) {
+        const std::int32_t splits = detail::gqa_attention_split_capacity(
+            q.ne[0], q.ne[1], cache.num_kv_heads, width, cache.dtype, envelope);
+        SmallTWorkspace partial =
+            allocate_small_t_workspace(workspace, q.ne[0], q.ne[1], width, splits, batch);
+        detail::gqa_attention_cached_batch_small_t_launch(
+            q, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
+            partial.acc, partial.m, partial.l, out, stream, selection);
+        return;
+    }
+    detail::gqa_attention_prompt_cached_launch(q, positions, valid_columns, kv_table_rows, scale,
+                                               cache, out, stream, envelope.sliding_window,
+                                               selection);
 }
 
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,

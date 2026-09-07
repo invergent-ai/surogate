@@ -21,6 +21,7 @@ tokenizers = pytest.importorskip("tokenizers")
 from gguf import GGUFReader
 
 from surogate.serve.gguf.frontend import (
+    _declared_merges,
     _spm_merges,
     extract_chat_template,
     extract_tokenizer_json,
@@ -191,3 +192,81 @@ def test_spm_merges_reaches_user_defined_pieces():
     scores = [0.0, 0.0, -1.0]
     assert _spm_merges(tokens, scores, [_NORMAL, _NORMAL, _USER_DEFINED]) == [["x", "y"]]
     assert _spm_merges(tokens, scores, [_NORMAL, _NORMAL, _CONTROL]) == []
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4: a SentencePiece surface over a stated merge list
+# ---------------------------------------------------------------------------
+#
+# `tokenizer.ggml.model == "gemma4"` is neither of the two schemes above. llama.cpp reads it as
+# BPE over the file's own merges while keeping the metaspace surface (llama-vocab.cpp), and the
+# scores are a constant -1000, so `_spm_merges` could not recover the order even in principle.
+
+_G4_GGUF = _REPO_ROOT / "models" / "gguf" / "gemma-4-12b-it-qat-q4_0.gguf"
+_G4_OFFICIAL = _REPO_ROOT / "models" / "gemma-4-31B-it-frontend" / "tokenizer.json"
+
+needs_gemma4 = pytest.mark.skipif(
+    not _G4_GGUF.is_file(), reason=f"no Gemma 4 GGUF at {_G4_GGUF}"
+)
+
+
+def test_declared_merges_split_at_the_joining_space():
+    # The pieces spell a space as the word mark, so the one literal space is the join --
+    # including when a half is itself a run of marks or of newlines.
+    assert _declared_merges(_StubReader(["ab c", "\u2581\u2581 \u2581", "\n\n \n"])) == [
+        ["ab", "c"], ["\u2581\u2581", "\u2581"], ["\n\n", "\n"]
+    ]
+
+
+def test_declared_merges_refuse_an_entry_with_no_join():
+    # llama.cpp leaves both halves empty for such an entry, giving a rank nothing reaches;
+    # a merge list we cannot read is an error rather than a silently dropped merge.
+    with pytest.raises(SystemExit, match="no separating space"):
+        _declared_merges(_StubReader(["ab", "c d"]))
+
+
+class _StubReader:
+    """Just enough reader for `_declared_merges`: one key, read through `contents()`."""
+
+    def __init__(self, merges):
+        self._merges = merges
+
+    def get_field(self, name):
+        if name != "tokenizer.ggml.merges":
+            return None
+        return type("F", (), {"contents": lambda _self, m=self._merges: m})()
+
+
+@needs_gemma4
+def test_gemma4_reconstruction_reads_the_merges_it_is_given():
+    reader = GGUFReader(str(_G4_GGUF), "r")
+    tok = extract_tokenizer_json(reader)
+    stated = list(reader.get_field("tokenizer.ggml.merges").contents())
+    model = tok["model"]
+    # Read, not recovered: one pair per stated entry, in the file's order.
+    assert len(model["merges"]) == len(stated)
+    assert [" ".join(pair) for pair in model["merges"][:64]] == [str(e) for e in stated[:64]]
+    # The SentencePiece surface, which is what separates this from the byte-level scheme.
+    assert model["byte_fallback"] and model["fuse_unk"]
+    assert tok["normalizer"] == {
+        "type": "Replace", "pattern": {"String": " "}, "content": "\u2581"
+    }
+
+
+@needs_gemma4
+@pytest.mark.skipif(not _G4_OFFICIAL.is_file(), reason="no official Gemma 4 tokenizer on disk")
+def test_gemma4_reconstruction_matches_the_official_tokenizer(tmp_path):
+    """The gate. Google's own file is the standard, and llama.cpp agrees with it: all three
+    tokenize this battery identically, which was checked against `llama-tokenize` on the same
+    GGUF at the time this arm was written (2,608 tokens, no divergence)."""
+    path = tmp_path / "tokenizer.json"
+    path.write_text(
+        json.dumps(extract_tokenizer_json(GGUFReader(str(_G4_GGUF), "r")), ensure_ascii=False)
+    )
+    mine = tokenizers.Tokenizer.from_file(str(path))
+    official = tokenizers.Tokenizer.from_file(str(_G4_OFFICIAL))
+    for s in _BATTERY + ["<|turn>user\nhi<turn|>", "line\r\nwith\rcarriage\rreturns"]:
+        assert (
+            mine.encode(s, add_special_tokens=False).ids
+            == official.encode(s, add_special_tokens=False).ids
+        ), f"encode divergence on {s!r}"

@@ -22,6 +22,21 @@ namespace sinfer::ops::detail {
 // on the SIMT routes.
 inline constexpr std::int32_t kW8MmaScaleRowAlignmentK = 256;
 
+// The MMA routes are given the same row-alignment floor the Marlin band needs, and the reason
+// is what the shape that found it went on to prove.
+//
+// Gemma 4's 26B-A4B feed-forward (n = 2,112, k = 2,816) returned orthogonal results above
+// sixteen tokens. The cause was the *Marlin* band, which admitted `n % 64 == 0` while its
+// kernel tiles rows in 128s -- see `kMarlinRowTile` in `marlin/marlin_plane.cu`, where it is
+// fixed. That interception also meant the untuned MMA route was never exercised for this shape
+// at those widths: below the band it takes SIMT, inside the band it never ran.
+//
+// So this is a floor on an *untested* combination, not a diagnosis: a row count the MMA path
+// has no measurement behind takes the SIMT route, exactly as one that misses the K constraint
+// does. It costs a tuned kernel for shapes nobody has measured and buys the guarantee that the
+// next unaligned width is slow rather than wrong.
+inline constexpr std::int32_t kW8MmaRowAlignmentN = 128;
+
 using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 void launch_w8_decode_r4(const Tensor&, const Weight&, Tensor&, cudaStream_t);

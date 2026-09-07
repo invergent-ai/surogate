@@ -126,6 +126,25 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
     hc_streams = int(config.get("hc_count") or config.get("hc_mult") or 0)
     ngram, per_gram = config.get("ngram_size", 0), config.get("heads_per_ngram", 0)
     ple_heads = (ngram - 1) * per_gram if ngram else 0
+    # Gemma 4 attends at two head geometries in one model: its sliding layers run
+    # `head_size` heads and its global layers a wider `global_head_dim`, with their own
+    # key/value head count. Every other family here has one geometry, states neither key,
+    # and falls back to it.
+    global_head = config.get("global_head_dim") or config["head_size"]
+    global_kv_heads = config.get("global_num_kv_heads") or config["num_kv_heads"]
+    global_kv_size = global_kv_heads * global_head
+    # `attention_k_eq_v` drops the value projection from the *global* layers only -- the
+    # value is the key projection's raw output, normalised. Zero here is what removes the
+    # object from the inventory, which is how the checkpoint stores it: the 12B ships
+    # `v_proj` on 40 of its 48 layers and the 8 without are exactly the global ones.
+    global_value_dim = 0 if config.get("k_eq_v") else global_kv_size
+    # Per-layer input embeddings, the E-series' own capacity trick. Absent from the dense
+    # and mixture variants, where every symbol they feed resolves to 0.
+    pli_dim = config.get("d_per_layer_input", 0) or 0
+    # The E-series widens the feed-forward of exactly the layers that share their key/value
+    # projections -- `use_double_wide_mlp` -- so its shared layers hold twice the MLP of its
+    # others. E2B does, E4B does not, and the two are the same architecture otherwise.
+    shared_kv_ffn = dense_ffn * (2 if config.get("use_double_wide_mlp") else 1)
     return {
         "C": hidden,
         "TwoC": 2 * hidden,
@@ -147,6 +166,21 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "QKV": query_size + 2 * kv_size,
         "AttnDim": query_size,
         "KvDim": kv_size,
+        # The second attention geometry, for a family whose global layers are shaped
+        # differently from its windowed ones. Equal to the first wherever a model states
+        # only one, so an object written against these is correct for both.
+        "GlobalHeadDim": global_head,
+        "GlobalAttnDim": config["num_query_heads"] * global_head,
+        "GlobalKvDim": global_kv_size,
+        "GlobalValueDim": global_value_dim,
+        # Per-layer input embeddings. `PliHidden` is the model width *when the model has
+        # them*, so a hidden-width PLI object resolves away with the rest where it has none.
+        "PliDim": pli_dim,
+        "PliHidden": hidden if pli_dim else 0,
+        "PliVocab": config.get("vocab_size_per_layer_input", 0) if pli_dim else 0,
+        "PliTotal": config["n_layers"] * pli_dim,
+        # The feed-forward width of a layer that shares its key and value projections.
+        "SharedKvM": shared_kv_ffn,
         "HcCount": hc_streams,
         "HcWidth": hc_streams * hidden,
         "HcLowRank": config.get("hc_lowrank", 0),
@@ -849,6 +883,48 @@ _FUSED_GATE_UP = "gate_up_proj"
 
 #: Transforms whose work happens at load or in the kernel: the recipe passes the
 #: tensor through and the name only records that the served form differs.
+def _per_layer_input_slice(
+    parts: Sequence[Expression], obj: DeclaredObject, decl: Declaration
+) -> Expression:
+    """One layer's slice of a per-layer input tensor.
+
+    Gemma 4's E-series holds two model-wide tensors that are really `layers` tensors stacked:
+    a second embedding table `[vocab, layers * pli_dim]` and the projection that mixes the
+    hidden state into it, `[layers * pli_dim, C]`. A layer reads only its own slice.
+
+    They are cut here, at conversion, rather than sliced at runtime, and the reason is
+    contiguity: the ops that consume a slice -- `embedding`, `gelu_mul`, `rmsnorm` -- all
+    require contiguous operands, and a layer's slice of the stacked form is strided for any
+    prompt longer than one token. Cutting once costs nothing (the same bytes, in `layers`
+    objects instead of one) and leaves every runtime step reading a plain plane.
+
+    Which axis is which follows from the shape: the embedding table stacks its layers along
+    its *columns*, one row per token holding every layer's slice, and the projection stacks
+    along its rows.
+    """
+    if len(parts) != 1:
+        raise ValueError(f"{obj.name}: a per-layer input slice takes one source")
+    source = parts[0]
+    layer = obj.layer
+    if layer is None:
+        raise ValueError(f"{obj.name}: a per-layer input slice needs a layer")
+    width = decl.symbols["PliDim"]
+    if width <= 0:
+        raise ValueError(f"{obj.name}: the declaration states no per-layer input width")
+    rows, columns = expression_shape(source)
+    # The stacked axis is the one that is a whole number of slices *and* is not the other
+    # tensor's meaning: the table's vocabulary never equals `layers * pli_dim` in practice,
+    # but deciding on shape alone would be a coincidence away from silently transposing the
+    # cut, so the object's own declared shape settles it.
+    axis = 0 if obj.shape[0] == width else 1
+    extent = rows if axis == 0 else columns
+    if extent != width * decl.config["n_layers"]:
+        raise ValueError(
+            f"{obj.name}: axis {axis} is {extent}, not {width} x {decl.config['n_layers']}"
+        )
+    return Slice(source, axis, layer * width, (layer + 1) * width)
+
+
 TRANSFORMS: dict[str | None, Transform] = {
     None: _concat_rows,
     "split_interleaved_query_gate": _split_interleaved_query_gate,
@@ -856,6 +932,7 @@ TRANSFORMS: dict[str | None, Transform] = {
     "flatten_experts": _flatten_experts,
     "log_negate": _concat_rows,
     "unfold_unit_offset": _concat_rows,
+    "per_layer_input_slice": _per_layer_input_slice,
 }
 
 #: Components whose checkpoint tensor is another component's when the checkpoint ties

@@ -79,7 +79,28 @@ def _spm_merges(tokens: list[str], scores: list[float], types: list[int]) -> lis
     return [[left, right] for _, left, right in found]
 
 
-def _spm_tokenizer_json(reader) -> dict:
+def _declared_merges(reader) -> list[list[str]]:
+    """The merge list a GGUF states outright, as pairs.
+
+    llama.cpp splits each entry at `word.find(' ', 1)` (llama-vocab.cpp, the `gemma4` arm),
+    which is the only separator a metaspace vocabulary can use: its pieces spell the space as
+    the word mark, so the one literal space in an entry is the join. An entry without one
+    would leave llama.cpp with two empty halves and a rank nothing can reach, so it is an
+    error here rather than a silently dropped merge.
+    """
+    merges = []
+    for entry in _field(reader, "tokenizer.ggml.merges", []):
+        cut = str(entry).find(" ", 1)
+        if cut < 0:
+            raise SystemExit(
+                f"surogate serve: GGUF merge entry {entry!r} has no separating space; "
+                "its two halves cannot be recovered."
+            )
+        merges.append([str(entry)[:cut], str(entry)[cut + 1:]])
+    return merges
+
+
+def _spm_tokenizer_json(reader, merges: list[list[str]] | None = None) -> dict:
     """Reconstruct tokenizer.json for a SentencePiece vocabulary.
 
     Metaspace and byte fallback, which is a different scheme from the byte-level BPE below:
@@ -91,7 +112,7 @@ def _spm_tokenizer_json(reader) -> dict:
     tokens: list[str] = list(_field(reader, "tokenizer.ggml.tokens"))
     scores: list[float] = list(_field(reader, "tokenizer.ggml.scores", []))
     types: list[int] = list(_field(reader, "tokenizer.ggml.token_type"))
-    if not scores:
+    if merges is None and not scores:
         raise SystemExit(
             "surogate serve: this GGUF carries a SentencePiece vocabulary with no scores, "
             "so its merge order cannot be recovered."
@@ -141,7 +162,7 @@ def _spm_tokenizer_json(reader) -> dict:
             "byte_fallback": True,
             "ignore_merges": False,
             "vocab": {token: index for index, token in enumerate(tokens)},
-            "merges": _spm_merges(tokens, scores, types),
+            "merges": _spm_merges(tokens, scores, types) if merges is None else merges,
         },
     }
 
@@ -151,6 +172,14 @@ def extract_tokenizer_json(reader) -> dict:
     model = _field(reader, "tokenizer.ggml.model")
     if model == "llama":
         return _spm_tokenizer_json(reader)
+    if model == "gemma4":
+        # llama.cpp reads this vocabulary as BPE over the file's own merge list while keeping
+        # the SentencePiece surface (llama-vocab.cpp, `tokenizer_model == "gemma4"`): the space
+        # is escaped to the word mark, nothing is byte-encoded, and what the merges cannot place
+        # falls back to `<0xNN>`. That is the reconstruction above with the ranks read rather
+        # than recovered from the scores -- and Gemma 4 states its scores as a constant -1000,
+        # so recovering them is not open to us anyway.
+        return _spm_tokenizer_json(reader, merges=_declared_merges(reader))
     if model != "gpt2":
         raise SystemExit(
             f"surogate serve: GGUF tokenizer model '{model}' is not supported yet "
@@ -242,6 +271,41 @@ def extract_tokenizer_json(reader) -> dict:
     }
 
 
+#: How a family marks the reasoning span its model writes for itself, keyed by GGUF
+#: architecture. Published checkpoints state this in `tokenizer_config.json` as
+#: `response_template.fields.thinking`; a GGUF carries the chat template but not that file's
+#: other members, so the pair is restated here and then *checked against the template the file
+#: actually carries* before it is written -- an export whose template disagrees gets nothing
+#: rather than the wrong markers.
+#:
+#: Gemma 4 needs it because its generation prompt stops at the turn header: the model writes
+#: `<|channel>thought` itself, where Qwen's template opens `<think>` in the prompt and hands
+#: the model an already-open turn.
+_THINKING_MARKERS = {
+    "gemma4": ("<|channel>thought\n", "<channel|>"),
+}
+
+
+def thinking_markers(reader, arch: str) -> tuple[str, str] | None:
+    """The reasoning span's delimiters for this file, or None if it cannot be shown they apply.
+
+    The check is the point: the markers are only served when the file's own chat template
+    writes both of them, so this cannot put a Qwen span on a Gemma or survive a family
+    renaming its channel.
+
+    Compared without their surrounding whitespace, because a template spells that whitespace
+    as an escape: Gemma 4's source says `'<|channel>thought\n'`, two characters where the
+    render has a newline, so the marker never appears in the source verbatim.
+    """
+    pair = _THINKING_MARKERS.get(arch)
+    if pair is None:
+        return None
+    template = extract_chat_template(reader)
+    if not template or any(mark.strip() not in template for mark in pair):
+        return None
+    return pair
+
+
 def extract_chat_template(reader) -> str | None:
     t = _field(reader, "tokenizer.chat_template")
     return str(t) if t else None
@@ -297,6 +361,14 @@ def synthesize_tokenizer_config(reader, arch: str) -> dict:
     template = extract_chat_template(reader)
     if template:
         cfg["chat_template"] = template
+    # What the published `tokenizer_config.json` states about the reasoning span, in its own
+    # vocabulary, so the engine reads the delimiters off the artifact rather than compiling
+    # one family's spelling in. Only written when the file's template bears them out.
+    markers = thinking_markers(reader, arch)
+    if markers is not None:
+        cfg["response_template"] = {
+            "fields": {"thinking": {"open": markers[0], "close": markers[1]}}
+        }
     return cfg
 
 

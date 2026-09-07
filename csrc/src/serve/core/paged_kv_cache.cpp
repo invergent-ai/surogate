@@ -65,7 +65,33 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
     // every plane starts on a mapping quantum so a granule is a whole number of quanta.
     LayoutBuilder plane_builder;
     LayoutBuilder& planes_into = spec.elastic ? plane_builder : builder;
+    // The granule has to be settled before any plane is laid out, because it decides how many
+    // pages each plane's storage must cover: the region maps whole granules, so a plane sized
+    // for exactly `physical_pages` overruns its own reservation whenever the page count is not
+    // a multiple of the granule. That went unnoticed while every plane in a pool had the same
+    // stride and the granule came out 2 -- an even page count always fit. A model that attends
+    // at two geometries has two strides (Gemma 4: 1 MiB windowed against 256 KiB global), the
+    // narrower one drives the granule to 8, and the overrun is immediate.
     std::uint32_t granule_pages = 1;
+    if (spec.elastic) {
+        for (const PagedKVPlaneSpec& plane : spec.planes) {
+            if (plane.leading_extent <= 0 || plane.head_extent <= 0) { continue; }
+            const auto stride = static_cast<std::size_t>(
+                Tensor(nullptr, plane.dtype,
+                       {plane.leading_extent, kPagedKVPageSize, plane.head_extent, 1})
+                    .bytes());
+            const std::size_t common = std::gcd(kElasticKvGranuleBytes, stride);
+            granule_pages            = std::max(
+                granule_pages, static_cast<std::uint32_t>(kElasticKvGranuleBytes / common));
+        }
+    }
+    // Whole granules, so the last one is backed by storage the mapping is allowed to touch.
+    const std::int32_t plane_pages =
+        spec.elastic
+            ? checked_i32((static_cast<std::uint64_t>(physical_pages) + granule_pages - 1U) /
+                              granule_pages * granule_pages,
+                          "Paged KV granule-rounded page count")
+            : physical_pages;
     for (std::size_t index = 0; index < spec.planes.size(); ++index) {
         const PagedKVPlaneSpec& plane = spec.planes[index];
         if (plane.leading_extent <= 0 || plane.head_extent <= 0) {
@@ -79,19 +105,8 @@ PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder, const PagedKVPoolSp
                 spec.elastic ? std::max(plane.alignment, kElasticKvGranuleBytes) : plane.alignment;
             planned.storage = planes_into.add_tensor(
                 plane.dtype,
-                {plane.leading_extent, kPagedKVPageSize, plane.head_extent, physical_pages},
+                {plane.leading_extent, kPagedKVPageSize, plane.head_extent, plane_pages},
                 alignment, label);
-            if (spec.elastic) {
-                // Pages per granule: the least count whose span in this plane is a whole
-                // number of quanta, taken across planes (strides differ under mixed dtypes).
-                const auto stride = static_cast<std::size_t>(
-                    Tensor(nullptr, plane.dtype,
-                           {plane.leading_extent, kPagedKVPageSize, plane.head_extent, 1})
-                        .bytes());
-                const std::size_t common = std::gcd(kElasticKvGranuleBytes, stride);
-                granule_pages = std::max(
-                    granule_pages, static_cast<std::uint32_t>(kElasticKvGranuleBytes / common));
-            }
         } else {
             planned.storage = planes_into.add_tensor(
                 plane.dtype,

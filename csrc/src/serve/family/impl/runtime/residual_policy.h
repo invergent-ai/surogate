@@ -56,6 +56,16 @@ template <class Variant>
 /// Llama has no such weights at all, so a target whose artifact does not bind
 /// them declares false and the step is skipped rather than applied to a plane
 /// nothing wrote.
+/// Whether the target mixes a per-token, per-layer input into every block.
+template <class Variant>
+[[nodiscard]] constexpr bool has_per_layer_inputs() {
+    if constexpr (requires { Variant::has_per_layer_inputs; }) {
+        return Variant::has_per_layer_inputs;
+    } else {
+        return false;
+    }
+}
+
 template <class Variant>
 [[nodiscard]] constexpr bool attention_qk_norm() {
     if constexpr (requires { Variant::attention_qk_norm; }) {
@@ -166,10 +176,14 @@ template <class Variant>
 template <class TextConfig>
 [[nodiscard]] constexpr float layer_rope_theta(int layer, const family::TextGeometry& geometry) {
     if constexpr (requires { TextConfig::layer_rope_theta(layer); }) {
-        // Two bases keyed on the schedule: compiled, because which layers are windowed is
-        // the family's pattern. Their values are still the checkpoint's to state, which is
-        // what a per-layer geometry would carry.
-        (void)geometry;
+        // Two bases keyed on the schedule. Where the artifact declares that schedule it also
+        // declares both bases, and it wins: a target serving two sizes cannot compile the
+        // schedule -- Gemma 4's 12B has 48 layers and its 31B 60 -- and asking a 48-entry
+        // compiled array about layer 50 is out of bounds, not merely wrong.
+        if (geometry.windowed_schedule_declared && geometry.sliding_rope_theta > 0.0F) {
+            return geometry.layer_is_windowed(layer) ? geometry.sliding_rope_theta
+                                                     : geometry.rope_theta;
+        }
         return TextConfig::layer_rope_theta(layer);
     } else {
         (void)layer;
@@ -193,8 +207,14 @@ template <class TextConfig>
                       TextConfig::sliding_window;
                       TextConfig::is_windowed_attention(layer);
                   }) {
-        // Which layers are windowed is the family's pattern and stays compiled; how wide the
-        // window is belongs to the checkpoint, so it comes from the geometry.
+        // How wide the window is belongs to the checkpoint, so it comes from the geometry.
+        // *Which* layers are windowed is the family's pattern and stays compiled -- unless
+        // the artifact declared its own schedule, which is what a target serving more than
+        // one size must do; see `layer_rope_theta` above for what the compiled array does
+        // when the sizes disagree.
+        if (geometry.windowed_schedule_declared) {
+            return geometry.layer_is_windowed(layer) ? geometry.sliding_window : 0;
+        }
         return TextConfig::is_windowed_attention(layer) ? geometry.sliding_window : 0;
     } else {
         (void)layer;
@@ -424,6 +444,43 @@ struct ResidualHooks {
         }
     }
 
+    /// Whether the model mixes a per-token, per-layer input into every block.
+    ///
+    /// Gemma 4's E-series does, and it is the whole of what the "E" buys: a second embedding
+    /// table, `vocab x layers * per_layer_dim`, whose slice for a layer is folded into that
+    /// layer after its feed-forward. Nothing else here has one, so nothing else declares it
+    /// and neither hook below emits any code.
+    static constexpr bool per_layer_inputs = has_per_layer_inputs<Variant>();
+
+    /// What a block does after its feed-forward has landed on the residual.
+    ///
+    /// Gemma 4's E-series folds this layer's per-layer input in here: a gate over the
+    /// residual, gated by this token's slice of a second embedding table, projected back to
+    /// the model width and normalised onto the residual. It needs the token ids, because the
+    /// slice is an embedding lookup, and it needs nothing else the layer does not already
+    /// hold -- the two stacked tensors are stored cut per layer, so this layer's objects are
+    /// planes it can read directly.
+    static void layer_epilogue(const Model& model, int layer, const Tensor& ids,
+                               const Tensor& embedded, Tensor& residual, WorkspaceArena& work,
+                               cudaStream_t stream) {
+        if constexpr (per_layer_inputs) {
+            Variant::layer_epilogue(model, layer, ids, embedded, residual, work, stream);
+        } else {
+            (void)model; (void)layer; (void)ids; (void)embedded; (void)residual; (void)work;
+            (void)stream;
+        }
+    }
+
+    [[nodiscard]] static std::size_t layer_epilogue_workspace_capacity_bytes(
+        const family::TextGeometry& geometry, std::int32_t first, std::int32_t last) {
+        if constexpr (per_layer_inputs) {
+            return Variant::layer_epilogue_workspace_capacity_bytes(geometry, first, last);
+        } else {
+            (void)geometry; (void)first; (void)last;
+            return 0;
+        }
+    }
+
     /// Token ids into the residual planes.
     static void embed(const Model& model, const Tensor& ids, Tensor& residual,
                       WorkspaceArena& work, cudaStream_t stream) {
@@ -432,9 +489,20 @@ struct ResidualHooks {
         } else {
             (void)work;
             ops::embedding(ids, model.token_embedding, residual, stream);
-            if constexpr (embedding_scale<Variant>() != 0.0F) {
-                ops::scale(residual, embedding_scale<Variant>(), stream);
-            }
+            // The artifact's own scale where it declares one, the target's compiled constant
+            // otherwise.
+            //
+            // A target serving more than one size *cannot* compile this: Gemma's factor is
+            // `sqrt(hidden)`, which is 62.0 at the 12B's 3840 and 73.5 at the 31B's 5376. And
+            // getting it wrong is close to invisible from the top -- every norm divides the
+            // scale straight back out, so the projections and their norms all agree, and only
+            // the residual carries the error. It shows up as the residual being weighted
+            // wrongly against each block's output: measured on a 512-wide fixture served with
+            // the 12B's compiled 62.0, every probe through the attention core matched at
+            // cosine 0.9999 and the layer's own output came out at 0.925.
+            const float declared = as_bf16(model.geometry.embedding_scale);
+            const float scale    = declared != 0.0F ? declared : embedding_scale<Variant>();
+            if (scale != 0.0F) { ops::scale(residual, scale, stream); }
         }
     }
 

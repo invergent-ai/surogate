@@ -5,6 +5,9 @@
 #include "runtime/engine/pipeline_instance.h"
 #include "runtime/engine/request_memory.h"
 #include <api/targets/gemma3/package.h>
+#include <api/targets/gemma4/package.h>
+#include <api/targets/gemma4_e/package.h>
+#include <api/targets/gemma4_moe/package.h>
 #include <api/targets/glm5_next/package.h>
 #include <api/targets/lfm2/package.h>
 #include <api/targets/llama/package.h>
@@ -27,6 +30,12 @@ struct DeviceContext;
 namespace targets {
 
 using Gemma3          = gemma3_270m::Package;
+/// One architecture, both dense sizes: the 12B and the 31B.
+using Gemma4          = gemma4::Package;
+/// The E-series pair: per-layer input embeddings and shared key/value layers.
+using Gemma4E         = gemma4_e::Package;
+/// The 26B-A4B: a dense feed-forward and 128 routed experts on every layer.
+using Gemma4Moe       = gemma4_moe::Package;
 using Glm5Next        = glm5_next::Package;
 using Lfm2            = lfm2::Package;
 using Llama           = llama::Package;
@@ -84,6 +93,12 @@ struct TargetInstance {
 
 using LoadedGemma3 = LoadedTarget<Gemma3>;
 using Gemma3Instance = TargetInstance<Gemma3>;
+using LoadedGemma4 = LoadedTarget<Gemma4>;
+using Gemma4Instance = TargetInstance<Gemma4>;
+using LoadedGemma4E = LoadedTarget<Gemma4E>;
+using Gemma4EInstance = TargetInstance<Gemma4E>;
+using LoadedGemma4Moe = LoadedTarget<Gemma4Moe>;
+using Gemma4MoeInstance = TargetInstance<Gemma4Moe>;
 using LoadedGlm5Next = LoadedTarget<Glm5Next>;
 using Glm5NextInstance = TargetInstance<Glm5Next>;
 using LoadedLfm2 = LoadedTarget<Lfm2>;
@@ -108,7 +123,10 @@ using Qwen3_5Pipeline    = runtime::PipelineInstance<Qwen3_5Instance>;
 using Qwen3_5MoePipeline = runtime::PipelineInstance<Qwen3_5MoeInstance>;
 
 using ActiveTarget =
-    std::variant<std::unique_ptr<Gemma3Instance>, std::unique_ptr<Glm5NextInstance>,
+    std::variant<std::unique_ptr<Gemma3Instance>, std::unique_ptr<Gemma4Instance>,
+                 std::unique_ptr<Gemma4EInstance>,
+                 std::unique_ptr<Gemma4MoeInstance>,
+                 std::unique_ptr<Glm5NextInstance>,
                  std::unique_ptr<Lfm2Instance>,
                  std::unique_ptr<LlamaInstance>, std::unique_ptr<Qwen3DenseInstance>,
                  std::unique_ptr<Qwen3MoeInstance>,
