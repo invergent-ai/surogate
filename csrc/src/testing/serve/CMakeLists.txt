@@ -5,6 +5,11 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_executable(sinfer_public_api_test test_public_api.cpp)
 target_include_directories(sinfer_public_api_test PRIVATE ${SERVE_ROOT})
 add_test(NAME sinfer_public_api_test COMMAND sinfer_public_api_test)
+# It joins the aggregate like every test built by the helper below. It is excluded
+# from `all` and was not on the list, so `make serve-test-build` never compiled it
+# and ctest reported it Not Run -- the exact failure the helper's comment describes,
+# in the one test that predates the helper.
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_public_api_test)
 
 function(sinfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
@@ -21,11 +26,25 @@ function(sinfer_add_test name)
     # links sinfer_engine rather than sinfer_core does not inherit the toolkit's
     # include path, so give every test target its own.
     ${CUDAToolkit_INCLUDE_DIRS})
-  if(arg_LIBRARIES)
-    target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
-  else()
-    target_link_libraries(${name} PRIVATE sinfer_core)
+  # Every sinfer archive a test names resolves to the one shared library. libsinfer.so
+  # holds all of them, and a test that links the archives statically embeds the device
+  # code the way the products used to: 132 test binaries at ~450 MB each was 60 GB of
+  # build directory, and every link paid for writing it. The LIBRARIES argument is kept
+  # as the record of what a test actually uses; anything that is not a sinfer archive
+  # (CUDA::cudart, and whatever a test adds later) still links as itself.
+  set(test_libraries "")
+  foreach(requested IN LISTS arg_LIBRARIES)
+    if(requested MATCHES "^sinfer_")
+      list(APPEND test_libraries sinfer_shared)
+    else()
+      list(APPEND test_libraries ${requested})
+    endif()
+  endforeach()
+  if(NOT test_libraries MATCHES "sinfer_shared")
+    list(APPEND test_libraries sinfer_shared)
   endif()
+  list(REMOVE_DUPLICATES test_libraries)
+  target_link_libraries(${name} PRIVATE ${test_libraries})
   if(arg_NEEDS_SOURCE_DIR)
     target_compile_definitions(${name} PRIVATE
       SINFER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
@@ -244,7 +263,7 @@ target_include_directories(sinfer_bench_support_test PRIVATE ${CMAKE_CURRENT_SOU
 # artifact — but built beside the tests so it stays compiling.
 add_executable(sinfer_embed_cli encoder/embed_cli.cpp)
 target_include_directories(sinfer_embed_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT})
-target_link_libraries(sinfer_embed_cli PRIVATE sinfer_encoder)
+target_link_libraries(sinfer_embed_cli PRIVATE sinfer_shared)
 
 # The host kernels: no GPU and no artifact, so this one is a real ctest.
 sinfer_add_op_test(sinfer_cpu_ops_test
@@ -253,7 +272,7 @@ sinfer_add_op_test(sinfer_cpu_ops_test
 
 add_executable(sinfer_cpu_embed_cli encoder/cpu_embed_cli.cpp)
 target_include_directories(sinfer_cpu_embed_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT})
-target_link_libraries(sinfer_cpu_embed_cli PRIVATE sinfer_encoder)
+target_link_libraries(sinfer_cpu_embed_cli PRIVATE sinfer_shared)
 
 # The /v1/embeddings server moved to the product build as `surogate-embed`
 # (csrc/CMakeLists.txt): `surogate serve --embed` execs it, so it is not a test
