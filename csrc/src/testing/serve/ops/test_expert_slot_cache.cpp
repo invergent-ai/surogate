@@ -539,6 +539,119 @@ int main() {
         }
     }
 
+    // --- A bank whose halves differ: Q4G32AM gate/up over W8 down ---------------------------
+    // The gather runs one launch per half, each by that half's format, so a mixed bank must put
+    // exactly the same bytes in the pool as two same-format banks would, half for half. That is
+    // checked against those two rather than against fresh expectation maths: the all-Q4 and
+    // all-W8 gathers are already verified above, so agreeing with them is the claim that
+    // matters -- no half reads the other's format, and no stride is the wrong one.
+    {
+        Fixture f;
+        const std::size_t gate_groups =
+            static_cast<std::size_t>(kGeometry.expert_rows()) * kGeometry.hidden / 32;
+        const std::size_t down_groups =
+            static_cast<std::size_t>(kGeometry.hidden) * kGeometry.intermediate / 32;
+        // The W8 bank's own planes, requantised into a pinned Q4 object (as the host bank does).
+        const ops::Q4BankPlanes gate_planes =
+            ops::q4_bank_planes(static_cast<std::int64_t>(kGeometry.routed_gate_rows()), kGeometry.hidden);
+        const ops::Q4BankPlanes down_planes =
+            ops::q4_bank_planes(static_cast<std::int64_t>(kGeometry.routed_down_rows()), kGeometry.intermediate);
+        void* gate_pinned = nullptr;
+        void* down_pinned = nullptr;
+        cuda_check(cudaHostAlloc(&gate_pinned, gate_planes.total_bytes,
+                                 cudaHostAllocMapped | cudaHostAllocPortable), "mixed gate alloc");
+        cuda_check(cudaHostAlloc(&down_pinned, down_planes.total_bytes,
+                                 cudaHostAllocMapped | cudaHostAllocPortable), "mixed down alloc");
+        auto* gb = static_cast<std::byte*>(gate_pinned);
+        auto* db = static_cast<std::byte*>(down_pinned);
+        const auto* gate_src_codes = reinterpret_cast<const std::int8_t*>(f.bank.gate_codes_plane());
+        const auto* gate_src_scales = reinterpret_cast<const std::uint16_t*>(f.bank.gate_scales_plane());
+        const auto* down_src_codes = reinterpret_cast<const std::int8_t*>(f.bank.down_codes_plane());
+        const auto* down_src_scales = reinterpret_cast<const std::uint16_t*>(f.bank.down_scales_plane());
+        ops::requantise_w8_expert_groups_to_q4(
+            gate_src_codes, gate_src_scales, static_cast<std::int64_t>(gate_planes.groups),
+            reinterpret_cast<std::uint8_t*>(gb),
+            reinterpret_cast<std::uint16_t*>(gb + gate_planes.scales_offset),
+            reinterpret_cast<std::uint16_t*>(gb + gate_planes.mins_offset));
+        ops::requantise_w8_expert_groups_to_q4(
+            down_src_codes, down_src_scales, static_cast<std::int64_t>(down_planes.groups),
+            reinterpret_cast<std::uint8_t*>(db),
+            reinterpret_cast<std::uint16_t*>(db + down_planes.scales_offset),
+            reinterpret_cast<std::uint16_t*>(db + down_planes.mins_offset));
+        void* gate_mapped = nullptr;
+        void* down_mapped = nullptr;
+        cuda_check(cudaHostGetDevicePointer(&gate_mapped, gate_pinned, 0), "mixed gate map");
+        cuda_check(cudaHostGetDevicePointer(&down_mapped, down_pinned, 0), "mixed down map");
+        void* w8_mapped = nullptr;
+        cuda_check(cudaHostGetDevicePointer(&w8_mapped, f.bank.pinned, 0), "mixed w8 map");
+        const std::ptrdiff_t shift = static_cast<std::byte*>(w8_mapped) - f.bank.base();
+        const Weight w8_gate = host_weight(f.bank.gate_codes_plane() + shift,
+                                           f.bank.gate_scales_plane() + shift,
+                                           kGeometry.routed_gate_rows(), kGeometry.hidden);
+        const Weight w8_down = host_weight(f.bank.down_codes_plane() + shift,
+                                           f.bank.down_scales_plane() + shift,
+                                           kGeometry.routed_down_rows(), kGeometry.intermediate);
+        const ops::ExpertHostBank all_q4 = ops::expert_host_bank_q4(kGeometry, gate_mapped, down_mapped);
+        const ops::ExpertHostBank all_w8 = ops::expert_host_bank(kGeometry, w8_gate, w8_down);
+        const ops::ExpertHostBank mixed  = ops::expert_host_bank(
+            kGeometry, ops::ExpertBankHalfSource{&w8_gate, gate_mapped, nullptr},
+            ops::ExpertBankHalfSource{&w8_down, nullptr, nullptr});
+        const int mixed_ok = mixed.gate_up_format == ops::ExpertBankFormat::Q4G32AM &&
+                             mixed.down_format == ops::ExpertBankFormat::W8G32;
+        failures += expect(mixed_ok == 1, "mixed bank: gate/up Q4G32AM, down W8G32");
+
+        // Three pools, the same round into each; the mixed pool must equal Q4's gate/up half
+        // and W8's down half.
+        const std::vector<int> ids = {0, 5, 3};
+        const auto gather_into = [&](const ops::ExpertHostBank& bank, GuardedDeviceBuffer& pool_mem,
+                                     GuardedDeviceBuffer& dir_mem, GuardedDeviceBuffer& miss_mem,
+                                     GuardedDeviceBuffer& id_mem) {
+            ops::ExpertSlotPool pool = ops::create_expert_slot_pool(kGeometry, kSlots, pool_mem.data());
+            ops::ExpertSlotDirectory directory = ops::create_expert_slot_directory(
+                kLayers, kGeometry.experts, kSlots, 0, dir_mem.data(), nullptr);
+            ops::ExpertMissList misses = ops::create_expert_miss_list(kGeometry.experts, miss_mem.data());
+            cuda_check(cudaMemcpy(id_mem.data(), ids.data(), ids.size() * sizeof(int),
+                                  cudaMemcpyHostToDevice), "mixed ids upload");
+            Tensor t(id_mem.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+            ops::expert_slot_resolve(t, 0, directory, misses, nullptr);
+            ops::expert_slot_gather(bank, misses, pool, nullptr);
+            cuda_synchronize();
+            return pool;
+        };
+        GuardedDeviceBuffer pm[3] = {GuardedDeviceBuffer(ops::expert_slot_pool_bytes(kGeometry, kSlots)),
+                                     GuardedDeviceBuffer(ops::expert_slot_pool_bytes(kGeometry, kSlots)),
+                                     GuardedDeviceBuffer(ops::expert_slot_pool_bytes(kGeometry, kSlots))};
+        GuardedDeviceBuffer dm[3] = {GuardedDeviceBuffer(ops::expert_slot_directory_bytes(kLayers, kGeometry.experts, kSlots)),
+                                     GuardedDeviceBuffer(ops::expert_slot_directory_bytes(kLayers, kGeometry.experts, kSlots)),
+                                     GuardedDeviceBuffer(ops::expert_slot_directory_bytes(kLayers, kGeometry.experts, kSlots))};
+        GuardedDeviceBuffer mm[3] = {GuardedDeviceBuffer(ops::expert_miss_list_bytes(kGeometry.experts)),
+                                     GuardedDeviceBuffer(ops::expert_miss_list_bytes(kGeometry.experts)),
+                                     GuardedDeviceBuffer(ops::expert_miss_list_bytes(kGeometry.experts))};
+        GuardedDeviceBuffer im[3] = {GuardedDeviceBuffer(64 * sizeof(int)),
+                                     GuardedDeviceBuffer(64 * sizeof(int)),
+                                     GuardedDeviceBuffer(64 * sizeof(int))};
+        const ops::ExpertSlotPool p_q4    = gather_into(all_q4, pm[0], dm[0], mm[0], im[0]);
+        const ops::ExpertSlotPool p_w8    = gather_into(all_w8, pm[1], dm[1], mm[1], im[1]);
+        const ops::ExpertSlotPool p_mixed = gather_into(mixed, pm[2], dm[2], mm[2], im[2]);
+        const std::size_t slots_gathered = ids.size();
+        const auto same = [&](const std::byte* a, const std::byte* b, std::size_t bytes,
+                              const std::string& what) {
+            const auto va = from_device<std::uint8_t>(a, bytes);
+            const auto vb = from_device<std::uint8_t>(b, bytes);
+            failures += expect(va == vb ? 1 : 0, "mixed bank: " + what);
+        };
+        same(p_mixed.gate_up_codes, p_q4.gate_up_codes, slots_gathered * gate_groups * 32,
+             "gate/up codes match the all-Q4 gather");
+        same(p_mixed.gate_up_scales, p_q4.gate_up_scales, slots_gathered * gate_groups * 2,
+             "gate/up scales match the all-Q4 gather");
+        same(p_mixed.down_codes, p_w8.down_codes, slots_gathered * down_groups * 32,
+             "down codes match the all-W8 gather");
+        same(p_mixed.down_scales, p_w8.down_scales, slots_gathered * down_groups * 2,
+             "down scales match the all-W8 gather");
+        cudaFreeHost(gate_pinned);
+        cudaFreeHost(down_pinned);
+    }
+
     std::cout << (failures ? "FAIL" : "OK") << " expert_slot_cache\n";
     return failures ? 1 : 0;
 }

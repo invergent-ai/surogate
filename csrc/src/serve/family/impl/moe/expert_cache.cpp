@@ -59,6 +59,11 @@ StreamWaitValue64Fn stream_wait_value64() {
 }
 constexpr unsigned int kStreamWaitValueGeq = 0x0; // CU_STREAM_WAIT_VALUE_GEQ
 
+/// The widest round that still takes the decode share (`Impl::share_for`). One token per
+/// expert is the host's fast shape; several tokens per expert is its slow one, so the band is
+/// about where a batch stops being one-token-per-expert rather than a memory size.
+constexpr std::int32_t kDefaultDecodeBand = 64;
+
 [[nodiscard]] inline bool cpu_moe_verify() {
     static const bool on = std::getenv("SUROGATE_SERVE_CPU_MOE_VERIFY") != nullptr;
     return on;
@@ -596,14 +601,26 @@ struct ExpertCache::Impl {
     // decode round is one token, 1 reads 20.2 against 15.3 tok/s on the board shape and 16
     // users are unmoved by it (2026-09-04, GPU 0).
     std::int32_t cpu_min_tokens = 1;
+    // Widest round that still takes the decode share. SUROGATE_SERVE_CPU_MOE_DECODE_BAND
+    // overrides it; see `share_for` for what it means and design/INFERENCE.md for the
+    // measurement that set the default.
+    std::int32_t cpu_decode_band = 0;
     std::vector<ops::CpuExpertJob> job_scratch;
 
     bool cpu_split_enabled() const { return cpu_pool != nullptr; }
-    // The share for a round of `tokens` columns in total (0 = no split): decode-sized rounds
-    // use the decode share, wider ones the prefill share, and nothing wider than the staging.
+    // The share for a round of `tokens` columns in total (0 = no split): rounds inside the
+    // decode band use the decode share, wider ones the prefill share, and nothing wider than
+    // the staging.
+    //
+    // The band is not the staging width. What decides the share is which host path a round
+    // takes: one token per expert is a row-chunked GEMV, DRAM-bound, and the host relieves the
+    // link; several tokens per expert is the grouped path, compute-bound far below VNNI peak,
+    // and the host becomes the round's ceiling. `cpu_max_tokens` sizes the staging for the
+    // widest decode-shaped round a mixed batch can bring; `cpu_decode_band` says how wide a
+    // round may be and still be worth splitting.
     std::uint32_t share_for(std::int32_t tokens) const {
         if (tokens > stage_tokens) { return 0U; }
-        if (tokens <= cpu_max_tokens) { return cpu_share_q16; }
+        if (tokens <= cpu_decode_band) { return cpu_share_q16; }
         return tokens <= cpu_prefill_max_tokens ? cpu_prefill_share_q16 : 0U;
     }
     // Called before the MoE op: fixes the round's split decision and share.
@@ -1304,7 +1321,13 @@ struct ExpertCache::Impl {
         if (prefill_chunk == 0) { prefill_chunk = 2048; }
         if (fraction > 0.0 || prefill_fraction > 0.0) {
             cpu_share_q16 = static_cast<std::uint32_t>(std::min(1.0, std::max(0.0, fraction)) * 65536.0);
-            cpu_max_tokens = 64; // decode and small-T rounds use cpu_share; wider rounds are prefill
+            cpu_max_tokens = 64; // the widest decode-shaped round the staging must hold
+            cpu_decode_band = kDefaultDecodeBand;
+            if (const char* band = std::getenv("SUROGATE_SERVE_CPU_MOE_DECODE_BAND");
+                band != nullptr && *band != '\0') {
+                cpu_decode_band = static_cast<std::int32_t>(std::strtol(band, nullptr, 10));
+            }
+            cpu_decode_band = std::clamp(cpu_decode_band, 1, cpu_max_tokens);
             if (prefill_fraction > 0.0 && prefill_chunk > 0) {
                 cpu_prefill_share_q16 = static_cast<std::uint32_t>(std::min(1.0, prefill_fraction) * 65536.0);
                 cpu_prefill_max_tokens = static_cast<std::int32_t>(prefill_chunk);
@@ -1404,10 +1427,12 @@ struct ExpertCache::Impl {
             auto_share            = auto_share_;
             prefill_share_default = prefill_default;
             std::fprintf(stderr,
-                         "expert cache: CPU expert split enabled: %.0f%% of decode misses, %.0f%% "
-                         "of prefill misses (rounds up to %d columns) on %u host threads%s\n",
-                         100.0 * fraction, 100.0 * prefill_fraction, cpu_prefill_max_tokens,
-                         cpu_pool->threads(), auto_share_ ? " (auto: measured at startup)" : "");
+                         "expert cache: CPU expert split enabled: %.0f%% of the misses of rounds "
+                         "up to %d columns, %.0f%% of prefill misses (up to %d columns) on %u host "
+                         "threads%s\n",
+                         100.0 * fraction, cpu_decode_band, 100.0 * prefill_fraction,
+                         cpu_prefill_max_tokens, cpu_pool->threads(),
+                         auto_share_ ? " (auto: measured at startup)" : "");
         }
         std::fprintf(stderr,
                      "expert cache: ready: %d slots (%.1f GiB pool) over %d layers of %d experts, "
