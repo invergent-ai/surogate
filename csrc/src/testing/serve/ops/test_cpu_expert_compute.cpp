@@ -571,9 +571,19 @@ int main() {
     // lost wake-up shows up as a hang, so the test runs it with a watchdog thread.
     {
         std::atomic<bool> finished{false};
+        // The watchdog is here to turn a lost wake-up into a message instead of a hung suite,
+        // so its bound has to be far above any slow run rather than near one: this test shares
+        // a machine with 113 others under ctest, and at 60 s it was firing on load rather than
+        // on a hang -- with `_Exit` discarding the buffered output, which left a failure with
+        // nothing to read. Ten minutes, and the output is flushed before the exit.
         std::thread watchdog([&] {
-            for (int i = 0; i < 600 && !finished.load(); ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
-            if (!finished.load()) { std::cout << "FAIL pool stress hung\n"; std::_Exit(2); }
+            for (int i = 0; i < 6000 && !finished.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!finished.load()) {
+                std::cout << "FAIL pool stress hung\n" << std::flush;
+                std::_Exit(2);
+            }
         });
         ops::CpuExpertPool wide(kGeometry, {.threads = 32, .pin_threads = false});
         std::vector<ops::CpuExpertJob> tiny = {{0, 1, 1.0F}};
