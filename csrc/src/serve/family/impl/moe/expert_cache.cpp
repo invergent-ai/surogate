@@ -403,6 +403,15 @@ struct ExpertCache::Impl {
         std::int32_t tokens     = 0;
         std::int32_t ordinal    = 0;
         const JobMirror* mirror = nullptr;
+        /// This slice's own handshake flag pair, or -1 for the host-function path. Assigned
+        /// once, when the context is created, and never reused: a captured graph bakes the
+        /// flag's *address* into its write and wait nodes, while the slot-to-context mapping
+        /// the coordinator reads is host state that a replay cannot update. Keying the slot by
+        /// (layer, ordinal) made every decode graph of a layer share one, so a replay of the
+        /// 13-column graph could raise a flag the coordinator resolved to the 16-column
+        /// context -- the host then reading a job list against the wrong width and the wrong
+        /// staging columns. One slot per context is what makes the mapping a constant.
+        std::int32_t handshake_slot = -1;
         // Issue order of this slice. Not a race detector: the host runs far ahead of the
         // stream, so a large gap between this and `staging_generation` is normal -- the
         // overwriting copy is only *enqueued*, and the main stream cannot reach it until the
@@ -421,7 +430,21 @@ struct ExpertCache::Impl {
         }
         slice_contexts.push_back(SliceContext{&entry, offset, tokens, ordinal,
                                               &mirrors[static_cast<std::size_t>(ordinal)]});
-        return slice_contexts.back();
+        SliceContext& created = slice_contexts.back();
+        // The last slot is the probe's; stop one short of it so the two never meet.
+        if (handshake.enabled && handshake.used + 1 < handshake_slots()) {
+            created.handshake_slot = static_cast<std::int32_t>(handshake.used);
+            handshake.slice[handshake.used].store(&created, std::memory_order_release);
+            // Publish the count last: the coordinator scans [0, used), so a slot is visible
+            // only once the context it names is.
+            handshake.used_published.store(++handshake.used, std::memory_order_release);
+        } else if (handshake.enabled) {
+            std::fprintf(stderr,
+                         "expert cache: out of handshake slots at %zu round shapes; this slice "
+                         "takes the host-function path\n",
+                         handshake.used);
+        }
+        return created;
     }
     bool enabled = false;
     std::int32_t slots     = 0;
@@ -555,8 +578,14 @@ struct ExpertCache::Impl {
     // round and raises `done`; the stream waits on `done` and clears it again itself, so the
     // next replay of the same graph waits properly. Ordering across layers needs nothing more:
     // the stream raises L+1's flag only after it has passed L's wait.
+    /// Distinct round shapes a (layer, slice ordinal) may take: one graph profile per decode
+    /// width, plus the eager shapes. The flags are two 8-byte words each, so being generous
+    /// costs kilobytes, and the coordinator's scan is bounded by what is actually used rather
+    /// than by this.
+    static constexpr std::size_t kHandshakeShapesPerSlice = 24;
     std::size_t handshake_slots() const {
-        return static_cast<std::size_t>(layers) * static_cast<std::size_t>(kJobMirrors);
+        return static_cast<std::size_t>(layers) * static_cast<std::size_t>(kJobMirrors) *
+               kHandshakeShapesPerSlice;
     }
     struct Handshake {
         bool enabled              = false;
@@ -564,14 +593,14 @@ struct ExpertCache::Impl {
         unsigned long long* done  = nullptr; // pinned, mapped: [slots], the host writes
         CUdeviceptr ready_device  = 0;
         CUdeviceptr done_device   = 0;
-        std::vector<std::atomic<SliceContext*>> slice; // [slots], set at issue time
+        std::vector<std::atomic<SliceContext*>> slice; // [slots], set once per context
+        /// Slots handed out so far (host-side) and the count the coordinator may scan. Two
+        /// variables because the context pointer must be visible before the slot is.
+        std::size_t used = 0;
+        std::atomic<std::size_t> used_published{0};
         std::thread coordinator;
         std::atomic<bool> stop{false};
     } handshake;
-    static std::size_t handshake_slot(const Layer& entry, std::int32_t ordinal) {
-        return static_cast<std::size_t>(entry.index) * kJobMirrors +
-               static_cast<std::size_t>(ordinal);
-    }
     ~Impl() {
         // The coordinator spins on flags this object owns; stop it before they go.
         handshake.stop.store(true, std::memory_order_relaxed);
@@ -694,11 +723,12 @@ struct ExpertCache::Impl {
             return;
         }
         handshake.enabled     = true;
-        handshake.coordinator = std::thread([this, slots_total] {
+        handshake.coordinator = std::thread([this] {
             unsigned idle = 0;
             while (!handshake.stop.load(std::memory_order_relaxed)) {
                 bool did = false;
-                for (std::size_t k = 0; k < slots_total; ++k) {
+                const std::size_t live = handshake.used_published.load(std::memory_order_acquire);
+                for (std::size_t k = 0; k < live; ++k) {
                     if (__atomic_load_n(&handshake.ready[k], __ATOMIC_ACQUIRE) == 0ULL) { continue; }
                     __atomic_store_n(&handshake.ready[k], 0ULL, __ATOMIC_RELAXED);
                     SliceContext* slice = handshake.slice[k].load(std::memory_order_acquire);
@@ -953,12 +983,11 @@ struct ExpertCache::Impl {
         entry.round_offset = offset + tokens;
         int partial_device = -1;
         CUDA_CHECK(cudaGetDevice(&partial_device));
-        if (handshake.enabled && !stagecheck) {
-            // Hand the slice to the coordinator first, then let the stream raise its flag once
-            // the copies above have landed: the coordinator only acts on a flag whose
-            // generation it was told to expect.
-            const std::size_t k = handshake_slot(entry, ordinal);
-            handshake.slice[k].store(&slice, std::memory_order_release);
+        if (handshake.enabled && !stagecheck && slice.handshake_slot >= 0) {
+            // The slot belongs to this slice alone and was published when its context was
+            // created, so the address the stream raises and the context the coordinator reads
+            // agree whether this is an eager round or the replay of a graph captured long ago.
+            const auto k = static_cast<std::size_t>(slice.handshake_slot);
             const CUresult rc = stream_write_value64()(
                 stream, handshake.ready_device + k * sizeof(unsigned long long), 1ULL, 0U);
             if (rc != CUDA_SUCCESS) { throw std::runtime_error("expert cache: cuStreamWriteValue64 failed"); }
