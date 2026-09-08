@@ -23,9 +23,10 @@ namespace sinfer::ops {
  * is promoted and compared directly with that result; output storage rounding
  * belongs to the Op's numerical criterion, not the oracle. Private kernel
  * arithmetic is implementation-defined. The Op writes all of out and uses no
- * workspace or persistent state.
+ * workspace or persistent state. With round_gate=true, GELU is rounded to BF16
+ * before multiplication (the unfused PyTorch BF16 evaluation order).
  */
 void gelu_mul(const Tensor& gate, const Tensor& up, GeluMode mode, Tensor& out,
-              cudaStream_t stream);
+              cudaStream_t stream, bool round_gate = false);
 
 } // namespace sinfer::ops

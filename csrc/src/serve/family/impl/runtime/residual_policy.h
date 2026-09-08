@@ -14,6 +14,7 @@
 #include "api/ops/linear.h"
 #include "api/ops/rmsnorm.h"
 #include "api/ops/scale.h"
+#include "api/ops/sigmoid_mul.h"
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/ngram_ple_state.h"
@@ -225,6 +226,15 @@ template <class Variant>
         return Variant::attention_output_gate;
     } else {
         return true;
+    }
+}
+
+template <class Variant>
+void apply_attention_gate(const Tensor& gate, Tensor& attention, cudaStream_t stream) {
+    if constexpr (requires { Variant::apply_attention_gate(gate, attention, stream); }) {
+        Variant::apply_attention_gate(gate, attention, stream);
+    } else {
+        ops::sigmoid_mul(gate, attention, stream);
     }
 }
 

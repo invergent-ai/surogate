@@ -36,8 +36,8 @@ std::size_t lora_num_parameters(const ModelConfig& model_config, const ModularLo
         contains_ci(model_config.ArchitectureName, "qwen3_5") || contains_ci(model_config.ArchitectureName, "qwen3.5");
 
     const std::size_t q_out = Hq * Hs;
-    const std::size_t q_lora_out = is_qwen3_5 ? (2 * q_out) : q_out;
     const std::size_t kv_out = Hkv * Hs;
+    const std::size_t q_lora_out = lora_config.fused_qkv ? q_out + 2 * kv_out : (is_qwen3_5 ? 2 * q_out : q_out);
     const bool use_shared_expert = model_config.moe_config.has_value() && model_config.moe_config->use_shared_expert;
     const std::size_t shared_D =
         use_shared_expert && model_config.moe_config->shared_expert_size > 0

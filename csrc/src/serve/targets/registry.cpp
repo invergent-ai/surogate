@@ -375,6 +375,7 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     dispatch.template operator()<Glm5Next, LoadedGlm5Next, Glm5NextInstance>(constructed);
     dispatch.template operator()<Lfm2, LoadedLfm2, Lfm2Instance>(constructed);
     dispatch.template operator()<Llama, LoadedLlama, LlamaInstance>(constructed);
+    dispatch.template operator()<Spark, LoadedSpark, SparkInstance>(constructed);
     dispatch.template operator()<Qwen3Dense, LoadedQwen3Dense, Qwen3DenseInstance>(constructed);
     dispatch.template operator()<Qwen3Moe, LoadedQwen3Moe, Qwen3MoeInstance>(constructed);
     dispatch.template operator()<Qwen3_5, LoadedQwen3_5, Qwen3_5Instance>(constructed);

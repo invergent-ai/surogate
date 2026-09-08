@@ -30,10 +30,10 @@ inline ITensorContainer& empty_tensor_container() {
 inline std::vector<std::string> targets_to_peft_names(const ModularLoRAConfig& cfg) {
     std::vector<std::string> out;
     out.reserve(10);
-    if (cfg.applies_to_q()) out.emplace_back("q_proj");
+    if (cfg.applies_to_q()) out.emplace_back(cfg.q_proj_name);
     if (cfg.applies_to_k()) out.emplace_back("k_proj");
     if (cfg.applies_to_v()) out.emplace_back("v_proj");
-    if (cfg.applies_to_o()) out.emplace_back("o_proj");
+    if (cfg.applies_to_o()) out.emplace_back(cfg.o_proj_name);
     if (cfg.applies_to_gate()) out.emplace_back("gate_proj");
     if (cfg.applies_to_gate_up()) out.emplace_back("gate_up_proj");
     if (cfg.applies_to_up()) out.emplace_back("up_proj");

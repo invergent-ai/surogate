@@ -251,7 +251,7 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     stage.last    = plan.pipeline_stage_last;
     stage.columns = static_cast<std::int32_t>(plan.pipeline_boundary_columns);
     stage_boundary_bytes_ = static_cast<std::size_t>(cfg.residual) *
-                            plan.pipeline_boundary_columns * sizeof(std::uint16_t);
+                            plan.pipeline_boundary_columns * dtype_size(plan.geometry.residual_dtype());
     if (stage.first > 0) {
         // The stage owns its import buffer (the driver copies the previous stage's export
         // into it), so stages can run different micro-batches at the same time.

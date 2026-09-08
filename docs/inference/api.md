@@ -86,7 +86,7 @@ local paths, HTTP(S) URLs, or base64 data URIs. `input_audio` is refused with
 `modality_not_supported`.
 
 For automatic tool choice, start the server with `--enable-auto-tool-choice` and a matching
-`--tool-call-parser` (default `qwen3_xml`; `hermes`, `llama3_json`, and `llama4_json` are also
+`--tool-call-parser` (default `qwen3_xml`; `hermes`, `spark25`, `llama3_json`, and `llama4_json` are also
 accepted). The model generates tool calls, and your application executes them. Validate the
 arguments before use: the server does not guarantee that they match the tool's schema.
 

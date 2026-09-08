@@ -224,7 +224,7 @@ the model's chat template.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--reasoning-parser NAME` | `qwen3` | Read reasoning in the model's output format; also accepts `deepseek_r1`, `glm4_moe`, `think`, or `none`/`off` |
-| `--tool-call-parser NAME` | `qwen3_xml` | Read tool calls; also accepts `hermes`, `llama3_json`, `llama4_json`, or `none`/`off` |
+| `--tool-call-parser NAME` | `qwen3_xml` | Read tool calls; also accepts `hermes`, `spark25`, `llama3_json`, `llama4_json`, or `none`/`off` |
 | `--enable-auto-tool-choice` | off | Allow the model to choose a tool automatically; requires an enabled tool parser |
 | `--chat-template FILE` | model template | Use this Jinja file to format chat prompts |
 

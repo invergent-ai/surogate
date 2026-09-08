@@ -260,6 +260,13 @@ void fused_residual_rmsnorm_forward(float* residual,
                                     int N,
                                     int C,
                                     cudaStream_t stream);
+void fused_residual_rmsnorm_fp32_forward(Tensor& residual, Tensor& normed, Tensor& rstd,
+                                       const Tensor& residual_in, const Tensor& branch, const Tensor& weight,
+                                       float epsilon, int rows, int channels, cudaStream_t stream);
+void fused_residual_rmsnorm_fp32_backward(Tensor& d_residual, Tensor& d_branch, Tensor* d_weight,
+                                        Tensor& weight_partials, const Tensor& d_y, const Tensor* d_residual_next,
+                                        const Tensor& residual, const Tensor& weight, const Tensor& rstd,
+                                        int rows, int channels, cudaStream_t stream);
 void fused_residual_rmsnorm_forward(nv_bfloat16* residual,
                                     nv_bfloat16* normed,
                                     float* rrms,
@@ -1305,6 +1312,8 @@ void softplus_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t strea
 void softplus_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream);
 void softplus_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream);
 void softplus_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream);
+void gelu_exact_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);
+void gelu_exact_backward(Tensor& dx, const Tensor& inp, const Tensor& dy, long n, cudaStream_t stream);
 void gelu_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream);
 void gelu_forward(float* out, const float* inp, long n, cudaStream_t stream);
 void gelu_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);

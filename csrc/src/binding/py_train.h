@@ -89,6 +89,7 @@ public:
                                       std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights);
     void export_model(std::string path);
     void export_adapter(std::string path, std::string base_model_path = "");
+    void import_adapter(std::string path);
     void init_weights();
     void load_checkpoint(std::string directory, int step);
     void save_checkpoint(std::string directory, int step);

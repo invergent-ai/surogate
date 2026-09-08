@@ -160,7 +160,8 @@ void ModularLoRAGradsManager::allocate_gradients() {
         const int layer_q_out = layer_dims.q_out;
         const int layer_kv_out = layer_dims.kv_out;
         const int layer_d_ff = layer_dims.d_ff;
-        const int q_lora_out = model_is_qwen3_5 ? (2 * layer_q_out) : layer_q_out;
+        const int q_lora_out = mConfig.lora_config.fused_qkv ? layer_q_out + 2 * layer_kv_out
+                                                          : (model_is_qwen3_5 ? 2 * layer_q_out : layer_q_out);
 
         // Attention LoRA grads: Dense always, Attention always, MoE/SwitchMoE only in non-hybrid.
         // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.

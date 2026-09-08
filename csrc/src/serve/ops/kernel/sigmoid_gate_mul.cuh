@@ -85,4 +85,14 @@ __launch_bounds__(256) __global__
     }
 }
 
+__global__ void headwise_sigmoid_mul_kernel(const __nv_bfloat16* gate, __nv_bfloat16* x,
+                                            std::int64_t n, int head_dim) {
+    const std::int64_t start = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        const auto scale = __float2bfloat16_rn(sigmoid(__bfloat162float(gate[i / head_dim])));
+        x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) * __bfloat162float(scale));
+    }
+}
+
 } // namespace sinfer::ops

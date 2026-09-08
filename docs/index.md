@@ -71,6 +71,8 @@ We support the following models. Please create a PR if you need a specific model
 | GPT-OSS            | GptOssForCausalLM                                       | 20B, 120B                     |
 | Llama 3.1          | LlamaForCausalLM                                        | 8B, 70B, 405B                     |
 | Llama 3.2          | LlamaForCausalLM                                        | 1B, 3B                      |
+| MiniCPM5           | LlamaForCausalLM                                        | 1B, 2B                      |
+| Spark-X2.5         | Spark2_5ForCausalLM                                     | 1.7B, 4B                    |
 
 
 ## Quickstart

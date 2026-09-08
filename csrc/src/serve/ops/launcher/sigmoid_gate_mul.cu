@@ -51,4 +51,12 @@ void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream)
     CUDA_CHECK(cudaGetLastError());
 }
 
+void headwise_sigmoid_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream) {
+    const auto grid = static_cast<unsigned>(std::min<std::int64_t>(4096, (x.numel() + 255) / 256));
+    headwise_sigmoid_mul_kernel<<<grid, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(x.data),
+        x.numel(), x.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace sinfer::ops::detail

@@ -193,13 +193,13 @@ class GenericMLP(Module):
             # bs=2 gas=4. Only applies to the tanh-approx GELU (cpp_op=="gelu"
             # in our kernel — matches HF gelu_pytorch_tanh); SiLU falls back
             # to the split gelu/silu + mul path below.
-            if cfg.activation.cpp_op == "gelu":
+            if cfg.activation.cpp_op == "gelu" and cfg.activation.attrs.get("approximate", "tanh") == "tanh":
                 act_flat = g.gelu_glu(gate_flat, up_flat, out_name=tracer.prefixed("act_flat"))
             else:
                 act_fn = act_table.get(cfg.activation.cpp_op)
                 if act_fn is None:
                     raise ValueError(f"Unsupported activation '{cfg.activation.cpp_op}' for non-fused gated MLP")
-                gate_act = act_fn(gate_flat, out_name=tracer.prefixed("gate_act"))
+                gate_act = act_fn(gate_flat, out_name=tracer.prefixed("gate_act"), **dict(cfg.activation.attrs))
                 act_flat = g.mul(gate_act, up_flat)
         else:
             up_flat = g.matmul(x_flat, up_w, transpose="NT")

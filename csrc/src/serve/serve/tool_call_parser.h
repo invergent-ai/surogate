@@ -18,6 +18,9 @@ struct ParsedToolCallOutput {
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length);
 
+ParsedToolCallOutput parse_spark_tool_call_output(const std::string& text,
+                                                  std::size_t max_tool_name_length);
+
 // Incrementally publishes text that is provably outside a possible Qwen
 // <tool_call> suffix. At terminal time, a valid tool response discards the
 // buffered tool region; malformed/non-tool output flushes it verbatim.

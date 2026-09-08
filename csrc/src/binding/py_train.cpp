@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -22,6 +23,7 @@
 #include <cuda_fp16.h>
 
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
 
 #include "utilities/gpu_info.h"
 #include "utilities/dtype.h"
@@ -443,12 +445,29 @@ void MultiGPUPyTrainer::import_weights_from_external(std::string safetensors_pat
  * @param path Output directory path.
  */
 void MultiGPUPyTrainer::export_model(std::string path) {
-    run_work([path](sThreadContext& ctx) {
+    nlohmann::json source_config = nlohmann::json::object();
+    if (!mOptions.DslIrJson.empty()) {
+        const auto ir = nlohmann::json::parse(mOptions.DslIrJson);
+        if (ir.contains("modules") && !ir["modules"].empty()) {
+            source_config = ir["modules"][0].value("hf_config", nlohmann::json::object())
+                                .value("source_config", nlohmann::json::object());
+        }
+    }
+    run_work([path, source_config](sThreadContext& ctx) {
         std::filesystem::path p(path);
         std::filesystem::create_directories(p);
 
         if (ctx.Communicator->rank() == 0) {
             save_pretrained_config(*ctx.Model->get_run_state().Config, (p / "config.json").c_str());
+            if (!source_config.empty()) {
+                std::ifstream input(p / "config.json");
+                const auto resolved = nlohmann::json::parse(input);
+                input.close();
+                auto complete = source_config;
+                complete.update(resolved);
+                std::ofstream output(p / "config.json");
+                output << complete.dump(2) << '\n';
+            }
         }
         ctx.Model->export_weights((p / "model.safetensors").c_str(), *ctx.Communicator);
     });
@@ -475,6 +494,16 @@ void MultiGPUPyTrainer::export_adapter(std::string path, std::string base_model_
             throw std::runtime_error("export_adapter: DSL model is not configured for LoRA");
         }
         dsl_model->export_adapter(path, *ctx.Communicator, base_model_path);
+    });
+}
+
+void MultiGPUPyTrainer::import_adapter(std::string path) {
+    run_work([path](sThreadContext& ctx) {
+        auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!model || !model->lora_enabled()) {
+            throw std::runtime_error("import_adapter: trainer must be configured for LoRA");
+        }
+        model->import_adapter(path, *ctx.Communicator);
     });
 }
 
@@ -1985,10 +2014,18 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         mod_lora.train_router = mLoRAConfig->TrainRouter;
         mod_lora.targets.clear();
         if (mLoRAConfig->TargetModules.count("all") > 0) {
+            mod_lora.all_targets = true;
             mod_lora.with_all();
         } else {
             for (const auto& name : mLoRAConfig->TargetModules) {
-                if (name == "q_proj")
+                if (name == "q_k_v_proj") {
+                    mod_lora.targets.insert(modules::LoRATarget::Q_PROJ);
+                    mod_lora.fused_qkv = true;
+                    mod_lora.q_proj_name = name;
+                } else if (name == "out_proj") {
+                    mod_lora.targets.insert(modules::LoRATarget::O_PROJ);
+                    mod_lora.o_proj_name = name;
+                } else if (name == "q_proj")
                     mod_lora.targets.insert(modules::LoRATarget::Q_PROJ);
                 else if (name == "k_proj")
                     mod_lora.targets.insert(modules::LoRATarget::K_PROJ);

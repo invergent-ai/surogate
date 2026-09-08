@@ -30,4 +30,7 @@ namespace sinfer::ops {
  */
 void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream);
 
+/// Exact BF16 promotion to FP32. Same shapes, contiguous, non-overlapping tensors.
+void cast_bf16_to_fp32(const Tensor& source, Tensor& destination, cudaStream_t stream);
+
 } // namespace sinfer::ops

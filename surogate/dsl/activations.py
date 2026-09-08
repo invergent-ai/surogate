@@ -47,6 +47,12 @@ class Activation:
         cpp_op="gelu",
         cpp_backward_op="gelu_backward",
     )
+    GELU_EXACT: ClassVar[ActivationSpec] = ActivationSpec(
+        name="gelu_exact",
+        cpp_op="gelu",
+        cpp_backward_op="gelu_backward",
+        attrs={"approximate": "none"},
+    )
     RELU2: ClassVar[ActivationSpec] = ActivationSpec(
         name="relu2",
         cpp_op="relu2",

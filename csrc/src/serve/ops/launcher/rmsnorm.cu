@@ -149,4 +149,12 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     CUDA_CHECK(cudaGetLastError());
 }
 
+void rmsnorm_fp32_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
+                         Tensor& out, cudaStream_t stream) {
+    rmsnorm_fp32_kernel<<<static_cast<unsigned>(x.numel() / x.ne[0]), 256, 0, stream>>>(
+        static_cast<const float*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
+        static_cast<__nv_bfloat16*>(out.data), x.ne[0], eps, unit_offset);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace sinfer::ops::detail

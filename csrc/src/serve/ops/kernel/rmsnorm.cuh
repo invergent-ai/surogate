@@ -312,4 +312,20 @@ __launch_bounds__(256) __global__
     }
 }
 
+__global__ void rmsnorm_fp32_kernel(const float* x, const __nv_bfloat16* weight,
+                                    __nv_bfloat16* out, int d, float eps, bool unit_offset) {
+    __shared__ float sums[8];
+    const auto base = static_cast<std::int64_t>(blockIdx.x) * d;
+    float sum = 0.0F;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) { sum += x[base + i] * x[base + i]; }
+    const float total = block_reduce_sum<256>(sum, sums);
+    __shared__ float inv;
+    if (threadIdx.x == 0) { inv = rsqrtf(total / d + eps); }
+    __syncthreads();
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        const float gain = __bfloat162float(weight[i]) + (unit_offset ? 1.0F : 0.0F);
+        out[base + i] = __float2bfloat16_rn((x[base + i] * inv) * gain);
+    }
+}
+
 } // namespace sinfer::ops

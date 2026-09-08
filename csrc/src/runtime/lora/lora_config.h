@@ -61,6 +61,12 @@ struct ModularLoRAConfig {
     /// Train MoE router gate weights during LoRA fine-tuning
     bool train_router = false;
 
+    /// Native fused QKV uses the Q adapter storage for all three projections.
+    bool fused_qkv = false;
+    bool all_targets = false;
+    std::string q_proj_name = "q_proj";
+    std::string o_proj_name = "o_proj";
+
     /// Target modules for LoRA adaptation
     std::set<LoRATarget> targets = {LoRATarget::Q_PROJ, LoRATarget::K_PROJ, LoRATarget::V_PROJ, LoRATarget::O_PROJ};
 

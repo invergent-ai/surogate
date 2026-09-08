@@ -1226,7 +1226,7 @@ void DslRunState::allocate_residual_buffers(const PretrainedConfig& cfg, bool of
                                                                   static_cast<int>(B),
                                                                   static_cast<int>(T),
                                                                   cfg.HiddenSize,
-                                                                  cfg.DType,
+                                                                  mRuntimeConfig.residual_fp32 ? ETensorDType::FP32 : cfg.DType,
                                                                   offload_residuals,
                                                                   /*num_residual_buffers=*/2,
                                                                   MainStream);

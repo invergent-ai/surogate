@@ -20,10 +20,11 @@ class RMSNorm(Module):
         "weight": "{prefix}.weight",
     }
 
-    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+    def __init__(self, d_model: int, eps: float = 1e-6, *, residual_dtype: str | None = None) -> None:
         super().__init__()
         self.d_model = d_model
         self.eps = eps
+        self.residual_dtype = residual_dtype
         self.C = Dim("C")
 
     def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy | tuple[Proxy, ...]:
@@ -39,6 +40,7 @@ class RMSNorm(Module):
             res_slot = tracer.register_activation(
                 "res",
                 ("B", "T", "C"),
+                dtype=self.residual_dtype,
                 share_policy="when_recomputed",
             )
             y_slot = tracer.register_activation(

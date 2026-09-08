@@ -82,4 +82,10 @@ __launch_bounds__(256) __global__
     }
 }
 
+__global__ void residual_add_fp32_kernel(const __nv_bfloat16* y, float* x, std::int64_t n) {
+    const auto start = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (auto i = start; i < n; i += stride) { x[i] += __bfloat162float(y[i]); }
+}
+
 } // namespace sinfer::ops

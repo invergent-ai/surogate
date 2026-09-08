@@ -79,6 +79,15 @@ void refuses(const char* label, std::string_view chat_template_member, std::stri
 } // namespace
 
 int main() {
+    for (const auto pad : {R"({"content":"<pad>","normalized":true})", R"({"content":7})", R"({})"}) {
+        auto assets = resources(std::string(R"({"pad_token":)") + pad + "}");
+        bool rejected = false;
+        try { sinfer::family::FrontendTestAccess::check_tokenizer_config(assets); }
+        catch (const std::exception&) { rejected = true; }
+        const bool valid = std::string_view(pad).find("<pad>") != std::string_view::npos;
+        if (rejected == valid) { ++failures; }
+    }
+
     for (const std::string_view prefix : {"null", "false", "true"}) {
         auto assets = resources("{\"pad_token\":\"</s>\",\"add_prefix_space\":" +
                                 std::string(prefix) + "}");

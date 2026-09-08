@@ -122,6 +122,8 @@ class GenericGQAttention(Module):
             LoRATarget(name="k", offset=_hq, size=_hkv),
             LoRATarget(name="v", offset=_hq + _hkv, size=_hkv),
         ]
+        if cfg.fused_qkv_lora:
+            qkv_targets = [LoRATarget(name="q", size=_hq + 2 * _hkv)]
         out_targets = [LoRATarget(name="o", offset=0, size=_hidden)]
 
         # -- params -----------------------------------------------------
@@ -129,6 +131,10 @@ class GenericGQAttention(Module):
         qkv_b = tracer.register_param("qkv_bias", ("QKV",), when="use_qkv_bias")
         out_w = tracer.register_param("out_weight", ("C", "AttnDim"), lora_targets=out_targets)
         out_b = tracer.register_param("out_bias", ("C",), when="use_out_bias")
+        if cfg.headwise_output_gate:
+            gate_w = tracer.register_param(
+                "output_gate_weight", ("Hq", "C"), quantizable=False,
+            )
         # q_norm / k_norm sit before rope_freqs to match the legacy
         # Qwen3Attention param ordering (preserves existing weight init /
         # checkpoint offsets).
@@ -188,7 +194,7 @@ class GenericGQAttention(Module):
         att_slot = tracer.register_activation(
             "att",
             ("B", "T", "AttnDim"),
-            aliases=["att_flat", "attn"],
+            aliases=["attn"] if cfg.headwise_output_gate else ["att_flat", "attn"],
             save=True,
             share_policy="always_recompute",
         )
@@ -288,11 +294,19 @@ class GenericGQAttention(Module):
             **fa_kwargs,
         )
 
+        if cfg.headwise_output_gate:
+            gate = g.matmul(x_flat, gate_w, transpose="NT", out_name=tracer.prefixed("gate_logits"))
+            gate = g.sigmoid(gate, out_name=tracer.prefixed("gate_sigmoid"))
+            # The row broadcast also defines the head reduction in backward.
+            gate = g.view(gate, shape=[B * T * self.Hq, 1], out_name=tracer.prefixed("gate_rows"))
+            heads = g.view(attn_out, shape=[B * T * self.Hq, self.D], out_name=tracer.prefixed("att_heads"))
+            attn_out = g.mul(heads, gate, out_name=tracer.prefixed("gated_att"))
+
         # -- Output projection ------------------------------------------
         attn_flat = g.view(
             attn_out,
             shape=[B * T, self.AttnDim],
-            out_name=tracer.prefixed("att_flat"),
+            out_name=tracer.prefixed("gated_att_flat" if cfg.headwise_output_gate else "att_flat"),
         )
         if self.use_out_bias:
             out_flat = g.matmul_bias(

@@ -1,4 +1,6 @@
 #pragma once
+
+#include "core/dtype.h"
 #include <api/family/dflash_geometry.h>
 
 #include <api/family/geometry_validation.h>
@@ -32,6 +34,12 @@ struct TextGeometry {
     std::int32_t kv_heads           = 0;
     std::int32_t head_dim           = 0;
     std::int32_t rotary_dim         = 0;
+    // Optional contiguous rotary prefix for windowed layers; zero inherits rotary_dim.
+    std::int32_t sliding_rotary_dim = 0;
+    std::int32_t residual_fp32 = 0;
+    [[nodiscard]] DType residual_dtype() const noexcept {
+        return residual_fp32 ? DType::FP32 : DType::BF16;
+    }
     std::int32_t gdn_conv_kernel    = 0;
     std::int32_t gdn_key_heads      = 0;
     std::int32_t gdn_key_head_dim   = 0;
@@ -313,6 +321,13 @@ struct TextGeometry {
             g.rotary_dim > g.head_dim || g.rotary_dim % 2 != 0 ||
             (g.rotary_dim > 0 && g.rope_theta <= 0.0F)) {
             throw std::invalid_argument("inconsistent checkpoint text geometry");
+        }
+        if (g.residual_fp32 != 0 && g.residual_fp32 != 1) {
+            throw std::invalid_argument("residual_fp32 must be 0 or 1");
+        }
+        if (g.sliding_rotary_dim > g.head_dim || g.sliding_rotary_dim % 2 ||
+            (g.sliding_rotary_dim > 0 && (g.sliding_window <= 0 || g.sliding_rope_theta <= 0))) {
+            throw std::invalid_argument("invalid windowed rotary geometry");
         }
         if (g.layers > 256) { throw std::invalid_argument("serving supports at most 256 layers"); }
         for (const auto heads : {g.query_heads, g.kv_heads}) {

@@ -11,6 +11,7 @@
 #include <api/targets/glm5_next/package.h>
 #include <api/targets/lfm2/package.h>
 #include <api/targets/llama/package.h>
+#include <api/targets/spark2_5/package.h>
 #include <api/targets/qwen3/package.h>
 #include <api/targets/qwen3_5/package.h>
 #include <api/targets/qwen3_moe/package.h>
@@ -39,6 +40,7 @@ using Gemma4Moe       = gemma4_moe::Package;
 using Glm5Next        = glm5_next::Package;
 using Lfm2            = lfm2::Package;
 using Llama           = llama::Package;
+using Spark           = spark2_5::Package;
 using Qwen3Dense      = qwen3::Package;
 using Qwen3Moe        = qwen3_moe::Package;
 /// One architecture, every size and generation that shares it: Qwen3.5, 3.6 and 3.8.
@@ -103,6 +105,8 @@ using LoadedGlm5Next = LoadedTarget<Glm5Next>;
 using Glm5NextInstance = TargetInstance<Glm5Next>;
 using LoadedLfm2 = LoadedTarget<Lfm2>;
 using Lfm2Instance = TargetInstance<Lfm2>;
+using LoadedSpark = LoadedTarget<Spark>;
+using SparkInstance = TargetInstance<Spark>;
 using LoadedLlama = LoadedTarget<Llama>;
 using LlamaInstance = TargetInstance<Llama>;
 using LoadedQwen3Dense = LoadedTarget<Qwen3Dense>;
@@ -128,7 +132,7 @@ using ActiveTarget =
                  std::unique_ptr<Gemma4MoeInstance>,
                  std::unique_ptr<Glm5NextInstance>,
                  std::unique_ptr<Lfm2Instance>,
-                 std::unique_ptr<LlamaInstance>, std::unique_ptr<Qwen3DenseInstance>,
+                 std::unique_ptr<LlamaInstance>, std::unique_ptr<SparkInstance>, std::unique_ptr<Qwen3DenseInstance>,
                  std::unique_ptr<Qwen3MoeInstance>,
                  std::unique_ptr<Qwen3_5Instance>,
                  std::unique_ptr<Qwen3_5MoeInstance>,

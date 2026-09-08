@@ -136,6 +136,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
         // Qwen3.5 full-attention q_proj emits [q, gate] => 2 * (Hq * head_dim).
         q_lora_out = 2 * q_out;
     }
+    if (mConfig.lora_config.fused_qkv) q_lora_out = q_out + 2 * kv_out;
 
     // Attention LoRA: Dense always, Attention always, MoE/SwitchMoE only in non-hybrid.
     // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
@@ -415,6 +416,7 @@ void ModularLoRAWeightsManager::random_init(int seed, NCCLCommunicator& comm) {
 void ModularLoRAWeightsManager::import_from_file(const std::string& file_name, NCCLCommunicator& comm) {
     if (!enabled()) return;
     load_safetensors(file_name, *this, /*allow_cast=*/true);
+    advance_sync_generation();
     CUDA_CHECK(cudaDeviceSynchronize());
     comm.barrier();
 }
@@ -826,8 +828,8 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
         auto& block = mMaster.blocks[l];
 
         if (block.attention.q.has_value()) {
-            callback(prefix + ".self_attn.q_proj.lora_A.weight", block.attention.q->A);
-            callback(prefix + ".self_attn.q_proj.lora_B.weight", block.attention.q->B);
+            callback(prefix + ".self_attn." + mConfig.lora_config.q_proj_name + ".lora_A.weight", block.attention.q->A);
+            callback(prefix + ".self_attn." + mConfig.lora_config.q_proj_name + ".lora_B.weight", block.attention.q->B);
         }
         if (block.attention.k.has_value()) {
             callback(prefix + ".self_attn.k_proj.lora_A.weight", block.attention.k->A);
@@ -838,8 +840,8 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
             callback(prefix + ".self_attn.v_proj.lora_B.weight", block.attention.v->B);
         }
         if (block.attention.o.has_value()) {
-            callback(prefix + ".self_attn.o_proj.lora_A.weight", block.attention.o->A);
-            callback(prefix + ".self_attn.o_proj.lora_B.weight", block.attention.o->B);
+            callback(prefix + ".self_attn." + mConfig.lora_config.o_proj_name + ".lora_A.weight", block.attention.o->A);
+            callback(prefix + ".self_attn." + mConfig.lora_config.o_proj_name + ".lora_B.weight", block.attention.o->B);
         }
 
         // Dense MLP LoRA

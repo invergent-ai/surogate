@@ -39,7 +39,7 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const family::TextGeom
     out.ids       = vector(allocator, DType::I32, tokens);
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
-    out.residual = matrix(allocator, DType::BF16, geometry.residual, tokens);
+    out.residual = matrix(allocator, geometry.residual_dtype(), geometry.residual, tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
     }
@@ -231,7 +231,7 @@ MtpTrunkRoots mtp_trunk_stem(Allocator& allocator, const family::TextGeometry& g
     if (allocate_embedding) {
         out.embedding = matrix(allocator, DType::BF16, geometry.hidden, tokens);
     }
-    out.residual = matrix(allocator, DType::BF16, geometry.residual, tokens);
+    out.residual = matrix(allocator, geometry.residual_dtype(), geometry.residual, tokens);
     return out;
 }
 

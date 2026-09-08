@@ -76,6 +76,27 @@ int main() {
     }
     assert(missing_schedule);
 
+    auto spark = complete;
+    spark["rotary_dim"] = 16;
+    spark["sliding_rotary_dim"] = 64;
+    spark["sliding_window"] = 192;
+    spark["sliding_rope_theta"] = 10000;
+    spark["residual_fp32"] = 1;
+    const auto spark_geometry = sinfer::family::TextGeometry::resolved(spark, types);
+    assert(spark_geometry.rotary_dim == 16 && spark_geometry.sliding_rotary_dim == 64);
+    assert(spark_geometry.residual_dtype() == sinfer::DType::FP32);
+    assert(resolved.residual_dtype() == sinfer::DType::BF16);
+    for (const auto& [name, value] : std::map<std::string, double>{
+             {"sliding_rotary_dim", 65}, {"sliding_window", 0},
+             {"sliding_rope_theta", 0}, {"residual_fp32", 2}}) {
+        auto bad = spark;
+        bad[name] = value;
+        bool threw = false;
+        try { (void)sinfer::family::TextGeometry::resolved(bad, types); }
+        catch (const std::invalid_argument&) { threw = true; }
+        assert(threw);
+    }
+
     auto gemma3 = complete;
     gemma3.insert({{"sliding_window", 192}, {"sliding_rope_theta", 1234}, {"embedding_scale", 16}});
     const auto resolved_gemma3 = sinfer::family::TextGeometry::resolved_gemma3(gemma3, types);

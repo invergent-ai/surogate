@@ -401,6 +401,52 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     Tensor& residual_out = *residual_out_ptr;
 
     // d_residual_next is the incoming gradient from the next layer (may be zero/empty)
+    if (residual_out.DType == ETensorDType::FP32 && d_y.DType == ETensorDType::BF16) {
+        Tensor d_residual{};
+        Tensor d_branch{};
+        Tensor d_weight{};
+        if (!op.outputs[0].name.empty()) d_residual = ensure_output_tensor(op.outputs[0]);
+        if (!op.outputs[1].name.empty()) d_branch = ensure_output_tensor(op.outputs[1]);
+        if (op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
+            d_weight = ensure_output_tensor(op.outputs[2]);
+            if (op.outputs[2].slot == TensorSlot::Mapped) fill_zero(d_weight, mRunState.MainStream);
+        }
+        const Tensor* d_next = op.inputs[1].name.empty() ? nullptr : &resolve_tensor(op.inputs[1]);
+        // The backward arena may reuse an input's storage at its last use.
+        // FP32 residual gradients and BF16 branch gradients cannot safely
+        // share that storage during the kernel: different rows would read
+        // and overwrite overlapping bytes concurrently.
+        auto stage_overlapping_input = [&](const Tensor& input, const char* name) {
+            if (!tensors_overlap(input, d_residual) && !tensors_overlap(input, d_branch)) {
+                return input;
+            }
+            Tensor copy = mRunState.temp_alloc(input.DType,
+                std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank), name);
+            CUDA_CHECK(cudaMemcpyAsync(copy.Data, input.Data, input.bytes(), cudaMemcpyDeviceToDevice,
+                                       mRunState.MainStream));
+            mTemps.push_back(copy);
+            return copy;
+        };
+        Tensor kernel_d_y = stage_overlapping_input(d_y, "fp32_norm_dy");
+        Tensor kernel_d_next{};
+        if (d_next) kernel_d_next = stage_overlapping_input(*d_next, "fp32_norm_d_next");
+        const int channels = mConfig.HiddenSize;
+        const int rows = static_cast<int>(residual_out.nelem() / channels);
+        Tensor partials{};
+        if (d_weight.Data) {
+            partials = mRunState.temp_alloc(ETensorDType::FP32, {(rows + 31) / 32, channels}, "fp32_norm_dw");
+            mTemps.push_back(partials);
+        }
+        fused_residual_rmsnorm_fp32_backward(d_residual, d_branch, d_weight.Data ? &d_weight : nullptr,
+                                             partials, kernel_d_y, d_next ? &kernel_d_next : nullptr,
+                                             residual_out, weight, *rstd_ptr,
+                                             rows, channels, mRunState.MainStream);
+        if (d_residual.Data) store_tensor(op.outputs[0], d_residual);
+        if (d_branch.Data) store_tensor(op.outputs[1], d_branch);
+        if (d_weight.Data) store_tensor(op.outputs[2], d_weight);
+        return;
+    }
+
     Tensor d_residual_zero{};
     Tensor* d_residual_next = nullptr;
     if (!op.inputs[1].name.empty()) {

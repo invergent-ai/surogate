@@ -27,6 +27,7 @@ class AttentionConfig:
 
     # QKV layout
     fuse_qkv: bool = True
+    fused_qkv_lora: bool = False  # one adapter for a native fused QKV projection
     k_eq_v: bool = False
 
     # Norms
@@ -49,6 +50,7 @@ class AttentionConfig:
 
     # Attention-specific extras
     has_sinks: bool = False  # GPT-OSS: per-head learnable sink scalars
+    headwise_output_gate: bool = False  # sigmoid gate projected from the normalized input
     softmax_scale: float | None = None  # None = default (1/sqrt(D)); Gemma4 uses 1.0
     partial_rotary_factor: float = 1.0  # fraction of head dim rotated by RoPE
 

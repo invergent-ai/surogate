@@ -457,7 +457,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
     // A head whose attention writes no gate rows skips the multiply, as the trunk does.
-    if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
+    if constexpr (kAttentionOutputGate) { apply_attention_gate<Variant>(gate, a, s); }
 
     const auto post = workspace_recipe::mtp_post_attention(work_, cfg_geometry(), T);
     Tensor o        = post.output;
@@ -706,7 +706,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor a = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
         ops::gqa_attention_cached(qn, last_position, cfg_.attention_scale, mtp_kv_.layer_view(0), envelope,
                                   work_, a, s);
-        if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
+        if constexpr (kAttentionOutputGate) { apply_attention_gate<Variant>(gate, a, s); }
 
         Tensor o = work_.alloc(DType::BF16, {cfg_.hidden, 1});
         mtp_attention_output(a.view({cfg_.q_size, 1}), o);
@@ -996,7 +996,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
-        Tensor x = work_.alloc(DType::BF16, {cfg_.residual, batch});
+        Tensor x = work_.alloc(weights_.geometry.residual_dtype(), {cfg_.residual, batch});
         if constexpr (Hooks::prologue) {
             prologue_ =
                 prologue_staging::decode_columns(work_, ids, linear_state_slots, batch, stream);
@@ -1057,7 +1057,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
 
-        Tensor x        = work_.alloc(DType::BF16, {cfg_.residual, columns});
+        Tensor x        = work_.alloc(weights_.geometry.residual_dtype(), {cfg_.residual, columns});
         Tensor flat_ids = ids.view({columns});
         if constexpr (Hooks::prologue) {
             // A speculative verify gives each lane several consecutive columns, and they are
@@ -1283,7 +1283,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
                                   kv_view, layer_envelope, work_, a, s, selection);
     }
     // A dense stack writes no gate rows; see attention_output_gate<Variant>().
-    if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
+    if constexpr (kAttentionOutputGate) { apply_attention_gate<Variant>(gate, a, s); }
 
     debug_probe<Variant>("attn_core", a.view({layer_q_size, T}), cfg_.n_layers, s);
     Hooks::attention_output(a.view({layer_q_size, T}), *w.o_proj, *w.projection, x, ph, work_, s);
@@ -2000,7 +2000,7 @@ void TextContext::stage_import(Tensor& x, cudaStream_t stream) {
     const std::int32_t columns = x.ne[1];
     if (columns > stage_.columns) { throw std::logic_error("pipeline stage import wider than its buffer"); }
     CUDA_CHECK(cudaMemcpyAsync(x.data, stage_.import_pinned,
-                               static_cast<std::size_t>(cfg_.residual) * columns * sizeof(std::uint16_t),
+                               x.bytes(),
                                cudaMemcpyHostToDevice, stream));
     stage_checksum("import", stage_first_, stage_last_, x.data, cfg_.residual, columns, stream);
 }
@@ -2010,7 +2010,7 @@ void TextContext::stage_export(const Tensor& x, cudaStream_t stream) {
     if (columns > stage_.columns) { throw std::logic_error("pipeline stage export wider than its buffer"); }
     stage_checksum("export", stage_first_, stage_last_, x.data, cfg_.residual, columns, stream);
     CUDA_CHECK(cudaMemcpyAsync(stage_.export_pinned, x.data,
-                               static_cast<std::size_t>(cfg_.residual) * columns * sizeof(std::uint16_t),
+                               x.bytes(),
                                cudaMemcpyDeviceToHost, stream));
 }
 
@@ -2310,7 +2310,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     }
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
-                if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
+                if constexpr (kAttentionOutputGate) { apply_attention_gate<Variant>(gate, a, s); }
                 Hooks::attention_output(a.view({layer_q_size, total}), *full.o_proj,
                                         *full.projection, x,
                                                      Phase::Prefill, work_, s);
@@ -2889,7 +2889,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     }
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
-                if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
+                if constexpr (kAttentionOutputGate) { apply_attention_gate<Variant>(gate, a, s); }
                 Hooks::attention_output(a.view({layer_q_size, total}), *full.o_proj,
                                         *full.projection, x,
                                                      Phase::Prefill, work_, s);

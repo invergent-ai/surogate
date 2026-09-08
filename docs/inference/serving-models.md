@@ -98,6 +98,26 @@ The GGUF includes its tokenizer and chat template. Use `--no-thinking` for direc
 or set `"chat_template_kwargs": {"enable_thinking": false}` in an individual chat request.
 Set `enable_thinking` to `true` to request reasoning output.
 
+## Spark-X2.5
+
+Serve either [Spark-X2.5-1.7B](https://huggingface.co/XHToken/Spark-X2.5-1.7B) or
+[Spark-X2.5-4B](https://huggingface.co/XHToken/Spark-X2.5-4B) directly:
+
+```bash
+surogate serve XHToken/Spark-X2.5-1.7B --port 8080 --enable-auto-tool-choice --tool-call-parser spark25
+surogate serve XHToken/Spark-X2.5-4B --port 8080 --enable-auto-tool-choice --tool-call-parser spark25
+```
+
+The `spark25` parser enables tool calling through the chat API. LoRA adapters are not yet
+supported for these models.
+
+Choose one command. The first start downloads the checkpoint and prepares its serving cache;
+subsequent starts reuse that cache. A local checkpoint directory also works.
+
+Use `--no-thinking` for direct answers. You can override this per chat request with
+`"chat_template_kwargs": {"enable_thinking": true}` or `false`. Set `--max-model-len`
+to the context length you need, for example `--max-model-len 8192`.
+
 ## A model larger than the card
 
 Use system RAM for part of a model when its weights do not fit in GPU memory. This requires

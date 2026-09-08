@@ -10,6 +10,7 @@
 #include <api/family/frontend_resources.h>
 
 #include "family/impl/frontend/test_access.h"
+#include "family/impl/frontend/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -104,6 +105,35 @@ void check_split_sequence() {
     root["model"]["vocab"]["ģ"] = 12;
     assets.tokenizer_json = root.dump();
     expect_resources("identity normalization", assets, "e\u0301", {10, 11, 12});
+    // Spark's empty normalizer sequence is identity, including normalized added tokens.
+    root["normalizer"] = Json{{"type", "Sequence"}, {"normalizers", Json::array()}};
+    root["added_tokens"] = Json::array({Json{{"id", 13}, {"content", "<special>"},
+        {"special", true}, {"normalized", true}, {"lstrip", false}, {"rstrip", false},
+        {"single_word", false}}});
+    auto& spark_stages = root["pre_tokenizer"]["pretokenizers"];
+    spark_stages.insert(spark_stages.end() - 1, Json{{"type", "Digits"}, {"individual_digits", true}});
+    assets.tokenizer_json = root.dump();
+    expect_resources("Digits after Split forbids digit merges", assets, "1734", {0, 3, 1, 2});
+    expect_resources("empty Sequence preserves decomposed text", assets, "e\u0301", {10, 11, 12});
+    expect_resources("identity normalized special token", assets, "<special>", {13});
+    const std::string tmpl = "{{ tools[0].function.name }}:{{ messages[0].reasoning_content }}:"
+        "{{ messages[0].tool_calls[0].function.arguments.city }}:{{ messages[1].tool_call_id }}";
+    sinfer::family::frontend_internal::Tokenizer tok({
+        .tokenizer_json = assets.tokenizer_json,
+        .tokenizer_config_json = assets.tokenizer_config_json,
+        .generation_config_json = assets.generation_config_json,
+        .chat_template_jinja = tmpl,
+        .render_chat_template = true,
+    });
+    const auto rendered = tok.render_chat_template_json(
+        R"([{"role":"assistant","content":"","reasoning_content":"reason","tool_calls":[{"function":{"name":"weather","arguments":{"city":"Paris"}}}]},{"role":"tool","content":"sunny","tool_call_id":"call_1"}])",
+        {R"({"type":"function","function":{"name":"weather","parameters":{}}})"}, false);
+    if (rendered != "weather:reason:Paris:call_1") {
+        std::cerr << "structured Jinja messages lost fields: " << rendered << '\n';
+        ++failures;
+    }
+
+
 }
 
 } // namespace

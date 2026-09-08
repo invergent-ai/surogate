@@ -90,6 +90,8 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     if model_type == "qwen3_moe" and hidden > 0 and layers > 0:
         return ConverterTarget("qwen3_moe", "surogate.serve.convert.qwen3_moe.convert",
                                "Qwen3-MoE", gguf_repack=True)
+    if model_type == "spark2_5" and hidden > 0 and layers > 0:
+        return ConverterTarget("spark2_5", "surogate.serve.convert.spark2_5.convert", "Spark-X2.5")
     if model_type == "llama" and hidden > 0 and layers > 0:
         return ConverterTarget("llama", "surogate.serve.convert.llama.convert", "Llama",
                                gguf_repack=True)

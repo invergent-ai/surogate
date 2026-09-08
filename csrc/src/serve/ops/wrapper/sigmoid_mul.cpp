@@ -49,4 +49,15 @@ void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
     detail::sigmoid_gate_mul_launch(gate, x, stream); // single variant -> direct dispatch
 }
 
+void headwise_sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
+    if (gate.dtype != DType::BF16 || x.dtype != DType::BF16 ||
+        x.ne[0] <= 0 || x.ne[1] <= 0 || x.ne[2] <= 0 || x.ne[3] != 1 ||
+        gate.ne[0] != x.ne[1] || gate.ne[1] != x.ne[2] ||
+        gate.ne[2] != 1 || gate.ne[3] != 1 || !gate.is_contiguous() || !x.is_contiguous() ||
+        !gate.data || !x.data) {
+        throw std::invalid_argument("headwise_sigmoid_mul: expected BF16 gate[heads,tokens] and x[dim,heads,tokens]");
+    }
+    detail::headwise_sigmoid_mul_launch(gate, x, stream);
+}
+
 } // namespace sinfer::ops

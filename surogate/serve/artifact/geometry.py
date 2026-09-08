@@ -12,6 +12,7 @@ from collections.abc import Mapping
 TEXT_INT_FIELDS = (
     "hidden",
     "residual",
+    "residual_fp32",
     "layers",
     "intermediate",
     "output_rows",
@@ -20,6 +21,7 @@ TEXT_INT_FIELDS = (
     "kv_heads",
     "head_dim",
     "rotary_dim",
+    "sliding_rotary_dim",
     "gdn_conv_kernel",
     "gdn_key_heads",
     "gdn_key_head_dim",
@@ -124,6 +126,13 @@ def validate_resolved_geometry(values: Mapping[str, object]) -> dict[str, int | 
         raise ValueError("geometry.rotary_dim must be even and no greater than head_dim")
     if result["rotary_dim"] and result["rope_theta"] <= 0:
         raise ValueError("geometry.rope_theta must be positive when rotary_dim is nonzero")
+    if result.get("residual_fp32", 0) not in (0, 1):
+        raise ValueError("geometry.residual_fp32 must be 0 or 1")
+    sliding_dim = result.get("sliding_rotary_dim", 0)
+    if sliding_dim > result["head_dim"] or sliding_dim % 2:
+        raise ValueError("geometry.sliding_rotary_dim must be even and no greater than head_dim")
+    if sliding_dim and (not result.get("sliding_window") or not result.get("sliding_rope_theta")):
+        raise ValueError("sliding_rotary_dim requires sliding_window and sliding_rope_theta")
     if result["layers"] > 256:
         raise ValueError("serving supports at most 256 layers")
     for heads in ("query_heads", "kv_heads"):

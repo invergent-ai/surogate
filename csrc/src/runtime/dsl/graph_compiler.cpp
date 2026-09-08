@@ -1218,6 +1218,9 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
         // Map field to slot using the registry (supports both built-in and DSL-defined slots)
         if (auto slot_entry = mSlotRegistry.lookup(base_field)) {
             ref.slot = slot_entry->slot;
+            if (slot_entry->dtype.has_value()) {
+                ref.dtype = *slot_entry->dtype;
+            }
 
             // Handle global slots that appear with block indices (e.g., rope_freqs)
             if (slot_entry->scope == ActivationScope::Global) {
@@ -1542,6 +1545,13 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         case CompiledOpType::MoEGroupedGemmGateUpBackward:
         case CompiledOpType::MoEGroupedGemmDownBackward: inject_lora_slices(/*weight_idx=*/2); break;
         default: break;
+    }
+
+    if (auto* value = find_attr(op.attrs, "approximate")) {
+        const auto mode = attr_string(*value);
+        if (!mode || (*mode != "tanh" && *mode != "none"))
+            throw std::runtime_error("gelu approximate must be tanh or none");
+        attrs.gelu_exact = *mode == "none";
     }
 
     // Epsilon for normalization ops
@@ -5785,6 +5795,12 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
         compiled.inputs.reserve(op.inputs.size());
         for (std::size_t i = 0; i < op.inputs.size(); ++i) {
             auto ref = resolve_tensor_ref(op.inputs[i], false, op, *env_ptr);
+            // Slot lookup can return before consulting inferred dtypes. A
+            // consumer must use its producer's dtype, including block refs
+            // and the gradients carried between blocks.
+            if (auto it = mTensorDtypes.find(ref.name); it != mTensorDtypes.end()) {
+                ref.dtype = it->second;
+            }
             if ((compiled.type == CompiledOpType::RMSNormBackward ||
                  compiled.type == CompiledOpType::LayerNormBackward) &&
                 i == 3) {
@@ -6602,6 +6618,18 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                         }
                     }
                 }
+            }
+
+            // Residual storage can be FP32 while the branch and norm remain BF16.
+            if ((compiled.type == CompiledOpType::View || compiled.type == CompiledOpType::ViewBackward) &&
+                !compiled.inputs.empty()) {
+                ref.dtype = compiled.inputs[0].dtype;
+            }
+            if (compiled.type == CompiledOpType::FusedResidualRMSNorm && i < 2 && compiled.inputs.size() >= 2) {
+                ref.dtype = compiled.inputs[i].dtype;
+            }
+            if (compiled.type == CompiledOpType::FusedResidualRMSNormBackward && i < 2 && compiled.inputs.size() >= 3) {
+                ref.dtype = compiled.inputs[i == 0 ? 2 : 0].dtype;
             }
 
             // Also fix dtype for pre-allocated RSTD slots (must be FP32)

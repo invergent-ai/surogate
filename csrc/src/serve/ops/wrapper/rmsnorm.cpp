@@ -50,7 +50,8 @@ namespace {
 void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                   const Tensor* z, Tensor& out, cudaStream_t stream,
                   GatedRmsGate gate = GatedRmsGate::Silu, bool accumulate = false) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || out.dtype != DType::BF16 ||
+    const bool fp32_input = x.dtype == DType::FP32 && z == nullptr && !accumulate;
+    if ((!fp32_input && x.dtype != DType::BF16) || weight.dtype != DType::BF16 || out.dtype != DType::BF16 ||
         (z != nullptr && z->dtype != DType::BF16)) {
         throw std::invalid_argument("rmsnorm: x/weight/z/out must be BF16");
     }
@@ -84,6 +85,10 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
         throw std::invalid_argument("rmsnorm: x/weight/z/out data must be non-null");
     }
 
+    if (fp32_input) {
+        detail::rmsnorm_fp32_launch(x, weight, eps, unit_offset, out, stream);
+        return;
+    }
     if (accumulate) {
         if (x.data == out.data) {
             throw std::invalid_argument("rmsnorm_add: x must not alias out");

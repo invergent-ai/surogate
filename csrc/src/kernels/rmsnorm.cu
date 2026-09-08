@@ -1238,3 +1238,128 @@ void rmsnorm_forward_quant(Tensor& out,
                           C,
                           stream);
 }
+
+namespace {
+
+__device__ float residual_block_sum(float value) {
+    __shared__ float warps[8];
+    value = warpReduceSum(value);
+    if ((threadIdx.x & 31) == 0) warps[threadIdx.x / 32] = value;
+    __syncthreads();
+    float total = threadIdx.x < 8 ? warps[threadIdx.x] : 0.0f;
+    if (threadIdx.x < 32) total = warpReduceSum(total);
+    if (threadIdx.x == 0) warps[0] = total;
+    __syncthreads();
+    return warps[0];
+}
+
+__global__ void residual_fp32_norm_fwd(float* residual, nv_bfloat16* y, float* rstd,
+                                      const float* residual_in, const nv_bfloat16* branch,
+                                      const nv_bfloat16* weight, float eps, int C) {
+    const long row = blockIdx.x;
+    float sum = 0.0f;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        const long i = row * C + c;
+        const float x = residual_in[i] + __bfloat162float(branch[i]);
+        residual[i] = x;
+        sum += x * x;
+    }
+    const float scale = rsqrtf(residual_block_sum(sum) / C + eps);
+    if (threadIdx.x == 0) rstd[row] = scale;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        const long i = row * C + c;
+        y[i] = __float2bfloat16_rn((residual[i] * scale) * __bfloat162float(weight[c]));
+    }
+}
+
+__global__ void residual_fp32_norm_bwd(float* d_residual, nv_bfloat16* d_branch,
+                                      const nv_bfloat16* dy, const float* d_next,
+                                      const float* residual, const nv_bfloat16* weight,
+                                      const float* rstd, int C) {
+    const long row = blockIdx.x;
+    const float scale = rstd[row];
+    float sum = 0.0f;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        const long i = row * C + c;
+        sum += (__bfloat162float(dy[i]) * __bfloat162float(weight[c])) * (residual[i] * scale);
+    }
+    const float mean = residual_block_sum(sum) / C;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        const long i = row * C + c;
+        const float norm_grad = scale * (__bfloat162float(dy[i]) * __bfloat162float(weight[c])
+                                        - (residual[i] * scale) * mean);
+        const float grad = norm_grad + (d_next ? d_next[i] : 0.0f);
+        if (d_residual) d_residual[i] = grad;
+        if (d_branch) d_branch[i] = __float2bfloat16_rn(grad);
+    }
+}
+
+// Keep the norm-weight reduction bounded: one partial for each group of 32 rows.
+__global__ void residual_fp32_norm_dw_partials(float* partials, const nv_bfloat16* dy,
+                                              const float* residual, const float* rstd, int rows, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int start = blockIdx.y * 32;
+    float sum = 0.0f;
+    for (int row = start; row < min(rows, start + 32); ++row) {
+        const long i = static_cast<long>(row) * C + c;
+        sum += __bfloat162float(dy[i]) * (residual[i] * rstd[row]);
+    }
+    partials[static_cast<long>(blockIdx.y) * C + c] = sum;
+}
+
+template<typename T>
+__global__ void residual_fp32_norm_dw_reduce(T* dw, const float* partials, int groups, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float sum = 0.0f;
+    for (int group = 0; group < groups; ++group) sum += partials[static_cast<long>(group) * C + c];
+    dw[c] = static_cast<T>(static_cast<float>(dw[c]) + sum);
+}
+
+}  // namespace
+
+void fused_residual_rmsnorm_fp32_forward(Tensor& residual, Tensor& normed, Tensor& rstd,
+                                       const Tensor& residual_in, const Tensor& branch, const Tensor& weight,
+                                       float epsilon, int rows, int channels, cudaStream_t stream) {
+    if (residual.DType != ETensorDType::FP32 || residual_in.DType != ETensorDType::FP32 ||
+        normed.DType != ETensorDType::BF16 || branch.DType != ETensorDType::BF16 ||
+        weight.DType != ETensorDType::BF16 || rstd.DType != ETensorDType::FP32)
+        throw std::logic_error("fused_residual_rmsnorm_fp32_forward: dtype mismatch");
+    if (rows == 0) return;
+    residual_fp32_norm_fwd<<<rows, 256, 0, stream>>>(
+        residual.get<float>(), normed.get<nv_bfloat16>(), rstd.get<float>(), residual_in.get<float>(),
+        branch.get<nv_bfloat16>(), weight.get<nv_bfloat16>(), epsilon, channels);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void fused_residual_rmsnorm_fp32_backward(Tensor& d_residual, Tensor& d_branch, Tensor* d_weight,
+                                        Tensor& weight_partials, const Tensor& d_y, const Tensor* d_residual_next,
+                                        const Tensor& residual, const Tensor& weight, const Tensor& rstd,
+                                        int rows, int channels, cudaStream_t stream) {
+    if ((d_residual.Data && d_residual.DType != ETensorDType::FP32) ||
+        (d_branch.Data && d_branch.DType != ETensorDType::BF16) || d_y.DType != ETensorDType::BF16 ||
+        (d_residual_next && d_residual_next->DType != ETensorDType::FP32) ||
+        residual.DType != ETensorDType::FP32 || weight.DType != ETensorDType::BF16 || rstd.DType != ETensorDType::FP32)
+        throw std::logic_error("fused_residual_rmsnorm_fp32_backward: dtype mismatch");
+    if (rows == 0) return;
+    residual_fp32_norm_bwd<<<rows, 256, 0, stream>>>(
+        d_residual.Data ? d_residual.get<float>() : nullptr,
+        d_branch.Data ? d_branch.get<nv_bfloat16>() : nullptr, d_y.get<nv_bfloat16>(),
+        d_residual_next ? d_residual_next->get<float>() : nullptr, residual.get<float>(),
+        weight.get<nv_bfloat16>(), rstd.get<float>(), channels);
+    CUDA_CHECK(cudaGetLastError());
+    if (d_weight && d_weight->Data) {
+        const int groups = (rows + 31) / 32;
+        residual_fp32_norm_dw_partials<<<dim3((channels + 255) / 256, groups), 256, 0, stream>>>(
+            weight_partials.get<float>(), d_y.get<nv_bfloat16>(), residual.get<float>(), rstd.get<float>(), rows, channels);
+        if (d_weight->DType == ETensorDType::FP32) {
+            residual_fp32_norm_dw_reduce<<<(channels + 255) / 256, 256, 0, stream>>>(
+                d_weight->get<float>(), weight_partials.get<float>(), groups, channels);
+        } else if (d_weight->DType == ETensorDType::BF16) {
+            residual_fp32_norm_dw_reduce<<<(channels + 255) / 256, 256, 0, stream>>>(
+                d_weight->get<nv_bfloat16>(), weight_partials.get<float>(), groups, channels);
+        } else throw std::logic_error("fused_residual_rmsnorm_fp32_backward: unsupported weight gradient dtype");
+        CUDA_CHECK(cudaGetLastError());
+    }
+}

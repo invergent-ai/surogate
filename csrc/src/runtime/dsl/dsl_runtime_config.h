@@ -32,6 +32,7 @@ struct LayerRoPEConfig {
 };
 
 struct DslRuntimeConfig {
+    bool residual_fp32 = false;
     int num_experts = 0;
     int num_experts_per_tok = 0;
     int moe_intermediate_size = 0;

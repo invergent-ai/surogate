@@ -39,7 +39,7 @@ struct LoRAAdapterConfig {
     }
 
     [[nodiscard]] bool applies_to_q() const {
-        return applies_to("q_proj");
+        return applies_to("q_proj") || applies_to("q_k_v_proj");
     }
     [[nodiscard]] bool applies_to_k() const {
         return applies_to("k_proj");
@@ -48,7 +48,7 @@ struct LoRAAdapterConfig {
         return applies_to("v_proj");
     }
     [[nodiscard]] bool applies_to_o() const {
-        return applies_to("o_proj");
+        return applies_to("o_proj") || applies_to("out_proj");
     }
     [[nodiscard]] bool applies_to_gate() const {
         return applies_to("gate_proj");

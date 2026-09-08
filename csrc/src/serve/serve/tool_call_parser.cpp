@@ -116,6 +116,38 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, To
     return true;
 }
 
+bool parse_spark_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
+    constexpr std::string_view key_open = "<arg_key>", key_close = "</arg_key>";
+    constexpr std::string_view value_open = "<arg_value>", value_close = "</arg_value>";
+    const auto name_end = block.find('<');
+    const auto name = trim_ascii(block.substr(0, name_end));
+    if (!valid_function_name(name, max_name_length)) { return false; }
+    Json args = Json::object();
+    std::size_t pos = name_end == std::string_view::npos ? block.size() : name_end;
+    while (pos < block.size()) {
+        skip_ws(block, pos);
+        if (pos == block.size()) { break; }
+        if (!starts_with_at(block, pos, key_open)) { return false; }
+        pos += key_open.size();
+        const auto end_key = block.find(key_close, pos);
+        if (end_key == std::string_view::npos) { return false; }
+        const auto key = trim_ascii(block.substr(pos, end_key - pos));
+        if (key.empty() || args.contains(key)) { return false; }
+        pos = end_key + key_close.size();
+        skip_ws(block, pos);
+        if (!starts_with_at(block, pos, value_open)) { return false; }
+        pos += value_open.size();
+        const auto end_value = block.find(value_close, pos);
+        if (end_value == std::string_view::npos) { return false; }
+        const auto raw = std::string(block.substr(pos, end_value - pos));
+        auto value = Json::parse(raw, nullptr, false);
+        args[key] = value.is_discarded() ? Json(raw) : std::move(value);
+        pos = end_value + value_close.size();
+    }
+    out.id = new_tool_call_id(); out.name = name; out.arguments_json = args.dump();
+    return true;
+}
+
 ParsedToolCallOutput fallback(const std::string& text) {
     ParsedToolCallOutput out;
     out.content = text;
@@ -124,8 +156,8 @@ ParsedToolCallOutput fallback(const std::string& text) {
 
 } // namespace
 
-ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length) {
+static ParsedToolCallOutput parse_tagged_tool_call_output(const std::string& text,
+                                                 std::size_t max_tool_name_length, bool spark) {
     constexpr std::string_view kToolOpen  = "<tool_call>";
     constexpr std::string_view kToolClose = "</tool_call>";
 
@@ -144,7 +176,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         const std::size_t close       = text.find(kToolClose, inner_begin);
         if (close == std::string::npos) { return fallback(text); }
         ToolCall call;
-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+        const auto parser = spark ? parse_spark_call : parse_one_tool_call;
+        if (!parser(std::string_view(text).substr(inner_begin, close - inner_begin),
                                  max_tool_name_length, call)) {
             return fallback(text);
         }
@@ -155,6 +188,14 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     if (out.tool_calls.empty()) { return fallback(text); }
     out.is_tool_call_response = true;
     return out;
+}
+
+ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text, std::size_t max_name) {
+    return parse_tagged_tool_call_output(text, max_name, false);
+}
+
+ParsedToolCallOutput parse_spark_tool_call_output(const std::string& text, std::size_t max_name) {
+    return parse_tagged_tool_call_output(text, max_name, true);
 }
 
 std::string ToolCallStreamFilter::feed(std::string_view text) {

@@ -126,6 +126,12 @@ public:
                                     bool add_generation_prompt,
                                     const ChatTemplateVariables& variables) const;
 
+    // Preserve reasoning, tool calls and tool results when rendering an external template.
+    std::string apply_chat_template_json(const std::string& messages_json,
+                                         const std::vector<std::string>& tool_jsons,
+                                         bool add_generation_prompt,
+                                         const ChatTemplateVariables& variables) const;
+
     // Convenience: apply_chat_template + encode_with_special_tokens in one call.
     std::vector<int32_t> apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,
                                                         bool add_generation_prompt = false) const;

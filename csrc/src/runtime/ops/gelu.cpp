@@ -27,7 +27,8 @@ void CompiledExecutor::dispatch_gelu(const CompiledOp& op) {
     }
 
     const long N = static_cast<long>(inp.nelem());
-    gelu_forward(out, inp, N, mRunState.MainStream);
+    if (op.attrs.gelu_exact) gelu_exact_forward(out, inp, N, mRunState.MainStream);
+    else gelu_forward(out, inp, N, mRunState.MainStream);
 
     store_tensor(op.outputs[0], out);
 }
@@ -47,7 +48,8 @@ void CompiledExecutor::dispatch_gelu_backward(const CompiledOp& op) {
         : ensure_output_tensor(op.outputs[0]);
 
     const long N = static_cast<long>(inp.nelem());
-    gelu_backward(d_inp, inp, d_out, N, mRunState.MainStream);
+    if (op.attrs.gelu_exact) gelu_exact_backward(d_inp, inp, d_out, N, mRunState.MainStream);
+    else gelu_backward(d_inp, inp, d_out, N, mRunState.MainStream);
 
     store_tensor(op.outputs[0], d_inp);
 }
@@ -70,7 +72,7 @@ std::vector<Operation> gelu_backward(const BackwardRuleContext& ctx) {
                                      "gelu_backward",
                                      "gelu_backward",
                                      {ctx.d_output, saved_ref(x)},
-                                     {ctx.d_inputs[0]}));
+                                     {ctx.d_inputs[0]}, copy_attrs(fwd.attrs, {"approximate"})));
     }
 
     return ops;

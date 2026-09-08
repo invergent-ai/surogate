@@ -188,7 +188,8 @@ struct Tokenizer::Impl {
     // Render the chat template with the given messages and options.
     std::string render_chat_template(const nlohmann::ordered_json& messages,
                                      bool add_generation_prompt,
-                                     const ChatTemplateVariables& variables = {}) const {
+                                     const ChatTemplateVariables& variables = {},
+                                     const std::vector<std::string>& tool_jsons = {}) const {
         if (!chat_tmpl_root) {
             throw std::runtime_error("No chat template loaded.");
         }
@@ -205,6 +206,10 @@ struct Tokenizer::Impl {
         }
         if (variables.reasoning_effort.has_value()) {
             ctx_json["reasoning_effort"] = *variables.reasoning_effort;
+        }
+        if (!tool_jsons.empty()) {
+            ctx_json["tools"] = json::array();
+            for (const auto& tool : tool_jsons) { ctx_json["tools"].push_back(json::parse(tool)); }
         }
         auto context = minja::Context::make(ctx_json);
         context->set("bos_token", bos_token_str);
@@ -1151,6 +1156,15 @@ std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messa
                                            bool add_generation_prompt,
                                            const ChatTemplateVariables& variables) const {
     return impl_->render_prefix(messages, messages.size(), add_generation_prompt, variables);
+}
+
+std::string Tokenizer::apply_chat_template_json(const std::string& messages_json,
+                                                const std::vector<std::string>& tool_jsons,
+                                                bool add_generation_prompt,
+                                                const ChatTemplateVariables& variables) const {
+    const auto messages = nlohmann::ordered_json::parse(messages_json);
+    if (!messages.is_array()) { throw std::invalid_argument("chat messages must be a JSON array"); }
+    return impl_->render_chat_template(messages, add_generation_prompt, variables, tool_jsons);
 }
 
 std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,

@@ -379,14 +379,17 @@ class GraphBuilder:
         )
         return self._make_output(out)
 
-    def gelu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
-        """GELU activation."""
+    def gelu(self, x: str | GraphRef, *, approximate: str = "tanh", out_name: str | None = None) -> GraphRef:
+        """GELU activation, with either tanh approximation or the exact erf formula."""
+        if approximate not in ("tanh", "none"):
+            raise ValueError("GELU approximate must be 'tanh' or 'none'")
         out = out_name if out_name else self._fresh_name("gelu")
         self._add_node(
             GraphNode(
                 op="gelu",
                 inputs=[self._resolve_input(x)],
                 outputs=[out],
+                attrs={"approximate": approximate},
             )
         )
         return self._make_output(out)

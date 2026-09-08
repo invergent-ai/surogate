@@ -32,6 +32,7 @@ enum class ReasoningFormat {
 enum class ToolCallFormat {
     None,        ///< tool calls are not parsed out of the text
     QwenXml,     ///< `<tool_call>{"name":..,"arguments":{..}}</tool_call>` (qwen3_xml, hermes)
+    Spark25,     ///< `<tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value></tool_call>`
     Llama3Json,  ///< bare `{"name":..,"parameters":{..}}`, optionally after `<|python_tag|>`
 };
 

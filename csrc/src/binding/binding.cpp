@@ -1273,6 +1273,8 @@ NB_MODULE(_surogate, m) {
              nb::arg("path"),
              "Export model weights and config to a directory.\n\n"
              "Parameters:\n- path: Output directory path.")
+        .def("import_adapter", &MultiGPUPyTrainer::import_adapter, nb::arg("path"),
+             "Load adapter_model.safetensors into a trainer configured with matching LoRA targets and rank.")
         .def("export_adapter",
              &MultiGPUPyTrainer::export_adapter,
              nb::arg("path"),

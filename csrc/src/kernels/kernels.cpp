@@ -219,6 +219,10 @@ void fused_residual_rmsnorm_forward(Tensor& residual,
                                     int N,
                                     int C,
                                     cudaStream_t stream) {
+    if (residual.DType == ETensorDType::FP32 && normed.DType == ETensorDType::BF16) {
+        fused_residual_rmsnorm_fp32_forward(residual, normed, rrms, inp1, inp2, weight, epsilon, N, C, stream);
+        return;
+    }
     if (residual.DType == ETensorDType::BF16) {
         fused_residual_rmsnorm_forward(residual.get<nv_bfloat16>(),
                                        normed.get<nv_bfloat16>(),

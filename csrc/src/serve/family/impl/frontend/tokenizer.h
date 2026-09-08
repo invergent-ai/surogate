@@ -86,6 +86,10 @@ public:
                          bool add_generation_prompt,
                          const ChatTemplateVariables& variables = {}) const;
 
+    [[nodiscard]] std::string render_chat_template_json(
+        const std::string& messages_json, const std::vector<std::string>& tool_jsons,
+        bool add_generation_prompt, const ChatTemplateVariables& variables = {}) const;
+
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;

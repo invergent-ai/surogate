@@ -30,8 +30,8 @@ std::int64_t numel_allow_zero(const Tensor& t) {
 } // namespace
 
 void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
-    if (y.dtype != DType::BF16 || x.dtype != DType::BF16) {
-        throw std::invalid_argument("residual_add: y/x must be BF16");
+    if (y.dtype != DType::BF16 || (x.dtype != DType::BF16 && x.dtype != DType::FP32)) {
+        throw std::invalid_argument("residual_add: y must be BF16 and x BF16 or FP32");
     }
     for (int d = 0; d < 4; ++d) {
         if (y.ne[d] != x.ne[d]) {

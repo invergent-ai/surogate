@@ -13,7 +13,7 @@ namespace sinfer::ops {
  *   gain[d]  = unit_offset ? 1 + weight[d] : weight[d]
  *   ideal[d,r] = x[d,r] * inv_r * gain[d].
  *
- * `x` and `out` are same-shaped contiguous BF16 tensors, weight is contiguous BF16 [D], and eps
+ * `x` is BF16 or FP32 and `out` is BF16 with the same contiguous shape; weight is BF16 [D], and eps
  * is positive and finite. Input, weight, and output must not overlap. The oracle evaluates `ideal`
  * naively in FP64 from the represented inputs. The BF16 output is promoted and compared directly
  * with that result; output storage rounding belongs to the Op's numerical criterion, not the

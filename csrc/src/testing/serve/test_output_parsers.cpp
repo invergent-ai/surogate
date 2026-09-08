@@ -7,6 +7,7 @@
 // to keep its answer.
 
 #include "serve/output_parsers.h"
+#include "serve/tool_call_parser.h"
 
 #include <nlohmann/json.hpp>
 
@@ -141,6 +142,37 @@ void test_tool_call_dispatch() {
           "`none` leaves the block in the content untouched");
 }
 
+void test_spark_tool_calls() {
+    check(parse_tool_call_format("spark25") == ToolCallFormat::Spark25, "Spark parser name");
+    const std::string text = "Looking now.\n<tool_call>weather<arg_key>city</arg_key>"
+        "<arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value>"
+        "<arg_key>options</arg_key><arg_value>{\"units\":\"C\"}</arg_value></tool_call>"
+        "<tool_call>refresh</tool_call>";
+    const auto parsed = parse_tool_calls(ToolCallFormat::Spark25, text, 64);
+    check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2, "Spark multiple calls");
+    check(parsed.content == "Looking now.", "Spark preserves preceding content");
+    if (parsed.tool_calls.size() == 2) {
+        const auto args = Json::parse(parsed.tool_calls[0].arguments_json);
+        check(args["city"] == "Paris" && args["days"] == 3 && args["options"]["units"] == "C",
+              "Spark string, number and nested JSON arguments");
+        check(parsed.tool_calls[1].arguments_json == "{}", "Spark zero arguments");
+    }
+    for (std::size_t split=0; split<=text.size(); ++split) {
+        ToolCallStreamFilter filter;
+        auto content = filter.feed(std::string_view(text).substr(0,split));
+        content += filter.feed(std::string_view(text).substr(split));
+        content += filter.finish(true);
+        check(content == parsed.content, "Spark split-stream content");
+    }
+    for (const auto malformed : {
+        "<tool_call>bad.name</tool_call>", "<tool_call>weather<arg_key>city</arg_key></tool_call>",
+        "<tool_call>weather<arg_key>x</arg_key><arg_value>1</arg_value><arg_key>x</arg_key><arg_value>2</arg_value></tool_call>",
+        "<tool_call>weather", "<tool_call>weather</tool_call>trailing"}) {
+        const auto result = parse_tool_calls(ToolCallFormat::Spark25, malformed, 64);
+        check(!result.is_tool_call_response && result.content == malformed, "Spark malformed fallback");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -149,6 +181,7 @@ int main() {
     test_reasoning_split();
     test_llama3_tool_calls();
     test_tool_call_dispatch();
+    test_spark_tool_calls();
 
     if (failures != 0) {
         std::cerr << "output_parsers: " << failures << " case(s) failed\n";

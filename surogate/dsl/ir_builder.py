@@ -88,7 +88,11 @@ def build_dsl_ir_from_python(
                 "produced no ep_dispatch ops. EP is not wired in this graph."
             )
 
-    return ir_json
+    # Keep checkpoint-specific fields (for example nested rotary settings and
+    # activation names) available when exporting a fully fine-tuned model.
+    for module in result.get("modules", []):
+        module.setdefault("hf_config", {})["source_config"] = config_json
+    return json.dumps(result)
 
 
 def build_dsl_ir_for_model(

@@ -43,4 +43,10 @@ void cast_fp32_to_bf16_launch(const Tensor& source, Tensor& destination, cudaStr
     CUDA_CHECK(cudaGetLastError());
 }
 
+void cast_bf16_to_fp32_launch(const Tensor& source, Tensor& destination, cudaStream_t stream) {
+    cast_bf16_to_fp32_kernel<<<cast_grid(source.numel()), kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(source.data), static_cast<float*>(destination.data), source.numel());
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace sinfer::ops::detail

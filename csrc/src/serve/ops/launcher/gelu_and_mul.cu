@@ -13,7 +13,7 @@
 namespace sinfer::ops::detail {
 
 void gelu_and_mul_launch(const Tensor& gate, const Tensor& up, bool tanh_approx, Tensor& out,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, bool round_gate) {
     const std::int64_t n = out.numel();
     constexpr int kBlock = 256;
     const std::int64_t pairs = n / 2;
@@ -23,7 +23,11 @@ void gelu_and_mul_launch(const Tensor& gate, const Tensor& up, bool tanh_approx,
     const auto* g = static_cast<const __nv_bfloat16*>(gate.data);
     const auto* u = static_cast<const __nv_bfloat16*>(up.data);
     auto* o       = static_cast<__nv_bfloat16*>(out.data);
-    if (tanh_approx) {
+    if (round_gate && tanh_approx) {
+        gelu_and_mul_kernel<true, true><<<grid, kBlock, 0, stream>>>(g, u, o, n);
+    } else if (round_gate) {
+        gelu_and_mul_kernel<false, true><<<grid, kBlock, 0, stream>>>(g, u, o, n);
+    } else if (tanh_approx) {
         gelu_and_mul_kernel<true><<<grid, kBlock, 0, stream>>>(g, u, o, n);
     } else {
         gelu_and_mul_kernel<false><<<grid, kBlock, 0, stream>>>(g, u, o, n);

@@ -136,6 +136,8 @@ Training and serving have different architecture coverage. Model dimensions come
 | **Qwen3.5 / Qwen3.6 dense** | 3.5: 0.8B, 2B, 4B, 9B, 27B; 3.6: 27B | [Text, vision & pipeline examples](examples/sft/qwen35) |
 | **Qwen3.5 / Qwen3.6 MoE** | 35B-A3B; 3.5 also 122B-A10B, 397B-A17B | [MoE recipes](examples/sft/qwen35moe) |
 | **Llama 3.1 / 3.2** | 3.1: 8B, 70B, 405B; 3.2: 1B, 3B | [Llama example](examples/sft/llama) |
+| **MiniCPM5** | 1B, 2B | [BF16 LoRA](examples/sft/minicpm5) |
+| **Spark-X2.5** | 1.7B, 4B | [BF16 LoRA](examples/sft/spark) |
 | **Gemma 4** | E2B, 12B, 26B-A4B; text backbones | [LoRA recipes](examples/sft/gemma4) |
 | **Nemotron 3 / Cascade 2** | Nano 30B-A3B, Super 120B-A12B, Cascade 2 30B-A3B | [Nemotron recipes](examples/sft/nemotron3) |
 | **GPT-OSS** | 20B, 120B; MXFP4 checkpoints use QLoRA | [GPT-OSS recipes](examples/sft/gpt-oss) |

@@ -103,6 +103,7 @@ The family is detected automatically. Available formats and optional features va
 | Qwen3 MoE | Mixture-of-experts models |
 | Llama | Includes TinyLlama |
 | MiniCPM5 | Hugging Face safetensors and GGUF; thinking can be enabled or disabled |
+| Spark-X2.5 | Hugging Face safetensors; thinking can be enabled or disabled |
 | Gemma 3 | Text generation |
 | Gemma 4 | Text generation with dense, E-series, and mixture-of-experts models |
 | LFM2 / LFM2.5 | Dense text models from Hugging Face safetensors or GGUF |

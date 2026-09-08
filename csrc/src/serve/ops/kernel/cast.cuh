@@ -41,4 +41,11 @@ __global__ void cast_fp32_to_bf16_scalar_kernel(const float* source, __nv_bfloat
     }
 }
 
+__global__ void cast_bf16_to_fp32_kernel(const __nv_bfloat16* source, float* destination,
+                                          std::int64_t n) {
+    const auto start = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (auto i = start; i < n; i += stride) { destination[i] = __bfloat162float(source[i]); }
+}
+
 } // namespace sinfer::ops

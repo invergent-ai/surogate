@@ -6,6 +6,8 @@ This runs a small LoRA SFT example using a YAML config.
 
 Example configs are in `examples/sft/`.
 
+For MiniCPM5 and Spark-X2.5 checkpoints, see the [fine-tuning guide](../guides/minicpm5-spark.md) for examples and LoRA target names.
+
 A reasonable default starting point:
 - `examples/sft/qwen3-lora-bf16.yaml`
 

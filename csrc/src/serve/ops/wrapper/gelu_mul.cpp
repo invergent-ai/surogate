@@ -10,7 +10,7 @@
 namespace sinfer::ops {
 
 void gelu_mul(const Tensor& gate, const Tensor& up, GeluMode mode, Tensor& out,
-              cudaStream_t stream) {
+              cudaStream_t stream, bool round_gate) {
     if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("gelu_mul: gate/up/out must be BF16");
     }
@@ -27,7 +27,7 @@ void gelu_mul(const Tensor& gate, const Tensor& up, GeluMode mode, Tensor& out,
         throw std::invalid_argument("gelu_mul: gate/up/out data must be non-null");
     }
 
-    detail::gelu_and_mul_launch(gate, up, mode == GeluMode::Tanh, out, stream);
+    detail::gelu_and_mul_launch(gate, up, mode == GeluMode::Tanh, out, stream, round_gate);
 }
 
 } // namespace sinfer::ops

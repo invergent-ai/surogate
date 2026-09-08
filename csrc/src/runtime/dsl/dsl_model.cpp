@@ -327,6 +327,7 @@ DslConfigView parse_dsl_config(const Module& module) {
 DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConfig& base) {
     DslRuntimeConfig runtime;
     const auto view = parse_dsl_config(module);
+    runtime.residual_fp32 = get_bool_attr(module.config, "residual_fp32").value_or(false);
 
     runtime.use_qk_norm = view.use_qk_norm.value_or(base.UseQKNorm);
     // If the IR graph uses qkv_qk_norm(_rope), force-enable qk-norm even when
@@ -1345,6 +1346,23 @@ DslModel::DslModel(const PretrainedConfig& config,
 
     if (lora_config.has_value() && lora_config->enabled()) {
         mLoRAConfig = lora_config;
+        const bool fused_qkv_lora = get_bool_attr(mModule->config, "fused_qkv_lora").value_or(false);
+        if (fused_qkv_lora && mLoRAConfig->all_targets) {
+            mLoRAConfig->fused_qkv = true;
+            mLoRAConfig->q_proj_name = "q_k_v_proj";
+            mLoRAConfig->o_proj_name = "out_proj";
+            mLoRAConfig->targets.erase(modules::LoRATarget::K_PROJ);
+            mLoRAConfig->targets.erase(modules::LoRATarget::V_PROJ);
+        }
+        if (fused_qkv_lora &&
+            ((mLoRAConfig->applies_to_q() && !mLoRAConfig->fused_qkv) ||
+             mLoRAConfig->applies_to_k() || mLoRAConfig->applies_to_v() ||
+             (mLoRAConfig->applies_to_o() && mLoRAConfig->o_proj_name != "out_proj"))) {
+            throw std::invalid_argument("This model uses q_k_v_proj and out_proj LoRA targets; use those names or all.");
+        }
+        if (!fused_qkv_lora && mLoRAConfig->fused_qkv) {
+            throw std::invalid_argument("q_k_v_proj LoRA requires a model with a native fused QKV adapter declaration.");
+        }
         mIsMoEModel = (mModelConfig.architecture == modules::ArchitectureType::MoE) ||
                       (mModelConfig.architecture == modules::ArchitectureType::Hybrid) ||
                       mModelConfig.moe_config.has_value();

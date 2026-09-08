@@ -19,4 +19,9 @@ namespace sinfer::ops {
  */
 void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream);
 
+/// Headwise gate: gate is contiguous BF16 [heads,tokens], x is BF16
+/// [head_dim,heads,tokens]. The sigmoid is rounded to BF16 before multiplication,
+/// as in Spark's reference. The tensors must not overlap; no workspace is used.
+void headwise_sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream);
+
 } // namespace sinfer::ops

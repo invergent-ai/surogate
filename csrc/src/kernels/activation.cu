@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "utilities/utils.h"
+#include "utilities/tensor.h"
 
 namespace {
 
@@ -133,6 +134,25 @@ __global__ void silu_forward_kernel(T* out, const T* inp, long n) {
         y = x * s;
     }
     out[idx] = from_float<T>(y);
+}
+
+
+template <typename T>
+__global__ void gelu_exact_forward_kernel(T* out, const T* inp, long n) {
+    const long i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = to_float(inp[i]);
+    out[i] = from_float<T>(0.5f * x * (1.0f + erff(x * 0.7071067811865475f)));
+}
+
+template <typename T>
+__global__ void gelu_exact_backward_kernel(T* dx, const T* inp, const T* dy, long n) {
+    const long i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = to_float(inp[i]);
+    const float derivative = 0.5f * (1.0f + erff(x * 0.7071067811865475f))
+                           + x * expf(-0.5f * x * x) * 0.3989422804014327f;
+    dx[i] = from_float<T>(to_float(dy[i]) * derivative);
 }
 
 template <typename T>
@@ -356,4 +376,30 @@ void gelu_backward(float* dinp, const float* inp, const float* dout, long n, cud
 
 void gelu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream) {
     launch_gelu_backward(dinp, inp, dout, n, stream);
+}
+
+void gelu_exact_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream) {
+    if (n == 0) return;
+    if (out.DType != inp.DType) throw std::logic_error("gelu_exact_forward: dtype mismatch");
+    if (inp.DType == ETensorDType::BF16) {
+        gelu_exact_forward_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+            out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), n);
+    } else if (inp.DType == ETensorDType::FP32) {
+        gelu_exact_forward_kernel<<<(n + 255) / 256, 256, 0, stream>>>(out.get<float>(), inp.get<float>(), n);
+    } else throw std::logic_error("gelu_exact_forward: unsupported dtype");
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void gelu_exact_backward(Tensor& dx, const Tensor& inp, const Tensor& dy, long n, cudaStream_t stream) {
+    if (n == 0) return;
+    if (dx.DType != inp.DType || dy.DType != inp.DType)
+        throw std::logic_error("gelu_exact_backward: dtype mismatch");
+    if (inp.DType == ETensorDType::BF16) {
+        gelu_exact_backward_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+            dx.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), dy.get<nv_bfloat16>(), n);
+    } else if (inp.DType == ETensorDType::FP32) {
+        gelu_exact_backward_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+            dx.get<float>(), inp.get<float>(), dy.get<float>(), n);
+    } else throw std::logic_error("gelu_exact_backward: unsupported dtype");
+    CUDA_CHECK(cudaGetLastError());
 }

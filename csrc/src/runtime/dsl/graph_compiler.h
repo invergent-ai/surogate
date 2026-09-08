@@ -217,6 +217,7 @@ struct TensorRef {
 struct CompiledAttrs {
     // Common attributes
     float eps = 1e-6f;
+    bool gelu_exact = false;
     EMMTranspose transpose = EMMTranspose::NN;
     int rotary_dim = 0;
     bool compute_accuracy = false;

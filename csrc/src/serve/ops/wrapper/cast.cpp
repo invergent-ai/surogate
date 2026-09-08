@@ -25,4 +25,23 @@ void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t s
     detail::cast_fp32_to_bf16_launch(source, destination, stream);
 }
 
+void cast_bf16_to_fp32(const Tensor& source, Tensor& destination, cudaStream_t stream) {
+    if (source.dtype != DType::BF16 || destination.dtype != DType::FP32) {
+        throw std::invalid_argument("cast_bf16_to_fp32: source must be BF16 and destination FP32");
+    }
+    for (int dim = 0; dim < 4; ++dim) {
+        if (source.ne[dim] != destination.ne[dim]) {
+            throw std::invalid_argument("cast_bf16_to_fp32: shapes must match");
+        }
+    }
+    if (!source.is_contiguous() || !destination.is_contiguous() || source.data == nullptr ||
+        destination.data == nullptr) {
+        throw std::invalid_argument("cast_bf16_to_fp32: tensors must be contiguous and non-null");
+    }
+    if (source.data == destination.data) {
+        throw std::invalid_argument("cast_bf16_to_fp32: source and destination must not alias");
+    }
+    detail::cast_bf16_to_fp32_launch(source, destination, stream);
+}
+
 } // namespace sinfer::ops

@@ -160,6 +160,8 @@ def symbols_for(config: dict[str, Any]) -> dict[str, int]:
         "DraftVocab": config.get("draft_head_vocab", 0),
         "Vocab": config["vocab_size"],
         "HeadDim": config["head_size"],
+        "QueryHeads": config["num_query_heads"],
+        "Hq": config["num_query_heads"],
         "QuerySize": query_size,
         "AttnFusedRows": 2 * query_size + 2 * kv_size,
         # No attention output gate: q, k and v stacked, nothing else.

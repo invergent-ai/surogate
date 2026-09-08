@@ -49,6 +49,7 @@ struct ModelConfig {
     int n_kv                = 0;
     int head_dim            = 0;
     int rotary_dim          = 0;
+    int sliding_rotary_dim  = 0;
     int key_dim             = 0;
     int value_dim           = 0;
     int conv_dim            = 0;
@@ -171,10 +172,11 @@ struct ModelConfig {
     /// pairs carrying an angle -- the pairs are (i, i + 256) either way, and narrowing the
     /// rotation instead would pair each channel with a different partner.
     [[nodiscard]] int layer_rotary_dim(int layer) const noexcept {
+        if (layer_windowed(layer) && sliding_rotary_dim > 0) { return sliding_rotary_dim; }
         return (global_head_dim <= 0 || layer_windowed(layer)) ? rotary_dim : global_head_dim;
     }
     [[nodiscard]] int layer_rotary_pairs(int layer) const noexcept {
-        if (global_head_dim <= 0 || layer_windowed(layer)) { return rotary_dim / 2; }
+        if (global_head_dim <= 0 || layer_windowed(layer)) { return layer_rotary_dim(layer) / 2; }
         return global_rotary_angles > 0 ? global_rotary_angles : global_head_dim / 2;
     }
 
@@ -249,6 +251,7 @@ struct ModelConfig {
           n_kv(geometry.kv_heads),
           head_dim(geometry.head_dim),
           rotary_dim(geometry.rotary_dim),
+          sliding_rotary_dim(geometry.sliding_rotary_dim),
           key_dim(geometry.key_dim()),
           value_dim(geometry.value_dim()),
           conv_dim(geometry.convolution_dim()),

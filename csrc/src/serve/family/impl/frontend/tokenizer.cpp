@@ -735,6 +735,18 @@ std::size_t declared_digit_run(const Json& root, std::string_view label) {
     return run;
 }
 
+bool identity_normalizer(const Json& normalizer) {
+    if (normalizer.is_null()) { return true; }
+    if (!normalizer.is_object() || normalizer.value("type", "") != "Sequence" ||
+        !normalizer.contains("normalizers") || !normalizer.at("normalizers").is_array()) {
+        return false;
+    }
+    for (const auto& child : normalizer.at("normalizers")) {
+        if (!identity_normalizer(child)) { return false; }
+    }
+    return true;
+}
+
 std::vector<std::string> declared_split_sequence(const Json& root) {
     std::vector<std::string> patterns;
     if (!root.contains("pre_tokenizer") || !root.at("pre_tokenizer").is_object()) {
@@ -745,6 +757,9 @@ std::vector<std::string> declared_split_sequence(const Json& root) {
         return patterns;
     }
     for (const auto& item : pre.at("pretokenizers")) {
+        if (item.value("type", "") == "Digits") {
+            patterns.push_back(item.value("individual_digits", false) ? R"(\p{N})" : R"(\p{N}+)");
+        }
         if (item.value("type", "") == "Split" && item.contains("pattern") &&
             item.at("pattern").contains("Regex")) {
             if (item.value("behavior", "") != "Isolated" || item.value("invert", false)) {
@@ -777,7 +792,7 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const Json& model = require_object_field(root, "model", tokenizer_label);
     ignore_merges_ = model.value("ignore_merges", false);
     split_patterns_ = declared_split_sequence(root);
-    normalize_nfc_ = root.contains("normalizer") && !root.at("normalizer").is_null();
+    normalize_nfc_ = root.contains("normalizer") && !identity_normalizer(root.at("normalizer"));
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
     id_to_token_                 = std::move(vocab_metadata.id_to_token);
@@ -790,7 +805,7 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     // `normalized` flag can change anything. Both files' added tokens are the same tokens, so
     // both are judged against the tokenizer.json that declares the normalizer.
     const bool normalizer_is_identity =
-        !root.contains("normalizer") || root.at("normalizer").is_null();
+        !root.contains("normalizer") || identity_normalizer(root.at("normalizer"));
     added_tokens_ = load_added_tokens(root, normalizer_is_identity, tokenizer_label, id_to_token_,
                                       vocab_metadata.occupied_ids, vocab_token_to_id_);
     merge_added_tokens_decoder(tokenizer_config, normalizer_is_identity, tokenizer_config_label,
@@ -844,6 +859,15 @@ Tokenizer::render_chat_template(const std::vector<std::pair<std::string, std::st
     return delegate_->inner.apply_chat_template(
         converted, add_generation_prompt,
         ::tokenizer::ChatTemplateVariables{.enable_thinking  = variables.enable_thinking,
+                                           .reasoning_effort = variables.reasoning_effort});
+}
+
+std::string Tokenizer::render_chat_template_json(
+    const std::string& messages_json, const std::vector<std::string>& tool_jsons,
+    bool add_generation_prompt, const ChatTemplateVariables& variables) const {
+    if (!delegate_) { throw std::logic_error("tokenizer has no chat template renderer"); }
+    return delegate_->inner.apply_chat_template_json(messages_json, tool_jsons, add_generation_prompt,
+        ::tokenizer::ChatTemplateVariables{.enable_thinking = variables.enable_thinking,
                                            .reasoning_effort = variables.reasoning_effort});
 }
 

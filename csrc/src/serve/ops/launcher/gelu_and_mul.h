@@ -12,6 +12,6 @@ namespace sinfer::ops::detail {
 
 // Host entry; assumes inputs already validated by the wrapper.
 void gelu_and_mul_launch(const Tensor& gate, const Tensor& up, bool tanh_approx, Tensor& out,
-                         cudaStream_t stream);
+                         cudaStream_t stream, bool round_gate);
 
 } // namespace sinfer::ops::detail

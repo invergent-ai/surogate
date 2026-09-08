@@ -307,7 +307,10 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     // <|endoftext|>, and TinyLlama pads with </s>. What identifies a registered
     // checkpoint is its token domain and its special-token ids, which
     // `validate_registered_tokenizer` asserts directly.
-    if (!tokenizer_config.contains("pad_token") || !tokenizer_config.at("pad_token").is_string()) {
+    const auto pad = tokenizer_config.find("pad_token");
+    if (pad == tokenizer_config.end() ||
+        !(pad->is_string() || (pad->is_object() && pad->contains("content") &&
+                              pad->at("content").is_string()))) {
         throw std::invalid_argument("tokenizer_config.json declares no pad token");
     }
     // The template must be present and must be the one that was loaded. Where a
@@ -915,14 +918,25 @@ public:
         }
         // A checkpoint whose template this family does not reproduce by hand is
         // rendered by the tokenizer, from the artifact's own Jinja.
-        std::vector<std::pair<std::string, std::string>> plain;
-        plain.reserve(messages.size());
+        auto structured = nlohmann::ordered_json::array();
         for (const fi::ChatMessage& message : messages) {
-            plain.emplace_back(jinja_role_name(message.role), message.rendered_content());
+            nlohmann::ordered_json item{{"role", jinja_role_name(message.role)},
+                                        {"content", message.rendered_content()}};
+            if (!message.reasoning_content.empty()) { item["reasoning_content"] = message.reasoning_content; }
+            if (!message.tool_call_id.empty()) { item["tool_call_id"] = message.tool_call_id; }
+            if (!message.tool_calls.empty()) {
+                item["tool_calls"] = nlohmann::ordered_json::array();
+                for (const auto& call : message.tool_calls) {
+                    auto arguments = nlohmann::ordered_json::parse(call.arguments_json);
+                    item["tool_calls"].push_back({{"id", call.id}, {"type", "function"},
+                        {"function", {{"name", call.name}, {"arguments", std::move(arguments)}}}});
+                }
+            }
+            structured.push_back(std::move(item));
         }
         fi::RenderedChat rendered;
-        rendered.text = tokenizer->render_chat_template(plain, options.add_generation_prompt,
-                                                        template_variables(options));
+        rendered.text = tokenizer->render_chat_template_json(structured.dump(), options.tool_jsons,
+            options.add_generation_prompt, template_variables(options));
         return rendered;
     }
 
