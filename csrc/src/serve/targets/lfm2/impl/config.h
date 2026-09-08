@@ -100,7 +100,7 @@ static_assert(TextConfig::gdn_layers() == 10);
 static_assert(TextConfig::query_size == TextConfig::hidden,
               "LFM2's attention output projection is [hidden, query_size]");
 
-/// No vision tower. Declared because the shared ModelView names one; never bound.
+/// The text-only default. LFM2-VL resolves its complete tower geometry from the artifact.
 struct VisionConfig {
     static constexpr int layers              = 0;
     static constexpr int hidden              = 0;

@@ -16,7 +16,7 @@ from .. import nn
 from ..blocks.common import VL_MODEL_NAME_REMAP
 from ..blocks.lfm2 import Lfm2AttentionBlock, Lfm2ConvBlock
 from ..hf import fuse, tied_to
-from ..models.lfm2 import _compute_lfm2_intermediate_size, _resolve_lfm2_layer_types
+from ..models.lfm2 import Lfm2Model, _compute_lfm2_intermediate_size, _resolve_lfm2_layer_types
 from ..modules import Embedding, LMHead, RMSNorm
 from ..specs import ActivationScope
 
@@ -50,6 +50,10 @@ _LAYER_PREFIX = "model.language_model.layers.{layer}"
 )
 class Lfm2VlModel(nn.Model):
     """LFM2-VL text backbone: LFM2 hybrid blocks fed image features by scatter."""
+
+    _serve_objects_ = Lfm2Model._serve_objects_
+    _serve_blocks_ = Lfm2Model._serve_blocks_
+    _serve_block_schedule_ = staticmethod(Lfm2Model._serve_block_schedule_)
 
     _name_remap_ = VL_MODEL_NAME_REMAP
     _hf_block_mappings_ = {

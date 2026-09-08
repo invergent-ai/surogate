@@ -118,6 +118,31 @@ Use `--no-thinking` for direct answers. You can override this per chat request w
 `"chat_template_kwargs": {"enable_thinking": true}` or `false`. Set `--max-model-len`
 to the context length you need, for example `--max-model-len 8192`.
 
+## LFM2-MoE and LFM2-VL
+
+Serve an LFM2-MoE checkpoint directly:
+
+```bash
+surogate serve LiquidAI/LFM2-8B-A1B --port 8080
+```
+
+A local LFM2-MoE GGUF also works. GGUFs are prepared as 8-bit serving weights, so a
+lower-bit download needs more disk space and GPU memory after preparation.
+
+For images, use an LFM2-VL or LFM2.5-VL safetensors checkpoint with `--vision`:
+
+```bash
+surogate serve LiquidAI/LFM2-VL-450M --vision --port 8080
+```
+
+Send images through the chat API using `image_url` content parts, as shown in the
+[API guide](api.md). Large images are resized or split automatically using the checkpoint's
+processor settings. Multiple images and text-only requests are supported. Video input and
+VL GGUF files are not supported yet.
+
+These models run on one GPU. Merge trained LoRA adapters into the checkpoint before serving
+them; loading adapters separately is not supported for LFM2-MoE or LFM2-VL.
+
 ## A model larger than the card
 
 Use system RAM for part of a model when its weights do not fit in GPU memory. This requires

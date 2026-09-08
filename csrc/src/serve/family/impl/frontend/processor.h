@@ -82,6 +82,18 @@ struct PreprocessStats {
 };
 
 struct ProcessorOptions {
+    bool lfm2_vl = false;
+    int image_token_id = 0;
+    int lfm_min_tokens = 64;
+    int lfm_max_tokens = 256;
+    int lfm_min_tiles = 2;
+    int lfm_max_tiles = 10;
+    int lfm_tile_size = 512;
+    int lfm_resample = 3;
+    double lfm_pixels_tolerance = 2.0;
+    bool lfm_thumbnail = true;
+    bool lfm_splitting = true;
+    bool lfm_special_tokens = true;
     std::uint64_t image_min_pixels = 32ULL * 32ULL;
     std::uint64_t image_max_pixels = 1024ULL * 1024ULL;
     std::uint64_t video_min_pixels = 128ULL * 32ULL * 32ULL;
@@ -107,7 +119,7 @@ struct ProcessedInput {
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;
     std::vector<VisionItem> vision_items;
-    // One immutable row-major [raw_patches, 1536] payload per Vision item.
+    // One immutable row-major [raw_patches, checkpoint patch_dim] payload per Vision item.
     std::vector<std::shared_ptr<const family::PreparedMediaPayload>> media_payloads;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     PreprocessStats stats;
@@ -119,6 +131,10 @@ struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
 };
+
+ProcessedInput process_lfm2_vl(const Tokenizer& tokenizer, const ProcessorOptions& options,
+    MediaPreprocessCache& cache, std::vector<ChatMessage> messages, ChatRenderOptions render_options,
+    const PreparationControl& control);
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);
 

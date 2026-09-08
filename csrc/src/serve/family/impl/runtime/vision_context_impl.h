@@ -50,6 +50,7 @@ struct VisionWorkspaceLayout {
     TensorRegion mlp_up;
     TensorRegion mlp_norm;
     TensorRegion normalized;
+    TensorRegion projector_norm;
     TensorRegion merger_hidden;
     std::size_t bytes = 0;
 };
@@ -115,7 +116,10 @@ VisionWorkspaceLayout build_workspace_layout(const family::VisionGeometry& g,
         out.mlp_down = add(DType::BF16, {g.hidden, patches}, "vision MLP down");
     }
     out.normalized    = add(DType::BF16, {g.hidden, patches}, "vision merger norm");
-    out.merger_hidden = add(DType::BF16, {g.merger_hidden(), tokens}, "vision merger hidden");
+    if (g.siglip2 && g.projector_norm) {
+        out.projector_norm = add(DType::BF16, {g.merger_hidden(), tokens}, "vision projector norm");
+    }
+    out.merger_hidden = add(DType::BF16, {g.projector_width(), tokens}, "vision merger hidden");
     out.bytes = builder.finish(1, "vision workspace");
     return out;
 }
@@ -136,6 +140,8 @@ VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights)
     patch_embed_       = &vision.common.patch_embedding;
     patch_embed_bias_  = &vision.common.patch_embedding_bias;
     position_embed_    = &vision.common.position_embedding;
+    post_norm_weight_ = &vision.common.post_norm_weight;
+    post_norm_bias_ = &vision.common.post_norm_bias;
     // The materialized tower is the authority on its own depth; reading the count from the
     // geometry a second time is one more way for the two to disagree.
     blocks_.resize(vision.common.layers.size());
@@ -243,7 +249,12 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     // contiguous matrix convention is [inner,columns]. The payload is already
     // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
     Tensor position_table = position_embed_->reshape({g.hidden, g.position_embeddings});
-    ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+    if (g.siglip2) {
+        ops::siglip2_pos_embed_add(position_table, control.grid.height, control.grid.width,
+                                   g.merge, x, stream);
+    } else {
+        ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+    }
     for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
         const BlockW& block = blocks_[layer];
         {
@@ -267,7 +278,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
                 q.nb[2] = qkv.nb[1];
                 k.nb[2] = qkv.nb[1];
                 v.nb[2] = qkv.nb[1];
-                ops::rope(position_ids, g.rotary_dim, g.rope_theta, q, k, stream);
+                if (g.rotary_dim) { ops::rope(position_ids, g.rotary_dim, g.rope_theta, q, k, stream); }
                 Tensor attended_heads = attended.view({g.head_dim(), g.heads, patches});
                 const DeviceSpan attention_backing = layout.attention_workspace
                                                          ? layout.attention_workspace->bind(backing)
@@ -299,15 +310,23 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     }
 
     Tensor normalized = layout.normalized.bind(backing);
-    ops::layer_norm(x, *merger_.norm_weight, *merger_.norm_bias, g.norm_epsilon, normalized,
+    ops::layer_norm(x, g.siglip2 ? *post_norm_weight_ : *merger_.norm_weight,
+                    g.siglip2 ? *post_norm_bias_ : *merger_.norm_bias, g.norm_epsilon, normalized,
                     stream);
     Tensor merged = normalized.view({g.merger_hidden(), tokens});
+    if (g.siglip2 && g.projector_norm) {
+        Tensor norm = layout.projector_norm.bind(backing);
+        ops::layer_norm(merged, *merger_.norm_weight, *merger_.norm_bias, 1.0e-5F, norm, stream);
+        merged = norm;
+    }
     Tensor hidden = layout.merger_hidden.bind(backing);
     ops::linear(merged, *merger_.fc1, hidden, stream);
     ops::add_bias(*merger_.fc1_bias, hidden, stream);
     ops::gelu(hidden, ops::GeluMode::Exact, stream);
     ops::linear(hidden, *merger_.fc2, output, stream);
     ops::add_bias(*merger_.fc2_bias, output, stream);
+    debug_probe<Variant>("vision_projection", output.slice(1, 0, std::min(tokens, 64)),
+                         g.layers, stream);
 }
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,

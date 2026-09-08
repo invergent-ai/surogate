@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
+import math
 
 from surogate.serve.convert.common import declaration
 from surogate.serve.convert.common.checkpoint import positive_int
@@ -80,6 +81,21 @@ class Geometry:
         return layer in self.attention_layers
 
 
+def execution_config(config: Mapping[str, Any]) -> dict:
+    source = deepcopy(dict(config))
+    positive_int(source, "max_position_embeddings")
+    rope = source.get("rope_parameters") or source.get("rope_scaling") or {}
+    if not isinstance(rope, dict) or rope.get("rope_type", rope.get("type", "default")) != "default":
+        raise ValueError("LFM2 serving supports default rotary embeddings")
+    source["rope_theta"] = rope.get("rope_theta", source.get("rope_theta"))
+    for key in ("norm_eps", "rope_theta"):
+        value = source.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"config.{key} must be a positive finite number")
+    source["rms_norm_eps"] = source["norm_eps"]
+    return source
+
+
 def geometry_from_config(config: Mapping[str, Any]) -> Geometry:
     """The geometry a checkpoint's own config states.
 
@@ -88,7 +104,7 @@ def geometry_from_config(config: Mapping[str, Any]) -> Geometry:
     schedule is a list of attention indices rather than a period. The declaration
     performs both, exactly as training does.
     """
-    source = deepcopy(dict(config))
+    source = execution_config(config)
     for name in ("hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "vocab_size"):
         positive_int(source, name)
     if source["num_attention_heads"] % source["num_key_value_heads"]:

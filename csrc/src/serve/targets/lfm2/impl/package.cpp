@@ -48,6 +48,9 @@ constexpr ModelSamplingDefaults kLfm2Defaults{.thinking = kLfm2Preset,
 /// module name in that vocabulary to bind them under.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
+    if (runtime.geometry.experts || runtime.vision_geometry.siglip2) {
+        throw std::invalid_argument("LFM2-MoE and LFM2-VL adapters must be merged into the checkpoint before serving");
+    }
     using TextConfig      = detail::TextConfig;
     ops::LoraStore& store = ops::lora_store_for_current_device();
     if (store.empty()) {
@@ -134,7 +137,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
-    if (model == model_id) { return kLfm2Defaults; }
+    if (std::find(model_ids.begin(), model_ids.end(), model) != model_ids.end()) { return kLfm2Defaults; }
     throw std::runtime_error("model '" + std::string(model) +
                              "' has no sampling defaults in target package '" +
                              std::string(target_key) + "'");
@@ -143,7 +146,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.architecture == target_key && identity.weights_id == "groupwise-int") {
+    if (accepts_architecture(identity.architecture) && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -165,14 +168,13 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
     return family::make_frontend(
         model.impl_->data.frontend,
         family::FrontendOptions{
-            .vision_enabled = false,
+            .vision_enabled = model.impl_->data.runtime.features.vision,
             .max_context    = options.max_context,
             .media_cache_bytes        = options.media_cache_bytes,
             .media_live_bytes         = options.media_live_bytes,
             .media_preprocess_threads = options.media_preprocess_threads,
             .chat_template_override   = options.chat_template_override,
-            // LFM2's tokenizer is its own 65,536-id domain with no vision tokens; the
-            // family's registered-checkpoint assertions describe a different one entirely.
+            // Each LFM checkpoint supplies its own vocabulary and optional image tokens.
             .registered_tokenizer = false,
         });
 }

@@ -180,6 +180,16 @@ template <class Variant>
 /// with an unset `rotary_dim` still reaches `ops::rope` and is refused there, which is the
 /// difference between declaring this and testing the width.
 template <class Variant>
+[[nodiscard]] Tensor text_rope_positions(Tensor positions) {
+    if constexpr (requires { Variant::one_dimensional_rope; }) {
+        if constexpr (Variant::one_dimensional_rope) {
+            return positions.slice(1, 0, 1);
+        }
+    }
+    return positions;
+}
+
+template <class Variant>
 [[nodiscard]] constexpr bool applies_rotary() {
     if constexpr (requires { Variant::applies_rotary; }) {
         return Variant::applies_rotary;

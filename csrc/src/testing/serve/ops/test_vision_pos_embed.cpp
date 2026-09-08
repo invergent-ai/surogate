@@ -111,6 +111,70 @@ int run_case(std::int32_t patches, std::uint32_t seed) {
     return failures;
 }
 
+// A separable FP64 interpolation oracle, including the BF16 storage between passes.
+// Covers downsampling antialiasing, border normalization, rectangular grids and block order.
+int run_siglip_case(int height, int width) {
+    constexpr int side = 16, channels = 64, merge = 2;
+    std::vector<float> table(side * side * channels), input(height * width * channels);
+    fill_uniform(table, 81u, -2.0f, 2.0f);
+    fill_uniform(input, 82u, -1.0f, 1.0f);
+    round_to_bf16(table);
+    round_to_bf16(input);
+    const auto weights = [](int target) {
+        std::vector<double> result(target * side);
+        const double scale = static_cast<double>(side) / target;
+        for (int out = 0; out < target; ++out) {
+            double total = 0;
+            for (int in = 0; in < side; ++in) {
+                const double distance = std::abs((in + 0.5 - (out + 0.5) * scale) / std::max(1.0, scale));
+                total += result[out * side + in] = std::max(0.0, 1.0 - distance);
+            }
+            for (int in = 0; in < side; ++in) {
+                const float raw = bf16_to_f32(f32_to_bf16(result[out * side + in]));
+                result[out * side + in] = bf16_to_f32(f32_to_bf16(raw / total));
+            }
+        }
+        return result;
+    };
+    const auto wx = weights(width), wy = weights(height);
+    const auto rounded = [](double value) { return bf16_to_f32(f32_to_bf16(static_cast<float>(value))); };
+    std::vector<float> horizontal(side * width * channels);
+    for (int y = 0; y < side; ++y) for (int x = 0; x < width; ++x) for (int c = 0; c < channels; ++c) {
+        double sum = 0;
+        for (int source = 0; source < side; ++source) {
+            sum += wx[x * side + source] * table[(y * side + source) * channels + c];
+        }
+        horizontal[(y * width + x) * channels + c] = rounded(sum);
+    }
+    std::vector<double> reference(input.size());
+    for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) for (int c = 0; c < channels; ++c) {
+        double sum = 0;
+        for (int source = 0; source < side; ++source) {
+            sum += wy[y * side + source] * horizontal[(source * width + x) * channels + c];
+        }
+        const int patch = ((y / merge) * (width / merge) + x / merge) * merge * merge +
+                           (y % merge) * merge + x % merge;
+        reference[patch * channels + c] = rounded(input[patch * channels + c] + rounded(sum));
+    }
+    const auto table_bits = as_bf16_bits(table), input_bits = as_bf16_bits(input);
+    GuardedDeviceBuffer dt(table_bits.size() * 2), dx(input_bits.size() * 2);
+    dt.copy_from_host(table_bits.data(), table_bits.size() * 2);
+    dx.copy_from_host(input_bits.data(), input_bits.size() * 2);
+    Tensor t(dt.data(), DType::BF16, {channels, side * side});
+    Tensor x(dx.data(), DType::BF16, {channels, height * width});
+    ops::siglip2_pos_embed_add(t, height, width, merge, x, nullptr);
+    cuda_synchronize();
+    const std::string label = "siglip2 position " + std::to_string(height) + "x" + std::to_string(width);
+    // FP32 GPU sums can resolve BF16 halfway cases differently from the FP64 oracle.
+    int failures = verify_pointwise(label.c_str(), from_device_bf16(dx.data(), input.size()),
+                                    reference, PointwiseCriterion{0.015625, 0.0});
+    failures += verify_exact((label + " preserves table").c_str(),
+        from_device<std::uint16_t>(dt.data(), table_bits.size()), table_bits);
+    failures += dt.verify_guards((label + " table").c_str());
+    failures += dx.verify_guards((label + " output").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -120,6 +184,9 @@ int main() {
     }
 
     int failures = 0;
+    for (auto [h, w] : {std::pair{8, 8}, {8, 12}, {16, 16}, {24, 32}, {32, 8}}) {
+        failures += run_siglip_case(h, w);
+    }
     failures += run_case(17, 1u);
     failures += run_case(1024, 11u);
     std::cout << (failures ? "FAIL" : "OK") << " vision_pos_embed\n";

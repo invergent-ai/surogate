@@ -103,4 +103,48 @@ __global__ void vision_pos_embed_add_kernel(const __nv_bfloat16* table, const st
     }
 }
 
+__global__ void siglip2_position_kernel(const __nv_bfloat16* table, __nv_bfloat16* x,
+                                       int channels, int side, int height, int width, int merge) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= channels * height * width) { return; }
+    const int channel = index % channels;
+    const int patch = index / channels;
+    const int group = patch / (merge * merge);
+    const int inner = patch % (merge * merge);
+    const int y = group / (width / merge) * merge + inner / merge;
+    const int xcoord = group % (width / merge) * merge + inner % merge;
+    const float sy = float(side) / height, sx = float(side) / width;
+    const float ry = fmaxf(sy, 1.0F), rx = fmaxf(sx, 1.0F);
+    const float cy = (y + 0.5F) * sy, cx = (xcoord + 0.5F) * sx;
+    const int y0 = max(int(cy - ry + 0.5F), 0), y1 = min(int(cy + ry + 0.5F), side);
+    const int x0 = max(int(cx - rx + 0.5F), 0), x1 = min(int(cx + rx + 0.5F), side);
+    float total_x = 0.0F, total_y = 0.0F;
+    for (int ix = x0; ix < x1; ++ix) {
+        total_x += fmaxf(0.0F, 1.0F - fabsf((ix + 0.5F - cx) / rx));
+    }
+    for (int iy = y0; iy < y1; ++iy) {
+        total_y += fmaxf(0.0F, 1.0F - fabsf((iy + 0.5F - cy) / ry));
+    }
+    float value = 0.0F;
+    for (int iy = y0; iy < y1; ++iy) {
+        // Torch's CUDA antialias filter stores both raw and normalized coefficients
+        // in the input dtype, as well as the intermediate horizontal image.
+        const float raw_y = __bfloat162float(__float2bfloat16(
+            fmaxf(0.0F, 1.0F - fabsf((iy + 0.5F - cy) / ry))));
+        const float wy = __bfloat162float(__float2bfloat16(raw_y / total_y));
+        float row = 0.0F;
+        for (int ix = x0; ix < x1; ++ix) {
+            const float raw_x = __bfloat162float(__float2bfloat16(
+                fmaxf(0.0F, 1.0F - fabsf((ix + 0.5F - cx) / rx))));
+            const float wx = __bfloat162float(__float2bfloat16(raw_x / total_x));
+            row += wx * __bfloat162float(table[(iy * side + ix) * channels + channel]);
+        }
+        row = __bfloat162float(__float2bfloat16(row));
+        value += wy * row;
+    }
+    const float position = __bfloat162float(__float2bfloat16(value));
+    x[index] = __float2bfloat16(__bfloat162float(x[index]) + position);
+}
+
+
 } // namespace sinfer::ops

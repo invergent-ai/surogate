@@ -92,7 +92,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     for (std::size_t i = 0; i < prompt.media_payloads.size(); ++i) {
         if (!prompt.media_payloads[i] ||
             prompt.media_payloads[i]->patch_elements !=
-                prompt.vision_items[i].patch_count * kPreparedVisionPatchFeatures) {
+                prompt.vision_items[i].patch_count * static_cast<std::size_t>(model.vision_geometry.patch_dim)) {
             throw std::invalid_argument("prepared prompt media item payload has an invalid shape");
         }
     }

@@ -7,9 +7,9 @@ import math
 from surogate.serve.convert.common.checkpoint import positive_int
 
 
-def config_from_gguf(reader) -> dict:
+def config_from_gguf(reader, arch="lfm2") -> dict:
     def kv(name, default=None):
-        field = reader.get_field("lfm2." + name)
+        field = reader.get_field(arch + "." + name)
         return default if field is None else field.contents()
 
     dimensions = {
@@ -29,7 +29,7 @@ def config_from_gguf(reader) -> dict:
         if len(values) != layers or any(
             isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in values
         ):
-            raise ValueError(f"GGUF lfm2.{name} must declare a nonnegative count for each layer")
+            raise ValueError(f"GGUF {arch}.{name} must declare a nonnegative count for each layer")
         return values
 
     kv_counts = per_layer("attention.head_count_kv")
@@ -47,17 +47,17 @@ def config_from_gguf(reader) -> dict:
     head_dim = dimensions["hidden_size"] // query_heads
     for key in ("attention.key_length", "attention.value_length", "rope.dimension_count"):
         if kv(key, head_dim) != head_dim:
-            raise ValueError(f"LFM2 serving does not support GGUF lfm2.{key} != hidden_size / heads")
+            raise ValueError(f"LFM2 serving does not support GGUF {arch}.{key} != hidden_size / heads")
     if kv("attention.sliding_window", 0):
         raise ValueError("LFM2 serving does not support sliding-window attention")
     if kv("attention.causal", True) is not True or kv("pooling_type", 0):
         raise ValueError("LFM2 GGUF serving supports causal text generation, not embedding models")
-    if kv("expert_count", 0):
+    if kv("expert_count", 0) and arch != "lfm2moe":
         raise ValueError("LFM2 GGUF serving does not support mixture-of-experts checkpoints")
     for key in ("rope.freq_base", "attention.layer_norm_rms_epsilon"):
         value = kv(key)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"GGUF lfm2.{key} must be a positive finite number")
+            raise ValueError(f"GGUF {arch}.{key} must be a positive finite number")
 
     tokens = reader.get_field("tokenizer.ggml.tokens")
     if tokens is None:
@@ -67,7 +67,7 @@ def config_from_gguf(reader) -> dict:
         raise ValueError("LFM2 GGUF vocab_size disagrees with its tokenizer vocabulary")
     from surogate.serve.gguf.frontend import extract_generation_config
 
-    return {
+    config = {
         **dimensions,
         **extract_generation_config(reader),
         "architectures": ["Lfm2ForCausalLM"],
@@ -83,3 +83,16 @@ def config_from_gguf(reader) -> dict:
         "conv_bias": False,
         "tie_word_embeddings": reader.tensor("output.weight") is None,
     }
+    if arch == "lfm2moe":
+        config.update(
+            architectures=["Lfm2MoeForCausalLM"], model_type="lfm2_moe",
+            num_experts=kv("expert_count"), num_experts_per_tok=kv("expert_used_count"),
+            moe_intermediate_size=kv("expert_feed_forward_length"),
+            num_dense_layers=kv("leading_dense_block_count"), use_expert_bias=True,
+            norm_topk_prob=True, routed_scaling_factor=kv("expert_weights_scale", 1.0),
+        )
+        if kv("expert_gating_func", 2) != 2:
+            raise ValueError("LFM2-MoE GGUF must use sigmoid expert gating")
+        for name in ("num_experts", "num_experts_per_tok", "moe_intermediate_size"):
+            positive_int(config, name)
+    return config

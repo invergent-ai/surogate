@@ -75,6 +75,16 @@ SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeGemma4Geometry)
 #include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
 } // namespace geometry_gemma4
 
+namespace geometry_lfm2_moe32 {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeLfm2Moe32Geometry)
+#include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
+} // namespace geometry_lfm2_moe32
+
+namespace geometry_lfm2_moe64 {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeLfm2Moe64Geometry)
+#include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
+} // namespace geometry_lfm2_moe64
+
 void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                                const Tensor& router_x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
@@ -98,6 +108,14 @@ void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& 
     }
     if (geometry == kSparseMoeGemma4Geometry) {
         geometry_gemma4::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeLfm2Moe32Geometry) {
+        geometry_lfm2_moe32::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeLfm2Moe64Geometry) {
+        geometry_lfm2_moe64::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled prefill kernels");

@@ -85,6 +85,10 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     # in the checkpoint, so the architecture is the only gate here too.
     if model_type == "lfm2" and hidden > 0 and layers > 0:
         return ConverterTarget("lfm2", "surogate.serve.convert.lfm2.convert", "LFM2", gguf_repack=True)
+    if model_type == "lfm2_moe" and hidden > 0 and layers > 0:
+        return ConverterTarget("lfm2_moe", "surogate.serve.convert.lfm2_moe.convert", "LFM2-MoE", gguf_repack=True)
+    if model_type == "lfm2_vl" and hidden > 0 and layers > 0:
+        return ConverterTarget("lfm2_vl", "surogate.serve.convert.lfm2_vl.convert", "LFM2-VL")
     # Qwen3-MoE: the same attention as the dense Qwen3 over a routed mixture with no
     # always-on expert. Its GGUF keeps its experts as K-quants, so it takes the repack path.
     if model_type == "qwen3_moe" and hidden > 0 and layers > 0:

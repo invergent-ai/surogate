@@ -375,12 +375,12 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
         const int query1 = query0 + 8;
         if (query0 < tile.end) {
             const std::int64_t offset =
-                (static_cast<std::int64_t>(query0) * kVisionAttentionHeads + head) * D + d0;
+                (static_cast<std::int64_t>(query0) * gridDim.y + head) * D + d0;
             store_vec(&out[offset], pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0));
         }
         if (query1 < tile.end) {
             const std::int64_t offset =
-                (static_cast<std::int64_t>(query1) * kVisionAttentionHeads + head) * D + d0;
+                (static_cast<std::int64_t>(query1) * gridDim.y + head) * D + d0;
             store_vec(&out[offset], pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1));
         }
     }

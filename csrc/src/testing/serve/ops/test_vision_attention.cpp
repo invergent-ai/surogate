@@ -18,8 +18,6 @@ using namespace sinfer::test;
 
 namespace {
 
-constexpr int kDim   = 72;
-constexpr int kHeads = 16;
 
 constexpr ReductionCriterion kVisionAttentionBf16Criterion{
     .relative_l2                     = 2.5e-3,
@@ -27,6 +25,7 @@ constexpr ReductionCriterion kVisionAttentionBf16Criterion{
     .gross_relative_to_max_reference = 2.8e-3,
 };
 
+template <int kDim, int kHeads>
 std::size_t index_of(int token, int head, int d) {
     return (static_cast<std::size_t>(token) * kHeads + static_cast<std::size_t>(head)) * kDim +
            static_cast<std::size_t>(d);
@@ -38,10 +37,11 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
+template <int kDim, int kHeads>
 void vision_attention_oracle(const std::vector<float>& q, const std::vector<float>& k,
                              const std::vector<float>& v, const std::vector<int>& cu_seqlens,
                              std::vector<double>& out) {
-    constexpr double scale = 1.0 / std::sqrt(72.0);
+    constexpr double scale = 1.0 / std::sqrt(static_cast<double>(kDim));
     out.assign(q.size(), 0.0);
 
     for (std::size_t segment = 0; segment + 1 < cu_seqlens.size(); ++segment) {
@@ -54,8 +54,8 @@ void vision_attention_oracle(const std::vector<float>& q, const std::vector<floa
                 for (int key = begin; key < end; ++key) {
                     double dot = 0.0;
                     for (int d = 0; d < kDim; ++d) {
-                        dot += static_cast<double>(q[index_of(query, head, d)]) *
-                               static_cast<double>(k[index_of(key, head, d)]);
+                        dot += static_cast<double>(q[index_of<kDim, kHeads>(query, head, d)]) *
+                               static_cast<double>(k[index_of<kDim, kHeads>(key, head, d)]);
                     }
                     const double score                            = dot * scale;
                     scores[static_cast<std::size_t>(key - begin)] = score;
@@ -71,9 +71,9 @@ void vision_attention_oracle(const std::vector<float>& q, const std::vector<floa
                     double numerator = 0.0;
                     for (int key = begin; key < end; ++key) {
                         numerator += scores[static_cast<std::size_t>(key - begin)] *
-                                     static_cast<double>(v[index_of(key, head, d)]);
+                                     static_cast<double>(v[index_of<kDim, kHeads>(key, head, d)]);
                     }
-                    out[index_of(query, head, d)] = numerator / denominator;
+                    out[index_of<kDim, kHeads>(query, head, d)] = numerator / denominator;
                 }
             }
         }
@@ -109,6 +109,7 @@ const char* entry_name(PublicEntry entry) {
     return "unknown";
 }
 
+template <int kDim = 72, int kHeads = 16>
 int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProfile storage_profile,
              PublicEntry entry, InputProfile input_profile = InputProfile::Random) {
     const int patches             = cu_seqlens.back();
@@ -136,7 +137,7 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
     round_to_bf16(v);
 
     std::vector<double> reference;
-    vision_attention_oracle(q, k, v, cu_seqlens, reference);
+    vision_attention_oracle<kDim, kHeads>(q, k, v, cu_seqlens, reference);
 
     const auto q_expected = bf16_bits(q);
     const auto k_expected = bf16_bits(k);
@@ -269,6 +270,12 @@ int main() {
     failures +=
         run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
 
+    failures += run_case<64, 12>({0, 68, 136}, 303u, StorageProfile::InterleavedQkv,
+                                  PublicEntry::UniformSegments);
+    failures += run_case<64, 12>({0, 64, 129}, 304u, StorageProfile::InterleavedQkv,
+                                  PublicEntry::CuSeqlensArena);
+    failures += run_case<72, 16>({0, 64}, 305u, StorageProfile::Contiguous,
+                                  PublicEntry::CuSeqlensArena);
     if (failures != 0) {
         std::cerr << "vision_attention failures=" << failures << '\n';
         return 1;

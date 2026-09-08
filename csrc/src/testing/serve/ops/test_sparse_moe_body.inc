@@ -365,9 +365,9 @@ constexpr int route_expert(int slot) { return slot * (kExperts - 1) / (kRouteSlo
 
 static_assert(kExperts >= kRouteSlots,
               "the route patterns need ten distinct experts to name");
-static_assert(kTopK == 8, "the route patterns below select eight experts");
+static_assert(kTopK > 0 && kTopK <= 8, "the route patterns select up to eight experts");
 
-constexpr RoutePattern route_pattern(std::array<int, kTopK> slots, int tied_slot) {
+constexpr RoutePattern route_pattern(std::array<int, 8> slots, int tied_slot) {
     RoutePattern out{};
     for (int rank = 0; rank < kTopK; ++rank) { out.selected[rank] = route_expert(slots[rank]); }
     out.tied_excluded = tied_slot >= 0 ? route_expert(tied_slot) : -1;
@@ -1186,4 +1186,3 @@ int run_profile(const CodecProfile& profile) {
     failures += fixture.verify_persistent_inputs();
     return failures;
 }
-

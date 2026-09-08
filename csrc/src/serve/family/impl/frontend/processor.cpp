@@ -128,13 +128,13 @@ struct Coefficients {
     std::vector<float> weights;
 };
 
-Coefficients coefficients(int input, int output) {
+Coefficients coefficients(int input, int output, bool bilinear = false) {
     Coefficients out;
     out.starts.resize(static_cast<std::size_t>(output));
     out.offsets.resize(static_cast<std::size_t>(output + 1));
     const double scale    = static_cast<double>(input) / output;
     const double invscale = scale >= 1.0 ? 1.0 / scale : 1.0;
-    const double support  = 2.0 * (scale >= 1.0 ? scale : 1.0);
+    const double support  = (bilinear ? 1.0 : 2.0) * (scale >= 1.0 ? scale : 1.0);
     for (int dst = 0; dst < output; ++dst) {
         const double center = scale * (dst + 0.5);
         const int begin     = std::max(static_cast<int>(center - support + 0.5), 0);
@@ -143,7 +143,8 @@ Coefficients coefficients(int input, int output) {
         out.offsets[static_cast<std::size_t>(dst)] = static_cast<int>(out.weights.size());
         double sum                                 = 0.0;
         for (int j = 0; j < size; ++j) {
-            const double weight = cubic((j + begin - center + 0.5) * invscale);
+            const double distance = (j + begin - center + 0.5) * invscale;
+            const double weight = bilinear ? std::max(0.0, 1.0 - std::abs(distance)) : cubic(distance);
             out.weights.push_back(static_cast<float>(weight));
             sum += weight;
         }
@@ -158,10 +159,10 @@ Coefficients coefficients(int input, int output) {
 }
 
 media::decode::Image resize_bicubic(const media::decode::Image& input, Size size,
-                                    const PreparationControl& control) {
+                                    const PreparationControl& control, bool bilinear = false) {
     if (input.width == size.w && input.height == size.h) { return input; }
-    const Coefficients horizontal = coefficients(input.width, size.w);
-    const Coefficients vertical   = coefficients(input.height, size.h);
+    const Coefficients horizontal = coefficients(input.width, size.w, bilinear);
+    const Coefficients vertical   = coefficients(input.height, size.h, bilinear);
     std::vector<std::uint8_t> temp(static_cast<std::size_t>(input.height) * size.w * 3);
     for (int y = 0; y < input.height; ++y) {
         if (y % 16 == 0) { check_preparation_control(control); }
@@ -625,6 +626,10 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
         throw std::invalid_argument("processor budgets must be positive");
     }
     if (!media_cache_) { throw std::invalid_argument("processor media cache must not be null"); }
+    if (options_.lfm2_vl) {
+        validate_special_token(tokenizer_, "<image>", options_.image_token_id);
+        return;
+    }
     validate_special_token(tokenizer_, kImagePad, kImageToken);
     validate_special_token(tokenizer_, kVideoPad, kVideoToken);
 }
@@ -633,6 +638,10 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   ChatRenderOptions render_options,
                                   const PreparationControl& control) const {
     check_preparation_control(control);
+    if (options_.lfm2_vl) {
+        return process_lfm2_vl(tokenizer_, options_, *media_cache_, std::move(messages),
+                              std::move(render_options), control);
+    }
     const std::vector<ChatPart*> parts = media_parts(messages);
     const std::uint64_t maximum_items_from_extents =
         std::min(options_.max_raw_patches / kMinimumRawPatchesPerItem, options_.max_vision_tokens);
@@ -795,6 +804,11 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     check_preparation_control(control);
     output.stats = stats;
     return output;
+}
+
+media::decode::Image resize_processor_image(const media::decode::Image& image, int height, int width,
+                                           bool bilinear, const PreparationControl& control) {
+    return resize_bicubic(image, {height, width}, control, bilinear);
 }
 
 } // namespace sinfer::family::frontend_internal

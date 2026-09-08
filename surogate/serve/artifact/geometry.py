@@ -81,6 +81,9 @@ TEXT_FLOAT_FIELDS = (
 )
 
 VISION_INT_FIELDS = (
+    "siglip2",
+    "projector_hidden",
+    "projector_norm",
     "layers",
     "hidden",
     "intermediate",

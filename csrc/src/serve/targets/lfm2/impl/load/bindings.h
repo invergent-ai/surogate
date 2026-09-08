@@ -11,6 +11,7 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
+#include "api/ops/sparse_moe.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -25,8 +26,11 @@ struct WeightPlan {
 };
 
 struct MlpPlan {
+    bool sparse = false;
     WeightPlan gate_up;
     WeightPlan down;
+    artifact::ObjectHandle router;
+    artifact::ObjectHandle router_bias;
 };
 
 /// LFM2 attention is UNGATED: the fused projection carries `[query | key | value]` rows and
@@ -61,6 +65,12 @@ struct TextLayerPlan {
 
 struct BindingPlan {
     family::TextGeometry geometry = {};
+    family::VisionGeometry vision_geometry;
+    family::VisionBackbonePlan vision_backbone;
+    artifact::ObjectHandle vision_post_norm_weight, vision_post_norm_bias;
+    artifact::ObjectHandle projector_norm_weight, projector_norm_bias;
+    artifact::LinearBinding projector_fc1, projector_fc2;
+    artifact::ObjectHandle projector_fc1_bias, projector_fc2_bias;
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
@@ -87,6 +97,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 struct DensePostMixerPayload {
     Weight gate_up;
     Weight down;
+    ops::SparseMoeWeights moe;
 };
 
 struct FusedAttentionProjectionPayload {

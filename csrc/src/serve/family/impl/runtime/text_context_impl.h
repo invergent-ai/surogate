@@ -432,7 +432,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         ops::rmsnorm(q, *mtp_.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
         ops::rmsnorm(k, *mtp_.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
     }
-    Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+    Tensor rope_for_op = text_rope_positions<Variant>(
+        active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions);
     if constexpr (applies_rotary<Variant>()) {
         ops::rope(rope_for_op, cfg_.rotary_dim, cfg_.rope_theta, qn, kn, s);
     }
@@ -1218,7 +1219,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
-    Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+    Tensor rope_for_op = text_rope_positions<Variant>(
+        active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions);
     if constexpr (applies_rotary<Variant>()) {
         ops::rope(rope_for_op, cfg_.layer_rotary_dim(layer), cfg_.layer_rotary_pairs(layer),
                   layer_rope_theta(layer, weights_.geometry), qn, kn, s);

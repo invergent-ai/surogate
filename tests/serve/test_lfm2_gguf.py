@@ -20,8 +20,9 @@ from surogate.serve.gguf.bridge import (
 from surogate.serve.gguf.frontend import extract_tokenizer_json
 
 
-def checkpoint(path, *, hidden=256, tied=True, quantized=True, metadata=None):
-    writer = gguf.GGUFWriter(str(path), "lfm2")
+def checkpoint(path, *, hidden=256, tied=True, quantized=True, metadata=None, moe=False):
+    arch = "lfm2moe" if moe else "lfm2"
+    writer = gguf.GGUFWriter(str(path), arch)
     fields = {
         "lfm2.block_count": 3, "lfm2.embedding_length": hidden,
         "lfm2.feed_forward_length": 512, "lfm2.attention.head_count": 4,
@@ -29,6 +30,12 @@ def checkpoint(path, *, hidden=256, tied=True, quantized=True, metadata=None):
         "lfm2.context_length": 8192, "lfm2.rope.freq_base": 123456.,
         "lfm2.attention.layer_norm_rms_epsilon": 1e-5,
     }
+    fields = {key.replace("lfm2.", arch + "."): value for key, value in fields.items()}
+    if moe:
+        fields.update({f"{arch}.{key}": value for key, value in {
+            "expert_count": 8, "expert_used_count": 2, "expert_feed_forward_length": 128,
+            "leading_dense_block_count": 1, "expert_gating_func": 2,
+        }.items()})
     fields.update(metadata or {})
     for key, value in fields.items():
         if value is None:
@@ -70,11 +77,18 @@ def checkpoint(path, *, hidden=256, tied=True, quantized=True, metadata=None):
         p = f"blk.{i}."
         for name in ("attn_norm", "ffn_norm"):
             add(p + name + ".weight", (hidden,), matrix=False)
-        for name, shape in (("ffn_gate", (512, hidden)), ("ffn_up", (512, hidden)),
-                            ("ffn_down", (hidden, 512))):
-            # Gate and up use different GGUF types, both exactly representable in W8.
-            kind = gguf.GGMLQuantizationType.Q4_0 if quantized and name == "ffn_up" else None
-            add(p + name + ".weight", shape, kind=kind)
+        if moe and i >= 1:
+            add(p + "ffn_gate_inp.weight", (8, hidden), matrix=False)
+            add(p + "exp_probs_b.bias", (8,), matrix=False)
+            add(p + "ffn_gate_exps.weight", (8, 128, hidden))
+            add(p + "ffn_up_exps.weight", (8, 128, hidden))
+            add(p + "ffn_down_exps.weight", (8, hidden, 128))
+        else:
+            for name, shape in (("ffn_gate", (512, hidden)), ("ffn_up", (512, hidden)),
+                                ("ffn_down", (hidden, 512))):
+                # Gate and up use different GGUF types, both exactly representable in W8.
+                kind = gguf.GGMLQuantizationType.Q4_0 if quantized and name == "ffn_up" else None
+                add(p + name + ".weight", shape, kind=kind)
         if i == 1:
             for name, rows in (("attn_q", hidden), ("attn_k", hidden // 2),
                                ("attn_v", hidden // 2), ("attn_output", hidden)):
@@ -171,3 +185,41 @@ def test_complete_gguf_conversion_preserves_weights(tmp_path, monkeypatch, quant
                 decoded = dequantize_row_split(artifact.payload(obj), obj.format, obj.shape, dtype=torch.float32)
                 expected = np.concatenate([dequantize(stored[s][0], stored[s][1]) for s in sources])
                 np.testing.assert_array_equal(decoded.numpy(), expected)
+
+
+@pytest.mark.parametrize("hidden", [256, 512])
+def test_complete_moe_gguf_conversion(tmp_path, hidden):
+    from surogate.serve.convert.lfm2_moe import convert as moe_convert
+    path = tmp_path / "arbitrary-filename.gguf"
+    stored = checkpoint(path, hidden=hidden, moe=True)
+    assert gguf_target_key(path) == "lfm2_moe"
+    model = build_hf_dir_from_gguf(path, "lfm2_moe", tmp_path / "bridge",
+        repack_planner=ingest._repack_planner(Path(__file__).resolve().parents[2], "lfm2_moe"))
+    config = json.loads((model / "config.json").read_text())
+    assert converter_for_moe(config).hidden == hidden
+    output = tmp_path / "model.sinfer"
+    repack = model / "gguf_repack.json"
+    moe_convert.convert(model, output, device="cpu", gguf_repack=repack if repack.exists() else None)
+    with Artifact(output) as artifact:
+        assert artifact.identity.architecture == "lfm2_moe"
+        assert artifact.geometry["intermediate"] == 128
+        assert artifact.geometry["dense_intermediate"] == 512
+        assert artifact.geometry["leading_dense_layers"] == 1
+        bias = stored["blk.2.exp_probs_b.bias"][2]
+        assert bytes(artifact.payload("text/layers/2/moe/router_bias")) == bias.tobytes()
+        for i in (1, 2):
+            for name, source_names in {
+                "routed_gate_up": ["ffn_gate_exps", "ffn_up_exps"],
+                "routed_down": ["ffn_down_exps"],
+            }.items():
+                obj = artifact.find(f"text/layers/{i}/moe/{name}")
+                actual = dequantize_row_split(artifact.payload(obj), obj.format, obj.shape, dtype=torch.float32)
+                expected = np.concatenate([dequantize(stored[f"blk.{i}.{n}.weight"][0],
+                    stored[f"blk.{i}.{n}.weight"][1]) for n in source_names], axis=1)
+                np.testing.assert_array_equal(actual.numpy(), expected.reshape(obj.shape))
+
+
+def converter_for_moe(config):
+    from surogate.serve.convert.lfm2_moe import inventory
+    assert ingest.converter_for_config(config).key == "lfm2_moe"
+    return inventory.geometry_from_config(config)

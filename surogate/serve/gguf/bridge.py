@@ -171,7 +171,14 @@ def _hf_name_map(arch: str, n_layers: int) -> dict[str, str]:
         if prev is None or hf_preference(alias) < hf_preference(prev):
             reverse[gguf_base] = alias
 
-    fixups = _HF_ALIAS_FIXUPS.get(arch, ())
+    fixups = _HF_ALIAS_FIXUPS.get("lfm2" if arch == "lfm2moe" else arch, ())
+    if arch == "lfm2moe":
+        fixups += (
+            ("block_sparse_moe.gate", "feed_forward.gate"),
+            ("mlp.experts.gate_proj", "feed_forward.experts.w1"),
+            ("mlp.experts.up_proj", "feed_forward.experts.w3"),
+            ("mlp.experts.down_proj", "feed_forward.experts.w2"),
+        )
     out: dict[str, str] = {}
     # Base names are stored without the trailing ".weight"/".bias"; GGUF tensor
     # names carry the suffix. Emit both suffixed forms.
@@ -180,6 +187,9 @@ def _hf_name_map(arch: str, n_layers: int) -> dict[str, str]:
             hf_base = hf_base.replace(wrong, right)
         for suffix in (".weight", ".bias"):
             out[gguf_base + suffix] = hf_base + suffix
+        if arch == "lfm2moe" and gguf_base.endswith(".exp_probs_b"):
+            layer = gguf_base.split(".")[1]
+            out[gguf_base + ".bias"] = f"model.layers.{layer}.feed_forward.expert_bias"
         # Some checkpoint entries are not `.weight` at all: a buffer, or a stacked parameter
         # the checkpoint stores under its bare name. The generic loop appends a suffix to
         # every base, so those are corrected here rather than guessed at.
@@ -233,9 +243,9 @@ def synthesised_config(reader, arch: str) -> dict | None:
     Dimensions and execution settings come from GGUF metadata. Family-specific normalization
     translates those fields into the same configuration consumed by safetensors conversion.
     """
-    if arch == "lfm2":
+    if arch in ("lfm2", "lfm2moe"):
         from surogate.serve.gguf.lfm2 import config_from_gguf
-        return config_from_gguf(reader)
+        return config_from_gguf(reader, arch)
     if arch in ("qwen35", "qwen35moe", "qwen38", "qwen3_5", "qwen3_6",
                 "qwen3_8", "qwen3_5_moe", "qwen3_6_moe"):
         from surogate.serve.convert.common.qwen3_5 import config_from_gguf
@@ -484,7 +494,7 @@ def _gemma4_config(reader, kv, common: dict, layers: int, heads: int) -> dict:
 def _has_export_transform(arch: str, hf_name: str) -> bool:
     """Whether reading this tensor back means undoing something, which decides whether it can
     be moved into the artifact bit-exactly or has to go through the dequantise path."""
-    if arch == "lfm2":
+    if arch in ("lfm2", "lfm2moe"):
         return hf_name.endswith(".conv.conv.weight")
     if arch == "gemma3":
         return hf_name.endswith("norm.weight")
@@ -512,7 +522,7 @@ def _invert_export_transform(arch: str, hf_name: str, tensor, heads: int, kv_hea
     Left alone, neither is loud: TinyLlama answered "The capital of France is" with fluent,
     confident, wrong text, and Gemma 3 produced multilingual noise.
     """
-    if arch == "lfm2" and hf_name.endswith(".conv.conv.weight"):
+    if arch in ("lfm2", "lfm2moe") and hf_name.endswith(".conv.conv.weight"):
         # llama.cpp squeezes the depthwise channel axis: [hidden, 1, taps] -> [hidden, taps].
         return tensor.unsqueeze(1) if tensor.ndim == 2 else tensor
     if arch == "gemma3":
@@ -718,10 +728,12 @@ def build_hf_dir_from_gguf(
             t = fam.invert_tensor(hf_name, t, geom)
         else:
             t = _invert_export_transform(arch, hf_name, t, export_heads, export_kv_heads)
-        t = t.to(torch.bfloat16)
+        # LFM2-MoE's expert-selection correction is trained/stored in FP32.
+        dtype = torch.float32 if arch == "lfm2moe" and hf_name.endswith(".expert_bias") else torch.bfloat16
+        t = t.to(dtype)
         shard[hf_name] = t
-        shard_bytes += t.numel() * 2
-        total_bytes += t.numel() * 2
+        shard_bytes += t.numel() * t.element_size()
+        total_bytes += t.numel() * t.element_size()
         if shard_bytes >= _SHARD_BYTES:
             flush()
         if (i + 1) % 100 == 0 or i + 1 == n_tensors:
@@ -802,6 +814,8 @@ def gguf_target_key(gguf_path: Path, reader=None):
         return "llama"
     if arch == "lfm2" and hidden > 0 and layers > 0:
         return "lfm2"
+    if arch == "lfm2moe" and hidden > 0 and layers > 0:
+        return "lfm2_moe"
     if arch == "gemma3" and hidden > 0 and layers > 0:
         return "gemma3"
     # Gemma 4. llama.cpp gives all five published checkpoints one architecture string, exactly

@@ -362,7 +362,10 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     // do you call yourself when you do -- so adding a target is one line here.
     const auto dispatch = [&]<class Target, class Loaded, class Instance>(
                               std::optional<ConstructedTarget>& out) {
-        if (out.has_value() || identity.architecture != Target::target_key) { return; }
+        if (out.has_value()) { return; }
+        if constexpr (requires { Target::accepts_architecture(identity.architecture); }) {
+            if (!Target::accepts_architecture(identity.architecture)) { return; }
+        } else if (identity.architecture != Target::target_key) { return; }
         out = construct_registered<Target, Loaded, Instance>(
             options, device, reader, load_start,
             Target::target_key);

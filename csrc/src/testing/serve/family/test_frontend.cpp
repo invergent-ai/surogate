@@ -1101,6 +1101,51 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     return failures;
 }
 
+int test_lfm2_image_preparation() {
+    auto owned = resources("{% for message in messages %}{{ message.content }}{% endfor %}");
+    auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
+    auto config = nlohmann::json::parse(owned.tokenizer_config_json);
+    for (auto [id, text] : {std::pair{40, "<image>"}, {41, "<|image_start|>"}, {42, "<|image_end|>"}}) {
+        tokenizer["added_tokens"].push_back(added(id, text, true));
+        config["added_tokens_decoder"][std::to_string(id)] = decoder_added(text, true);
+    }
+    owned.tokenizer_json = tokenizer.dump();
+    owned.tokenizer_config_json = config.dump();
+    owned.preprocessor_config_json =
+        R"({"image_processor_type":"Lfm2VlImageProcessor","image_token_id":40,"min_image_tokens":4,"max_image_tokens":256,"do_image_splitting":false})";
+    owned.video_preprocessor_config_json.clear();
+    const auto frontend = FrontendFactory::create_component(owned);
+    const auto prepared = frontend.prepare(image_input());
+    const auto& data = FrontendFactory::inspect(prepared);
+    int failures = check(data.vision_items.size() == 1 && data.media_payloads.size() == 1 &&
+        data.prepare.raw_patches == 16 && data.prepare.vision_tokens == 4,
+        "LFM2 image grid/token counts are incorrect");
+    failures += check(frontend.count_tokens(image_input()) == data.token_ids.size(),
+        "LFM2 image count_tokens disagrees with preparation");
+    const auto patches = data.media_payloads.front()->span();
+    failures += check(patches.size() == 16 * 768, "LFM2 image patch payload has the wrong width");
+    // Original RGB values at (0,0), (0,1), (0,16), (16,0), then (0,32).
+    // Check channel-last pixels inside patches and 2x2 patch blocks before the next block.
+    for (auto [patch, y, x] : {std::array{0, 0, 0}, {1, 0, 16}, {2, 16, 0}, {4, 0, 32}}) {
+        for (int channel = 0; channel < 3; ++channel) {
+            const int factor = channel == 0 ? 1 : channel == 1 ? 3 : 7;
+            const int value = ((y * 64 + x) * factor) & 255;
+            failures += check(patches[patch * 768 + channel] == bf16_bits(value / 127.5F - 1.0F),
+                "LFM2 image normalization or pixel-unshuffle order is incorrect");
+        }
+    }
+    for (std::size_t i = 0; i < data.token_ids.size(); ++i) {
+        for (int axis = 0; axis < 3; ++axis) {
+            failures += check(data.positions[axis * data.token_ids.size() + i] == i,
+                "LFM2 images must use ordinary sequence positions");
+        }
+    }
+    const auto reused = frontend.prepare(image_input());
+    failures += check(FrontendFactory::inspect(reused).prepare.media_cache_hits == 1,
+        "LFM2 image preparation did not reuse the cached payload");
+    return failures;
+}
+
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
@@ -1560,6 +1605,7 @@ int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
+    failures += test_lfm2_image_preparation();
     failures += test_jinja_capability_probe();
     failures += test_official_tokenizer_merge();
     failures += test_transformers5_config_without_decoder();

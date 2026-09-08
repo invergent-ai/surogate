@@ -24,4 +24,9 @@ namespace sinfer::ops {
 void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
                           Tensor& x, cudaStream_t stream);
 
+/// SigLIP2's antialiased bilinear resize of its square position table. Patches are ordered
+/// by merge block, matching the pixel-unshuffle projector; interpolation uses their image coordinates.
+void siglip2_pos_embed_add(const Tensor& table, int height, int width, int merge,
+                           Tensor& x, cudaStream_t stream);
+
 } // namespace sinfer::ops

@@ -5,6 +5,7 @@
 #include "api/ops/linear.h"
 #include "api/ops/linear_swiglu.h"
 #include "api/ops/rmsnorm.h"
+#include "api/ops/sparse_moe.h"
 
 #include "core/device.h"
 #include "family/impl/lora_hook.h"
@@ -146,6 +147,15 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
+    if (weights.moe.experts_per_token) {
+        auto storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
+            ops::sparse_moe_geometry(weights.moe), weights.moe.routed_gate_up.qtype,
+            weights.moe.routed_down.qtype, hidden.ne[1], hidden.ne[1]));
+        WorkspaceArena leaf(storage);
+        ops::sparse_moe(hidden, weights.moe, ops::SparseMoeEpilogue::AddResidual,
+                        residual, leaf, stream);
+        return;
+    }
     // The width comes from the weight the SwiGLU reads, so this one function serves whatever
     // size of LFM2 was bound: gate and up are fused, hence half the rows.
     Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
@@ -161,10 +171,20 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
                                                          std::int32_t last) {
     family::validate_token_interval(first, last);
     const QType qtype = profile_qtype(weights_profile);
-    return std::max(
-        post_mixer_workspace_bytes(geometry, qtype, qtype, kTextPolicy, first, last),
-        post_mixer_workspace_bytes(geometry, QType::Q4_K, QType::Q4_K,
+    auto dense = geometry;
+    if (geometry.experts) { dense.intermediate = geometry.dense_intermediate; }
+    auto bytes = std::max(
+        post_mixer_workspace_bytes(dense, qtype, qtype, kTextPolicy, first, last),
+        post_mixer_workspace_bytes(dense, QType::Q4_K, QType::Q4_K,
                                    ops::LinearPolicy::A16Only, first, last));
+    if (geometry.experts) {
+        const ops::SparseMoeGeometry moe{geometry.hidden, geometry.experts,
+            geometry.experts_per_token, geometry.intermediate,
+            ops::SparseMoeGating::SigmoidBiasTopK, geometry.routed_scale};
+        bytes = std::max(bytes, ops::sparse_moe_workspace_capacity_bytes(
+            moe, qtype, qtype, first, last));
+    }
+    return bytes;
 }
 
 // ---- The short-convolution mixer -------------------------------------------

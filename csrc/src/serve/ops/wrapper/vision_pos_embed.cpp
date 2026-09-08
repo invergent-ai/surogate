@@ -2,6 +2,8 @@
 
 #include "ops/launcher/vision_pos_embed.h"
 
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace sinfer::ops {
@@ -33,6 +35,20 @@ void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tens
         throw std::invalid_argument("vision_pos_embed_add: tensor data must be non-null");
     }
     detail::vision_pos_embed_add_launch(table, indices, weights, x, stream);
+}
+
+void siglip2_pos_embed_add(const Tensor& table, int height, int width, int merge,
+                           Tensor& x, cudaStream_t stream) {
+    const int side = static_cast<int>(std::sqrt(static_cast<double>(table.ne[1])));
+    if (table.dtype != DType::BF16 || x.dtype != DType::BF16 || !table.is_contiguous() ||
+        !x.is_contiguous() || !table.data || !x.data || side * side != table.ne[1] ||
+        height <= 0 || width <= 0 || merge <= 0 || height % merge || width % merge ||
+        table.ne[0] <= 0 || table.ne[1] <= 0 || table.ne[2] != 1 || table.ne[3] != 1 ||
+        x.ne[2] != 1 || x.ne[3] != 1 || x.numel() > std::numeric_limits<int>::max() ||
+        x.ne[1] != std::int64_t(height) * width || x.ne[0] != table.ne[0]) {
+        throw std::invalid_argument("siglip2_pos_embed_add: invalid table or patch grid");
+    }
+    detail::siglip2_pos_embed_add_launch(table, side, height, width, merge, x, stream);
 }
 
 } // namespace sinfer::ops

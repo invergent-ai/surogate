@@ -40,6 +40,23 @@ __device__ __forceinline__ bool gqa_block_visible(const std::uint32_t* row_words
     }
 }
 
+/// The kernel's shared tiles, sized from the same constants the body derives.
+///
+/// They are *dynamic* shared memory, not static: a 512-wide head wants 68 KB and Ada caps a
+/// block's static allocation at 48 KB, while its dynamic cap with `cudaFuncSetAttribute` is
+/// 99 KB. The same kernel therefore compiles for sm_89 and sm_120 alike, and the launcher
+/// raises the limit once per device before the first launch.
+template <typename Geometry, int WarpsPerCta>
+struct GqaSmallTTcSmem {
+    static constexpr int kBc       = 32;
+    static constexpr int kQkvRows  = 2 * kBc;
+    static constexpr int kPageIds  = 64;
+    static constexpr int kQkvBytes = kQkvRows * Geometry::HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+    static constexpr int kPBytes   = WarpsPerCta * 16 * kBc * static_cast<int>(sizeof(__nv_bfloat16));
+    static constexpr int kPageBytes = kPageIds * static_cast<int>(sizeof(std::int32_t));
+    static constexpr int kBytes    = kQkvBytes + kPBytes + kPageBytes;
+};
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput, typename CacheT = __nv_bfloat16, bool Sparse = false,
           int SparseBlock = 4>
@@ -93,9 +110,15 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     static_assert(QkvRows >= Br);
 
-    __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
-    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
-    __shared__ std::int32_t physical_pages_s[PageIds];
+    using Smem = GqaSmallTTcSmem<Geometry, WarpsPerCta>;
+    static_assert(Smem::kQkvBytes == QkvRows * D * static_cast<int>(sizeof(__nv_bfloat16)));
+    static_assert(Smem::kPBytes == Wc * 16 * Bc * static_cast<int>(sizeof(__nv_bfloat16)));
+    static_assert(Smem::kPageIds == PageIds);
+    extern __shared__ __align__(16) unsigned char gqa_small_t_smem[];
+    auto* qkv_s = reinterpret_cast<__nv_bfloat16*>(gqa_small_t_smem);
+    auto* p_s   = reinterpret_cast<__nv_bfloat16*>(gqa_small_t_smem + Smem::kQkvBytes);
+    auto* physical_pages_s =
+        reinterpret_cast<std::int32_t*>(gqa_small_t_smem + Smem::kQkvBytes + Smem::kPBytes);
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
 

@@ -18,11 +18,25 @@ from __future__ import annotations
 
 from .. import nn
 from ..attention import AttentionConfig
-from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
+from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, ServeObject, SlotDecl, StreamingHint
 from ..dim import B, Dim, T
 from ..modules import GenericGQAttention, LagunaMoEExperts, Lfm2ShortConv, RMSNorm
 from .common import MOE_BLOCK_NAME_REMAP
-from .lfm2 import LFM2_ATTENTION_BLOCK_REMAP, LFM2_CONV_BLOCK_REMAP
+from .lfm2 import (
+    LFM2_ATTENTION_BLOCK_REMAP, LFM2_CONV_BLOCK_REMAP,
+    _LFM2_ATTENTION_OBJECTS, _LFM2_CONV_OBJECTS,
+)
+
+_LFM2_MOE_OBJECTS = (
+    ServeObject("input_norm", "bf16", ("C",), ("operator_norm_weight",)),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ffn_norm_weight",)),
+    ServeObject("moe/router", "bf16", ("E", "C"), ("router_weight",)),
+    ServeObject("moe/router_bias", "fp32", ("E",), ("e_score_correction_bias",)),
+    ServeObject("moe/routed_gate_up", "quantised", ("RoutedGateUpRows", "C"),
+                ("experts_gate_up",), transform="flatten_experts", residency="auto"),
+    ServeObject("moe/routed_down", "quantised", ("RoutedDownRows", "MoeM"),
+                ("experts_down",), transform="flatten_experts", residency="auto"),
+)
 
 # The MoE half of the name remap, lifted off the dense-MoE block so the two
 # families cannot drift apart.
@@ -105,6 +119,7 @@ class Lfm2MoeAttentionBlock(nn.Block):
         routing=_moe_routing(),
         ep_topology=EPTopology(ep_size_param="ep_size"),
         attrs={"block_family": "lfm2_moe_attention"},
+        serve_objects=(*_LFM2_ATTENTION_OBJECTS, *_LFM2_MOE_OBJECTS),
     )
 
     def __init__(
@@ -126,6 +141,8 @@ class Lfm2MoeAttentionBlock(nn.Block):
         self.use_qkv_bias = False
         self.use_out_bias = False
         self.d_model = d_model
+        self.M = d_ff
+        self.MUp = 2 * d_ff
         self.C = Dim("C")
         self.operator_norm = RMSNorm(d_model, eps=eps)
         self.self_attn = GenericGQAttention(
@@ -182,6 +199,7 @@ class Lfm2MoeConvBlock(nn.Block):
         routing=_moe_routing(),
         ep_topology=EPTopology(ep_size_param="ep_size"),
         attrs={"block_family": "lfm2_moe_conv"},
+        serve_objects=(*_LFM2_CONV_OBJECTS, *_LFM2_MOE_OBJECTS),
     )
 
     def __init__(
@@ -199,6 +217,8 @@ class Lfm2MoeConvBlock(nn.Block):
         super().__init__()
         self.use_bias = conv_bias
         self.d_model = d_model
+        self.M = d_ff
+        self.MUp = 2 * d_ff
         self.C = Dim("C")
         self.operator_norm = RMSNorm(d_model, eps=eps)
         self.short_conv = Lfm2ShortConv(d_model, conv_kernel=conv_kernel, use_bias=conv_bias)

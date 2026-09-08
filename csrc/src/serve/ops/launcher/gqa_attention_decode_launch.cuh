@@ -118,15 +118,24 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
     Tensor& cache_v = cache.v_pages;
-    // bf16 kernel uses only static smem (no dynamic staging). A QSA selection instantiates the
-    // sparse specialization; without one the dense kernel is unchanged.
+    // The K/V/P tiles are dynamic shared memory: a 512-wide head asks for 68 KB, which is past
+    // the 48 KB a block may declare statically on sm_89 but inside the 99 KB it may opt into.
+    // The limit is raised once per device, per kernel -- the same call the prefill launchers make.
+    constexpr int kSmemBytes = GqaSmallTTcSmem<Geometry, WarpsPerCta>::kBytes;
+    // A QSA selection instantiates the sparse specialization; without one the dense kernel is
+    // unchanged.
     if (invocation.selection.words != nullptr) {
         if (invocation.selection.block != 4) {
             throw std::invalid_argument("gqa_attention: unregistered QSA block size");
         }
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+            gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                         MultiBatch, Masked, CacheInput, CacheT,
+                                                         true, 4>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
         gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
                                                      Masked, CacheInput, CacheT, true, 4>
-            <<<grid, kBlock, 0, stream>>>(
+            <<<grid, kBlock, kSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data), static_cast<CacheT*>(cache_k.data),
                 static_cast<CacheT*>(cache_v.data),
@@ -145,9 +154,13 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
+                                                     Masked, CacheInput, CacheT>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
                                                  Masked, CacheInput,
-                                                 CacheT><<<grid, kBlock, 0, stream>>>(
+                                                 CacheT><<<grid, kBlock, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), input,
         static_cast<const std::int32_t*>(pos.data), static_cast<CacheT*>(cache_k.data),
         static_cast<CacheT*>(cache_v.data),

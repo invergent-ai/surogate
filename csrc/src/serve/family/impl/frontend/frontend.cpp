@@ -153,6 +153,36 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     }
     const Json image =
         parse_resource_json(resources.preprocessor_config_json, "preprocessor_config.json");
+    if (image.value("image_processor_type", "").starts_with("Lfm2Vl")) {
+        fi::ProcessorOptions options;
+        options.lfm2_vl = true;
+        options.image_token_id = image.at("image_token_id").get<int>();
+        options.lfm_min_tokens = image.value("min_image_tokens", 64);
+        options.lfm_max_tokens = image.value("max_image_tokens", 256);
+        options.lfm_min_tiles = image.value("min_tiles", 2);
+        options.lfm_max_tiles = image.value("max_tiles", 10);
+        options.lfm_tile_size = image.value("tile_size", 512);
+        options.lfm_resample = image.value("resample", 3);
+        options.lfm_pixels_tolerance = image.value("max_pixels_tolerance", 2.0);
+        options.lfm_thumbnail = image.value("use_thumbnail", true);
+        options.lfm_splitting = image.value("do_image_splitting", true);
+        options.lfm_special_tokens = image.value("use_image_special_tokens", true);
+        if (options.image_token_id < 0 || options.lfm_min_tokens <= 0 ||
+            options.lfm_max_tokens < options.lfm_min_tokens || options.lfm_max_tokens > 32768 ||
+            options.lfm_min_tiles <= 0 || options.lfm_max_tiles < options.lfm_min_tiles ||
+            options.lfm_max_tiles > 64 || options.lfm_tile_size <= 0 ||
+            options.lfm_tile_size > 4096 || options.lfm_tile_size % 32 ||
+            !std::isfinite(options.lfm_pixels_tolerance) || options.lfm_pixels_tolerance <= 0 ||
+            (options.lfm_resample != 2 && options.lfm_resample != 3) ||
+            image.value("encoder_patch_size", 16) != 16 || image.value("downsample_factor", 2) != 2 ||
+            !image.value("do_normalize", true) || !image.value("do_rescale", true) ||
+            std::abs(image.value("rescale_factor", 1.0 / 255.0) - 1.0 / 255.0) > 1.0e-12 ||
+            image.value("image_mean", std::vector<double>{0.5, 0.5, 0.5}) != std::vector<double>{0.5, 0.5, 0.5} ||
+            image.value("image_std", std::vector<double>{0.5, 0.5, 0.5}) != std::vector<double>{0.5, 0.5, 0.5}) {
+            throw std::invalid_argument("unsupported LFM2-VL image processor configuration");
+        }
+        return options;
+    }
     const Json video = parse_resource_json(resources.video_preprocessor_config_json,
                                            "video_preprocessor_config.json");
     validate_pixel_pipeline(image, "preprocessor_config.json");

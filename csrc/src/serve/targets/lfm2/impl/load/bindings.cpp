@@ -25,7 +25,7 @@ using artifact::NumericFormat;
 }
 
 [[nodiscard]] std::int32_t mlp_gate_up_rows(const family::TextGeometry& g) {
-    return 2 * g.intermediate;
+    return 2 * (g.experts ? g.dense_intermediate : g.intermediate);
 }
 
 /// The mixer's projection produces B, C and x at once, each as wide as the residual stream.
@@ -63,8 +63,21 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized,
                                const family::TextGeometry& g) {
     DensePostMixerPayload out;
+    if (plan.sparse) {
+        out.moe.router_shared_gate = artifact::materialized_weight(
+            materialized, plan.router, NumericFormat::BF16, g.experts, g.hidden);
+        out.moe.router_bias = static_cast<const float*>(artifact::materialized_tensor(
+            materialized, plan.router_bias, NumericFormat::FP32, {g.experts}).data);
+        out.moe.routed_scale = g.routed_scale;
+        out.moe.routed_gate_up = materialized_weight(
+            materialized, plan.gate_up, g.experts * 2 * g.intermediate, g.hidden);
+        out.moe.routed_down = materialized_weight(
+            materialized, plan.down, g.experts * g.hidden, g.intermediate);
+        out.moe.experts_per_token = g.experts_per_token;
+        return out;
+    }
     out.gate_up = materialized_weight(materialized, plan.gate_up, mlp_gate_up_rows(g), g.hidden);
-    out.down    = materialized_weight(materialized, plan.down, g.hidden, g.intermediate);
+    out.down    = materialized_weight(materialized, plan.down, g.hidden, mlp_gate_up_rows(g) / 2);
     return out;
 }
 
@@ -110,10 +123,22 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
-        target.mlp.gate_up =
-            bind_weight(binder, prefix + "mlp/gate_up", weights, {mlp_gate_up_rows(g), g.hidden});
-        target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", weights, {g.hidden, g.intermediate});
+        target.mlp.sparse = g.experts > 0 && layer >= static_cast<std::size_t>(g.leading_dense_layers);
+        if (target.mlp.sparse) {
+            target.mlp.router = artifact::bind_device_tensor(
+                binder, prefix + "moe/router", NumericFormat::BF16, {g.experts, g.hidden});
+            target.mlp.router_bias = artifact::bind_device_tensor(
+                binder, prefix + "moe/router_bias", NumericFormat::FP32, {g.experts});
+            target.mlp.gate_up = bind_weight(binder, prefix + "moe/routed_gate_up", weights,
+                                            {g.experts * 2 * g.intermediate, g.hidden});
+            target.mlp.down = bind_weight(binder, prefix + "moe/routed_down", weights,
+                                         {g.experts * g.hidden, g.intermediate});
+        } else {
+            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", weights,
+                                            {mlp_gate_up_rows(g), g.hidden});
+            target.mlp.down = bind_weight(binder, prefix + "mlp/down", weights,
+                                         {g.hidden, mlp_gate_up_rows(g) / 2});
+        }
     }
 }
 
@@ -129,11 +154,36 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.geometry     = declared_geometry_with_schedule(binder.reader());
-    out.frontend     = family::bind_text_only_frontend_resources(binder);
+    out.frontend     = family::bind_frontend_resources(binder);
     out.features     = features;
 
-    if (features.vision) {
-        throw std::runtime_error("lfm2 is a text-only target: --vision is unsupported");
+    const bool has_vision = binder.has("vision/patch_embedding");
+    if (features.vision && !has_vision) {
+        throw std::runtime_error("this LFM2 checkpoint has no vision encoder");
+    }
+    if (has_vision) {
+        out.vision_geometry = family::VisionGeometry::resolved(binder.reader().vision_geometry());
+        const auto& v = out.vision_geometry;
+        if (!v.siglip2 || v.output_hidden != out.geometry.hidden) {
+            throw std::runtime_error("LFM2-VL vision geometry does not match its text model");
+        }
+        const auto placement = features.vision ? artifact::TensorPlacement::Device
+                                               : artifact::TensorPlacement::ValidateOnly;
+        out.vision_backbone = family::bind_vision_backbone(binder, placement, v);
+        const auto tensor = [&](const char* name, int size) {
+            return artifact::bind_tensor(binder, name, NumericFormat::BF16,
+                {static_cast<std::uint64_t>(size)}, placement);
+        };
+        out.vision_post_norm_weight = tensor("vision/post_norm/weight", v.hidden);
+        out.vision_post_norm_bias = tensor("vision/post_norm/bias", v.hidden);
+        if (v.projector_norm) {
+            out.projector_norm_weight = tensor("vision/merger/norm/weight", v.merger_hidden());
+            out.projector_norm_bias = tensor("vision/merger/norm/bias", v.merger_hidden());
+        }
+        out.projector_fc1 = artifact::bind_linear(binder, "vision/merger/fc1", v.projector_width(), v.merger_hidden(), placement);
+        out.projector_fc1_bias = tensor("vision/merger/fc1_bias", v.projector_width());
+        out.projector_fc2 = artifact::bind_linear(binder, "vision/merger/fc2", v.output_hidden, v.projector_width(), placement);
+        out.projector_fc2_bias = tensor("vision/merger/fc2_bias", v.output_hidden);
     }
     if (features.speculative_enabled()) {
         throw std::runtime_error(
@@ -168,7 +218,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     for (const TextLayerPlan& source : plan.text_layers) { attending += source.attends ? 1U : 0U; }
     runtime.full_layers.resize(attending);
     runtime.gdn_layers.resize(plan.text_layers.size() - attending);
-    frontend = family::take_text_only_frontend_resources(backing, plan.frontend);
+    frontend = family::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
@@ -222,6 +272,31 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {g.hidden});
     runtime.output_head = materialized_weight(backing, plan.output_head, g.output_rows, g.hidden);
+    runtime.vision_geometry = plan.vision_geometry;
+    if (plan.features.vision) {
+        const auto& v = plan.vision_geometry;
+        // Reuse the common backbone materializer, with its merger bindings shaped for this projector.
+        family::VisionWeights vision;
+        auto& common = vision.common;
+        common = family::materialize_vision_backbone(backing, plan.vision_backbone, v);
+        const auto tensor = [&](artifact::ObjectHandle handle, int size) {
+            return artifact::materialized_tensor(backing, handle, NumericFormat::BF16,
+                {static_cast<std::uint64_t>(size)});
+        };
+        common.post_norm_weight = tensor(plan.vision_post_norm_weight, v.hidden);
+        common.post_norm_bias = tensor(plan.vision_post_norm_bias, v.hidden);
+        if (v.projector_norm) {
+            common.merger_norm_weight = tensor(plan.projector_norm_weight, v.merger_hidden());
+            common.merger_norm_bias = tensor(plan.projector_norm_bias, v.merger_hidden());
+        }
+        common.merger_fc1 = artifact::materialized_linear(backing, plan.projector_fc1,
+                                                          v.projector_width(), v.merger_hidden());
+        common.merger_fc1_bias = tensor(plan.projector_fc1_bias, v.projector_width());
+        vision.merger_fc2 = artifact::materialized_linear(backing, plan.projector_fc2,
+                                                          v.output_hidden, v.projector_width());
+        vision.merger_fc2_bias = tensor(plan.projector_fc2_bias, v.output_hidden);
+        runtime.vision = std::move(vision);
+    }
 }
 
 } // namespace sinfer::targets::lfm2::detail

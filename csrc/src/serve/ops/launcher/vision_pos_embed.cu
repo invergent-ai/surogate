@@ -60,4 +60,13 @@ void vision_pos_embed_add_launch(const Tensor& table, const Tensor& indices, con
     CUDA_CHECK(cudaGetLastError());
 }
 
+void siglip2_pos_embed_add_launch(const Tensor& table, int side, int height, int width, int merge,
+                                  Tensor& x, cudaStream_t stream) {
+    constexpr int threads = 256;
+    siglip2_position_kernel<<<(x.numel() + threads - 1) / threads, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(table.data), static_cast<__nv_bfloat16*>(x.data),
+        x.ne[0], side, height, width, merge);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace sinfer::ops::detail

@@ -21,7 +21,7 @@ void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
     constexpr int kSmemBytes =
         (Br + 2 * Bc) * kVisionAttentionPaddedD * static_cast<int>(sizeof(__nv_bfloat16));
     const dim3 grid(static_cast<unsigned>(query_tiles),
-                    static_cast<unsigned>(kVisionAttentionHeads), 1u);
+                    static_cast<unsigned>(q.ne[1]), 1u);
     vision_attention_flash_kernel<D, Br, Bc><<<grid, kThreads, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,

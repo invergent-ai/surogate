@@ -62,16 +62,19 @@ def convert(
     *,
     device: str | torch.device = "cuda",
     gguf_repack: str | Path | None = None,
+    _inventory=inventory,
+    _recipe=recipe,
 ) -> Path:
     """Run the conversion and return the path of its report."""
     started = time.perf_counter()
+    inventory, recipe = _inventory, _recipe
     model = Path(model_dir)
     output = Path(out_path)
     requested_device = str(device)
     resolved_device = pick_device(device)
 
     config = family_conversion.load_json(model / "config.json")
-    geometry = validate_config(config)
+    geometry = inventory.geometry_from_config(config)
     family_conversion.honour_declared_scope(
         config, geometry, model, what=family_conversion.checkpoint_label(model)
     )
@@ -90,7 +93,8 @@ def convert(
             raise RepackError("repack map names sources still needed by materialized recipes: "
                               + ", ".join(sorted(stray)))
 
-    resources = family_conversion.load_resources(model, inventory.RESOURCE_SPECS)
+    resource_loader = getattr(inventory, "load_resources", family_conversion.load_resources)
+    resources = resource_loader(model, inventory.RESOURCE_SPECS)
     resource_payloads = {item.name: item.data for item in resources}
     plan = family_conversion.build_object_plan(
         tuple(tensor_specs) + tuple(inventory.RESOURCE_SPECS), resource_payloads
@@ -107,10 +111,11 @@ def convert(
         output.parent.mkdir(parents=True, exist_ok=True)
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="lfm2"),
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture=inventory.TARGET_KEY),
             plan.specs,
             geometry=_geometry_block(geometry, token_domain=tokenizer_domain(model)),
             layer_types=geometry.layer_types,
+            vision_geometry=getattr(geometry, "vision", None),
         ) as writer:
             total = len(plan.specs)
             for index, spec in enumerate(plan.specs, start=1):
@@ -130,11 +135,11 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="lfm2")
+    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture=inventory.TARGET_KEY)
     report = family_conversion.build_conversion_report(
         identity=identity,
         target_key=inventory.TARGET_KEY,
-        recipe_id=RECIPE_ID,
+        recipe_id=f"{inventory.TARGET_KEY}-v1",
         repo_root=Path(__file__).resolve().parents[4],
         ranking_path=model,
         model_dir=model,
@@ -169,6 +174,15 @@ def _geometry_block(geometry: inventory.Geometry, *, token_domain: int) -> dict[
 
     metadata = dense_geometry(geometry, token_domain=token_domain)
     metadata.update(gdn_conv_kernel=geometry.conv_kernel)
+    if getattr(geometry, "experts", 0):
+        metadata.update(
+            dense_intermediate=geometry.intermediate,
+            intermediate=geometry.moe_intermediate,
+            experts=geometry.experts,
+            experts_per_token=geometry.experts_per_token,
+            leading_dense_layers=geometry.dense_layers,
+            routed_scale=geometry.routed_scale,
+        )
     return metadata
 
 

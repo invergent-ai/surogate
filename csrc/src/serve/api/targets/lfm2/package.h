@@ -51,9 +51,12 @@ struct Package {
     /// Every checkpoint this architecture serves. The stack is the same graph at every size --
     /// attention at a handful of named layers, a short convolution at the rest -- and the
     /// artifact states both its dimensions and which layers attend, so one target serves them.
-    static constexpr std::array<std::string_view, 1> model_ids{"lfm2"};
+    static constexpr std::array<std::string_view, 3> model_ids{"lfm2", "lfm2_moe", "lfm2_vl"};
     static constexpr std::string_view model_id   = model_ids[0];
     static constexpr std::string_view target_key = "lfm2";
+    [[nodiscard]] static constexpr bool accepts_architecture(std::string_view architecture) {
+        return architecture == "lfm2" || architecture == "lfm2_moe" || architecture == "lfm2_vl";
+    }
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to fit
     /// the largest the device's free memory allows, up to this. A function, not a constant:
     /// `detail::Variant` is only forward-declared here.

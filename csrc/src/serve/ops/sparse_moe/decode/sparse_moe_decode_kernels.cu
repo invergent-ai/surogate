@@ -66,6 +66,16 @@ SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeGemma4Geometry)
 #include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
 } // namespace geometry_gemma4
 
+namespace geometry_lfm2_moe32 {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeLfm2Moe32Geometry)
+#include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
+} // namespace geometry_lfm2_moe32
+
+namespace geometry_lfm2_moe64 {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeLfm2Moe64Geometry)
+#include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
+} // namespace geometry_lfm2_moe64
+
 void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, const Tensor& x,
                                          const SparseMoeWeights& weights, const int* token_ids,
                                          float* token_activations, std::int32_t tokens,
@@ -96,6 +106,18 @@ void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, cons
     }
     if (geometry == kSparseMoeGemma4Geometry) {
         geometry_gemma4::decode_launch_d3_small_t(x, weights, token_ids, token_activations,
+                                                     tokens, schedule, stream,
+                                                     adaptive_route_jobs);
+        return;
+    }
+    if (geometry == kSparseMoeLfm2Moe32Geometry) {
+        geometry_lfm2_moe32::decode_launch_d3_small_t(x, weights, token_ids, token_activations,
+                                                     tokens, schedule, stream,
+                                                     adaptive_route_jobs);
+        return;
+    }
+    if (geometry == kSparseMoeLfm2Moe64Geometry) {
+        geometry_lfm2_moe64::decode_launch_d3_small_t(x, weights, token_ids, token_activations,
                                                      tokens, schedule, stream,
                                                      adaptive_route_jobs);
         return;
@@ -140,6 +162,18 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
                                                      schedule, stream, adaptive_route_jobs);
         return;
     }
+    if (geometry == kSparseMoeLfm2Moe32Geometry) {
+        geometry_lfm2_moe32::decode_launch_d4_small_t(weights, destination, token_ids, token_alpha,
+                                                     shared_scale, token_activations, tokens,
+                                                     schedule, stream, adaptive_route_jobs);
+        return;
+    }
+    if (geometry == kSparseMoeLfm2Moe64Geometry) {
+        geometry_lfm2_moe64::decode_launch_d4_small_t(weights, destination, token_ids, token_alpha,
+                                                     shared_scale, token_activations, tokens,
+                                                     schedule, stream, adaptive_route_jobs);
+        return;
+    }
     throw std::invalid_argument("sparse_moe: geometry has no compiled decode kernels");
 }
 
@@ -165,6 +199,14 @@ void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x
     }
     if (geometry == kSparseMoeGemma4Geometry) {
         geometry_gemma4::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeLfm2Moe32Geometry) {
+        geometry_lfm2_moe32::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeLfm2Moe64Geometry) {
+        geometry_lfm2_moe64::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled decode kernels");

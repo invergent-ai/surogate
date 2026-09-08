@@ -8,6 +8,7 @@ from ..blocks.lfm2_moe import Lfm2MoeAttentionBlock, Lfm2MoeConvBlock
 from ..hf import fuse, stack_experts, tied_to
 from ..modules import Embedding, LMHead, RMSNorm
 from ..specs import ActivationScope
+from .lfm2 import LFM2_MODEL_SERVE_OBJECTS
 
 _LAYER_PREFIX = "model.layers.{layer}"
 _FFN = f"{_LAYER_PREFIX}.feed_forward"
@@ -72,6 +73,23 @@ def _resolve_lfm2_moe_layer_types(
 )
 class Lfm2MoeModel(nn.Model):
     """LFM2-MoE hybrid model: attention/short-conv operators, dense then sparse FFNs."""
+
+    _serve_objects_ = LFM2_MODEL_SERVE_OBJECTS
+    _serve_blocks_ = {
+        "attention": Lfm2AttentionBlock,
+        "conv": Lfm2ConvBlock,
+        "attention_moe": Lfm2MoeAttentionBlock,
+        "conv_moe": Lfm2MoeConvBlock,
+    }
+
+    @staticmethod
+    def _serve_block_schedule_(config: dict) -> list[str]:
+        return _resolve_lfm2_moe_layer_types(
+            n_layers=int(config["n_layers"]),
+            layer_types=config.get("layer_types"),
+            full_attn_idxs=config.get("full_attn_idxs"),
+            num_dense_layers=int(config["num_dense_layers"]),
+        )
 
     _name_remap_ = LFM2_MODEL_NAME_REMAP
     _hf_block_mappings_ = {

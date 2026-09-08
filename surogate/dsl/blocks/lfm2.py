@@ -156,6 +156,8 @@ class Lfm2AttentionBlock(nn.Block):
         eps: float = 1e-5,
     ):
         super().__init__()
+        self.M = d_ff
+        self.MUp = 2 * d_ff
         self.use_qk_norm = True
         self.use_qkv_bias = False
         self.use_out_bias = False
@@ -213,6 +215,8 @@ class Lfm2ConvBlock(nn.Block):
         conv_bias: bool = False,
     ):
         super().__init__()
+        self.M = d_ff
+        self.MUp = 2 * d_ff
         self.use_bias = conv_bias
         self.operator_norm = RMSNorm(d_model, eps=eps)
         self.short_conv = Lfm2ShortConv(d_model, conv_kernel=conv_kernel, use_bias=conv_bias)

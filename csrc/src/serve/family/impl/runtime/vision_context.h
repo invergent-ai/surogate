@@ -79,6 +79,8 @@ private:
     const Weight* patch_embed_      = nullptr;
     const Tensor* patch_embed_bias_ = nullptr;
     const Tensor* position_embed_   = nullptr;
+    const Tensor* post_norm_weight_ = nullptr;
+    const Tensor* post_norm_bias_ = nullptr;
     /// Sized from the bound weights rather than by the type: two checkpoints of one family
     /// ship towers of different depths.
     std::vector<BlockW> blocks_;

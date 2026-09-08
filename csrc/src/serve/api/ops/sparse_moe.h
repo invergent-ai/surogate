@@ -125,11 +125,18 @@ inline constexpr SparseMoeGeometry kSparseMoeGemma4Geometry{
     /*shared_intermediate=*/0, /*swiglu_limit=*/0.0F, GatedActivation::GeluTanh,
     /*per_expert_scaled=*/true};
 
+/// LFM2-MoE expert banks. Checkpoint metadata selects their dimensions.
+inline constexpr SparseMoeGeometry kSparseMoeLfm2Moe32Geometry{
+    2048, 32, 4, 1792, SparseMoeGating::SigmoidBiasTopK, 1.0F};
+inline constexpr SparseMoeGeometry kSparseMoeLfm2Moe64Geometry{
+    2048, 64, 4, 1536, SparseMoeGating::SigmoidBiasTopK, 1.0F};
+
 /// Every mixture this op serves. One list, so registering a geometry is one line here and one
 /// kernel-body instantiation per route rather than a predicate repeated in five places.
-inline constexpr std::array<SparseMoeGeometry, 5> kSparseMoeGeometries{
+inline constexpr std::array<SparseMoeGeometry, 7> kSparseMoeGeometries{
     kSparseMoeQwen36Geometry, kSparseMoeFlashNextGeometry, kSparseMoeQwen3MoeGeometry,
-    kSparseMoeGlm53Geometry, kSparseMoeGemma4Geometry};
+    kSparseMoeGlm53Geometry, kSparseMoeGemma4Geometry,
+    kSparseMoeLfm2Moe32Geometry, kSparseMoeLfm2Moe64Geometry};
 
 struct SparseMoeWeights {
     Weight router_shared_gate;

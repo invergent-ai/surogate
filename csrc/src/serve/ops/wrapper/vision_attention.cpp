@@ -15,7 +15,6 @@ namespace {
 // Either tower: 72 (Qwen3.6 family, Flash-Next) or 64 (Qwen3.5).
 constexpr std::int32_t kHeadDim   = 72;
 constexpr std::int32_t kHeadDim64 = 64;
-constexpr std::int32_t kHeads   = 16;
 
 std::int32_t scratch_tiles(std::int32_t patches, std::int32_t segments) {
     if (segments == 1) { return 0; }
@@ -37,12 +36,12 @@ Tensor allocate_workspace(Allocator& allocator, std::int32_t patches, std::int32
 void require_qkv(const Tensor& tensor, std::int32_t patches, const char* name) {
     const std::int32_t head_dim = static_cast<std::int32_t>(tensor.ne[0]);
     if (tensor.dtype != DType::BF16 || (head_dim != kHeadDim && head_dim != kHeadDim64) ||
-        tensor.ne[1] != kHeads || tensor.ne[2] != patches || tensor.ne[3] != 1) {
+        tensor.ne[1] <= 0 || tensor.ne[2] != patches || tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string("vision_attention: invalid ") + name + " shape");
     }
     constexpr std::int64_t elem = 2;
     if (tensor.nb[0] != elem || tensor.nb[1] != elem * head_dim ||
-        tensor.nb[2] < elem * head_dim * kHeads || (tensor.nb[2] % elem) != 0) {
+        tensor.nb[2] < elem * head_dim * tensor.ne[1] || (tensor.nb[2] % elem) != 0) {
         throw std::invalid_argument(std::string("vision_attention: invalid ") + name + " strides");
     }
     if (tensor.data == nullptr) {
@@ -76,6 +75,10 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
     require_qkv(k, patches, "k");
     require_qkv(v, patches, "v");
     require_qkv(out, patches, "out");
+    if (!std::equal(q.ne, q.ne + 4, k.ne) || !std::equal(q.ne, q.ne + 4, v.ne) ||
+        !std::equal(q.ne, q.ne + 4, out.ne)) {
+        throw std::invalid_argument("vision_attention: q/k/v/out shapes must match");
+    }
     if (!out.is_contiguous()) {
         throw std::invalid_argument("vision_attention: out must be contiguous");
     }
@@ -98,6 +101,10 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_qkv(k, patches, "k");
     require_qkv(v, patches, "v");
     require_qkv(out, patches, "out");
+    if (!std::equal(q.ne, q.ne + 4, k.ne) || !std::equal(q.ne, q.ne + 4, v.ne) ||
+        !std::equal(q.ne, q.ne + 4, out.ne)) {
+        throw std::invalid_argument("vision_attention: q/k/v/out shapes must match");
+    }
     if (!out.is_contiguous()) {
         throw std::invalid_argument("vision_attention: out must be contiguous");
     }

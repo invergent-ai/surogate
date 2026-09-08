@@ -51,6 +51,8 @@ struct Variant {
     /// LFM2's attention writes no gate rows, so the multiply is skipped rather than applied to
     /// whatever the unwritten gate plane last held.
     static constexpr bool attention_output_gate = false;
+    /// Images occupy ordinary sequence positions in LFM2-VL.
+    static constexpr bool one_dimensional_rope = true;
 
     /// LFM2 stores RMSNorm scales directly, not zero-centred: the scale is `w`, not `1 + w`.
     static constexpr bool norm_unit_offset = false;

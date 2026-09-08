@@ -79,13 +79,32 @@ SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeGlm53Geometry)
 #include "ops/test_sparse_moe_body.inc"
 } // namespace glm53
 
+namespace lfm2_moe32 {
+SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeLfm2Moe32Geometry)
+#include "ops/test_sparse_moe_body.inc"
+}
+
+namespace lfm2_moe64 {
+SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeLfm2Moe64Geometry)
+#include "ops/test_sparse_moe_body.inc"
+}
+
+int run_lfm2() {
+    constexpr std::array<std::int32_t, 5> tokens{{1, 4, 19, 20, 129}};
+    const CodecProfile profile{"lfm2_moe w8+w8", QType::W8G32_F16S, QType::W8G32_F16S,
+                               tokens, true};
+    return lfm2_moe32::run_profile(profile) + lfm2_moe64::run_profile(profile);
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+
+    if (argc == 2 && std::string(argv[1]) == "--lfm2") { return run_lfm2() ? 1 : 0; }
 
     // These are public-behavior cases, not route assertions. They exercise decode (T=1), the
     // Small-T supported-domain edges, each profile's first prefill T, the wide-prefill boundary,
@@ -110,7 +129,7 @@ int main() {
         {"sparse_moe nvfp4 w4a4", QType::NVFP4, QType::NVFP4, kNvfp4Tokens, false},
     }};
 
-    int failures = 0;
+    int failures = run_lfm2();
     for (const CodecProfile& profile : profiles) { failures += qwen36::run_profile(profile); }
 
     // The second registered mixture routes every token and has no always-on expert, which is

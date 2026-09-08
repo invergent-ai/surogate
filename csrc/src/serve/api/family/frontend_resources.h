@@ -26,6 +26,7 @@ struct FrontendResourcePlan {
     /// vision family does not; the frontend reads the empty strings as "never asked for a
     /// pixel" and refuses --vision at load.
     bool has_preprocessor_configs = true;
+    bool has_video_preprocessor_config = true;
 };
 
 struct FrontendResources {

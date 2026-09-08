@@ -102,6 +102,8 @@ struct VisionCommonWeights {
     Tensor merger_fc1_bias;
     Tensor merger_norm_weight;
     Tensor merger_norm_bias;
+    Tensor post_norm_weight;
+    Tensor post_norm_bias;
 };
 
 template <class Config>
@@ -200,9 +202,8 @@ inline VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder,
     };
 }
 
-inline VisionCommonWeights materialize_vision_common(
+inline VisionCommonWeights materialize_vision_backbone(
     const artifact::MaterializedArtifact& materialized, const VisionBackbonePlan& backbone,
-    const VisionMergerInputPlan& merger_input, const VisionMergerNormPlan& merger_norm,
     const VisionGeometry& geometry) {
     using artifact::NumericFormat;
 
@@ -254,6 +255,15 @@ inline VisionCommonWeights materialize_vision_common(
             materialized, source.norm2_bias, NumericFormat::BF16, {geometry.hidden});
     }
 
+    return out;
+}
+
+inline VisionCommonWeights materialize_vision_common(
+    const artifact::MaterializedArtifact& materialized, const VisionBackbonePlan& backbone,
+    const VisionMergerInputPlan& merger_input, const VisionMergerNormPlan& merger_norm,
+    const VisionGeometry& geometry) {
+    using artifact::NumericFormat;
+    auto out = materialize_vision_backbone(materialized, backbone, geometry);
     out.merger_fc1 = artifact::materialized_linear(
         materialized, merger_input.fc1, geometry.merger_hidden(),
         geometry.merger_hidden());
