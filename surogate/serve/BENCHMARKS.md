@@ -209,9 +209,16 @@ artifact. The 09-04 one-card rows read 33.6 / 85.7 / 116.4 decode at 1 / 16 / 64
 llama.cpp rows: `-cmoe -b 4096 -ub 4096`, the flags its own community benchmarks use — the
 earlier `-ot exps=CPU` rows without batch flags understated it 3.9× and are gone.
 
+**This target could not be served at all between 3fca7ba5 and 43c74128 (2026-09-08).** Its warm-up
+prefills 4,096 tokens, past the indexer's 2,048-key budget, so the QSA selection engages; `auto`
+gives this hybrid an e4m3 KV cache; and the prefill dispatch refused the pair. No board shape
+reaches the selection -- 512-token prompts stay inside the budget -- which is why no row here ever
+showed it.
+
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
 | **surogate** | 1 | 1 | **156** | **35.2** | **192** | **0.88 s** | defaults (2026-09-07, the per-object bank): pool 3,172 slots (15.4 GiB, sized to leave the runtime its floor -- the floor no longer charges this A16-only target for FP8/Marlin planes it never derives), unpinned host workers sized to the cores other jobs leave free, host round started and joined through stream memory operations (no host-function dispatch: +6 % decode over the event path), the CPU/PCIe split measured with both sides running against each other (189 vs 46 GB/s), min-tokens 1 so the split fires on one-token rounds. The bank holds each expert half at the narrowest width that loses nothing: the Q4_K gate/up at four bits, the Q5_1 down at six, the Q8_0 down at eight -- 105.7 GiB pinned. **+69 % decode and +68 % prefill over llama.cpp, at matching perplexity** (3.3219 against its 3.3223 -- the table below). With the Q5_1 halves held as W8 instead this read 137 / 30.8 / 0.98 s |
+| surogate (2026-09-08, loaded host) | 1 | 1 | 139.7 | 31.4 | 171.1 | 0.88 s | the same flags on today's binary -- the single-token MoE decode kernels (7402c756) and the QSA/e4m3 prefill fix (43c74128) -- on GPU 4, an idle **x16** card, but a **host under another job**: load average 8-23, ~11 cores busy. This target computes half its experts on the CPU, so that is what the -11 % is: TTFT is unchanged at 0.88 s and the warm-up window read 31.7. **Not comparable with the idle-host row above**; recorded because it is the only measurement of the current kernels on this target
 | surogate `--host-expert-bank q4` | 1 | 1 | 163 | 36.7 | 200 | 0.83 s | the same run with every expert half requantised to four bits: **+4 % decode for +0.69 % perplexity** (3.3451). This was the default until 2026-09-07, when the cost was first measured |
 | llama.cpp | 1 | 1 | 93 | 20.8 | 114 | 2.95 s | the same GGUF, served by both engines as the file's own blocks now. surogate **+62 % decode, 3.5× the prompt rate** |
 | **surogate** | 1 | 1 | — | **40.8** | — | **7.06 s** | 28k prompt into 131k context (23.1 GiB VRAM): **3,966 tok/s prompt processing**; decode is the post-28k stream rate |
@@ -220,6 +227,7 @@ earlier `-ot exps=CPU` rows without batch flags understated it 3.9× and are gon
 | llama.cpp | 1 | 1 | — | 27.3 | — | 23.02 s | 28k prompt, 80k context: 1,216 tok/s prompt processing. surogate **3.3× ingestion, +49 % decode** |
 | cafe-llama.cpp `-hmoe` | 1 | 1 | — | 18.8 / 4.3 | — | 3.55 s / 25.46 s | 512 and 28k prompts. Experts pinned in host memory, computed on the GPU over PCIe — **our architecture in their engine** (935-1,100 tok/s at 28k); kept as the like-for-like reference |
 | **surogate** | 1 | 16 | **431** | **96.7** | **528** | **1.83 s** | defaults, `--max-num-seqs 16`: KV auto 65,536 tokens (2026-09-07, the per-object bank). `--host-expert-bank q4` reads 454 / 101.9 / 1.71 s here, +5 % decode for the 0.69 % perplexity above; with the Q5_1 halves held as W8 this read 373 / 83.7 / 2.03 s; the 09-04 row read 381 / 85.7 / 1.74 with a 3,004-slot pool. Run-to-run spread at 16 users is ~±8 % |
+| surogate (2026-09-08, loaded host) | 1 | 16 | 343.3 | 77.1 | 420.4 | 1.84 s | same binary and the same busy host, `--max-num-seqs 16` on defaults: the pool sized itself to 3,172 slots and KV auto to 65,536 tokens, matching the row above. TTFT p50 1.84 s against its 1.83; the 20 % on throughput is the host, and the 20 s warm-up window read 93.9 against the row's 96.7. **Not comparable with the idle-host row above.** An 8,192-token chunk does not fit 16 lanes on a 32 GB card -- the runtime floor takes the whole card and the engine refuses at startup, so this row is the default chunk
 | llama.cpp | 1 | 16 | 253 | 56.8 | 310 | 16.17 s | `-np 16`. surogate **+51 % decode at 9× lower TTFT** |
 | **surogate** | 1 | 64 | **567** | **127.3** | **694** | **3.20 s** | defaults, `--max-num-seqs 64 --max-pending-requests 512` (2026-09-07, the per-object bank): the pool sized itself to 3,172 slots and the KV cache to 160,192 tokens, where the 09-04 row (518 / 116.4 / 4.73 s) got 1,985 slots and 74,240 tokens -- the registry had reserved 1.5x the card's W8 bytes for derived planes this target never makes, and both the pool and the cache were paying for it. `--host-expert-bank q4` reads 609 / 136.7 / 1.90 s here, +7 % decode for the 0.69 % perplexity above; with the Q5_1 halves held as W8 this read 533 / 119.8 / 5.15 s |
 | llama.cpp | 1 | 64 | 46 | 10.4 | 56 | 655 s | `-np 64`: CPU expert compute serialises across 64 decodes and the queue is the run — every request ~13 min. surogate **11.2×** |
@@ -268,6 +276,12 @@ cache -- `--max-model-len 704 --max-num-batched-tokens 512 --kv-cache-dtype bf16
 llama.cpp: the same file on the same eight cards, `--split-mode layer -ngl 99 -fa 1 -np N`,
 built from ggml-org PR 27754 (`study/llama.cpp-glm`) — no released llama.cpp knows this
 architecture.
+
+**These rows predate 7402c756 and have not been re-measured.** That commit takes this geometry's
+single-token MoE decode kernels from 107 to 83 us (gate/up) and 63.3 to 56.4 us (down) at Q4_K/Q6_K,
+measured in isolation, so the decode column here is a floor rather than the current rate. The row is
+an eight-card row and the two cards it would need were unavailable on 2026-09-08; 181.65 GiB of
+weights does not fit six.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
