@@ -851,10 +851,15 @@ function(sinfer_internal_includes target)
       POSITION_INDEPENDENT_CODE ON)
 endfunction()
 
+# Whole-program, not relocatable. Nothing in these archives references device code across
+# translation units -- the one apparent exception, Marlin's cross-TU template kernels, is
+# handled by exporting their host stubs (below) -- and relocatable device code cost a
+# 150-second nvlink of the entire archive on every rebuild that touched one .cu. The
+# trtllm_moe and nvfp4_cutlass archives had already gone this way, for ptxas's sake.
 function(sinfer_cuda_archive target)
   set_target_properties(${target} PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
@@ -1305,7 +1310,14 @@ set_source_files_properties(
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_repack.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
 
+# Marlin's dispatchers launch `Marlin<...>` template kernels that other TUs instantiate. With
+# whole-program compilation a kernel's host stub is static to the TU that defines it, so
+# that launch would be an undefined hidden symbol at the shared-library link; this flag
+# exports the stubs. It is what lets these archives build without relocatable device code,
+# and without it sinfer_ops paid a 150-second device link on every rebuild.
 set_source_files_properties(
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
   PROPERTIES COMPILE_OPTIONS
