@@ -180,27 +180,36 @@ struct Nvfp4CodecFor {
     }
 };
 
+/// W8 is the always-on expert's format in every artifact, so it runs in one warp of every D3
+/// and D4 block beside the routed warps. It used to read one byte per lane per 32-value group:
+/// 64 dependent DRAM round trips across a 2048-wide row where a Q4_K warp beside it makes 8,
+/// and in D4 a loop that left half the warp idle. That warp was the long pole of both kernels
+/// -- D4's barrier stall was the routed warps waiting for it. Eight consecutive values per
+/// lane, as every other codec: one 8-byte load per lane per group, four lanes to a group,
+/// eight groups per warp step.
 struct W8Codec {
     static constexpr bool kGateRowsFirst        = true;
     static constexpr int kGroupK                = 32;
     static constexpr int kStoredKAlignment      = 128;
-    static constexpr bool kD3SingleValuePerLane = true;
+    static constexpr bool kD3SingleValuePerLane = false;
     static constexpr bool kD3PackedWord8        = false;
-    static constexpr bool kPackedWord8          = false;
-
-    __device__ static __forceinline__ float load_one(const std::uint8_t* codes,
-                                                     const std::uint8_t* scales,
-                                                     std::int64_t group_index, int lane) {
-        const float scale = __half2float(
-            __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + group_index * 2)));
-        return static_cast<float>(static_cast<std::int8_t>(codes[group_index * kGroupK + lane])) *
-               scale;
-    }
+    static constexpr bool kPackedWord8          = true;
 
     __device__ static __forceinline__ void
-    load_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
-              std::int64_t group_index, int lane, float& w0, float& w1) {
-        W8ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
+    load_eight(const std::uint8_t* codes, const std::uint8_t* /*high*/,
+               const std::uint8_t* scales, std::int64_t group_index, int lane_in_group,
+               float (&weights)[8]) {
+        const uint2 packed = load_vec<uint2>(
+            codes + group_index * W8RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 8);
+        const float scale = __half2float(
+            __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + group_index * 2)));
+        const std::uint32_t words[2] = {packed.x, packed.y};
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            // Arithmetic shift out of the word sign-extends the byte.
+            const int code = static_cast<int>(words[item >> 2] << (24 - 8 * (item & 3))) >> 24;
+            weights[item]  = static_cast<float>(code) * scale;
+        }
     }
 };
 
@@ -274,6 +283,7 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
         static_assert(Codec::kGroupK % 8 == 0, "packed codecs own eight values per lane");
         const int lane_group    = lane / kLanesPerGroup;
         const int lane_in_group = lane % kLanesPerGroup;
+#pragma unroll
         for (int group_base = first_group; group_base < last_group; group_base += kGroupsPerWarp) {
             const int group = group_base + lane_group;
             if (group >= last_group) { break; }
@@ -466,6 +476,8 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
         static_assert(Codec::kGroupK % 8 == 0, "packed codecs own eight values per lane");
         const int lane_group    = lane / kLanesPerGroup;
         const int lane_in_group = lane % kLanesPerGroup;
+        // Not unrolled, unlike D3's loop above: unrolling this one cost GLM-5.3-Flash's
+        // 2048-wide Q6_K down projection 12 % (5090, cold), and gained nothing at FFN 512.
         for (int group_base = first_group; group_base < last_group; group_base += kGroupsPerWarp) {
             const int group = group_base + lane_group;
             // The last step is short whenever the group count is not a whole number of warp
@@ -780,8 +792,14 @@ void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destinat
     const auto* shared_codes  = static_cast<const std::uint8_t*>(weights.shared_down.qdata);
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_down.scales);
     auto* output              = static_cast<__nv_bfloat16*>(destination.data);
-    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden), dim3(kPaths * 32), 0, stream},
-                                     sparse_moe_d4_nine_warp_kernel<Codec, 1>, ids, alpha,
+    // Output rows one warp carries for a single token. A warp re-reads its path's activation
+    // slice once per row it owns, and a block pays its barrier and epilogue once per block, so
+    // short rows want several per warp: four at FFN 512 was 12 % off D4, one at FFN 2048
+    // was the best of the three there. Measured on a 5090, cold, over Q4_K/Q5_K/Q6_K.
+    constexpr int kD4Rows = kIntermediate <= 512 ? 4 : kIntermediate <= 1024 ? 2 : 1;
+    static_assert(kHidden % kD4Rows == 0);
+    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden / kD4Rows), dim3(kPaths * 32), 0, stream},
+                                     sparse_moe_d4_nine_warp_kernel<Codec, kD4Rows>, ids, alpha,
                                      shared_scale, act, routed_codes, routed_high, routed_scales,
                                      weights.slot_of_expert, weights.routed_down_scale,
                                      shared_codes, shared_scales, output));

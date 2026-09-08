@@ -137,8 +137,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                                cudaStream_t stream,
                                                GqaBlockMask selection = {}) {
     if (q.ne[1] != Geometry::QHeads) {
-        if (selection.words && (selection.block != 4 || cache.dtype != DType::BF16)) {
-            throw std::invalid_argument("gqa_attention: selection requires block 4 and BF16 cache");
+        if (selection.words && cache.dtype == DType::I8) {
+            throw std::invalid_argument(
+                "gqa_attention: the QSA selection is not served over an int8 KV cache");
         }
         const auto launch = [&]<typename CacheT>() {
             gqa_attention_generic_kernel<CacheT, Metadata><<<dim3(q.ne[1], q.ne[2]), 32, 0, stream>>>(
@@ -159,9 +160,15 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     }
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
-    if (selection.words != nullptr && cache.dtype != DType::BF16) {
+    // A selection rides on the cache dtype rather than replacing it: the BF16 and e4m3 prefill
+    // kernels are one template over the cache type, and the block mask is orthogonal to it. The
+    // int8 kernel is a different one and has no sparse specialization, so it says so by name.
+    if (selection.words != nullptr && cache.dtype == DType::I8) {
         throw std::invalid_argument(
-            "gqa_attention: the QSA selection needs a BF16 KV cache (the quantized kernels are dense)");
+            "gqa_attention: the QSA selection is not served over an int8 KV cache");
+    }
+    if (selection.words != nullptr && selection.block != 4) {
+        throw std::invalid_argument("gqa_attention: unregistered QSA block size");
     }
     // Both dtype-specialized kernels size their arena from the geometry's head
     // dimension; at 256 both exceed the default 48 KiB dynamic-smem ceiling, and
@@ -195,26 +202,35 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     } else if (cache.dtype == DType::FP8_E4M3FN) {
-        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
-            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
-        gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>
-            <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const std::uint8_t*>(cache_k.data),
-                static_cast<const std::uint8_t*>(cache_v.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+        if (selection.words != nullptr) {
+            CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t, true, 4>
+                <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::uint8_t*>(cache_k.data),
+                    static_cast<const std::uint8_t*>(cache_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens, selection);
+        } else {
+            CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>
+                <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::uint8_t*>(cache_k.data),
+                    static_cast<const std::uint8_t*>(cache_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+        }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         if (selection.words != nullptr) {
-            // QSA selection: only the 4-cell block is registered.
-            if (selection.block != 4) {
-                throw std::invalid_argument("gqa_attention: unregistered QSA block size");
-            }
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));

@@ -579,14 +579,17 @@ public:
         router_.copy_from_host(router.data(), router_.bytes);
         CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
 
-        weights_ = {
-            dense_weight(router_.p, kRouterRows, kHidden),
-            routed_gate_.weight,
-            routed_down_.weight,
-            shared_gate_.weight,
-            shared_down_.weight,
-            kTopK,
-        };
+        // Named, not positional: the contract has grown router and activation fields between
+        // the router weight and the expert weights, and a positional list silently lands a
+        // `Weight` in `router_bias` the moment one is added. The fields left at their defaults
+        // -- softmax gating, routed scale 1, a gated shared expert, no clamp, SiLU -- are
+        // kSparseMoeQwen36Geometry's, which is the geometry these constants describe.
+        weights_.router_shared_gate = dense_weight(router_.p, kRouterRows, kHidden);
+        weights_.routed_gate_up     = routed_gate_.weight;
+        weights_.routed_down        = routed_down_.weight;
+        weights_.shared_gate_up     = shared_gate_.weight;
+        weights_.shared_down        = shared_down_.weight;
+        weights_.experts_per_token  = kTopK;
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
