@@ -20,11 +20,7 @@
 
 namespace sinfer::targets::qwen3::detail {
 
-// The compiled default for a Qwen3-0.6B; an artifact that declares `layers` overrides it,
-// which is what lets this one target serve every size of the family.
-// Every layer is full attention. The empty half of the family's split is not a
-// placeholder: the shared ModelView is instantiated with it, and the shared
-// runtime's GDN arrays and state pool are sized from it.
+// Qwen3 and Qwen3-VL use full attention at every text layer.
 inline constexpr std::size_t kGdnLayers = 0;
 
 struct WeightPlan {
@@ -56,14 +52,21 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
-    /// The dimensions bound against: the compiled config with the artifact's
-    /// `geometry` member laid over it.
+    struct DeepstackPlan {
+        std::int32_t layer;
+        artifact::LinearBinding fc1, fc2;
+        artifact::ObjectHandle fc1_bias, fc2_bias, norm_weight, norm_bias;
+    };
+    family::VisionGeometry vision_geometry;
+    family::VisionBackbonePlan vision_backbone;
+    family::VisionMergerInputPlan vision_merger_input;
+    family::VisionMergerNormPlan vision_merger_norm;
+    artifact::LinearBinding vision_merger_output;
+    artifact::ObjectHandle vision_merger_output_bias;
+    std::vector<DeepstackPlan> deepstack;
+    /// The dimensions declared by the checkpoint.
     family::TextGeometry geometry = {};
-    /// Only four of the family plan's six slots are filled. Qwen3-0.6B publishes
-    /// no image or video preprocessor config, and the loader refuses an artifact
-    /// carrying an object no binder consumed -- so this target binds its own
-    /// four rather than reusing `family::bind_frontend_resources`, which would
-    /// demand two objects the artifact does not have.
+    /// Text resources and, for Qwen3-VL, image/video processor settings.
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
@@ -71,8 +74,7 @@ struct BindingPlan {
     /// One per layer, sized when the artifact is bound rather than by the type.
     std::vector<TextLayerPlan> text_layers;
     artifact::ObjectHandle final_norm;
-    /// Qwen3-0.6B sets `tie_word_embeddings`, but the converter stores the head
-    /// as its own object rather than an alias, so this is an ordinary binding.
+    /// The converter resolves tied embeddings and stores the output head explicitly.
     WeightPlan output_head;
 };
 

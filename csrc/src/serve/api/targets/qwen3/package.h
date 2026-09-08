@@ -50,11 +50,13 @@ SINFER_TARGET_LOAD_TYPES(qwen3::Package);
 } // namespace detail
 
 struct Package {
-    /// The checkpoints this target serves. One entry here, because this architecture
-    /// ships as one model; the registry asks every package the same question.
-    static constexpr std::array<std::string_view, 1> model_ids{"qwen3-0.6b"};
+    /// Checkpoint families served by the dense Qwen3 text stack, plus a legacy identity.
+    static constexpr std::array<std::string_view, 3> model_ids{"qwen3", "qwen3_vl", "qwen3-0.6b"};
     static constexpr std::string_view model_id = model_ids[0];
     static constexpr std::string_view target_key = "qwen3";
+    [[nodiscard]] static constexpr bool accepts_architecture(std::string_view architecture) {
+        return architecture == "qwen3" || architecture == "qwen3_vl";
+    }
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a
     /// constant: `detail::Variant` is only forward-declared here.

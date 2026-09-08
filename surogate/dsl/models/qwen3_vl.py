@@ -5,6 +5,7 @@ from __future__ import annotations
 from .. import nn
 from ..modules import Embedding, LMHead, RMSNorm
 from ..blocks.qwen3_vl import Qwen3VLBlock
+from .qwen3 import Qwen3Model
 from ..hf import build_dense_block_mappings
 from ..modules.attention import Qwen3Attention
 from ..blocks.common import VL_MODEL_NAME_REMAP
@@ -31,6 +32,12 @@ class Qwen3VLModel(nn.Model):
     """Qwen3-VL text model using Qwen3VLBlock (MRoPE)."""
 
     _name_remap_ = VL_MODEL_NAME_REMAP
+    _serve_objects_ = Qwen3Model._serve_objects_
+    _serve_blocks_ = {"dense": Qwen3VLBlock}
+
+    @staticmethod
+    def _serve_block_schedule_(config: dict) -> list[str]:
+        return ["dense"] * int(config["n_layers"])
     _hf_block_mappings_ = {
         **build_dense_block_mappings(
             attn_module=Qwen3Attention,

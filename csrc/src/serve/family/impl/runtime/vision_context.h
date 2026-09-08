@@ -85,12 +85,14 @@ private:
     /// ship towers of different depths.
     std::vector<BlockW> blocks_;
     MergerW merger_{};
+    std::vector<std::pair<std::int32_t, MergerW>> deepstack_;
 };
 
 struct VisionChunk {
     std::int32_t length                       = 0;
     const family::VisionItemControl* control = nullptr;
     Tensor embeddings;
+    Tensor deepstack;
 };
 
 class VisionPrefillSession {

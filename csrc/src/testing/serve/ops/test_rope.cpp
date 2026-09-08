@@ -35,6 +35,7 @@ struct Geometry {
     /// rotation is Gemma 4's proportional rope: 64 pairs of a 512-wide head rotate and the
     /// remaining 192 are left exactly as they were.
     int active_pairs = 0;
+    std::array<int, 3> sections{};
 };
 
 /// The pairs a geometry actually rotates.
@@ -96,10 +97,16 @@ std::vector<double> rope_oracle(const std::vector<float>& input, const std::vect
                 int axis        = 0;
                 double exponent = 0.0;
                 if (geometry.axes == 2) {
-                    axis     = pair / 18;
-                    exponent = -2.0 * static_cast<double>(pair % 18) / 36.0;
+                    axis = pair / (geometry.rotary_dim / 4);
+                    exponent = -2.0 * static_cast<double>(pair % (geometry.rotary_dim / 4)) / (geometry.rotary_dim / 2);
                 } else {
                     axis     = geometry.axes == 3 ? pair % 3 : 0;
+                    if (geometry.sections[0]) {
+                        // Construct the published interleaving by assigning each H/W frequency slot.
+                        axis = 0;
+                        for (int i = 0; i < geometry.sections[1]; ++i) { if (pair == 3*i+1) { axis = 1; } }
+                        for (int i = 0; i < geometry.sections[2]; ++i) { if (pair == 3*i+2) { axis = 2; } }
+                    }
                     exponent = -2.0 * static_cast<double>(pair) / geometry.rotary_dim;
                 }
                 const double frequency = std::pow(static_cast<double>(geometry.theta), exponent);
@@ -273,8 +280,13 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
     q_tensor.nb[2] = static_cast<std::int64_t>(q_stride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(k_stride) * sizeof(std::uint16_t);
 
+    if (geometry.sections[0]) {
+        ops::rope_interleaved(position_tensor, geometry.rotary_dim, geometry.theta,
+                              geometry.sections, q_tensor, k_tensor, nullptr);
+    } else {
     ops::rope(position_tensor, geometry.rotary_dim, active_pairs_of(geometry), geometry.theta,
               q_tensor, k_tensor, nullptr);
+    }
     cuda_synchronize();
 
     const auto q_got        = from_device<std::uint16_t>(q_device.data(), q_storage.size());
@@ -453,6 +465,11 @@ int main() {
     failures += run_single_case({"qsa indexer strided", 128, 64, 1, 7, kTextTheta}, 4, 8192, 16);
 
     failures += run_vision_packed_case();
+    failures += run_pair_case({"qwen3-vl interleaved image", 128, 128, 3, 129, 5.0e6F, 0, {24,20,20}}, 16, 8, 4096);
+    failures += run_pair_case({"qwen3-vl strided video", 128, 128, 3, 17, 5.0e6F, 0, {24,20,20}}, 32, 8, 262000, 16, 8);
+    failures += run_pair_case({"configured interleaving", 128, 128, 3, 9, 700000.0F, 0, {32,17,15}}, 12, 4, 5000);
+    failures += run_pair_case({"64-wide vision generic", 64, 64, 2, 19, kVisionTheta}, 8, 8, 23);
+
 
     // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
     failures += run_pair_case({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);

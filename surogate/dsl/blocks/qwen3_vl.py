@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .. import nn
 from ..block_schema import BlockSchema, SlotDecl
+from .qwen3 import _QWEN3_SERVE_OBJECTS
 from ..modules import GenericMLP, Qwen3VLAttention, RMSNorm
 from .common import VL_DENSE_BLOCK_NAME_REMAP
 
@@ -34,6 +35,7 @@ class Qwen3VLBlock(nn.Block):
             SlotDecl("swiglu", shape=("B", "T", "M")),
             SlotDecl("mlp_down", shape=("B", "T", "C")),
         ),
+        serve_objects=_QWEN3_SERVE_OBJECTS,
         attrs={"block_family": "qwen3_vl_dense"},
     )
 

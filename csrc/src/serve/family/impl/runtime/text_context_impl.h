@@ -1222,8 +1222,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     Tensor rope_for_op = text_rope_positions<Variant>(
         active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions);
     if constexpr (applies_rotary<Variant>()) {
+        const auto& g = weights_.geometry;
+        if (rope_for_op.ne[1] == 3 && g.mrope_temporal) {
+            ops::rope_interleaved(rope_for_op, cfg_.layer_rotary_dim(layer), layer_rope_theta(layer, g),
+                                 {g.mrope_temporal, g.mrope_height, g.mrope_width}, qn, kn, s);
+        } else {
         ops::rope(rope_for_op, cfg_.layer_rotary_dim(layer), cfg_.layer_rotary_pairs(layer),
                   layer_rope_theta(layer, weights_.geometry), qn, kn, s);
+        }
     }
     debug_probe<Variant>("q_post_rope", qn.view({layer_q_size, T}), cfg_.n_layers, s);
     debug_probe<Variant>("k_post_rope", kn.view({layer_kv_size, T}), cfg_.n_layers, s);
@@ -1771,7 +1777,8 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, in
 // exists while the switch is set.
 
 template <class Tap>
-void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
+void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepstack,
+                              std::span<const std::int32_t> visual_indices) {
     const bool prefill = ph == Phase::Prefill;
     PrefillFamilyTimer& timer = prefill_family_timer();
     // Event synchronisation is illegal inside stream capture, and a captured
@@ -1819,7 +1826,6 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 if (timing) { cudaEventRecord(timer.begin, ctx_.stream); }
                 mlp_tail(full.post_attn_norm, full.mlp, x, layer, ph);
                 if (timing) { lap(timer.begin, timer.mlp_full, acc_mlp_full); }
-                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
             const int gidx       = cfg_.gdn_idx(layer);
@@ -1848,9 +1854,13 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 if (timing) { cudaEventRecord(timer.begin, ctx_.stream); }
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, layer, ph);
                 if (timing) { lap(timer.begin, timer.mlp_gdn, acc_mlp_gdn); }
-                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
+        if (deepstack != nullptr && layer < deepstack->ne[2]) {
+            family::detail::add_visual_embeddings(x, deepstack->slice(2, layer, 1),
+                                                  visual_indices, ctx_.stream);
+        }
+        if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
     }
     if (timing) {
         timer.t_attn += acc_attn; timer.t_mlp_full += acc_mlp_full;
@@ -3322,7 +3332,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ops::scatter(embeddings, indices_device, x, s);
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
-            run_layers(x, Phase::Prefill, tap);
+            Tensor deepstack;
+            if (vision_chunk.deepstack.data != nullptr && !local_scatter_indices.empty()) {
+                deepstack = vision_chunk.deepstack.slice(1, visual_begin,
+                    static_cast<std::int32_t>(local_scatter_indices.size()));
+            }
+            run_layers(x, Phase::Prefill, tap, deepstack.data ? &deepstack : nullptr,
+                       local_scatter_indices);
             window_laps.mark_layers();
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);

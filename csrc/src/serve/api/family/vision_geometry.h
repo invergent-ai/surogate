@@ -12,6 +12,7 @@ namespace sinfer::family {
 
 /// Tower dimensions and execution settings resolved from the checkpoint.
 struct VisionGeometry {
+    std::int32_t deepstack_layers = 0;
     std::int32_t siglip2 = 0;
     std::int32_t projector_hidden = 0;
     std::int32_t projector_norm = 0;
@@ -50,7 +51,7 @@ struct VisionGeometry {
         g.override_from(values);
 #define SINFER_GEOMETRY_INT(name) \
         if (std::string_view(#name) != "siglip2" && std::string_view(#name) != "projector_hidden" && \
-            std::string_view(#name) != "projector_norm" && \
+            std::string_view(#name) != "projector_norm" && std::string_view(#name) != "deepstack_layers" && \
             !(g.siglip2 && (std::string_view(#name) == "rotary_dim" || std::string_view(#name) == "rope_theta")) && \
             (!values.contains(#name) || g.name <= 0)) { \
             throw std::invalid_argument("missing or invalid vision_geometry." #name); \
@@ -62,6 +63,9 @@ struct VisionGeometry {
         if (g.siglip2 && (g.siglip2 != 1 || g.projector_hidden <= 0 || g.projector_norm > 1 ||
                          g.rotary_dim != 0 || g.merge != 2)) {
             throw std::invalid_argument("invalid SigLIP2 projector geometry");
+        }
+        if (g.deepstack_layers > g.layers || (g.siglip2 && g.deepstack_layers)) {
+            throw std::invalid_argument("invalid vision deepstack count");
         }
         if (g.hidden % g.heads || g.head_dim() % 4 || g.rotary_dim > g.head_dim() || g.rotary_dim % 4 ||
             std::int64_t(g.merge) * g.merge > std::numeric_limits<std::int32_t>::max() / g.hidden ||

@@ -3,8 +3,15 @@
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t
+#include <array>
 
 namespace sinfer::ops {
+
+// Interleaved three-axis text RoPE. Sections count temporal, height and width pairs.
+// Height occupies 1:3*sections[1]:3, width 2:3*sections[2]:3; remaining pairs use time.
+// The sections sum to rotary_dim/2. Storage and arithmetic follow rope below.
+void rope_interleaved(const Tensor& positions, int rotary_dim, float theta,
+                      std::array<int, 3> sections, Tensor& q, Tensor& k, cudaStream_t stream);
 
 /**
  * Applies split-half NeoX RoPE in place. For pair i in [0,rotary_dim/2), angle phi(i,t), and

@@ -206,7 +206,7 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
 }
 
 void launch_generic(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
-                    Tensor* q, Tensor* k, cudaStream_t stream) {
+                    Tensor* q, Tensor* k, cudaStream_t stream, int height_pairs = -1, int width_pairs = -1) {
     constexpr int block = 128;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
@@ -215,10 +215,17 @@ void launch_generic(const Tensor& positions, int rotary_dim, int active_pairs, f
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
         active_pairs, theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens,
-        token_stride(q), token_stride(k));
+        token_stride(q), token_stride(k), height_pairs, width_pairs);
 }
 
 } // namespace
+
+void rope_interleaved_launch(const Tensor& positions, int rotary_dim, float theta,
+                             int height_pairs, int width_pairs, Tensor& q, Tensor& k,
+                             cudaStream_t stream) {
+    launch_generic(positions, rotary_dim, rotary_dim / 2, theta, &q, &k, stream, height_pairs, width_pairs);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void rope_launch(const Tensor& positions, int rotary_dim, int active_pairs, float theta,
                  Tensor& q, Tensor& k, cudaStream_t stream) {

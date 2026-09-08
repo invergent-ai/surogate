@@ -144,9 +144,11 @@ public:
               ProcessorOptions options, std::shared_ptr<MediaPreprocessCache> media_cache);
 
     ProcessedInput process(std::vector<ChatMessage> messages, ChatRenderOptions render_options = {},
-                           const PreparationControl& control = {}) const;
+                           const PreparationControl& control = {},
+                           std::optional<RenderedChat> prepared_chat = std::nullopt) const;
 
 private:
+    int image_token_id_ = -1, video_token_id_ = -1;
     const Tokenizer& tokenizer_;
     const CompiledChatTemplate& chat_template_;
     ProcessorOptions options_;

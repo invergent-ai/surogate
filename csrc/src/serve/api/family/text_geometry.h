@@ -34,6 +34,7 @@ struct TextGeometry {
     std::int32_t kv_heads           = 0;
     std::int32_t head_dim           = 0;
     std::int32_t rotary_dim         = 0;
+    std::int32_t mrope_temporal = 0, mrope_height = 0, mrope_width = 0;
     // Optional contiguous rotary prefix for windowed layers; zero inherits rotary_dim.
     std::int32_t sliding_rotary_dim = 0;
     std::int32_t residual_fp32 = 0;
@@ -321,6 +322,13 @@ struct TextGeometry {
             g.rotary_dim > g.head_dim || g.rotary_dim % 2 != 0 ||
             (g.rotary_dim > 0 && g.rope_theta <= 0.0F)) {
             throw std::invalid_argument("inconsistent checkpoint text geometry");
+        }
+        const int pairs = g.rotary_dim / 2;
+        if ((g.mrope_temporal || g.mrope_height || g.mrope_width) &&
+            (g.mrope_temporal <= 0 || g.mrope_height <= 0 || g.mrope_width <= 0 ||
+             static_cast<std::int64_t>(g.mrope_temporal) + g.mrope_height + g.mrope_width != pairs ||
+             g.mrope_height > (pairs + 1) / 3 || g.mrope_width > pairs / 3)) {
+            throw std::invalid_argument("invalid interleaved MRoPE sections");
         }
         if (g.residual_fp32 != 0 && g.residual_fp32 != 1) {
             throw std::invalid_argument("residual_fp32 must be 0 or 1");

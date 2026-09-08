@@ -21,6 +21,7 @@ TEXT_INT_FIELDS = (
     "kv_heads",
     "head_dim",
     "rotary_dim",
+    "mrope_temporal", "mrope_height", "mrope_width",
     "sliding_rotary_dim",
     "gdn_conv_kernel",
     "gdn_key_heads",
@@ -81,6 +82,7 @@ TEXT_FLOAT_FIELDS = (
 )
 
 VISION_INT_FIELDS = (
+    "deepstack_layers",
     "siglip2",
     "projector_hidden",
     "projector_norm",
@@ -129,6 +131,11 @@ def validate_resolved_geometry(values: Mapping[str, object]) -> dict[str, int | 
         raise ValueError("geometry.rotary_dim must be even and no greater than head_dim")
     if result["rotary_dim"] and result["rope_theta"] <= 0:
         raise ValueError("geometry.rope_theta must be positive when rotary_dim is nonzero")
+    sections = [result.get(name, 0) for name in ("mrope_temporal", "mrope_height", "mrope_width")]
+    pairs = result["rotary_dim"] // 2
+    if any(sections) and (min(sections) <= 0 or sum(sections) != pairs or
+                          sections[1] > (pairs + 1) // 3 or sections[2] > pairs // 3):
+        raise ValueError("invalid interleaved MRoPE sections")
     if result.get("residual_fp32", 0) not in (0, 1):
         raise ValueError("geometry.residual_fp32 must be 0 or 1")
     sliding_dim = result.get("sliding_rotary_dim", 0)

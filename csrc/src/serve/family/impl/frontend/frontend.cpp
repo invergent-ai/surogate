@@ -1267,7 +1267,14 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                 impl_->media_cache);
         fi::ProcessedInput processed;
         try {
-            processed = processor.process(std::move(messages), render_options(options), control);
+            std::optional<fi::RenderedChat> rendered;
+            if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl) {
+                rendered = impl_->render_chat(messages, options);
+                opens_reasoning = options.add_generation_prompt &&
+                    fi::prompt_opens_reasoning(rendered->text, impl_->reasoning.open);
+            }
+            processed = processor.process(std::move(messages), render_options(options), control,
+                                          std::move(rendered));
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.token_types    = std::move(processed.token_types);
@@ -1367,8 +1374,12 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
                             impl_->media_cache);
     try {
+        std::optional<fi::RenderedChat> rendered;
+        if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl) {
+            rendered = impl_->render_chat(messages, options);
+        }
         return checked_token_count(
-            processor.process(std::move(messages), render_options(options), control)
+            processor.process(std::move(messages), render_options(options), control, std::move(rendered))
                 .input_ids.size());
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }

@@ -61,6 +61,21 @@ int main() {
         assert(threw);
     }
 
+    auto mrope = complete;
+    mrope["mrope_temporal"] = 12;
+    mrope["mrope_height"] = 10;
+    mrope["mrope_width"] = 10;
+    assert(sinfer::family::TextGeometry::resolved(mrope, types).mrope_temporal == 12);
+    for (const auto& [name, value] : std::map<std::string, double>{
+             {"mrope_temporal", 0}, {"mrope_height", 11}, {"mrope_width", 11}}) {
+        auto bad = mrope;
+        bad[name] = value;
+        bool threw = false;
+        try { (void)sinfer::family::TextGeometry::resolved(bad, types); }
+        catch (const std::invalid_argument&) { threw = true; }
+        assert(threw);
+    }
+
     auto hybrid_values = complete;
     hybrid_values["sliding_window"] = 256;
     const std::array<std::string, 3> hybrid_types{"sliding_attention", "linear_attention", "full_attention"};

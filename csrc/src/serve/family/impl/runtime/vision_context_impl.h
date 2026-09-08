@@ -161,6 +161,11 @@ VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights)
         out.fc2             = &source.fc2;
         out.fc2_bias        = &source.fc2_bias;
     }
+    for (const auto& source : vision.deepstack) {
+        deepstack_.push_back({source.layer, MergerW{
+            &source.norm_weight, &source.norm_bias, &source.fc1, &source.fc1_bias,
+            &source.fc2, &source.fc2_bias}});
+    }
     merger_.norm_weight = &vision.common.merger_norm_weight;
     merger_.norm_bias   = &vision.common.merger_norm_bias;
     merger_.fc1         = &vision.common.merger_fc1;
@@ -184,7 +189,7 @@ std::size_t VisionContext::output_transient_bytes(const family::VisionGeometry& 
     }
     LayoutBuilder layout;
     (void)layout.add_tensor(
-        DType::BF16, {geometry.output_hidden, static_cast<std::int32_t>(merged_tokens)},
+        DType::BF16, {geometry.output_hidden, static_cast<std::int32_t>(merged_tokens), 1 + geometry.deepstack_layers},
         kWorkspaceAlignment, "Vision item output transient");
     return layout.finish(kWorkspaceAlignment, "Vision item output transient layout");
 }
@@ -216,9 +221,9 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
         throw std::invalid_argument("Vision processor patch buffer has invalid shape");
     }
     if (output.dtype != DType::BF16 || output.ne[0] != g.output_hidden ||
-        output.ne[1] != static_cast<std::int32_t>(tokens64) || output.ne[2] != 1 ||
+        output.ne[1] != static_cast<std::int32_t>(tokens64) || output.ne[2] != 1 + g.deepstack_layers ||
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {
-        throw std::invalid_argument("Vision output must be contiguous BF16 [H,V]");
+        throw std::invalid_argument("Vision output must be contiguous BF16 [H,V,1+deepstack_layers]");
     }
     const VisionWorkspaceLayout layout = build_workspace_layout(
         g, patches64, tokens64, static_cast<std::size_t>(control.segment_count));
@@ -255,6 +260,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     } else {
         ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
     }
+    std::size_t deepstack_index = 0;
     for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
         const BlockW& block = blocks_[layer];
         {
@@ -307,6 +313,20 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
             ops::add_bias(*block.fc2_bias, down, stream);
             ops::residual_add(down, x, stream);
         }
+        if (deepstack_index < deepstack_.size() &&
+            deepstack_[deepstack_index].first == static_cast<std::int32_t>(layer)) {
+            const auto& merger = deepstack_[deepstack_index].second;
+            Tensor merged = x.view({g.merger_hidden(), tokens});
+            Tensor norm = layout.normalized.bind(backing).view({g.merger_hidden(), tokens});
+            ops::layer_norm(merged, *merger.norm_weight, *merger.norm_bias, g.norm_epsilon, norm, stream);
+            Tensor hidden = layout.merger_hidden.bind(backing);
+            ops::linear(norm, *merger.fc1, hidden, stream);
+            ops::add_bias(*merger.fc1_bias, hidden, stream);
+            ops::gelu(hidden, ops::GeluMode::Exact, stream);
+            Tensor features = output.slice(2, static_cast<int>(++deepstack_index), 1);
+            ops::linear(hidden, *merger.fc2, features, stream);
+            ops::add_bias(*merger.fc2_bias, features, stream);
+        }
     }
 
     Tensor normalized = layout.normalized.bind(backing);
@@ -323,9 +343,10 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     ops::linear(merged, *merger_.fc1, hidden, stream);
     ops::add_bias(*merger_.fc1_bias, hidden, stream);
     ops::gelu(hidden, ops::GeluMode::Exact, stream);
-    ops::linear(hidden, *merger_.fc2, output, stream);
-    ops::add_bias(*merger_.fc2_bias, output, stream);
-    debug_probe<Variant>("vision_projection", output.slice(1, 0, std::min(tokens, 64)),
+    Tensor final_output = output.slice(2, 0, 1);
+    ops::linear(hidden, *merger_.fc2, final_output, stream);
+    ops::add_bias(*merger_.fc2_bias, final_output, stream);
+    debug_probe<Variant>("vision_projection", final_output.slice(1, 0, std::min(tokens, 64)),
                          g.layers, stream);
 }
 
@@ -386,15 +407,12 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         throw std::overflow_error("Vision item output columns exceed int32");
     }
     const family::VisionGeometry& g = context_.geometry();
-    const std::size_t output_bytes =
-        checked_mul(checked_mul(static_cast<std::size_t>(g.output_hidden), control.merged_count,
-                                "item output elements"),
-                    dtype_size(DType::BF16), "item output bytes");
+    const std::size_t output_bytes = VisionContext::output_transient_bytes(g, control.merged_count);
     if (output_bytes > transient_.size) {
         throw std::invalid_argument("Vision item output transient is too small");
     }
     Tensor output(transient_.data, DType::BF16,
-                  {g.output_hidden, static_cast<std::int32_t>(control.merged_count)});
+                  {g.output_hidden, static_cast<std::int32_t>(control.merged_count), 1 + g.deepstack_layers});
 
     if (!active_item_ || *active_item_ != active->item_index) {
         if (active_item_ && active->item_index <= *active_item_) {
@@ -415,7 +433,8 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         active_item_ = active->item_index;
         encoded_payloads_pending_release_.push_back(active->item_index);
     }
-    return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
+    return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output.slice(2, 0, 1),
+                       g.deepstack_layers ? output.slice(2, 1, g.deepstack_layers) : Tensor{}};
 }
 
 void VisionPrefillSession::release_encoded_media_payloads() noexcept {

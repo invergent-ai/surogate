@@ -231,10 +231,11 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
 
 __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, int rotary_dim,
                                                        int pair, int* axis, float* exponent) {
-    if (axes == 2 && head_dim == 72 && rotary_dim == 72) {
-        *axis           = pair / 18;
-        const int local = pair % 18;
-        *exponent       = -2.0F * static_cast<float>(local) / 36.0F;
+    if (axes == 2) {
+        const int quarter = rotary_dim / 4;
+        *axis = pair / quarter;
+        const int local = pair % quarter;
+        *exponent = -2.0F * static_cast<float>(local) / static_cast<float>(rotary_dim / 2);
     } else {
         *axis     = axes == 3 ? pair % 3 : 0;
         *exponent = -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
@@ -247,7 +248,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
                                            std::int32_t active_pairs, float theta,
                                            std::int32_t q_heads, std::int32_t k_heads,
                                            std::int32_t tokens, std::int64_t q_token_stride,
-                                           std::int64_t k_token_stride) {
+                                           std::int64_t k_token_stride, int height_pairs, int width_pairs) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -274,11 +275,22 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             int axis       = 0;
             float exponent = 0.0F;
             generic_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
-            const float frequency = powf(theta, exponent);
-            const float angle =
-                static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
-                frequency;
-            sincosf(angle, &sin_cache[pair], &cos_cache[pair]);
+            if (axes == 3 && height_pairs >= 0) {
+                axis = pair % 3 == 1 && pair / 3 < height_pairs ? 1
+                     : pair % 3 == 2 && pair / 3 < width_pairs ? 2 : 0;
+            }
+            // Long contexts amplify float frequency/phase rounding before sine reduction.
+            // Compute the phase in double, then store float coefficients for BF16 rotation.
+            const double power = axes == 2
+                ? -2.0 * (pair % (rotary_dim / 4)) / (rotary_dim / 2)
+                : -2.0 * pair / rotary_dim;
+            const double frequency = pow(static_cast<double>(theta), power);
+            const double angle =
+                static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) * frequency;
+            double sine, cosine;
+            sincos(angle, &sine, &cosine);
+            sin_cache[pair] = static_cast<float>(sine);
+            cos_cache[pair] = static_cast<float>(cosine);
         }
     }
     __syncthreads();

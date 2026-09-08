@@ -32,8 +32,6 @@ constexpr int kTemporal                           = 2;
 constexpr int kMerge                              = 2;
 constexpr int kFactor                             = kPatch * kMerge;
 constexpr int kPatchFeatures                      = 3 * kTemporal * kPatch * kPatch;
-constexpr int kImageToken                         = 248056;
-constexpr int kVideoToken                         = 248057;
 constexpr std::uint64_t kMinimumRawPatchesPerItem = kMerge * kMerge;
 constexpr std::string_view kImagePad              = "<|image_pad|>";
 constexpr std::string_view kVideoPad              = "<|video_pad|>";
@@ -566,7 +564,7 @@ void validate_special_token(const Tokenizer& tokenizer, std::string_view text, i
     const std::vector<int> ids = tokenizer.encode(text);
     if (ids.size() != 1 || ids.front() != expected) {
         throw std::invalid_argument(
-            "Qwen3.6 tokenizer vision token IDs do not match model contract");
+            "tokenizer vision token ID does not match the processor configuration");
     }
 }
 
@@ -630,13 +628,23 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
         validate_special_token(tokenizer_, "<image>", options_.image_token_id);
         return;
     }
-    validate_special_token(tokenizer_, kImagePad, kImageToken);
-    validate_special_token(tokenizer_, kVideoPad, kVideoToken);
+    const auto media_token_id = [&](std::string_view token) {
+        const auto ids = tokenizer_.encode(token);
+        if (ids.size() != 1 || !tokenizer_.is_special_token(ids.front())) {
+            throw std::invalid_argument("vision marker must be one special token: " + std::string(token));
+        }
+        return ids.front();
+    };
+    image_token_id_ = media_token_id(kImagePad);
+    video_token_id_ = media_token_id(kVideoPad);
+    (void)media_token_id(kVisionStart);
+    (void)media_token_id(kVisionEnd);
 }
 
 ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   ChatRenderOptions render_options,
-                                  const PreparationControl& control) const {
+                                  const PreparationControl& control,
+                                  std::optional<RenderedChat> prepared_chat) const {
     check_preparation_control(control);
     if (options_.lfm2_vl) {
         return process_lfm2_vl(tokenizer_, options_, *media_cache_, std::move(messages),
@@ -658,7 +666,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         remaining_media_bytes -= part->media.bytes.size();
     }
     MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
-    RenderedChat rendered = chat_template_.render(messages, std::move(render_options));
+    RenderedChat rendered = prepared_chat ? std::move(*prepared_chat)
+        : chat_template_.render(messages, std::move(render_options));
     std::atomic<bool> stop_preparation{false};
     const PreparationControl worker_control{
         .deadline     = control.deadline,
@@ -783,9 +792,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.rewrite_checkpoint = encoded.rewrite_checkpoint;
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
-        if (output.input_ids[i] == kImageToken) {
+        if (output.input_ids[i] == image_token_id_) {
             output.token_types[i] = static_cast<std::uint8_t>(Modality::Image);
-        } else if (output.input_ids[i] == kVideoToken) {
+        } else if (output.input_ids[i] == video_token_id_) {
             output.token_types[i] = static_cast<std::uint8_t>(Modality::Video);
         }
     }

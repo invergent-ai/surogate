@@ -1101,6 +1101,33 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     return failures;
 }
 
+int test_checkpoint_vision_ids_and_jinja() {
+    auto owned = resources("{% for message in messages %}{{ message.content }}{% endfor %}");
+    auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
+    auto config = nlohmann::json::parse(owned.tokenizer_config_json);
+    for (auto [old_id, new_id] : {std::pair{248053,151652}, {248054,151653},
+                                 {248056,151655}, {248057,151656}}) {
+        auto& decoder = config["added_tokens_decoder"];
+        decoder[std::to_string(new_id)] = decoder.at(std::to_string(old_id));
+        decoder.erase(std::to_string(old_id));
+        for (auto& token : tokenizer["added_tokens"]) {
+            if (token["id"] == old_id) { token["id"] = new_id; }
+        }
+    }
+    owned.tokenizer_json = tokenizer.dump();
+    owned.tokenizer_config_json = config.dump();
+    const auto frontend = FrontendFactory::create_component(owned);
+    const auto prepared = frontend.prepare(image_input());
+    const auto& data = FrontendFactory::inspect(prepared);
+    int failures = check(data.vision_items.size() == 1 && data.prepare.vision_tokens == 4,
+                         "checkpoint vision token IDs or Jinja image preparation failed");
+    failures += check(std::count(data.token_ids.begin(), data.token_ids.end(), 151655) == 4,
+                      "image placeholders did not use the checkpoint tokenizer IDs");
+    failures += check(frontend.count_tokens(image_input()) == data.token_ids.size(),
+                      "Jinja media count_tokens disagrees with preparation");
+    return failures;
+}
+
 int test_lfm2_image_preparation() {
     auto owned = resources("{% for message in messages %}{{ message.content }}{% endfor %}");
     auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
@@ -1606,6 +1633,7 @@ int main() {
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
     failures += test_lfm2_image_preparation();
+    failures += test_checkpoint_vision_ids_and_jinja();
     failures += test_jinja_capability_probe();
     failures += test_official_tokenizer_merge();
     failures += test_transformers5_config_without_decoder();

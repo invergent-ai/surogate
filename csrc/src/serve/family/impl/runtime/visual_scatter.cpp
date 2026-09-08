@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "api/ops/scatter.h"
+#include "api/ops/residual_add.h"
 
 #include <stdexcept>
 
@@ -18,6 +19,26 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
 }
 
 } // namespace
+
+void add_visual_embeddings(Tensor& residual, const Tensor& features,
+                           std::span<const std::int32_t> indices, cudaStream_t stream) {
+    if (features.ne[1] != static_cast<std::int32_t>(indices.size())) {
+        throw std::invalid_argument("visual residual features and indices disagree");
+    }
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        if (indices[i] < 0 || indices[i] >= residual.ne[1] || (i && indices[i] <= indices[i - 1])) {
+            throw std::invalid_argument("visual residual indices must be ordered, unique and in bounds");
+        }
+    }
+    for (std::size_t begin = 0; begin < indices.size();) {
+        auto end = begin + 1;
+        while (end < indices.size() && indices[end] == indices[end - 1] + 1) { ++end; }
+        const auto count = static_cast<std::int32_t>(end - begin);
+        Tensor destination = residual.slice(1, indices[begin], count);
+        ops::residual_add(features.slice(1, static_cast<std::int32_t>(begin), count), destination, stream);
+        begin = end;
+    }
+}
 
 void scatter_shifted_visual_embeddings(Tensor& input_embeddings, const Tensor& visual_embeddings,
                                        const family::MtpVisualOverlap& overlap,

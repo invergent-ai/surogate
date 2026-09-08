@@ -78,6 +78,8 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
                                "Qwen3.5/3.6/3.8", gguf_repack=True)
     # Any size of the plain dense Qwen3: the artifact states its dimensions and the engine
     # binds against those, so the architecture is the gate.
+    if model_type == "qwen3_vl" and hidden > 0 and layers > 0:
+        return ConverterTarget("qwen3_vl", "surogate.serve.convert.qwen3_vl.convert", "Qwen3-VL")
     if model_type == "qwen3" and hidden > 0 and layers > 0:
         return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3",
                                gguf_repack=True)

@@ -129,6 +129,30 @@ void require_active_pairs(int active_pairs, int rotary_dim) {
 
 } // namespace
 
+void rope_interleaved(const Tensor& positions, int rotary_dim, float theta,
+                      std::array<int, 3> sections, Tensor& q, Tensor& k, cudaStream_t stream) {
+    require_common(positions, rotary_dim, theta);
+    const int pairs = rotary_dim / 2;
+    if (sections[0] <= 0 || sections[1] <= 0 || sections[2] <= 0 ||
+        static_cast<std::int64_t>(sections[0]) + sections[1] + sections[2] != pairs ||
+        sections[1] > (pairs + 1) / 3 || sections[2] > pairs / 3) {
+        throw std::invalid_argument("rope_interleaved: invalid temporal/height/width sections");
+    }
+    if (q.dtype != DType::BF16 || k.dtype != DType::BF16 ||
+        (q.ne[0] != 64 && q.ne[0] != 128 && q.ne[0] != 256 && q.ne[0] != 512) ||
+        rotary_dim > q.ne[0] || position_axes(positions, q.ne[2]) != 3) {
+        throw std::invalid_argument("rope_interleaved: expected BF16 heads and [T,3] positions");
+    }
+    const auto elements = numel_allow_zero(q, "q");
+    (void)numel_allow_zero(k, "k");
+    require_tensor_layout(q, "q", q.ne[0], q.ne[1], q.ne[2]);
+    require_tensor_layout(k, "k", q.ne[0], k.ne[1], q.ne[2]);
+    if (!elements) { return; }
+    require_positions_storage(positions);
+    if (!q.data || !k.data) { throw std::invalid_argument("rope_interleaved: null head storage"); }
+    detail::rope_interleaved_launch(positions, rotary_dim, theta, sections[1], sections[2], q, k, stream);
+}
+
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
           cudaStream_t stream) {
     rope(positions, rotary_dim, rotary_dim / 2, theta, q, k, stream);

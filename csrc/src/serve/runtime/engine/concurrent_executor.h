@@ -596,6 +596,14 @@ private:
         return cancelled;
     }
 
+    void release_prefill_owner(std::uint32_t lane) noexcept {
+        prefill_lanes_.erase(lane);
+        if (transient_owner_ == lane) {
+            instance_.request_memory.deactivate();
+            transient_owner_.reset();
+        }
+    }
+
     void
     cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary) {
         bool changed = false;
@@ -604,8 +612,7 @@ private:
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             instance_.program->abort_lane(lane);
             if (prefill_lanes_.contains(lane)) {
-                prefill_lanes_.erase(lane);
-                if (prefill_lanes_.empty()) { instance_.request_memory.deactivate(); }
+                release_prefill_owner(lane);
             }
             complete_cancelled(request);
             remove_completed_slot(lane);
@@ -696,8 +703,7 @@ private:
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;
             if (prefill_lanes_.contains(lane)) {
-                prefill_lanes_.erase(lane);
-                if (prefill_lanes_.empty()) { instance_.request_memory.deactivate(); }
+                release_prefill_owner(lane);
             }
             instance_.program->abort_lane(lane);
             complete_cancelled(request);
@@ -707,8 +713,7 @@ private:
         if (!step.complete) { return; }
         if (!request->lane) { throw std::logic_error("completed prefill has no request lane"); }
         if (prefill_lanes_.contains(*request->lane)) {
-            prefill_lanes_.erase(*request->lane);
-            if (prefill_lanes_.empty()) { instance_.request_memory.deactivate(); }
+            release_prefill_owner(*request->lane);
         }
         request->begin = step.summary;
         if (step.round.tokens.size() != 1) {
@@ -785,6 +790,7 @@ private:
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
+            if (plan.summary().transient_bytes != 0 && transient_owner_) { continue; }
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
@@ -798,6 +804,7 @@ private:
             if (slots_[lane] != nullptr) { continue; }
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
+            if (plan.summary().transient_bytes != 0 && transient_owner_) { continue; }
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
@@ -889,10 +896,13 @@ private:
 
             TransientRegion transient;
             if (needs_prefill) {
-                instance_.request_memory.activate(summary.transient_bytes,
-                                                  summary.transient_alignment);
+                if (summary.transient_bytes != 0) {
+                    if (transient_owner_) { throw std::logic_error("request transient already has an owner"); }
+                    instance_.request_memory.activate(summary.transient_bytes, summary.transient_alignment);
+                    transient_owner_ = lane;
+                    transient = instance_.request_memory.region();
+                }
                 prefill_lanes_.add(lane);
-                transient     = instance_.request_memory.region();
             }
             publish_runtime_stats();
             target_started                = true;
@@ -911,8 +921,7 @@ private:
             const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }
             if (prefill_lanes_.contains(lane)) {
-                prefill_lanes_.erase(lane);
-                if (prefill_lanes_.empty()) { instance_.request_memory.deactivate(); }
+                release_prefill_owner(lane);
             }
             slots_[lane].reset();
             invalidate_lane_plans(lane);
@@ -983,7 +992,9 @@ private:
             // protection policy reasons on lanes and pages and would find the head unblocked;
             // the head simply waits for memory (retained lanes go back at the round boundary,
             // the other engines' reserves have been asked for) and retries next round.
-            if (instance_.program->kv_under_pressure()) {
+            // The frozen media buffer is also outside the lane/page protection accounting.
+            // Its owner releases it when prefill finishes, so retry admission at that boundary.
+            if (instance_.program->kv_under_pressure() || transient_owner_) {
                 protection_.reset();
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
@@ -1479,6 +1490,7 @@ private:
         }
         if (!prefill_lanes_.empty()) {
             instance_.request_memory.deactivate();
+            transient_owner_.reset();
             prefill_lanes_.clear();
         }
         protection_.reset();
@@ -1810,6 +1822,8 @@ private:
         std::size_t size_ = 0;
     };
     PrefillLaneSet prefill_lanes_;
+    // Encoded media survives across prefill chunks in the single frozen transient buffer.
+    std::optional<std::uint32_t> transient_owner_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

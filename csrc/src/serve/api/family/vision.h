@@ -110,9 +110,15 @@ template <class Config>
 using VisionCommonWeightsFor = VisionCommonWeights;
 
 struct VisionWeights {
+    struct DeepstackMerger {
+        std::int32_t layer;
+        Weight fc1, fc2;
+        Tensor fc1_bias, fc2_bias, norm_weight, norm_bias;
+    };
     VisionCommonWeights common;
     Weight merger_fc2;
     Tensor merger_fc2_bias;
+    std::vector<DeepstackMerger> deepstack;
 };
 
 template <class Config>

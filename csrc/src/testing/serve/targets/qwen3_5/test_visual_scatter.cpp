@@ -64,6 +64,25 @@ int main() {
     int failures = 0;
     failures += run(8, "MTP shifted visual composition crosses chunk boundary");
     failures += run(4, "MTP shifted visual composition keeps bonus token embedding");
+    {
+        DeviceBuffer dinput = to_device_bf16(token_embeddings);
+        Tensor input(dinput.p, DType::BF16, {d, t});
+        const std::vector<std::int32_t> indices{0, 2, 3};
+        family::detail::add_visual_embeddings(input, visual, indices, nullptr);
+        cuda_synchronize();
+        std::vector<double> expected(token_embeddings.begin(), token_embeddings.end());
+        for (int i = 0; i < v; ++i) {
+            for (int row = 0; row < d; ++row) {
+                expected[indices[i] * d + row] += visual_embeddings[i * d + row];
+            }
+        }
+        failures += verify_exact("deepstack keeps intervening text columns", from_device_bf16(dinput, expected.size()), expected);
+        try {
+            const std::vector<std::int32_t> invalid{0, 2, 2};
+            family::detail::add_visual_embeddings(input, visual, invalid, nullptr);
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    }
     std::cout << (failures ? "FAIL" : "OK") << " shifted visual composition\n";
     return failures ? 1 : 0;
 }

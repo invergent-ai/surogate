@@ -1,4 +1,5 @@
 // Generated from surogate/serve/artifact/geometry.py. Do not edit.
+SINFER_GEOMETRY_INT(deepstack_layers)
 SINFER_GEOMETRY_INT(siglip2)
 SINFER_GEOMETRY_INT(projector_hidden)
 SINFER_GEOMETRY_INT(projector_norm)

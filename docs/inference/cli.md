@@ -235,6 +235,15 @@ sets how much processed media to retain for reuse; `0` disables retention. `--me
 (default 2048) limits memory for media currently being processed or used by requests.
 `--media-preprocess-threads N` chooses processing threads; `0` selects automatically, up to 16.
 
+For example, serve a dense Qwen3-VL checkpoint with image and video inputs:
+
+```bash
+surogate serve Qwen/Qwen3-VL-2B-Instruct --vision --port 8080
+```
+
+Send media through the [chat API](api.md#chat-completions). Without `--vision`, the same
+checkpoint serves text prompts. Qwen3-VL-MoE and Qwen3-VL GGUF files are not supported yet.
+
 ### Responses state
 
 `--response-store-max-records N` (1024) and `--response-store-max-mib N` (256) limit stored

@@ -629,7 +629,8 @@ private:
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, int layer, Phase phase);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
-    void run_layers(Tensor& x, Phase phase, Tap& tap);
+    void run_layers(Tensor& x, Phase phase, Tap& tap, const Tensor* deepstack = nullptr,
+                    std::span<const std::int32_t> visual_indices = {});
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,
