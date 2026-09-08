@@ -62,6 +62,22 @@ RECIPE_ID = "qwen3-v1"
 ResourcePayload = family_conversion.ResourcePayload
 ObjectPlan = family_conversion.ObjectPlan
 
+
+@dataclass(frozen=True, slots=True)
+class ConversionPreflight:
+    model_dir: Path
+    geometry: inventory.Geometry
+    config_summary: dict
+    recipes: tuple[TensorRecipe, ...]
+    source: SourcePreflight
+    resources: tuple[ResourcePayload, ...]
+    object_plan: ObjectPlan
+
+    @property
+    def recipes_by_name(self) -> dict[str, TensorRecipe]:
+        return {item.object_name: item for item in self.recipes}
+
+
 #: Members of `config.json` that must hold for the registered target. Geometry is
 #: read out of the file rather than asserted against a second copy of itself;
 #: these are the members that are not geometry, plus the architecture identity.
@@ -70,7 +86,6 @@ _REQUIRED_CONFIG = {
     "model_type": "qwen3",
     "hidden_act": "silu",
     "attention_bias": False,
-    "rms_norm_eps": 1e-6,
     "rope_scaling": None,
     "sliding_window": None,
     "use_sliding_window": False,
@@ -168,84 +183,19 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
 
 
 def token_domain(root: Path) -> int:
-    """How many token ids the tokenizer defines: the rows of the head that are real tokens.
-
-    `config.json.vocab_size` is the padded row count of the embedding and the head; the ids a
-    prompt can contain, and the ids sampling may return, stop earlier. The tokenizer is the
-    authority on where -- its vocabulary plus the added tokens -- and the engine restricts
-    sampling to exactly this many rows.
-    """
-    tokenizer = json.loads((root / "tokenizer.json").read_text(encoding="utf-8"))
-    ids = list(tokenizer["model"]["vocab"].values())
-    ids.extend(int(token["id"]) for token in tokenizer.get("added_tokens", ()))
-    return max(ids) + 1
+    from surogate.serve.convert.common.checkpoint import tokenizer_domain
+    return tokenizer_domain(root)
 
 
 def geometry_block(preflight: "ConversionPreflight", root: Path) -> dict[str, float]:
-    """The artifact's `geometry` member: the numbers the engine's one `qwen3` target reads at
-    load instead of compiling, keyed as the family's `TextGeometry` names them."""
-    geometry = preflight.geometry
-    text = preflight.config_summary["text"]
-    return {
-        "hidden": geometry.hidden,
-        "layers": geometry.layers,
-        "intermediate": geometry.intermediate,
-        "output_rows": geometry.vocab,
-        "token_domain": token_domain(root),
-        "query_heads": geometry.query_heads,
-        "kv_heads": geometry.kv_heads,
-        "head_dim": geometry.head_dim,
-        "rotary_dim": geometry.head_dim,
-        "rms_epsilon": float(text["rms_norm_eps"]),
-        "rope_theta": float(text["rope_theta"]),
-    }
+    """Serialize the checkpoint's resolved dimensions and execution settings."""
+    from surogate.serve.convert.common.checkpoint import dense_geometry
 
-
-
-
-# ---------------------------------------------------------------------------
-# conversion
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class ConversionPreflight:
-    model_dir: Path
-    geometry: inventory.Geometry
-    config_summary: dict
-    recipes: tuple[TensorRecipe, ...]
-    source: SourcePreflight
-    resources: tuple[ResourcePayload, ...]
-    object_plan: ObjectPlan
-
-    @property
-    def recipes_by_name(self) -> dict[str, TensorRecipe]:
-        return {tensor_recipe.object_name: tensor_recipe for tensor_recipe in self.recipes}
-
-
-def preflight_inventory() -> None:
-    """The registered inventory, which describes the size this target compiles.
-
-    A conversion of a differently sized Qwen3 does not go through here: it builds the
-    checkpoint's own specs and recipes and checks those against each other. This stays
-    as the check that the module's own constants have not drifted apart.
-    """
-
-    expected_tensors = 2 + inventory.LAYERS * 8 + 1
-    if len(inventory.TENSOR_SPECS) != expected_tensors:
-        raise ValueError(
-            f"registered inventory holds {len(inventory.TENSOR_SPECS)} tensors, "
-            f"expected {expected_tensors}"
-        )
-    if len(inventory.RESOURCE_SPECS) != 4:
-        raise ValueError("registered inventory does not hold the four text resources")
-    if len(inventory.OBJECT_SPECS) != expected_tensors + 4:
-        raise ValueError("registered object inventory is incomplete")
-    recipe.validate_recipe_coverage()
+    return dense_geometry(preflight.geometry, token_domain=token_domain(root))
 
 
 def build_object_plan(
-    resources: Mapping[str, bytes], geometry: inventory.Geometry = inventory.GEOMETRY,
+    resources: Mapping[str, bytes], geometry: inventory.Geometry,
     *, native=None, object_specs=None
 ) -> ObjectPlan:
     """`native` names the objects a GGUF serves as it stores them, with their format
@@ -293,7 +243,6 @@ def preflight_conversion(
     model = Path(model_dir)
     config = family_conversion.load_json(model / "config.json")
     geometry, summary = validate_config(config)
-    preflight_inventory()
     # What the checkpoint says about its own quantisation: refused where the serving path
     # cannot honour it, reported where the declaration disagrees with the checkpoint's own
     # tensors. A claim about a file is not the file.
@@ -466,9 +415,10 @@ def convert(
     with recipe.open_reader(model) as reader:
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="qwen3"),
             preflight.object_plan.specs,
             geometry=geometry_block(preflight, model),
+            layer_types=["full_attention"] * geometry.layers,
             external=external,
         ) as writer:
             if writer.objects != preflight.object_plan.objects:

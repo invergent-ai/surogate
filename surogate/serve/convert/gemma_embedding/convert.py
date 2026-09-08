@@ -92,6 +92,14 @@ def materialize(source: GgufSource, item: TensorRecipe, shape: tuple[int, ...]) 
     return encode_row_split(torch.from_numpy(codes), torch.from_numpy(scales), _W8, (rows, k))
 
 
+def sentencepiece_domain(resources: dict[str, bytes]) -> int:
+    """Address the SentencePiece vocabulary actually stored in the encoder artifact."""
+    from sentencepiece import SentencePieceProcessor
+
+    tokenizer = SentencePieceProcessor(model_proto=resources["frontend/tokenizer.model"])
+    return tokenizer.get_piece_size()
+
+
 def load_frontend(frontend_dir: Path) -> dict[str, bytes]:
     resources = {}
     for name in inventory.FRONTEND_RESOURCES:
@@ -109,6 +117,7 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path) ->
     geometry = recipe.geometry_from_config(config)
     objects = inventory.declared_objects(geometry)
     recipes = {item.object_name: item for item in recipe.build_recipes(geometry)}
+    recipe.validate_recipe_coverage(tuple(recipes.values()), geometry)
     resources = load_frontend(Path(frontend_dir))
 
     specs: list[TensorSpec | ResourceSpec] = inventory.tensor_specs(objects)
@@ -123,7 +132,10 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path) ->
 
     print(f"{len(objects)} objects from {Path(gguf).name}", flush=True)
     repacked = 0
-    with ArtifactWriter(output, ArtifactIdentity(MODEL_ID, WEIGHTS_ID), specs) as writer:
+    with ArtifactWriter(
+        output, ArtifactIdentity(MODEL_ID, WEIGHTS_ID, architecture="gemma_embedding"), specs,
+        geometry=geometry_block(geometry, token_domain=sentencepiece_domain(resources)), layer_types=geometry.layer_types,
+    ) as writer:
         for index, spec in enumerate(specs, start=1):
             if isinstance(spec, ResourceSpec):
                 writer.write(spec.name, resources[spec.name])
@@ -152,6 +164,20 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path) ->
         flush=True,
     )
     return output
+
+
+def geometry_block(geometry: inventory.Geometry, *, token_domain: int) -> dict[str, int | float]:
+    from surogate.serve.convert.common.checkpoint import dense_geometry, positive_int
+
+    config = geometry.declared.hf_config
+    metadata = dense_geometry(geometry, token_domain=token_domain)
+    metadata.update(
+        attention_scale=positive_int(config, "query_pre_attn_scalar") ** -0.5,
+        sliding_window=positive_int(config, "sliding_window"),
+        sliding_rope_theta=float(config["rope_local_base_freq"]),
+        embedding_scale=geometry.hidden ** 0.5,
+    )
+    return metadata
 
 
 def main(argv: Sequence[str] | None = None) -> int:

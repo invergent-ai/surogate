@@ -10,11 +10,8 @@
 # chat_template.jinja — with no network access, keeping local GGUF serving
 # fully offline (llama.cpp parity).
 #
-# The reconstructed tokenizer.json is semantically equivalent but not
-# byte-identical to the official file, so GGUF-sourced conversions run the
-# vendored converter with SINFER_ALLOW_DERIVED_FRONTEND=1 (PATCHES.md #12),
-# which downgrades the pinned-hash mismatch to a recorded warning.
-# Equivalence is enforced by tests/serve/test_gguf_frontend.py: the
+# The reconstructed tokenizer.json can differ in serialization from the original.
+# Equivalence is checked by tests/serve/test_gguf_frontend.py: the
 # reconstruction must encode/decode identically to the official tokenizer.
 
 from __future__ import annotations
@@ -30,6 +27,8 @@ _NORMAL, _UNKNOWN, _CONTROL, _USER_DEFINED, _UNUSED, _BYTE = 1, 2, 3, 4, 5, 6
 # comments (study/llama.cpp/src/llama-vocab.cpp) — llama.cpp preserves the
 # upstream regex verbatim in a comment above its own case-folded rewrite.
 _PRE_SPLIT_REGEX = {
+    # GLM groups decimal digits in threes (llama.cpp's CHATGLM4 pre-tokenizer).
+    "glm4": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
     "qwen2": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
     "qwen35": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 }
@@ -370,6 +369,35 @@ def synthesize_tokenizer_config(reader, arch: str) -> dict:
             "fields": {"thinking": {"open": markers[0], "close": markers[1]}}
         }
     return cfg
+
+
+def extract_generation_config(reader) -> dict:
+    """Carry declared stop, start and padding IDs into the serving frontend."""
+    tokens = _field(reader, "tokenizer.ggml.tokens")
+    if not isinstance(tokens, (list, tuple)) or not tokens:
+        raise ValueError("GGUF must declare its tokenizer vocabulary")
+    def token_id(key):
+        value = _field(reader, "tokenizer.ggml." + key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or
+                                  not 0 <= value < len(tokens)):
+            raise ValueError(f"GGUF tokenizer {key} is outside its vocabulary")
+        return value
+    stops = list(dict.fromkeys(value for key in ("eos_token_id", "eot_token_id", "eom_token_id")
+                               if (value := token_id(key)) is not None))
+    # Gemma 3 exports may omit the eot metadata while retaining this control token.
+    # It ends an assistant turn, just as the EOS token ends a sequence.
+    if _field(reader, "general.architecture") == "gemma3" and "<end_of_turn>" in tokens:
+        end_of_turn = tokens.index("<end_of_turn>")
+        if end_of_turn not in stops:
+            stops.append(end_of_turn)
+    if not stops:
+        raise ValueError("GGUF must declare an end-of-generation token")
+    generation = {"eos_token_id": stops[0] if len(stops) == 1 else stops}
+    for key, name in (("bos_token_id", "bos_token_id"), ("padding_token_id", "pad_token_id")):
+        value = token_id(key)
+        if value is not None:
+            generation[name] = value
+    return generation
 
 
 def write_frontend(reader, arch: str, out_dir: Path, *, echo=print) -> None:

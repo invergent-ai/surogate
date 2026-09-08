@@ -22,13 +22,22 @@ constexpr std::int32_t kMaximumBatchSize             = kMaximumBatchColumns;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 
+// Optimized schedules cover selected query counts; the fallback uses the cache's
+// supported head width and KV count with any positive integral query group.
+bool supported_attention_shape(std::int32_t dim, std::int32_t queries, std::int32_t kv) {
+    return queries > 0 && kv > 0 && queries % kv == 0 &&
+           gqa_kv_shape_is_registered(dim, kv);
+}
+
 // Resolves the served shape against the geometry registry. A query count can be registered
 // against more than one KV count (16 queries over 2 or 4; 24 over 4 or 2), which is why the
 // caller's KV source picks between them; an unregistered shape throws naming all three numbers.
 std::int32_t kv_heads_for_pair(std::int32_t head_dim, std::int32_t q_heads,
                                std::int32_t source_kv_heads) {
-    return static_cast<std::int32_t>(
-        gqa_registered_kv_heads(head_dim, q_heads, source_kv_heads));
+    if (!supported_attention_shape(head_dim, q_heads, source_kv_heads)) {
+        throw std::invalid_argument("gqa_attention: invalid query/KV head geometry");
+    }
+    return source_kv_heads;
 }
 
 // The head dimension belongs to the shape and comes off the query tensor, which is the only
@@ -38,7 +47,7 @@ std::int32_t kv_heads_for_pair(std::int32_t head_dim, std::int32_t q_heads,
 // of them the other's width and validated every tensor against it.
 void require_registered_shape(std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads,
                               const char* op) {
-    if (!gqa_shape_is_registered(head_dim, q_heads, kv_heads)) {
+    if (!supported_attention_shape(head_dim, q_heads, kv_heads)) {
         throw std::invalid_argument(std::string(op) + ": unregistered head geometry (head dim " +
                                     std::to_string(head_dim) + ", " + std::to_string(q_heads) +
                                     " query heads over " + std::to_string(kv_heads) +
@@ -454,7 +463,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
-    if (!gqa_shape_is_registered(head_dim, q_heads, kv_heads)) {
+    if (!supported_attention_shape(head_dim, q_heads, kv_heads)) {
         throw std::invalid_argument("gqa_attention workspace: unsupported head geometry");
     }
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
@@ -467,6 +476,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
         envelope.max_visible_keys < static_cast<std::uint32_t>(max_width)) {
         throw std::invalid_argument("gqa_attention workspace: invalid profile or interval");
     }
+
+    if (!gqa_shape_is_registered(head_dim, q_heads, kv_heads)) { return 0; }
 
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits =
@@ -520,6 +531,12 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
 
+    if (!gqa_shape_is_registered(head_dim, q.ne[1], kv_heads)) {
+        detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,
+                                            scale, cache, out, stream, envelope.sliding_window,
+                                            selection);
+        return;
+    }
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], kv_heads, width, batch, envelope);
@@ -581,6 +598,12 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
     const std::int32_t batch = q.ne[3];
     require_registered_shape(q.ne[0], q.ne[1], cache.num_kv_heads, op);
 
+    if (!gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
+        detail::gqa_attention_prompt_cached_launch(q, positions, valid_columns, kv_table_rows,
+                                                   scale, cache, out, stream,
+                                                   envelope.sliding_window, selection);
+        return;
+    }
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], cache.num_kv_heads, width, batch, envelope);
@@ -611,6 +634,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     constexpr const char* op = "gqa_attention_cached";
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
+    if (!gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
+        detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,
+                                                      envelope.sliding_window, selection);
+        return;
+    }
     auto scope = workspace.scope();
     if (detail::gqa_attention_resolve_route(q.ne[1], cache.num_kv_heads, q.ne[2], 1, envelope) ==
         detail::GqaAttentionRoute::ChunkedSmallT) {

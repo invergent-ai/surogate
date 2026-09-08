@@ -107,7 +107,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
     const bool registered_heads =
-        qk_heads == 16 && (value_heads == 48 || value_heads == 32 || value_heads == 16);
+        qk_heads > 0 && value_heads > 0 && value_heads % qk_heads == 0;
     if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -154,29 +154,19 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_pairwise_disjoint(ranges, "gated_delta_net_replay_record: tensors must not overlap");
 }
 
-bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
-    if (spec.diagonal_gate) {
-        // GLM-5.3-Flash's Kimi Delta Attention: 34 layers of 64 symmetric heads.
-        return spec.layers == 34 && spec.qk_heads == 64 && spec.value_heads == 64 &&
-               spec.conv_channels == 24576;
-    }
-    const bool geometry_48 = spec.layers == 48 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-                             spec.conv_channels == 10240;
-    const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
-                             spec.conv_channels == 8192;
-    // qwen3.5-0.8b and 2b share this one: 18 GDN layers, 16 symmetric heads.
-    const bool geometry_18 = spec.layers == 18 && spec.qk_heads == 16 && spec.value_heads == 16 &&
-                             spec.conv_channels == 6144;
-    // Qwen3.8-Flash-Next: 36 of its 48 layers are GDN, the head shape of the 48-layer entry.
-    const bool geometry_36 = spec.layers == 36 && spec.qk_heads == 16 && spec.value_heads == 48 &&
-                             spec.conv_channels == 10240;
-    return geometry_48 || geometry_36 || geometry_30 || geometry_18;
+bool is_supported_fold_geometry(const GdnReplayRecordSpec& spec) {
+    if (spec.layers <= 0 || spec.layers > 256 || spec.qk_heads <= 0 ||
+        spec.value_heads <= 0 || spec.value_heads % spec.qk_heads != 0) { return false; }
+    const std::int64_t channels =
+        (2LL * spec.qk_heads + spec.value_heads) * kStateDim;
+    return channels == spec.conv_channels &&
+           (!spec.diagonal_gate || spec.qk_heads == spec.value_heads);
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {
     constexpr const char* kOp       = "gdn_replay_fold";
     const GdnReplayRecordSpec& spec = records.spec;
-    if (!is_registered_fold_geometry(spec) || spec.record_capacity <= 0 ||
+    if (!is_supported_fold_geometry(spec) || spec.record_capacity <= 0 ||
         spec.record_capacity > kMaximumRows || spec.width < 2 || spec.width > 16 ||
         spec.key_dim != kStateDim || spec.value_dim != kStateDim) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported record geometry");

@@ -1,24 +1,11 @@
-"""Convert Qwen3.6-35B-A3B BF16 weights into its exact SInfer artifact.
-
-Canonical invocation::
-
-    python -m surogate.serve.convert.qwen3_5_moe.convert \
-      --model /home/densemax2/work/models/hf/qwen/Qwen3.6-35B-A3B/base-hf-bf16 \
-      --dflash-model /home/densemax2/work/models/hf/qwen/Qwen3.6-35B-A3B/dflash-bf16 \
-      --out out/qwen3_6_35b_a3b.sinfer
-
-The target deliberately reuses the measured 27B ranking because both checkpoints
-have the same semantic token-id vocabulary.  Draft rows are always gathered from
-the 35B output head.
-"""
+"""Convert a hybrid MoE checkpoint using its resolved configuration and stored weights."""
 
 from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 import json
-from types import SimpleNamespace
 from pathlib import Path
 import time
 from typing import Mapping, Sequence
@@ -34,128 +21,15 @@ from surogate.serve.convert.common.gguf_repack import (
 from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
-from surogate.serve.convert.common import official_resources
+from surogate.serve.convert.common import dflash as dflash_checkpoint
 from surogate.serve.convert.common import recipe as family_recipe
 
 from . import draft_head, inventory, recipe
 from .exports import compressed_tensors_source, routed_nvfp4
 
 
-RECIPE_ID = "qwen3_6_35b_a3b-v2"
+RECIPE_ID = "qwen3_5_moe-config-v3"
 ENCODER_PROFILE = "MAXABS_F16_RECIP_RNE_V1"
-GGUF_EVIDENCE_PATH = Path(
-    "/home/densemax2/work/models/hf/qwen/Qwen3.6-35B-A3B/"
-    "gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-)
-
-_ROOT_CONFIG = {
-    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
-    "model_type": "qwen3_5_moe",
-    "tie_word_embeddings": False,
-    "vision_start_token_id": 248053,
-    "vision_end_token_id": 248054,
-    "image_token_id": 248056,
-    "video_token_id": 248057,
-}
-_TEXT_CONFIG = {
-    "num_hidden_layers": 40,
-    "full_attention_interval": 4,
-    "hidden_size": 2048,
-    "vocab_size": 248320,
-    "num_attention_heads": 16,
-    "num_key_value_heads": 2,
-    "head_dim": 256,
-    "attn_output_gate": True,
-    "hidden_act": "silu",
-    "linear_num_key_heads": 16,
-    "linear_num_value_heads": 32,
-    "linear_key_head_dim": 128,
-    "linear_value_head_dim": 128,
-    "linear_conv_kernel_dim": 4,
-    "num_experts": 256,
-    "num_experts_per_tok": 8,
-    "moe_intermediate_size": 512,
-    "shared_expert_intermediate_size": 512,
-    "tie_word_embeddings": False,
-    "attention_bias": False,
-    "attention_dropout": 0.0,
-    "rms_norm_eps": 1e-6,
-    "mamba_ssm_dtype": "float32",
-    "mtp_num_hidden_layers": 1,
-    "mtp_use_dedicated_embeddings": False,
-    "max_position_embeddings": 262144,
-}
-_ROPE_CONFIG = {
-    "rope_theta": 10000000,
-    "mrope_section": [11, 11, 10],
-    "mrope_interleaved": True,
-    "partial_rotary_factor": 0.25,
-}
-_VISION_CONFIG = {
-    "depth": 27,
-    "hidden_size": 1152,
-    "intermediate_size": 4304,
-    "out_hidden_size": 2048,
-    "num_heads": 16,
-    "in_channels": 3,
-    "patch_size": 16,
-    "temporal_patch_size": 2,
-    "spatial_merge_size": 2,
-    "num_position_embeddings": 2304,
-    "hidden_act": "gelu_pytorch_tanh",
-    "deepstack_visual_indexes": [],
-}
-
-_DFLASH_CONFIG = {
-    "architectures": ["DFlashDraftModel"],
-    "attention_bias": False,
-    "attention_dropout": 0.0,
-    "dtype": "bfloat16",
-    "head_dim": 128,
-    "hidden_act": "silu",
-    "hidden_size": 2048,
-    "intermediate_size": 6144,
-    "layer_types": [
-        "sliding_attention",
-        "sliding_attention",
-        "sliding_attention",
-        "sliding_attention",
-        "sliding_attention",
-        "full_attention",
-    ],
-    "max_position_embeddings": 262144,
-    "model_type": "qwen3",
-    "num_attention_heads": 32,
-    "num_hidden_layers": 6,
-    "num_key_value_heads": 8,
-    "num_target_layers": 40,
-    "rms_norm_eps": 1e-6,
-    "sliding_window": 4096,
-    "tie_word_embeddings": False,
-    "use_sliding_window": True,
-    "vocab_size": 248320,
-}
-_DFLASH_ROPE_CONFIG = {
-    "rope_theta": 10000000,
-    "rope_type": "default",
-}
-_DFLASH_DRAFT_CONFIG = {
-    "block_size": 16,
-    "mask_token_id": 248077,
-    "target_layer_ids": [1, 6, 11, 16, 22, 27, 32, 37],
-}
-
-EXPECTED_TENSOR_BYTES = 22_770_245_536
-EXPECTED_DEVICE_ARENA_BYTES = 22_770_260_992
-EXPECTED_RESIDENT_TENSOR_BYTES = 22_360_191_904
-EXPECTED_RESIDENT_DEVICE_ARENA_BYTES = 22_360_207_360
-EXPECTED_COMPONENT_BYTES = {
-    "main_text": 21_038_461_952,
-    "draft_head": 143_130_624,
-    "mtp": 897_934_336,
-    "vision": 280_664_992,
-    "dflash": 410_053_632,
-}
 
 ResourcePayload = family_conversion.ResourcePayload
 ObjectPlan = family_conversion.ObjectPlan
@@ -163,6 +37,9 @@ ObjectPlan = family_conversion.ObjectPlan
 
 @dataclass(frozen=True, slots=True)
 class ConversionPreflight:
+    geometry: inventory.Geometry
+    dflash_geometry: dflash_checkpoint.Geometry | None
+    recipes: tuple[recipe.TensorRecipe, ...]
     model_dir: Path
     dflash_model_dir: Path | None
     base_config_summary: dict[str, object]
@@ -186,313 +63,93 @@ def _tools_root() -> Path:
 
 
 def validate_config(config: Mapping[str, object]) -> dict[str, object]:
-    """Validate every checkpoint fact that fixes storage or execution shape."""
-
-    family_conversion.check_members("config", config, _ROOT_CONFIG)
-    text = config.get("text_config")
-    vision = config.get("vision_config")
-    if not isinstance(text, Mapping) or not isinstance(vision, Mapping):
-        raise ValueError("config.json must contain text_config and vision_config")
-    family_conversion.check_members("text_config", text, _TEXT_CONFIG)
-
-    expected_layer_types = tuple(
-        "full_attention"
-        if layer in inventory.FULL_ATTENTION_LAYERS
-        else "linear_attention"
-        for layer in range(40)
-    )
-    layer_types = text.get("layer_types")
-    if not isinstance(layer_types, list) or tuple(layer_types) != expected_layer_types:
-        raise ValueError(
-            "text_config.layer_types does not match the target 40-layer schedule"
-        )
-
-    rope = text.get("rope_parameters")
-    if not isinstance(rope, Mapping):
-        raise ValueError("text_config.rope_parameters is missing")
-    family_conversion.check_members("text_config.rope_parameters", rope, _ROPE_CONFIG)
-    family_conversion.check_members("vision_config", vision, _VISION_CONFIG)
-    return {
-        "architecture": config["architectures"][0],
-        "model_type": config["model_type"],
-        "text": {name: text[name] for name in _TEXT_CONFIG},
-        "layer_types": {
-            "layers": len(layer_types),
-            "full_attention": len(inventory.FULL_ATTENTION_LAYERS),
-            "linear_attention": len(inventory.GDN_LAYERS),
-            "full_attention_layers": list(inventory.FULL_ATTENTION_LAYERS),
-        },
-        "rope": {name: rope[name] for name in _ROPE_CONFIG},
-        "vision": {name: vision[name] for name in _VISION_CONFIG},
-        "vision_token_ids": {
-            name: config[name]
-            for name in (
-                "vision_start_token_id",
-                "vision_end_token_id",
-                "image_token_id",
-                "video_token_id",
-            )
-        },
-    }
+    return inventory.geometry_block(inventory.geometry_from_config(config))
 
 
-def validate_dflash_config(config: Mapping[str, object]) -> dict[str, object]:
-    """Validate every DFlash fact that fixes storage or future execution shape."""
-
-    family_conversion.check_members("dflash config", config, _DFLASH_CONFIG)
-    rope = config.get("rope_parameters")
-    draft = config.get("dflash_config")
-    if not isinstance(rope, Mapping) or not isinstance(draft, Mapping):
-        raise ValueError(
-            "DFlash config.json must contain rope_parameters and dflash_config"
-        )
-    family_conversion.check_members(
-        "dflash config.rope_parameters",
-        rope,
-        _DFLASH_ROPE_CONFIG,
-    )
-    family_conversion.check_members(
-        "dflash config.dflash_config",
-        draft,
-        _DFLASH_DRAFT_CONFIG,
-    )
-    return {
-        name: config[name] for name in _DFLASH_CONFIG
-    } | {
-        "rope_parameters": {
-            name: rope[name] for name in _DFLASH_ROPE_CONFIG
-        },
-        "dflash_config": {
-            name: draft[name] for name in _DFLASH_DRAFT_CONFIG
-        },
-    }
+def validate_dflash_config(config: Mapping[str, object], geometry: inventory.Geometry):
+    return asdict(dflash_checkpoint.geometry_from_config(config, geometry))
 
 
-def preflight_inventory() -> None:
-    """Prove the target-private inventory before any payload is written."""
-
-    counts = (
-        len(inventory.RESOURCE_SPECS),
-        len(inventory.TEXT_CORE_TENSOR_SPECS),
-        len(inventory.DRAFT_HEAD_TENSOR_SPECS),
-        len(inventory.MTP_TENSOR_SPECS),
-        len(inventory.VISION_TENSOR_SPECS),
-        len(inventory.DFLASH_TENSOR_SPECS),
-        len(inventory.TENSOR_SPECS),
-        len(inventory.OBJECT_SPECS),
-    )
-    if counts != (6, 533, 2, 15, 333, 51, 934, 940):
-        raise ValueError(f"target inventory is incomplete: {counts}")
-    if {k: v for k, v in inventory.FORMAT_COUNTS.items() if v} != {
-        inventory.BF16: 487,
-        inventory.FP32: 60,
-        inventory.I32: 1,
-        inventory.Q4: 95,
-        inventory.Q5: 91,
-        inventory.Q6: 5,
-        inventory.W8: 195,
-    }:
-        raise ValueError(f"target format counts drifted: {inventory.FORMAT_COUNTS}")
-    if {k: v for k, v in inventory.LAYOUT_COUNTS.items() if v} != {
-        inventory.CONTIGUOUS_LAYOUT: 548,
-        inventory.ROW_SPLIT_LAYOUT: 386,
-    }:
-        raise ValueError(f"target layout counts drifted: {inventory.LAYOUT_COUNTS}")
-    if family_conversion.tensor_payload_bytes(inventory.TENSOR_SPECS) != EXPECTED_TENSOR_BYTES:
-        raise ValueError("target tensor payload byte total drifted")
-    if (
-        family_conversion.device_arena_bytes(inventory.TENSOR_SPECS)
-        != EXPECTED_DEVICE_ARENA_BYTES
-    ):
-        raise ValueError("target device-arena byte total drifted")
-    component_bytes = {
-        "main_text": family_conversion.tensor_payload_bytes(
-            inventory.TEXT_CORE_TENSOR_SPECS
-        ),
-        "draft_head": family_conversion.tensor_payload_bytes(
-            inventory.DRAFT_HEAD_TENSOR_SPECS
-        ),
-        "mtp": family_conversion.tensor_payload_bytes(inventory.MTP_TENSOR_SPECS),
-        "vision": family_conversion.tensor_payload_bytes(
-            inventory.VISION_TENSOR_SPECS
-        ),
-        "dflash": family_conversion.tensor_payload_bytes(
-            inventory.DFLASH_TENSOR_SPECS
-        ),
-    }
-    if component_bytes != EXPECTED_COMPONENT_BYTES:
-        raise ValueError(f"target component byte totals drifted: {component_bytes}")
-    resident_specs = inventory.TENSOR_SPECS[: -len(inventory.DFLASH_TENSOR_SPECS)]
-    if (
-        family_conversion.tensor_payload_bytes(resident_specs)
-        != EXPECTED_RESIDENT_TENSOR_BYTES
-        or family_conversion.device_arena_bytes(resident_specs)
-        != EXPECTED_RESIDENT_DEVICE_ARENA_BYTES
-    ):
-        raise ValueError("default resident Text/MTP/Vision byte totals drifted")
-    recipe.validate_recipe_coverage()
+def preflight_inventory(geometry: inventory.Geometry, *, dflash=None) -> None:
+    recipe.validate_recipe_coverage(geometry, dflash=dflash)
 
 
-def load_resources(
-    model_dir: str | Path, *, accept_source: bool = False
-) -> tuple[ResourcePayload, ...]:
-    return official_resources.load_official_resources(
-        model_dir, inventory.RESOURCE_SPECS, accept_source=accept_source
-    )
+def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
+    return family_conversion.load_resources(model_dir, inventory.RESOURCE_SPECS)
 
 
-def tensor_specs(routed_nvfp4_source: bool) -> tuple[inventory.TensorSpec, ...]:
-    """The tensor half of the inventory for the requested weights profile."""
-    return routed_nvfp4.tensor_specs() if routed_nvfp4_source else inventory.TENSOR_SPECS
+def tensor_specs(geometry: inventory.Geometry, routed_nvfp4_source: bool = False, *, dflash=None):
+    return (routed_nvfp4.tensor_specs(geometry, dflash=dflash) if routed_nvfp4_source
+            else inventory.build_tensor_specs(geometry, dflash=dflash))
 
 
-def object_specs(
-    include_dflash: bool, routed_nvfp4_source: bool = False
-) -> tuple[inventory.StoredObjectSpec, ...]:
-    """The artifact's objects, with the dflash/* family only when a drafter
-    checkpoint was supplied. The engine probes for that family and refuses
-    --spec dflash against an artifact that lacks it."""
-    specs = inventory.RESOURCE_SPECS + tensor_specs(routed_nvfp4_source)
-    if include_dflash:
-        return specs
-    return tuple(spec for spec in specs if spec not in inventory.DFLASH_TENSOR_SPECS)
+def object_specs(geometry: inventory.Geometry, routed_nvfp4_source: bool = False, *, dflash=None):
+    return inventory.RESOURCE_SPECS + tensor_specs(geometry, routed_nvfp4_source, dflash=dflash)
 
 
-def build_object_plan(
-    resources: Mapping[str, bytes],
-    include_dflash: bool = True,
-    routed_nvfp4_source: bool = False,
-) -> ObjectPlan:
+def build_object_plan(resources, geometry: inventory.Geometry, *, routed_nvfp4_source=False, dflash=None):
     return family_conversion.build_object_plan(
-        object_specs(include_dflash, routed_nvfp4_source), resources
-    )
+        object_specs(geometry, routed_nvfp4_source, dflash=dflash), resources)
 
 
 def preflight_conversion(
     model_dir: str | Path,
     dflash_model_dir: str | Path | None,
     routed_nvfp4_dir: str | Path | None = None,
-    *,
-    shared_expert: str = "as-stored",
-    covered: tuple[str, ...] = (),
-    object_specs=None,
+    *, shared_expert: str = "as-stored", covered: tuple[str, ...] = (),
+    object_specs=None, geometry: inventory.Geometry | None = None, dflash_geometry=None,
 ) -> ConversionPreflight:
-    """Complete config, source, shortlist, and offset work before writing.
-
-    ``dflash_model_dir`` is optional: the DFlash drafter is a separate
-    checkpoint, and without it the artifact simply omits the dflash/* family
-    (speculation stays available through MTP and the draft head)."""
-
     model = Path(model_dir)
+    config = family_conversion.load_json(model / "config.json")
+    geometry = geometry or inventory.geometry_from_checkpoint(model, config)
     dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
-    # What the checkpoint says about its own quantisation. This target's geometry lives in
-    # `inventory` rather than in a Geometry object, so the GDN layer count is passed directly:
-    # it is the one number the KV decision turns on.
-    _scope = family_conversion.honour_declared_scope(
-        family_conversion.load_json(model / "config.json"),
-        SimpleNamespace(gdn_layers=inventory.GDN_LAYERS), model,
-        what=family_conversion.checkpoint_label(model),
-    )
-    if _scope:
-        print(_scope, flush=True)
-    # A compressed-tensors export supplies every role itself: its config says which
-    # modules are quantized, its packed routed experts come from the same shards, and
-    # the modules it left alone are read as the BF16 they are stored in.
-    compressed_source = (
-        compressed_tensors_source.CompressedTensorsSource(model)
-        if quant_schemes.quantization_config_of(family_conversion.load_json(model / "config.json"))
-        is not None
-        else None
-    )
+    if dflash_model is not None and dflash_geometry is None:
+        dflash_geometry = dflash_checkpoint.geometry_from_config(
+            family_conversion.load_json(dflash_model / "config.json"), geometry)
+    recipes = recipe.build_recipes(geometry, dflash=dflash_geometry)
+    base = {r.object_name: r for r in recipes if not r.object_name.startswith("dflash/")}
+    scope = family_conversion.honour_declared_scope(
+        config, geometry, model, what=family_conversion.checkpoint_label(model))
+    if scope:
+        print(scope, flush=True)
+    compressed_source = (compressed_tensors_source.CompressedTensorsSource(model)
+                         if quant_schemes.quantization_config_of(config) is not None else None)
     if compressed_source is not None and routed_nvfp4_dir is None:
         routed_nvfp4_dir = model
-    routed_nvfp4_model = Path(routed_nvfp4_dir) if routed_nvfp4_dir is not None else None
-    routed_nvfp4_summary = (
-        routed_nvfp4.validate_config(
-            family_conversion.load_json(routed_nvfp4_model / "config.json")
-        )
-        if routed_nvfp4_model is not None
-        else None
-    )
-    base_config_summary = validate_config(
-        family_conversion.load_json(model / "config.json")
-    )
-    dflash_config_summary = (
-        validate_dflash_config(
-            family_conversion.load_json(dflash_model / "config.json")
-        )
-        if dflash_model is not None
-        else None
-    )
-    preflight_inventory()
-    compressed_plan = (
-        compressed_source.plan(
-            routed_nvfp4.tensor_specs(), recipe.BASE_RECIPES_BY_NAME, shared_expert=shared_expert
-        )
-        if compressed_source is not None
-        else None
-    )
-    if compressed_plan is None and covered:
-        # A GGUF source: the objects it serves from the file need no bridged tensor, so the
-        # rest are checked leniently the way the compressed-tensors path is.
-        remaining = tuple(
-            item for name, item in recipe.BASE_RECIPES_BY_NAME.items() if name not in covered
-        )
-        base_source = family_recipe.preflight_sources(model, remaining)
-    elif compressed_plan is None:
-        base_source = recipe.preflight_base_sources(model)
-    else:
-        # The exact-inventory preflight cannot apply here: the export stores packed
-        # tensors the recipes never name and lacks the plain ones they do. The recipes
-        # the plan did not take over are checked leniently, as the GGUF path does.
-        remaining = tuple(
-            item
-            for name, item in recipe.BASE_RECIPES_BY_NAME.items()
-            if name not in compressed_plan.covered and not routed_nvfp4.is_routed_object(name)
-        )
-        base_source = family_recipe.preflight_sources(model, remaining)
-    dflash_source = (
-        recipe.preflight_dflash_sources(dflash_model)
-        if dflash_model is not None
-        else None
-    )
-
-    resources = load_resources(model, accept_source=compressed_source is not None)
-    resource_map = {resource.name: resource.data for resource in resources}
-    if compressed_plan is None and object_specs is not None:
-        specs = inventory.RESOURCE_SPECS + tuple(object_specs)
-        if dflash_model is None:
-            specs = tuple(spec for spec in specs if spec not in inventory.DFLASH_TENSOR_SPECS)
-        object_plan = family_conversion.build_object_plan(specs, resource_map)
-    elif compressed_plan is None:
-        object_plan = build_object_plan(
-            resource_map,
-            include_dflash=dflash_model is not None,
-            routed_nvfp4_source=routed_nvfp4_model is not None,
-        )
-    else:
-        specs = inventory.RESOURCE_SPECS + compressed_plan.specs
-        if dflash_model is None:
-            specs = tuple(spec for spec in specs if spec not in inventory.DFLASH_TENSOR_SPECS)
-        object_plan = family_conversion.build_object_plan(specs, resource_map)
-
-    ranking = _tools_root() / draft_head.DEFAULT_RANKING
-    draft = draft_head.compute_shortlist(ranking, model)
+    routed = Path(routed_nvfp4_dir) if routed_nvfp4_dir is not None else None
+    routed_summary = (routed_nvfp4.validate_config(
+        family_conversion.load_json(routed / "config.json"), geometry) if routed is not None else None)
+    preflight_inventory(geometry, dflash=dflash_geometry)
+    compressed_plan = (compressed_source.plan(
+        routed_nvfp4.tensor_specs(geometry, dflash=dflash_geometry), base, shared_expert=shared_expert)
+        if compressed_source is not None else None)
+    excluded = set(covered)
+    if compressed_plan is not None:
+        excluded.update(compressed_plan.covered)
+    if routed is not None:
+        excluded.update(name for name in base if routed_nvfp4.is_routed_object(name))
+    base_source = family_recipe.preflight_sources(model, tuple(
+        r for name, r in base.items() if name not in excluded))
+    if routed is not None:
+        # Validate the separate expert checkpoint before opening the output artifact.
+        with ShardReader.for_directory(routed) as reader:
+            routed_nvfp4.preflight_source(reader, geometry)
+    dflash_source = recipe.preflight_dflash_sources(dflash_model, recipes) if dflash_model else None
+    resources = load_resources(model)
+    resource_map = {r.name: r.data for r in resources}
+    specs = (compressed_plan.specs if compressed_plan is not None else tuple(object_specs)
+             if object_specs is not None else tensor_specs(geometry, routed is not None, dflash=dflash_geometry))
+    object_plan = family_conversion.build_object_plan(inventory.RESOURCE_SPECS + specs, resource_map)
+    draft = draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, model, geometry=geometry)
     return ConversionPreflight(
-        model_dir=model,
-        dflash_model_dir=dflash_model,
-        base_config_summary=base_config_summary,
-        dflash_config_summary=dflash_config_summary,
-        base_source=base_source,
-        dflash_source=dflash_source,
-        resources=resources,
-        draft=draft,
-        object_plan=object_plan,
-        routed_nvfp4_dir=routed_nvfp4_model,
-        routed_nvfp4_summary=routed_nvfp4_summary,
-        compressed_source=compressed_source,
-        compressed_plan=compressed_plan,
-    )
+        geometry=geometry, dflash_geometry=dflash_geometry, recipes=recipes,
+        model_dir=model, dflash_model_dir=dflash_model,
+        base_config_summary=inventory.geometry_block(geometry),
+        dflash_config_summary=asdict(dflash_geometry) if dflash_geometry else None,
+        base_source=base_source, dflash_source=dflash_source, resources=resources,
+        draft=draft, object_plan=object_plan, routed_nvfp4_dir=routed,
+        routed_nvfp4_summary=routed_summary, compressed_source=compressed_source,
+        compressed_plan=compressed_plan)
 
 
 def materialize_tensor(
@@ -540,7 +197,8 @@ def build_conversion_report(
     elapsed_seconds: float,
     final_bytes: int,
     device: torch.device,
-    ranking_path: str | Path,
+    ranking_path: str | Path | None,
+    weights_id: str = inventory.WEIGHTS_ID,
     revision: str | None = None,
     environment: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -565,7 +223,7 @@ def build_conversion_report(
         },
     )
     report = family_conversion.build_conversion_report(
-        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+        identity=ArtifactIdentity(inventory.MODEL_ID, weights_id, architecture="qwen3_5_moe"),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_tools_root(),
@@ -609,25 +267,9 @@ def build_conversion_report(
             "dtypes": dict(combined_source.source_dtype_counts),
         },
     }
-    report["draft_head"] = {
-        "rows": draft_head.DRAFT_HEAD_N,
-        "tokenizer_vocab_size": draft_head.TOKENIZER_VOCAB_SIZE,
-        "ranking_source_target": draft_head.RANKING_SOURCE_TARGET,
-        "shared_semantic_vocabulary": True,
-    }
-    report["source"]["gguf_evidence_path"] = str(GGUF_EVIDENCE_PATH)
-    report["quantization"] = {
-        "encoder_profile": ENCODER_PROFILE,
-        "component_tensor_bytes": {
-            **EXPECTED_COMPONENT_BYTES,
-            "total": EXPECTED_TENSOR_BYTES,
-            "all_tensor_device_arena": EXPECTED_DEVICE_ARENA_BYTES,
-            "default_resident": EXPECTED_RESIDENT_TENSOR_BYTES,
-            "default_resident_device_arena": (
-                EXPECTED_RESIDENT_DEVICE_ARENA_BYTES
-            ),
-        },
-    }
+    report["draft_head"] = {"rows": base_config_summary["draft_vocab"],
+                            "tokenizer_vocab_size": base_config_summary["token_domain"]}
+    report["quantization"] = {"encoder_profile": ENCODER_PROFILE}
     return report
 
 
@@ -655,7 +297,21 @@ def convert(
     # superblocks and the Q8_0 tensors repack into W8 bit-exactly, so only the remainder takes
     # the dequantise path.
     repack = GgufRepackSource(gguf_repack) if gguf_repack else None
-    gguf_specs = tensor_specs(routed_nvfp4_dir is not None)
+    geometry = inventory.geometry_from_checkpoint(model, extra_names=repack.sources if repack else ())
+    if not mtp:
+        geometry = replace(geometry, mtp_layers=0)
+    if not vision and "vision_config" in geometry.declared.hf_config:
+        source_config = dict(geometry.declared.hf_config)
+        source_config.pop("vision_config")
+        geometry = inventory.geometry_from_checkpoint(model, source_config, extra_names=repack.sources if repack else ())
+        if not mtp:
+            geometry = replace(geometry, mtp_layers=0)
+    dflash_geometry = (dflash_checkpoint.geometry_from_config(
+        family_conversion.load_json(dflash_model / "config.json"), geometry) if dflash_model else None)
+    recipes = recipe.build_recipes(geometry, dflash=dflash_geometry)
+    base_recipes = {r.object_name: r for r in recipes if not r.object_name.startswith("dflash/")}
+    dflash_recipes = {r.object_name: r for r in recipes if r.object_name.startswith("dflash/")}
+    gguf_specs = tensor_specs(geometry, routed_nvfp4_dir is not None, dflash=dflash_geometry)
     native: dict[str, str] = {}
     repacked: tuple[str, ...] = ()
     dropped_prefixes = tuple(
@@ -677,11 +333,11 @@ def convert(
         # repacked rather than served from the file. Everything else -- the K-quant experts,
         # the output head, the embedding table, the attention output -- is read in place.
         native = repack.plan_native(
-            recipe.BASE_RECIPES_BY_NAME,
+            base_recipes,
             gguf_specs,
             exclude_suffixes=recipe.NATIVE_EXCLUDE_SUFFIXES,
         )
-        repacked = repack.plan(recipe.BASE_RECIPES_BY_NAME, gguf_specs)
+        repacked = repack.plan(base_recipes, gguf_specs)
         if native:
             # By default those objects are not copied at all: the artifact names the GGUF and
             # the stretches of it each object reads. SUROGATE_GGUF_COPY=1 writes the bytes in.
@@ -691,12 +347,12 @@ def convert(
                 # ranking file and the checkpoint, so computing it here matches what preflight
                 # computes later.
                 draft_ids = draft_head.materialize_draft_head_token_ids(
-                    draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, model)
+                    draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, model, geometry=geometry)
                 )
                 native_runs = {
                     spec.name: repack.runs_for_native(
                         spec,
-                        recipe.BASE_RECIPES_BY_NAME[spec.name],
+                        base_recipes[spec.name],
                         draft_ids if spec.name == draft_head.DRAFT_HEAD_OBJECT else None,
                     )
                     for spec in GgufRepackSource.native_specs(gguf_specs, native)
@@ -718,9 +374,12 @@ def convert(
         # loader rearranges them.
         if os.environ.get("SUROGATE_GGUF_COPY", "0") == "0":
             in_place = repack.plan_repack_in_place(
-                recipe.BASE_RECIPES_BY_NAME, gguf_specs, recipe.NATIVE_EXCLUDE_SUFFIXES
+                base_recipes, gguf_specs, recipe.NATIVE_EXCLUDE_SUFFIXES
             )
             if in_place:
+                if not external:
+                    external = ((str(Path(repack.gguf_path).resolve()),
+                                 Path(repack.gguf_path).stat().st_size),)
                 gguf_specs = GgufRepackSource.in_place_specs(gguf_specs, in_place)
                 moved = sum(sum(r[2] for r in entry[0]) for entry in in_place.values())
                 print(f"rearranged at load: {len(in_place)} objects read from the GGUF "
@@ -728,8 +387,9 @@ def convert(
                 repacked = tuple(n for n in repacked if n not in in_place)
     preflight = preflight_conversion(
         model, dflash_model, routed_nvfp4_dir, shared_expert=shared_expert,
+        geometry=geometry, dflash_geometry=dflash_geometry,
         covered=tuple(native) + tuple(repacked) + tuple(in_place) + tuple(
-            n for n in recipe.BASE_RECIPES_BY_NAME if n.startswith(dropped_prefixes)
+            n for n in base_recipes if n.startswith(dropped_prefixes)
         ) if dropped_prefixes or native or repacked else (),
         object_specs=gguf_specs if (native or repacked or dropped_prefixes) else None,
     )
@@ -752,9 +412,14 @@ def convert(
             else routed_nvfp4.WEIGHTS_ID
             if preflight.routed_nvfp4_dir is not None
             else inventory.WEIGHTS_ID,
-        ),
+         architecture="qwen3_5_moe"),
         preflight.object_plan.specs,
         external=external,
+        geometry=inventory.geometry_block(geometry),
+        layer_types=geometry.layer_types,
+        dflash_geometry=dflash_checkpoint.geometry_block(dflash_geometry) if dflash_geometry else None,
+        dflash_target_layers=dflash_geometry.target_feature_layers if dflash_geometry else None,
+        vision_geometry=inventory.vision_geometry_block(geometry.declared.hf_config),
     ) as writer:
         index = 0
 
@@ -767,32 +432,16 @@ def convert(
                 flush=True,
             )
 
-        for spec in inventory.RESOURCE_SPECS:
-            write_payload(spec, resources[spec.name])
+        for spec in preflight.object_plan.specs:
+            if spec.name in resources:
+                write_payload(spec, resources[spec.name])
 
-        all_specs = (
-            gguf_specs
-            if (native or repacked or dropped_prefixes)
-            else preflight.compressed_plan.specs
-            if preflight.compressed_plan is not None
-            else tensor_specs(preflight.routed_nvfp4_dir is not None)
-        )
-        # A GGUF plan rewrites formats and may drop whole families, so the DFlash tail cannot be
-        # sliced off by length any more.
-        dflash_names = {spec.name for spec in inventory.DFLASH_TENSOR_SPECS}
-        base_specs = tuple(spec for spec in all_specs if spec.name not in dflash_names)
-        routed_reader = (
-            ShardReader.from_index(
-                preflight.routed_nvfp4_dir / "model.safetensors.index.json"
-            )
-            if preflight.routed_nvfp4_dir is not None
-            else None
-        )
-        routed_cache = routed_nvfp4.LayerCache(routed_reader) if routed_reader else None
+        all_specs = tuple(s for s in preflight.object_plan.specs if hasattr(s, "format"))
+        base_specs = tuple(s for s in all_specs if not s.name.startswith("dflash/"))
+        routed_reader = ShardReader.for_directory(preflight.routed_nvfp4_dir) if preflight.routed_nvfp4_dir else None
+        routed_cache = routed_nvfp4.LayerCache(routed_reader, geometry) if routed_reader else None
         try:
-            with ShardReader.from_index(
-                model / "model.safetensors.index.json"
-            ) as reader:
+            with ShardReader.for_directory(model) as reader:
                 for spec in base_specs:
                     if repack is not None and (
                         spec.name in native or spec.name in repacked or spec.name in in_place
@@ -803,7 +452,7 @@ def convert(
                             if spec.name == draft_head.DRAFT_HEAD_OBJECT
                             else None
                         )
-                        source_recipe = recipe.BASE_RECIPES_BY_NAME[spec.name]
+                        source_recipe = base_recipes[spec.name]
                         if spec.name in native_runs or spec.name in in_place:
                             continue  # read from the GGUF in place; nothing to write here
                         payload = (
@@ -844,7 +493,7 @@ def convert(
                         spec,
                         reader,
                         preflight.draft,
-                        recipe.BASE_RECIPES_BY_NAME,
+                        base_recipes,
                     )
                     payload = encode_tensor_payload(tensor, spec, resolved_device)
                     del tensor
@@ -855,15 +504,13 @@ def convert(
                 routed_reader.close()
 
         if dflash_model is not None:
-            with ShardReader.from_file(
-                dflash_model / "model.safetensors"
-            ) as reader:
-                for spec in all_specs[-len(inventory.DFLASH_TENSOR_SPECS) :]:
+            with ShardReader.for_directory(dflash_model) as reader:
+                for spec in (s for s in all_specs if s.name.startswith("dflash/")):
                     tensor = materialize_tensor(
                         spec,
                         reader,
                         preflight.draft,
-                        recipe.DFLASH_RECIPES_BY_NAME,
+                        dflash_recipes,
                     )
                     payload = encode_tensor_payload(tensor, spec, resolved_device)
                     del tensor
@@ -872,7 +519,7 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    ranking = _tools_root() / draft_head.DEFAULT_RANKING
+    ranking = preflight.draft.ranking
     arguments = {
         "model": str(model_dir),
         "dflash_model": str(dflash_model_dir) if dflash_model_dir is not None else None,
@@ -894,6 +541,8 @@ def convert(
         final_bytes=final_bytes,
         device=resolved_device,
         ranking_path=ranking,
+        weights_id=compressed_tensors_source.WEIGHTS_ID if preflight.compressed_plan is not None
+                   else routed_nvfp4.WEIGHTS_ID if preflight.routed_nvfp4_dir else inventory.WEIGHTS_ID,
     )
     report_path = Path(str(output) + ".conversion.json")
     with report_path.open("w", encoding="utf-8") as handle:

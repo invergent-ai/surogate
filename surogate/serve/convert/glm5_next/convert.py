@@ -18,6 +18,8 @@ repository: a GGUF holds a token table, and the engine's frontend reads a `token
 
 from __future__ import annotations
 
+from surogate.serve.convert.common.checkpoint import tokenizer_domain
+
 import argparse
 import json
 import time
@@ -93,39 +95,27 @@ def materialize_unspoken(source: GgufSource, name: str, spec) -> bytes:
     return encode_tensor(torch.from_numpy(np.log(-stored)), spec)
 
 
-def _geometry_block(geometry: inv.Geometry) -> dict[str, float]:
-    """The dimensions the artifact states about itself, which the engine lays over its compiled
-    constants. Everything a target derives -- the fused row counts, the convolution width, the
-    mixing-matrix size -- is a function of these, so none of them is restated."""
-    return {
-        "hidden": float(geometry.hidden),
-        "residual": float(geometry.residual),
-        "hc_streams": float(geometry.hc_streams),
-        "layers": float(geometry.layers),
-        "intermediate": float(geometry.expert_intermediate),
-        "dense_intermediate": float(geometry.dense_intermediate),
-        "output_rows": float(geometry.vocab),
-        "token_domain": float(geometry.vocab),
-        "query_heads": float(geometry.query_heads),
-        # The attention is served absorbed: one key/value head as wide as the latent, and the
-        # per-head query and value widths are the target's own constants (256), checked against
-        # every bound shape rather than declared here.
-        "kv_heads": 1.0,
-        "head_dim": float(geometry.kv_lora_rank),
-        # NoPE: the checkpoint states `rope.dimension_count` 0 and the served attention applies
-        # no rotary at all.
-        "rotary_dim": 0.0,
-        "q_lora_rank": float(geometry.q_lora_rank),
-        "kv_lora_rank": float(geometry.kv_lora_rank),
-        "gdn_conv_kernel": float(geometry.kda_conv_kernel),
-        "gdn_key_heads": float(geometry.kda_heads),
-        "gdn_key_head_dim": float(geometry.kda_head_dim),
-        "gdn_value_heads": float(geometry.kda_heads),
-        "gdn_value_head_dim": float(geometry.kda_head_dim),
-        "kda_gate_rank": float(geometry.kda_head_dim),
-        "mtp_layers": float(geometry.nextn_layers),
-        "rms_epsilon": float(geometry.rms_epsilon),
-    }
+def _geometry_block(g: inv.Geometry, *, token_domain: int) -> dict[str, int | float]:
+    from surogate.serve.artifact.geometry import validate_resolved_geometry
+
+    return validate_resolved_geometry({
+        "hidden": g.hidden, "residual": g.residual, "hc_streams": g.hc_streams,
+        "hc_sinkhorn_iterations": g.hc_sinkhorn_iterations, "hc_epsilon": g.hc_epsilon,
+        "layers": g.layers, "intermediate": g.expert_intermediate,
+        "dense_intermediate": g.dense_intermediate, "leading_dense_layers": len(g.dense_layers),
+        "shared_intermediate": g.shared_intermediate, "experts": g.experts,
+        "experts_per_token": g.experts_per_token, "routed_scale": g.routed_scale,
+        "swiglu_limit": g.swiglu_limit, "output_rows": g.vocab, "token_domain": token_domain,
+        "query_heads": g.query_heads, "kv_heads": 1, "head_dim": g.kv_lora_rank,
+        "rotary_dim": 0, "rope_theta": 0.0, "qk_head_dim": g.qk_head_dim,
+        "v_head_dim": g.v_head_dim, "q_lora_rank": g.q_lora_rank, "kv_lora_rank": g.kv_lora_rank,
+        "gdn_conv_kernel": g.kda_conv_kernel, "gdn_key_heads": g.kda_heads,
+        "gdn_key_head_dim": g.kda_head_dim, "gdn_value_heads": g.kda_heads,
+        "gdn_value_head_dim": g.kda_head_dim, "kda_gate_rank": g.kda_gate_rank,
+        "kda_gate_bound": -g.kda_lower_bound, "mtp_layers": g.nextn_layers,
+        "rms_epsilon": g.rms_epsilon, "max_context": g.serving_context,
+        "attention_scale": g.kv_lora_rank ** -0.5, "gdn_scale": g.kda_head_dim ** -0.5,
+    })
 
 
 def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
@@ -179,10 +169,11 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path,
     print(f"converting {total} objects from {len(source.shards)} shards", flush=True)
     with ArtifactWriter(
         output,
-        ArtifactIdentity(inv.MODEL_ID, inv.WEIGHTS_ID),
+        ArtifactIdentity(inv.MODEL_ID, inv.WEIGHTS_ID, architecture="glm5_next"),
         plan.specs,
         external=external,
-        geometry=_geometry_block(geometry),
+        geometry=_geometry_block(geometry, token_domain=tokenizer_domain(frontend_dir)),
+        layer_types=geometry.layer_types,
     ) as writer:
         for index, spec in enumerate(specs, start=1):
             t0 = time.perf_counter()

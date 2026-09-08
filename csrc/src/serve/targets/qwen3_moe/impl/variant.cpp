@@ -41,7 +41,7 @@ void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, 
                     WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
-        kMoeGeometry, weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1],
+        ops::sparse_moe_geometry(weights), weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1],
         hidden.ne[1]));
     WorkspaceArena leaf_workspace(storage);
     ops::sparse_moe(hidden, weights, ops::SparseMoeEpilogue::AddResidual, residual,
@@ -142,7 +142,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry&,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& g,
                                                          WeightsProfile weights_profile,
                                                          family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
@@ -151,11 +151,12 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     // artifact may carry: the profile's group-wise int8, or the K-quants a GGUF served natively
     // keeps -- and a GGUF may hold a different down type from its gate/up, layer by layer.
     const QType qtype = profile_qtype(weights_profile);
+    const ops::SparseMoeGeometry geometry{g.hidden, g.experts, g.experts_per_token, g.intermediate};
     return std::max({
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, qtype, qtype, first, last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q4_K, first,
+        ops::sparse_moe_workspace_capacity_bytes(geometry, qtype, qtype, first, last),
+        ops::sparse_moe_workspace_capacity_bytes(geometry, QType::Q4_K, QType::Q4_K, first,
                                                  last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q6_K, first,
+        ops::sparse_moe_workspace_capacity_bytes(geometry, QType::Q4_K, QType::Q6_K, first,
                                                  last),
     });
 }
@@ -171,9 +172,9 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
 // family/impl/runtime/unrunnable_leaves.h. The two arguments are this target's own refusals.
 SINFER_FAMILY_UNRUNNABLE_LEAVES(no_linear_layers, no_speculation)
 
-void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream) {
     // Only the magic is this target's: 'Q3ME'.
-    family::debug_probe_dump(0x51334D45, tag, tensor, TextConfig::layers, stream);
+    family::debug_probe_dump(0x51334D45, tag, tensor, layer_count, stream);
 }
 
 } // namespace sinfer::targets::qwen3_moe::detail

@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from surogate.serve.convert.common.declaration import declare, derive_recipes
+from surogate.serve.convert.common.declaration import derive_recipes
 from surogate.serve.convert.common.recipe import (
     SourcePreflight,
     TensorRecipe,
@@ -25,9 +25,10 @@ from surogate.serve.convert.common.safetensors import ShardReader
 from . import inventory
 
 
-def build_recipes(config: Mapping[str, object]) -> tuple[TensorRecipe, ...]:
+def build_recipes(geometry: inventory.Geometry) -> tuple[TensorRecipe, ...]:
     """Every object's source, in object order, for one checkpoint's config."""
-    declared = declare(inventory.ARCHITECTURE, dict(config))
+    declared = geometry.declared
+    config = declared.hf_config
     return tuple(
         derive_recipes(
             declared,
@@ -40,23 +41,14 @@ def build_recipes(config: Mapping[str, object]) -> tuple[TensorRecipe, ...]:
     )
 
 
-def build_recipes_by_name(config: Mapping[str, object]) -> dict[str, TensorRecipe]:
+def build_recipes_by_name(geometry: inventory.Geometry) -> dict[str, TensorRecipe]:
     """The same recipes, keyed by object name -- what the GGUF repack planner asks for."""
-    return {r.object_name: r for r in build_recipes(config)}
+    return {r.object_name: r for r in build_recipes(geometry)}
 
 
-def geometry_from_config(config: Mapping[str, object]) -> dict[str, object]:
-    """What `build_recipes` needs to describe one checkpoint.
-
-    The GGUF repack planner asks a converter for "the geometry" and hands whatever it gets back
-    to `build_recipes` and `inventory.build_tensor_specs`. For the converters that predate the
-    declaration that is a `Geometry` of resolved dimensions; for this one it is the config
-    itself, because the declaration resolves the dimensions and there is nothing to precompute.
-    The config is validated on the way through, so a checkpoint the target cannot shape is
-    refused here rather than at the first missing tensor.
-    """
-    inventory.geometry_from_config(config)
-    return dict(config)
+def geometry_from_config(config: Mapping[str, object]) -> inventory.Geometry:
+    """Resolve once before the GGUF planner builds objects and recipes."""
+    return inventory.geometry_from_config(config)
 
 
 def open_reader(model_dir: str | Path) -> ShardReader:

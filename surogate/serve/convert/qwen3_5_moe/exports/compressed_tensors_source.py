@@ -1,7 +1,7 @@
 """One artifact object per HF Linear, in the format the export declares.
 
 A compressed-tensors export decides per module what it quantized; nothing in
-a converter may decide otherwise. This module applies that to the 35B-A3B's
+a converter may decide otherwise. This module applies that to the resolved checkpoint’s
 text core: the inventory still says which objects exist and the recipes still
 say where their rows come from, but the *format* of every Linear-derived
 object comes from ``quant_schemes.resolve_checkpoint`` -- NVFP4 words copied
@@ -52,7 +52,6 @@ from surogate.serve.convert.common.recipe import TensorRecipe
 from surogate.serve.convert.common.row_algebra import evaluate_rows
 from surogate.serve.convert.common.safetensors import ShardReader
 
-from .. import inventory
 
 WEIGHTS_ID = "compressed-tensors"
 
@@ -172,6 +171,11 @@ class CompressedTensorsSource:
             if recipe is None or suffix is None:
                 out.append(spec)
                 continue
+            if suffix in SHARED_EXPERT_SUFFIXES and shared_expert != "w8":
+                raise ValueError(
+                    f"{spec.name}: serving currently requires W8 shared experts; "
+                    "pass --shared-expert w8 to explicitly convert these matrices"
+                )
             program = evaluate_rows(recipe.expression, self.logical, None)
             if program is None:
                 out.append(spec)
@@ -315,10 +319,9 @@ def _fp32_word(tensor: torch.Tensor, what: str) -> bytes:
 def _text_core_suffix(name: str) -> str | None:
     """The per-layer or top-level text-core suffix, or None for other families."""
 
-    for layer in inventory.TEXT_LAYERS:
-        prefix = f"text/layers/{layer}/"
-        if name.startswith(prefix):
-            return name[len(prefix):]
+    parts = name.split("/", 3)
+    if len(parts) == 4 and parts[:2] == ["text", "layers"] and parts[2].isdigit():
+        return parts[3]
     if name in ("text/token_embedding", "text/output_head"):
         return name
     return None

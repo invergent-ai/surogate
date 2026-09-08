@@ -31,21 +31,24 @@
 #include "family/impl/runtime/instantiate.h"
 
 namespace sinfer::targets::qwen4exp::detail {
+ops::SparseMoeGeometry moe_geometry(const family::TextGeometry& g) {
+    return {.hidden = g.hidden, .experts = g.experts, .experts_per_token = g.experts_per_token,
+            .intermediate = g.intermediate, .gating = ops::SparseMoeGating::SoftmaxTopK,
+            .routed_scale = g.routed_scale, .shared_gated = true,
+            .shared_intermediate = g.shared_intermediate};
+}
+
 namespace {
 
-constexpr std::int32_t kStreams  = TextConfig::hc_count;
-constexpr std::int32_t kHidden   = TextConfig::hidden;
-constexpr std::int32_t kResidual = TextConfig::hc_width;
-constexpr std::int32_t kLowRank  = TextConfig::hc_low_rank;
-constexpr float kEps             = TextConfig::rms_epsilon;
 constexpr auto kPolicy           = ops::LinearPolicy::A16Only;
 
 // The mix hook of a block computes the inject gates its output projection scatters with. The
 // family plans the hooks' scratch as transient, so the gates cannot live in the arena between
 // the two calls; they use a small device buffer created before any graph capture, and travel
 // through a thread-local handle rather than a family-visible parameter.
-constexpr std::size_t kInjectScratchBytes = 1u << 20; // [4 streams, T] FP32 up to T = 65536
+constexpr std::size_t kInjectScratchTokens = 65536;
 thread_local Tensor t_inject;
+thread_local family::TextGeometry t_inject_geometry;
 // The inject gates are handed from the mixer to the combine through this thread (the host
 // partial through the device's expert cache), while the buffers they name belong to a device. One thread drives every stage of a
 // pipeline, so a hand-off that crosses a stage boundary would add one device's expert output
@@ -74,13 +77,13 @@ struct InjectScratch {
     std::size_t bytes = 0;
 };
 
-InjectScratch& inject_scratch_for_current_device() {
+InjectScratch& inject_scratch_for_current_device(std::int32_t streams) {
     static std::mutex mutex;
-    static std::unordered_map<int, InjectScratch> registry;
+    static std::unordered_map<std::uint64_t, InjectScratch> registry;
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     const std::lock_guard<std::mutex> lock(mutex);
-    return registry[device];
+    return registry[(std::uint64_t(device) << 32U) | std::uint32_t(streams)];
 }
 
 std::vector<GraphExecutionProfile>
@@ -174,8 +177,8 @@ std::size_t plane_bytes(std::int32_t rows, std::int32_t tokens, DType dtype) {
                     dtype_size(dtype));
 }
 
-std::size_t mix_capacity(std::int32_t first, std::int32_t last) {
-    return ops::hyper_connection_mix_workspace_capacity_bytes(kStreams, kHidden, kLowRank, first,
+std::size_t mix_capacity(const family::TextGeometry& g, std::int32_t first, std::int32_t last) {
+    return ops::hyper_connection_mix_workspace_capacity_bytes(g.hc_streams, g.hidden, g.hc_low_rank, first,
                                                               last);
 }
 
@@ -186,19 +189,20 @@ std::size_t w8_capacity(std::int32_t rows, std::int32_t columns, std::int32_t fi
 }
 
 // Mixes the residual streams into `hidden` and keeps the inject gates for the combine.
-void mix_into(const Tensor& residual, const ops::HyperConnectionWeights& weights, Tensor& hidden,
+void mix_into(const family::TextGeometry& g, const Tensor& residual, const ops::HyperConnectionWeights& weights, Tensor& hidden,
               WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t tokens = residual.ne[1];
-    const InjectScratch& scratch = inject_scratch_for_current_device();
+    const InjectScratch& scratch = inject_scratch_for_current_device(g.hc_streams);
     const std::size_t needed =
-        static_cast<std::size_t>(kStreams) * static_cast<std::size_t>(tokens) * sizeof(float);
+        static_cast<std::size_t>(g.hc_streams) * static_cast<std::size_t>(tokens) * sizeof(float);
     if (scratch.data == nullptr || needed > scratch.bytes) {
         throw std::logic_error("qwen4exp: inject scratch is missing or too small for this forward");
     }
-    Tensor inject(scratch.data, DType::FP32, {kStreams, tokens});
-    ops::hyper_connection_mix(residual, weights, kStreams, kEps, hidden, &inject, workspace,
+    Tensor inject(scratch.data, DType::FP32, {g.hc_streams, tokens});
+    ops::hyper_connection_mix(residual, weights, g.hc_streams, g.rms_epsilon, hidden, &inject, workspace,
                               stream);
     t_inject = inject;
+    t_inject_geometry = g;
     CUDA_CHECK(cudaGetDevice(&t_inject_device));
     maybe_dump_block("mixed", hidden, stream);
     maybe_dump_block("inject", inject, stream);
@@ -206,11 +210,12 @@ void mix_into(const Tensor& residual, const ops::HyperConnectionWeights& weights
 
 // Scatters a block output into the residual streams with the gates the mix kept.
 void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t stream) {
+    const auto& g = t_inject_geometry;
     if (t_inject.data == nullptr || t_inject.ne[1] != residual.ne[1]) {
         throw std::logic_error("qwen4exp: combine without a matching mix");
     }
     family::ExpertCache& cache = family::ExpertCache::for_current_device(
-        ops::kSparseMoeFlashNextGeometry, TextConfig::expert_layers);
+        moe_geometry(g), (g.layers + g.mtp_layers));
     cache.tick_combine();
     maybe_dump_block("blockout", block_output, stream);
     if (cache.has_pending_partial()) {
@@ -266,22 +271,24 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t,
 
 void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& residual,
                              WorkspaceArena& workspace, cudaStream_t stream) {
+    const auto& g = model.geometry;
     // Transient: the broadcast consumes the embedding before anything else runs.
     auto scope                = workspace.scope();
     const std::int32_t tokens = residual.ne[1];
-    Tensor embedded           = workspace.alloc(DType::BF16, {kHidden, tokens});
+    Tensor embedded           = workspace.alloc(DType::BF16, {g.hidden, tokens});
     ops::embedding(ids, model.token_embedding, embedded, stream);
-    ops::broadcast_streams(embedded, kStreams, residual, stream);
+    ops::broadcast_streams(embedded, g.hc_streams, residual, stream);
 }
 
 void Variant::prepare_expert_split(const ModelView& model) {
+    const auto& g = model.geometry;
     family::ExpertCache& cache = family::ExpertCache::for_current_device(
-        ops::kSparseMoeFlashNextGeometry, TextConfig::expert_layers);
+        moe_geometry(g), (g.layers + g.mtp_layers));
     // The first mixture layer whose experts are in the host bank: what the measurement runs on.
     for (const auto& gdn : model.gdn_layers) {
         const SparseMoePayload& payload = gdn.post_mixer;
         if (payload.layer < 0 || payload.host_gate_up == nullptr) { continue; }
-        cache.prepare_split(family::BankedMixture{payload.layer, TextConfig::expert_layers,
+        cache.prepare_split(family::BankedMixture{payload.layer, (g.layers + g.mtp_layers),
                                                   &payload.op, payload.gate_up_planes,
                                                   payload.down_planes, payload.host_gate_up,
                                                   payload.host_down});
@@ -290,37 +297,41 @@ void Variant::prepare_expert_split(const ModelView& model) {
     cache.prepare_split(family::BankedMixture{});
 }
 
-void Variant::prewarm_device_scratch() {
-    InjectScratch& scratch = inject_scratch_for_current_device();
+void Variant::prewarm_device_scratch(const family::TextGeometry& g) {
+    InjectScratch& scratch = inject_scratch_for_current_device(g.hc_streams);
     if (scratch.data == nullptr) {
-        CUDA_CHECK(cudaMalloc(&scratch.data, kInjectScratchBytes));
-        scratch.bytes = kInjectScratchBytes;
+        scratch.bytes = kInjectScratchTokens * g.hc_streams * sizeof(float);
+        CUDA_CHECK(cudaMalloc(&scratch.data, scratch.bytes));
     }
-    (void)family::ExpertCache::for_current_device(ops::kSparseMoeFlashNextGeometry,
-                                                  TextConfig::expert_layers);
+    (void)family::ExpertCache::for_current_device(moe_geometry(g),
+                                                  (g.layers + g.mtp_layers));
 }
 
 void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::hyper_connection_mix(residual, model.output_mix, kStreams, kEps, hidden, nullptr,
+    const auto& g = model.geometry;
+    ops::hyper_connection_mix(residual, model.output_mix, g.hc_streams, g.rms_epsilon, hidden, nullptr,
                               workspace, stream);
     maybe_dump_final(hidden, stream);
 }
 
 void Variant::attention_norm(const Tensor& residual, const FullAttentionProjectionWeights& weights,
                              Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream) {
-    mix_into(residual, weights.mix, hidden, workspace, stream);
+    const auto& g = weights.geometry;
+    mix_into(g, residual, weights.mix, hidden, workspace, stream);
 }
 
 void Variant::post_mixer_norm(const Tensor& residual, const PostMixerWeights& weights,
                               Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream) {
-    mix_into(residual, weights.mix, hidden, workspace, stream);
+    const auto& g = weights.geometry;
+    mix_into(g, residual, weights.mix, hidden, workspace, stream);
 }
 
 void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual,
                              const family::detail::PrologueColumns& columns,
                              NgramPleStatePool* ple_state, WorkspaceArena& workspace,
                              cudaStream_t stream) {
+    const auto& g = model.geometry;
     maybe_dump_layer(layer, residual, stream);
     if (layer != model.ple.layer) { return; }
     if (ple_state == nullptr || ple_state->empty()) {
@@ -331,12 +342,12 @@ void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual
     ops::NgramPleState state{ple_state->history, ple_state->conv_state};
     maybe_dump_block("ple_in", residual, stream);
     ops::ngram_ple_forward(residual, ple_columns, model.ple.hash, model.ple.table, model.ple.op,
-                           state, kStreams, TextConfig::ple_conv_kernel,
-                           TextConfig::ple_conv_dilation, kEps, workspace, stream);
+                           state, g.hc_streams, g.ple_conv_kernel,
+                           g.ple_ngram, g.rms_epsilon, workspace, stream);
     maybe_dump_block("ple_out", residual, stream);
 }
 
-void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t /*layer_count*/, cudaStream_t stream) {
     ResidualDump& dump = residual_dump();
     if (dump.dir.empty() || dump.forward > dump.limit || g_dump_layer < 0 || g_dump_layer > 1) {
         return;
@@ -351,23 +362,23 @@ void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t st
                 dump.forward, stream);
 }
 
-NgramPleStatePoolSpec Variant::ple_state_spec(std::int32_t slot_count) {
+NgramPleStatePoolSpec Variant::ple_state_spec(const family::TextGeometry& g, std::int32_t slot_count) {
     return NgramPleStatePoolSpec{
-        .history_tokens = TextConfig::ple_ngram - 1,
-        .conv_history   = TextConfig::ple_conv_history,
-        .channels       = kResidual,
+        .history_tokens = g.ple_ngram - 1,
+        .conv_history   = g.ple_conv_history(),
+        .channels       = g.residual,
         .slot_count     = slot_count,
-        .eos_token      = TextConfig::eos_token,
+        .eos_token      = g.ple_eos_token,
     };
 }
 
-std::size_t Variant::layer_prologue_workspace_capacity_bytes(std::int32_t first,
+std::size_t Variant::layer_prologue_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t first,
                                                              std::int32_t last) {
     // The PLE forward and the transient embedding never overlap; reserve the larger.
-    return std::max(ops::ngram_ple_workspace_capacity_bytes(kStreams, kHidden,
-                                                            TextConfig::ple_embed,
-                                                            TextConfig::ple_heads, first, last),
-                    plane_bytes(kHidden, last, DType::BF16));
+    return std::max(g.ple_ngram ? ops::ngram_ple_workspace_capacity_bytes(g.hc_streams, g.hidden,
+                                                            g.ple_embed(),
+                                                            g.ple_heads(), first, last) : std::size_t{0},
+                    plane_bytes(g.hidden, last, DType::BF16));
 }
 
 // --- projections -------------------------------------------------------------------------------
@@ -376,15 +387,16 @@ void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    const auto& g = weights.geometry;
     auto scope                = workspace.scope();
     const std::int32_t tokens = hidden.ne[1];
-    Tensor fused = workspace.alloc(DType::BF16, {TextConfig::query_projection_rows, tokens});
+    Tensor fused = workspace.alloc(DType::BF16, {(2 * g.query_size() + 2 * g.kv_size()), tokens});
     ops::linear(hidden, weights.query_key_gate_value, fused, kPolicy, workspace, stream);
     // Row order from the converter: q | k | gate | v.
     ops::extract_bf16_columns(fused, 0, query, stream);
-    ops::extract_bf16_columns(fused, TextConfig::query_size, key, stream);
-    ops::extract_bf16_columns(fused, TextConfig::query_size + TextConfig::kv_size, gate, stream);
-    ops::extract_bf16_columns(fused, 2 * TextConfig::query_size + TextConfig::kv_size, value,
+    ops::extract_bf16_columns(fused, g.query_size(), key, stream);
+    ops::extract_bf16_columns(fused, g.query_size() + g.kv_size(), gate, stream);
+    ops::extract_bf16_columns(fused, 2 * g.query_size() + g.kv_size(), value,
                               stream);
     family::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
 }
@@ -393,7 +405,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
                                           Tensor& residual, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
-    Tensor output  = workspace.alloc(DType::BF16, {kHidden, attention.ne[1]});
+    Tensor output  = workspace.alloc(DType::BF16, {weight.n, attention.ne[1]});
     ops::linear(attention, weight, output, kPolicy, workspace, stream);
     // Before the hyper-connection combine: the delta belongs to o_proj's output,
     // and the combine is what distributes it across the residual streams.
@@ -419,6 +431,7 @@ const FullAttentionWeights& Variant::mtp_block(const ModelView& model) {
 
 void Variant::mtp_fold(const ModelView& model, const Tensor& embedding, const Tensor& hidden,
                        Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
+    const auto& g = model.geometry;
     const MtpHeadWeights& head = model.mtp_head;
     if (!head.present) { throw std::logic_error("qwen4exp: the draft head is not resident"); }
     const std::int32_t tokens = embedding.ne[1];
@@ -426,28 +439,29 @@ void Variant::mtp_fold(const ModelView& model, const Tensor& embedding, const Te
 
     // The two inputs, each under its own norm. `hidden` is the wide residual, so its norm is
     // per stream -- the same first line the layer mixers run.
-    Tensor e = workspace.alloc(DType::BF16, {kHidden, tokens});
-    Tensor h = workspace.alloc(DType::BF16, {kResidual, tokens});
-    ops::rmsnorm(embedding, head.embedding_norm, kEps, false, e, stream);
-    ops::hyper_connection_norm(hidden, head.hidden_norm, kStreams, kEps, h, stream);
+    Tensor e = workspace.alloc(DType::BF16, {g.hidden, tokens});
+    Tensor h = workspace.alloc(DType::BF16, {g.residual, tokens});
+    ops::rmsnorm(embedding, head.embedding_norm, g.rms_epsilon, false, e, stream);
+    ops::hyper_connection_norm(hidden, head.hidden_norm, g.hc_streams, g.rms_epsilon, h, stream);
 
     // One matmul over [e; h_s] per stream. The pack puts the stream fastest, so the result
     // read as [kHcWidth, tokens] is already stream-major within each column.
-    Tensor packed = workspace.alloc(DType::BF16, {2 * kHidden, kStreams * tokens});
-    ops::mtp_pack_fc_input_streams(e, h, kStreams, packed, stream);
-    Tensor folded = residual.view({kHidden, kStreams * tokens});
+    Tensor packed = workspace.alloc(DType::BF16, {2 * g.hidden, g.hc_streams * tokens});
+    ops::mtp_pack_fc_input_streams(e, h, g.hc_streams, packed, stream);
+    Tensor folded = residual.view({g.hidden, g.hc_streams * tokens});
     ops::linear(packed, head.input_projection, folded, kPolicy, workspace, stream);
 }
 
 void Variant::mtp_collapse(const ModelView& model, const Tensor& residual, Tensor& hidden,
                            WorkspaceArena& workspace, cudaStream_t stream) {
+    const auto& g = model.geometry;
     const MtpHeadWeights& head = model.mtp_head;
     if (!head.present) { throw std::logic_error("qwen4exp: the draft head is not resident"); }
-    ops::hyper_connection_mix(residual, head.head_mix, kStreams, kEps, hidden, nullptr, workspace,
+    ops::hyper_connection_mix(residual, head.head_mix, g.hc_streams, g.rms_epsilon, hidden, nullptr, workspace,
                               stream);
 }
 
-std::size_t Variant::mtp_fold_workspace_capacity_bytes(const family::TextGeometry& geometry,
+std::size_t Variant::mtp_fold_workspace_capacity_bytes(const family::TextGeometry& g,
                                                        std::int32_t first, std::int32_t last) {
     if (first <= 0 || last < first) {
         throw std::invalid_argument("qwen4exp: draft-head token interval is empty");
@@ -455,9 +469,9 @@ std::size_t Variant::mtp_fold_workspace_capacity_bytes(const family::TextGeometr
     const auto plane = [&](std::int32_t rows, std::int32_t columns) {
         return plane_bytes(rows, columns, DType::BF16);
     };
-    return plane(kHidden, last) + plane(kResidual, last) + plane(2 * kHidden, kStreams * last) +
-           w8_capacity(kHidden, kStreams * last, kStreams * first, kStreams * last) +
-           mix_capacity(first, last);
+    return plane(g.hidden, last) + plane(g.residual, last) + plane(2 * g.hidden, g.hc_streams * last) +
+           w8_capacity(g.hidden, 2 * g.hidden, g.hc_streams * first, g.hc_streams * last) +
+           mix_capacity(g, first, last);
 }
 
 void Variant::mtp_attention_projection(const Tensor&, const MtpAttentionProjectionWeights&,
@@ -481,16 +495,17 @@ void Variant::mtp_q_gate_projection(const Tensor&, const MtpAttentionProjectionW
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    const auto& g = weights.geometry;
     auto scope                = workspace.scope();
     const std::int32_t tokens = static_cast<std::int32_t>(hidden.ne[1] * hidden.ne[2]);
-    Tensor flat_hidden        = hidden.view({kHidden, tokens});
-    Tensor fused = workspace.alloc(DType::BF16, {TextConfig::gdn_projection_rows, tokens});
+    Tensor flat_hidden        = hidden.view({g.hidden, tokens});
+    Tensor fused = workspace.alloc(DType::BF16, {(g.convolution_dim() + g.value_dim()), tokens});
     ops::linear(flat_hidden, weights.query_key_value_z, fused, kPolicy, workspace, stream);
     maybe_dump_block("gdn_fused", fused, stream);
-    Tensor qkv_flat  = qkv.view({TextConfig::convolution_dim, tokens});
-    Tensor gate_flat = output_gate.view({TextConfig::value_dim, tokens});
+    Tensor qkv_flat  = qkv.view({g.convolution_dim(), tokens});
+    Tensor gate_flat = output_gate.view({g.value_dim(), tokens});
     ops::extract_bf16_columns(fused, 0, qkv_flat, stream);
-    ops::extract_bf16_columns(fused, TextConfig::convolution_dim, gate_flat, stream);
+    ops::extract_bf16_columns(fused, g.convolution_dim(), gate_flat, stream);
 }
 
 void Variant::gdn_input_projection_snapshot(
@@ -499,23 +514,24 @@ void Variant::gdn_input_projection_snapshot(
     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
     Tensor& output_gate, family::TextPhase phase, WorkspaceArena& workspace,
     cudaStream_t stream) {
+    const auto& g = weights.geometry;
     auto scope               = workspace.scope();
     const std::int32_t width = hidden.ne[1];
     const std::int32_t batch = hidden.ne[2];
     const std::int32_t tokens = width * batch;
-    Tensor projected = workspace.alloc(DType::BF16, {TextConfig::convolution_dim, width, batch});
+    Tensor projected = workspace.alloc(DType::BF16, {g.convolution_dim(), width, batch});
     gdn_input_projection(hidden, weights, projected, output_gate, phase, workspace, stream);
-    Tensor convolved = workspace.alloc(DType::BF16, {TextConfig::convolution_dim, width, batch});
+    Tensor convolved = workspace.alloc(DType::BF16, {g.convolution_dim(), width, batch});
     ops::causal_conv1d_silu_snapshot(projected, conv_weight, conv_states, valid_columns,
                                      initial_slot, snapshot_base_slot, convolved, stream);
-    Tensor convolved_flat = convolved.view({TextConfig::convolution_dim, tokens});
+    Tensor convolved_flat = convolved.view({g.convolution_dim(), tokens});
     maybe_dump_block("gdn_conv", convolved_flat, stream);
-    Tensor query_flat     = query.view({TextConfig::key_dim, tokens});
-    Tensor key_flat       = key.view({TextConfig::key_dim, tokens});
-    Tensor value_flat     = value.view({TextConfig::value_dim, tokens});
+    Tensor query_flat     = query.view({g.key_dim(), tokens});
+    Tensor key_flat       = key.view({g.key_dim(), tokens});
+    Tensor value_flat     = value.view({g.value_dim(), tokens});
     ops::extract_bf16_columns(convolved_flat, 0, query_flat, stream);
-    ops::extract_bf16_columns(convolved_flat, TextConfig::key_dim, key_flat, stream);
-    ops::extract_bf16_columns(convolved_flat, 2 * TextConfig::key_dim, value_flat, stream);
+    ops::extract_bf16_columns(convolved_flat, g.key_dim(), key_flat, stream);
+    ops::extract_bf16_columns(convolved_flat, 2 * g.key_dim(), value_flat, stream);
 }
 
 void Variant::gdn_input_projection_record(const Tensor& hidden,
@@ -526,6 +542,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden,
                                           Tensor& value, Tensor& output_gate,
                                           family::TextPhase phase, WorkspaceArena& workspace,
                                           cudaStream_t stream) {
+    const auto& g = weights.geometry;
     // A speculative round records the pre-convolution projection instead of advancing the
     // convolution state: a rejected draft replays the scan from the record, so the recurrent
     // state is never rolled back, only re-derived. The projection is the layer's own; the
@@ -540,7 +557,7 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
                                     family::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
     auto scope    = workspace.scope();
-    Tensor output = workspace.alloc(DType::BF16, {kHidden, hidden.ne[1]});
+    Tensor output = workspace.alloc(DType::BF16, {weight.n, hidden.ne[1]});
     maybe_dump_block("gdn_final", hidden, stream);
     ops::linear(hidden, weight, output, kPolicy, workspace, stream);
     maybe_dump_block("gdn_out", output, stream);
@@ -549,41 +566,43 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor&, float,
                                           const GdnProjectionWeights& weights, Tensor& hidden,
-                                          Tensor& g, Tensor& beta, WorkspaceArena& workspace,
+                                          Tensor& gates, Tensor& beta, WorkspaceArena& workspace,
                                           cudaStream_t stream) {
-    mix_into(residual, weights.mix, hidden, workspace, stream);
+    const auto& g = weights.geometry;
+    mix_into(g, residual, weights.mix, hidden, workspace, stream);
     auto scope                = workspace.scope();
     const std::int32_t tokens = hidden.ne[1];
-    const std::int32_t heads  = TextConfig::gdn_value_heads;
+    const std::int32_t heads  = g.gdn_value_heads;
     Tensor ab                 = workspace.alloc(DType::BF16, {2 * heads, tokens});
     ops::detail::bf16_cublaslt_gemm(weights.a_b_projection, hidden, ab, stream);
     Tensor a = rows_of(ab, 0, heads, workspace, stream);
     Tensor b = rows_of(ab, heads, heads, workspace, stream);
-    ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, g, beta, stream);
+    ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, gates, beta, stream);
     maybe_dump_block("gdn_ab", ab, stream);
-    maybe_dump_block("gdn_g", g, stream);
+    maybe_dump_block("gdn_g", gates, stream);
     maybe_dump_block("gdn_beta", beta, stream);
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    const auto& g = weights.geometry;
     auto scope                = workspace.scope();
     const std::int32_t tokens = hidden.ne[1];
     // The MoE op adds into its destination; a zeroed plane turns that into a plain store.
-    Tensor output = workspace.alloc(DType::BF16, {kHidden, tokens});
+    Tensor output = workspace.alloc(DType::BF16, {g.hidden, tokens});
     CUDA_CHECK(cudaMemsetAsync(output.data, 0, output.bytes(), stream));
     family::ExpertCache& cache = family::ExpertCache::for_current_device(
-        ops::kSparseMoeFlashNextGeometry, TextConfig::expert_layers);
+        moe_geometry(g), (g.layers + g.mtp_layers));
     if (cache.enabled()) {
         // Routed experts come from the device slot pool, and the misses the split hands the
         // host come back as a partial the combine adds (family/impl/moe/expert_cache.h).
-        cache.run(family::BankedMixture{weights.layer, TextConfig::expert_layers, &weights.op,
+        cache.run(family::BankedMixture{weights.layer, (g.layers + g.mtp_layers), &weights.op,
                                         weights.gate_up_planes, weights.down_planes,
                                         weights.host_gate_up, weights.host_down},
                   hidden, output, workspace, stream);
     } else {
         const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
-            ops::kSparseMoeFlashNextGeometry, weights.op.routed_gate_up.qtype,
+            ops::sparse_moe_geometry(weights.op), weights.op.routed_gate_up.qtype,
             weights.op.routed_down.qtype, tokens, tokens));
         WorkspaceArena leaf(storage);
         ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
@@ -599,84 +618,82 @@ void Variant::mtp_post_mixer(const Tensor&, const MtpPostMixerWeights&, Tensor&,
 
 // --- workspace capacities ----------------------------------------------------------------------
 
-std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, std::int32_t) {
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t, std::int32_t) {
     return 0;
 }
 
-std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, std::int32_t) {
+std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t, std::int32_t) {
     return 0;
 }
 
-std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, std::int32_t) {
+std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t, std::int32_t) {
     return 0;
 }
 
-std::size_t Variant::attention_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
+std::size_t Variant::attention_projection_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile,
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     // The mix hook's planes live in the same mixer scope as the projection.
-    return mix_capacity(first, last) +
-           plane_bytes(TextConfig::query_projection_rows, last, DType::BF16) +
-           w8_capacity(TextConfig::query_projection_rows, kHidden, first, last);
+    return mix_capacity(g, first, last) +
+           plane_bytes((2 * g.query_size() + 2 * g.kv_size()), last, DType::BF16) +
+           w8_capacity((2 * g.query_size() + 2 * g.kv_size()), g.hidden, first, last);
 }
 
-std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
+std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile,
                                                                           family::TextPhase,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
-    return plane_bytes(kHidden, last, DType::BF16) +
-           w8_capacity(kHidden, TextConfig::query_size, first, last);
+    return plane_bytes(g.hidden, last, DType::BF16) +
+           w8_capacity(g.hidden, g.query_size(), first, last);
 }
 
-std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
+std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile,
                                                                    family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
-    return plane_bytes(TextConfig::gdn_projection_rows, last, DType::BF16) +
-           w8_capacity(TextConfig::gdn_projection_rows, kHidden, first, last);
+    return plane_bytes((g.convolution_dim() + g.value_dim()), last, DType::BF16) +
+           w8_capacity((g.convolution_dim() + g.value_dim()), g.hidden, first, last);
 }
 
-std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile profile, family::TextPhase phase, std::int32_t batch_size,
+std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile profile, family::TextPhase phase, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
     const std::int32_t tokens = batch_size * max_width;
-    return 2 * plane_bytes(TextConfig::convolution_dim, tokens, DType::BF16) +
-           gdn_input_projection_workspace_capacity_bytes(geometry, profile, phase, batch_size * min_width,
+    return 2 * plane_bytes(g.convolution_dim(), tokens, DType::BF16) +
+           gdn_input_projection_workspace_capacity_bytes(g, profile, phase, batch_size * min_width,
                                                          tokens);
 }
 
-std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
-                                                                          family::TextPhase,
-                                                                          std::int32_t,
-                                                                          std::int32_t,
-                                                                          std::int32_t) {
-    return 0;
+std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
+    const family::TextGeometry& g, WeightsProfile profile, family::TextPhase phase,
+    std::int32_t batch, std::int32_t first, std::int32_t last) {
+    return gdn_input_projection_workspace_capacity_bytes(g, profile, phase, batch * first, batch * last);
 }
 
-std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile,
+std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile,
                                                                     family::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
-    return plane_bytes(kHidden, last, DType::BF16) +
-           w8_capacity(kHidden, TextConfig::value_dim, first, last);
+    return plane_bytes(g.hidden, last, DType::BF16) +
+           w8_capacity(g.hidden, g.value_dim(), first, last);
 }
 
-std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
+std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t first,
                                                                           std::int32_t last) {
-    const std::int32_t heads = TextConfig::gdn_value_heads;
-    return mix_capacity(first, last) + plane_bytes(2 * heads, last, DType::BF16) +
+    const std::int32_t heads = g.gdn_value_heads;
+    return mix_capacity(g, first, last) + plane_bytes(2 * heads, last, DType::BF16) +
            2 * plane_bytes(heads, last, DType::BF16);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile, family::TextPhase,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, WeightsProfile, family::TextPhase,
                                                          std::int32_t first, std::int32_t last) {
-    return mix_capacity(first, last) + plane_bytes(kHidden, last, DType::BF16) +
-           round_up(ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeFlashNextGeometry,
+    return mix_capacity(g, first, last) + plane_bytes(g.hidden, last, DType::BF16) +
+           round_up(ops::sparse_moe_workspace_capacity_bytes(moe_geometry(g),
                                                              QType::W8G32_F16S, QType::W8G32_F16S,
                                                              first, last));
 }
 
-std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t, std::int32_t) {
+std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& g, std::int32_t, std::int32_t) {
     return 0;
 }
 

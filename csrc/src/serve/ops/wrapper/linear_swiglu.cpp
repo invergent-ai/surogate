@@ -4,7 +4,6 @@
 #include "ops/linear/fp8_block/fp8_block.h"
 
 #include "api/ops/linear.h"
-#include "api/ops/silu_mul.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/marlin/marlin_plane.h"
 
@@ -14,6 +13,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/w8a8/w8a8_linear_swiglu.h"
 
 #include <string>
@@ -82,10 +82,12 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("linear_swiglu workspace: W8 admits A16 or A8");
         }
-        // A shape the W8 route's table does not serve takes no workspace from it: the profile
-        // is sized for what it binds, and a W8 weight of such a shape is refused where it runs.
+        // The general fused FP32 route is workspace-free.
         if (!detail::w8_linear_swiglu_admits({gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens}) ||
             !detail::w8_linear_swiglu_admits({gate_up_rows, gate_up_rows / 2, input_rows, input_rows, max_tokens})) {
+            if (gate_up_rows <= 0 || input_rows <= 0 || input_rows % 32 != 0) {
+                throw std::invalid_argument("linear_swiglu workspace: invalid W8 dimensions");
+            }
             return 0;
         }
         // surogate vendor patch (PATCHES.md #17): under AllowA8 the large-T
@@ -156,6 +158,31 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
     const std::int32_t t = x.ne[1];
+    if (gate_up_weight.qtype == QType::W8G32_F16S &&
+        !detail::w8_linear_swiglu_admits({gate_up_weight.n, gate_up_weight.n / 2,
+                                        gate_up_weight.k, gate_up_weight.padded_shape[1], t})) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument("linear_swiglu: W8 admits A16 or A8");
+        }
+        if (gate_up_weight.n <= 0 || (gate_up_weight.n % 2) != 0 ||
+            out.ne[0] != gate_up_weight.n / 2 || out.ne[1] != t ||
+            out.ne[2] != 1 || out.ne[3] != 1 || !out.is_contiguous() || out.data == nullptr) {
+            throw std::invalid_argument("linear_swiglu: expected out [gate_up_rows/2,T]");
+        }
+        const auto& w = gate_up_weight;
+        if (t <= 0 || x.ne[0] != w.k || x.ne[2] != 1 || x.ne[3] != 1 ||
+            !x.is_contiguous() || !aligned_to(x.data, 16) || !aligned_to(out.data, 16) ||
+            w.k <= 0 || w.k % 32 != 0 || w.layout != QuantLayout::RowSplit ||
+            w.scale_dtype != DType::FP16 || w.group_size != 32 || w.group != 32 ||
+            w.ndim != 2 || w.shape[0] != w.n || w.shape[1] != w.k ||
+            w.padded_shape[0] != w.n || w.padded_shape[1] != w.k ||
+            w.qhigh != nullptr || w.high_plane_bytes != 0 ||
+            !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 2)) {
+            throw std::invalid_argument("linear_swiglu: invalid W8 input or row-split weight");
+        }
+        detail::w8_linear_swiglu_generic_launch(x, w, out, stream);
+        return;
+    }
     // The fused route's registered shapes, and which stored format each one may arrive in.
     // These were seven booleans named after the checkpoints they came from, each testing the
     // same five numbers, and three more disjunctions further down deciding the route from

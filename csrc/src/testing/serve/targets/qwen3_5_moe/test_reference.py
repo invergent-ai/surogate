@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from tools.reference.qwen3_5_moe.config import CFG
 from tools.reference.qwen3_5_moe.bindings import ArtifactBinding
 from tools.reference.qwen3_5_moe.weights import (
     WeightStore,
@@ -116,6 +117,7 @@ def test_256k_int8_text_mtp_fixed_bytes() -> None:
             text=True,
             mtp=True,
             prefill_chunk=1024,
+            cfg=CFG,
         )
         == 3_377_889_280
     )

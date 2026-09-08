@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Mapping, Iterable, Iterator, Sequence, TypeAlias
 
 from .layouts import align_up, encoded_size, get_layout
+from .geometry import validate_geometry, validate_dflash_geometry
 
 
 MAGIC = b"SINFER\x00\x02"
@@ -25,7 +26,7 @@ _ROOT_MEMBERS = frozenset({"identity", "objects"})
 #: which let one engine target serve every size of its family. The tower a checkpoint ships is
 #: its own size, independent of the text stack's, so it is declared separately rather than
 #: folded into `geometry` where two members would collide on names like `layers` and `hidden`.
-_ROOT_OPTIONAL = frozenset({"external", "geometry", "vision_geometry"})
+_ROOT_OPTIONAL = frozenset({"external", "geometry", "vision_geometry", "layer_types", "dflash_geometry", "dflash_target_layers"})
 _IDENTITY_MEMBERS = frozenset({"model_id", "weights_id"})
 _TENSOR_MEMBERS = frozenset(
     {"name", "kind", "shape", "format", "layout", "offset", "bytes"}
@@ -46,6 +47,7 @@ class ArtifactError(ValueError):
 class ArtifactIdentity:
     model_id: str
     weights_id: str
+    architecture: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +257,8 @@ def _require_identity(identity: ArtifactIdentity) -> ArtifactIdentity:
     return ArtifactIdentity(
         model_id=_require_string(identity.model_id, "model_id"),
         weights_id=_require_string(identity.weights_id, "weights_id"),
+        architecture=(_require_string(identity.architecture, "architecture")
+                      if identity.architecture is not None else None),
     )
 
 
@@ -264,6 +268,9 @@ def encode_directory(
     external: Sequence[tuple[str, int]] = (),
     geometry: Mapping[str, float] | None = None,
     vision_geometry: Mapping[str, float] | None = None,
+    layer_types: Sequence[str] | None = None,
+    dflash_geometry: Mapping[str, float] | None = None,
+    dflash_target_layers: Sequence[int] | None = None,
 ) -> bytes:
     checked_identity = _require_identity(identity)
     if not objects:
@@ -282,23 +289,44 @@ def encode_directory(
         },
         "objects": [obj.to_json() for obj in objects],
     }
+    if checked_identity.architecture is not None:
+        value["identity"]["architecture"] = checked_identity.architecture
     if external:
         value["external"] = [
             {"path": str(path), "bytes": int(size)} for path, size in external
         ]
     if geometry:
-        value["geometry"] = {str(k): _require_number(v, f"geometry.{k}") for k, v in geometry.items()}
+        value["geometry"] = _checked_geometry(geometry, "geometry")
     if vision_geometry:
-        value["vision_geometry"] = {
-            str(k): _require_number(v, f"vision_geometry.{k}") for k, v in vision_geometry.items()
-        }
+        value["vision_geometry"] = _checked_geometry(vision_geometry, "vision_geometry")
+    if layer_types is not None:
+        value["layer_types"] = _checked_layer_types(list(layer_types), value.get("geometry", {}))
+    if dflash_geometry is not None or dflash_target_layers is not None:
+        try:
+            value["dflash_geometry"] = validate_dflash_geometry(
+                dflash_geometry or {}, list(dflash_target_layers or ()), value.get("geometry", {}))
+        except ValueError as error:
+            raise ArtifactError(str(error)) from error
+        value["dflash_target_layers"] = list(dflash_target_layers or ())
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def _require_number(value: object, field: str) -> float | int:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ArtifactError(f"{field} must be a number")
-    return value
+def _checked_layer_types(values: object, geometry: Mapping) -> list[str]:
+    layers = geometry.get("layers", 0)
+    if not isinstance(values, list) or not 1 <= layers <= 256 or len(values) != layers:
+        raise ArtifactError("layer_types must contain one entry per geometry.layers")
+    if any(kind not in ("full_attention", "sliding_attention", "linear_attention") for kind in values):
+        raise ArtifactError("layer_types contains an unsupported layer type")
+    if "sliding_attention" in values and geometry.get("sliding_window", 0) <= 0:
+        raise ArtifactError("sliding_attention requires a positive geometry.sliding_window")
+    return values
+
+
+def _checked_geometry(values: Mapping[str, object], member: str) -> dict[str, int | float]:
+    try:
+        return validate_geometry(values, vision=member == "vision_geometry", dflash=member == "dflash_geometry")
+    except ValueError as error:
+        raise ArtifactError(str(error)) from error
 
 
 def _parse_geometry_member(directory: bytes, member: str) -> dict[str, float]:
@@ -308,7 +336,7 @@ def _parse_geometry_member(directory: bytes, member: str) -> dict[str, float]:
         return {}
     if not isinstance(raw, dict):
         raise ArtifactError(f"{member} must be an object")
-    return {str(k): _require_number(v, f"{member}.{k}") for k, v in raw.items()}
+    return _checked_geometry(raw, member)
 
 
 def parse_external(directory: bytes) -> tuple[tuple[str, int], ...]:
@@ -416,14 +444,17 @@ def parse_directory(
     raw_identity = value["identity"]
     if (
         not isinstance(raw_identity, dict)
-        or frozenset(raw_identity) != _IDENTITY_MEMBERS
+        or not _IDENTITY_MEMBERS <= frozenset(raw_identity)
+        or frozenset(raw_identity) - _IDENTITY_MEMBERS - {"architecture"}
     ):
         raise ArtifactError(
-            "artifact identity must contain exactly model_id and weights_id"
+            "artifact identity must contain model_id and weights_id, plus at most architecture"
         )
     identity = ArtifactIdentity(
         model_id=_require_string(raw_identity["model_id"], "model_id"),
         weights_id=_require_string(raw_identity["weights_id"], "weights_id"),
+        architecture=(_require_string(raw_identity["architecture"], "architecture")
+                      if "architecture" in raw_identity else None),
     )
     raw_objects = value["objects"]
     if not isinstance(raw_objects, list) or not raw_objects:
@@ -478,8 +509,8 @@ class Artifact:
             magic, json_bytes = PREFIX.unpack(prefix)
             if magic == _V1_MAGIC:
                 raise ArtifactError(
-                    "SInfer artifact v1 is no longer supported; migrate it with: "
-                    "python -m surogate.serve.artifact.migrate_v1_to_v2 <artifact>"
+                    "SInfer artifact v1 is no longer supported; "
+                    "rebuild the serving artifact from its source checkpoint"
                 )
             if magic != MAGIC:
                 raise ArtifactError("artifact magic is not SInfer v2")
@@ -496,6 +527,16 @@ class Artifact:
             self.external = parse_external(directory)
             self.geometry = parse_geometry(directory)
             self.vision_geometry = parse_vision_geometry(directory)
+            raw = json.loads(directory)
+            self.dflash_geometry = _parse_geometry_member(directory, "dflash_geometry")
+            self.dflash_target_layers = raw.get("dflash_target_layers", [])
+            if "dflash_geometry" in raw or "dflash_target_layers" in raw:
+                try:
+                    validate_dflash_geometry(self.dflash_geometry, self.dflash_target_layers, self.geometry)
+                except ValueError as error:
+                    raise ArtifactError(str(error)) from error
+            self.layer_types = (_checked_layer_types(raw["layer_types"], self.geometry)
+                                if "layer_types" in raw else None)
             payload_bytes = self.file_bytes - self.payload_offset
             self._index = _validate_ranges(self.objects, payload_bytes)
             self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
@@ -559,6 +600,9 @@ class ArtifactWriter:
         external: Sequence[tuple[str, int]] = (),
         geometry: Mapping[str, float] | None = None,
         vision_geometry: Mapping[str, float] | None = None,
+        layer_types: Sequence[str] | None = None,
+        dflash_geometry: Mapping[str, float] | None = None,
+        dflash_target_layers: Sequence[int] | None = None,
     ):
         self.path = Path(path)
         self.identity = _require_identity(identity)
@@ -566,9 +610,13 @@ class ArtifactWriter:
         self.external = tuple((str(p), int(n)) for p, n in external)
         self.geometry = dict(geometry) if geometry else {}
         self.vision_geometry = dict(vision_geometry) if vision_geometry else {}
+        self.layer_types = tuple(layer_types) if layer_types is not None else None
         directory = encode_directory(self.identity, self.objects, self.external,
                                      geometry=self.geometry,
-                                     vision_geometry=self.vision_geometry)
+                                     vision_geometry=self.vision_geometry,
+                                     layer_types=self.layer_types,
+                                     dflash_geometry=dflash_geometry,
+                                     dflash_target_layers=dflash_target_layers)
         self.payload_offset = align_up(PREFIX_BYTES + len(directory), PAYLOAD_ALIGNMENT)
         self._file = self.path.open("wb")
         self._file.write(PREFIX.pack(MAGIC, len(directory)))

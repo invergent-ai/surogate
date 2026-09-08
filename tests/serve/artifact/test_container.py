@@ -168,7 +168,7 @@ def test_reader_rejects_invalid_framing_schema_and_geometry(tmp_path):
         Artifact.open(path)
 
 
-def test_reader_rejects_v1_with_the_migration_command(tmp_path):
+def test_reader_rejects_v1_with_checkpoint_rebuild_guidance(tmp_path):
     path = tmp_path / "legacy.sinfer"
     _write_raw(
         path,
@@ -180,7 +180,7 @@ def test_reader_rejects_v1_with_the_migration_command(tmp_path):
     )
     with pytest.raises(
         ArtifactError,
-        match=r"python -m surogate\.serve\.artifact\.migrate_v1_to_v2 <artifact>",
+        match=r"rebuild the serving artifact from its source checkpoint",
     ):
         Artifact.open(path)
 
@@ -219,7 +219,7 @@ def test_geometry_member_round_trips_and_is_optional(tmp_path):
 
     root["geometry"] = {"hidden": "2048"}
     _write_raw(path, root, b"\x00" * 4)
-    with pytest.raises(ArtifactError, match="geometry.hidden must be a number"):
+    with pytest.raises(ArtifactError, match="geometry.hidden must be a finite number"):
         Artifact.open(path)
 
     root["geometry"] = [2048]

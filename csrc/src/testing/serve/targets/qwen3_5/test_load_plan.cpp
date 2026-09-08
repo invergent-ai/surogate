@@ -173,7 +173,8 @@ int verify_rejection() {
     return 1;
 }
 
-int verify_profile_mismatch_rejection() {
+int verify_profile_mismatch_rejection(const std::filesystem::path& path) {
+    sinfer::artifact::Reader reader(path);
     sinfer::DeviceContext device(0);
     sinfer::EngineOptions options;
     options.max_context    = 128;
@@ -182,7 +183,7 @@ int verify_profile_mismatch_rejection() {
     options.use_cuda_graph = false;
     auto planner =
         Package::make_sequence_planner(device, options, WeightsProfile::GroupwiseInt,
-                          sinfer::family::TextGeometry::compiled<Variant::TextConfig>());
+                          Package::declared_geometry(reader));
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
@@ -209,7 +210,7 @@ int main() {
         return 77;
     }
     if (const int result = verify_rejection(); result != 0) { return result; }
-    if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
+    if (const int result = verify_profile_mismatch_rejection(groupwise); result != 0) { return result; }
     if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
     if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }
     return 0;

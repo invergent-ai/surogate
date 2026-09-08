@@ -10,6 +10,7 @@
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -18,6 +19,34 @@
 
 namespace sinfer::ops::detail {
 namespace {
+
+// One warp per (head, token), with geometry supplied by the checkpoint.
+__global__ void bf16_gdn_gating_proj_generic_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* a_weight, const __nv_bfloat16* b_weight,
+    const float* A_log, const float* dt_bias, float* g, float* beta,
+    int heads, int rows, std::int64_t outputs) {
+    const int lane = threadIdx.x & 31;
+    const std::int64_t first = (static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x / 32;
+    for (std::int64_t index = first; index < outputs; index += stride) {
+        const int head = static_cast<int>(index % heads);
+        const auto* column = x + (index / heads) * rows;
+        const auto* wa = a_weight + static_cast<std::int64_t>(head) * rows;
+        const auto* wb = b_weight + static_cast<std::int64_t>(head) * rows;
+        float a = 0.0F, b = 0.0F;
+        for (std::int64_t k = lane; k < rows; k += 32) {
+            const float value = __bfloat162float(column[k]);
+            a = fmaf(value, __bfloat162float(wa[k]), a);
+            b = fmaf(value, __bfloat162float(wb[k]), b);
+        }
+        a = warp_reduce_sum(a);
+        b = warp_reduce_sum(b);
+        if (lane == 0) {
+            g[index] = -expf(A_log[head]) * softplus(a + dt_bias[head]);
+            beta[index] = sigmoid(b);
+        }
+    }
+}
 
 constexpr int kN                  = 48;
 constexpr int kK                  = 5120;
@@ -718,6 +747,22 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
                                                      b_weight, A_log, dt_bias, nullptr, g, beta,
                                                      stream);
+}
+
+void bf16_gdn_gating_proj_generic_launch(const Tensor& x, const Weight& a_weight,
+                                        const Weight& b_weight, const Tensor& A_log,
+                                        const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                        cudaStream_t stream) {
+    const std::int64_t outputs = g.numel();
+    const int blocks = static_cast<int>(std::min<std::int64_t>((outputs + 7) / 8, 65535));
+    bf16_gdn_gating_proj_generic_kernel<<<blocks, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata),
+        static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+        static_cast<float*>(g.data), static_cast<float*>(beta.data), a_weight.n, a_weight.k,
+        outputs);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace sinfer::ops::detail

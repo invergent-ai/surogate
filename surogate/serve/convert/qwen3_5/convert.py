@@ -10,7 +10,7 @@ Canonical invocation::
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -33,112 +33,19 @@ from surogate.serve.convert.common.gguf_repack import (
 from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
-from surogate.serve.convert.common import official_resources
+from surogate.serve.convert.common.checkpoint import tokenizer_domain
+from surogate.serve.convert.common import qwen3_5 as checkpoint
 
 from . import draft_head, inventory, recipe
 
 
-#: The registered size's recipe. Each generation is a separately published lineage with its
-#: own id, and every artifact records the one that made it, so the id follows the checkpoint.
-RECIPE_ID = "qwen3_5-v2"
-RECIPE_IDS = {"qwen3.6-27b": "qwen3_6_27b-v2", "qwen3.8-27b": "qwen3_8_27b-v1"}
+RECIPE_ID = "qwen3_5-config-v3"
+ResourcePayload = family_conversion.ResourcePayload
+ObjectPlan = family_conversion.ObjectPlan
 
 
 def recipe_id_for(geometry: "inventory.Geometry") -> str:
-    return RECIPE_IDS.get(inventory.model_id_for(geometry), RECIPE_ID)
-
-
-#: The published frontend of each generation, pinned by content. Qwen3.8 ships a different
-#: tokenizer and chat template from Qwen3.6, so the profile is per model id; the smaller
-#: sizes have no pinned profile yet and their frontend correctness is covered by the
-#: tokenizer equivalence tests in tests/serve/.
-_QWEN3_8_RESOURCE_SHA256 = {
-    "frontend/tokenizer.json": (
-        "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
-    ),
-    "frontend/tokenizer_config.json": (
-        "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"
-    ),
-    "frontend/chat_template.jinja": (
-        "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
-    ),
-    "frontend/generation_config.json": (
-        "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
-    ),
-    "frontend/preprocessor_config.json": (
-        "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
-    ),
-    "frontend/video_preprocessor_config.json": (
-        "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
-    ),
-}
-
-
-_ROOT_CONFIG = {
-    "architectures": ["Qwen3_5ForConditionalGeneration"],
-    "vision_start_token_id": 248053,
-    "vision_end_token_id": 248054,
-    "image_token_id": 248056,
-    "video_token_id": 248057,
-}
-#: The generations this converter serves. They share every graph and differ only in how their
-#: exports quantise, which the artifact records rather than the code branching on.
-_MODEL_TYPES = ("qwen3_5", "qwen3_6", "qwen3_8")
-#: Members that must hold for any size of this family, checked by value. The dimensions are
-#: *not* here: one converter serves every size, so they are read from the checkpoint and the
-#: artifact states them. What remains is what makes a checkpoint this architecture.
-_TEXT_CONFIG = {
-    "full_attention_interval": 4,
-    "vocab_size": 248320,
-    "mamba_ssm_dtype": "float32",
-    "mtp_num_hidden_layers": 1,
-    "mtp_use_dedicated_embeddings": False,
-    "max_position_embeddings": 262144,
-    "rms_norm_eps": 1e-6,
-}
-
-#: The dimensions, checked only for presence and self-consistency.
-_TEXT_DIMENSIONS = (
-    "num_hidden_layers",
-    "hidden_size",
-    "intermediate_size",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "head_dim",
-    "linear_num_key_heads",
-    "linear_num_value_heads",
-    "linear_key_head_dim",
-    "linear_value_head_dim",
-    "linear_conv_kernel_dim",
-)
-_ROPE_CONFIG = {
-    "rope_theta": 10000000,
-    "mrope_section": [11, 11, 10],
-}
-#: The tower members that hold at every size. The four that do not are checked against the
-#: tower this size's object list is built from, so a config and an inventory cannot disagree.
-_VISION_CONFIG = {
-    "num_heads": 16,
-    "in_channels": 3,
-    "patch_size": 16,
-    "temporal_patch_size": 2,
-    "spatial_merge_size": 2,
-    "num_position_embeddings": 2304,
-}
-
-
-def _vision_dimensions(geometry: "inventory.Geometry") -> dict[str, int]:
-    tower = inventory.vision_tower(geometry)
-    return {
-        "depth": tower["layers"],
-        "hidden_size": tower["hidden"],
-        "intermediate_size": tower["intermediate"],
-        "out_hidden_size": geometry.hidden,
-    }
-
-
-ResourcePayload = family_conversion.ResourcePayload
-ObjectPlan = family_conversion.ObjectPlan
+    return RECIPE_ID
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,224 +77,39 @@ def _check_members(
 
 
 
-def geometry_block(config: Mapping[str, object]) -> dict[str, float]:
-    """The artifact's `geometry` member: the dimensions the engine reads at load.
-
-    This target is one compiled size, and these are the numbers that make it that size.
-    Stating them in the artifact is what lets one engine target serve every size of the
-    family, and it is the checkpoint's own config that states them here.
-    """
-    text = config["text_config"]
-    rope = text["rope_parameters"]
-    return {
-        "hidden": int(text["hidden_size"]),
-        "layers": int(text["num_hidden_layers"]),
-        "intermediate": int(text["intermediate_size"]),
-        "output_rows": int(text["vocab_size"]),
-        "query_heads": int(text["num_attention_heads"]),
-        "kv_heads": int(text["num_key_value_heads"]),
-        "head_dim": int(text["head_dim"]),
-        "gdn_key_heads": int(text["linear_num_key_heads"]),
-        "gdn_key_head_dim": int(text["linear_key_head_dim"]),
-        "gdn_value_heads": int(text["linear_num_value_heads"]),
-        "gdn_value_head_dim": int(text["linear_value_head_dim"]),
-        "gdn_conv_kernel": int(text["linear_conv_kernel_dim"]),
-        "mtp_layers": int(text["mtp_num_hidden_layers"]),
-        "rms_epsilon": float(text["rms_norm_eps"]),
-        "rope_theta": float(rope["rope_theta"]),
-    }
-
-def validate_config(config: Mapping[str, object], *,
-                    vision: bool = True) -> dict[str, object]:
-    """Validate the checkpoint against the family contract and summarize it.
-
-    `vision` says whether the artifact will carry the tower; a text-only export is converted
-    from a config that still names one, and validating a tower nothing is read from would
-    refuse a checkpoint the artifact never touches.
-    """
-
-    _check_members("config", config, _ROOT_CONFIG)
-    if str(config.get("model_type")) not in _MODEL_TYPES:
-        raise ValueError(
-            f"config.model_type is {config.get('model_type')!r}, expected one of "
-            + ", ".join(_MODEL_TYPES)
-        )
-    # Only the 27B publishes it, and only ever as False; absent means the same thing.
-    if config.get("language_model_only", False):
-        raise ValueError("config.language_model_only must be false")
-    text = config.get("text_config")
-    if not isinstance(text, Mapping):
-        raise ValueError("config.json must contain text_config")
-    _check_members("text_config", text, _TEXT_CONFIG)
-    missing = [name for name in _TEXT_DIMENSIONS if name not in text]
-    if missing:
-        raise ValueError("text_config is missing dimensions: " + ", ".join(missing))
-    # The schedule is the family's -- three linear layers then every fourth attending -- at
-    # whatever depth this checkpoint has.
-    geometry_for_schedule = inventory.geometry_from_config(config)
-    full = set(geometry_for_schedule.full_attention_layers)
-    expected_layer_types = tuple(
-        "full_attention" if layer in full else "linear_attention"
-        for layer in range(geometry_for_schedule.layers)
-    )
-    layer_types = text.get("layer_types")
-    if not isinstance(layer_types, list) or tuple(layer_types) != expected_layer_types:
-        raise ValueError(
-            "text_config.layer_types does not match this family's schedule at "
-            f"{geometry_for_schedule.layers} layers"
-        )
-    rope = text.get("rope_parameters")
-    if not isinstance(rope, Mapping):
-        raise ValueError("text_config.rope_parameters is missing")
-    _check_members("text_config.rope_parameters", rope, _ROPE_CONFIG)
-    # A text-only export of this family declares no vision tower, and the artifact then omits
-    # `vision/*`. The engine probes for the tower rather than assuming it.
-    vision_config = config.get("vision_config")
-    if vision_config is not None and not isinstance(vision_config, Mapping):
-        raise ValueError("config.json vision_config must be an object when present")
-    vision_members = {**_VISION_CONFIG, **_vision_dimensions(geometry_for_schedule)}
-    if vision and vision_config is not None:
-        _check_members("vision_config", vision_config, vision_members)
-    return {
-        "architecture": config["architectures"][0],
-        "model_type": config["model_type"],
-        "text": {name: text[name] for name in (*_TEXT_CONFIG, *_TEXT_DIMENSIONS)},
-        "layer_types": {
-            "layers": len(layer_types),
-            "full_attention": len(full),
-            "linear_attention": len(layer_types) - len(full),
-            "full_attention_layers": sorted(full),
-        },
-        "rope": {name: rope[name] for name in _ROPE_CONFIG},
-        "vision": ({name: vision_config[name] for name in vision_members}
-                   if vision_config is not None else None),
-        "mtp_num_hidden_layers": text["mtp_num_hidden_layers"],
-        "vision_token_ids": {
-            name: config[name]
-            for name in (
-                "vision_start_token_id",
-                "vision_end_token_id",
-                "image_token_id",
-                "video_token_id",
-            )
-        },
-    }
+def geometry_block(geometry: inventory.Geometry, *, mtp: bool | None = None) -> dict:
+    return checkpoint.geometry_block(geometry, mtp=mtp)
 
 
-#: (resources, text core, draft head, MTP, vision, tensors, objects) per registered size,
-#: and what the no-MTP variant of each holds. This restates what the inventory builds, on
-#: purpose: it is the check that blocks a conversion run, so a size whose object list grows
-#: without this table growing with it fails here rather than after hours of writing.
-_SECTION_COUNTS = {
-    "qwen3.5-0.8b": ((6, 267, 2, 12, 297, 578, 584), (566, 572)),
-    "qwen3.5-2b": ((6, 267, 2, 12, 297, 578, 584), (566, 572)),
-    "qwen3.5-4b": ((6, 355, 2, 12, 297, 666, 672), (654, 660)),
-    "qwen3.6-27b": ((6, 771, 2, 12, 333, 1118, 1124), (1106, 1112)),
-    "qwen3.8-27b": ((6, 771, 2, 12, 333, 1118, 1124), (1106, 1112)),
-}
+def validate_config(config: Mapping[str, object], *, vision: bool = True) -> dict:
+    g = inventory.geometry_from_config(config)
+    return _config_summary(g, vision=vision)
 
 
-def preflight_inventory(geometry: "inventory.Geometry | None" = None) -> None:
-    """Establish the complete target inventory and recipe pairing at this size."""
+def _config_summary(g: inventory.Geometry, *, vision: bool = True) -> dict:
+    return {"architecture": g.declared.hf_config["architectures"][0],
+            "text": dict(g.text_config), "layer_types": list(g.layer_types),
+            "vision": g.declared.hf_config.get("vision_config") if vision else None}
 
-    geometry = geometry or inventory.GEOMETRY
-    model_id = inventory.model_id_for(geometry)
-    registered = _SECTION_COUNTS.get(model_id)
-    if registered is None:
-        raise ValueError(f"no registered inventory for {model_id}")
-    complete, without_mtp = registered
-    tensors, objects = inventory.active_specs(mtp=True, vision=True, geometry=geometry)
-    if (
-        len(inventory.RESOURCE_SPECS),
-        len(inventory.build_text_core_specs(geometry)),
-        len(inventory.build_draft_head_specs(geometry)),
-        len(inventory.build_mtp_specs(geometry)),
-        len(inventory.build_vision_specs(geometry)),
-        len(tensors),
-        len(objects),
-    ) != complete:
-        raise ValueError(f"registered inventory is incomplete for {model_id}")
-    no_mtp_tensors, no_mtp_objects = inventory.active_specs(
-        mtp=False, vision=True, geometry=geometry
-    )
-    if (len(no_mtp_tensors), len(no_mtp_objects)) != without_mtp:
-        raise ValueError(f"registered no-MTP inventory is incomplete for {model_id}")
-    if geometry == inventory.GEOMETRY:
-        recipe.validate_recipe_coverage()
+
+def preflight_inventory(geometry: inventory.Geometry) -> None:
+    inventory.export_inventory(inventory.GROUPWISE_INT, geometry).validate_inventory()
+    recipe.validate_recipe_coverage(geometry)
 
 
 def load_resources(model_dir: str | Path,
-                   geometry: "inventory.Geometry | None" = None) -> tuple[ResourcePayload, ...]:
-    if geometry is None:
-        geometry = inventory.geometry_from_config(_load_config(Path(model_dir)))
-    model_id = inventory.model_id_for(geometry)
-    if model_id == inventory.QWEN3_8_MODEL_ID:
-        return _load_pinned_resources(model_dir, _QWEN3_8_RESOURCE_SHA256)
-    if inventory.is_27b(geometry):
-        # The 3.6 profile lives in the shared module because the MoE target pins it too, and
-        # it downgrades to a warning for a GGUF-derived frontend the way that path needs.
-        return official_resources.load_official_resources(
-            model_dir, inventory.RESOURCE_SPECS
-        )
+                   geometry: inventory.Geometry | None = None) -> tuple[ResourcePayload, ...]:
     return family_conversion.load_resources(model_dir, inventory.RESOURCE_SPECS)
 
 
-def vision_geometry_block(config: Mapping[str, object]) -> dict[str, float] | None:
-    """The artifact's `vision_geometry` member: the tower's dimensions, keyed the way the
-    engine's `VisionGeometry` names them.
-
-    The tower is per-checkpoint the way the text stack is (the 0.8B ships 12 layers of 768,
-    the 2B and 4B 24 of 1024, the 27B 27 of 1152) and the target compiles one of them; an
-    artifact that leaves this unstated binds its tower against that one. `None` for a
-    text-only checkpoint. RoPE theta and the norm epsilon are not in the checkpoint's vision
-    config and stay the compiled values, which every tower of the family shares.
-    """
-    vision = config.get("vision_config")
-    if vision is None:
-        return None
-    hidden = int(vision["hidden_size"])
-    heads = int(vision["num_heads"])
-    patch_dim = (int(vision["in_channels"]) * int(vision["temporal_patch_size"])
-                 * int(vision["patch_size"]) * int(vision["patch_size"]))
-    return {
-        "layers": int(vision["depth"]),
-        "hidden": hidden,
-        "intermediate": int(vision["intermediate_size"]),
-        "heads": heads,
-        "patch_dim": patch_dim,
-        "merge": int(vision["spatial_merge_size"]),
-        "position_embeddings": int(vision["num_position_embeddings"]),
-        # Every tower shipped so far rotates the whole head.
-        "rotary_dim": hidden // heads,
-        "output_hidden": int(vision["out_hidden_size"]),
-    }
+def vision_geometry_block(config: Mapping[str, object]) -> dict | None:
+    return checkpoint.vision_geometry_block(config)
 
 
 def carries_vision(object_specs) -> bool:
     """Whether an object plan holds the tower, so the artifact declares its geometry only
     when there is one to bind."""
     return any(spec.name.startswith("vision/") for spec in object_specs)
-
-
-def _load_pinned_resources(model_dir: str | Path,
-                           expected: Mapping[str, str]) -> tuple[ResourcePayload, ...]:
-    """Load exactly the pinned frontend of one generation, refusing any substitution."""
-    spec_names = tuple(spec.name for spec in inventory.RESOURCE_SPECS)
-    if spec_names != tuple(expected):
-        raise ValueError(
-            "converter resource inventory does not match the pinned profile: "
-            f"expected {tuple(expected)!r}, got {spec_names!r}"
-        )
-    resources = family_conversion.load_resources(model_dir, inventory.RESOURCE_SPECS)
-    for resource in resources:
-        actual = hashlib.sha256(resource.data).hexdigest()
-        if actual != expected[resource.name]:
-            filename = resource.name.removeprefix("frontend/")
-            raise ValueError(
-                f"official resource hash mismatch for {filename}: "
-                f"expected {expected[resource.name]}, got {actual}"
-            )
-    return resources
 
 
 def build_object_plan(
@@ -399,7 +121,7 @@ def build_object_plan(
     preflight_inventory(geometry)
     if object_specs is None:
         _, object_specs = inventory.active_specs(mtp=mtp, vision=vision,
-                                                 geometry=geometry or inventory.GEOMETRY)
+                                                 geometry=geometry)
     if native:
         object_specs = GgufRepackSource.native_specs(object_specs, native)
     return family_conversion.build_object_plan(object_specs, resources)
@@ -408,10 +130,7 @@ def build_object_plan(
 def active_recipes(*, mtp: bool, vision: bool = True,
                    geometry=None) -> dict[str, recipe.TensorRecipe]:
     """Recipes for the requested artifact variant, at this checkpoint's size."""
-    by_name = (
-        dict(recipe.RECIPES_BY_NAME) if geometry is None or geometry == inventory.GEOMETRY
-        else {r.object_name: r for r in recipe.build_recipes(geometry)}
-    )
+    by_name = {r.object_name: r for r in recipe.build_recipes(geometry)}
     dropped = tuple(
         prefix for prefix, keep in (("mtp/", mtp), ("vision/", vision)) if not keep
     )
@@ -465,13 +184,15 @@ def preflight_conversion(
     vision: bool = True,
     native: Mapping[str, str] | None = None,
     object_specs=None,
+    geometry: inventory.Geometry | None = None,
 ) -> ConversionPreflight:
     """Finish all checkpoint, inventory, shortlist, and offset work before writing."""
 
     model = Path(model_dir)
     config = _load_config(model)
-    config_summary = validate_config(config, vision=vision)
-    geometry = inventory.geometry_from_config(config)
+    if geometry is None:
+        geometry = inventory.geometry_from_checkpoint(model, config, extra_names=repack.sources if repack else ())
+    config_summary = _config_summary(geometry, vision=vision)
     preflight_inventory(geometry)
     recipes = active_recipes(mtp=mtp, vision=vision, geometry=geometry)
     if planned or not mtp or not vision:
@@ -491,7 +212,7 @@ def preflight_conversion(
     object_plan = build_object_plan(resource_map, mtp=mtp, vision=vision, native=native,
                                     object_specs=object_specs, geometry=geometry)
     ranking = _tools_root() / draft_head.DEFAULT_RANKING
-    draft = draft_head.compute_shortlist(ranking, model)
+    draft = draft_head.compute_shortlist(ranking, model, geometry=geometry)
     return ConversionPreflight(
         model_dir=model,
         config=config,
@@ -507,7 +228,7 @@ def materialize_tensor(
     spec: inventory.TensorSpec,
     reader: ShardReader,
     draft: draft_head.DraftHeadContext,
-    recipes: Mapping[str, recipe.TensorRecipe] | None = None,
+    recipes: Mapping[str, recipe.TensorRecipe],
 ) -> torch.Tensor:
     derived = None
     if spec.name in (
@@ -520,7 +241,7 @@ def materialize_tensor(
             )
         }
     tensor = recipe.materialize_recipe(
-        (recipes or recipe.RECIPES_BY_NAME)[spec.name],
+        recipes[spec.name],
         reader,
         derived,
     )
@@ -557,7 +278,7 @@ def build_conversion_report(
     elapsed_seconds: float,
     final_bytes: int,
     device: torch.device,
-    ranking_path: str | Path,
+    ranking_path: str | Path | None,
     revision: str | None = None,
     environment: Mapping[str, object] | None = None,
     geometry: "inventory.Geometry | None" = None,
@@ -566,10 +287,10 @@ def build_conversion_report(
 
     return family_conversion.build_conversion_report(
         identity=ArtifactIdentity(
-            inventory.model_id_for(geometry or inventory.GEOMETRY), inventory.WEIGHTS_ID
-        ),
+            inventory.model_id_for(geometry), inventory.WEIGHTS_ID
+        , architecture="qwen3_5"),
         target_key=inventory.TARGET_KEY,
-        recipe_id=recipe_id_for(geometry or inventory.GEOMETRY),
+        recipe_id=recipe_id_for(geometry),
         repo_root=_tools_root(),
         model_dir=model_dir,
         out_path=out_path,
@@ -603,7 +324,12 @@ def convert(
     requested_device = str(device)
     resolved_device = pick_device(device)
     repack = GgufRepackSource(gguf_repack) if gguf_repack else None
-    geometry = inventory.geometry_from_config(_load_config(model))
+    geometry = inventory.geometry_from_checkpoint(model, extra_names=repack.sources if repack else ())
+    source_names = set(family_conversion.checkpoint_tensor_names(model)) | set(repack.sources if repack else ())
+    mtp = mtp and bool(geometry.mtp_layers) and any(name.startswith("mtp.") for name in source_names)
+    vision = vision and bool(geometry.declared.hf_config.get("vision_config")) and any(
+        "visual." in name for name in source_names)
+    geometry = replace(geometry, mtp_layers=geometry.mtp_layers if mtp else 0)
     recipes = active_recipes(mtp=mtp, vision=vision, geometry=geometry)
     active_tensor_specs, active_object_specs = inventory.active_specs(
         mtp=mtp, vision=vision, geometry=geometry)
@@ -646,7 +372,7 @@ def convert(
         # By default those objects are not copied at all: the artifact names the GGUF and the
         # stretches of it each object reads. SUROGATE_GGUF_COPY=1 writes the bytes in.
         draft_ids = draft_head.materialize_draft_head_token_ids(
-            draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, model)
+            draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, model, geometry=geometry)
         )
         native_runs = {
             spec.name: repack.runs_for_native(
@@ -673,7 +399,8 @@ def convert(
             print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
                   flush=True)
     preflight = preflight_conversion(
-        model, repack, planned + tuple(native) + tuple(sorted(tied)) + tuple(halves) + tuple(in_place), mtp=mtp, vision=vision, native=native, object_specs=active_object_specs
+        model, repack, planned + tuple(native) + tuple(sorted(tied)) + tuple(halves) + tuple(in_place),
+        mtp=mtp, vision=vision, native=native, object_specs=active_object_specs, geometry=geometry
     )
 
     print(
@@ -692,12 +419,13 @@ def convert(
             half_lookup[name] = (parent, slice(first, first + rows))
             first += rows
 
-    with ShardReader(model) as reader:
+    with ShardReader.for_directory(model) as reader:
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.model_id_for(geometry), inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.model_id_for(geometry), inventory.WEIGHTS_ID, architecture="qwen3_5"),
             preflight.object_plan.specs,
-            geometry=geometry_block(preflight.config),
+            geometry=geometry_block(geometry),
+            layer_types=geometry.layer_types,
             vision_geometry=(vision_geometry_block(preflight.config)
                              if carries_vision(preflight.object_plan.specs) else None),
             external=external,
@@ -754,7 +482,7 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    ranking = _tools_root() / draft_head.DEFAULT_RANKING
+    ranking = preflight.draft.ranking
     arguments = {
         "model": str(model_dir),
         "out": str(out_path),
@@ -793,30 +521,25 @@ DUAL_SOURCE_PROFILES = (inventory.NVFP4_MIXED_BF16, inventory.NVFP4_MLP_ONLY)
 
 
 def _export_writer(profile: str):
-    """The module that writes one export's artifact. Imported on use: each pulls in its own
-    source-format machinery, and a group-wise conversion needs none of it."""
-    from .exports import convert_fp8_block, convert_nvfp4_all, convert_nvfp4_mixed_bf16
-    from .exports import convert_nvfp4_mlp_only, convert_nvfp4_uniform
-
-    return {
-        inventory.FP8_BLOCK: convert_fp8_block,
-        inventory.FP8_CHANNEL: convert_fp8_block,
-        inventory.NVFP4_UNIFORM: convert_nvfp4_uniform,
-        inventory.NVFP4_MIXED_BF16: convert_nvfp4_mixed_bf16,
-        inventory.NVFP4_MLP_ONLY: convert_nvfp4_mlp_only,
-        inventory.NVFP4_ALL: convert_nvfp4_all,
-    }[profile]
+    from importlib import import_module
+    modules = {
+        inventory.FP8_BLOCK: "convert_fp8_block", inventory.FP8_CHANNEL: "convert_fp8_block",
+        inventory.NVFP4_UNIFORM: "convert_nvfp4_uniform",
+        inventory.NVFP4_MIXED_BF16: "convert_nvfp4_mixed_bf16",
+        inventory.NVFP4_MLP_ONLY: "convert_nvfp4_mlp_only",
+        inventory.NVFP4_ALL: "convert_nvfp4_all",
+    }
+    return import_module(f"{__package__}.exports.{modules[profile]}")
 
 
 def profile_for_checkpoint(config: Mapping[str, object]) -> str:
     """Which export this checkpoint is, from what it says about itself.
 
-    A BF16 or GGUF-bridged checkpoint declares no quantisation and converts group-wise.
-    Beyond that the published releases are one per (size, generation), so the geometry and
-    the model type name the export; `--profile` overrides when a size grows a second one.
+    Unquantized checkpoints use the groupwise policy; quantized checkpoints dispatch by
+    their declared encoding. Tensor metadata resolves the per-layer exceptions.
     """
     quantization = config.get("quantization_config") or {}
-    text = json.dumps(quantization)[:2000] if isinstance(quantization, Mapping) else ""
+    text = json.dumps(quantization) if isinstance(quantization, Mapping) else ""
     method = str(quantization.get("quant_method", "")) if isinstance(quantization, Mapping) else ""
     if method == "fp8" and isinstance(quantization, Mapping) and quantization.get("weight_block_size"):
         # Hugging Face fine-grained FP8: a [128, 128] block scale grid per weight.
@@ -829,14 +552,20 @@ def profile_for_checkpoint(config: Mapping[str, object]) -> str:
         if (str(weights.get("type", "")).lower() == "float" and int(weights.get("num_bits", 0) or 0) == 8
                 and str(weights.get("strategy", "")) == "channel"):
             return inventory.FP8_CHANNEL
-    if "NVFP4" not in text and "nvfp4" not in method:
+    if "nvfp4" not in text.lower() and not any(
+        (group.get("weights") or {}).get("num_bits") == 4
+        for group in (quantization.get("config_groups") or {}).values()
+    ):
         return inventory.GROUPWISE_INT
-    geometry = inventory.geometry_from_config(config)
-    if not inventory.is_27b(geometry):
+    if method.lower() in ("modelopt", "nvfp4", "modelopt_fp4"):
         return inventory.NVFP4_UNIFORM
-    if inventory.model_id_for(geometry) == inventory.QWEN3_8_MODEL_ID:
+    groups = quantization.get("config_groups", {})
+    kinds = {(g.get("weights") or {}).get("num_bits") for g in groups.values()}
+    if 4 in kinds and 8 in kinds:
         return inventory.NVFP4_MLP_ONLY
-    return inventory.NVFP4_MIXED_BF16
+    if 4 in kinds:
+        return inventory.NVFP4_ALL
+    raise ValueError("NVFP4 quantization_config does not declare a supported storage scheme")
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -867,27 +596,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     if _scope:
         print(_scope, flush=True)
     profile = args.profile or profile_for_checkpoint(_config)
-    # An export table that names exception layers is a measurement of a published file. Check
-    # it against the file in hand: a stale table builds an artifact whose formats do not match
-    # its own weights, and nothing downstream would say so.
-    _export = inventory.export_for(profile, inventory.geometry_from_config(_config))
-    if _export.exceptions:
-        from surogate.serve.convert.common import quant_scope as _qs
-        # The table describes the quantised release; a two-role profile names it separately
-        # from the unquantised base, and scanning the base read every MLP as an exception.
-        _quantized = Path(args.quantized_model) if args.quantized_model else _model
-        _observed = _qs.observed_scope(family_conversion.checkpoint_tensor_names(_quantized))
-        _differ = inventory.exception_disagreement(_export, _observed)
-        if _differ:
-            _detail = "; ".join(
-                f"{role}: the table says {table} and the checkpoint has {found}"
-                for role, (table, found) in sorted(_differ.items())
-            )
-            raise SystemExit(
-                f"the {profile} export table does not describe this checkpoint -- {_detail}. "
-                f"The tables were measured from published files; this one differs, so the "
-                f"artifact would claim formats its own weights do not have."
-            )
     if profile == inventory.GROUPWISE_INT:
         convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack,
                 mtp=not args.no_mtp, vision=not args.no_vision)
@@ -895,11 +603,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     writer = _export_writer(profile)
     if profile in DUAL_SOURCE_PROFILES:
         if args.quantized_model is None:
-            parser.error(f"--profile {profile} reads two checkpoints; pass "
-                         "--quantized-model as well as --model")
-        writer.convert(args.model, args.quantized_model, args.out, device=args.device)
+            writer.convert(args.model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision)
+        else:
+            writer.convert(args.model, args.quantized_model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision)
         return
-    writer.convert(args.model, args.out, device=args.device)
+    writer.convert(args.model, args.out, device=args.device, mtp=not args.no_mtp, vision=not args.no_vision)
 
 
 if __name__ == "__main__":

@@ -1446,8 +1446,7 @@ int verify_geometry_registration_contract() {
         std::int32_t kv_heads;
     };
     const Shape unregistered[] = {
-        {256, 32, 2}, {256, 12, 4}, {256, 8, 4}, {256, 24, 8}, {256, 16, 16},
-        {256, 32, 4}, {256, 32, 8},
+        {64, 15, 8}, {256, 0, 4}, {256, 12, 5}, {96, 16, 8},
     };
     for (const auto& [head_dim, q_heads, kv_heads] : unregistered) {
         if (accepted(head_dim, q_heads, kv_heads)) {
@@ -1503,6 +1502,20 @@ int main() {
     failures += verify_geometry_registration_contract();
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
+    for (const Geometry geometry : {Geometry{"fallback_16q8_d64", 16, 8, 64},
+                                    Geometry{"fallback_12q4_d256", 12, 4, 256}}) {
+        for (const int tokens : {1, 3, 17}) {
+            const AttentionCase test_case{tokens, 61, 128, 2100U + tokens, 32};
+            failures += run_a1_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);
+            failures += run_a3_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);
+        }
+        failures += run_batch_case(geometry, DType::BF16,
+            {6, {61, 127, 255}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 2200U});
+        if (geometry.head_dim >= 128) {
+            failures += run_batch_case(geometry, DType::I8,
+                {3, {61, 127}, {3, 2}, {1, 0}, MappingPattern::Fragmented, 2201U});
+        }
+    }
     failures += run_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " gqa_attention public-contract correctness\n";

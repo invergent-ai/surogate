@@ -92,7 +92,7 @@ sinfer::PromptInput altered_history_after_boundary() {
 
 int verify_dflash_load(const sinfer::Engine& engine) {
     const sinfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_moe" || load.weights_id != "groupwise-int" ||
+    if (load.target != "qwen3_5_moe" || load.weights_id != "groupwise-int" ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "DFlash Engine materialized an invalid artifact payload: target="
                   << load.target << " weights=" << load.weights_id << '\n';

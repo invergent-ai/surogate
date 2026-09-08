@@ -22,8 +22,6 @@ namespace sinfer::targets::qwen3::detail {
 
 // The compiled default for a Qwen3-0.6B; an artifact that declares `layers` overrides it,
 // which is what lets this one target serve every size of the family.
-inline constexpr std::size_t kTextLayers          = 28;
-inline constexpr std::size_t kFullAttentionLayers = 28;
 // Every layer is full attention. The empty half of the family's split is not a
 // placeholder: the shared ModelView is instantiated with it, and the shared
 // runtime's GDN arrays and state pool are sized from it.
@@ -60,7 +58,7 @@ struct TextLayerPlan {
 struct BindingPlan {
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry = {};
     /// Only four of the family plan's six slots are filled. Qwen3-0.6B publishes
     /// no image or video preprocessor config, and the loader refuses an artifact
     /// carrying an object no binder consumed -- so this target binds its own
@@ -115,7 +113,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     family::ModelView<FusedAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<1>>;
+                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

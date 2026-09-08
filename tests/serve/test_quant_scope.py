@@ -142,35 +142,24 @@ def test_a_sub_stack_layer_is_not_a_text_layer():
     assert observed.layers_of("self_attn.q_proj", quantised=True) == (3,)
 
 
-def test_a_stale_exception_table_is_a_disagreement_not_a_wrong_artifact():
-    """The export tables were measured from published files and written down. Both
-    `nvidia/Qwen3.6-27B-NVFP4` and `unsloth/Qwen3.6-27B-NVFP4` quantise every attention layer,
-    so neither matches `_BF16_ATTENTION_INPUT_LAYERS`; the converter refuses rather than
-    building an artifact that claims formats its own weights do not have."""
+def test_exception_layers_come_from_checkpoint_tensors():
+    from types import SimpleNamespace
     from surogate.serve.convert.qwen3_5 import inventory as inv
 
-    export = inv.export_for(inv.NVFP4_MIXED_BF16, inv.GEOMETRY_27B)
-    assert export.exceptions, "this profile is the one that carries measured exceptions"
-
-    # A checkpoint that quantises every attention layer, as both published ones do.
-    every_layer_quantised = qs.observed_scope(tuple(
-        f"model.language_model.layers.{layer}.self_attn.{proj}.weight{suffix}"
-        for layer in inv.GEOMETRY_27B.full_attention_layers
+    observed = qs.observed_scope(tuple(
+        f"model.layers.{layer}.self_attn.{proj}.weight{suffix}"
+        for layer in (1, 5)
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj")
-        for suffix in ("", "_scale")
+        for suffix in ("", "_packed", "_scale")
     ))
-    differ = inv.exception_disagreement(export, every_layer_quantised)
-    assert "attention_input" in differ
-    table, found = differ["attention_input"]
-    assert table == (3, 7, 11, 15, 19, 23) and found == ()
-
-    # And a checkpoint that matches the table is not a disagreement.
-    matching = qs.observed_scope(
-        tuple(f"model.language_model.layers.{layer}.self_attn.{proj}.weight"
-              for layer in (3, 7, 11, 15, 19, 23) for proj in ("q_proj", "k_proj", "v_proj"))
-        + tuple(f"model.language_model.layers.{layer}.self_attn.o_proj.weight"
-                for layer in (3, 7))
-        + tuple(f"model.language_model.layers.{layer}.linear_attn.out_proj.weight"
-                for layer in (4,))
-    )
-    assert "attention_input" not in inv.exception_disagreement(export, matching)
+    geometry = SimpleNamespace(observed_scope=observed)
+    assert inv.export_for(inv.NVFP4_MIXED_BF16, geometry).exceptions == {}
+    geometry.observed_scope = qs.observed_scope(tuple(
+        f"model.layers.5.self_attn.{proj}.weight" for proj in ("q_proj", "k_proj", "v_proj")
+    ))
+    assert inv.export_for(inv.NVFP4_MIXED_BF16, geometry).exceptions == {
+        "attention_input": (inv.BF16, (5,)),
+    }
+    geometry.observed_scope = qs.observed_scope(("model.layers.5.self_attn.q_proj.weight",))
+    with pytest.raises(ValueError, match="cannot fuse"):
+        inv.export_for(inv.NVFP4_MIXED_BF16, geometry)

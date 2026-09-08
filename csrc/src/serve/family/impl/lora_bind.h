@@ -20,7 +20,7 @@
 
 namespace sinfer::family {
 
-template <class TextConfig, class FusedPayload, class Runtime, class IsFull>
+template <class FusedPayload, class Runtime, class IsFull>
 void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFull&& is_full) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
@@ -47,14 +47,16 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
     // weight each. Attention modules exist only on the full-attention layers;
     // the MLP is on every layer, and a real PEFT adapter carries down_proj on
     // all of them.
+    const auto& g = runtime.geometry;
     using Binding          = ops::LoraStore::ModuleBinding;
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
-    for (std::size_t layer = 0; layer < TextConfig::layers; ++layer) {
+    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         const auto index          = static_cast<std::int32_t>(layer);
         const void* mlp_down      = nullptr;
         const Weight* mlp_gate_up = nullptr;
-        if (is_full(layer)) {
+        if (g.attention_schedule_declared ? g.layer_attends(static_cast<std::int32_t>(layer))
+                                        : is_full(layer)) {
             const auto& full = runtime.full_layers.at(full_index++);
             mlp_down         = full.post_mixer.down.qdata;
             mlp_gate_up      = &full.post_mixer.gate_up;
@@ -62,14 +64,14 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
             if (fused != nullptr) {
                 const void* qkv = fused->query_key_gate_value.qdata;
                 store.register_module(index, "q_proj",
-                                      Binding{qkv, kQueryPort, TextConfig::hidden,
-                                              TextConfig::query_heads * TextConfig::head_dim});
+                                      Binding{qkv, kQueryPort, g.hidden,
+                                              g.query_size()});
                 store.register_module(index, "k_proj",
-                                      Binding{qkv, kKeyPort, TextConfig::hidden,
-                                              TextConfig::kv_heads * TextConfig::head_dim});
+                                      Binding{qkv, kKeyPort, g.hidden,
+                                              g.kv_size()});
                 store.register_module(index, "v_proj",
-                                      Binding{qkv, kValuePort, TextConfig::hidden,
-                                              TextConfig::kv_heads * TextConfig::head_dim});
+                                      Binding{qkv, kValuePort, g.hidden,
+                                              g.kv_size()});
             } else {
                 store.register_layer_refusal(
                     index, "q_proj",
@@ -78,8 +80,8 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
             }
             store.register_module(index, "o_proj",
                                   Binding{full.output.qdata, kOutputPort,
-                                          TextConfig::query_heads * TextConfig::head_dim,
-                                          TextConfig::hidden});
+                                          g.query_size(),
+                                          g.hidden});
         } else {
             const auto& linear = runtime.gdn_layers.at(gdn_index++);
             mlp_down           = linear.post_mixer.down.qdata;
@@ -93,7 +95,7 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
         }
         store.register_module(
             index, "down_proj",
-            Binding{mlp_down, kDownPort, TextConfig::intermediate, TextConfig::hidden});
+            Binding{mlp_down, kDownPort, g.intermediate, g.hidden});
         // Gate and up share one fused parent, so they bind the way q/k/v do: one
         // pointer, told apart by port. `swiglu_mlp` takes the parent apart on a
         // round that has either of them bound. A format whose halves cannot be
@@ -101,11 +103,11 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
         // every forward pass.
         if (swiglu_halves_addressable(*mlp_gate_up)) {
             store.register_module(index, "gate_proj",
-                                  Binding{mlp_gate_up->qdata, kGatePort, TextConfig::hidden,
-                                          TextConfig::intermediate});
+                                  Binding{mlp_gate_up->qdata, kGatePort, g.hidden,
+                                          g.intermediate});
             store.register_module(index, "up_proj",
-                                  Binding{mlp_gate_up->qdata, kUpPort, TextConfig::hidden,
-                                          TextConfig::intermediate});
+                                  Binding{mlp_gate_up->qdata, kUpPort, g.hidden,
+                                          g.intermediate});
         } else {
             for (const char* module : {"gate_proj", "up_proj"}) {
                 store.register_layer_refusal(
@@ -131,7 +133,7 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
 /// The MoE flavor: attention adapters bind; the MLP is routed experts, so its
 /// modules are refused with the reason rather than half-applied. The attention
 /// projection is a plain struct here (always fused), not a variant.
-template <class TextConfig, class Runtime, class IsFull>
+template <class Runtime, class IsFull>
 void bind_lora_moe_hybrid(const Runtime& runtime, const EngineOptions& options, IsFull&& is_full) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
@@ -148,26 +150,28 @@ void bind_lora_moe_hybrid(const Runtime& runtime, const EngineOptions& options, 
                         static_cast<std::int32_t>(widest));
     }
 
+    const auto& g = runtime.geometry;
     using Binding          = ops::LoraStore::ModuleBinding;
     std::size_t full_index = 0;
-    for (std::size_t layer = 0; layer < TextConfig::layers; ++layer) {
+    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         const auto index = static_cast<std::int32_t>(layer);
-        if (is_full(layer)) {
+        if (g.attention_schedule_declared ? g.layer_attends(static_cast<std::int32_t>(layer))
+                                        : is_full(layer)) {
             const auto& full = runtime.full_layers.at(full_index++);
             const void* qkv  = full.projection.query_key_gate_value.qdata;
             store.register_module(index, "q_proj",
-                                  Binding{qkv, kQueryPort, TextConfig::hidden,
-                                          TextConfig::query_heads * TextConfig::head_dim});
+                                  Binding{qkv, kQueryPort, g.hidden,
+                                          g.query_size()});
             store.register_module(index, "k_proj",
-                                  Binding{qkv, kKeyPort, TextConfig::hidden,
-                                          TextConfig::kv_heads * TextConfig::head_dim});
+                                  Binding{qkv, kKeyPort, g.hidden,
+                                          g.kv_size()});
             store.register_module(index, "v_proj",
-                                  Binding{qkv, kValuePort, TextConfig::hidden,
-                                          TextConfig::kv_heads * TextConfig::head_dim});
+                                  Binding{qkv, kValuePort, g.hidden,
+                                          g.kv_size()});
             store.register_module(index, "o_proj",
                                   Binding{full.output.qdata, kOutputPort,
-                                          TextConfig::query_heads * TextConfig::head_dim,
-                                          TextConfig::hidden});
+                                          g.query_size(),
+                                          g.hidden});
         } else {
             for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
                 store.register_layer_refusal(

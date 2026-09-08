@@ -60,7 +60,7 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry = {};
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
@@ -112,7 +112,7 @@ struct MtpAttentionPayload {
 using RuntimeModelView =
     family::ModelView<FusedAttentionProjectionPayload, ShortConvProjectionPayload,
                       DensePostMixerPayload, MtpAttentionPayload, DensePostMixerPayload,
-                      family::DFlashWeights<1>>;
+                      family::DFlashWeights>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using ConvWeights          = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

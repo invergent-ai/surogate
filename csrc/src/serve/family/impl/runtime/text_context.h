@@ -33,58 +33,37 @@ class PrefillGraphFamily;
 
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 
-// Target-private compatibility vocabulary for the mechanically preserved fixed schedule. It is
-// data-only: TextContext is constructed on the stack for one schedule recording/execution and owns
-// neither weights nor device state.
-/// A target's compiled softcap, or zero where it declares none. `if constexpr` only discards
-/// a branch in a template, which is why this is one.
-template <class Config>
-[[nodiscard]] constexpr float logit_softcap_of() {
-    if constexpr (requires { Config::logit_softcap; }) {
-        return Config::logit_softcap;
-    } else {
-        return 0.0F;
-    }
-}
-
 struct ModelConfig {
-    // The geometry, as data. Every member still defaults to the target's compiled `TextConfig`,
-    // so nothing about a registered model changes; what changes is that the runtime now reads
-    // these off an object it could have been handed instead. That is the whole of the
-    // difference between serving one size of a family and serving the family: of the 326 reads
-    // in this runtime, not one needs the value at compile time.
-    int hidden              = TextConfig::hidden;
-    int residual            = residual_width<TextConfig>();
-    int n_layers            = TextConfig::layers;
-    int intermediate        = TextConfig::intermediate;
-    int vocab               = TextConfig::output_rows;
-    int token_domain        = TextConfig::token_domain;
-    int gdn_k_heads         = TextConfig::gdn_key_heads;
-    int gdn_k_dim           = TextConfig::gdn_key_head_dim;
-    int gdn_v_heads         = TextConfig::gdn_value_heads;
-    int gdn_v_dim           = TextConfig::gdn_value_head_dim;
-    int n_q                 = TextConfig::query_heads;
-    int n_kv                = TextConfig::kv_heads;
-    int head_dim            = TextConfig::head_dim;
-    int rotary_dim          = TextConfig::rotary_dim;
-    int key_dim             = TextConfig::key_dim;
-    int value_dim           = TextConfig::value_dim;
-    int conv_dim            = TextConfig::convolution_dim;
-    int q_size              = TextConfig::query_size;
-    int kv_size             = TextConfig::kv_size;
-    int mtp_fc_in           = TextConfig::mtp_input_rows;
-    int mtp_attn_in         = TextConfig::mtp_attention_input_rows;
-    int mtp_mlp_gateup_rows = TextConfig::mtp_mlp_gate_up_rows;
-    float rms_eps           = TextConfig::rms_epsilon;
-    float rope_theta        = TextConfig::rope_theta;
-    /// The bound the head's logits are squashed to, or zero for a family that does not cap
-    /// them -- which is every one here but Gemma 4, whose published configs all say 30.
-    float logit_softcap     = logit_softcap_of<TextConfig>();
-    int mtp_layers          = TextConfig::mtp_layers;
+    // Values are initialized only from the geometry bound to the loaded weights.
+    int hidden              = 0;
+    int residual            = 0;
+    int n_layers            = 0;
+    int intermediate        = 0;
+    int vocab               = 0;
+    int token_domain        = 0;
+    int gdn_k_heads         = 0;
+    int gdn_k_dim           = 0;
+    int gdn_v_heads         = 0;
+    int gdn_v_dim           = 0;
+    int n_q                 = 0;
+    int n_kv                = 0;
+    int head_dim            = 0;
+    int rotary_dim          = 0;
+    int key_dim             = 0;
+    int value_dim           = 0;
+    int conv_dim            = 0;
+    int q_size              = 0;
+    int kv_size             = 0;
+    int mtp_fc_in           = 0;
+    int mtp_attn_in         = 0;
+    int mtp_mlp_gateup_rows = 0;
+    float rms_eps           = 0;
+    float rope_theta        = 0;
+    float attention_scale   = 0;
+    float gdn_scale         = 0;
+    float logit_softcap     = 0;
+    int mtp_layers          = 0;
 
-    /// The schedule the artifact declared, if it declared one. A family that repeats a fixed
-    /// interval declares nothing and every predicate below falls through to the compiled
-    /// `TextConfig`, exactly as it did when they were static.
     std::array<std::uint64_t, 4> attention_mask{};
     bool schedule_declared = false;
 
@@ -217,7 +196,6 @@ struct ModelConfig {
     /// per size -- the answer is a property of the model that was loaded, not of the target
     /// that was compiled.
     [[nodiscard]] constexpr bool is_full(int layer) const {
-        if (!schedule_declared) { return TextConfig::is_full_attention(layer); }
         const auto word = static_cast<std::size_t>(layer) / 64U;
         return word < attention_mask.size() &&
                ((attention_mask[word] >> (static_cast<unsigned>(layer) % 64U)) & 1U) != 0U;
@@ -236,12 +214,10 @@ struct ModelConfig {
     /// declared, because an irregular one has no closed form; the loop is over layers already
     /// walked, on the launch path, and costs nothing measurable next to the round it launches.
     [[nodiscard]] constexpr int full_idx(int layer) const {
-        if (!schedule_declared) { return TextConfig::full_attention_index(layer); }
         return count_before(layer, true);
     }
 
     [[nodiscard]] constexpr int gdn_idx(int layer) const {
-        if (!schedule_declared) { return TextConfig::gdn_index(layer); }
         return count_before(layer, false);
     }
 
@@ -253,8 +229,7 @@ struct ModelConfig {
         return index;
     }
 
-    /// The compiled defaults, which is what a target without a declared geometry gets.
-    ModelConfig() = default;
+    ModelConfig() = delete;
 
     /// The dimensions the weights were bound against. Everything derived is derived here
     /// rather than copied, so a geometry that declares `gdn_key_heads` cannot disagree
@@ -284,8 +259,13 @@ struct ModelConfig {
           mtp_mlp_gateup_rows(geometry.mtp_mlp_gate_up_rows()),
           rms_eps(geometry.rms_epsilon),
           rope_theta(geometry.rope_theta),
+          attention_scale(geometry.attention_scale),
+          gdn_scale(geometry.gdn_scale),
           logit_softcap(geometry.logit_softcap),
           mtp_layers(geometry.mtp_layers) {
+        if (!geometry.attention_schedule_declared || !geometry.windowed_schedule_declared) {
+            throw std::invalid_argument("runtime geometry requires a declared layer schedule");
+        }
         if (geometry.attention_schedule_declared) {
             attention_mask    = geometry.attention_layer_mask;
             schedule_declared = true;
@@ -306,9 +286,7 @@ struct ModelConfig {
     }
 };
 
-inline const ModelConfig kCfg{};
 using Hooks = ResidualHooks<Variant>;
-inline constexpr float kAttnScale                     = kAttentionScale;
 // False only for a target whose attention has no output gate (a dense GQA
 // stack); every hybrid target in the family leaves it at the default.
 inline constexpr bool kAttentionOutputGate            = family::detail::attention_output_gate<Variant>();
@@ -604,6 +582,8 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::GqaExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+    /// Project a stored round boundary through the model's output transform and head.
+    void logits_from_hidden(const Tensor& hidden, Tensor& logits);
 private:
     void bind();
 
@@ -751,10 +731,8 @@ private:
     std::uint32_t mtp_proposal_extent_                    = 0;
 
     int stage_first_                            = 0;
-    /// The geometry this context runs. It defaults to the target's compiled `TextConfig`, so a
-    /// registered model is unchanged; holding it per context rather than reading a namespace
-    /// constant is what lets two engines of different sizes share one process.
-    ModelConfig cfg_{};
+    /// The geometry bound to this context's loaded weights.
+    ModelConfig cfg_;
     /// The same dimensions as the value the workspace recipe is shaped by.
     [[nodiscard]] const family::TextGeometry& cfg_geometry() const noexcept {
         return weights_.geometry;

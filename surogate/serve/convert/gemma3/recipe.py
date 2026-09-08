@@ -13,11 +13,7 @@ from surogate.serve.convert.common.recipe import (
     preflight_source_reader,
     source,
 )
-from surogate.serve.convert.common.declaration import declare, derive_recipes
-from surogate.dsl.ir_builder import resolve_architecture
-from surogate.serve.convert.common.recipe import (
-    validate_recipe_coverage as _validate_recipe_coverage,
-)
+from surogate.serve.convert.common.declaration import derive_recipes
 
 from . import inventory
 
@@ -39,20 +35,18 @@ def geometry_from_config(config: Mapping[str, object]) -> inventory.Geometry:
     `hidden // heads` shortcut the Llama converter can take would give 160 here.
     """
 
-    head_dim = config.get("head_dim")
-    if not head_dim:
-        raise ValueError(
-            "config.json declares no head_dim; Gemma 3 does not derive it from "
-            "hidden_size // num_attention_heads and the value cannot be guessed"
-        )
+    from surogate.serve.convert.common.checkpoint import resolve_dense
+
+    if not (config.get("layer_types") or config.get("sliding_window_pattern")
+            or config.get("_sliding_window_pattern")):
+        raise ValueError("config.json states no attention schedule")
+    declared = resolve_dense("Gemma3ForCausalLM", config)
+    resolved = declared.config
     return inventory.Geometry(
-        layers=int(config["num_hidden_layers"]),
-        hidden=int(config["hidden_size"]),
-        intermediate=int(config["intermediate_size"]),
-        vocab=int(config["vocab_size"]),
-        query_heads=int(config["num_attention_heads"]),
-        kv_heads=int(config["num_key_value_heads"]),
-        head_dim=int(head_dim),
+        layers=int(resolved["n_layers"]), hidden=int(resolved["d_model"]),
+        intermediate=int(resolved["d_ff"]), vocab=int(resolved["vocab_size"]),
+        query_heads=int(resolved["num_query_heads"]), kv_heads=int(resolved["num_kv_heads"]),
+        head_dim=int(resolved["head_size"]), declared=declared,
     )
 
 
@@ -62,32 +56,15 @@ def geometry_from_config(config: Mapping[str, object]) -> inventory.Geometry:
 
 
 def build_recipes(
-    geometry: inventory.Geometry = inventory.GEOMETRY,
+    geometry: inventory.Geometry,
     *,
-    tied_output_head: bool = True,
-    hf_config: Mapping[str, object] | None = None,
+    tied_output_head: bool | None = None,
 ) -> tuple[TensorRecipe, ...]:
-    """Where every artifact object comes from in the checkpoint, in object order.
-
-    Not written here: derived from the training declaration, which maps every
-    parameter to its checkpoint tensor (`hf_mapping`) and says which parameters
-    each artifact object is built from, in row order (`ServeObject.components`).
-    `hf_config` is the checkpoint's own `config.json` when the caller has it, and
-    the registered geometry's implied config otherwise.
-
-    `tied_output_head` stays an argument rather than being read from the config:
-    it is a property of the file in hand, and the converter has already resolved
-    it against what the checkpoint actually ships.
-
-    A tied Gemma 3 has no `text/output_head` object at all — `inventory.ALIAS_SPECS`
-    makes the head a role served by `text/token_embedding` — so that recipe is
-    dropped rather than given the embedding's expression, which would quantise the
-    same 167.8M elements twice and write ~170 MB of byte-identical duplicate.
-    """
-    config = dict(hf_config) if hf_config is not None else inventory.hf_config_for(geometry)
-    declaration = declare(resolve_architecture(config), config)
+    """Derive recipes from the checkpoint declaration used to shape the inventory."""
+    if tied_output_head is None:
+        tied_output_head = bool(geometry.declared.hf_config.get("tie_word_embeddings", True))
     recipes = derive_recipes(
-        declaration, capabilities={"text"}, tied_output_head=tied_output_head
+        geometry.declared, capabilities={"text"}, tied_output_head=tied_output_head
     )
     if tied_output_head:
         recipes = tuple(r for r in recipes if r.object_name != "text/output_head")
@@ -106,28 +83,13 @@ def build_recipes(
     return recipes
 
 
-RECIPE_SPECS = build_recipes()
-RECIPES_BY_NAME = {recipe.object_name: recipe for recipe in RECIPE_SPECS}
-
-
-def validate_recipe_coverage(
-    recipes: Sequence[TensorRecipe] = RECIPE_SPECS,
-    *,
-    tied_output_head: bool = True,
-) -> None:
-    stored, _ = inventory.active_specs(tied_output_head=tied_output_head)
-    _validate_recipe_coverage(recipes, stored)
-
-
-def source_requirements(recipes: Sequence[TensorRecipe] = RECIPE_SPECS) -> dict:
+def source_requirements(recipes: Sequence[TensorRecipe]) -> dict:
     requirements: dict = {}
     for recipe in recipes:
         for requirement in expression_sources(recipe.expression):
             requirements.setdefault(requirement.name, requirement)
     return requirements
 
-
-validate_recipe_coverage()
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +119,7 @@ def open_reader(model_dir: str | Path) -> ShardReader:
 
 def preflight_sources(
     model_dir: str | Path,
-    recipes: Sequence[TensorRecipe] = RECIPE_SPECS,
+    recipes: Sequence[TensorRecipe],
 ) -> SourcePreflight:
     with open_reader(model_dir) as reader:
         return preflight_source_reader(reader, recipes)

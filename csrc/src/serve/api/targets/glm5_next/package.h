@@ -88,7 +88,8 @@ struct Package {
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile,
-                                                               const family::TextGeometry& geometry);
+                                                               const family::TextGeometry& geometry,
+                                                               const family::VisionGeometry& vision_geometry = {});
     [[nodiscard]] static family::TextGeometry declared_geometry(const artifact::Reader& reader);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);

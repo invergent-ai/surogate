@@ -100,6 +100,7 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
     Impl& impl = *model.impl_;
     impl.device = &device;
     impl.reader = std::make_unique<artifact::Reader>(path);
+    impl.config = GemmaEmbeddingConfig::from_artifact(*impl.reader);
 
     const GemmaEmbeddingConfig& config = impl.config;
     const auto hidden       = static_cast<std::uint64_t>(config.hidden);

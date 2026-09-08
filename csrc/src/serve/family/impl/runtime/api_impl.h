@@ -354,9 +354,10 @@ template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile,
-                                                        const TextGeometry& geometry) {
+                                                        const TextGeometry& geometry,
+                                                        const VisionGeometry& vision_geometry) {
     return SequencePlanner<Variant>(detail::SINFER_FAMILY_RUNTIME_NS::make_sequence_planner_impl(
-        device, options, weights_profile, geometry));
+        device, options, weights_profile, geometry, vision_geometry));
 }
 
 template <>

@@ -174,14 +174,14 @@ def iter_reader_payload(
         source = handle.get_slice(stored_name)
         actual_shape = tuple(source.get_shape())
         actual_dtype = str(source.get_dtype())
-        if actual_shape != (geometry.n, geometry.k) or actual_dtype != "BF16":
+        if actual_shape != (geometry.n, geometry.k) or actual_dtype not in ("BF16", "F16", "F32"):
             raise ValueError(
                 f"{source_name}: source signature {(actual_shape, actual_dtype)} "
                 f"!= {((geometry.n, geometry.k), 'BF16')}"
             )
         for begin in range(0, geometry.n, chunk_rows):
             end = min(begin + chunk_rows, geometry.n)
-            rows = source[begin:end]
+            rows = source[begin:end].to(torch.bfloat16)
             quantized = quantize_bf16_rows(rows)
             scale_words[begin:end] = (
                 quantized.scales.view(torch.int16).numpy().view(np.uint16)

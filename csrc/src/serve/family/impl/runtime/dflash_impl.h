@@ -51,11 +51,11 @@ DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
         throw std::logic_error("DFlash feature capture is unavailable for this target");
     } else {
         require_dflash_state(state);
-        using Config = typename V::DFlashConfig;
+        const auto& config = state.execution.model.geometry.dflash;
         return DFlashFeatureSink{
             .features        = &dflash_state(state).prefill_features,
             .positions       = &dflash_state(state).prefill_positions,
-            .layers          = std::span<const int>(Config::target_feature_layers),
+            .layers          = config.target_layers(),
             .consume_prefill = std::move(consume_prefill),
         };
     }
@@ -68,14 +68,14 @@ DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tenso
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash feature capture is unavailable for this target");
     } else {
-        using Config = typename V::DFlashConfig;
+        const auto& config = state.execution.model.geometry.dflash;
         return DFlashFeatureSink{
             .batch_features      = &dflash_state(state).pending_features,
             .batch_lanes         = &lanes,
             .batch_valid_columns = &valid_columns,
             .batch_width         = width,
             .batch_size          = batch_size,
-            .layers              = std::span<const int>(Config::target_feature_layers),
+            .layers              = config.target_layers(),
         };
     }
 }
@@ -87,30 +87,30 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash context append is unavailable for this target");
     } else {
-        using Config               = typename V::DFlashConfig;
+        const auto& config = state.execution.model.geometry.dflash;
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
         const std::int32_t columns = width * batch;
         if (width <= 0 || batch <= 0 || features.dtype != DType::BF16 ||
-            features.ne[0] != Config::feature_rows || features.ne[3] != 1 ||
+            features.ne[0] != config.feature_rows || features.ne[3] != 1 ||
             positions.dtype != DType::I32 || positions.ne[0] != width || positions.ne[1] != batch ||
             commit_counts.dtype != DType::I32 || commit_counts.ne[0] != batch ||
             lanes.dtype != DType::I32 || lanes.ne[0] != batch || table_rows.dtype != DType::I32 ||
             table_rows.ne[0] != batch) {
             throw std::invalid_argument("DFlash context append inputs are invalid");
         }
-        const bool replace_local_window = batch == 1 && width > Config::local_capacity;
+        const bool replace_local_window = batch == 1 && width > config.local_capacity;
         if (replace_local_window && (envelope.min_count != static_cast<std::uint32_t>(width) ||
                                      envelope.max_count != static_cast<std::uint32_t>(width))) {
             throw std::invalid_argument(
                 "DFlash oversized local append requires an exact full-prefix commit");
         }
-        const int local_offset = replace_local_window ? width - Config::local_capacity : 0;
-        const int local_width  = replace_local_window ? Config::local_capacity : width;
+        const int local_offset = replace_local_window ? width - config.local_capacity : 0;
+        const int local_width  = replace_local_window ? config.local_capacity : width;
         const ops::KVCacheAppendPrefixExecutionEnvelope local_envelope{
-            replace_local_window ? static_cast<std::uint32_t>(Config::local_capacity)
+            replace_local_window ? static_cast<std::uint32_t>(config.local_capacity)
                                  : envelope.min_count,
-            replace_local_window ? static_cast<std::uint32_t>(Config::local_capacity)
+            replace_local_window ? static_cast<std::uint32_t>(config.local_capacity)
                                  : envelope.max_count,
         };
         Tensor local_counts = commit_counts;
@@ -119,25 +119,25 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 throw std::logic_error("DFlash prefill count storage is unavailable");
             }
             local_counts = state.execution.io.dflash_prefill->produced_count;
-            ops::set_i32_scalar(local_counts, Config::local_capacity,
+            ops::set_i32_scalar(local_counts, config.local_capacity,
                                 state.execution.device.stream);
         }
 
         const auto context_roots =
-            workspace_recipe::dflash_context<DFlashConfig>(state.execution.work, columns);
+            workspace_recipe::dflash_context(state.execution.work, columns, config);
         Tensor projected = context_roots.projected;
-        ops::linear(features.view({Config::feature_rows, columns}),
+        ops::linear(features.view({config.feature_rows, columns}),
                     state.execution.model.dflash->feature_projection, projected,
                     state.execution.device.stream);
         Tensor context = context_roots.normalized;
-        ops::rmsnorm(projected, state.execution.model.dflash->context_norm, Config::rms_epsilon,
+        ops::rmsnorm(projected, state.execution.model.dflash->context_norm, config.rms_epsilon,
                      false, context, state.execution.device.stream);
 
-        for (int layer = 0; layer < Config::layers; ++layer) {
+        for (int layer = 0; layer < config.layers; ++layer) {
             auto layer_scope = state.execution.work.scope();
             const auto& weight =
                 state.execution.model.dflash->layers.at(static_cast<std::size_t>(layer));
-            const bool local_layer  = layer < Config::local_layers;
+            const bool local_layer  = layer < config.local_layers;
             const int layer_width   = local_layer ? local_width : width;
             const int layer_columns = layer_width * batch;
             Tensor layer_context    = local_layer && replace_local_window
@@ -147,23 +147,23 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                                           ? positions.slice(0, local_offset, local_width)
                                           : positions;
             auto layer_roots =
-                workspace_recipe::dflash_context_layer<DFlashConfig>(state.execution.work, layer_columns);
+                workspace_recipe::dflash_context_layer(state.execution.work, layer_columns, config);
             Tensor key_raw =
-                layer_roots.key_raw.view({Config::head_dim, Config::kv_heads, layer_columns});
+                layer_roots.key_raw.view({config.head_dim, config.kv_heads, layer_columns});
             Tensor value =
-                layer_roots.value.view({Config::head_dim, Config::kv_heads, layer_columns});
-            Tensor key_flat   = key_raw.view({Config::kv_size, layer_columns});
-            Tensor value_flat = value.view({Config::kv_size, layer_columns});
+                layer_roots.value.view({config.head_dim, config.kv_heads, layer_columns});
+            Tensor key_flat   = key_raw.view({config.kv_size(), layer_columns});
+            Tensor value_flat = value.view({config.kv_size(), layer_columns});
             ops::linear_pair(layer_context, weight.context_key, weight.context_value, key_flat,
                              value_flat, state.execution.device.stream);
-            Tensor key = layer_roots.key.view({Config::head_dim, Config::kv_heads, layer_columns});
-            ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
+            Tensor key = layer_roots.key.view({config.head_dim, config.kv_heads, layer_columns});
+            ops::rmsnorm(key_raw, weight.key_norm, config.rms_epsilon, false, key,
                          state.execution.device.stream);
-            ops::rope(layer_positions.view({layer_columns}), Config::head_dim, Config::rope_theta,
+            ops::rope(layer_positions.view({layer_columns}), config.head_dim, config.rope_theta,
                       key, state.execution.device.stream);
-            Tensor key_batch = key.view({Config::head_dim, Config::kv_heads, layer_width, batch});
+            Tensor key_batch = key.view({config.head_dim, config.kv_heads, layer_width, batch});
             Tensor value_batch =
-                value.view({Config::head_dim, Config::kv_heads, layer_width, batch});
+                value.view({config.head_dim, config.kv_heads, layer_width, batch});
             Tensor position_batch = layer_positions.view({layer_width, batch});
             if (local_layer) {
                 ops::kv_cache_append_prefix(
@@ -185,7 +185,10 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
     if constexpr (!V::supports_dflash) {
         throw std::logic_error("DFlash proposal is unavailable for this target");
     } else {
-        using Config               = typename V::DFlashConfig;
+        const auto& config = state.execution.model.geometry.dflash;
+        if (k == 0 || k >= static_cast<std::uint32_t>(config.block_size)) {
+            throw std::invalid_argument("DFlash draft extent exceeds checkpoint block_size");
+        }
         const std::int32_t width   = static_cast<std::int32_t>(k) + 1;
         const std::int32_t columns = width * batch_size;
         Tensor anchors             = frame.anchors.slice(0, 0, batch_size);
@@ -198,67 +201,67 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
         Tensor drafts              = frame.draft_tokens.slice(1, 0, batch_size);
 
         state.execution.work.reset();
-        ops::prepare_masked_block(anchors, frontiers, valid_columns, Config::mask_token, ids,
+        ops::prepare_masked_block(anchors, frontiers, valid_columns, config.mask_token, ids,
                                   positions, state.execution.device.stream);
-        Tensor residual = state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
+        Tensor residual = state.execution.work.alloc(DType::BF16, {config.hidden, columns});
         ops::embedding(ids.view({columns}), state.execution.model.token_embedding, residual,
                        state.execution.device.stream);
 
-        for (int layer = 0; layer < Config::layers; ++layer) {
+        for (int layer = 0; layer < config.layers; ++layer) {
             const auto& weight =
                 state.execution.model.dflash->layers.at(static_cast<std::size_t>(layer));
             {
                 auto attention_scope = state.execution.work.scope();
                 auto roots =
-                    workspace_recipe::dflash_attention<DFlashConfig>(state.execution.work, columns);
-                ops::rmsnorm(residual, weight.input_norm, Config::rms_epsilon, false, roots.hidden,
+                    workspace_recipe::dflash_attention(state.execution.work, columns, config);
+                ops::rmsnorm(residual, weight.input_norm, config.rms_epsilon, false, roots.hidden,
                              state.execution.device.stream);
                 Tensor query_raw =
-                    roots.query_raw.view({Config::head_dim, Config::query_heads, columns});
-                Tensor key_raw = roots.key_raw.view({Config::head_dim, Config::kv_heads, columns});
-                Tensor value   = roots.value.view({Config::head_dim, Config::kv_heads, columns});
-                Tensor query_flat = query_raw.view({Config::query_size, columns});
-                Tensor key_flat   = key_raw.view({Config::kv_size, columns});
-                Tensor value_flat = value.view({Config::kv_size, columns});
+                    roots.query_raw.view({config.head_dim, config.query_heads, columns});
+                Tensor key_raw = roots.key_raw.view({config.head_dim, config.kv_heads, columns});
+                Tensor value   = roots.value.view({config.head_dim, config.kv_heads, columns});
+                Tensor query_flat = query_raw.view({config.query_size(), columns});
+                Tensor key_flat   = key_raw.view({config.kv_size(), columns});
+                Tensor value_flat = value.view({config.kv_size(), columns});
                 ops::attn_input_proj(roots.hidden, weight.query_key_value, query_flat, key_flat,
                                      value_flat, state.execution.device.stream);
-                Tensor query = roots.query.view({Config::head_dim, Config::query_heads, columns});
-                Tensor key   = roots.key.view({Config::head_dim, Config::kv_heads, columns});
-                ops::rmsnorm(query_raw, weight.query_norm, Config::rms_epsilon, false, query,
+                Tensor query = roots.query.view({config.head_dim, config.query_heads, columns});
+                Tensor key   = roots.key.view({config.head_dim, config.kv_heads, columns});
+                ops::rmsnorm(query_raw, weight.query_norm, config.rms_epsilon, false, query,
                              state.execution.device.stream);
-                ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
+                ops::rmsnorm(key_raw, weight.key_norm, config.rms_epsilon, false, key,
                              state.execution.device.stream);
-                ops::rope(positions.view({columns}), Config::head_dim, Config::rope_theta, query,
+                ops::rope(positions.view({columns}), config.head_dim, config.rope_theta, query,
                           key, state.execution.device.stream);
                 Tensor query_batch =
-                    query.view({Config::head_dim, Config::query_heads, width, batch_size});
+                    query.view({config.head_dim, config.query_heads, width, batch_size});
                 Tensor key_batch =
-                    key.view({Config::head_dim, Config::kv_heads, width, batch_size});
+                    key.view({config.head_dim, config.kv_heads, width, batch_size});
                 Tensor value_batch =
-                    value.view({Config::head_dim, Config::kv_heads, width, batch_size});
+                    value.view({config.head_dim, config.kv_heads, width, batch_size});
                 Tensor attention_batch = roots.attention.view(
-                    {Config::head_dim, Config::query_heads, width, batch_size});
-                if (layer < Config::local_layers) {
+                    {config.head_dim, config.query_heads, width, batch_size});
+                if (layer < config.local_layers) {
                     ops::swa(query_batch, key_batch, value_batch, positions, valid_columns, lanes,
-                             Config::attention_scale,
+                             config.attention_scale,
                              dflash_state(state).local_layer(static_cast<std::uint32_t>(layer)),
                              envelopes.local, state.execution.work, attention_batch,
                              state.execution.device.stream);
                 } else {
                     ops::bidirectional_gqa_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,
-                        Config::attention_scale, dflash_state(state).full_batch_layer(0),
+                        config.attention_scale, dflash_state(state).full_batch_layer(0),
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
                 }
-                ops::linear_add(roots.attention.view({Config::query_size, columns}),
+                ops::linear_add(roots.attention.view({config.query_size(), columns}),
                                 weight.attention_output, residual, state.execution.work,
                                 state.execution.device.stream);
             }
             {
                 auto mlp_scope = state.execution.work.scope();
-                auto roots = workspace_recipe::dflash_mlp<DFlashConfig>(state.execution.work, columns);
-                ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon, false,
+                auto roots = workspace_recipe::dflash_mlp(state.execution.work, columns, config);
+                ops::rmsnorm(residual, weight.post_attention_norm, config.rms_epsilon, false,
                              roots.hidden, state.execution.device.stream);
                 ops::linear_swiglu(roots.hidden, weight.gate_up, roots.intermediate,
                                    state.execution.work, state.execution.device.stream);
@@ -268,20 +271,20 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
         }
 
         Tensor packed = state.execution.work.alloc(
-            DType::BF16, {Config::hidden, static_cast<std::int32_t>(k) * batch_size});
+            DType::BF16, {config.hidden, static_cast<std::int32_t>(k) * batch_size});
         const std::size_t element_bytes = dtype_size(DType::BF16);
         const std::size_t row_bytes =
-            static_cast<std::size_t>(Config::hidden) * static_cast<std::size_t>(k) * element_bytes;
+            static_cast<std::size_t>(config.hidden) * static_cast<std::size_t>(k) * element_bytes;
         const std::size_t source_pitch =
-            static_cast<std::size_t>(Config::hidden) * width * element_bytes;
+            static_cast<std::size_t>(config.hidden) * width * element_bytes;
         const auto* source = static_cast<const std::byte*>(residual.data) +
-                             static_cast<std::size_t>(Config::hidden) * element_bytes;
+                             static_cast<std::size_t>(config.hidden) * element_bytes;
         CUDA_CHECK(cudaMemcpy2DAsync(packed.data, row_bytes, source, source_pitch, row_bytes,
                                      static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                                      state.execution.device.stream));
         Tensor proposal_hidden = state.execution.work.alloc(
-            DType::BF16, {Config::hidden, static_cast<std::int32_t>(k) * batch_size});
-        ops::rmsnorm(packed, state.execution.model.dflash->final_norm, Config::rms_epsilon, false,
+            DType::BF16, {config.hidden, static_cast<std::int32_t>(k) * batch_size});
+        ops::rmsnorm(packed, state.execution.model.dflash->final_norm, config.rms_epsilon, false,
                      proposal_hidden, state.execution.device.stream);
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
         if (state.execution.proposal_head == ProposalHead::Full) {
@@ -298,12 +301,12 @@ void propose_batch_impl(DFlashBatchContext& state, family::DFlashDecodeState& fr
             }
             const auto& proposal = *state.execution.model.optimized_proposal;
             Tensor logits        = state.execution.work.alloc(
-                DType::BF16, {V::draft_head_rows, static_cast<std::int32_t>(k) * batch_size});
+                DType::BF16, {state.execution.model.geometry.draft_vocab, static_cast<std::int32_t>(k) * batch_size});
             ops::linear(proposal_hidden, proposal.head, logits, state.execution.device.stream);
-            ops::argmax(logits, flat_drafts, V::draft_head_rows, state.execution.device.stream);
+            ops::argmax(logits, flat_drafts, state.execution.model.geometry.draft_vocab, state.execution.device.stream);
             ops::proposal_remap_token_ids(flat_drafts,
                                           static_cast<const std::int32_t*>(proposal.token_ids.data),
-                                          V::draft_head_rows, state.execution.device.stream);
+                                          state.execution.model.geometry.draft_vocab, state.execution.device.stream);
         }
         state.execution.work.reset();
     }
@@ -346,7 +349,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {Variant::DFlashConfig::feature_rows, width, batch_size});
+            DType::BF16, {state.execution.model.geometry.dflash.feature_rows, width, batch_size});
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
                                    frontiers, compact_features, append_positions, append_counts,
                                    state.execution.device.stream);

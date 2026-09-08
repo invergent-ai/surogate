@@ -32,11 +32,14 @@ namespace {
 // A parent split by row range straight into its outputs: the K-quants and block-scaled FP8
 // both project any range, so the fused ops need no registered shape for either.
 bool row_projectable(QType qtype) {
-    return detail::ggml::is_ggml_qtype(qtype) || detail::fp8_block::is_fp8_block_qtype(qtype);
+    return qtype == QType::BF16_CTRL || detail::ggml::is_ggml_qtype(qtype) ||
+           detail::fp8_block::is_fp8_block_qtype(qtype);
 }
 void project_rows_any(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                       WorkspaceArena* workspace, cudaStream_t stream) {
-    if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
+    if (w.qtype == QType::BF16_CTRL) {
+        linear_rows(x, w, row_begin, out, workspace, stream);
+    } else if (detail::fp8_block::is_fp8_block_qtype(w.qtype)) {
         detail::fp8_block::project_rows(x, w, row_begin, out, workspace, stream);
     } else {
         detail::ggml::ggml_project_rows(x, w, row_begin, out, workspace, stream);
@@ -44,6 +47,7 @@ void project_rows_any(const Tensor& x, const Weight& w, std::int32_t row_begin, 
 }
 std::size_t row_projectable_workspace_capacity_bytes(QType qtype, std::int32_t rows, std::int32_t k,
                                                      std::int32_t max_tokens) {
+    if (qtype == QType::BF16_CTRL) { return 0; }
     return detail::fp8_block::is_fp8_block_qtype(qtype)
                ? detail::fp8_block::linear_workspace_capacity_bytes(rows, k, max_tokens)
                : detail::ggml::ggml_linear_workspace_capacity_bytes(rows, k, max_tokens);
@@ -122,7 +126,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
     validate_policy(policy);
-    if (row_projectable(weight.qtype)) {
+    if (weight.qtype == QType::BF16_CTRL && policy != LinearPolicy::A16Only) {
+        throw std::invalid_argument("BF16 input projection admits only A16");
+    }
+    const bool fused_bf16 = weight.qtype == QType::BF16_CTRL && weight.n == 14336 && weight.k == 5120 &&
+                             q.ne[0] == 6144 && gate.ne[0] == 6144 && k.ne[0] == 1024 && v.ne[0] == 1024;
+    if (row_projectable(weight.qtype) && !fused_bf16) {
         // A K-quant or block-FP8 parent is split by row range straight into the four outputs:
         // physical row order query, key, output gate, value. Any width.
         const std::int32_t rows_q = q.ne[0], rows_k = k.ne[0], rows_gate = gate.ne[0], rows_v = v.ne[0];
@@ -156,14 +165,9 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::NVFP4) {
-        // Keyed on parent rows the way the W8 branch below is: 14336 is the 27B, 10240 the
-        // 4B (q,k,gate,v), 5120 the small fused parent (#84).
-        const bool registered      = weight.n == 14336;
-        const bool small_fused     = weight.n == 5120;
-        const bool q4b             = weight.n == 10240;
-        const std::int32_t kHidden = registered ? 5120 : weight.k;
-        const std::int32_t kQRows  = registered ? 6144 : (small_fused ? 2048 : 4096);
-        const std::int32_t kKvRows = (registered || q4b) ? 1024 : 512;
+        const std::int32_t kHidden = weight.k;
+        const std::int32_t kQRows = q.ne[0];
+        const std::int32_t kKvRows = k.ne[0];
         const std::int32_t kRows   = weight.n;
         const std::int32_t cols    = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
@@ -178,7 +182,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj");
         if (weight.n != kRows || weight.k != kHidden ||
             2 * kQRows + 2 * kKvRows != kRows ||
-            (!registered && !detail::is_nvfp4_generic_problem(weight.n, weight.k))) {
+            !detail::is_nvfp4_linear_problem(weight.n, weight.k)) {
             throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
         }
         detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
@@ -254,6 +258,9 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
                                                      std::int32_t min_tokens,
                                                      std::int32_t max_tokens) {
     validate_policy(policy);
+    if (parent_qtype == QType::BF16_CTRL && policy != LinearPolicy::A16Only) {
+        throw std::invalid_argument("BF16 input projection admits only A16");
+    }
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
     }
@@ -269,7 +276,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     case QType::FP8_E4M3FN_ROW_F32S:
         return detail::fp8_block::linear_workspace_capacity_bytes(parent_rows, input_rows, max_tokens);
     case QType::BF16_CTRL:
-        if (parent_rows != 14336 || input_rows != 5120 || policy != LinearPolicy::A16Only) {
+        if (parent_rows <= 0 || input_rows <= 0 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");
         }
         return 0;
@@ -447,11 +454,26 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
         {3072, 2048, 2048, 512},  // lfm2-1.2b: 32 query, 8 kv, head dim 64
     }};
     const auto* split = std::find_if(kUngated.begin(), kUngated.end(), [&](const UngatedSplit& e) {
-        return e.rows == kRows && e.hidden == kHidden;
+        return e.rows == kRows && e.hidden == kHidden && e.q_rows == q.ne[0] &&
+               e.kv_rows == k.ne[0] && e.kv_rows == v.ne[0];
     });
     if (split == kUngated.end()) {
-        refuse("no registered ungated query/key/value geometry; register the shape in "
-               "w8_attn_input_plan.cpp and instantiate its launchers");
+        if (query_key_value_weight.qtype != QType::W8G32_F16S) {
+            refuse("unsupported ungated weight format");
+        }
+        const std::int32_t rows_q = q.ne[0], rows_k = k.ne[0], rows_v = v.ne[0];
+        if (rows_q <= 0 || rows_k <= 0 || rows_v <= 0 ||
+            static_cast<std::int64_t>(rows_q) + rows_k + rows_v != kRows) {
+            refuse("parent rows must equal q+k+v");
+        }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, rows_q, cols, "q");
+        require_matrix(k, rows_k, cols, "k");
+        require_matrix(v, rows_v, cols, "v");
+        linear_rows(x, query_key_value_weight, 0, q, nullptr, stream);
+        linear_rows(x, query_key_value_weight, rows_q, k, nullptr, stream);
+        linear_rows(x, query_key_value_weight, rows_q + rows_k, v, nullptr, stream);
+        return;
     }
     const std::int32_t kQRows  = split->q_rows;
     const std::int32_t kKvRows = split->kv_rows;

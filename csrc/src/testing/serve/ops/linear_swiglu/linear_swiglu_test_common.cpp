@@ -207,15 +207,10 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4G64_F16S && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
-    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp (1024 -> 2x3584).
-    // The W8 geometries come from the plan that owns them rather than a third
-    // copy of the list: this harness restating them is how three registered
-    // shapes ended up with no numerical coverage, since adding one here was a
-    // second edit nobody made.
+    // The public W8 operation also serves shapes without a fused-kernel registration.
     const bool w8 = profile.qtype == QType::W8G32_F16S &&
-                    ops::detail::w8_linear_swiglu_admits({profile.gate_up_rows,
-                                                          profile.output_rows, profile.input_rows,
-                                                          profile.input_rows, 1});
+                    profile.gate_up_rows > 0 && profile.output_rows > 0 &&
+                    profile.input_rows > 0 && profile.input_rows % 128 == 0;
     const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
                        profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16S &&

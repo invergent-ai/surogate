@@ -56,6 +56,8 @@ separates the two, so `architectures[0]` is what this converter matches on.
 
 from __future__ import annotations
 
+from surogate.serve.convert.common.checkpoint import tokenizer_domain
+
 import argparse
 import json
 import os
@@ -96,7 +98,6 @@ from .recipe import (
     geometry_from_config,
     open_reader,
     preflight_sources,
-    validate_recipe_coverage,
 )
 
 RECIPE_ID = "gemma3-v1"
@@ -122,7 +123,6 @@ _REQUIRED_CONFIG = {
     "architectures": ["Gemma3ForCausalLM"],
     "hidden_activation": "gelu_pytorch_tanh",
     "attention_bias": False,
-    "rms_norm_eps": 1e-6,
     "rope_scaling": None,
 }
 
@@ -143,28 +143,6 @@ _OPTIONAL_CONFIG = {
     "final_logit_softcapping": None,
     "attention_dropout": 0.0,
 }
-
-#: What the engine holds as compile-time constants in
-#: `csrc/src/serve/targets/gemma3/impl/config.h`. A checkpoint that disagrees
-#: with any of them would load and be served wrong, so it is refused here.
-#:
-#: The local/global schedule is *not* here. It used to be, as
-#: `"_sliding_window_pattern": 6`, and that entry refused every newer
-#: `transformers` export: those state the schedule as a `layer_types` list and
-#: write no period at all, so `check_members` saw an absent key and called it a
-#: mismatch. `check_layer_schedule` below subsumes it — it accepts either
-#: spelling, resolves the per-layer schedule the way the DSL does, and compares
-#: the result against the array the header states.
-_ENGINE_CONSTANTS = {
-    "sliding_window": inventory.SLIDING_WINDOW,
-    "rope_theta": 1000000.0,
-    "rope_local_base_freq": 10000.0,
-    # kAttentionScale = 0.0625 = 256 ** -0.5. Not the same thing as
-    # 1/sqrt(head_dim) in general, even though it coincides here.
-    "query_pre_attn_scalar": 256,
-    "max_position_embeddings": 32768,
-}
-
 
 # ---------------------------------------------------------------------------
 # checkpoint geometry
@@ -236,42 +214,11 @@ def resolve_layer_schedule(
     )
 
 
-def check_layer_schedule(config: Mapping[str, object], geometry: inventory.Geometry) -> None:
-    """The schedule the engine bakes in, against the one the checkpoint states.
-
-    The target header states the schedule as data — `config.h::kWindowedAttention`,
-    one bool per layer, read through `is_windowed_attention(layer)` — and
-    `inventory.WINDOWED_ATTENTION` is this side's copy of it. A checkpoint that
-    disagreed would be served with the wrong mask and the wrong rope base on
-    every layer where they differ, and nothing downstream would notice: a
-    windowed layer and a global one store identical objects.
-    """
-
-    resolved = resolve_layer_schedule(config, geometry)
-    expected = ["sliding" if windowed else "full" for windowed in inventory.WINDOWED_ATTENTION]
-    disagreeing = [
-        layer for layer, (got, want) in enumerate(zip(resolved, expected)) if got != want
-    ]
-    if disagreeing:
-        detail = ", ".join(
-            f"{layer}: checkpoint {resolved[layer]}, target {expected[layer]}"
-            for layer in disagreeing[:8]
-        )
-        raise ValueError(
-            "checkpoint attention schedule disagrees with the one "
-            "csrc/src/serve/targets/gemma3/impl/config.h states as "
-            f"kWindowedAttention; {len(disagreeing)} of {geometry.layers} layers "
-            f"disagree ({detail}"
-            f"{', ...' if len(disagreeing) > 8 else ''})"
-        )
-
-
 def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, dict]:
     """Validate the checkpoint and summarize it for the conversion report."""
 
     family_conversion.check_members("config", config, _REQUIRED_CONFIG)
     check_optional_members("config", config, _OPTIONAL_CONFIG)
-    family_conversion.check_members("config", config, _ENGINE_CONSTANTS)
     geometry = geometry_from_config(config)
     # Any size of the family converts: the artifact states its own dimensions and the engine
     # binds against those, so what has to hold is that the checkpoint is self-consistent.
@@ -282,7 +229,6 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
         )
     if geometry.hidden <= 0 or geometry.layers <= 0 or geometry.intermediate <= 0:
         raise ValueError(f"checkpoint geometry has a non-positive dimension: {geometry}")
-    check_layer_schedule(config, geometry)
     text = {
         name: config[name]
         for name in (
@@ -321,7 +267,7 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
             "fused_rows": None,  # Q, K and V are stored as three objects
             "output_gate": False,
             "qk_norm": True,
-            "global_layers": list(inventory.GLOBAL_ATTENTION_LAYERS),
+            "global_layers": [i for i, kind in enumerate(geometry.layer_types) if kind == "full_attention"],
             # The resolved schedule, so the report says which layers were served
             # windowed whichever way the checkpoint spelled it.
             "layer_schedule": resolve_layer_schedule(config, geometry),
@@ -443,74 +389,37 @@ class ConversionPreflight:
         return {recipe.object_name: recipe for recipe in self.recipes}
 
 
-def preflight_inventory(*, tied_output_head: bool = True) -> None:
-    """The inventory the recipe and the writer agree to produce.
-
-    The embedding, thirteen objects a layer, the final norm — and the output head
-    only where the checkpoint unties it. A tied checkpoint stores the head as a
-    role on `text/token_embedding` (`inventory.ALIAS_SPECS`), so it is one object
-    short of the declaration, which is the count `TENSOR_SPECS` still carries.
-    """
-
-    declared_tensors = 1 + inventory.LAYERS * inventory.LAYER_OBJECT_COUNT + 2
-    if len(inventory.TENSOR_SPECS) != declared_tensors:
-        raise ValueError(
-            f"registered inventory holds {len(inventory.TENSOR_SPECS)} tensors, "
-            f"expected {declared_tensors}"
-        )
-    stored_tensors, object_specs = inventory.active_specs(tied_output_head=tied_output_head)
-    expected_stored = declared_tensors - (1 if tied_output_head else 0)
-    if len(stored_tensors) != expected_stored:
-        raise ValueError(
-            f"stored inventory holds {len(stored_tensors)} tensors, "
-            f"expected {expected_stored}"
-        )
-    if len(inventory.RESOURCE_SPECS) != 4:
-        raise ValueError("registered inventory does not hold the four text resources")
-    if len(object_specs) != expected_stored + 4:
-        raise ValueError("registered object inventory is incomplete")
-    validate_recipe_coverage(
-        build_recipes(tied_output_head=tied_output_head),
-        tied_output_head=tied_output_head,
-    )
-
-
 def build_object_plan(
     resources: Mapping[str, bytes],
+    geometry: inventory.Geometry,
     *,
     tied_output_head: bool = True,
     native=None,
     object_specs=None,
 ) -> ObjectPlan:
     """`native` names the objects a GGUF serves as it stores them."""
-    preflight_inventory(tied_output_head=tied_output_head)
     if object_specs is None:
-        _, object_specs = inventory.active_specs(tied_output_head=tied_output_head)
+        _, object_specs = inventory.active_specs(geometry=geometry, tied_output_head=tied_output_head)
     if native:
         object_specs = GgufRepackSource.native_specs(object_specs, native)
     return family_conversion.build_object_plan(object_specs, resources)
 
 
 
-def geometry_block(preflight: "ConversionPreflight") -> dict[str, float]:
-    """The artifact's `geometry` member: the dimensions the engine reads at load, which is
-    what lets one target serve every size of this family."""
-    geometry = preflight.geometry
-    text = preflight.config_summary["text"]
-    return {
-        "hidden": geometry.hidden,
-        "layers": geometry.layers,
-        "intermediate": geometry.intermediate,
-        "output_rows": geometry.vocab,
-        "token_domain": geometry.vocab,
-        "query_heads": geometry.query_heads,
-        "kv_heads": geometry.kv_heads,
-        "head_dim": geometry.head_dim,
-        "rotary_dim": geometry.head_dim,
-        "rms_epsilon": float(text["rms_norm_eps"]),
-        "rope_theta": float(text["rope_theta"]),
-        "sliding_window": int(text["sliding_window"]),
-    }
+def geometry_block(preflight: "ConversionPreflight", *, token_domain: int) -> dict[str, float]:
+    """Serialize the resolved dimensions, context, scales and both rotary bases."""
+    from surogate.serve.convert.common.checkpoint import dense_geometry, positive_int
+
+    g = preflight.geometry
+    config = g.declared.hf_config
+    metadata = dense_geometry(g, token_domain=token_domain)
+    metadata.update(
+        attention_scale=positive_int(config, "query_pre_attn_scalar") ** -0.5,
+        sliding_window=positive_int(config, "sliding_window"),
+        sliding_rope_theta=float(config["rope_local_base_freq"]),
+        embedding_scale=g.hidden ** 0.5,
+    )
+    return metadata
 
 
 def plan_repack(repack, recipes_by_name, tensor_specs, native=None) -> tuple[str, ...]:
@@ -559,9 +468,8 @@ def preflight_conversion(
     # the target, so both the recipe and the object list are built for the
     # checkpoint in hand rather than the module-level ones being used blind.
     tied = tied_output_head(config)
-    preflight_inventory(tied_output_head=tied)
     recipes = build_recipes(geometry, tied_output_head=tied)
-    stored_specs, active_object_specs = inventory.active_specs(tied_output_head=tied)
+    stored_specs, active_object_specs = inventory.active_specs(geometry=geometry, tied_output_head=tied)
     _validate_recipe_coverage(recipes, stored_specs)
     # Repacked objects read the GGUF directly; only what remains needs a bridged source.
     remaining = tuple(r for r in recipes if r.object_name not in planned) if planned else recipes
@@ -570,7 +478,7 @@ def preflight_conversion(
     if object_specs is not None:
         active_object_specs = object_specs
     plan = build_object_plan(
-        {item.name: item.data for item in resources}, tied_output_head=tied,
+        {item.name: item.data for item in resources}, geometry, tied_output_head=tied,
         native=native, object_specs=object_specs,
     )
     object_specs = active_object_specs
@@ -673,7 +581,7 @@ def convert(
     recipes_by_name = {
         r.object_name: r for r in build_recipes(geometry, tied_output_head=tied)
     }
-    stored_specs, object_specs = inventory.active_specs(tied_output_head=tied)
+    stored_specs, object_specs = inventory.active_specs(geometry=geometry, tied_output_head=tied)
     native = repack.plan_native(recipes_by_name, stored_specs) if repack is not None else {}
     halves = (repack.plan_native_halves(recipes_by_name, stored_specs)
               if repack is not None else {})
@@ -719,9 +627,10 @@ def convert(
     with open_reader(model) as reader:
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="gemma3"),
             preflight.object_plan.specs,
-            geometry=geometry_block(preflight),
+            geometry=geometry_block(preflight, token_domain=tokenizer_domain(model)),
+            layer_types=geometry.layer_types,
             external=external,
         ) as writer:
             if writer.objects != preflight.object_plan.objects:

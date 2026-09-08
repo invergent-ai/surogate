@@ -1,16 +1,12 @@
 # `qwen3_5` Python reference
 
-One reference for the whole architecture: an interleaved gated-delta-net / full-attention decoder
-with a dense MLP, an MTP draft block, and an optional vision tower. This is the complete Text,
-Vision, MTP, sampling, state, and weight-residency reference over a native `.sinfer` artifact. It
-uses typed artifact bindings and remains independent from the C++ Engine implementation.
+This diagnostic Python reference reads model dimensions, attention placement, normalization,
+and context limits from the converted artifact. The model name does not select a size.
+MTP and vision are available when the checkpoint includes their weights.
 
-Size is data, not code. The binding reads the decoder's dimensions from the artifact's own object
-shapes and its declared `geometry`, so the 0.8B, the 27B and every checkpoint between them run the
-same program. It also reads which projections a checkpoint fuses: a 27B-class export stores
-`attention/query_key` beside `attention/gate_value` and `gdn/query_key` beside `gdn/value_z`, a
-K-quant GGUF export stores `gdn/query_key_value` beside `gdn/z`, and the other exports store the
-one fused parent of each. Which objects the artifact contains decides that -- never its size.
+The reference currently reads inline BF16 and groupwise integer weights. Other formats require
+the C++ serving runtime. Artifacts created before complete checkpoint metadata was stored must
+be rebuilt from the original checkpoint.
 
 It does not need the original Hugging Face checkpoint at inference time. `Frontend` materializes the
 tokenizer, chat template, generation defaults, and image/video processor resources embedded in the
@@ -23,7 +19,7 @@ Install the target dependencies from `requirements.txt`, then run:
 ```bash
 python3 \
   -m tools.reference.qwen3_5 \
-  --weights out/qwen3_6_27b.sinfer \
+  --weights out/model.sinfer \
   --prompt "请简短介绍一下你自己。" --decode 512
 ```
 
@@ -40,7 +36,7 @@ Important runtime controls include:
 
 - `--gpu-memory auto|24GiB` and `--headroom 2GiB`;
 - `--kv-dtype bf16|int8`;
-- `--prefill-chunk N`, which otherwise follows the artifact's own schedule chunk;
+- `--prefill-chunk N`, which controls the number of prompt tokens processed at once;
 - `--greedy` or sampling overrides for temperature, top-p, top-k, and penalties;
 - `--vision-attention-limit N`;
 - `--activation-dump DIR --dump-level layer|op`.

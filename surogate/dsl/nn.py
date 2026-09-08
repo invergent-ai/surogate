@@ -618,6 +618,9 @@ class Block(Module):
             activations=activation_layout,
             schema=getattr(type(self), "schema", None),
         )
+        # This graph was traced with this block's resolved constructor arguments.
+        # A hybrid stack can give different dimensions to instances of the same class.
+        spec._traced_instance = self
 
         # Register in block registry (both class name and override name)
         _block_registry[type(self).__name__] = spec

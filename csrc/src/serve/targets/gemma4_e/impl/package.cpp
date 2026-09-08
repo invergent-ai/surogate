@@ -56,7 +56,6 @@ constexpr ModelSamplingDefaults kGemma4EDefaults{
 /// would place a v_proj delta on the key projection.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
-    using TextConfig      = detail::TextConfig;
     ops::LoraStore& store = ops::lora_store_for_current_device();
     if (store.empty()) {
         // The widest round an adapter can see. This target refuses speculation,
@@ -131,7 +130,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
+    if (identity.architecture == target_key && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -168,20 +167,15 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile,
-                                                        const family::TextGeometry& geometry) {
+                                                        const family::TextGeometry& geometry,
+                                                        const family::VisionGeometry& vision_geometry) {
     return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                         geometry);
+                                                         geometry, vision_geometry);
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    family::TextGeometry geometry =
-        family::TextGeometry::declared<detail::TextConfig>(reader.geometry());
-    // The window schedule is not a number, so the artifact's `geometry` object cannot
-    // carry it; it is read off the layers' own query norms. It belongs here because the
-    // KV pool is sized from this geometry, and a layer the pool thinks is windowed while
-    // the binder runs it global has its cache built for the wrong head.
-    detail::declare_attention_schedule(reader, geometry);
-    return geometry;
+    return family::TextGeometry::resolved_gemma4(
+        reader.geometry(), reader.layer_types(), true, false);
 }
 
 std::unique_ptr<Package::Program>

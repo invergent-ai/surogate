@@ -50,7 +50,6 @@ constexpr ModelSamplingDefaults kTinyLlamaDefaults{
 /// have a weight each -- over a stack where every layer is attention.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
-    using TextConfig      = detail::TextConfig;
     ops::LoraStore& store = ops::lora_store_for_current_device();
     if (store.empty()) {
         // The widest round an adapter can see. This target refuses speculation,
@@ -71,16 +70,16 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         const void* qkv       = attention.projection.query_key_value.qdata;
         store.register_module(
             index, "q_proj",
-            Binding{qkv, family::kQueryPort, g.hidden, TextConfig::query_heads * TextConfig::head_dim});
+            Binding{qkv, family::kQueryPort, g.hidden, g.query_size()});
         store.register_module(
             index, "k_proj",
-            Binding{qkv, family::kKeyPort, g.hidden, TextConfig::kv_heads * TextConfig::head_dim});
+            Binding{qkv, family::kKeyPort, g.hidden, g.kv_size()});
         store.register_module(
             index, "v_proj",
-            Binding{qkv, family::kValuePort, g.hidden, TextConfig::kv_heads * TextConfig::head_dim});
+            Binding{qkv, family::kValuePort, g.hidden, g.kv_size()});
         store.register_module(index, "o_proj",
                               Binding{attention.output.qdata, family::kOutputPort,
-                                      TextConfig::query_heads * TextConfig::head_dim,
+                                      g.query_size(),
                                       g.hidden});
         store.register_module(
             index, "down_proj",
@@ -133,7 +132,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
+    if (identity.architecture == target_key && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -171,13 +170,14 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile,
-                                                        const family::TextGeometry& geometry) {
+                                                        const family::TextGeometry& geometry,
+                                                        const family::VisionGeometry& vision_geometry) {
     return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                         geometry);
+                                                         geometry, vision_geometry);
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    return family::TextGeometry::declared<detail::TextConfig>(reader.geometry());
+    return family::TextGeometry::resolved(reader.geometry(), reader.layer_types());
 }
 
 std::unique_ptr<Package::Program>

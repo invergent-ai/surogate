@@ -13,8 +13,10 @@ from surogate.serve.convert.qwen3_5_moe import (
 def test_report_retains_target_specific_provenance_and_component_bytes(
     tmp_path: Path,
 ) -> None:
+    from tests.serve.test_qwen3_5_moe_checkpoint_config import config_for
+    g = inventory.geometry_from_config(config_for(), token_domain=500)
     resources = {spec.name: b"x" for spec in inventory.RESOURCE_SPECS}
-    plan = convert.build_object_plan(resources)
+    plan = convert.build_object_plan(resources, geometry=g)
     base_source = recipe.SourcePreflight(883, 1045, 26, {"BF16": 1045})
     dflash_source = recipe.SourcePreflight(51, 69, 1, {"BF16": 69})
     report = convert.build_conversion_report(
@@ -22,7 +24,7 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
         dflash_model_dir=tmp_path / "dflash",
         out_path=tmp_path / "model.sinfer",
         arguments={},
-        base_config_summary={"text": {"hidden_size": 2048}},
+        base_config_summary={"hidden": 128, "draft_vocab": 500, "token_domain": 500},
         dflash_config_summary={"hidden_size": 2048},
         base_source_preflight=base_source,
         dflash_source_preflight=dflash_source,
@@ -50,22 +52,6 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
     assert report["source_preflight"]["base"]["tensors"] == 1045
     assert report["source_preflight"]["dflash"]["tensors"] == 69
     assert report["source_preflight"]["combined"]["tensors"] == 1114
-    assert report["source"]["gguf_evidence_path"] == str(
-        convert.GGUF_EVIDENCE_PATH
-    )
-    assert report["draft_head"] == {
-        "rows": 131072,
-        "tokenizer_vocab_size": 248077,
-        "ranking_source_target": "qwen3_5",
-        "shared_semantic_vocabulary": True,
-    }
-    assert report["quantization"] == {
-        "encoder_profile": "MAXABS_F16_RECIP_RNE_V1",
-        "component_tensor_bytes": {
-            **convert.EXPECTED_COMPONENT_BYTES,
-            "total": 22_770_245_536,
-            "all_tensor_device_arena": 22_770_260_992,
-            "default_resident": 22_360_191_904,
-            "default_resident_device_arena": 22_360_207_360,
-        },
-    }
+    assert report["draft_head"] == {"rows": 500, "tokenizer_vocab_size": 500}
+    assert report["artifact"]["bytes"] == 123
+    assert "gguf_evidence_path" not in report["source"]

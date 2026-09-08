@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import torch
+
+from .checkpoint import tokenizer_ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,22 +20,14 @@ class DraftHeadContext:
 
     n: int
     selected: np.ndarray
-    ranking: Path
+    ranking: Path | None
     tokenizer: Path
     force_include: tuple[int, ...]
 
 
 
 def _tools_root() -> Path:
-    """The `tools` directory this module lives under."""
-
-    for parent in Path(__file__).resolve().parents:
-        if parent.name == "tools":
-            return parent
-    raise RuntimeError(
-        f"draft_head is outside the tools package ({__file__}); "
-        "package-relative fixture paths cannot be resolved"
-    )
+    return Path(__file__).resolve().parents[2] / "tools"
 
 def load_total_counts(path: str | Path, vocab: int) -> np.ndarray:
     """Load only the total-frequency row from a ``[rows,vocab]`` I64 ranking."""
@@ -48,7 +43,27 @@ def load_total_counts(path: str | Path, vocab: int) -> np.ndarray:
     total = np.fromfile(ranking, dtype="<i8", count=vocab)
     if total.size != vocab:
         raise ValueError(f"ranking total row has {total.size} entries, expected {vocab}")
+    if np.any(total < 0):
+        raise ValueError("ranking counts must be nonnegative")
     return total
+
+
+def _ranking_matches_tokenizer(ranking: Path, tokenizer: Path, vocab: int) -> bool:
+    """A bundled corpus can be reused only with explicit tokenizer provenance."""
+    manifest_path = ranking.with_name(ranking.name.removesuffix(".counts.i64") + ".manifest.json")
+    if not ranking.is_file() or not manifest_path.is_file():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    expected = manifest.get("tokenizer_sha256")
+    if not isinstance(expected, str) or len(expected) != 64 or manifest.get("vocab") != vocab:
+        return False
+    with (tokenizer / "tokenizer.json").open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest() == expected.lower()
 
 
 def read_special_ids(tokenizer_dir: str | Path) -> tuple[int, ...]:
@@ -118,6 +133,7 @@ def compute_shortlist(
     n: int,
     vocab: int,
     tokenizer_vocab_size: int,
+    require_tokenizer_match: bool = False,
 ) -> DraftHeadContext:
     """Compute a shortlist constrained to an explicitly supplied tokenizer domain."""
 
@@ -127,16 +143,22 @@ def compute_shortlist(
         )
     ranking = Path(ranking_path)
     if not ranking.is_absolute() and not ranking.exists():
-        # Fixtures are named relative to surogate/serve/tools. Anchoring on the
-        # directory by name rather than by how many levels up it happens to be
-        # keeps this working when the module moves: it moved once already, and a
-        # hardcoded depth resolved silently to the wrong directory rather than
-        # failing, which a fixture path is well placed to hide.
         ranking = _tools_root() / ranking_path
     tokenizer = Path(tokenizer_dir)
     forced = read_special_ids(tokenizer)
-    total = load_total_counts(ranking, vocab)
-    selected = select_shortlist(total[:tokenizer_vocab_size], n, forced)
+    valid_ids = np.asarray(tokenizer_ids(tokenizer), dtype=np.int64)
+    if valid_ids[-1] + 1 != tokenizer_vocab_size:
+        raise ValueError("tokenizer domain disagrees with its declared token IDs")
+    if require_tokenizer_match and not _ranking_matches_tokenizer(ranking, tokenizer, vocab):
+        # Frequency ranks from another tokenizer have no meaning here. Stable ID order
+        # gives a reproducible valid shortlist when no compatible measurement is supplied.
+        ranking = None
+        total = np.zeros(valid_ids.size, dtype=np.int64)
+    else:
+        total = load_total_counts(ranking, vocab)[valid_ids]
+    forced_set = set(forced)
+    forced_indices = [i for i, token_id in enumerate(valid_ids) if token_id in forced_set]
+    selected = valid_ids[select_shortlist(total, n, forced_indices)]
     return DraftHeadContext(
         n=n,
         selected=selected,

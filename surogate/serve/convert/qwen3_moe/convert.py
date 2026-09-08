@@ -13,6 +13,8 @@ plan order.
 
 from __future__ import annotations
 
+from surogate.serve.convert.common.checkpoint import tokenizer_domain
+
 import argparse
 import json
 import os
@@ -105,10 +107,10 @@ def convert(
     if scope:
         print(scope, flush=True)
 
-    objects = inventory.declared_objects(config)
+    objects = inventory.declared_objects(geometry)
     tensor_specs = inventory.tensor_specs(objects)
     object_specs = tensor_specs
-    recipes = recipe.build_recipes_by_name(config)
+    recipes = recipe.build_recipes_by_name(geometry)
 
     # What the GGUF can serve as it stores it. `native` is a whole object read verbatim,
     # `halves` a fused parent whose two halves carry different K-quant types, `planned` the
@@ -168,9 +170,10 @@ def convert(
         output.parent.mkdir(parents=True, exist_ok=True)
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="qwen3_moe"),
             plan.specs,
-            geometry=_geometry_block(geometry),
+            geometry=_geometry_block(geometry, token_domain=tokenizer_domain(model)),
+            layer_types=geometry.layer_types,
             external=external,
         ) as writer:
             total = len(plan.specs)
@@ -206,7 +209,7 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
+    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="qwen3_moe")
     report = family_conversion.build_conversion_report(
         identity=identity,
         target_key=inventory.TARGET_KEY,
@@ -239,20 +242,13 @@ def convert(
     return report_path
 
 
-def _geometry_block(geometry: inventory.Geometry) -> dict[str, float]:
-    """The dimensions the artifact states about itself, which the engine's binder validates its
-    compiled constants against."""
-    return {
-        "hidden": float(geometry.hidden),
-        "layers": float(geometry.layers),
-        "query_heads": float(geometry.query_heads),
-        "kv_heads": float(geometry.kv_heads),
-        "head_dim": float(geometry.head_dim),
-        "intermediate": float(geometry.intermediate),
-        "vocab": float(geometry.vocab),
-        "experts": float(geometry.experts),
-        "experts_per_token": float(geometry.experts_per_token),
-    }
+def _geometry_block(geometry: inventory.Geometry, *, token_domain: int) -> dict[str, float]:
+    """Serialize dimensions and execution settings from the resolved checkpoint."""
+    from surogate.serve.convert.common.checkpoint import dense_geometry
+
+    metadata = dense_geometry(geometry, token_domain=token_domain)
+    metadata.update(experts=geometry.experts, experts_per_token=geometry.experts_per_token)
+    return metadata
 
 
 def main(argv: Sequence[str] | None = None) -> None:

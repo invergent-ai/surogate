@@ -16,10 +16,12 @@ checkpoint's `full_attn_idxs`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from surogate.serve.convert.common import declaration
+from surogate.serve.convert.common.checkpoint import positive_int
+from copy import deepcopy
 from surogate.serve.convert.common.inventory import (
     BF16,
     DIRECT_FORMATS,
@@ -51,6 +53,12 @@ class Geometry:
     vocab: int
     conv_kernel: int
     attention_layers: tuple[int, ...]
+    declared: declaration.Declaration = field(repr=False, compare=False)
+
+    @property
+    def layer_types(self) -> tuple[str, ...]:
+        return tuple("full_attention" if i in self.attention_layers else "linear_attention"
+                     for i in range(self.layers))
 
     @property
     def query_size(self) -> int:
@@ -80,7 +88,21 @@ def geometry_from_config(config: Mapping[str, Any]) -> Geometry:
     schedule is a list of attention indices rather than a period. The declaration
     performs both, exactly as training does.
     """
-    declared = declaration.declare(ARCHITECTURE, dict(config))
+    source = deepcopy(dict(config))
+    for name in ("hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "vocab_size"):
+        positive_int(source, name)
+    if source["num_attention_heads"] % source["num_key_value_heads"]:
+        raise ValueError("config.num_attention_heads must be divisible by num_key_value_heads")
+    positive_int(source, "conv_L_cache")
+    positive_int(source, "block_ff_dim" if "block_ff_dim" in source else "intermediate_size")
+    if source["hidden_size"] % source["num_attention_heads"]:
+        raise ValueError("LFM2 hidden_size must be divisible by num_attention_heads")
+    if source.get("conv_bias", False):
+        raise ValueError("the LFM2 serving backend does not implement convolution bias")
+    if "layer_types" not in source and "full_attn_idxs" not in source:
+        raise ValueError("LFM2 config must declare layer_types or full_attn_idxs")
+    source["rms_norm_eps"] = source["norm_eps"]
+    declared = declaration.declare(ARCHITECTURE, source)
     resolved = declared.config
     schedule = declaration.block_types(resolved, declared.model)
     return Geometry(
@@ -93,13 +115,13 @@ def geometry_from_config(config: Mapping[str, Any]) -> Geometry:
         vocab=int(resolved["vocab_size"]),
         conv_kernel=int(resolved["conv_kernel"]),
         attention_layers=tuple(i for i, kind in enumerate(schedule) if kind == "attention"),
+        declared=declared,
     )
 
 
-def declared_objects(config: Mapping[str, Any]) -> list[declaration.DeclaredObject]:
+def declared_objects(geometry: Geometry) -> list[declaration.DeclaredObject]:
     """Every object the artifact stores, in declaration order."""
-    declared = declaration.declare(ARCHITECTURE, dict(config))
-    return list(declared.objects(capabilities=set(CAPABILITIES)))
+    return list(geometry.declared.objects(capabilities=set(CAPABILITIES)))
 
 
 def tensor_specs(objects: Sequence[declaration.DeclaredObject]) -> tuple[TensorSpec, ...]:

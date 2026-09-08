@@ -20,8 +20,6 @@
 
 namespace sinfer::targets::llama::detail {
 
-inline constexpr std::size_t kTextLayers          = 22;
-inline constexpr std::size_t kFullAttentionLayers = 22;
 // Every layer is full attention. The empty half of the family's split is not a
 // placeholder: the shared ModelView is instantiated with it, and the shared
 // runtime's GDN arrays and state pool are sized from it.
@@ -61,7 +59,7 @@ struct TextLayerPlan {
 struct BindingPlan {
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry = {};
     /// Only four of the family plan's six slots are filled. TinyLlama-1.1B
     /// publishes no image or video preprocessor config, and the loader refuses an
     /// artifact carrying an object no binder consumed -- so this target binds its
@@ -116,7 +114,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     family::ModelView<FusedAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<1>>;
+                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

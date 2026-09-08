@@ -1,4 +1,4 @@
-"""Explicit 40-layer Text schedule for Qwen3.6-35B-A3B."""
+"""Checkpoint-driven Text schedule for hybrid MoE."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import torch
 
 from surogate.serve.tools.reference.common.tap import NullTap
 
-from .config import CFG
 from .moe import forward as sparse_moe
 from .ops import (
     apply_rope,
@@ -34,7 +33,7 @@ def attention_mixer(
 ) -> torch.Tensor:
     layer_weights = model.binding.text.layers[layer]
     attention_weights = layer_weights.attention
-    h = rmsnorm(x, model.weight(layer_weights.input_norm))
+    h = rmsnorm(x, model.weight(layer_weights.input_norm), eps=model.config.rms_eps)
     projected = linear(
         h,
         model.block_weight(
@@ -43,20 +42,18 @@ def attention_mixer(
         ),
         small_t=small_t,
     )
-    q1 = CFG.q_size
-    k1 = q1 + CFG.kv_size
-    gate1 = k1 + CFG.q_size
-    q = projected[:, :q1].reshape(-1, CFG.q_heads, CFG.head_dim)
-    k = projected[:, q1:k1].reshape(-1, CFG.kv_heads, CFG.head_dim)
-    gate = projected[:, k1:gate1].reshape(-1, CFG.q_heads, CFG.head_dim)
-    value = projected[:, gate1:].reshape(-1, CFG.kv_heads, CFG.head_dim)
+    q1 = model.config.q_size
+    k1 = q1 + model.config.kv_size
+    gate1 = k1 + model.config.q_size
+    q = projected[:, :q1].reshape(-1, model.config.q_heads, model.config.head_dim)
+    k = projected[:, q1:k1].reshape(-1, model.config.kv_heads, model.config.head_dim)
+    gate = projected[:, k1:gate1].reshape(-1, model.config.q_heads, model.config.head_dim)
+    value = projected[:, gate1:].reshape(-1, model.config.kv_heads, model.config.head_dim)
     q = apply_rope(
-        rmsnorm(q, model.weight(attention_weights.query_norm)),
-        positions,
+        rmsnorm(q, model.weight(attention_weights.query_norm), eps=model.config.rms_eps), positions, cfg=model.config
     )
     k = apply_rope(
-        rmsnorm(k, model.weight(attention_weights.key_norm)),
-        positions,
+        rmsnorm(k, model.weight(attention_weights.key_norm), eps=model.config.rms_eps), positions, cfg=model.config
     )
     if tap.level == "op":
         for name, tensor in (("q", q), ("k", k), ("v", value), ("gate", gate)):
@@ -65,11 +62,11 @@ def attention_mixer(
         q,
         k,
         value,
-        CFG.full_index(layer),
+        model.config.full_index(layer),
         start,
     )
     output = linear(
-        sigmoid_mul(gate, attended).reshape(-1, CFG.q_size),
+        sigmoid_mul(gate, attended).reshape(-1, model.config.q_size),
         model.weight(attention_weights.output, small_t=small_t),
         small_t=small_t,
     )
@@ -80,26 +77,26 @@ def gdn_mixer(model, layer, x, tap, context, *, small_t) -> torch.Tensor:
     _, state = model._ready()
     layer_weights = model.binding.text.layers[layer]
     gdn_weights = layer_weights.gdn
-    index = CFG.gdn_index(layer)
-    h = rmsnorm(x, model.weight(layer_weights.input_norm))
+    index = model.config.gdn_index(layer)
+    h = rmsnorm(x, model.weight(layer_weights.input_norm), eps=model.config.rms_eps)
 
     projected = linear(
         h,
         model.block_weight(gdn_weights.query_key_value_z, small_t=small_t),
         small_t=small_t,
     )
-    qkv = projected[:, : CFG.conv_dim]
-    z = projected[:, CFG.conv_dim :].reshape(
+    qkv = projected[:, : model.config.conv_dim]
+    z = projected[:, model.config.conv_dim :].reshape(
         -1,
-        CFG.gdn_v_heads,
-        CFG.gdn_v_dim,
+        model.config.gdn_v_heads,
+        model.config.gdn_v_dim,
     )
     ab = linear(
         h,
         model.block_weight(gdn_weights.a_b_projection, small_t=small_t),
         small_t=small_t,
     )
-    a, b = ab.split(CFG.gdn_v_heads, dim=-1)
+    a, b = ab.split(model.config.gdn_v_heads, dim=-1)
 
     qkv, state.conv[index] = causal_conv1d(
         qkv,
@@ -113,32 +110,27 @@ def gdn_mixer(model, layer, x, tap, context, *, small_t) -> torch.Tensor:
         model.weight(gdn_weights.dt_bias),
     )
     q = l2norm(
-        qkv[:, : CFG.key_dim].reshape(
+        qkv[:, : model.config.key_dim].reshape(
             -1,
-            CFG.gdn_k_heads,
-            CFG.gdn_k_dim,
-        )
+            model.config.gdn_k_heads,
+            model.config.gdn_k_dim,
+        ),
+        eps=model.config.rms_eps,
     )
     k = l2norm(
-        qkv[:, CFG.key_dim : 2 * CFG.key_dim].reshape(
+        qkv[:, model.config.key_dim : 2 * model.config.key_dim].reshape(
             -1,
-            CFG.gdn_k_heads,
-            CFG.gdn_k_dim,
-        )
+            model.config.gdn_k_heads,
+            model.config.gdn_k_dim,
+        ),
+        eps=model.config.rms_eps,
     )
-    value = qkv[:, 2 * CFG.key_dim :].reshape(
+    value = qkv[:, 2 * model.config.key_dim :].reshape(
         -1,
-        CFG.gdn_v_heads,
-        CFG.gdn_v_dim,
+        model.config.gdn_v_heads,
+        model.config.gdn_v_dim,
     )
-    output, state.ssm[index] = gated_delta_net(
-        q,
-        k,
-        value,
-        g,
-        beta,
-        state.ssm[index],
-    )
+    output, state.ssm[index] = gated_delta_net(q, k, value, g, beta, state.ssm[index], scale=model.config.gdn_scale)
     if tap.level == "op":
         for name, tensor in (
             ("conv", qkv),
@@ -147,16 +139,11 @@ def gdn_mixer(model, layer, x, tap, context, *, small_t) -> torch.Tensor:
             ("gdn", output),
         ):
             model._tap(tap, f"layer_{layer:02d}/op/{name}", tensor, **context)
-    output = rmsnorm(
-        output,
-        model.weight(gdn_weights.norm),
-        unit_offset=False,
-        z=z,
-    )
+    output = rmsnorm(output, model.weight(gdn_weights.norm), unit_offset=False, z=z, eps=model.config.rms_eps)
     return residual_add(
         x,
         linear(
-            output.reshape(-1, CFG.value_dim),
+            output.reshape(-1, model.config.value_dim),
             model.weight(gdn_weights.output, small_t=small_t),
             small_t=small_t,
         ),
@@ -165,7 +152,7 @@ def gdn_mixer(model, layer, x, tap, context, *, small_t) -> torch.Tensor:
 
 def moe_layer(model, layer, x, tap, context, *, small_t) -> torch.Tensor:
     layer_weights = model.binding.text.layers[layer]
-    h = rmsnorm(x, model.weight(layer_weights.post_attention_norm))
+    h = rmsnorm(x, model.weight(layer_weights.post_attention_norm), eps=model.config.rms_eps)
     result = sparse_moe(model, layer_weights.moe, h, small_t=small_t)
     if tap.level == "op":
         for name, tensor in (
@@ -191,7 +178,7 @@ def run(
     tap = tap or NullTap()
     context = dict(phase=phase, step=step, chunk=chunk, position=start)
     small_t = phase == "decode"
-    for layer in range(CFG.layers):
+    for layer in range(model.config.layers):
         x = (
             attention_mixer(
                 model,
@@ -203,7 +190,7 @@ def run(
                 context,
                 small_t=small_t,
             )
-            if CFG.is_full(layer)
+            if model.config.is_full(layer)
             else gdn_mixer(
                 model,
                 layer,

@@ -22,9 +22,8 @@
 
 namespace sinfer::targets::qwen3_5::detail {
 
-inline constexpr std::size_t kTextLayers          = 24;
-inline constexpr std::size_t kFullAttentionLayers = 6;
-inline constexpr std::size_t kGdnLayers           = 18;
+family::TextGeometry resolved_geometry(const artifact::Reader& reader);
+
 
 struct WeightPlan {
     artifact::ObjectHandle object;
@@ -135,7 +134,7 @@ struct BindingPlan {
     bool has_vision = false;
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry{};
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
@@ -155,7 +154,7 @@ struct BindingPlan {
     family::VisionGeometry vision_geometry;
     family::VisionBackbonePlanFor<VisionConfig> vision_backbone;
     family::VisionMergerInputPlan vision_merger_input;
-    artifact::ObjectHandle vision_merger_fc2;
+    artifact::LinearBinding vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
     family::VisionMergerNormPlan vision_merger_norm;
 };
@@ -223,6 +222,7 @@ struct GdnProjectionPayload {
 };
 
 struct MtpAttentionPayload {
+    std::int32_t head_dim = 0;
     Weight packed;
     Weight query;
     Weight key;
@@ -232,7 +232,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     family::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<6>, VisionConfig>;
+                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights, VisionConfig>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

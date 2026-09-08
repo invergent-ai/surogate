@@ -215,6 +215,7 @@ struct ExternalFile {
 struct ArtifactIdentity {
     std::string model_id;
     std::string weights_id;
+    std::string architecture;
 
     bool operator==(const ArtifactIdentity&) const = default;
 };
@@ -250,9 +251,12 @@ public:
     /// The artifact's declared dimensions, keyed as `family::TextGeometry` names them; empty
     /// for an artifact written without a `geometry` member.
     const std::map<std::string, double>& geometry() const noexcept;
+    const std::vector<std::string>& layer_types() const noexcept;
     /// The declared dimensions of the artifact's vision tower, keyed as `family::VisionGeometry`
     /// names them; empty for a text-only artifact and for one written before the member existed.
     const std::map<std::string, double>& vision_geometry() const noexcept;
+    const std::map<std::string, double>& dflash_geometry() const noexcept;
+    const std::vector<std::int32_t>& dflash_target_layers() const noexcept;
     std::size_t read_direct(std::uint32_t source, std::uint64_t absolute_offset,
                             std::span<std::byte> destination) const;
 

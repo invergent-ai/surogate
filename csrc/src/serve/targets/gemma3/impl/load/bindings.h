@@ -20,8 +20,6 @@
 
 namespace sinfer::targets::gemma3_270m::detail {
 
-inline constexpr std::size_t kTextLayers          = 18;
-inline constexpr std::size_t kFullAttentionLayers = 18;
 // Every layer is full attention. The empty half of the family's split is not a
 // placeholder: the shared ModelView is instantiated with it, and the shared
 // runtime's GDN arrays and state pool are sized from it.
@@ -99,7 +97,7 @@ struct TextLayerPlan {
 struct BindingPlan {
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry = {};
     /// Only four of the family plan's six slots are filled. gemma-3-270m-it
     /// publishes no image or video preprocessor config, and the loader refuses an
     /// artifact carrying an object no binder consumed -- so this target binds its
@@ -135,6 +133,7 @@ struct DensePostMixerPayload {
     Weight up;
     Weight down;
     Tensor post_feedforward_norm;
+    float rms_epsilon = 0.0F;
 };
 
 struct AttentionProjectionPayload {
@@ -145,6 +144,7 @@ struct AttentionProjectionPayload {
     /// payload is the only per-layer object the family hands to a Variant leaf on
     /// the attention side; see `Variant::attention_output_projection`.
     Tensor post_attention_norm;
+    float rms_epsilon = 0.0F;
 };
 
 /// The linear-mixer payload the shared ModelView still names. This target has no
@@ -167,7 +167,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     family::ModelView<AttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                      MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<1>>;
+                      MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

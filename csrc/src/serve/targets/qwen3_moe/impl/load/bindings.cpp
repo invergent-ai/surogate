@@ -27,11 +27,11 @@ using artifact::NumericFormat;
 /// Rows of the stacked routed experts. The declaration writes an expert-major `[E, 2M, C]`
 /// parameter as rows, which is a contiguous reshape rather than a permutation.
 [[nodiscard]] std::int32_t routed_gate_up_rows(const family::TextGeometry& g) {
-    return TextConfig::experts * 2 * g.intermediate;
+    return g.experts * 2 * g.intermediate;
 }
 
 [[nodiscard]] std::int32_t routed_down_rows(const family::TextGeometry& g) {
-    return TextConfig::experts * g.hidden;
+    return g.experts * g.hidden;
 }
 
 static_assert(TextConfig::query_projection_rows == TextConfig::query_size,
@@ -68,7 +68,7 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
     return SparseMoePayload{
         .op = {
             .router_shared_gate = artifact::materialized_weight(
-                materialized, plan.router, NumericFormat::BF16, TextConfig::router_rows, g.hidden),
+                materialized, plan.router, NumericFormat::BF16, g.experts, g.hidden),
             // The *stored* format decides how these bytes are read. Passing the profile's
             // expectation instead decoded a GGUF's K-quant superblocks as the group-wise
             // row-split codec: the same byte count, an entirely different meaning, and every
@@ -82,7 +82,7 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
             // nothing else.
             .shared_gate_up    = Weight{},
             .shared_down       = Weight{},
-            .experts_per_token = TextConfig::experts_per_token,
+            .experts_per_token = g.experts_per_token,
         }};
 }
 
@@ -121,7 +121,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile,
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
         target.moe.router = artifact::bind_device_tensor(
             binder, prefix + "moe/router", NumericFormat::BF16,
-            {static_cast<std::uint64_t>(TextConfig::router_rows),
+            {static_cast<std::uint64_t>(g.experts),
              static_cast<std::uint64_t>(g.hidden)});
         const artifact::ScopedPlacement experts(
             layer < host_moe_layers ? artifact::TensorPlacement::HostBank
@@ -143,7 +143,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // The checkpoint's own dimensions, where it states them: absent members keep the
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.
-    out.geometry = family::TextGeometry::declared<TextConfig>(binder.reader().geometry());
+    out.geometry = family::TextGeometry::resolved_moe(binder.reader().geometry(), binder.reader().layer_types());
     out.frontend     = family::bind_text_only_frontend_resources(binder);
     out.features     = features;
 

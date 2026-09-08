@@ -69,7 +69,7 @@ INVENTORY_TARGETS = (
     ("qwen3_5", "hub:models--Qwen--Qwen3.5-0.8B", {"text"}),
     ("qwen3_5", "hub:models--Qwen--Qwen3.5-2B", {"text", "vision"}),
     ("qwen3_5", "hub:models--Qwen--Qwen3.5-4B", {"text"}),
-    ("qwen3_5_moe", "hub:models--Qwen--Qwen3.6-35B-A3B", {"text", "vision", "dflash"}),
+    ("qwen3_5_moe", "hub:models--Qwen--Qwen3.6-35B-A3B", {"text", "vision"}),
 )
 
 
@@ -104,10 +104,12 @@ def test_artifact_inventory_derives_from_the_declaration(emitters, target, sourc
     # A converter that serves a whole family builds its list for the checkpoint in hand;
     # the module-level one describes only the size it registers.
     if hasattr(inventory, "geometry_from_config") and hasattr(inventory, "active_specs"):
-        geometry = inventory.geometry_from_config(hf_config)
+        geometry = inventory.geometry_from_config(hf_config, **({"ple_table_rows": 128} if target == "qwen4exp" else {}))
         specs, _ = inventory.active_specs(
-            mtp=True, vision="vision" in capabilities, geometry=geometry
+            mtp=target != "qwen4exp", vision="vision" in capabilities, geometry=geometry
         )
+    elif hasattr(inventory, "geometry_from_config"):
+        specs = inventory.build_tensor_specs(inventory.geometry_from_config(hf_config))
     else:
         specs = inventory.TENSOR_SPECS
     committed = {s.name: (tuple(s.shape), s.format) for s in specs}
@@ -290,7 +292,14 @@ def test_converter_preflight_accepts_its_own_inventory(target):
     preflight = getattr(module, "preflight_inventory", None)
     if preflight is None:
         pytest.skip(f"{target} has no preflight_inventory")
-    preflight()
+    if target == "qwen3_5":
+        config = json.loads((REPO / "surogate/serve/resources/qwen3_5/config.json").read_text())
+        preflight(module.inventory.geometry_from_config(config))
+    elif target == "qwen3_5_moe":
+        from tests.serve.test_qwen3_5_moe_checkpoint_config import config_for
+        preflight(module.inventory.geometry_from_config(config_for()))
+    else:
+        preflight()
 
 
 def test_qwen4exp_inventory_has_a_text_only_variant():
@@ -305,11 +314,13 @@ def test_qwen4exp_inventory_has_a_text_only_variant():
     import importlib
 
     inventory = importlib.import_module("surogate.serve.convert.qwen4exp.inventory")
-    with_tower, _ = inventory.active_specs(vision=True)
-    text_only, _ = inventory.active_specs(vision=False)
+    from tests.serve.test_qwen4exp_checkpoint_config import config_for
+    geometry = inventory.geometry_from_config(config_for(vision=True), ple_table_rows=128)
+    with_tower, _ = inventory.active_specs(geometry=geometry, vision=True)
+    text_only, _ = inventory.active_specs(geometry=geometry, vision=False)
 
     assert len(with_tower) > len(text_only)
-    assert len(with_tower) - len(text_only) == len(inventory.VISION_TENSOR_SPECS)
+    assert len(with_tower) - len(text_only) == len(inventory.build_vision_specs(geometry))
     assert not [s for s in text_only if s.name.startswith("vision/")]
     assert [s for s in with_tower if s.name.startswith("vision/")]
 
@@ -489,7 +500,7 @@ DERIVED_RECIPE_TARGETS = (
     ("qwen3_5", "hub:models--Qwen--Qwen3.5-0.8B"),
     ("qwen3_5", "hub:models--Qwen--Qwen3.5-2B"),
     ("qwen3_5", "hub:models--Qwen--Qwen3.5-4B"),
-    ("qwen3_5", "geometry:GEOMETRY_27B"),
+    ("qwen3_5", "fixture:qwen3_5"),
     ("qwen3", "hub:models--Qwen--Qwen3-0.6B"),
     ("llama", "hub:models--TinyLlama--TinyLlama-1.1B-Chat-v1.0"),
     ("gemma3", "hub:models--google--gemma-3-270m-it"),
@@ -498,15 +509,21 @@ DERIVED_RECIPE_TARGETS = (
 
 #: Targets whose `build_recipes` takes no geometry: one checkpoint, one size, and the
 #: config it implies lives in the inventory beside the object list.
-_SINGLE_SIZE = ("qwen3_5_moe",)
+_SINGLE_SIZE = ()
 
 
 def _derived_case(target, source):
     import importlib
     inventory = importlib.import_module(f"surogate.serve.convert.{target}.inventory")
     recipe = importlib.import_module(f"surogate.serve.convert.{target}.recipe")
-    if source.startswith("geometry:"):
-        return inventory, recipe, getattr(inventory, source.split(":", 1)[1]), None, None
+    if source == "fixture:qwen3_5":
+        config = json.loads((REPO / "surogate/serve/resources/qwen3_5/config.json").read_text())
+        text = config["text_config"]
+        text.update(num_hidden_layers=7, hidden_size=384, intermediate_size=768,
+                    num_attention_heads=4, num_key_value_heads=1,
+                    layer_types=["full_attention", "linear_attention"] * 3 + ["full_attention"])
+        config.pop("vision_config", None)
+        return inventory, recipe, inventory.geometry_from_config(config), config, None
     config_path = _resolve_source(source)
     if config_path is None:
         pytest.skip(f"no checkpoint config for {source}")
@@ -619,29 +636,27 @@ def test_a_substack_names_its_own_checkpoint_tensors():
     from surogate.serve.convert.qwen3_5_moe import inventory
     from surogate.dsl.ir_builder import resolve_architecture
 
-    config = inventory.hf_config_for()
-    declaration = declare(resolve_architecture(config), config, flat_sources=False)
+    from tests.serve.test_qwen3_5_moe_checkpoint_config import config_for, draft_config
+    from surogate.serve.convert.common import dflash
+    geometry = inventory.geometry_from_config(config_for())
+    drafter = dflash.geometry_from_config(draft_config(geometry), geometry)
+    declaration = drafter.declaration(geometry)
     derived = {
         r.object_name: r.expression
         for r in derive_recipes(declaration, capabilities={"text", "dflash"})
         if r.object_name.startswith("dflash/")
     }
-    assert len(derived) == len(inventory.DFLASH_TENSOR_SPECS)
-    assert set(derived) == {spec.name for spec in inventory.DFLASH_TENSOR_SPECS}
-
-    # Its tensors sit at the root of that checkpoint, indexed per layer.
+    specs = inventory.build_dflash_specs(geometry, drafter)
+    assert set(derived) == {spec.name for spec in specs}
     assert derived["dflash/feature_projection"] == SourceTensor(
-        "fc.weight", (2048, 16384)
+        "fc.weight", (geometry.hidden, drafter.feature_rows)
     )
-    fused = derived["dflash/layers/3/attention/query_key_value"]
+    fused = derived["dflash/layers/1/attention/query_key_value"]
     assert isinstance(fused, Concat) and fused.axis == 0
     assert [part.name for part in fused.sources] == [
-        "layers.3.self_attn.q_proj.weight",
-        "layers.3.self_attn.k_proj.weight",
-        "layers.3.self_attn.v_proj.weight",
+        "layers.1.self_attn.q_proj.weight", "layers.1.self_attn.k_proj.weight", "layers.1.self_attn.v_proj.weight",
     ]
-    spec = next(s for s in inventory.DFLASH_TENSOR_SPECS
-                if s.name == "dflash/layers/3/attention/query_key_value")
+    spec = next(s for s in specs if s.name == "dflash/layers/1/attention/query_key_value")
     assert expression_shape(fused) == tuple(spec.shape)
 
 

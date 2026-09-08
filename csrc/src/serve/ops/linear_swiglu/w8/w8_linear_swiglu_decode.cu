@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include "ops/common/math.cuh"
@@ -17,6 +18,35 @@
 
 namespace sinfer::ops::detail {
 namespace {
+
+// Keep both projections in FP32 through SiLU: rounding them to BF16 first can
+// exceed the fused operation's error bound around the activation's steep region.
+__global__ void w8_swiglu_generic_kernel(
+    const __nv_bfloat16* x, const std::int8_t* codes, const __half* scales,
+    __nv_bfloat16* out, int intermediate, int k, std::int64_t pairs) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (std::int64_t pair = static_cast<std::int64_t>(blockIdx.x) * 4 + warp;
+         pair < pairs; pair += static_cast<std::int64_t>(gridDim.x) * 4) {
+        const int row = pair % intermediate;
+        const std::int64_t token = pair / intermediate;
+        const std::int64_t gate_row = static_cast<std::int64_t>(row) * k;
+        const std::int64_t up_row = static_cast<std::int64_t>(row + intermediate) * k;
+        float gate = 0.0F, up = 0.0F;
+        for (int column = lane; column < k; column += 32) {
+            const float activation = __bfloat162float(x[token * k + column]);
+            const float gate_weight = static_cast<float>(codes[gate_row + column]) *
+                                      __half2float(scales[(gate_row + column) / 32]);
+            const float up_weight = static_cast<float>(codes[up_row + column]) *
+                                    __half2float(scales[(up_row + column) / 32]);
+            gate = fmaf(gate_weight, activation, gate);
+            up = fmaf(up_weight, activation, up);
+        }
+        gate = warp_reduce_sum(gate);
+        up = warp_reduce_sum(up);
+        if (lane == 0) { out[pair] = __float2bfloat16_rn(silu(gate) * up); }
+    }
+}
 
 // surogate vendor patch (PATCHES.md #13): geometry is templated so the
 // qwen3.5-0.8b mlp (3584 x 2, k=1024) shares this kernel with the 35B shape.
@@ -188,6 +218,17 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 }
 
 } // namespace
+
+void w8_linear_swiglu_generic_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream) {
+    const std::int64_t pairs = static_cast<std::int64_t>(out.ne[0]) * out.ne[1];
+    const auto blocks = static_cast<unsigned>(std::min<std::int64_t>((pairs + 3) / 4, 65535));
+    w8_swiglu_generic_kernel<<<blocks, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::int8_t*>(w.qdata),
+        static_cast<const __half*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+        out.ne[0], w.k, pairs);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 // The kernel bakes both extents, so the dispatch has to name the whole geometry.
 // Keying it on the hidden extent alone was wrong the moment two models shared a

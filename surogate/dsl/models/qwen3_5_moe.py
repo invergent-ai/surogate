@@ -57,8 +57,7 @@ QWEN3_5_MOE_MTP_SERVE_SECTION = ServeSection(
 )
 
 #: DFlash: a small dense stack that scores draft continuations. It comes from its
-#: own checkpoint rather than this model's config, so its geometry is declared as
-#: constants on the model below. That checkpoint keeps its tensors at the root and
+#: own checkpoint rather than this model's config, so its geometry is supplied by the resolved auxiliary checkpoint. That checkpoint keeps its tensors at the root and
 #: the training graph has no scorer, so the section names them directly rather than
 #: through parameters that do not exist.
 QWEN3_5_MOE_DFLASH_SERVE_SECTION = ServeSection(
@@ -198,7 +197,7 @@ class Qwen3_5MoECausalModel(nn.Model):
 
     #: The complete served artifact: text stack (block schemas), the MTP head, the
     #: vision tower and the DFlash scorer. DFlash geometry comes from its own
-    #: checkpoint rather than this config, so it is declared here.
+    #: checkpoint rather than this config, so serving resolves it separately.
     _serve_objects_ = (
         *QWEN3_5_MOE_MODEL_SERVE_OBJECTS,
         *QWEN3_5_MOE_DFLASH_HEAD_OBJECTS,
@@ -214,14 +213,14 @@ class Qwen3_5MoECausalModel(nn.Model):
         "mamba": Qwen3_5MoELinearBlock,
     }
     draft_head_vocab = 131072
-    dflash_layers = 6
-    dflash_head_dim = 128
-    dflash_qkv_rows = 6144
-    dflash_attn_cols = 4096
-    dflash_kv_rows = 1024
-    dflash_gate_up_rows = 12288
-    dflash_ffn = 6144
-    dflash_feature_rows = 16384
+    dflash_layers = 0
+    dflash_head_dim = 0
+    dflash_qkv_rows = 0
+    dflash_attn_cols = 0
+    dflash_kv_rows = 0
+    dflash_gate_up_rows = 0
+    dflash_ffn = 0
+    dflash_feature_rows = 0
 
     _name_remap_ = QWEN3_5_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_qwen3_5_moe_block_mappings("model.layers.{layer}")
@@ -461,7 +460,7 @@ class Qwen3_5MoEConditionalModel(nn.Model):
 
     #: The complete served artifact: text stack (block schemas), the MTP head, the
     #: vision tower and the DFlash scorer. DFlash geometry comes from its own
-    #: checkpoint rather than this config, so it is declared here.
+    #: checkpoint rather than this config, so serving resolves it separately.
     _serve_objects_ = (
         *QWEN3_5_MOE_MODEL_SERVE_OBJECTS,
         *QWEN3_5_MOE_DFLASH_HEAD_OBJECTS,
@@ -477,14 +476,14 @@ class Qwen3_5MoEConditionalModel(nn.Model):
         "mamba": Qwen3_5MoELinearBlock,
     }
     draft_head_vocab = 131072
-    dflash_layers = 6
-    dflash_head_dim = 128
-    dflash_qkv_rows = 6144
-    dflash_attn_cols = 4096
-    dflash_kv_rows = 1024
-    dflash_gate_up_rows = 12288
-    dflash_ffn = 6144
-    dflash_feature_rows = 16384
+    dflash_layers = 0
+    dflash_head_dim = 0
+    dflash_qkv_rows = 0
+    dflash_attn_cols = 0
+    dflash_kv_rows = 0
+    dflash_gate_up_rows = 0
+    dflash_ffn = 0
+    dflash_feature_rows = 0
 
     _name_remap_ = QWEN3_5_VL_MODEL_NAME_REMAP
     _hf_block_mappings_ = _build_qwen3_5_moe_conditional_block_mappings(

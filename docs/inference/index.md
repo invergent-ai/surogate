@@ -32,9 +32,15 @@ surogate serve ~/models/qwen3.6-27b-hf/
 surogate serve ~/models/qwen3.6-27b-Q4_K_M.gguf
 ```
 
+Surogate reads the model's dimensions and context limit from `config.json`, or from the GGUF
+metadata. Keep the checkpoint's configuration and tokenizer files alongside local safetensors
+weights. Renaming the directory or setting `--served-model-name` changes the name used to
+identify the model; it does not select a different model size or change its settings.
+
 The first start prepares the model and saves reusable files under `~/.cache/surogate/serve`.
 Later starts skip that preparation, but still need time to load the model. Set
 `SUROGATE_SERVE_CACHE` to use a different cache directory; `--no-cache` rebuilds an entry.
+Changes to local configuration, tokenizer, or chat-template files trigger fresh preparation.
 
 Supported GGUF weights are read from the original file, so preparation does not require a
 second full copy of the model. Keep the GGUF files at their original paths while using the
@@ -97,7 +103,8 @@ The family is detected automatically. Available formats and optional features va
 | Qwen3 MoE | Mixture-of-experts models |
 | Llama | Includes TinyLlama |
 | Gemma 3 | Text generation |
-| LFM2 | Text generation |
+| Gemma 4 | Text generation with dense, E-series, and mixture-of-experts models |
+| LFM2 | Text generation from Hugging Face safetensors; GGUF input is not yet supported |
 | Qwen3.5/3.6/3.8 | Includes BF16 and NVFP4 exports |
 | Qwen3.5/3.6 MoE | Includes 35B-A3B; optional speculative decoding |
 | Qwen3.8 Flash-Next | GGUF; supports CPU offload |

@@ -206,18 +206,37 @@ CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, Thr
     impl.pool = std::make_unique<ThreadPool>(std::move(plan));
 
     const artifact::Reader reader(path);
+    impl.config = GemmaEmbeddingConfig::from_artifact(reader);
     const GemmaEmbeddingConfig& config = impl.config;
 
+    const auto checked_tensor = [&](const std::string& name, artifact::NumericFormat format,
+                                    std::initializer_list<std::uint64_t> shape) {
+        const auto* object = reader.find(name);
+        const auto* tensor = object ? std::get_if<artifact::TensorDescriptor>(object) : nullptr;
+        const auto layout = format == artifact::NumericFormat::BF16
+                                ? artifact::StorageLayout::ContiguousLeV1
+                                : artifact::StorageLayout::RowSplitK128V1;
+        if (tensor == nullptr || tensor->format != format || tensor->layout != layout ||
+            tensor->shape != std::vector<std::uint64_t>(shape)) {
+            throw std::invalid_argument("embedding tensor disagrees with checkpoint metadata: " + name);
+        }
+    };
+
     const auto quantised = [&](const std::string& name, std::int32_t n, std::int32_t k) {
+        checked_tensor(name, artifact::NumericFormat::W8G32_F16S,
+                       {static_cast<std::uint64_t>(n), static_cast<std::uint64_t>(k)});
         const auto span = reader.payload(name);
         return decode_w8(span.data, n, k);
     };
     const auto dense = [&](const std::string& name, std::size_t count) {
+        checked_tensor(name, artifact::NumericFormat::BF16, {count});
         return decode_bf16(reader.payload(name).data, count);
     };
 
     impl.token_embedding = quantised("text/token_embedding", config.vocab, config.hidden);
     impl.final_norm      = dense("text/final_norm", static_cast<std::size_t>(config.hidden));
+    checked_tensor("text/embedding_head", artifact::NumericFormat::BF16,
+                   {static_cast<std::uint64_t>(config.hidden), static_cast<std::uint64_t>(config.hidden)});
     impl.embedding_head =
         raw_bf16(reader.payload("text/embedding_head").data,
                  static_cast<std::size_t>(config.hidden) * config.hidden);

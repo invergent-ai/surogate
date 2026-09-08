@@ -73,11 +73,10 @@ struct DFlashLayerWeights {
     Weight down;
 };
 
-template <std::size_t Layers>
 struct DFlashWeights {
     Weight feature_projection;
     Tensor context_norm;
-    std::array<DFlashLayerWeights, Layers> layers;
+    std::vector<DFlashLayerWeights> layers;
     Tensor final_norm;
 };
 
@@ -111,9 +110,8 @@ struct ModelView {
     std::optional<MtpLayer> mtp;
     std::optional<DFlashPayload> dflash;
     /// The tower's dimensions the vision weights were bound against, carried beside them the
-    /// way `geometry` is carried beside the text weights. Defaulted to the target's compiled
-    /// tower, so a target that binds against its own constants is unchanged.
-    VisionGeometry vision_geometry = VisionGeometry::compiled<VisionCfg>();
+    /// way `geometry` is carried beside the text weights.
+    VisionGeometry vision_geometry;
     std::optional<VisionWeightsFor<VisionCfg>> vision;
 };
 

@@ -18,7 +18,10 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+from surogate.serve.cache_version import SERVING_CACHE_VERSION
 from pathlib import Path
 
 # Registered converter targets in the vendored engine, keyed by facts read
@@ -96,7 +99,7 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
         return ConverterTarget("qwen3_5_moe",
                                "surogate.serve.convert.qwen3_5_moe.convert",
-                               "Qwen3.6-35B-A3B", gguf_repack=True)
+                               "Qwen3.5/3.6/3.8 MoE", gguf_repack=True)
     # Gemma 4. Its five published checkpoints share `model_type` across three architectures,
     # so the shape of the model decides the target rather than its name: the mixture is told
     # by `enable_moe_block`, and the E-series from the dense sizes by the two things only it
@@ -140,14 +143,18 @@ def _flatten_text_config(config: dict) -> dict:
 
 
 def source_fingerprint(model_dir: Path) -> str:
-    """Cheap, stable fingerprint: config bytes + (name, size, mtime_ns) of shards.
+    """Hash checkpoint/frontend metadata and the names, sizes and mtimes of weight shards.
 
     Plan §5.3 wants source-content hashes; hashing 50+ GB on every serve is not
     acceptable startup cost, so v0 fingerprints metadata. A corrupted-in-place
     shard with identical size+mtime evades this — accepted and documented.
     """
-    h = hashlib.sha256()
-    h.update((model_dir / "config.json").read_bytes())
+    h = hashlib.sha256(f"serving-cache:{SERVING_CACHE_VERSION}:".encode())
+    for metadata in sorted((*model_dir.glob("*.json"), *model_dir.glob("*.jinja"))):
+        h.update(metadata.name.encode())
+        h.update(b"\0")
+        with metadata.open("rb") as handle:
+            h.update(hashlib.file_digest(handle, "sha256").digest())
     for shard in sorted(model_dir.glob("*.safetensors")):
         st = shard.stat()
         h.update(f"{shard.name}:{st.st_size}:{st.st_mtime_ns}".encode())
@@ -175,7 +182,8 @@ def _gguf_fingerprint(path: Path, *extra: Path) -> str:
         st = p.stat()
         return f"{p.name}:{st.st_size}:{st.st_mtime_ns}"
 
-    h = hashlib.sha256(":".join(stamp(p) for p in (path, *extra)).encode())
+    h = hashlib.sha256(f"serving-cache:{SERVING_CACHE_VERSION}:".encode())
+    h.update(":".join(stamp(p) for p in (path, *extra)).encode())
     return h.hexdigest()[:24]
 
 
@@ -200,12 +208,31 @@ def _find_mtp_gguf(gguf_path: Path) -> Path | None:
         prefix = os.path.commonprefix([name, stem])
         return len(prefix) if len(prefix) > 4 and prefix.endswith("-") else 0
 
+    def compatible(candidate: Path) -> bool:
+        from surogate.serve.gguf.lean import LeanGguf
+        with LeanGguf(gguf_path) as trunk, LeanGguf(candidate) as draft:
+            arch = trunk.kv("general.architecture")
+            if not arch or draft.kv("general.architecture") != arch:
+                return False
+            for key in ("embedding_length", "attention.head_count", "attention.head_count_kv",
+                        "attention.key_length", "ssm.state_size", "ssm.inner_size", "ssm.time_step_rank"):
+                value = trunk.kv(f"{arch}.{key}")
+                if value is None or draft.kv(f"{arch}.{key}") != value:
+                    return False
+            text_layers = trunk.kv(f"{arch}.block_count")
+            draft_layers = draft.kv(f"{arch}.block_count")
+            trunk_next = trunk.kv(f"{arch}.nextn_predict_layers", 0)
+            draft_next = draft.kv(f"{arch}.nextn_predict_layers", 0)
+            counts = (text_layers, draft_layers, trunk_next, draft_next)
+            return (all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in counts)
+                    and draft_next == 1 and text_layers - trunk_next == draft_layers - draft_next)
+
     for directory in (gguf_path.parent, gguf_path.parent / "MTP"):
         if not directory.is_dir():
             continue
         # One head per model, published once and shared by every quant of it -- the head's
         # name carries the model, not the trunk's quant suffix, so match on what they share.
-        matches = [p for p in sorted(directory.glob("mtp-*.gguf")) if shared_prefix(p) > 0]
+        matches = [p for p in sorted(directory.glob("mtp-*.gguf")) if shared_prefix(p) > 0 and compatible(p)]
         if matches:
             return max(matches, key=shared_prefix)
     return None
@@ -239,20 +266,27 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     target_key = serve_gguf.gguf_target_key(gguf_path, reader)
     if target_key is None:
         s = serve_gguf.read_gguf_summary(gguf_path, reader)
+        if s["architecture"] == "lfm2":
+            raise SystemExit(
+                "surogate serve: LFM2 currently requires Hugging Face safetensors weights.\n"
+                "  Pass the model's Hugging Face repository or local safetensors directory;\n"
+                "  LFM2 GGUF input is not supported yet."
+            )
         raise SystemExit(
             "surogate serve: this GGUF is not yet supported by the native engine.\n"
             f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
             f"layers={s['num_hidden_layers']} quants={s['quant_types']}\n"
             "  Registered today: Qwen3.5/3.6/3.8 (dense and MoE), Qwen3.8-Flash-Next,\n"
-            "  Qwen3 (any size), Gemma 3, Llama/TinyLlama and LFM2. A target reads its\n"
+            "  Qwen3 (dense and MoE), Gemma 3/4, Llama/TinyLlama and GLM-5-Next. A target reads its\n"
             "  dimensions from the artifact, so what has to match is the architecture rather\n"
             "  than the size -- a family with no target here has none yet."
         )
 
     out = cache_dir() / f"{target_key}-gguf-{fp}.sinfer"
 
-    if target_key == "qwen4exp":
-        return _convert_gguf_native(root, gguf_path, out, mtp_path=mtp_path, echo=echo)
+    if target_key in ("qwen4exp", "glm5_next"):
+        return _convert_gguf_native(root, gguf_path, out, target_key=target_key,
+                                    mtp_path=mtp_path, reader=reader, echo=echo)
 
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate
@@ -293,41 +327,30 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
             shutil.rmtree(work, ignore_errors=True)
 
 
-def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *,
-                         mtp_path: Path | None = None, echo=print) -> Path:
-    """Qwen3.8-Flash-Next: the GGUF is the weight source and the model's own HF frontend
-    (tokenizer, chat template, generation and preprocessor configs) is fetched from the Hub.
+def _native_gguf_frontend(reader, directory: Path, *, echo=print) -> Path:
+    """Extract frontend resources from the same GGUF that supplies the weights."""
+    from surogate.serve.gguf.frontend import extract_generation_config, write_frontend
+    arch = reader.kv("general.architecture")
+    write_frontend(reader, arch, directory, echo=echo)
+    generation = extract_generation_config(reader)
+    (directory / "generation_config.json").write_text(json.dumps(generation, indent=2), encoding="utf-8")
+    return directory
 
-    No bridge: the base model is 131 safetensors shards on the Hub, so the converter reads
-    the GGUF directly and builds its own repack candidate map. What it writes is ~1.5 GB of
-    index -- the weights themselves stay in the GGUF shards, which the artifact names by
-    absolute path, so the cached `.sinfer` is only good while they stay put.
-    """
-    from surogate.serve.convert.qwen4exp import inventory as inv
-    frontend_files = [spec.name.removeprefix("frontend/") for spec in inv.RESOURCE_SPECS]
-    frontend_dir = cache_dir() / "frontends" / "Qwen3.8-Flash-Next"
-    missing = [name for name in frontend_files if not (frontend_dir / name).is_file()]
-    if missing:
-        try:
-            from huggingface_hub import snapshot_download
-        except ImportError as error:
-            raise SystemExit(
-                "surogate serve: huggingface_hub is required to fetch the Qwen3.8-Flash-Next "
-                "frontend (tokenizer, chat template, generation config)."
-            ) from error
-        echo("surogate serve: fetching the Qwen3.8-Flash-Next frontend from the Hub")
-        frontend_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_download("Qwen/Qwen3.8-Flash-Next", allow_patterns=frontend_files + ["config.json"],
-                          local_dir=str(frontend_dir))
-        missing = [name for name in frontend_files if not (frontend_dir / name).is_file()]
-        if missing:
-            raise SystemExit(f"surogate serve: frontend files missing after download: {missing}")
+
+def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *,
+                         target_key: str = "qwen4exp", mtp_path: Path | None = None,
+                         reader=None, echo=print) -> Path:
+    """Convert a native GGUF using its own tokenizer, chat template and special IDs."""
+    if reader is None:
+        from surogate.serve.gguf.bridge import open_gguf
+        reader = open_gguf(gguf_path)
+    frontend_dir = _native_gguf_frontend(reader, cache_dir() / "frontends" / out.stem, echo=echo)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".sinfer.partial")
     tmp.unlink(missing_ok=True)
-    echo(f"surogate serve: preparing engine weights for Qwen3.8-Flash-Next "
+    echo(f"surogate serve: preparing engine weights for {reader.kv('general.architecture')} "
          f"(one-time conversion of the GGUF shards; cached at {out})")
-    cmd = [sys.executable, "-m", "surogate.serve.convert.qwen4exp.convert",
+    cmd = [sys.executable, "-m", f"surogate.serve.convert.{target_key}.convert",
            "--gguf", str(gguf_path), "--frontend", str(frontend_dir), "--out", str(tmp),
            "--device", os.environ.get("SUROGATE_CONVERT_DEVICE", "cuda")]
     if mtp_path is not None:
@@ -355,18 +378,23 @@ def _gguf_geometry(recipe_module, inventory_module, gguf_path: Path):
     from surogate.serve.gguf import bridge as serve_gguf
     from surogate.serve.gguf.lean import LeanGguf
 
-    if not hasattr(recipe_module, "build_recipes"):
-        return None
     with LeanGguf(gguf_path) as reader:
         arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
-        # A converter may read the file's key-values directly -- a hybrid's linear-attention
-        # widths are in no synthesised `config.json` -- or take the synthesised config.
+        # A converter can read GGUF fields directly or consume their normalized HF spelling.
         if hasattr(inventory_module, "geometry_from_gguf"):
             return inventory_module.geometry_from_gguf(reader.kv)
-        if not hasattr(recipe_module, "geometry_from_config"):
-            return None
+        resolve = getattr(inventory_module, "geometry_from_config", None) or getattr(recipe_module, "geometry_from_config", None)
+        if resolve is None:
+            raise ValueError("converter must resolve checkpoint geometry before repack planning")
         config = serve_gguf.synthesised_config(reader, arch)
-    return recipe_module.geometry_from_config(config)
+        tokens = reader.kv("tokenizer.ggml.tokens")
+    if config is None:
+        raise ValueError(f"cannot resolve {arch} geometry from GGUF metadata")
+    if inventory_module.TARGET_KEY in ("qwen3_5", "qwen3_5_moe"):
+        if not tokens:
+            raise ValueError("GGUF must declare tokenizer tokens before repack planning")
+        return resolve(config, token_domain=len(tokens))
+    return resolve(config)
 
 
 def _gguf_synthesised_config(gguf_path: Path) -> dict:
@@ -408,28 +436,18 @@ def _repack_planner(root: Path, target_key: str):
         # The plan must describe *this* checkpoint, not the size the converter registers, so
         # a converter that can build from a geometry is asked to.
         geometry = _gguf_geometry(recipe, inventory, gguf_path)
-        if geometry is not None:
-            recipes_by_name = {r.object_name: r for r in recipe.build_recipes(geometry)}
-            tensor_specs = (
-                inventory.build_tensor_specs(geometry)
-                if hasattr(inventory, "build_tensor_specs")
-                else inventory.active_specs(mtp=True, vision=True, geometry=geometry)[0]
-            )
+        recipes = recipe.build_recipes(geometry)
+        recipes_by_name = dict(recipes) if isinstance(recipes, Mapping) else {r.object_name: r for r in recipes}
+        if hasattr(inventory, "build_stored_tensor_specs"):
+            tensor_specs = inventory.build_stored_tensor_specs(
+                geometry, tied_output_head=bool(geometry.declared.hf_config.get("tie_word_embeddings", True)))
+        elif hasattr(inventory, "build_tensor_specs"):
+            tensor_specs = inventory.build_tensor_specs(geometry)
         elif hasattr(inventory, "stored_objects"):
-            # A converter that derives its objects from the declaration takes the config
-            # itself, not a geometry: `stored_objects` decides what the artifact holds --
-            # a tied head is one object fewer -- and `tensor_specs` shapes them. This is
-            # the same pair `convert.py` computes, so the plan describes what will be written.
-            config = _gguf_synthesised_config(gguf_path)
-            recipes_by_name = {r.object_name: r for r in recipe.build_recipes(config)}
-            tensor_specs = inventory.tensor_specs(
-                inventory.stored_objects(
-                    config, tied_output_head=recipe.tied_output_head(config)
-                )
-            )
+            tensor_specs = inventory.tensor_specs(inventory.stored_objects(
+                geometry, tied_output_head=recipe.tied_output_head(geometry.declared.hf_config)))
         else:
-            recipes_by_name = recipe.RECIPES_BY_NAME
-            tensor_specs = inventory.TENSOR_SPECS
+            tensor_specs = inventory.tensor_specs(inventory.declared_objects(geometry))
 
         candidates = {
             hf: entry
@@ -556,9 +574,6 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
         echo("DRY: " + " ".join(cmd))
         raise SystemExit(0)
     env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    if derived_frontend:
-        # GGUF-sourced: tokenizer reconstructed from KV (PATCHES.md #12).
-        env["SINFER_ALLOW_DERIVED_FRONTEND"] = "1"
     result = subprocess.run(cmd, cwd=root, env=env)
     if result.returncode != 0 or not tmp.is_file():
         tmp.unlink(missing_ok=True)

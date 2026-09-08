@@ -270,3 +270,58 @@ def test_gemma4_reconstruction_matches_the_official_tokenizer(tmp_path):
             mine.encode(s, add_special_tokens=False).ids
             == official.encode(s, add_special_tokens=False).ids
         ), f"encode divergence on {s!r}"
+
+
+def test_generation_config_uses_declared_ids():
+    from types import SimpleNamespace
+    from surogate.serve.gguf.frontend import extract_generation_config
+    values = {"tokenizer.ggml.tokens": ["a", "b", "stop", "turn", "pad"],
+              "tokenizer.ggml.eos_token_id": 2, "tokenizer.ggml.eot_token_id": 3,
+              "tokenizer.ggml.eom_token_id": 3, "tokenizer.ggml.padding_token_id": 4}
+    class Reader:
+        def get_field(self, name):
+            return None if name not in values else SimpleNamespace(contents=lambda: values[name])
+    assert extract_generation_config(Reader()) == {"eos_token_id": [2, 3], "pad_token_id": 4}
+    values["tokenizer.ggml.eot_token_id"] = 5
+    with pytest.raises(ValueError, match="outside its vocabulary"):
+        extract_generation_config(Reader())
+
+
+def test_native_frontend_comes_from_the_weight_source(tmp_path):
+    from types import SimpleNamespace
+    from surogate.serve.ingest import _native_gguf_frontend
+    values = {"general.architecture": "qwen4exp", "tokenizer.ggml.model": "gpt2",
+              "tokenizer.ggml.pre": "qwen35", "tokenizer.ggml.tokens": ["a", "b", "stop"],
+              "tokenizer.ggml.token_type": [1, 1, 3], "tokenizer.ggml.merges": [],
+              "tokenizer.ggml.eos_token_id": 2, "tokenizer.chat_template": "{{ messages }}"}
+    class Reader:
+        def kv(self, name):
+            return values.get(name)
+        def get_field(self, name):
+            return None if name not in values else SimpleNamespace(contents=lambda: values[name])
+    root = _native_gguf_frontend(Reader(), tmp_path, echo=lambda _: None)
+    tokenizer = json.loads((root / "tokenizer.json").read_text())
+    assert tokenizer["model"]["vocab"] == {"a": 0, "b": 1}
+    assert tokenizer["added_tokens"][0]["id"] == 2
+    assert json.loads((root / "generation_config.json").read_text()) == {"eos_token_id": 2}
+    assert (root / "chat_template.jinja").read_text() == "{{ messages }}"
+
+
+def test_gemma3_turn_token_is_a_generation_stop():
+    from types import SimpleNamespace
+    from surogate.serve.gguf.frontend import extract_generation_config
+    values = {"general.architecture": "gemma3",
+              "tokenizer.ggml.tokens": ["a", "<eos>", "<end_of_turn>"],
+              "tokenizer.ggml.eos_token_id": 1}
+    class Reader:
+        def get_field(self, name):
+            return None if name not in values else SimpleNamespace(contents=lambda: values[name])
+    assert extract_generation_config(Reader())["eos_token_id"] == [1, 2]
+
+
+def test_glm_pre_tokenizer_groups_digits_in_threes():
+    from surogate.serve.gguf.frontend import _PRE_SPLIT_REGEX
+    split = tokenizers.pre_tokenizers.Split(tokenizers.Regex(_PRE_SPLIT_REGEX["glm4"]),
+                                           behavior="isolated")
+    pieces = [piece for piece, _ in split.pre_tokenize_str("1234567")]
+    assert pieces == ["123", "456", "7"]

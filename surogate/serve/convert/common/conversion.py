@@ -87,7 +87,7 @@ def load_resources(
         path = root / filename
         if not path.exists() and filename == "generation_config.json":
             data = _synthesize_generation_config(root)
-        elif not path.exists() and filename.endswith("preprocessor_config.json"):
+        elif not path.exists() and (filename == "chat_template.jinja" or filename.endswith("preprocessor_config.json")):
             # A text-only release of a vision family ships no image processor. The artifact
             # then carries no such resource, and the engine's frontend reads its absence as
             # "this target never asked for a pixel" and refuses --vision at load.
@@ -321,7 +321,7 @@ def build_conversion_report(
     elapsed_seconds: float,
     final_bytes: int,
     device: torch.device,
-    ranking_path: str | Path,
+    ranking_path: str | Path | None,
     revision: str | None = None,
     environment_summary: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -336,7 +336,8 @@ def build_conversion_report(
         "recipe_id": recipe_id,
         "source": {
             "model_path": str(Path(model_dir).resolve()),
-            "ranking_path": str(Path(ranking_path).resolve()),
+            "ranking_path": str(Path(ranking_path).resolve()) if ranking_path is not None else None,
+            "shortlist_order": "frequency" if ranking_path is not None else "token_id",
         },
         "arguments": dict(arguments),
         "config_summary": dict(config_summary),

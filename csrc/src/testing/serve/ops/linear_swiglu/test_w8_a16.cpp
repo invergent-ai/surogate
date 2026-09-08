@@ -18,6 +18,18 @@ int main() {
         int failures = run_profile(
             "LinearSwiGLU W8_A16",
             {QType::W8G32_F16S, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
+        constexpr std::array<std::int32_t, 4> kFallbackTokens{1, 17, 128, 512};
+        for (const auto compute : {ActivationCompute::A16, ActivationCompute::A8}) {
+            failures += run_profile(
+                "LinearSwiGLU W8 fallback",
+                {QType::W8G32_F16S, 9216, 1024, 4608, 1631U, compute}, kFallbackTokens);
+            failures += run_profile(
+                "LinearSwiGLU W8 fallback alternate geometry",
+                {QType::W8G32_F16S, 256, 256, 128, 1633U, compute}, kFallbackTokens);
+            failures += run_profile(
+                "LinearSwiGLU W8 fallback narrow scale loads",
+                {QType::W8G32_F16S, 256, 1152, 128, 1637U, compute}, kFallbackTokens);
+        }
         // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp (1024 -> 2x3584).
         constexpr std::array<std::int32_t, 8> kQ08TokenCases{1, 2, 6, 17, 33, 65, 129, 257};
         failures += run_profile(

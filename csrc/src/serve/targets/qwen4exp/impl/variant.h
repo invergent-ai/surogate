@@ -24,6 +24,8 @@ using GraphExecutionProfile = family::GraphExecutionProfile;
 // family hands in is the four-stream hyper-connection residual; the norm hooks mix it into a
 // block input and remember the inject gates, the output projections scatter the block output
 // back, and the layer prologue adds the n-gram memory at its layer.
+ops::SparseMoeGeometry moe_geometry(const family::TextGeometry& geometry);
+
 struct Variant {
     using WeightsProfile                 = detail::WeightsProfile;
     using TextConfig                     = detail::TextConfig;
@@ -48,12 +50,8 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     // QSA indexer (phase 4): the cache carries one BF16 plane of this width per full-attention
     // layer, and the selection engages only past TextConfig::dense_exact_context.
-    static constexpr std::int32_t indexer_head_dim             = TextConfig::indexer_head_dim;
-    static constexpr std::int32_t indexer_heads                = TextConfig::indexer_heads;
-    static constexpr std::int32_t indexer_block                = TextConfig::indexer_block;
-    static constexpr std::int32_t indexer_top_k                = TextConfig::indexer_top_k;
+    static constexpr bool has_qsa_indexer = true;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
-    static constexpr std::int32_t draft_head_rows              = 131072;
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);
@@ -75,7 +73,7 @@ struct Variant {
     /// Creates the device scratch the mix/combine pair shares and the expert cache of the
     /// current device (`family::ExpertCache`, configured by the package); call before any
     /// graph capture.
-    static void prewarm_device_scratch();
+    static void prewarm_device_scratch(const family::TextGeometry& geometry);
     /// With `--cpu-moe-share auto`, hands the first banked mixture layer to the expert cache's
     /// rate measurement (`ExpertCache::prepare_split`). Called by create_program before the
     /// graphs are captured; a no-op otherwise.
@@ -86,13 +84,13 @@ struct Variant {
     // per lane at 32 (the wider lanes cost more) against the family's 12.
     static constexpr std::size_t ordinary_graph_allowance_per_lane_bytes = 48ULL * 1024ULL * 1024ULL;
     // Parity probe: dumps family-loop intermediates under SUROGATE_SERVE_DUMP_RESIDUAL.
-    static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
-    [[nodiscard]] static NgramPleStatePoolSpec ple_state_spec(std::int32_t slot_count);
+    static void debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream);
+    [[nodiscard]] static NgramPleStatePoolSpec ple_state_spec(const family::TextGeometry& geometry, std::int32_t slot_count);
     static void layer_prologue(const ModelView& model, int layer, Tensor& residual,
                                const family::detail::PrologueColumns& columns,
                                NgramPleStatePool* ple_state, WorkspaceArena& workspace,
                                cudaStream_t stream);
-    [[nodiscard]] static std::size_t layer_prologue_workspace_capacity_bytes(std::int32_t first,
+    [[nodiscard]] static std::size_t layer_prologue_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                              std::int32_t last);
 
     // --- projections ---

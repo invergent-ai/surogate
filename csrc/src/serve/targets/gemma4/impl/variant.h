@@ -61,7 +61,6 @@ struct Variant {
     /// enabled speculative backend -- which `bind_artifact` refuses here. The
     /// value names the only head this model has, so the unreachable branch would
     /// at least be sized rather than zero.
-    static constexpr std::int32_t draft_head_rows              = TextConfig::output_rows;
 
     /// Read by the family runtime through `attention_output_gate<Variant>()`.
     /// The hybrid targets declare nothing and get the family default (true): the
@@ -94,7 +93,7 @@ struct Variant {
     /// Parity probe: under SUROGATE_SERVE_DUMP_RESIDUAL the family loop's attention
     /// intermediates are written out, tagged and numbered by the order the layers run in.
     /// A no-op unless the variable is set.
-    static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
+    static void debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream);
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,

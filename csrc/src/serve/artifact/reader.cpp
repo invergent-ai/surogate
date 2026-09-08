@@ -1,4 +1,6 @@
 #include "artifact/reader.h"
+#include <api/family/text_geometry.h>
+#include <api/family/vision_geometry.h>
 
 #include <map>
 #include <nlohmann/json.hpp>
@@ -396,8 +398,8 @@ struct Reader::Impl {
             throw ArtifactError("artifact is shorter than the v2 prefix");
         }
         if (std::equal(kV1Magic.begin(), kV1Magic.end(), file.data())) {
-            throw ArtifactError("SInfer artifact v1 is no longer supported; migrate it with: "
-                                "python -m surogate.serve.artifact.migrate_v1_to_v2 <artifact>");
+            throw ArtifactError("SInfer artifact v1 is no longer supported; "
+                                "rebuild the serving artifact from its source checkpoint");
         }
         if (std::equal(kPreRenameMagic.begin(), kPreRenameMagic.end(), file.data())) {
             throw ArtifactError(
@@ -431,7 +433,10 @@ struct Reader::Impl {
         require_members(directory, root_members, "directory root",
                         (directory.contains("external") ? 1 : 0) +
                             (directory.contains("geometry") ? 1 : 0) +
-                            (directory.contains("vision_geometry") ? 1 : 0));
+                            (directory.contains("vision_geometry") ? 1 : 0) +
+                            (directory.contains("layer_types") ? 1 : 0) +
+                            (directory.contains("dflash_geometry") ? 1 : 0) +
+                            (directory.contains("dflash_target_layers") ? 1 : 0));
         // "geometry" is another optional root member: the model's dimensions as a flat
         // object of numbers, keyed by the names the family's TextGeometry knows. A target lays
         // it over its compiled config, so an artifact without it loads as one size and an
@@ -454,6 +459,37 @@ struct Reader::Impl {
         // is declared separately rather than folded into "geometry" where two members would
         // collide on names like "layers" and "hidden".
         read_geometry("vision_geometry", vision_geometry);
+        read_geometry("dflash_geometry", dflash_geometry);
+        try {
+            family::TextGeometry text;
+            text.override_from(geometry);
+            family::VisionGeometry vision;
+            vision.override_from(vision_geometry);
+            if (directory.contains("dflash_target_layers")) {
+                const auto& raw = directory.at("dflash_target_layers");
+                if (!raw.is_array()) { throw ArtifactError("dflash_target_layers must be an array"); }
+                for (const auto& layer : raw) {
+                    if (!layer.is_number_integer() || layer.get<double>() < 0 || layer.get<double>() > 255) {
+                        throw ArtifactError("dflash_target_layers entries must be integers in 0..255");
+                    }
+                    dflash_target_layers.push_back(layer.get<std::int32_t>());
+                }
+            }
+            if (directory.contains("dflash_geometry") || directory.contains("dflash_target_layers")) {
+                (void)family::DFlashGeometry::resolved(dflash_geometry, dflash_target_layers,
+                                                       text.hidden, text.layers, text.output_rows);
+            }
+            if (directory.contains("layer_types")) {
+                const auto& raw = directory.at("layer_types");
+                if (!raw.is_array()) { throw ArtifactError("layer_types must be an array"); }
+                for (const auto& kind : raw) {
+                    layer_types.push_back(require_string(kind, "layer_types entry"));
+                }
+                text.apply_layer_types(layer_types);
+            }
+        } catch (const std::invalid_argument& error) {
+            throw ArtifactError(error.what());
+        }
         // An artifact may serve some of its objects straight out of another file rather than
         // copying them in. The table is absent from every artifact that does not, and those load
         // exactly as before.
@@ -469,9 +505,13 @@ struct Reader::Impl {
         }
         const auto& raw_identity                     = directory.at("identity");
         static constexpr std::array identity_members = {"model_id", "weights_id"};
-        require_members(raw_identity, identity_members, "artifact identity");
+        require_members(raw_identity, identity_members, "artifact identity",
+                        raw_identity.contains("architecture") ? 1 : 0);
         identity.model_id   = require_string(raw_identity.at("model_id"), "model_id");
         identity.weights_id = require_string(raw_identity.at("weights_id"), "weights_id");
+        if (raw_identity.contains("architecture")) {
+            identity.architecture = require_string(raw_identity.at("architecture"), "architecture");
+        }
 
         const auto& raw_objects = directory.at("objects");
         if (!raw_objects.is_array() || raw_objects.empty()) {
@@ -603,6 +643,9 @@ struct Reader::Impl {
     std::vector<ExternalFile> external;
     std::map<std::string, double> geometry;
     std::map<std::string, double> vision_geometry;
+    std::vector<std::string> layer_types;
+    std::map<std::string, double> dflash_geometry;
+    std::vector<std::int32_t> dflash_target_layers;
     std::vector<std::unique_ptr<MappedFile>> external_maps; // MappedFile owns an fd and a mapping
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     std::uint64_t payload_start = 0;
@@ -668,6 +711,10 @@ PayloadSpan Reader::payload(std::string_view name) const {
 }
 
 const std::map<std::string, double>& Reader::geometry() const noexcept { return impl_->geometry; }
+
+const std::vector<std::string>& Reader::layer_types() const noexcept { return impl_->layer_types; }
+const std::map<std::string, double>& Reader::dflash_geometry() const noexcept { return impl_->dflash_geometry; }
+const std::vector<std::int32_t>& Reader::dflash_target_layers() const noexcept { return impl_->dflash_target_layers; }
 
 const std::map<std::string, double>& Reader::vision_geometry() const noexcept {
     return impl_->vision_geometry;

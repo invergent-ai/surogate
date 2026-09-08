@@ -63,11 +63,12 @@ class RefModel:
             raise ValueError("draft_head requires MTP")
 
         self.binding = ArtifactBinding.open(weights)
+        if mtp_draft_tokens and self.binding.mtp is None:
+            self.binding.close()
+            raise ValueError("checkpoint has no MTP weights")
         self.config = self.binding.config
         self.vision_config = self.binding.vision_config
-        prefill_chunk = (
-            self.config.prefill_chunk if prefill_chunk is None else prefill_chunk
-        )
+        prefill_chunk = self.config.prefill_chunk if prefill_chunk is None else prefill_chunk
         self.memory_bytes = memory_bytes
         self.headroom_bytes = headroom_bytes
         self.kv_dtype = kv_dtype
@@ -167,9 +168,7 @@ class RefModel:
 
     def _positions(self, start: int, count: int) -> torch.Tensor:
         _, state = self._ready()
-        values = torch.arange(
-            start, start + count, device=self.device, dtype=torch.int32
-        )
+        values = torch.arange(start, start + count, device=self.device, dtype=torch.int32)
         if state.mrope:
             values = values + state.rope_delta
             return values.unsqueeze(0).expand(3, -1)
@@ -207,9 +206,7 @@ class RefModel:
         _, state = self._ready()
         cache = state.mtp_kv if mtp else state.kv
         if cache.length != start:
-            raise ValueError(
-                f"KV append start {start} does not match resident length {cache.length}"
-            )
+            raise ValueError(f"KV append start {start} does not match resident length {cache.length}")
         cache.write(layer, start, k, v)
         end = start + q.shape[0]
         k_all, v_all = cache.read(layer, end)
@@ -222,9 +219,7 @@ class RefModel:
         )
 
     def final_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        return rmsnorm(
-            x, self.weight(self.binding.text.final_norm), eps=self.config.rms_eps
-        )
+        return rmsnorm(x, self.weight(self.binding.text.final_norm), eps=self.config.rms_eps)
 
     def logits_last(self, hidden: torch.Tensor, *, draft: bool = False) -> torch.Tensor:
         weights, _ = self._ready()
@@ -233,9 +228,7 @@ class RefModel:
             head = self.binding.text.draft_head
             logits = linear(last, weights.tensor(head.weight))[0]
             ids = weights.tensor(head.token_ids).long()
-            full = torch.full(
-                (self.config.vocab,), -torch.inf, device=self.device, dtype=torch.float32
-            )
+            full = torch.full((self.config.vocab,), -torch.inf, device=self.device, dtype=torch.float32)
             full[ids] = logits.float()
             return full
 
@@ -272,9 +265,7 @@ class RefModel:
             start = state.position
             x = self.embed(part)
             self._tap(tap, "embed", x, phase="prefill", step=0, chunk=chunk, position=start)
-            positions = torch.arange(
-                start, start + len(part), device=self.device, dtype=torch.int32
-            )
+            positions = torch.arange(start, start + len(part), device=self.device, dtype=torch.int32)
             x = run_text(
                 self,
                 x,
@@ -311,9 +302,7 @@ class RefModel:
         assert last_hidden is not None
         logits = self.logits_last(last_hidden)
         target = (
-            sampler(logits)
-            if sampler is not None
-            else int(torch.argmax(logits[: self.config.token_domain]).item())
+            sampler(logits) if sampler is not None else int(torch.argmax(logits[: self.config.token_domain]).item())
         )
         self.last_hidden = last_hidden
         if self.mtp_enabled:
@@ -379,9 +368,7 @@ class RefModel:
             )
             x = span[: len(part)]
             self._tap(tap, "embed", x, phase="prefill", step=0, chunk=chunk, position=start)
-            positions = batch.position_ids[:, offset : offset + len(part)].to(
-                device=self.device, dtype=torch.int32
-            )
+            positions = batch.position_ids[:, offset : offset + len(part)].to(device=self.device, dtype=torch.int32)
             x = run_text(
                 self,
                 x,
@@ -421,9 +408,7 @@ class RefModel:
         assert last_hidden is not None and last_positions is not None
         logits = self.logits_last(last_hidden)
         target = (
-            sampler(logits)
-            if sampler is not None
-            else int(torch.argmax(logits[: self.config.token_domain]).item())
+            sampler(logits) if sampler is not None else int(torch.argmax(logits[: self.config.token_domain]).item())
         )
         self.last_hidden = last_hidden
         if self.mtp_enabled:
@@ -481,14 +466,10 @@ class RefModel:
         self.last_hidden = hidden
         self._tap(tap, "logits", logits, phase="decode", step=step, chunk=0, position=start)
         target = (
-            sampler(logits)
-            if sampler is not None
-            else int(torch.argmax(logits[: self.config.token_domain]).item())
+            sampler(logits) if sampler is not None else int(torch.argmax(logits[: self.config.token_domain]).item())
         )
         if self.mtp_enabled and update_mtp:
-            mtp_hidden, self.last_draft = self.mtp_forward(
-                [target], hidden, positions, start=state.mtp_kv.length
-            )
+            mtp_hidden, self.last_draft = self.mtp_forward([target], hidden, positions, start=state.mtp_kv.length)
             self.last_mtp_hidden = mtp_hidden[-1:]
         return target, hidden, logits
 
@@ -541,8 +522,7 @@ class RefModel:
             drafts.append(draft)
         return drafts
 
-    @staticmethod
-    def _greedy(logits: torch.Tensor) -> int:
+    def _greedy(self, logits: torch.Tensor) -> int:
         return int(torch.argmax(logits[: self.config.token_domain]).item())
 
     def _verify_choice(
@@ -607,9 +587,7 @@ class RefModel:
                 update_mtp=False,
             )
             target_hiddens.append(hidden)
-            accept, correction = self._verify_choice(
-                logits, draft, outputs, sampler
-            )
+            accept, correction = self._verify_choice(logits, draft, outputs, sampler)
             if not accept:
                 outputs.append(correction)
                 rejected = True
@@ -697,9 +675,7 @@ class RefModel:
         tap,
     ) -> list[int]:
         output = [token]
-        while len(output) < max_new_tokens and not (
-            stop_token_ids and token in stop_token_ids
-        ):
+        while len(output) < max_new_tokens and not (stop_token_ids and token in stop_token_ids):
             remaining = max_new_tokens - len(output)
             _, state = self._ready()
             window = min(self.mtp_draft_tokens, remaining - 1)
@@ -730,9 +706,7 @@ class RefModel:
                     step=len(output) - 1,
                     tap=tap,
                 )
-                round_output = mtp_schedule.truncate_at_stop(
-                    round_output, stop_token_ids
-                )
+                round_output = mtp_schedule.truncate_at_stop(round_output, stop_token_ids)
             output.extend(round_output)
             token = round_output[-1]
         return output

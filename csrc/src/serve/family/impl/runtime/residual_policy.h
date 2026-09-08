@@ -32,15 +32,7 @@
 
 namespace sinfer::family::detail {
 
-/// Width of the residual planes: `Config::residual` when the target declares one, else hidden.
-template <class Config>
-[[nodiscard]] constexpr int residual_width() {
-    if constexpr (requires { Config::residual; }) {
-        return Config::residual;
-    } else {
-        return Config::hidden;
-    }
-}
+
 
 template <class Variant>
 [[nodiscard]] constexpr bool has_layer_prologue() {
@@ -152,75 +144,15 @@ constexpr float as_bf16(float x) {
     return std::bit_cast<float>(rounded);
 }
 
-/// The factor a model applies to its embedding lookup, zero for none.
-///
-/// Rounded to bf16 deliberately. Gemma downcasts the scalar to the weight dtype
-/// before multiplying -- `embed_scale.to(self.weight.dtype)` in transformers'
-/// modeling_gemma3.py, and vLLM does the same -- so applying the fp32 value
-/// would be a different model: sqrt(640) is 25.2982 while bf16 holds 25.25, a
-/// 0.19% difference that lands on every token of every prompt.
-template <class Variant>
-[[nodiscard]] constexpr float embedding_scale() {
-    if constexpr (requires { Variant::TextConfig::embedding_scale; }) {
-        return as_bf16(Variant::TextConfig::embedding_scale);
-    } else {
-        return 0.0F;
-    }
-}
-
-/// The rope base a layer rotates at.
-///
-/// Gemma 3 rotates its windowed layers at a base 100x smaller than its global
-/// ones, so a single `rope_theta` cannot describe the model. A config that says
-/// nothing keeps the one base it always had, which is every target but that one.
-template <class TextConfig>
+/// RoPE base and window width follow the checkpoint's explicit layer schedule.
 [[nodiscard]] constexpr float layer_rope_theta(int layer, const family::TextGeometry& geometry) {
-    if constexpr (requires { TextConfig::layer_rope_theta(layer); }) {
-        // Two bases keyed on the schedule. Where the artifact declares that schedule it also
-        // declares both bases, and it wins: a target serving two sizes cannot compile the
-        // schedule -- Gemma 4's 12B has 48 layers and its 31B 60 -- and asking a 48-entry
-        // compiled array about layer 50 is out of bounds, not merely wrong.
-        if (geometry.windowed_schedule_declared && geometry.sliding_rope_theta > 0.0F) {
-            return geometry.layer_is_windowed(layer) ? geometry.sliding_rope_theta
-                                                     : geometry.rope_theta;
-        }
-        return TextConfig::layer_rope_theta(layer);
-    } else {
-        (void)layer;
-        return geometry.rope_theta;
-    }
+    return geometry.layer_is_windowed(layer) && geometry.sliding_rope_theta > 0.0F
+               ? geometry.sliding_rope_theta : geometry.rope_theta;
 }
 
-/// The sliding window this layer attends over, in keys, or 0 for a layer that
-/// sees its whole context.
-///
-/// The window is a property of a *layer*, not of a round: Gemma 3 alternates five
-/// windowed layers to one global one, so no single value describes a forward pass.
-/// A config that says nothing is unwindowed everywhere, which is every target but
-/// that one. `layer` is the absolute layer index, the same index
-/// `layer_rope_theta` takes -- the two must agree, because a windowed layer is
-/// exactly the layer that rotates at the local base.
-template <class TextConfig>
-[[nodiscard]] constexpr std::int32_t layer_sliding_window(int layer,
-                                                          const family::TextGeometry& geometry) {
-    if constexpr (requires {
-                      TextConfig::sliding_window;
-                      TextConfig::is_windowed_attention(layer);
-                  }) {
-        // How wide the window is belongs to the checkpoint, so it comes from the geometry.
-        // *Which* layers are windowed is the family's pattern and stays compiled -- unless
-        // the artifact declared its own schedule, which is what a target serving more than
-        // one size must do; see `layer_rope_theta` above for what the compiled array does
-        // when the sizes disagree.
-        if (geometry.windowed_schedule_declared) {
-            return geometry.layer_is_windowed(layer) ? geometry.sliding_window : 0;
-        }
-        return TextConfig::is_windowed_attention(layer) ? geometry.sliding_window : 0;
-    } else {
-        (void)layer;
-        (void)geometry;
-        return 0;
-    }
+[[nodiscard]] constexpr std::int32_t layer_sliding_window(
+    int layer, const family::TextGeometry& geometry) {
+    return geometry.layer_is_windowed(layer) ? geometry.sliding_window : 0;
 }
 
 /// RMSNorm weight convention. This family's checkpoints store zero-centred norm
@@ -258,9 +190,9 @@ template <class Variant>
 /// Debug probe for parity work: a variant may observe intermediate tensors of the family's
 /// layer loop by tag (the default is a no-op that compiles away).
 template <class Variant>
-inline void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
-    if constexpr (requires { Variant::debug_probe(tag, tensor, stream); }) {
-        Variant::debug_probe(tag, tensor, stream);
+inline void debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream) {
+    if constexpr (requires { Variant::debug_probe(tag, tensor, layer_count, stream); }) {
+        Variant::debug_probe(tag, tensor, layer_count, stream);
     }
 }
 
@@ -425,19 +357,20 @@ struct ResidualHooks {
     }
 
     /// The prologue's per-slot state pool, planned next to the linear-attention pool.
-    [[nodiscard]] static std::optional<NgramPleStatePoolSpec> ple_state_spec(std::int32_t slots) {
+    [[nodiscard]] static std::optional<NgramPleStatePoolSpec> ple_state_spec(const family::TextGeometry& geometry, std::int32_t slots) {
         if constexpr (prologue) {
-            return Variant::ple_state_spec(slots);
+            if (!geometry.ple_ngram) { return std::nullopt; }
+            return Variant::ple_state_spec(geometry, slots);
         } else {
             (void)slots;
             return std::nullopt;
         }
     }
 
-    [[nodiscard]] static std::size_t layer_prologue_workspace_capacity_bytes(std::int32_t first,
+    [[nodiscard]] static std::size_t layer_prologue_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                              std::int32_t last) {
         if constexpr (prologue) {
-            return Variant::layer_prologue_workspace_capacity_bytes(first, last);
+            return Variant::layer_prologue_workspace_capacity_bytes(geometry, first, last);
         } else {
             (void)first; (void)last;
             return 0;
@@ -489,19 +422,8 @@ struct ResidualHooks {
         } else {
             (void)work;
             ops::embedding(ids, model.token_embedding, residual, stream);
-            // The artifact's own scale where it declares one, the target's compiled constant
-            // otherwise.
-            //
-            // A target serving more than one size *cannot* compile this: Gemma's factor is
-            // `sqrt(hidden)`, which is 62.0 at the 12B's 3840 and 73.5 at the 31B's 5376. And
-            // getting it wrong is close to invisible from the top -- every norm divides the
-            // scale straight back out, so the projections and their norms all agree, and only
-            // the residual carries the error. It shows up as the residual being weighted
-            // wrongly against each block's output: measured on a 512-wide fixture served with
-            // the 12B's compiled 62.0, every probe through the attention core matched at
-            // cosine 0.9999 and the layer's own output came out at 0.925.
-            const float declared = as_bf16(model.geometry.embedding_scale);
-            const float scale    = declared != 0.0F ? declared : embedding_scale<Variant>();
+            // Gemma casts its configured embedding factor to BF16 before multiplying.
+            const float scale = as_bf16(model.geometry.embedding_scale);
             if (scale != 0.0F) { ops::scale(residual, scale, stream); }
         }
     }

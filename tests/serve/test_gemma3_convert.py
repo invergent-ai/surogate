@@ -40,18 +40,20 @@ GEMMA3_270M_CONFIG: dict[str, object] = {
     "sliding_window": 512,
     "_sliding_window_pattern": 6,
     "layer_types": [
-        "full_attention" if layer in inventory.GLOBAL_ATTENTION_LAYERS else "sliding_attention"
-        for layer in range(inventory.LAYERS)
+        "full_attention" if layer in (5, 11, 17) else "sliding_attention"
+        for layer in range(18)
     ],
-    "num_hidden_layers": inventory.LAYERS,
-    "hidden_size": inventory.HIDDEN,
-    "intermediate_size": inventory.INTERMEDIATE,
-    "vocab_size": inventory.VOCAB,
-    "num_attention_heads": inventory.QUERY_HEADS,
-    "num_key_value_heads": inventory.KV_HEADS,
-    "head_dim": inventory.HEAD_DIM,
+    "num_hidden_layers": 18,
+    "hidden_size": 640,
+    "intermediate_size": 2048,
+    "vocab_size": 262144,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 1,
+    "head_dim": 256,
 }
 
+
+GEOMETRY = convert.geometry_from_config(GEMMA3_270M_CONFIG)
 
 def config(**overrides: object) -> dict[str, object]:
     """The reference config with members replaced, or dropped by passing `None`
@@ -76,7 +78,7 @@ def without(*names: str, **overrides: object) -> dict[str, object]:
 
 def test_reference_config_validates() -> None:
     geometry, summary = convert.validate_config(GEMMA3_270M_CONFIG)
-    assert geometry == inventory.GEOMETRY
+    assert geometry == GEOMETRY
     assert summary["architecture"] == "Gemma3ForCausalLM"
     # Recorded as derived: this checkpoint writes no `tie_word_embeddings` key.
     assert summary["text"]["tie_word_embeddings"] is True
@@ -94,7 +96,7 @@ def test_an_export_that_omits_an_optional_member_still_converts(absent: str) -> 
     """
 
     geometry, _ = convert.validate_config(without(absent))
-    assert geometry == inventory.GEOMETRY
+    assert geometry == GEOMETRY
 
 
 def test_the_two_config_tables_are_disjoint() -> None:
@@ -133,27 +135,12 @@ def test_a_required_member_that_is_absent_is_still_refused() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_layer_types_that_disagree_with_the_target_schedule_are_refused() -> None:
-    """The header states the schedule as data (`config.h::kWindowedAttention`).
-
-    A checkpoint that windowed different layers would load and be served with the
-    wrong mask and the wrong rope base on each one, in silence: a windowed layer
-    and a global one store identical objects. The refusal names the layers.
-    """
-
+def test_checkpoint_layer_types_replace_the_old_preset_schedule() -> None:
     layer_types = list(GEMMA3_270M_CONFIG["layer_types"])
-    # Gemma counts the period from the end, so layer 5 is global and layer 6 is
-    # windowed. Swap exactly those two.
     layer_types[5], layer_types[6] = layer_types[6], layer_types[5]
-
-    with pytest.raises(ValueError) as excinfo:
-        convert.validate_config(config(layer_types=layer_types))
-
-    message = str(excinfo.value)
-    assert "kWindowedAttention" in message
-    assert "2 of 18 layers disagree" in message
-    assert "5: checkpoint sliding, target full" in message
-    assert "6: checkpoint full, target sliding" in message
+    geometry, summary = convert.validate_config(config(layer_types=layer_types))
+    assert geometry.layer_types == tuple(layer_types)
+    assert summary["attention"]["global_layers"] == [6, 11, 17]
 
 
 def test_a_layer_types_only_export_converts() -> None:
@@ -168,7 +155,7 @@ def test_a_layer_types_only_export_converts() -> None:
     geometry, summary = convert.validate_config(
         without("sliding_window_pattern", "_sliding_window_pattern")
     )
-    assert geometry == inventory.GEOMETRY
+    assert geometry == GEOMETRY
     assert summary["attention"]["layer_schedule"][:6] == [
         "sliding",
         "sliding",
@@ -184,10 +171,10 @@ def test_a_period_only_export_converts_in_either_spelling(spelling: str) -> None
     """And the period resolves to the same schedule the list states."""
 
     period_only = without("layer_types", "sliding_window_pattern", "_sliding_window_pattern")
-    period_only[spelling] = inventory.SLIDING_WINDOW_PERIOD
+    period_only[spelling] = 6
     _, summary = convert.validate_config(period_only)
     assert summary["attention"]["layer_schedule"] == [
-        "sliding" if windowed else "full" for windowed in inventory.WINDOWED_ATTENTION
+        "sliding" if windowed else "full" for windowed in [kind == "sliding_attention" for kind in GEMMA3_270M_CONFIG["layer_types"]]
     ]
 
 
@@ -201,15 +188,17 @@ def test_an_explicit_null_period_does_not_shadow_the_underscore_spelling() -> No
     both["sliding_window_pattern"] = None
     _, summary = convert.validate_config(both)
     assert summary["attention"]["layer_schedule"] == [
-        "sliding" if windowed else "full" for windowed in inventory.WINDOWED_ATTENTION
+        "sliding" if windowed else "full" for windowed in [kind == "sliding_attention" for kind in GEMMA3_270M_CONFIG["layer_types"]]
     ]
 
 
-def test_a_period_that_disagrees_with_the_target_schedule_is_refused() -> None:
+def test_checkpoint_period_replaces_the_old_preset_schedule() -> None:
     period_only = without("layer_types", "sliding_window_pattern", "_sliding_window_pattern")
     period_only["sliding_window_pattern"] = 4
-    with pytest.raises(ValueError, match="kWindowedAttention"):
-        convert.validate_config(period_only)
+    geometry, summary = convert.validate_config(period_only)
+    assert summary["attention"]["global_layers"] == [3, 7, 11, 15]
+    assert geometry.layer_types[3] == "full_attention"
+    assert geometry.layer_types[5] == "sliding_attention"
 
 
 def test_a_config_stating_no_schedule_at_all_is_refused() -> None:
@@ -223,14 +212,14 @@ def test_a_config_stating_no_schedule_at_all_is_refused() -> None:
 
 
 def test_the_target_schedule_matches_the_dsl_derivation() -> None:
-    """`inventory.WINDOWED_ATTENTION` mirrors the header; the DSL owns the rule.
+    """`[kind == "sliding_attention" for kind in GEMMA3_270M_CONFIG["layer_types"]]` mirrors the header; the DSL owns the rule.
     Restating it would be a second thing to get wrong."""
 
     from surogate.dsl.models.gemma3 import _parse_gemma3_layer_types
 
     assert _parse_gemma3_layer_types(
-        None, inventory.LAYERS, inventory.SLIDING_WINDOW_PERIOD
-    ) == ["sliding" if windowed else "full" for windowed in inventory.WINDOWED_ATTENTION]
+        None, 18, 6
+    ) == ["sliding" if windowed else "full" for windowed in [kind == "sliding_attention" for kind in GEMMA3_270M_CONFIG["layer_types"]]]
 
 
 # ---------------------------------------------------------------------------
@@ -246,8 +235,8 @@ def test_the_tied_output_head_is_aliased_not_stored() -> None:
     carries one 262144x640 table rather than two byte-identical ones.
     """
 
-    declared = [spec.name for spec in inventory.TENSOR_SPECS]
-    stored = [spec.name for spec in inventory.STORED_TENSOR_SPECS]
+    declared = [spec.name for spec in inventory.build_tensor_specs(GEOMETRY)]
+    stored = [spec.name for spec in inventory.build_stored_tensor_specs(GEOMETRY)]
 
     assert "text/output_head" in declared
     assert "text/output_head" not in stored
@@ -263,12 +252,12 @@ def test_the_recipe_does_not_quantise_the_embedding_twice() -> None:
     """The head used to carry the embedding's own source expression, so the
     single largest quantization in the run was done twice."""
 
-    tied = convert.build_recipes()
-    assert [r.object_name for r in tied] == [s.name for s in inventory.STORED_TENSOR_SPECS]
+    tied = convert.build_recipes(GEOMETRY)
+    assert [r.object_name for r in tied] == [s.name for s in inventory.build_stored_tensor_specs(GEOMETRY)]
     assert "text/output_head" not in {r.object_name for r in tied}
 
-    untied = convert.build_recipes(tied_output_head=False)
-    assert [r.object_name for r in untied] == [s.name for s in inventory.TENSOR_SPECS]
+    untied = convert.build_recipes(GEOMETRY, tied_output_head=False)
+    assert [r.object_name for r in untied] == [s.name for s in inventory.build_tensor_specs(GEOMETRY)]
     head = next(r for r in untied if r.object_name == "text/output_head")
     assert "lm_head.weight" in {s.name for s in convert.expression_sources(head.expression)}
 
@@ -277,19 +266,19 @@ def test_the_alias_removes_one_embedding_table_from_the_artifact() -> None:
     """What the alias is worth, in bytes the writer would actually emit."""
 
     resources = {spec.name: b"{}" for spec in inventory.RESOURCE_SPECS}
-    tied = convert.build_object_plan(resources, tied_output_head=True)
-    untied = convert.build_object_plan(resources, tied_output_head=False)
+    tied = convert.build_object_plan(resources, GEOMETRY, tied_output_head=True)
+    untied = convert.build_object_plan(resources, GEOMETRY, tied_output_head=False)
 
     assert len(untied.objects) - len(tied.objects) == 1
     # 262144 x 640 as W8G32_F16S: one byte an element plus one f16 scale per 32.
-    elements = inventory.VOCAB * inventory.HIDDEN
+    elements = 262144 * 640
     assert untied.payload_span_bytes - tied.payload_span_bytes == elements + elements // 32 * 2
 
 
-def test_preflight_accepts_both_artifact_shapes() -> None:
-    """`preflight_inventory` is the check that actually blocks a conversion run,
-    and it counts objects — so it has to know which shape it is counting."""
+def test_checkpoint_recipe_coverage_accepts_both_artifact_shapes() -> None:
+    from surogate.serve.convert.common.recipe import validate_recipe_coverage
 
-    convert.preflight_inventory(tied_output_head=True)
-    convert.preflight_inventory(tied_output_head=False)
-    assert len(inventory.OBJECT_SPECS) == len(inventory.STORED_TENSOR_SPECS) + 4
+    for tied in (True, False):
+        specs, objects = inventory.active_specs(geometry=GEOMETRY, tied_output_head=tied)
+        validate_recipe_coverage(convert.build_recipes(GEOMETRY, tied_output_head=tied), specs)
+        assert len(objects) == len(specs) + 4
