@@ -7,9 +7,9 @@
   </picture>
 </a>
 
-<h1>Train at full throttle. Serve at full speed.</h1>
+<h1>Train and serve LLMs at extreme speed and massive throughput.</h1>
 
-<p><strong>Native C++/CUDA engines for LLM training and serving.<br>BF16. FP8. NVFP4. From your first fine-tune to hundreds of concurrent requests.</strong></p>
+<p><strong>Native C++/CUDA engine for LLM training and serving.<br>Native GGUF, NVFP4, BF16, and FP8. From your first fine-tune to hundreds of concurrent requests.</strong></p>
 
 <p>
   <a href="https://surogate.ai">Website</a> ·
