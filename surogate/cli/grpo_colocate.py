@@ -1,6 +1,7 @@
 """CLI entry point for co-locate GRPO: `surogate grpo-colocate --train t.yaml --infer i.yaml --orch o.yaml`
 
-vLLM and the trainer share the same GPUs and exchange base weights via CUDA IPC.
+Native serving and training alternate on one GPU with shared BF16 Qwen3 weights.
+Select backend: vllm in the inference config for the CUDA IPC quantized path.
 For disjoint-GPU mode, see `surogate grpo`.
 """
 

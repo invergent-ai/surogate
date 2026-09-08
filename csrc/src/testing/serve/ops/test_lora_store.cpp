@@ -11,6 +11,7 @@
 // the multi-device cases skip. Nothing here needs a model or a checkpoint.
 
 #include "api/ops/lora_store.h"
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/engine_context.h"
 
@@ -98,6 +99,31 @@ void one_device() {
     bool tail_is_zero = true;
     for (std::size_t i = 2 * 4; i < written.size(); ++i) { tail_is_zero &= written[i] == 0; }
     check(tail_is_zero, "rows past the adapter's rank stay zero");
+
+    // A live trainer publishes compact GPU tensors into padded serving banks.
+    const std::vector<std::uint16_t> ones(8, 0x3F80);
+    sinfer::DeviceBuffer a(ones.size() * sizeof(std::uint16_t));
+    sinfer::DeviceBuffer b(ones.size() * sizeof(std::uint16_t));
+    a.copy_from_host(ones.data(), a.bytes);
+    b.copy_from_host(ones.data(), b.bytes);
+    sinfer::DeviceAdapterModule module{0, "down_proj", a.p, b.p, 2, 4, 4, 2.0F};
+    store.set_device_module(0, module);
+    check(read_slot_a(*bank, 0, device) == written, "GPU publication matches scaled host upload");
+    std::vector<std::uint16_t> published_b(bank->b_stride);
+    CUDA_CHECK(cudaMemcpy(published_b.data(), bank->b, published_b.size() * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost));
+    bool b_matches = true;
+    for (std::size_t i = 0; i < published_b.size(); ++i) {
+        b_matches &= published_b[i] == (i % 8 < 2 ? 0x3F80 : 0);
+    }
+    check(b_matches, "GPU B rows have the correct rank padding");
+    module.in = 3;
+    bool rejected = false;
+    try { store.set_device_module(0, module); }
+    catch (const std::exception&) { rejected = true; }
+    check(rejected, "GPU publication rejects an incompatible adapter shape");
+    check(read_slot_a(*bank, 0, device) == written, "rejected publication leaves the slot intact");
+    check(read_slot_a(*bank, 1, device) == written, "GPU publication leaves other slots intact");
 
     // Unloading scrubs the slot rather than freeing it, so a request still in
     // flight adds nothing instead of reading another adapter's weights.

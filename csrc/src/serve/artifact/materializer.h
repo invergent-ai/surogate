@@ -4,6 +4,7 @@
 #include "core/tensor.h"
 #include "core/arena.h"
 #include "core/device.h"
+#include "api/shared_weights.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -68,7 +69,7 @@ public:
 
 private:
     friend MaterializedArtifact materialize(const Reader&, const MaterializationPlan&,
-                                            DeviceContext&, LoadProgress*);
+                                            DeviceContext&, LoadProgress*, std::span<const BorrowedTensor>);
 
     struct ObjectStorage {
         void* device = nullptr;
@@ -85,6 +86,7 @@ private:
 };
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 DeviceContext& device, LoadProgress* progress = nullptr);
+                                 DeviceContext& device, LoadProgress* progress = nullptr,
+                                 std::span<const BorrowedTensor> borrowed = {});
 
 } // namespace sinfer::artifact

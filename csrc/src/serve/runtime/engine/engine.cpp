@@ -162,6 +162,9 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(normalized_device(std::move(engine_options))), device(options.device) {
+        if (!options.borrowed_weights.empty() && !options.devices.empty()) {
+            throw std::invalid_argument("borrowed weights currently require a single device");
+        }
         // The engine's op-layer state home. Bound here so everything target
         // construction creates -- Marlin scratch and adoption, LoRA banks,
         // sleepable arenas (which record this as their owner) -- lands in THIS
@@ -169,6 +172,12 @@ public:
         // so addresses captured into graphs now and used by rounds later agree.
         options.ops_context = &ops_context;
         ops::bind_ops_context(&ops_context);
+        struct ConstructionContextGuard {
+            ~ConstructionContextGuard() {
+                set_sleepable_allocations(false);
+                ops::bind_ops_context(nullptr);
+            }
+        } construction_context_guard;
         // surogate vendor patch (PATCHES.md #20): the engine opts into the
         // derived FP8 prefill plane (op tests stay int8-exact by default;
         // SUROGATE_SERVE_FP8_PREFILL=0 vetoes).

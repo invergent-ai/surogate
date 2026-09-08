@@ -136,6 +136,7 @@ class GRPOTrainer:
     """GRPO RL trainer using Surogate's C++ engine."""
 
     def __init__(self, config: GRPOTrainConfig, external_weights: list[list[dict]] | None = None):
+        self.phase_controller = None
         self.config = config
 
         # Build DSL IR for the model (same pattern as SurogateTrainerWrapper)
@@ -667,6 +668,8 @@ class GRPOTrainer:
         )
         # chunked GRPO: no packed-doc isolation in chunked training attention
         self.packer.single_sample_bins = bool(getattr(config, 'single_sample_bins', False))
+        if self.phase_controller is not None:
+            self.packer.check_cancelled = self.phase_controller.check_cancelled
 
         # Setup data loader (receives packed MicroBatches)
         self.data_loader = GRPODataLoader(
@@ -726,6 +729,8 @@ class GRPOTrainer:
         # on that broadcast.
         packs_done = 0
         while True:
+            if self.phase_controller is not None:
+                self.phase_controller.check_cancelled()
             orch_step = self.start_step + packs_done
 
             # 1. Broadcast weights (after first orchestrator step)
@@ -748,6 +753,9 @@ class GRPOTrainer:
             if not micro_batches:
                 logger.warning("No micro-batches received, retrying...")
                 continue
+
+            if self.phase_controller is not None:
+                self.phase_controller.begin_training(orch_step)
 
             # Accumulate ALL micro-batches from one pack into a single optimizer step.
             # No fixed gradient_accumulation_steps — the count is determined dynamically by the packer each step.

@@ -200,7 +200,9 @@ DslParamStore::DslParamStore(const Module& module,
         Entry entry;
         entry.external = mExternalParams.find(name) != mExternalParams.end();
         entry.managed_by_weight_manager = (!entry.external && mUsesWeightManager);
-        if (entry.external || entry.managed_by_weight_manager) {
+        entry.storage_alias = freeze_base && config.TiedWordEmbeddings && name == "lm_head" &&
+            graph.params.contains("embedding") && !entry.external && !mUsesWeightManager;
+        if (entry.external || entry.managed_by_weight_manager || entry.storage_alias) {
             entry.tensor = Tensor::empty(dtype, shape);
         } else {
             entry.tensor = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
@@ -212,6 +214,15 @@ DslParamStore::DslParamStore(const Module& module,
 
         mParams.emplace(name, entry);
         mParamOrder.push_back(name);
+    }
+
+    if (mParams.contains("lm_head") && mParams.at("lm_head").storage_alias) {
+        auto& head = mParams.at("lm_head").tensor;
+        const auto& embedding = mParams.at("embedding").tensor;
+        if (head.nelem() != embedding.nelem() || head.DType != embedding.DType) {
+            throw std::runtime_error("tied frozen head and embedding must have matching shapes and dtype");
+        }
+        head = embedding;
     }
 
     // Deterministic ordering for optimizer updates/checkpointing.
@@ -318,7 +329,7 @@ std::size_t DslParamStore::rebindable_persistent_bytes(const CompiledGraph& grap
     // `QLoRAWeightProvider` / `DslWeightManager` / the LoRA manager).
     for (const auto& kv : mParams) {
         const Entry& entry = kv.second;
-        if (entry.external || entry.managed_by_weight_manager) {
+        if (entry.external || entry.managed_by_weight_manager || entry.storage_alias) {
             return 0;
         }
     }
@@ -340,6 +351,7 @@ std::size_t DslParamStore::rebindable_persistent_bytes(const CompiledGraph& grap
 void DslParamStore::rebind_to_persistent_arena(const CompiledGraph& graph,
                                                const PhaseArenas& arenas,
                                                cudaStream_t stream) {
+    if (mParams.contains("lm_head") && mParams.at("lm_head").storage_alias) return;
     if (!arenas.allocated || arenas.persistent_ptr == nullptr || arenas.persistent_bytes == 0) return;
 
     std::size_t rebound = 0;

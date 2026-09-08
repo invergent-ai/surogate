@@ -175,6 +175,10 @@ public:
     /// Requests currently inside this service (admission-counted).
     [[nodiscard]] std::size_t active_requests() const;
     void prepare_sleep_backup() { engine_->prepare_sleep_backup(); }
+    /// Drain and release serving allocations while the trainer retains the base.
+    void begin_shared_training();
+    /// Publish a complete adapter from GPU tensors, then reopen generation.
+    void publish_shared_adapter(const std::string& name, const std::vector<DeviceAdapterModule>& modules);
     /// This model's VRAM footprint while awake (sleepable regions).
     [[nodiscard]] std::size_t resident_bytes() const { return engine_->sleepable_bytes(); }
 
@@ -194,6 +198,7 @@ private:
     std::unique_ptr<sinfer::Engine> engine_;
     sinfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    bool shared_training_ = false; // guarded by request_capacity_->mutex
 };
 
 } // namespace sinfer::serve

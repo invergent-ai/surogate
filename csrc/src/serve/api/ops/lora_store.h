@@ -16,6 +16,7 @@
 // and what lets tokens of different adapters share a kernel.
 
 #include "api/ops/lora.h"
+#include "api/shared_weights.h"
 #include "core/arena.h"
 
 #include <array>
@@ -90,6 +91,8 @@ public:
     void set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
                          const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
                          std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale);
+    void validate_device_module(const DeviceAdapterModule& module) const;
+    void set_device_module(std::int32_t slot, const DeviceAdapterModule& module);
 
     [[nodiscard]] bool has_bindings() const noexcept { return !directory_.empty(); }
 

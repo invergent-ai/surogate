@@ -80,6 +80,9 @@ class SinglePacker(BasePacker):
     def pack(self):
         batches = []
         while len(batches) == 0:
+            check_cancelled = getattr(self, "check_cancelled", None)
+            if check_cancelled is not None:
+                check_cancelled()
             self.multi_run_manager.discover_runs()
             batches = self.receiver.receive()
             time.sleep(0.2)

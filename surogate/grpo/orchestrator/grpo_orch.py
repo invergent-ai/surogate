@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
+import psutil
 
 from surogate.grpo.orchestrator.advantage import compute_advantages
 from surogate.grpo.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
@@ -88,7 +89,8 @@ from surogate.grpo.utils.vlm import is_vlm_model
 
 
 @clean_exit
-async def orchestrate(config: GRPOOrchestratorConfig):
+async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, initial_policy_name=None,
+                      prefetch_batches=True):
     # Initialize the logger
     logger = setup_logger(
         config.log.level,
@@ -140,7 +142,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             "Token-in-token-out (TITO) client is enabled. Only use this if your environment has a linear "
             "history and the chat template has the extension property."
         )
-    inference_pool = await setup_inference_pool(config.client, model_name=config.model.name, client_type=client_type)
+    if inference_pool is None:
+        inference_pool = await setup_inference_pool(config.client, model_name=config.model.name, client_type=client_type)
 
     # Setup teacher inference pool if configured
     if config.teacher_model:
@@ -248,9 +251,13 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             pass
         env_log_thread.join(timeout=2.0)
 
+    scheduler = None
+    training_batch_sender = None
+    rollout_executor = None
+    metrics_dump_file = None
+    env_processes: list[mp.Process] = []
     try:
         train_env_addresses = []
-        env_processes: list[mp.Process] = []
         for env_id, env, env_name in zip(env_ids, config.env, train_env_names):
             if env.address is None:
                 address, process = spawn_env_server(
@@ -372,7 +379,11 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             lora_name=config.model.lora_adapter,
             deferred_group_scoring_tasks=train_env_deferred_group_scoring_tasks,
             config=config,
+            prefetch_batches=prefetch_batches,
         )
+        if initial_policy_name is not None:
+            scheduler.model_name = initial_policy_name
+            inference_pool.update_model_name(initial_policy_name)
 
         # Adaptive rollout-depth budgeting. max_depth defaults to the largest
         # max_turns configured across training envs, so the cap can never exceed
@@ -968,41 +979,36 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             logger.info("Writing final checkpoint")
             ckpt_manager.save(progress, buffer, step=progress.step)
 
-        # Close metrics dump file
-        if metrics_dump_file is not None:
-            metrics_dump_file.close()
-
-        # Close training batch sender
-        training_batch_sender.close()
-
-        # Shutdown rollout executor
-        rollout_executor.shutdown(wait=False)
-
-        # Stop scheduler
-        await scheduler.stop()
-
-        # Stop inference pool
-        await inference_pool.stop()
-
+    finally:
+        # Failure and cancellation must also stop the environment workers;
+        # otherwise multiprocessing waits for them at process exit indefinitely.
+        cleanup = [safe_cancel(event_loop_lag_monitor_task), inference_pool.stop()]
+        if scheduler is not None:
+            cleanup.append(scheduler.stop())
         if teacher_inference_pool is not None:
-            await teacher_inference_pool.stop()
-
+            cleanup.append(teacher_inference_pool.stop())
         if ruler_judge_pool is not None:
-            await ruler_judge_pool.aclose()
-
-        # Cancel event loop lag monitor task
-        await safe_cancel(event_loop_lag_monitor_task)
-
-        # Shutdown env processes. Use SIGKILL to avoid noisy tracebacks from the
-        # verifiers library's signal handler which raises exceptions inside running
-        # coroutines, causing "Task exception was never retrieved" warnings.
-        # Graceful cleanup isn't needed here since the inference pool and scheduler
-        # are already stopped — no more requests are in flight.
+            cleanup.append(ruler_judge_pool.aclose())
+        await asyncio.gather(*cleanup, return_exceptions=True)
         for process in env_processes:
+            try:
+                descendants = psutil.Process(process.pid).children(recursive=True)
+            except psutil.NoSuchProcess:
+                descendants = []
+            for child in reversed(descendants):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
             if process.is_alive():
                 process.kill()
             process.join(timeout=5)
-    finally:
+        if rollout_executor is not None:
+            rollout_executor.shutdown(wait=False, cancel_futures=True)
+        if training_batch_sender is not None:
+            training_batch_sender.close()
+        if metrics_dump_file is not None:
+            metrics_dump_file.close()
         _stop_env_log_listener()
 
     logger.success("Orchestrator finished.")

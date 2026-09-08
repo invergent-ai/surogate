@@ -1,4 +1,5 @@
 #pragma once
+#include "api/shared_weights.h"
 
 #include <array>
 #include <chrono>
@@ -107,6 +108,7 @@ struct LoadProgress {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    std::vector<BorrowedTensor> borrowed_weights;
     int device                         = 0;
     // Pipeline parallelism (phase 3): more than one device splits the model into that many
     // layer-range stages, one per device in this order (the first is also `device`).

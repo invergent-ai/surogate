@@ -1570,6 +1570,13 @@ class SurogateTrainer:
         Returns: dict[str, ndarray] mapping parameter name -> gradient view.
         Note: blocking; intended for debugging only.
         """
+    def get_shared_base_weights(self) -> dict:
+        """Return owner-retaining CUDA views of frozen, resident BF16 base weights.
+
+        Requires single-GPU LoRA without quantization or weight offloading.
+        """
+    def get_lora_weights(self, gpu_id: int) -> dict:
+        """Return owner-retaining CUDA views of the live LoRA parameters."""
     def get_lora_gradients(self, gpu_id: int) -> dict:
         """
         Return LoRA adapter gradients for debugging.

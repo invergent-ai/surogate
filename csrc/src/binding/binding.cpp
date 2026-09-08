@@ -1878,7 +1878,8 @@ NB_MODULE(_surogate, m) {
             "Note: blocking; intended for debugging only.")
         .def(
             "get_lora_weights",
-            [](MultiGPUPyTrainer* trainer, int gpu_id) {
+            [](nb::object owner, int gpu_id) {
+                auto* trainer = nb::cast<MultiGPUPyTrainer*>(owner);
                 auto raw = trainer->get_lora_weights(gpu_id);
                 nb::dict ret;
                 for (const auto& [name, value] : raw) {
@@ -1887,7 +1888,7 @@ NB_MODULE(_surogate, m) {
                     nb::ndarray<> view{value.Data,
                                        (size_t)value.Rank,
                                        shape.data(),
-                                       ret,
+                                       owner,
                                        nullptr,
                                        to_dlpack_dtype(value.DType),
                                        nb::device::cuda::value,
@@ -1902,6 +1903,18 @@ NB_MODULE(_surogate, m) {
             "Parameters:\n- gpu_id: Which GPU's LoRA weights to return.\n\n"
             "Returns: dict[str, ndarray] mapping PEFT parameter name -> GPU tensor view.\n"
             "Tensors are live views into surogate's GPU memory (zero-copy via DLPack).")
+        .def("get_shared_base_weights", [](nb::object owner) {
+            auto* trainer = nb::cast<MultiGPUPyTrainer*>(owner);
+            auto raw = trainer->get_shared_base_weights();
+            nb::dict result;
+            for (const auto& [name, tensor] : raw) {
+                std::array<std::size_t, 6> shape{};
+                std::copy_n(tensor.Sizes.begin(), tensor.Rank, shape.begin());
+                result[nb::cast(name)] = nb::ndarray<>(tensor.Data, tensor.Rank, shape.data(),
+                    owner, nullptr, to_dlpack_dtype(tensor.DType), nb::device::cuda::value, tensor.Device);
+            }
+            return result;
+        }, "Borrow frozen resident BF16 base weights. Views retain the trainer's lifetime.")
         .def("get_valid_token_count",
              &MultiGPUPyTrainer::get_valid_token_count,
              nb::arg("gpu_id"),

@@ -45,6 +45,7 @@ public:
         bool trainable = true;
         bool external = false;                   ///< Provided by QLoRA weight provider (no local storage)
         bool managed_by_weight_manager = false;  ///< Provided by DslWeightManager (no local storage)
+        bool storage_alias = false;              ///< Frozen tied output reads the embedding allocation
     };
 
     DslParamStore(const Module& module,
@@ -61,6 +62,7 @@ public:
     bool has(const std::string& name) const;
     bool is_trainable(const std::string& name) const;
     bool is_external(const std::string& name) const;
+    bool is_storage_alias(const std::string& name) const { return mParams.at(name).storage_alias; }
     /// True when the weight's GPU buffer is refilled between uses (streamed /
     /// gathered-on-demand weights). See DslWeightManager::work_is_transient.
     bool work_is_transient(const std::string& name) const;

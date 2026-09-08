@@ -58,7 +58,7 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
     const bool use_weight_manager = (mWeightManager != nullptr);
 
     for (const auto& name : mParams->param_names()) {
-        if (mParams->is_external(name)) {
+        if (mParams->is_external(name) || mParams->is_storage_alias(name)) {
             continue;
         }
         Tensor& param = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
@@ -243,7 +243,7 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                 fflush(stderr);
             }
         }
-        if (mParams->is_external(name)) {
+        if (mParams->is_external(name) || mParams->is_storage_alias(name)) {
             continue;
         }
         Tensor& param = mWeightManager ? mWeightManager->get_master(name) : mParams->get(name);
@@ -1044,6 +1044,22 @@ IRunState& DslModel::get_run_state() const {
 
 bool DslModel::is_weight_streaming_enabled() const {
     return mWeightManager && mWeightManager->is_streaming_enabled();
+}
+
+std::vector<std::pair<std::string, Tensor>> DslModel::shared_base_weights() {
+    if (!lora_enabled() || qlora_enabled() || mNumShards != 1 || !mParams || mWeightManager) {
+        throw std::runtime_error("shared base weights require single-GPU resident BF16 LoRA");
+    }
+    std::vector<std::pair<std::string, Tensor>> result;
+    for (const auto& name : mParams->param_names()) {
+        Tensor& tensor = mParams->get(name);
+        if (!tensor.Data || tensor.Device < 0 || tensor.DType != ETensorDType::BF16) {
+            throw std::runtime_error("shared base weight is not resident BF16: " + name);
+        }
+        result.emplace_back(name, tensor);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return result;
 }
 
 void DslModel::import_weights_from_external(const std::string& safetensors_path,

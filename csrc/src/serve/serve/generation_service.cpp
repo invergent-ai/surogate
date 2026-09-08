@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "serve/generation_service.h"
+#include <set>
 
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
@@ -233,6 +234,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     : options_(std::move(options)) {
     sinfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
+    engine_options.borrowed_weights         = options_.borrowed_weights;
     engine_options.device                   = options_.device;
     engine_options.devices                  = options_.devices;
     engine_options.max_context              = options_.max_context;
@@ -327,6 +329,10 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
     const auto started = Clock::now();
     {
         std::lock_guard lock(request_capacity_->mutex);
+        if (shared_training_) {
+            throw_request_error(sinfer::RequestError(RequestErrorKind::Overloaded,
+                                                     "rollouts are paused for a training step"));
+        }
         if (request_capacity_->active >= request_capacity_->maximum) {
             throw_request_error(sinfer::RequestError(RequestErrorKind::Overloaded,
                                                      "inference request queue is full"));
@@ -617,6 +623,9 @@ void GenerationService::clear_lora_slot_everywhere(std::int32_t slot) {
 }
 
 void GenerationService::load_lora_adapter(const std::string& name, const std::string& path) {
+    if (!options_.borrowed_weights.empty()) {
+        throw std::invalid_argument("shared GRPO adapters are published by the trainer");
+    }
     if (!options_.enable_lora) {
         throw std::invalid_argument("the server was started without --enable-lora");
     }
@@ -736,6 +745,9 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
 }
 
 void GenerationService::unload_lora_adapter(const std::string& name) {
+    if (!options_.borrowed_weights.empty()) {
+        throw std::invalid_argument("shared GRPO adapters are owned by the trainer");
+    }
     std::int32_t slot = -1;
     {
         const std::lock_guard<std::mutex> lock(lora_mutex_);
@@ -794,7 +806,71 @@ void GenerationService::sleep(bool preempt) {
     engine_->sleep();
 }
 
-void GenerationService::wake_up() { engine_->wake(); }
+void GenerationService::wake_up() {
+    std::lock_guard lock(request_capacity_->mutex);
+    if (shared_training_) { throw std::logic_error("only the trainer can resume shared GRPO rollouts"); }
+    engine_->wake();
+}
+
+void GenerationService::begin_shared_training() {
+    if (options_.borrowed_weights.empty()) {
+        throw std::logic_error("shared training requires borrowed base weights");
+    }
+    {
+        std::lock_guard lock(request_capacity_->mutex);
+        if (shared_training_) { throw std::logic_error("already in the training phase"); }
+        shared_training_ = true;
+    }
+    try {
+        // Keep the worker running until admitted requests finish. sleep_begin()
+        // parks active generations too, so it cannot precede this drain.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+        while (active_requests() != 0) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                throw std::runtime_error("shared training timed out draining rollouts");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        engine_->sleep();
+    } catch (...) {
+        std::lock_guard lock(request_capacity_->mutex);
+        shared_training_ = false;
+        throw;
+    }
+}
+
+void GenerationService::publish_shared_adapter(const std::string& name,
+                                                const std::vector<DeviceAdapterModule>& modules) {
+    {
+        std::lock_guard lock(request_capacity_->mutex);
+        if (!shared_training_ || request_capacity_->active != 0) {
+            throw std::logic_error("publishing requires a drained training phase");
+        }
+    }
+    if (name.empty() || modules.empty()) { throw std::invalid_argument("an adapter name and modules are required"); }
+    auto& store = engine_->lora_stores().for_device(engine_->device());
+    // Validate the complete update before waking or changing any adapter bytes.
+    std::set<std::pair<int, std::string>> seen;
+    for (const auto& module : modules) {
+        store.validate_device_module(module);
+        if (!seen.emplace(module.layer, module.module).second) {
+            throw std::invalid_argument("duplicate adapter module");
+        }
+    }
+    engine_->wake();
+    store.clear_slot(0);
+    for (const auto& module : modules) { store.set_device_module(0, module); }
+    store.set_active(true);
+    engine_->shrink_kv();
+    {
+        const std::lock_guard lock(lora_mutex_);
+        lora_slot_of_.clear();
+        lora_slot_of_[name] = 0;
+        lora_free_slots_.clear();
+    }
+    std::lock_guard lock(request_capacity_->mutex);
+    shared_training_ = false;
+}
 
 std::size_t GenerationService::active_requests() const {
     const std::lock_guard<std::mutex> lock(request_capacity_->mutex);

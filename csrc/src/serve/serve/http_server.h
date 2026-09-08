@@ -38,6 +38,7 @@ public:
     /// Overcommit mode: the scheduler wakes and evicts models per request.
     void attach_scheduler(class ModelScheduler& scheduler);
     bool listen();
+    [[nodiscard]] bool is_running() const { return server_.is_running(); }
     /// Stop serving. In-flight generations are cancelled rather than waited on:
     /// a request may have a thousand tokens left to produce, and the supervisor
     /// that sent the signal escalates to SIGKILL long before that finishes --

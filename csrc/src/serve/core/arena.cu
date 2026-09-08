@@ -169,8 +169,9 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
 
 DeviceArena::DeviceArena(DeviceSpan storage)
     : base_(storage.data), cap_(storage.bytes), owns_(false) {
-    if (base_ == nullptr || cap_ == 0) {
-        throw std::invalid_argument("borrowed DeviceArena storage must be non-empty");
+    // Both empty represents externally owned model storage with no owned arena.
+    if ((base_ == nullptr) != (cap_ == 0)) {
+        throw std::invalid_argument("borrowed DeviceArena pointer and capacity must agree");
     }
 }
 

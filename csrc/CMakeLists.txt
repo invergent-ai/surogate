@@ -1640,9 +1640,10 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
         # from _surogate (arch gating + payload + lifecycle isolation).
         if(PYTHON_BINDING)
             nanobind_add_module(_surogate_serve NOSTRIP
-                ${CMAKE_CURRENT_SOURCE_DIR}/src/binding/py_serve.cpp)
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/binding/py_serve.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/binding/py_serve_shared.cpp)
             target_include_directories(_surogate_serve PRIVATE
-                ${SERVE_ROOT} ${SINFER_JSON_INCLUDE})
+                ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
             target_link_libraries(_surogate_serve PRIVATE sinfer_shared)
             set_target_properties(_surogate_serve PROPERTIES EXCLUDE_FROM_ALL TRUE)
         endif()

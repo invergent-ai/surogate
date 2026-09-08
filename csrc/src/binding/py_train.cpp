@@ -3317,6 +3317,17 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
     return result;
 }
 
+std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_shared_base_weights() {
+    if (mContexts.size() != 1) { throw std::runtime_error("shared base weights require one GPU"); }
+    std::vector<std::pair<std::string, Tensor>> result;
+    run_work([&](sThreadContext& ctx) {
+        auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!model) { throw std::runtime_error("shared base weights require a DSL model"); }
+        result = model->shared_base_weights();
+    }, 0);
+    return result;
+}
+
 std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input_ids,
                                                        const std::int32_t* targets,
                                                        int B,

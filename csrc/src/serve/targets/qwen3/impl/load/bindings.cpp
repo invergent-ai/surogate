@@ -61,7 +61,12 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized,
                                const family::TextGeometry& g) {
     DensePostMixerPayload out;
-    out.gate_up = materialized_weight(materialized, plan.gate_up, mlp_gate_up_rows(g), g.hidden);
+    if (plan.separate) {
+        out.gate = materialized_weight(materialized, plan.gate, g.intermediate, g.hidden);
+        out.up = materialized_weight(materialized, plan.up, g.intermediate, g.hidden);
+    } else {
+        out.gate_up = materialized_weight(materialized, plan.gate_up, mlp_gate_up_rows(g), g.hidden);
+    }
     out.down    = materialized_weight(materialized, plan.down, g.hidden, g.intermediate);
     return out;
 }
@@ -92,8 +97,14 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
                                               {g.hidden, g.query_size()});
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
-        target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", weights,
-                                         {mlp_gate_up_rows(g), g.hidden});
+        target.mlp.separate = binder.has(prefix + "mlp/gate");
+        if (target.mlp.separate) {
+            target.mlp.gate = bind_weight(binder, prefix + "mlp/gate", weights, {g.intermediate, g.hidden});
+            target.mlp.up = bind_weight(binder, prefix + "mlp/up", weights, {g.intermediate, g.hidden});
+        } else {
+            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", weights,
+                                             {mlp_gate_up_rows(g), g.hidden});
+        }
         target.mlp.down    = bind_weight(binder, prefix + "mlp/down", weights,
                                          {g.hidden, g.intermediate});
     }

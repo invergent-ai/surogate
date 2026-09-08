@@ -272,6 +272,7 @@ public:
     void dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
+    std::vector<std::pair<std::string, Tensor>> get_shared_base_weights();
     int get_valid_token_count(int gpu_id);
     void set_visual_inputs(const std::int32_t* visual_pos_masks,
                            const float* visual_embeds,

@@ -147,8 +147,20 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     auto scope        = workspace.scope();
     // The width comes from the weight the SwiGLU reads, so this one function serves whatever
     // size of Qwen3 was bound: gate and up are fused, hence half the rows.
-    Tensor activation = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
-    family::swiglu_mlp(hidden, weights.gate_up, activation, kTextPolicy, workspace, stream);
+    const bool separate = weights.gate.qdata != nullptr;
+    Tensor activation = workspace.alloc(DType::BF16, {separate ? weights.gate.n : weights.gate_up.n / 2, hidden.ne[1]});
+    if (separate) {
+        auto pair_scope = workspace.scope();
+        Tensor gate = workspace.alloc(DType::BF16, {weights.gate.n, hidden.ne[1]});
+        Tensor up = workspace.alloc(DType::BF16, {weights.up.n, hidden.ne[1]});
+        ops::linear(hidden, weights.gate, gate, kTextPolicy, workspace, stream);
+        ops::linear(hidden, weights.up, up, kTextPolicy, workspace, stream);
+        apply_lora(weights.gate, family::kGatePort, hidden, gate, stream);
+        apply_lora(weights.up, family::kUpPort, hidden, up, stream);
+        ops::silu_mul(gate, up, activation, stream);
+    } else {
+        family::swiglu_mlp(hidden, weights.gate_up, activation, kTextPolicy, workspace, stream);
+    }
     ops::linear_add(activation, weights.down, residual, kTextPolicy, workspace, stream);
     // down reads the SwiGLU activation, which is exactly the input its adapter
     // was trained against.

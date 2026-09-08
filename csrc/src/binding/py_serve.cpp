@@ -26,6 +26,7 @@
 #include <vector>
 
 namespace nb = nanobind;
+void bind_shared_server(nb::module_& m);
 
 namespace {
 
@@ -148,6 +149,7 @@ private:
 } // namespace
 
 NB_MODULE(_surogate_serve, m) {
+    bind_shared_server(m);
     m.doc() = "surogate serve engine (RTX inference; see csrc/src/serve)";
 
     nb::class_<PyEngine>(m, "Engine")

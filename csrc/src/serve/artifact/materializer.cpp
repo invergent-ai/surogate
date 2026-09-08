@@ -16,6 +16,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 namespace sinfer::artifact {
 namespace {
@@ -149,15 +150,47 @@ DeviceArena& MaterializedArtifact::device_arena() {
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 DeviceContext& device, LoadProgress* progress) {
+                                 DeviceContext& device, LoadProgress* progress,
+                                 std::span<const BorrowedTensor> borrowed) {
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
     const std::uint64_t capacity = plan.device_capacity_bytes;
     if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
         throw ArtifactError("artifact tensor backing size is invalid");
     }
-    out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
-    out.stats_.device_capacity_bytes = capacity;
+    std::unordered_map<std::string, const BorrowedTensor*> bindings;
+    for (const auto& tensor : borrowed) {
+        if (!bindings.emplace(tensor.name, &tensor).second) {
+            throw ArtifactError("duplicate borrowed tensor: " + tensor.name);
+        }
+    }
+    if (!borrowed.empty()) {
+        if (!plan.bank_objects.empty() || bindings.size() != plan.device_objects.size()) {
+            throw ArtifactError("borrowed weights must cover every device tensor without host offload");
+        }
+        for (const auto& placement : plan.device_objects) {
+            const auto& descriptor = std::get<TensorDescriptor>(reader.objects().at(placement.object.index));
+            const auto found = bindings.find(descriptor.name);
+            if (found == bindings.end()) { throw ArtifactError("missing borrowed tensor: " + descriptor.name); }
+            const auto& tensor = *found->second;
+            if (descriptor.format != NumericFormat::BF16 ||
+                descriptor.layout != StorageLayout::ContiguousLeV1 || tensor.shape != descriptor.shape ||
+                tensor.bytes != placement.bytes || tensor.device != device.device || tensor.data == nullptr) {
+                throw ArtifactError("borrowed tensor must match contiguous BF16 shape, bytes and device: " + descriptor.name);
+            }
+            cudaPointerAttributes attributes{};
+            CUDA_CHECK(cudaPointerGetAttributes(&attributes, tensor.data));
+            if (attributes.type != cudaMemoryTypeDevice || attributes.device != device.device) {
+                throw ArtifactError("borrowed tensor is not on the engine's CUDA device: " + descriptor.name);
+            }
+            out.objects_.at(placement.object.index).device = tensor.data;
+        }
+        // A non-owning empty arena preserves the model's accounting interface.
+        out.device_arena_ = std::make_unique<DeviceArena>(DeviceSpan{});
+    } else {
+        out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
+        out.stats_.device_capacity_bytes = capacity;
+    }
     out.stats_.tensor_count          = plan.device_objects.size();
     out.stats_.resource_count        = plan.host_objects.size();
 
@@ -169,6 +202,8 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         out.stats_.file_bytes =
             checked_add(out.stats_.file_bytes, resource.size(), "artifact read bytes overflow u64");
     }
+
+    if (!borrowed.empty()) { return out; }
 
     std::vector<CopyRange> ranges;
     ranges.reserve(plan.device_objects.size());

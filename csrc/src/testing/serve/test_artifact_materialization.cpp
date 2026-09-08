@@ -196,6 +196,52 @@ int main() {
         require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
                     materialized.device_arena().used() == plan.device_capacity_bytes,
                 "materialized tensor does not own the planned device backing");
+
+        // Shared serving must use the caller's bytes, never the file payload,
+        // and destroying the artifact must not release the caller's storage.
+        sinfer::DeviceBuffer owner(kSecondTensor.size());
+        owner.fill(9);
+        const sinfer::BorrowedTensor binding{"weights/second", owner.p, {4}, owner.bytes, 0};
+        {
+            const std::array borrowed{binding};
+            auto shared = sinfer::artifact::materialize(reader, validation_plan, device, nullptr, borrowed);
+            require(shared.device_data(retained_tensor) == owner.p, "borrowed pointer was replaced");
+            require(shared.stats().h2d_bytes == 0 && shared.stats().device_capacity_bytes == 0 &&
+                        shared.device_arena().capacity() == 0,
+                    "borrowed weights allocated or uploaded base storage");
+            const auto bytes = shared.resource_bytes(validated_resource);
+            require(std::equal(bytes.begin(), bytes.end(), kResource.begin(), kResource.end()),
+                    "shared materialization lost frontend resources");
+            owner.fill(7);
+            CUDA_CHECK(cudaMemcpy(second_copied.data(), shared.device_data(retained_tensor),
+                                  second_copied.size(), cudaMemcpyDeviceToHost));
+            require(std::all_of(second_copied.begin(), second_copied.end(),
+                                [](std::byte b) { return b == std::byte{7}; }),
+                    "borrowed tensor does not see its owner's storage");
+        }
+        owner.fill(8);
+        owner.copy_to_host(second_copied.data(), second_copied.size());
+        require(second_copied[0] == std::byte{8}, "borrowed destruction released owner storage");
+        auto rejects = [&](std::vector<sinfer::BorrowedTensor> borrowed) {
+            bool rejected = false;
+            try {
+                auto invalid = sinfer::artifact::materialize(reader, validation_plan, device, nullptr, borrowed);
+            } catch (const sinfer::artifact::ArtifactError&) { rejected = true; }
+            require(rejected, "invalid borrowed binding was accepted");
+        };
+        auto invalid = binding;
+        invalid.name = "missing";
+        rejects({invalid});
+        invalid = binding;
+        invalid.shape = {2, 2};
+        rejects({invalid});
+        invalid = binding;
+        invalid.bytes = 4;
+        rejects({invalid});
+        invalid = binding;
+        invalid.device = 1;
+        rejects({invalid});
+        rejects({binding, binding});
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

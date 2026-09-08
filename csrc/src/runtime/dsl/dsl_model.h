@@ -327,6 +327,8 @@ public:
     [[nodiscard]] DslWeightManager* weight_manager() {
         return mWeightManager.get();
     }
+    /// Frozen resident BF16 parameters for in-process serving. No copies are made.
+    std::vector<std::pair<std::string, Tensor>> shared_base_weights();
 
     /// Debuggability (design/buffer-runtime-v4.md Phase 4 debug surface):
     /// read-only access to the concrete graph executor so tooling can reach

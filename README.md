@@ -86,7 +86,7 @@ From raw text to specialized models, with Python configuration and native C++/CU
 | **Pretraining & full fine-tuning** | Train from scratch, continue pretraining, or update the full model with SFT. |
 | **LoRA & QLoRA** | Adapter training with BF16 bases or FP8, NVFP4, and BnB/NF4 quantization; supported pre-quantized checkpoints and stacked LoRA adapters. |
 | **Native precision recipes** | BF16, hybrid FP8, and Blackwell NVFP4, with configurable model, gradient, and adapter precision. |
-| **GRPO reinforcement learning** | Reward environments, rollout orchestration, evaluation, and native policy updates; separate GPUs or single-GPU colocation with vLLM. |
+| **GRPO reinforcement learning** | Reward environments, evaluation, and policy updates with native serving or vLLM; shared-weight single-GPU training for dense Qwen3 BF16 with LoRA. |
 | **DPO preference training** | Learn from chosen/rejected pairs, with an inline frozen reference, optional length normalization, and differing-span masking. |
 | **Knowledge distillation** | Capture teacher top-K distributions, then train a student with KL divergence and optional cross-entropy. |
 | **Multi-GPU & multi-node** | Native threaded data parallelism, ZeRO sharding, communication overlap, and Ray for multi-node training. |
@@ -257,6 +257,19 @@ surogate serve merged-Q4_K_M.gguf --served-model-name my-finetune
 ```
 
 Run one server at a time on the same port. Compatible adapters can also be [loaded at runtime](docs/inference/api.md#lora-adapters-at-runtime) with `--enable-lora`.
+
+### Run GRPO on one GPU
+
+**Load the base model once for both serving and training.** Native co-locate mode supports dense Qwen3 BF16 safetensors models with LoRA. It generates a batch of rollouts, pauses generation for the training update, then generates the next batch with the updated adapter. Per-step adapter updates stay in GPU memory.
+
+Create the three configuration files from the [Single-GPU GRPO guide](docs/guides/rl-colocate.md), using `backend: surogate` for inference and a fresh output directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 surogate grpo-colocate \
+  --train train.yaml --infer infer.yaml --orch orch.yaml
+```
+
+Training buffers remain reserved during generation, so choose a model and context length that fit your GPU. Quantized bases, other model families, multiple GPUs, and checkpoint resume are not yet supported in this native mode. See the [GRPO guide](docs/guides/rl-training.md) for separate-GPU and vLLM options.
 
 <details>
 <summary><strong>Docker and source builds</strong></summary>

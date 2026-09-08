@@ -1,6 +1,6 @@
 # RL Training (GRPO)
 
-Surogate supports reinforcement learning fine-tuning via GRPO (Group Relative Policy Optimization). The pipeline coordinates a vLLM inference server, a GRPO orchestrator, and the Surogate trainer.
+Surogate supports reinforcement learning fine-tuning via GRPO (Group Relative Policy Optimization). The pipeline coordinates an inference server, a GRPO orchestrator, and the Surogate trainer. Native Surogate serving is the default; vLLM is also available.
 
 This gives you:
 
@@ -16,8 +16,8 @@ GRPO training supports three deployment modes:
 
 | Mode | Command | When to use |
 | --- | --- | --- |
-| **Split-GPU** | `surogate grpo` | Multiple GPUs available; want vLLM and the trainer on disjoint GPU sets |
-| **Co-locate** | `surogate grpo-colocate` | Single GPU, or any case where vLLM and the trainer should share GPUs (zero-copy base weights) |
+| **Split-GPU** | `surogate grpo` | Run serving and training on separate GPU sets |
+| **Co-locate** | `surogate grpo-colocate` | Generate rollouts and train on one GPU with shared base weights |
 | **Multi-process** | `surogate grpo-infer` + `grpo-orch` + `grpo-train` | Multi-node, or when each component must run in its own process |
 
 ### Split-GPU mode
@@ -52,35 +52,25 @@ The CLI is the source of truth for the trainer GPU count: `--trainer-gpus 4,5,6,
 
 ### Co-locate mode
 
-A single `surogate grpo-colocate` command starts all three components in one process with zero-copy GPU weight sharing:
+For BF16 dense Qwen3 models, native co-locate mode loads the base weights once
+and shares them between serving and LoRA training. It generates a batch of
+rollouts, pauses generation for the training update, then continues with the
+updated adapter. Adapter updates stay in GPU memory.
 
-```
-surogate grpo-colocate --train train.yaml --infer infer.yaml --orch orch.yaml
-```
-
-```
-┌───────────────────────────────────────────────────────────┐
-│  surogate grpo-colocate (single process)                  │
-│                                                           │
-│  1. vLLM server (background thread, engine in subprocess) │
-│     └─ Owns quantized base weights on GPU                 │
-│     └─ Serves /v1/chat/completions                        │
-│                                                           │
-│  2. Trainer (background thread)                           │
-│     └─ Borrows vLLM's quantized weights (zero-copy IPC)   │
-│     └─ Dequantizes on-the-fly for forward/backward        │
-│                                                           │
-│  3. Orchestrator (main async event loop)                  │
-│     └─ Sends rollout requests to vLLM via HTTP            │
-│     └─ Computes rewards and advantages                    │
-│     └─ Sends training batches via filesystem transport    │
-│     └─ Signals LoRA weight updates to vLLM                │
-└───────────────────────────────────────────────────────────┘
+```bash
+CUDA_VISIBLE_DEVICES=0 surogate grpo-colocate \
+    --train train.yaml --infer infer.yaml --orch orch.yaml
 ```
 
-**How weight sharing works**: At startup, vLLM loads and quantizes the base model on GPU. The trainer then receives GPU pointers to those quantized tensors via CUDA IPC — no copy, no duplicate memory. Only the base weights (linear layers) are shared; small non-quantized weights (norms, embeddings) are loaded separately from disk. LoRA adapter updates are small (~10 MB) and go through the filesystem.
+Use `backend: surogate` in `infer.yaml`, `gpus: 1`, `recipe: bf16`, and
+`lora: true` in `train.yaml`. Training and orchestrator `max_steps` must match.
+Start with a fresh output directory. See [Single-GPU GRPO](rl-colocate.md) for
+complete configuration and current limitations.
 
-**Automatic memory management**: The trainer's GPU memory footprint (LoRA parameters, activations, dequantization buffers) is estimated automatically, and `gpu_memory_utilization` is computed so vLLM uses the remaining GPU memory for its KV cache. No manual tuning needed.
+The existing vLLM co-locate mode remains available with `backend: vllm`. It
+shares supported quantized base matrices; other tensors are loaded separately,
+and adapter updates use files. The vLLM-specific configuration is described
+[below](#vllm-co-locate-mode-details).
 
 ### Multi-process mode
 
@@ -193,13 +183,13 @@ That's it. The command:
 
 ## Quick Start (co-locate mode)
 
-For a single-GPU setup, run vLLM and the trainer on the same GPU with `surogate grpo-colocate`:
+For a single-GPU setup, run serving and training with `surogate grpo-colocate`:
 
 ```bash
 surogate grpo-colocate --train train.yaml --infer infer.yaml --orch orch.yaml
 ```
 
-You do **not** need to set `gpu_memory_utilization` in co-locate mode — it is computed automatically based on the trainer's memory requirements. Base weights are shared zero-copy via CUDA IPC.
+For native co-locate mode, follow [Single-GPU GRPO](rl-colocate.md). With `backend: vllm`, `gpu_memory_utilization` is computed automatically based on the trainer's memory requirements.
 
 ## Quick Start (multi-process mode)
 
@@ -373,7 +363,9 @@ easy to scroll past in volume.
 
 The `surogate grpo` process owns the vLLM subprocess: it terminates and (if necessary) kills the child during shutdown. If the parent is `SIGKILL`ed, the vLLM subprocess and its engine workers can be left orphaned holding GPU memory — clean up with `nvidia-smi` if that happens.
 
-## Co-locate Mode Details
+## vLLM Co-locate Mode Details
+
+This section applies to `backend: vllm`.
 
 ### How weight sharing works
 
@@ -516,7 +508,7 @@ noise_scheduler:
 - Tasks where reward signal diversity is low (many rollouts get the same reward)
 - Pre-quantized models (NVFP4, FP8) where quantization already introduces noise — QeRL amplifies this effect in a controlled way
 
-QeRL works in all three deployment modes (split, co-locate, multi-process).
+QeRL works in split, vLLM co-locate, and multi-process modes. Native co-locate does not yet support QeRL weight noise.
 
 ### On-Policy Distillation
 

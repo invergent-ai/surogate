@@ -90,7 +90,12 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         // projected on their own is refused here, once, rather than throwing on
         // every forward pass.
         const Weight& gate_up = attention.post_mixer.gate_up;
-        if (family::swiglu_halves_addressable(gate_up)) {
+        if (attention.post_mixer.gate.qdata != nullptr) {
+            store.register_module(index, "gate_proj", Binding{attention.post_mixer.gate.qdata,
+                family::kGatePort, g.hidden, g.intermediate});
+            store.register_module(index, "up_proj", Binding{attention.post_mixer.up.qdata,
+                family::kUpPort, g.hidden, g.intermediate});
+        } else if (family::swiglu_halves_addressable(gate_up)) {
             store.register_module(
                 index, "gate_proj",
                 Binding{gate_up.qdata, family::kGatePort, g.hidden, g.intermediate});

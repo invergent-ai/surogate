@@ -18,7 +18,7 @@ After training is complete, the fine-tuned model will be saved in the `././rever
 ## Reinforcement Learning with GRPO
 For the RL we will only do 20 steps at 8x16 rollouts, for a total batch size of 128 and sequence length 128. Because of the small context, training should be extremely quick.
 
-Also, we will use the [Co-locate mode](../../guides/rl-training.md#co-locate-mode-details) of Surogate, which will start a single process for vLLM, orchestrator and trainer, and everybody will share the same weights to reduce GPU memory usage.
+Use [Single-GPU GRPO](../../guides/rl-colocate.md) to share the BF16 Qwen3 base weights between serving and LoRA training. Rollout generation pauses during each training update. Select one GPU with `CUDA_VISIBLE_DEVICES` and start in a fresh output directory.
 
 Run the following command:
 

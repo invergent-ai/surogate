@@ -1,6 +1,7 @@
 // The resident adapter banks (api/ops/lora_store.h).
 
 #include "api/ops/lora_store.h"
+#include "api/ops/scale.h"
 
 #include "core/device.h"
 #include "core/engine_context.h"
@@ -328,6 +329,41 @@ void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, s
             "] -- the adapter was trained against a different model");
     }
     set_slot(binding.key, binding.port, slot, a, b, rank, in_dim, out_dim, scale);
+}
+
+void LoraStore::validate_device_module(const DeviceAdapterModule& m) const {
+    const auto found = directory_.find({m.layer, m.module});
+    if (found == directory_.end() || m.in != found->second.in || m.out != found->second.out ||
+        m.rank <= 0 || m.rank > max_rank_ || !std::isfinite(m.scale) || !m.a || !m.b) {
+        throw std::invalid_argument("invalid device adapter module: " + m.module);
+    }
+    if (!banks_.contains(Key{found->second.key, found->second.port})) {
+        throw std::logic_error("device adapter bank was not created at startup");
+    }
+    for (const void* pointer : {m.a, m.b}) {
+        cudaPointerAttributes attrs{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attrs, pointer));
+        if (attrs.type != cudaMemoryTypeDevice || attrs.device != device_) {
+            throw std::invalid_argument("device adapter must be on the serving device");
+        }
+    }
+}
+
+void LoraStore::set_device_module(std::int32_t slot, const DeviceAdapterModule& m) {
+    validate_device_module(m);
+    if (slot < 0 || slot >= slots_) { throw std::invalid_argument("invalid adapter slot"); }
+    const ScopedDevice on_store(device_);
+    const auto& binding = directory_.at({m.layer, m.module});
+    auto& bank = banks_.at(Key{binding.key, binding.port});
+    auto* a = static_cast<std::uint16_t*>(bank.a) + slot * bank.view.a_stride;
+    auto* b = static_cast<std::uint16_t*>(bank.b) + slot * bank.view.b_stride;
+    CUDA_CHECK(cudaMemset(a, 0, bank.view.a_stride * 2));
+    CUDA_CHECK(cudaMemset(b, 0, bank.view.b_stride * 2));
+    CUDA_CHECK(cudaMemcpy(a, m.a, static_cast<std::size_t>(m.rank) * m.in * 2, cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy2D(b, max_rank_ * 2, m.b, m.rank * 2, m.rank * 2, m.out, cudaMemcpyDeviceToDevice));
+    Tensor scaled(a, DType::BF16, {m.rank, m.in});
+    ops::scale(scaled, m.scale, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
 
 void LoraStore::clear_slot(std::int32_t slot) {

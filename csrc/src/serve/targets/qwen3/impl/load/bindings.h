@@ -30,6 +30,9 @@ struct WeightPlan {
 
 struct MlpPlan {
     WeightPlan gate_up;
+    WeightPlan gate;
+    WeightPlan up;
+    bool separate = false;
     WeightPlan down;
 };
 
@@ -88,6 +91,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 struct DensePostMixerPayload {
     Weight gate_up;
+    Weight gate;
+    Weight up;
     Weight down;
 };
 

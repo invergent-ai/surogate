@@ -1,4 +1,6 @@
-"""Co-locate GRPO runner: starts vLLM, trainer, and orchestrator in a single process.
+"""Co-locate GRPO runner, dispatching to native shared BF16 serving or vLLM.
+
+The native backend is implemented in native_colocate.py. Below is the vLLM path.
 
 vLLM's engine runs in a child process and the surogate trainer runs in the parent;
 both share the same set of GPUs. CUDA IPC is used to share quantized weight GPU
@@ -368,6 +370,10 @@ def grpo_colocate(
     3. Surogate C++ trainer (background thread, borrows vLLM's weights)
     4. Orchestrator (main async event loop)
     """
+    if infer_config.backend == "surogate":
+        from surogate.grpo.native_colocate import grpo_native_colocate
+        return grpo_native_colocate(train_config, infer_config, orch_config)
+
     logger.info("Starting GRPO pipeline (co-locate mode)")
 
     # Trainer uses filesystem broadcast for LoRA adapter updates — the vLLM

@@ -70,6 +70,7 @@ class Scheduler:
         tasks_per_minute: int | None,
         lora_name: str | None = None,
         deferred_group_scoring_tasks: set[str] | None = None,
+        prefetch_batches: bool = True,
     ):
         self.logger = get_logger()
         if tasks_per_minute is not None:
@@ -86,6 +87,7 @@ class Scheduler:
         self.max_async_level = max_async_level
         self.max_off_policy_steps = max_off_policy_steps
         self.strict_async_level = strict_async_level
+        self.prefetch_batches = prefetch_batches
         self.lora_name = lora_name
         initial_temp = compute_temperature(step=0, sampling_config=config.sampling, max_steps=config.max_steps)
         self.sampling_args = get_sampling_args(config.sampling, temperature=initial_temp)
@@ -533,7 +535,15 @@ class Scheduler:
                     batch_progress += progress_increment
                     pbar.update(progress_increment)
 
-        await self._fill_inflight_requests()
+        if self.prefetch_batches:
+            await self._fill_inflight_requests()
+        else:
+            # Interleaved training changes the policy before the next batch.
+            # Neither unfinished groups nor surplus scored rollouts may cross
+            # that boundary, even if their HTTP request already completed.
+            await self.cancel_inflight_rollouts()
+            await self.cancel_scoring_tasks()
+            self.buffer.rollout_buffer.clear()
 
         batch_rollouts = self.finalize_batch_rollouts(batch_rollouts)
         pbar.close()

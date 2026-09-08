@@ -259,7 +259,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         projected_derived_residency_bytes(binder, load_plan.materialization(),
                                           target_linear_policy<Target>());
     const std::size_t preflight_runtime_bytes = subtract_saturating(
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes),
+        runtime_bytes_after_planned_weights(options.borrowed_weights.empty()
+            ? load_plan.materialization().device_capacity_bytes : 0),
         derived_residency_bytes);
     EngineOptions effective = options;
     if (effective.max_context == 0) {
@@ -285,7 +286,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto progress     = artifact_progress(options.load_progress);
     auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
-                                              progress.callback ? &progress : nullptr);
+                                              progress.callback ? &progress : nullptr,
+                                              options.borrowed_weights);
     const artifact::MaterializationStats stats = materialized.stats();
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
