@@ -10,12 +10,11 @@ come from lives in :mod:`recipe`.
 
 from __future__ import annotations
 
-import sys
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Sequence
 
 from surogate.serve.artifact.container import TensorSpec
+from surogate.serve.convert.common import declaration
 from surogate.serve.convert.common.inventory import (
     BF16,
     CONTIGUOUS_LAYOUT,
@@ -27,7 +26,7 @@ if TYPE_CHECKING:  # a converter's GGUF reader, needed only for the annotation
     from surogate.serve.convert.common.gguf_source import GgufSource
 
 
-MODEL_ID = "embeddinggemma-300m"
+MODEL_ID = "gemma_embedding"
 TARGET_KEY = "gemma_embedding"
 #: Every quantised object comes from Q8_0, which is W8G32_F16S bit for bit.
 WEIGHTS_ID = "w8"
@@ -57,14 +56,7 @@ _MODEL_TYPE = "gemma3_text"
 
 @dataclass(frozen=True, slots=True)
 class Geometry:
-    """The dimensions the artifact's object list depends on.
-
-    Read off the checkpoint at convert time by `recipe.geometry_from_config`, so a second
-    published size of this encoder needs no edit here. Every field is an input to the
-    declaration and nothing else is: the object list is a function of exactly these seven
-    numbers and the capability set, which is why `declared_objects` can be asked for the
-    registered size with no checkpoint in hand.
-    """
+    """The dimensions and declaration resolved for this checkpoint."""
 
     layers: int
     hidden: int
@@ -73,63 +65,12 @@ class Geometry:
     query_heads: int
     kv_heads: int
     head_dim: int
+    declared: declaration.Declaration = field(repr=False, compare=False)
 
-
-#: `csrc/src/serve/encoder/gemma_embedding.h::GemmaEmbeddingConfig`, which this must agree
-#: with: that binder is compiled for one geometry and reads nothing from a config at serve
-#: time. It carries no kv_heads because EmbeddingGemma is multi-query.
-EMBEDDINGGEMMA_300M = Geometry(
-    layers=24,
-    hidden=768,
-    intermediate=1152,
-    vocab=262144,
-    query_heads=3,
-    kv_heads=1,
-    head_dim=256,
-)
-
-GEOMETRY = EMBEDDINGGEMMA_300M
-
-
-# --------------------------------------------------------------------------------------------
-# The config the declaration is compiled against
-# --------------------------------------------------------------------------------------------
-
-#: What the GGUF does not carry, and what llama.cpp supplies from the
-#: architecture identity instead (``models/gemma-embedding.cpp``). Every one is
-#: silent when wrong, which is the case for keeping them in a declaration rather
-#: than reading them from whatever file happens to be at hand.
-DECLARED_NOT_IN_GGUF = {
-    # swa_period = 6 there, as a default for an optional key this file omits.
-    "_sliding_window_pattern": 6,
-    # hparams.causal_attn = false, hardcoded for the architecture.
-    "use_bidirectional_attention": True,
-    # llama.cpp uses 1/sqrt(n_embd_head_k), which coincides with the real scalar
-    # here because head_dim is also 256. It does not for Gemma3-27B.
-    "query_pre_attn_scalar": 256,
-}
-
-
-def declaration_config(geometry: Geometry) -> SourceConfig:
-    """The half of the config the object list is a function of.
-
-    Split out because it is the half a caller can produce without a checkpoint: the
-    registered geometry goes in, and the declaration answers with the same object list
-    it would give for a real 300M file.
-    """
-
-    return {
-        "architectures": [DECLARATION],
-        "model_type": _MODEL_TYPE,
-        "vocab_size": geometry.vocab,
-        "hidden_size": geometry.hidden,
-        "num_hidden_layers": geometry.layers,
-        "num_attention_heads": geometry.query_heads,
-        "num_key_value_heads": geometry.kv_heads,
-        "intermediate_size": geometry.intermediate,
-        "head_dim": geometry.head_dim,
-        **DECLARED_NOT_IN_GGUF,
-    }
+    @property
+    def layer_types(self) -> tuple[str, ...]:
+        return tuple("sliding_attention" if kind == "sliding" else "full_attention"
+                     for kind in self.declared.block_types)
 
 
 def config_from_gguf(source: "GgufSource") -> SourceConfig:
@@ -146,19 +87,18 @@ def config_from_gguf(source: "GgufSource") -> SourceConfig:
         raise ValueError(f"expected a gemma-embedding GGUF, got {architecture!r}")
 
     vocab, hidden = source.tensor("token_embd.weight").shape
-    geometry = Geometry(
-        layers=int(kv("block_count")),
-        hidden=int(hidden),
-        intermediate=int(kv("feed_forward_length")),
-        vocab=int(vocab),
-        query_heads=int(kv("attention.head_count")),
-        kv_heads=int(kv("attention.head_count_kv")),
-        head_dim=int(kv("attention.key_length")),
-    )
+    head_dim = int(kv("attention.key_length"))
+    period_field = source.fields.get("gemma-embedding.attention.sliding_window_pattern")
+    # GGUF defines six as this architecture's default when the optional period is absent.
+    # Its attention scale is defined from the declared head width (llama.cpp's model reader).
     config = {
-        **declaration_config(geometry),
-        # Runtime, not shape. No object list depends on these; the binder is compiled
-        # with its own copy of them, and the artifact carries no config for it to read.
+        "architectures": [DECLARATION], "model_type": _MODEL_TYPE,
+        "num_hidden_layers": int(kv("block_count")), "hidden_size": int(hidden),
+        "intermediate_size": int(kv("feed_forward_length")), "vocab_size": int(vocab),
+        "num_attention_heads": int(kv("attention.head_count")),
+        "num_key_value_heads": int(kv("attention.head_count_kv")), "head_dim": head_dim,
+        "_sliding_window_pattern": int(period_field.contents()) if period_field is not None else 6,
+        "use_bidirectional_attention": True, "query_pre_attn_scalar": head_dim,
         "max_position_embeddings": int(kv("context_length")),
         "rms_norm_eps": float(kv("attention.layer_norm_rms_epsilon")),
         "sliding_window": int(kv("attention.sliding_window")),
@@ -175,17 +115,10 @@ def config_from_gguf(source: "GgufSource") -> SourceConfig:
 # --------------------------------------------------------------------------------------------
 
 
-def declared_objects(geometry: Geometry = GEOMETRY) -> list[dict[str, Any]]:
+def declared_objects(geometry: Geometry) -> list[dict[str, Any]]:
     """Every object the artifact stores, from the declaration."""
 
-    generate = Path(__file__).resolve().parents[2] / "tools" / "generate"
-    if str(generate) not in sys.path:
-        sys.path.insert(0, str(generate))
-    import emit_inventory  # noqa: PLC0415
-
-    return emit_inventory.inventory_for(
-        DECLARATION, declaration_config(geometry), capabilities=set(CAPABILITIES)
-    )
+    return [obj.as_dict() for obj in geometry.declared.objects(capabilities=set(CAPABILITIES))]
 
 
 def tensor_specs(objects: Sequence[dict[str, Any]]) -> list[TensorSpec]:
@@ -200,27 +133,3 @@ def tensor_specs(objects: Sequence[dict[str, Any]]) -> list[TensorSpec]:
         layout = ROW_SPLIT_LAYOUT if fmt == W8 else CONTIGUOUS_LAYOUT
         out.append(TensorSpec(name=obj["name"], shape=obj["shape"], format=fmt, layout=layout))
     return out
-
-
-__all__ = [
-    "BF16",
-    "CAPABILITIES",
-    "CONTIGUOUS_LAYOUT",
-    "DECLARATION",
-    "DECLARED_NOT_IN_GGUF",
-    "EMBEDDINGGEMMA_300M",
-    "FRONTEND_RESOURCES",
-    "GEOMETRY",
-    "Geometry",
-    "MODEL_ID",
-    "ROW_SPLIT_LAYOUT",
-    "SourceConfig",
-    "TARGET_KEY",
-    "TensorSpec",
-    "W8",
-    "WEIGHTS_ID",
-    "config_from_gguf",
-    "declaration_config",
-    "declared_objects",
-    "tensor_specs",
-]

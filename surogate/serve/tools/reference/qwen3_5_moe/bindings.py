@@ -1,4 +1,4 @@
-"""Typed binding of a native artifact to the Qwen3.6-35B-A3B target."""
+"""Typed hybrid MoE bindings derived from complete artifact configuration."""
 
 from __future__ import annotations
 
@@ -17,9 +17,11 @@ from surogate.serve.artifact import (
 )
 
 
-MODEL_ID = "qwen3.6-35b-a3b"
-WEIGHTS_ID = "groupwise-int"
-TOKENIZER_VOCAB_SIZE = 248077
+from types import SimpleNamespace
+from .config import model_config_from_declared, vision_config_from_declared
+from ..qwen3_5.bindings import _vision_contract as dense_vision_contract
+
+LINEAR_FORMATS = {"BF16", "Q4G64_F16S", "Q5G64_F16S", "Q6G64_F16S", "W8G32_F16S"}
 
 CONTIGUOUS = "contiguous-le-v1"
 ROW_SPLIT = "row-split-k128-v1"
@@ -32,13 +34,6 @@ Q4 = "Q4G64_F16S"
 Q5 = "Q5G64_F16S"
 Q6 = "Q6G64_F16S"
 W8 = "W8G32_F16S"
-
-FULL_ATTENTION_LAYERS = tuple(range(3, 40, 4))
-GDN_LAYERS = tuple(
-    layer for layer in range(40) if layer not in FULL_ATTENTION_LAYERS
-)
-Q6_ROUTED_DOWN_LAYERS = frozenset((34, 38, 39))
-VISION_LAYERS = tuple(range(27))
 
 Component = Literal["text", "draft", "mtp", "vision", "dflash"]
 
@@ -114,10 +109,10 @@ class BoundResource:
 class FrontendResources:
     tokenizer_json: BoundResource
     tokenizer_config_json: BoundResource
-    chat_template_jinja: BoundResource
+    chat_template_jinja: BoundResource | None
     generation_config_json: BoundResource
-    preprocessor_config_json: BoundResource
-    video_preprocessor_config_json: BoundResource
+    preprocessor_config_json: BoundResource | None
+    video_preprocessor_config_json: BoundResource | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,7 +282,7 @@ class DFlashBinding:
 class _ExpectedTensor:
     name: str
     shape: tuple[int, ...]
-    format: str
+    format: str | None
     layout: str
 
 
@@ -308,150 +303,111 @@ def _tensor(name: str, shape: tuple[int, ...], format_name: str) -> _ExpectedTen
 def _moe_contract(
     prefix: str,
     gate_up_format: str,
-    down_format: str,
+    down_format: str | None,
+    cfg,
 ) -> tuple[_ExpectedTensor, ...]:
     return (
-        _tensor(prefix + "router_shared_gate", (257, 2048), BF16),
-        _tensor(prefix + "routed_gate_up", (262144, 2048), gate_up_format),
-        _tensor(prefix + "routed_down", (524288, 512), down_format),
-        _tensor(prefix + "shared_gate_up", (1024, 2048), W8),
-        _tensor(prefix + "shared_down", (2048, 512), W8),
+        _tensor(prefix + "router_shared_gate", (cfg.experts + 1, cfg.hidden), BF16),
+        _tensor(prefix + "routed_gate_up", (cfg.experts * 2 * cfg.expert_intermediate, cfg.hidden), gate_up_format),
+        _tensor(prefix + "routed_down", (cfg.experts * cfg.hidden, cfg.expert_intermediate), down_format),
+        _tensor(prefix + "shared_gate_up", (2 * cfg.shared_intermediate, cfg.hidden), None),
+        _tensor(prefix + "shared_down", (cfg.hidden, cfg.shared_intermediate), None),
     )
 
 
-def _text_contract() -> tuple[_ExpectedTensor, ...]:
-    tensors: list[_ExpectedTensor] = [
-        _tensor("text/token_embedding", (248320, 2048), W8)
-    ]
-    for layer in range(40):
+def _text_contract(cfg) -> tuple[_ExpectedTensor, ...]:
+    tensors: list[_ExpectedTensor] = [_tensor("text/token_embedding", (cfg.vocab, cfg.hidden), None)]
+    for layer in range(cfg.layers):
         prefix = f"text/layers/{layer}/"
-        tensors.append(_tensor(prefix + "input_norm", (2048,), BF16))
-        if layer in FULL_ATTENTION_LAYERS:
+        tensors.append(_tensor(prefix + "input_norm", (cfg.hidden,), BF16))
+        if cfg.is_full(layer):
             tensors.extend(
                 (
                     _tensor(
                         prefix + "attention/query_key_gate_value",
-                        (9216, 2048),
-                        W8,
+                        (cfg.attention_input_rows, cfg.hidden),
+                        None,
                     ),
-                    _tensor(prefix + "attention/query_norm", (256,), BF16),
-                    _tensor(prefix + "attention/key_norm", (256,), BF16),
-                    _tensor(prefix + "attention/output", (2048, 4096), W8),
+                    _tensor(prefix + "attention/query_norm", (cfg.head_dim,), BF16),
+                    _tensor(prefix + "attention/key_norm", (cfg.head_dim,), BF16),
+                    _tensor(prefix + "attention/output", (cfg.hidden, cfg.q_size), None),
                 )
             )
         else:
             tensors.extend(
                 (
-                    _tensor(prefix + "gdn/a_log", (32,), FP32),
-                    _tensor(prefix + "gdn/dt_bias", (32,), FP32),
-                    _tensor(prefix + "gdn/convolution", (4, 8192), BF16),
-                    _tensor(prefix + "gdn/a_b_projection", (64, 2048), BF16),
-                    _tensor(
-                        prefix + "gdn/query_key_value_z", (12288, 2048), W8
-                    ),
-                    _tensor(prefix + "gdn/norm", (128,), BF16),
-                    _tensor(prefix + "gdn/output", (2048, 4096), W8),
+                    _tensor(prefix + "gdn/a_log", (cfg.gdn_v_heads,), FP32),
+                    _tensor(prefix + "gdn/dt_bias", (cfg.gdn_v_heads,), FP32),
+                    _tensor(prefix + "gdn/convolution", (cfg.conv_width, cfg.conv_dim), BF16),
+                    _tensor(prefix + "gdn/a_b_projection", (2 * cfg.gdn_v_heads, cfg.hidden), BF16),
+                    _tensor(prefix + "gdn/query_key_value_z", (cfg.conv_dim + cfg.value_dim, cfg.hidden), None),
+                    _tensor(prefix + "gdn/norm", (cfg.gdn_v_dim,), BF16),
+                    _tensor(prefix + "gdn/output", (cfg.hidden, cfg.value_dim), None),
                 )
             )
-        tensors.append(_tensor(prefix + "post_attention_norm", (2048,), BF16))
-        down_format = Q6 if layer in Q6_ROUTED_DOWN_LAYERS else Q5
-        tensors.extend(_moe_contract(prefix + "moe/", Q4, down_format))
+        tensors.append(_tensor(prefix + "post_attention_norm", (cfg.hidden,), BF16))
+        tensors.extend(_moe_contract(prefix + "moe/", None, None, cfg))
     tensors.extend(
         (
-            _tensor("text/final_norm", (2048,), BF16),
-            _tensor("text/output_head", (248320, 2048), Q6),
+            _tensor("text/final_norm", (cfg.hidden,), BF16),
+            _tensor("text/output_head", (cfg.vocab, cfg.hidden), None),
         )
     )
     return tuple(tensors)
 
 
-def _draft_contract() -> tuple[_ExpectedTensor, ...]:
+def _draft_contract(cfg) -> tuple[_ExpectedTensor, ...]:
     return (
-        _tensor("text/draft_head", (131072, 2048), Q4),
-        _tensor("text/draft_head_token_ids", (131072,), I32),
+        _tensor("text/draft_head", (cfg.draft_vocab, cfg.hidden), None),
+        _tensor("text/draft_head_token_ids", (cfg.draft_vocab,), I32),
     )
 
 
-def _mtp_contract() -> tuple[_ExpectedTensor, ...]:
+def _mtp_contract(cfg) -> tuple[_ExpectedTensor, ...]:
     tensors = [
-        _tensor("mtp/input_projection", (2048, 4096), W8),
-        _tensor("mtp/embedding_norm", (2048,), BF16),
-        _tensor("mtp/hidden_norm", (2048,), BF16),
-        _tensor("mtp/layer/input_norm", (2048,), BF16),
-        _tensor(
-            "mtp/layer/attention/query_key_gate_value", (9216, 2048), W8
-        ),
-        _tensor("mtp/layer/attention/query_norm", (256,), BF16),
-        _tensor("mtp/layer/attention/key_norm", (256,), BF16),
-        _tensor("mtp/layer/attention/output", (2048, 4096), W8),
-        _tensor("mtp/layer/post_attention_norm", (2048,), BF16),
+        _tensor("mtp/input_projection", (cfg.hidden, 2 * cfg.hidden), None),
+        _tensor("mtp/embedding_norm", (cfg.hidden,), BF16),
+        _tensor("mtp/hidden_norm", (cfg.hidden,), BF16),
+        _tensor("mtp/layer/input_norm", (cfg.hidden,), BF16),
+        _tensor("mtp/layer/attention/query_key_gate_value", (cfg.attention_input_rows, cfg.hidden), None),
+        _tensor("mtp/layer/attention/query_norm", (cfg.head_dim,), BF16),
+        _tensor("mtp/layer/attention/key_norm", (cfg.head_dim,), BF16),
+        _tensor("mtp/layer/attention/output", (cfg.hidden, cfg.q_size), None),
+        _tensor("mtp/layer/post_attention_norm", (cfg.hidden,), BF16),
     ]
-    tensors.extend(_moe_contract("mtp/layer/moe/", W8, W8))
-    tensors.append(_tensor("mtp/final_norm", (2048,), BF16))
+    tensors.extend(_moe_contract("mtp/layer/moe/", None, None, cfg))
+    tensors.append(_tensor("mtp/final_norm", (cfg.hidden,), BF16))
     return tuple(tensors)
 
 
-def _vision_contract() -> tuple[_ExpectedTensor, ...]:
-    tensors: list[_ExpectedTensor] = [
-        _tensor("vision/patch_embedding", (1152, 1536), Q6),
-        _tensor("vision/patch_embedding_bias", (1152,), BF16),
-        _tensor("vision/position_embedding", (2304, 1152), BF16),
-    ]
-    for layer in VISION_LAYERS:
-        prefix = f"vision/layers/{layer}/"
-        tensors.extend(
-            (
-                _tensor(prefix + "attention/qkv", (3456, 1152), Q4),
-                _tensor(prefix + "attention/qkv_bias", (3456,), BF16),
-                _tensor(prefix + "attention/output", (1152, 1152), Q5),
-                _tensor(prefix + "attention/output_bias", (1152,), BF16),
-                _tensor(prefix + "mlp/fc1", (4304, 1152), Q4),
-                _tensor(prefix + "mlp/fc1_bias", (4304,), BF16),
-                _tensor(prefix + "mlp/fc2", (1152, 4304), Q5),
-                _tensor(prefix + "mlp/fc2_bias", (1152,), BF16),
-                _tensor(prefix + "norm1/weight", (1152,), BF16),
-                _tensor(prefix + "norm1/bias", (1152,), BF16),
-                _tensor(prefix + "norm2/weight", (1152,), BF16),
-                _tensor(prefix + "norm2/bias", (1152,), BF16),
-            )
-        )
-    tensors.extend(
-        (
-            _tensor("vision/merger/fc1", (4608, 4608), W8),
-            _tensor("vision/merger/fc1_bias", (4608,), BF16),
-            _tensor("vision/merger/fc2", (2048, 4608), W8),
-            _tensor("vision/merger/fc2_bias", (2048,), BF16),
-            _tensor("vision/merger/norm/weight", (1152,), BF16),
-            _tensor("vision/merger/norm/bias", (1152,), BF16),
-        )
-    )
-    return tuple(tensors)
+def _vision_contract(cfg):
+    return tuple(_ExpectedTensor(s.name, s.shape, s.format, s.layout) for s in dense_vision_contract(cfg))
 
 
-def _dflash_contract() -> tuple[_ExpectedTensor, ...]:
+def _dflash_contract(d) -> tuple[_ExpectedTensor, ...]:
     tensors: list[_ExpectedTensor] = [
-        _tensor("dflash/feature_projection", (2048, 16384), W8),
-        _tensor("dflash/context_norm", (2048,), BF16),
+        _tensor("dflash/feature_projection", (d.hidden, d.feature_rows), None),
+        _tensor("dflash/context_norm", (d.hidden,), BF16),
     ]
-    for layer in range(6):
+    for layer in range(d.layers):
         prefix = f"dflash/layers/{layer}/"
         tensors.extend(
             (
-                _tensor(prefix + "input_norm", (2048,), BF16),
+                _tensor(prefix + "input_norm", (d.hidden,), BF16),
                 _tensor(
                     prefix + "attention/query_key_value",
-                    (6144, 2048),
-                    W8,
+                    (d.q_size + 2 * d.kv_size, d.hidden),
+                    None,
                 ),
-                _tensor(prefix + "attention/query_norm", (128,), BF16),
-                _tensor(prefix + "attention/key_norm", (128,), BF16),
-                _tensor(prefix + "attention/output", (2048, 4096), W8),
-                _tensor(prefix + "post_attention_norm", (2048,), BF16),
-                _tensor(prefix + "mlp/gate_up", (12288, 2048), W8),
-                _tensor(prefix + "mlp/down", (2048, 6144), W8),
+                _tensor(prefix + "attention/query_norm", (d.head_dim,), BF16),
+                _tensor(prefix + "attention/key_norm", (d.head_dim,), BF16),
+                _tensor(prefix + "attention/output", (d.hidden, d.q_size), None),
+                _tensor(prefix + "post_attention_norm", (d.hidden,), BF16),
+                _tensor(prefix + "mlp/gate_up", (2 * d.intermediate, d.hidden), None),
+                _tensor(prefix + "mlp/down", (d.hidden, d.intermediate), None),
             )
         )
-    tensors.append(_tensor("dflash/final_norm", (2048,), BF16))
+    tensors.append(_tensor("dflash/final_norm", (d.hidden,), BF16))
     return tuple(tensors)
 
 
@@ -465,19 +421,6 @@ _RESOURCE_CONTRACT = tuple(
         "frontend/preprocessor_config.json",
         "frontend/video_preprocessor_config.json",
     )
-)
-_TEXT_CONTRACT = _text_contract()
-_DRAFT_CONTRACT = _draft_contract()
-_MTP_CONTRACT = _mtp_contract()
-_VISION_CONTRACT = _vision_contract()
-_DFLASH_CONTRACT = _dflash_contract()
-_OBJECT_CONTRACT: tuple[_ExpectedObject, ...] = (
-    _RESOURCE_CONTRACT
-    + _TEXT_CONTRACT
-    + _DRAFT_CONTRACT
-    + _MTP_CONTRACT
-    + _VISION_CONTRACT
-    + _DFLASH_CONTRACT
 )
 
 
@@ -493,56 +436,40 @@ def _component(name: str) -> Component:
     return "text"
 
 
-def _validate_inventory(artifact: Artifact) -> None:
-    expected_identity = ArtifactIdentity(MODEL_ID, WEIGHTS_ID)
-    if artifact.identity != expected_identity:
+def _validate_inventory(artifact, cfg, vision, draft):
+    if artifact.identity.architecture != "qwen3_5_moe":
+        raise BindingError("artifact architecture is not qwen3_5_moe")
+    present = {obj.name for obj in artifact.objects}
+    contract = (
+        _text_contract(cfg)
+        + _draft_contract(cfg)
+        + (_mtp_contract(cfg) if cfg.mtp_layers else ())
+        + _vision_contract(vision)
+        + (_dflash_contract(draft) if draft else ())
+    )
+    contract = tuple(s for s in contract if s.name != "text/output_head" or s.name in present)
+    expected = {s.name: s for s in contract}
+    expected.update((r.name, r) for r in _RESOURCE_CONTRACT if r.name in present)
+    required = {"frontend/tokenizer.json", "frontend/tokenizer_config.json", "frontend/generation_config.json"}
+    if not required <= present or present != expected.keys():
         raise BindingError(
-            f"artifact identity is {artifact.identity!r}; expected "
-            f"{expected_identity!r}"
+            f"reference object contract mismatch; missing={sorted(expected.keys() - present)}, extra={sorted(present - expected.keys())}"
         )
-    if len(artifact.objects) != len(_OBJECT_CONTRACT):
-        raise BindingError(
-            f"artifact has {len(artifact.objects)} objects; "
-            f"expected {len(_OBJECT_CONTRACT)}"
-        )
-    expected_by_name = {obj.name: obj for obj in _OBJECT_CONTRACT}
-    actual_names = {obj.name for obj in artifact.objects}
-    expected_names = frozenset(expected_by_name)
-    if actual_names != expected_names:
-        missing = sorted(expected_names - actual_names)
-        extra = sorted(actual_names - expected_names)
-        raise BindingError(
-            f"artifact object names differ; missing={missing!r}, extra={extra!r}"
-        )
-    for actual in artifact.objects:
-        expected = expected_by_name[actual.name]
-        if isinstance(expected, _ExpectedTensor):
-            signature = (
-                expected.name,
-                expected.shape,
-                expected.format,
-                expected.layout,
-            )
-            if not isinstance(actual, TensorObject) or (
-                actual.name,
-                actual.shape,
-                actual.format,
-                actual.layout,
-            ) != signature:
-                raise BindingError(
-                    f"object {actual.name!r} does not match tensor signature "
-                    f"{signature!r}"
-                )
-        else:
-            signature = (expected.name, expected.encoding)
-            if not isinstance(actual, ResourceObject) or (
-                actual.name,
-                actual.encoding,
-            ) != signature:
-                raise BindingError(
-                    f"object {actual.name!r} does not match resource signature "
-                    f"{signature!r}"
-                )
+    for obj in artifact.objects:
+        spec = expected[obj.name]
+        if isinstance(spec, _ExpectedResource):
+            if not isinstance(obj, ResourceObject) or obj.encoding != spec.encoding:
+                raise BindingError(f"{obj.name}: expected a frontend resource")
+            continue
+        if not isinstance(obj, TensorObject) or obj.shape != spec.shape:
+            raise BindingError(f"{obj.name}: tensor shape disagrees with checkpoint geometry")
+        if obj.runs or obj.layout not in (CONTIGUOUS, ROW_SPLIT):
+            raise BindingError(f"{obj.name}: this numerical reference supports inline BF16/groupwise weights")
+        if spec.format is None:
+            if obj.format not in LINEAR_FORMATS:
+                raise BindingError(f"{obj.name}: unsupported reference linear format {obj.format}")
+        elif obj.format != spec.format or obj.layout != spec.layout:
+            raise BindingError(f"{obj.name}: control tensor format disagrees with its role")
 
 
 def _row_view(
@@ -566,10 +493,11 @@ def _expert_bank(
     rows_per_expert: int,
     split_rows: int | None,
     banks: list[ExpertBank],
+    experts: int,
 ) -> ExpertBank:
-    if block.layout != ROW_SPLIT or block.shape[0] != 256 * rows_per_expert:
+    if block.layout not in (ROW_SPLIT, CONTIGUOUS) or block.shape[0] != experts * rows_per_expert:
         raise BindingError("expert bank does not match its equal-stride geometry")
-    bank = ExpertBank(block, 256, rows_per_expert, split_rows)
+    bank = ExpertBank(block, experts, rows_per_expert, split_rows)
     banks.append(bank)
     return bank
 
@@ -578,14 +506,15 @@ def _attention_binding(
     prefix: str,
     blocks: dict[str, PhysicalBlock],
     row_views: list[LogicalRowView],
+    cfg,
 ) -> FullAttentionBinding:
     parent = blocks[prefix + "query_key_gate_value"]
     return FullAttentionBinding(
         query_key_gate_value=parent,
-        query=_row_view(parent, 0, 4096, row_views),
-        key=_row_view(parent, 4096, 4608, row_views),
-        output_gate=_row_view(parent, 4608, 8704, row_views),
-        value=_row_view(parent, 8704, 9216, row_views),
+        query=_row_view(parent, 0, cfg.q_size, row_views),
+        key=_row_view(parent, cfg.q_size, cfg.q_size + cfg.kv_size, row_views),
+        output_gate=_row_view(parent, cfg.q_size + cfg.kv_size, 2 * cfg.q_size + cfg.kv_size, row_views),
+        value=_row_view(parent, 2 * cfg.q_size + cfg.kv_size, cfg.attention_input_rows, row_views),
         query_norm=blocks[prefix + "query_norm"],
         key_norm=blocks[prefix + "key_norm"],
         output=blocks[prefix + "output"],
@@ -597,22 +526,25 @@ def _moe_binding(
     blocks: dict[str, PhysicalBlock],
     row_views: list[LogicalRowView],
     expert_banks: list[ExpertBank],
+    cfg,
 ) -> MoeBinding:
     router_shared_gate = blocks[prefix + "router_shared_gate"]
     shared_gate_up = blocks[prefix + "shared_gate_up"]
     return MoeBinding(
         router_shared_gate=router_shared_gate,
-        router=_row_view(router_shared_gate, 0, 256, row_views),
-        shared_gate=_row_view(router_shared_gate, 256, 257, row_views),
+        router=_row_view(router_shared_gate, 0, cfg.experts, row_views),
+        shared_gate=_row_view(router_shared_gate, cfg.experts, cfg.experts + 1, row_views),
         routed_gate_up=_expert_bank(
-            blocks[prefix + "routed_gate_up"], 1024, 512, expert_banks
+            blocks[prefix + "routed_gate_up"],
+            2 * cfg.expert_intermediate,
+            cfg.expert_intermediate,
+            expert_banks,
+            cfg.experts,
         ),
-        routed_down=_expert_bank(
-            blocks[prefix + "routed_down"], 2048, None, expert_banks
-        ),
+        routed_down=_expert_bank(blocks[prefix + "routed_down"], cfg.hidden, None, expert_banks, cfg.experts),
         shared_gate_up=shared_gate_up,
-        shared_expert_gate=_row_view(shared_gate_up, 0, 512, row_views),
-        shared_up=_row_view(shared_gate_up, 512, 1024, row_views),
+        shared_expert_gate=_row_view(shared_gate_up, 0, cfg.shared_intermediate, row_views),
+        shared_up=_row_view(shared_gate_up, cfg.shared_intermediate, 2 * cfg.shared_intermediate, row_views),
         shared_down=blocks[prefix + "shared_down"],
     )
 
@@ -621,7 +553,15 @@ class ArtifactBinding:
     """Complete typed target binding over one open generic artifact."""
 
     def __init__(self, artifact: Artifact, *, owns_artifact: bool = False):
-        _validate_inventory(artifact)
+        self.config = cfg = model_config_from_declared(artifact.geometry, layer_types=artifact.layer_types)
+        self.vision_config = vision_config_from_declared(artifact.vision_geometry) if artifact.vision_geometry else None
+        if self.vision_config and self.vision_config.out_hidden != cfg.hidden:
+            raise BindingError("vision output width disagrees with text checkpoint")
+        self.dflash_config = d = SimpleNamespace(**artifact.dflash_geometry) if artifact.dflash_geometry else None
+        if d:
+            d.q_size = d.query_heads * d.head_dim
+            d.kv_size = d.kv_heads * d.head_dim
+        _validate_inventory(artifact, cfg, self.vision_config, d)
         self._artifact = artifact
         self._owns_artifact = owns_artifact
 
@@ -640,28 +580,24 @@ class ArtifactBinding:
         self.frontend = FrontendResources(
             resources["frontend/tokenizer.json"],
             resources["frontend/tokenizer_config.json"],
-            resources["frontend/chat_template.jinja"],
+            resources.get("frontend/chat_template.jinja"),
             resources["frontend/generation_config.json"],
-            resources["frontend/preprocessor_config.json"],
-            resources["frontend/video_preprocessor_config.json"],
+            resources.get("frontend/preprocessor_config.json"),
+            resources.get("frontend/video_preprocessor_config.json"),
         )
 
         row_views: list[LogicalRowView] = []
         axis_views: list[AxisView] = []
         expert_banks: list[ExpertBank] = []
         layers: list[TextLayerBinding] = []
-        for layer in range(40):
+        for layer in range(cfg.layers):
             prefix = f"text/layers/{layer}/"
-            if layer in FULL_ATTENTION_LAYERS:
-                attention = _attention_binding(
-                    prefix + "attention/", blocks, row_views
-                )
+            if cfg.is_full(layer):
+                attention = _attention_binding(prefix + "attention/", blocks, row_views, cfg)
                 gdn = None
             else:
                 convolution_storage = blocks[prefix + "gdn/convolution"]
-                convolution = AxisView(
-                    convolution_storage, (1, 0), (8192, 4)
-                )
+                convolution = AxisView(convolution_storage, (1, 0), (cfg.conv_dim, cfg.conv_width))
                 axis_views.append(convolution)
                 a_b = blocks[prefix + "gdn/a_b_projection"]
                 qkvz = blocks[prefix + "gdn/query_key_value_z"]
@@ -671,13 +607,13 @@ class ArtifactBinding:
                     convolution_storage=convolution_storage,
                     convolution=convolution,
                     a_b_projection=a_b,
-                    a_projection=_row_view(a_b, 0, 32, row_views),
-                    b_projection=_row_view(a_b, 32, 64, row_views),
+                    a_projection=_row_view(a_b, 0, cfg.gdn_v_heads, row_views),
+                    b_projection=_row_view(a_b, cfg.gdn_v_heads, 2 * cfg.gdn_v_heads, row_views),
                     query_key_value_z=qkvz,
-                    query=_row_view(qkvz, 0, 2048, row_views),
-                    key=_row_view(qkvz, 2048, 4096, row_views),
-                    value=_row_view(qkvz, 4096, 8192, row_views),
-                    z=_row_view(qkvz, 8192, 12288, row_views),
+                    query=_row_view(qkvz, 0, cfg.key_dim, row_views),
+                    key=_row_view(qkvz, cfg.key_dim, 2 * cfg.key_dim, row_views),
+                    value=_row_view(qkvz, 2 * cfg.key_dim, cfg.conv_dim, row_views),
+                    z=_row_view(qkvz, cfg.conv_dim, cfg.conv_dim + cfg.value_dim, row_views),
                     norm=blocks[prefix + "gdn/norm"],
                     output=blocks[prefix + "gdn/output"],
                 )
@@ -690,125 +626,117 @@ class ArtifactBinding:
                     attention=attention,
                     gdn=gdn,
                     post_attention_norm=blocks[prefix + "post_attention_norm"],
-                    moe=_moe_binding(
-                        prefix + "moe/", blocks, row_views, expert_banks
-                    ),
+                    moe=_moe_binding(prefix + "moe/", blocks, row_views, expert_banks, cfg),
                 )
             )
 
-        draft_head = DraftHeadBinding(
-            blocks["text/draft_head"], blocks["text/draft_head_token_ids"]
-        )
+        draft_head = DraftHeadBinding(blocks["text/draft_head"], blocks["text/draft_head_token_ids"])
         self.text = TextBinding(
             token_embedding=blocks["text/token_embedding"],
             layers=tuple(layers),
             final_norm=blocks["text/final_norm"],
-            output_head=blocks["text/output_head"],
+            output_head=blocks.get("text/output_head", blocks["text/token_embedding"]),
             draft_head=draft_head,
         )
 
-        self.mtp = MtpBinding(
-            token_embedding=self.text.token_embedding,
-            full_output_head=self.text.output_head,
-            optimized_proposal_head=draft_head,
-            input_projection=blocks["mtp/input_projection"],
-            embedding_norm=blocks["mtp/embedding_norm"],
-            hidden_norm=blocks["mtp/hidden_norm"],
-            layer=MtpLayerBinding(
-                input_norm=blocks["mtp/layer/input_norm"],
-                attention=_attention_binding(
-                    "mtp/layer/attention/", blocks, row_views
+        self.mtp = None
+        if cfg.mtp_layers:
+            self.mtp = MtpBinding(
+                token_embedding=self.text.token_embedding,
+                full_output_head=self.text.output_head,
+                optimized_proposal_head=draft_head,
+                input_projection=blocks["mtp/input_projection"],
+                embedding_norm=blocks["mtp/embedding_norm"],
+                hidden_norm=blocks["mtp/hidden_norm"],
+                layer=MtpLayerBinding(
+                    input_norm=blocks["mtp/layer/input_norm"],
+                    attention=_attention_binding("mtp/layer/attention/", blocks, row_views, cfg),
+                    post_attention_norm=blocks["mtp/layer/post_attention_norm"],
+                    moe=_moe_binding("mtp/layer/moe/", blocks, row_views, expert_banks, cfg),
                 ),
-                post_attention_norm=blocks[
-                    "mtp/layer/post_attention_norm"
-                ],
-                moe=_moe_binding(
-                    "mtp/layer/moe/", blocks, row_views, expert_banks
+                final_norm=blocks["mtp/final_norm"],
+            )
+
+        self.vision = None
+        if self.vision_config:
+            vision_layers: list[VisionLayerBinding] = []
+            for layer in range(self.vision_config.depth):
+                prefix = f"vision/layers/{layer}/"
+                vision_layers.append(
+                    VisionLayerBinding(
+                        index=layer,
+                        attention_qkv=blocks[prefix + "attention/qkv"],
+                        attention_qkv_bias=blocks[prefix + "attention/qkv_bias"],
+                        attention_output=blocks[prefix + "attention/output"],
+                        attention_output_bias=blocks[prefix + "attention/output_bias"],
+                        mlp_fc1=blocks[prefix + "mlp/fc1"],
+                        mlp_fc1_bias=blocks[prefix + "mlp/fc1_bias"],
+                        mlp_fc2=blocks[prefix + "mlp/fc2"],
+                        mlp_fc2_bias=blocks[prefix + "mlp/fc2_bias"],
+                        norm1_weight=blocks[prefix + "norm1/weight"],
+                        norm1_bias=blocks[prefix + "norm1/bias"],
+                        norm2_weight=blocks[prefix + "norm2/weight"],
+                        norm2_bias=blocks[prefix + "norm2/bias"],
+                    )
+                )
+            self.vision = VisionBinding(
+                patch_embedding=blocks["vision/patch_embedding"],
+                patch_embedding_bias=blocks["vision/patch_embedding_bias"],
+                position_embedding=blocks["vision/position_embedding"],
+                layers=tuple(vision_layers),
+                merger=VisionMergerBinding(
+                    fc1=blocks["vision/merger/fc1"],
+                    fc1_bias=blocks["vision/merger/fc1_bias"],
+                    fc2=blocks["vision/merger/fc2"],
+                    fc2_bias=blocks["vision/merger/fc2_bias"],
+                    norm_weight=blocks["vision/merger/norm/weight"],
+                    norm_bias=blocks["vision/merger/norm/bias"],
                 ),
-            ),
-            final_norm=blocks["mtp/final_norm"],
-        )
-
-        vision_layers: list[VisionLayerBinding] = []
-        for layer in VISION_LAYERS:
-            prefix = f"vision/layers/{layer}/"
-            vision_layers.append(
-                VisionLayerBinding(
-                    index=layer,
-                    attention_qkv=blocks[prefix + "attention/qkv"],
-                    attention_qkv_bias=blocks[prefix + "attention/qkv_bias"],
-                    attention_output=blocks[prefix + "attention/output"],
-                    attention_output_bias=blocks[
-                        prefix + "attention/output_bias"
-                    ],
-                    mlp_fc1=blocks[prefix + "mlp/fc1"],
-                    mlp_fc1_bias=blocks[prefix + "mlp/fc1_bias"],
-                    mlp_fc2=blocks[prefix + "mlp/fc2"],
-                    mlp_fc2_bias=blocks[prefix + "mlp/fc2_bias"],
-                    norm1_weight=blocks[prefix + "norm1/weight"],
-                    norm1_bias=blocks[prefix + "norm1/bias"],
-                    norm2_weight=blocks[prefix + "norm2/weight"],
-                    norm2_bias=blocks[prefix + "norm2/bias"],
-                )
             )
-        self.vision = VisionBinding(
-            patch_embedding=blocks["vision/patch_embedding"],
-            patch_embedding_bias=blocks["vision/patch_embedding_bias"],
-            position_embedding=blocks["vision/position_embedding"],
-            layers=tuple(vision_layers),
-            merger=VisionMergerBinding(
-                fc1=blocks["vision/merger/fc1"],
-                fc1_bias=blocks["vision/merger/fc1_bias"],
-                fc2=blocks["vision/merger/fc2"],
-                fc2_bias=blocks["vision/merger/fc2_bias"],
-                norm_weight=blocks["vision/merger/norm/weight"],
-                norm_bias=blocks["vision/merger/norm/bias"],
-            ),
-        )
 
-        dflash_layers: list[DFlashLayerBinding] = []
-        for layer in range(6):
-            prefix = f"dflash/layers/{layer}/"
-            qkv = blocks[prefix + "attention/query_key_value"]
-            gate_up = blocks[prefix + "mlp/gate_up"]
-            dflash_layers.append(
-                DFlashLayerBinding(
-                    index=layer,
-                    input_norm=blocks[prefix + "input_norm"],
-                    attention=DFlashAttentionBinding(
-                        query_key_value=qkv,
-                        query=_row_view(qkv, 0, 4096, row_views),
-                        key=_row_view(qkv, 4096, 5120, row_views),
-                        value=_row_view(qkv, 5120, 6144, row_views),
-                        query_norm=blocks[prefix + "attention/query_norm"],
-                        key_norm=blocks[prefix + "attention/key_norm"],
-                        output=blocks[prefix + "attention/output"],
-                    ),
-                    post_attention_norm=blocks[
-                        prefix + "post_attention_norm"
-                    ],
-                    mlp=DFlashMlpBinding(
-                        gate_up=gate_up,
-                        gate=_row_view(gate_up, 0, 6144, row_views),
-                        up=_row_view(gate_up, 6144, 12288, row_views),
-                        down=blocks[prefix + "mlp/down"],
-                    ),
+        self.dflash = None
+        if d:
+            dflash_layers: list[DFlashLayerBinding] = []
+            for layer in range(d.layers):
+                prefix = f"dflash/layers/{layer}/"
+                qkv = blocks[prefix + "attention/query_key_value"]
+                gate_up = blocks[prefix + "mlp/gate_up"]
+                dflash_layers.append(
+                    DFlashLayerBinding(
+                        index=layer,
+                        input_norm=blocks[prefix + "input_norm"],
+                        attention=DFlashAttentionBinding(
+                            query_key_value=qkv,
+                            query=_row_view(qkv, 0, d.q_size, row_views),
+                            key=_row_view(qkv, d.q_size, d.q_size + d.kv_size, row_views),
+                            value=_row_view(qkv, d.q_size + d.kv_size, d.q_size + 2 * d.kv_size, row_views),
+                            query_norm=blocks[prefix + "attention/query_norm"],
+                            key_norm=blocks[prefix + "attention/key_norm"],
+                            output=blocks[prefix + "attention/output"],
+                        ),
+                        post_attention_norm=blocks[prefix + "post_attention_norm"],
+                        mlp=DFlashMlpBinding(
+                            gate_up=gate_up,
+                            gate=_row_view(gate_up, 0, d.intermediate, row_views),
+                            up=_row_view(gate_up, d.intermediate, 2 * d.intermediate, row_views),
+                            down=blocks[prefix + "mlp/down"],
+                        ),
+                    )
                 )
+            self.dflash = DFlashBinding(
+                token_embedding=self.text.token_embedding,
+                mask_embedding=_row_view(
+                    self.text.token_embedding,
+                    d.mask_token,
+                    d.mask_token + 1,
+                    row_views,
+                ),
+                proposal_output_head=self.text.output_head,
+                feature_projection=blocks["dflash/feature_projection"],
+                context_norm=blocks["dflash/context_norm"],
+                layers=tuple(dflash_layers),
+                final_norm=blocks["dflash/final_norm"],
             )
-        self.dflash = DFlashBinding(
-            token_embedding=self.text.token_embedding,
-            mask_embedding=_row_view(
-                self.text.token_embedding,
-                TOKENIZER_VOCAB_SIZE,
-                TOKENIZER_VOCAB_SIZE + 1,
-                row_views,
-            ),
-            proposal_output_head=self.text.output_head,
-            feature_projection=blocks["dflash/feature_projection"],
-            context_norm=blocks["dflash/context_norm"],
-            layers=tuple(dflash_layers),
-            final_norm=blocks["dflash/final_norm"],
-        )
         self.row_views = tuple(row_views)
         self.axis_views = tuple(axis_views)
         self.expert_banks = tuple(expert_banks)
@@ -843,11 +771,9 @@ class ArtifactBinding:
 
     def _validate_draft_ids(self) -> None:
         block = self.text.draft_head.token_ids
-        token_ids = decode_direct(
-            self.payload(block), block.format, block.shape, device="cpu"
-        )
-        if int(token_ids.min()) < 0 or int(token_ids.max()) >= TOKENIZER_VOCAB_SIZE:
-            raise BindingError("draft token IDs are outside 0..248076")
+        token_ids = decode_direct(self.payload(block), block.format, block.shape, device="cpu")
+        if int(token_ids.min()) < 0 or int(token_ids.max()) >= self.config.token_domain:
+            raise BindingError("draft token IDs are outside the checkpoint tokenizer domain")
         if torch.unique(token_ids).numel() != token_ids.numel():
             raise BindingError("draft token IDs are not unique")
 

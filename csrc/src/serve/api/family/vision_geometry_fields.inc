@@ -1,0 +1,12 @@
+// Generated from surogate/serve/artifact/geometry.py. Do not edit.
+SINFER_GEOMETRY_INT(layers)
+SINFER_GEOMETRY_INT(hidden)
+SINFER_GEOMETRY_INT(intermediate)
+SINFER_GEOMETRY_INT(heads)
+SINFER_GEOMETRY_INT(patch_dim)
+SINFER_GEOMETRY_INT(merge)
+SINFER_GEOMETRY_INT(position_embeddings)
+SINFER_GEOMETRY_INT(rotary_dim)
+SINFER_GEOMETRY_INT(output_hidden)
+SINFER_GEOMETRY_FLOAT(rope_theta)
+SINFER_GEOMETRY_FLOAT(norm_epsilon)

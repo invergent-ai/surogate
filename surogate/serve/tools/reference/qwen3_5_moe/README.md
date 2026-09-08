@@ -1,16 +1,15 @@
 # `qwen3_5_moe` Python reference
 
-This is the complete artifact-native Python reference for the routed-expert sibling of the
-`qwen3_5` architecture. Routed experts make it a different graph, so it stays a separate program
-rather than a mode of the dense reference; the frontend, sampling and vision helpers the two share
-live in [`../common/`](../common/). The numbers below are the 35B-A3B's. It runs the 40-layer Text decoder, top-8 routed and
-gated shared experts, Vision tower and 2048-wide merger, one-layer sparse-MoE MTP model, sampling,
-and persistent KV/GDN state directly from the `.sinfer` object layouts.
+This diagnostic Python reference reads dimensions, expert counts, routing settings, attention
+placement, and context limits from the converted artifact. The model name does not select a
+size. MTP and vision are available when the checkpoint includes their weights.
 
-The accepted artifact also contains the target-private DFlash companion tensors. The reference
-binds their complete typed weight views and can include them in an explicit weight-memory plan, but
-the current `RefModel` does not make them resident and has no DFlash state, schedule, or execution
-path.
+The reference reads inline BF16 and groupwise integer weights with fused text projections.
+Other storage layouts require the C++ serving runtime. Artifacts created before complete
+checkpoint metadata was stored must be rebuilt from the original checkpoint.
+
+An optional DFlash companion can be inspected and included in a weight-memory plan. This
+reference does not execute DFlash generation.
 
 The reference is an independent diagnostic implementation for the registered artifact. The C++
 Engine target is registered separately; this Python route is not its generated-token golden and
@@ -25,7 +24,7 @@ Install the target dependencies from `requirements.txt`, then run:
 ```bash
 python3 \
   -m tools.reference.qwen3_5_moe \
-  --weights out/qwen3_6_35b_a3b.sinfer \
+  --weights out/model.sinfer \
   --prompt "请简短介绍一下你自己。" --decode 128
 ```
 

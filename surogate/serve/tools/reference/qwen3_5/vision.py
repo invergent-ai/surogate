@@ -55,6 +55,8 @@ class VisionOutput:
 class VisionEncoder:
     """Run one request while streaming each large vision matrix exactly once."""
 
+    weight_store_type = WeightStore
+
     def __init__(
         self,
         binding: ArtifactBinding,
@@ -73,7 +75,7 @@ class VisionEncoder:
         self.memory_bytes = memory_bytes
         self.headroom_bytes = headroom_bytes
         self.attention_limit = attention_limit
-        self.weights = WeightStore(
+        self.weights = self.weight_store_type(
             binding,
             self.device,
             capacity=1,
@@ -105,10 +107,7 @@ class VisionEncoder:
     def _validate_budget(self, patches: int, attention_pairs: int) -> int:
         estimate = self._estimate_peak(patches)
         if self.attention_limit is not None and attention_pairs > self.attention_limit:
-            raise ValueError(
-                f"vision attention work {attention_pairs} exceeds configured limit "
-                f"{self.attention_limit}"
-            )
+            raise ValueError(f"vision attention work {attention_pairs} exceeds configured limit {self.attention_limit}")
         if self.device.type != "cuda":
             return estimate
         with torch.cuda.device(self.device):
@@ -166,10 +165,10 @@ class VisionEncoder:
         x = add_bias(linear(x, weight), self._weight(vision.patch_embedding_bias))
         del weight
         position = interpolate_position_embedding(
-            self._weight(vision.position_embedding), combined_grid
+            self._weight(vision.position_embedding), combined_grid, merge=cfg.spatial_merge
         )
         x = residual_add(x, position)
-        pos_ids = vision_position_ids(combined_grid)
+        pos_ids = vision_position_ids(combined_grid, merge=cfg.spatial_merge)
         cu_seqlens = vision_cu_seqlens(combined_grid)
         if tap:
             tap("patch_embed", x)
@@ -179,27 +178,25 @@ class VisionEncoder:
                 x,
                 self._weight(layer.norm1_weight),
                 self._weight(layer.norm1_bias),
+                eps=cfg.norm_eps,
             )
             weight = self._weight(layer.attention_qkv)
             qkv = add_bias(linear(h, weight), self._weight(layer.attention_qkv_bias))
             del weight, h
             qkv = qkv.reshape(-1, 3, cfg.heads, cfg.head_dim)
             q, k, v = qkv.unbind(1)
-            q, k = apply_vision_rope(q, k, pos_ids)
-            attended = vision_attention(q, k, v, cu_seqlens).reshape(
-                -1, cfg.hidden
-            )
+            q, k = apply_vision_rope(q, k, pos_ids, theta=cfg.rope_theta)
+            attended = vision_attention(q, k, v, cu_seqlens).reshape(-1, cfg.hidden)
             del qkv, q, k, v
             weight = self._weight(layer.attention_output)
-            projected = add_bias(
-                linear(attended, weight), self._weight(layer.attention_output_bias)
-            )
+            projected = add_bias(linear(attended, weight), self._weight(layer.attention_output_bias))
             del weight, attended
             x = residual_add(x, projected)
             h = layer_norm(
                 x,
                 self._weight(layer.norm2_weight),
                 self._weight(layer.norm2_bias),
+                eps=cfg.norm_eps,
             )
             weight = self._weight(layer.mlp_fc1)
             h = gelu(
@@ -219,6 +216,7 @@ class VisionEncoder:
             x,
             self._weight(merger.norm_weight),
             self._weight(merger.norm_bias),
+            eps=cfg.norm_eps,
         ).reshape(-1, cfg.merger_hidden)
         weight = self._weight(merger.fc1)
         x = gelu(
@@ -232,21 +230,14 @@ class VisionEncoder:
         if tap:
             tap("merger", x)
         if x.shape != (llm_tokens, cfg.out_hidden):
-            raise RuntimeError(
-                f"vision merger returned {tuple(x.shape)}, expected "
-                f"({llm_tokens},{cfg.out_hidden})"
-            )
+            raise RuntimeError(f"vision merger returned {tuple(x.shape)}, expected ({llm_tokens},{cfg.out_hidden})")
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
         image_embeddings = x[:image_tokens] if image_tokens else None
         video_embeddings = x[image_tokens:] if video_tokens else None
         elapsed = time.perf_counter() - started
-        peak = (
-            torch.cuda.max_memory_allocated(self.device)
-            if self.device.type == "cuda"
-            else 0
-        )
+        peak = torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0
         stats = VisionStats(
             images=0 if image_grid_thw is None else int(image_grid_thw.shape[0]),
             videos=0 if video_grid_thw is None else int(video_grid_thw.shape[0]),

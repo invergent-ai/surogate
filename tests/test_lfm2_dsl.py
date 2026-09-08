@@ -89,7 +89,7 @@ def test_lfm2_hf_weight_mappings_match_transformers_names():
 
     assert mappings["embedding"] == "model.embed_tokens.weight"
     assert mappings["final_norm"] == "model.embedding_norm.weight"
-    assert mappings["lm_head"]["target"] == "embedding"
+    assert mappings["lm_head"] == "lm_head.weight"
 
     attn_qkv = mappings["blocks[0].qkv_weight"]
     assert attn_qkv["type"] == "fuse"

@@ -14,6 +14,12 @@ enum class Bf16GdnGatingTokenVariant {
     Predicated,
 };
 
+// Shape-driven fallback; accumulates each complete projection in FP32 without BF16 staging.
+void bf16_gdn_gating_proj_generic_launch(const Tensor& x, const Weight& a_weight,
+                                        const Weight& b_weight, const Tensor& A_log,
+                                        const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                        cudaStream_t stream);
+
 void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
                                       const Weight& b_weight, const Tensor& A_log,
                                       const Tensor& dt_bias, Tensor& g, Tensor& beta,

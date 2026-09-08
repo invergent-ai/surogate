@@ -14,6 +14,8 @@
 
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include <api/family/text_geometry.h>
+#include <algorithm>
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
@@ -27,45 +29,66 @@
 
 namespace sinfer::encoder {
 
-/// Geometry the target is built for. Everything here comes from the DSL
-/// declaration by way of the artifact; nothing is read from a checkpoint config
-/// at serve time.
+/// Encoder dimensions and execution settings resolved from the artifact metadata.
 struct GemmaEmbeddingConfig {
-    std::int32_t layers       = 24;
-    std::int32_t hidden       = 768;
-    std::int32_t query_heads  = 3;
-    std::int32_t head_dim     = 256;
-    std::int32_t intermediate = 1152;
-    std::int32_t vocab        = 262144;
-    std::int32_t max_tokens   = 2048;
-    /// Total tokens one batched forward may carry, across all its sequences.
+    std::int32_t layers = 0;
+    std::int32_t hidden = 0;
+    std::int32_t query_heads = 0;
+    std::int32_t head_dim = 0;
+    std::int32_t intermediate = 0;
+    std::int32_t vocab = 0;
+    std::int32_t max_tokens = 0;
+    /// A batching policy; increased when a single supported sequence needs more room.
     std::int32_t max_batch_tokens = 8192;
+    float rms_epsilon = 0.0F;
+    std::int32_t sliding_window = 0;
+    float rope_theta_global = 0.0F;
+    float rope_theta_local = 0.0F;
+    float attention_scale = 0.0F;
+    float embedding_scale = 0.0F;
+    std::vector<bool> global_layers;
 
-    float rms_epsilon = 1.0e-6F;
-    /// Local layers mask abs(i - j) >= window; global layers mask nothing.
-    std::int32_t sliding_window = 512;
-    /// Layer i is global when (i + 1) % period == 0: 5, 11, 17, 23 for 24 layers.
-    std::int32_t sliding_period = 6;
-    float rope_theta_global     = 1.0e6F;
-    float rope_theta_local      = 1.0e4F;
-    /// query_pre_attn_scalar ** -0.5, which is *not* always 1/sqrt(head_dim).
-    float attention_scale = 0.0625F;
-    /// Gemma scales the embedding table by sqrt(hidden) on the way in.
-    ///
-    /// The reference casts this scalar to the weight dtype before multiplying
-    /// (`embed_scale.to(self.weight.dtype)`), so the value to match depends on
-    /// the dtype of the run being matched: a BF16 run rounds sqrt(768) to 27.75,
-    /// an FP32 one keeps 27.712812921102035, and the two differ by 0.134% on the
-    /// residual stream. The generation path rounds, because its target runs
-    /// BF16; this encoder is checked against an FP32 reference (cosine 0.999855)
-    /// and keeps the unrounded value. Settle it by measuring both against that
-    /// reference before changing it -- the arithmetic alone does not say which.
-    float embedding_scale = 27.712812921102035F; // sqrt(768)
-
-    [[nodiscard]] bool is_global(std::int32_t layer) const noexcept {
-        return (layer + 1) % sliding_period == 0;
+    [[nodiscard]] bool is_global(std::int32_t layer) const {
+        return global_layers.at(static_cast<std::size_t>(layer));
     }
     [[nodiscard]] std::int32_t query_size() const noexcept { return query_heads * head_dim; }
+
+    [[nodiscard]] static GemmaEmbeddingConfig from_artifact(const artifact::Reader& reader) {
+        if (reader.identity().architecture != "gemma_embedding") {
+            throw std::invalid_argument("expected a gemma_embedding artifact; rebuild the serving cache");
+        }
+        const auto g = family::TextGeometry::resolved(reader.geometry(), reader.layer_types());
+        // Both encoder attention implementations currently implement multi-query attention.
+        // A backend restriction is checked against the checkpoint, never used as a default.
+        if (g.kv_heads != 1) {
+            throw std::invalid_argument("the embedding backend requires exactly one key/value head");
+        }
+        if (g.embedding_scale <= 0.0F || g.sliding_rope_theta <= 0.0F) {
+            throw std::invalid_argument("embedding metadata requires embedding_scale and sliding_rope_theta");
+        }
+        GemmaEmbeddingConfig config;
+        config.layers = g.layers;
+        config.hidden = g.hidden;
+        config.query_heads = g.query_heads;
+        config.head_dim = g.head_dim;
+        config.intermediate = g.intermediate;
+        config.vocab = g.output_rows;
+        config.max_tokens = g.max_context;
+        config.max_batch_tokens = std::max(config.max_batch_tokens, config.max_tokens);
+        config.rms_epsilon = g.rms_epsilon;
+        config.sliding_window = g.sliding_window;
+        config.rope_theta_global = g.rope_theta;
+        config.rope_theta_local = g.sliding_rope_theta;
+        config.attention_scale = g.attention_scale;
+        config.embedding_scale = g.embedding_scale;
+        for (std::int32_t layer = 0; layer < g.layers; ++layer) {
+            if (!g.layer_attends(layer)) {
+                throw std::invalid_argument("the embedding backend requires attention at every layer");
+            }
+            config.global_layers.push_back(!g.layer_is_windowed(layer));
+        }
+        return config;
+    }
 };
 
 class GemmaEmbedding {

@@ -5,7 +5,7 @@ from __future__ import annotations
 from .. import nn
 from ..block_schema import ServeObject
 from ..blocks.lfm2 import LFM2_MODEL_NAME_REMAP, Lfm2AttentionBlock, Lfm2ConvBlock
-from ..hf import fuse, tied_to
+from ..hf import fuse
 from ..modules import Embedding, LMHead, RMSNorm
 from ..specs import ActivationScope
 
@@ -51,9 +51,8 @@ def _resolve_lfm2_layer_types(
     return block_types
 
 
-#: What a serving artifact holds beside the layers. LFM2 ties its output head to
-#: the embedding, so the head is not a tensor of its own -- the declaration says
-#: so with `tied_to` and the converter reads one weight for both.
+#: What a serving artifact holds beside the layers. The checkpoint's
+#: tie_word_embeddings flag determines whether the head reads the embedding.
 LFM2_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("text/token_embedding", "bf16", ("Vocab", "C"), ("embedding",), scope="model"),
     ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
@@ -143,7 +142,7 @@ class Lfm2Model(nn.Model):
         # Model-level weights
         "embedding": "model.embed_tokens.weight",
         "final_norm": "model.embedding_norm.weight",
-        "lm_head": tied_to("embedding"),
+        "lm_head": "lm_head.weight",
     }
 
     def __init__(

@@ -120,20 +120,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
 } // namespace
 
 family::TextGeometry declared_geometry_with_schedule(const artifact::Reader& reader) {
-    family::TextGeometry geometry = family::TextGeometry::declared<TextConfig>(reader.geometry());
-    // Which layers attend is read off the objects, not off a number: a layer holding an
-    // attention output projection attends. A checkpoint whose layer count the artifact declares
-    // therefore brings its own schedule with it, and the two cannot disagree.
-    for (std::int32_t layer = 0; layer < geometry.layers; ++layer) {
-        const std::string name =
-            "text/layers/" + std::to_string(layer) + "/attention/query_key_value";
-        if (reader.find(name) != nullptr) { geometry.declare_attention_layer(layer); }
-    }
-    if (!geometry.attention_schedule_declared) {
-        throw std::runtime_error(
-            "lfm2: this artifact holds no attention layer at all; every LFM2 checkpoint attends "
-            "at some of its layers, so the objects it carries do not describe this architecture");
-    }
+    family::TextGeometry geometry = family::TextGeometry::resolved(reader.geometry(), reader.layer_types());
     return geometry;
 }
 

@@ -250,7 +250,7 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     stage.first   = plan.pipeline_stage_first;
     stage.last    = plan.pipeline_stage_last;
     stage.columns = static_cast<std::int32_t>(plan.pipeline_boundary_columns);
-    stage_boundary_bytes_ = static_cast<std::size_t>(residual_width<TextConfig>()) *
+    stage_boundary_bytes_ = static_cast<std::size_t>(cfg.residual) *
                             plan.pipeline_boundary_columns * sizeof(std::uint16_t);
     if (stage.first > 0) {
         // The stage owns its import buffer (the driver copies the previous stage's export
@@ -1995,7 +1995,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     work.reset();
     Tensor features =
-        work.alloc(DType::BF16, {DFlashConfig::feature_rows,
+        work.alloc(DType::BF16, {model.geometry.dflash.feature_rows,
                                  static_cast<std::int32_t>(draft_window + 1U), batch});
     ops::prepare_ragged_prefix(dflash->pending_features, lane_tensor, device_starts, device_ends,
                                features, positions, device_counts, device.stream);

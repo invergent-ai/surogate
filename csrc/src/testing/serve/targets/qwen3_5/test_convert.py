@@ -17,25 +17,21 @@ from surogate.serve.artifact.layouts import decode_direct, dequantize_row_split,
 from surogate.serve.convert.qwen3_5 import convert, inventory, recipe
 
 
-OFFICIAL_MODEL = Path(
-    "/home/densemax2/work/models/hf/qwen/Qwen3.6-27B/base-hf-bf16"
-)
+from tests.serve.test_qwen3_5_checkpoint_config import config_for
+GEOMETRY = inventory.geometry_from_config(config_for(vision=True), token_domain=500)
 
 
-def test_official_config_uses_only_nested_mtp_field():
-    config = json.loads((OFFICIAL_MODEL / "config.json").read_text())
-
-    assert "mtp_num_hidden_layers" not in config
+def test_config_uses_nested_mtp_field():
+    config = config_for(nested=True)
     summary = convert.validate_config(config)
-    assert summary["mtp_num_hidden_layers"] == 1
     assert summary["text"]["mtp_num_hidden_layers"] == 1
-    assert convert.recipe_id_for(inventory.GEOMETRY_27B) == "qwen3_6_27b-v2"
+    assert convert.recipe_id_for(GEOMETRY) == convert.RECIPE_ID
 
 
 def test_complete_inventory_has_one_preplanned_object_directory():
-    export = inventory.export_inventory(inventory.GROUPWISE_INT, inventory.GEOMETRY_27B)
+    export = inventory.export_inventory(inventory.GROUPWISE_INT, GEOMETRY)
     resources = {spec.name: b"x" for spec in inventory.RESOURCE_SPECS}
-    plan = convert.build_object_plan(resources, geometry=inventory.GEOMETRY_27B)
+    plan = convert.build_object_plan(resources, geometry=GEOMETRY)
 
     expected_names = tuple(spec.name for spec in export.OBJECT_SPECS)
     assert tuple(spec.name for spec in plan.specs) == expected_names
@@ -80,7 +76,7 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
     path = tmp_path / "mini.sinfer"
     with ArtifactWriter(
         path,
-        ArtifactIdentity("mini-model", "mini-weights"),
+        ArtifactIdentity("mini-model", "mini-weights", architecture="mini"),
         artifact_specs,
     ) as writer:
         writer.write("frontend/test.json", b"{}")

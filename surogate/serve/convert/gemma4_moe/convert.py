@@ -11,6 +11,8 @@ check the checkpoint has what the recipes name, then write each object in plan o
 
 from __future__ import annotations
 
+from surogate.serve.convert.common.checkpoint import tokenizer_domain
+
 import argparse
 import json
 import os
@@ -33,21 +35,10 @@ from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.recipe import expression_sources, materialize_recipe
 
 from . import inventory, recipe
+from surogate.serve.convert.common.gemma4 import geometry_block
 
 RECIPE_ID = "gemma4-moe-v1"
 
-#: What the config must state for the artifact to be shaped at all.
-_REQUIRED_CONFIG = (
-    "hidden_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "vocab_size",
-    "head_dim",
-    "num_experts",
-    "top_k_experts",
-    "moe_intermediate_size",
-)
 
 
 def _plan_repack(repack, recipes_by_name, tensor_specs, native) -> tuple[str, ...]:
@@ -77,36 +68,7 @@ def _plan_repack(repack, recipes_by_name, tensor_specs, native) -> tuple[str, ..
 
 
 def validate_config(config: Mapping[str, object]) -> inventory.Geometry:
-    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
-    absent = [name for name in _REQUIRED_CONFIG if text.get(name) is None]
-    if absent:
-        raise ValueError(
-            "this checkpoint's config.json does not state "
-            + ", ".join(absent)
-            + "; a Gemma 4 mixture artifact cannot be shaped without them"
-        )
-    geometry = inventory.geometry_from_config(config)
-    if geometry.global_head_dim <= 0 or geometry.global_kv_heads <= 0:
-        raise ValueError(
-            "this checkpoint states no global attention geometry "
-            f"(global_head_dim={geometry.global_head_dim}, "
-            f"num_global_key_value_heads={geometry.global_kv_heads})"
-        )
-    # The dense feed-forward and the routed experts are two widths on the *same* layer here.
-    # A checkpoint that states one and means both would convert into an artifact whose experts
-    # are three times their real width -- which is the trap this target's declaration was
-    # written around, so it is checked rather than assumed.
-    if geometry.expert_intermediate <= 0 or geometry.experts <= 0:
-        raise ValueError(
-            "this checkpoint routes no experts "
-            f"(num_experts={geometry.experts}, moe_intermediate_size="
-            f"{geometry.expert_intermediate}); the dense sizes belong to the gemma4 target"
-        )
-    if geometry.experts_per_token <= 0 or geometry.experts_per_token > geometry.experts:
-        raise ValueError(
-            f"this checkpoint selects {geometry.experts_per_token} of {geometry.experts} experts"
-        )
-    return geometry
+    return inventory.geometry_from_config(config)
 
 
 def convert(
@@ -131,9 +93,9 @@ def convert(
     )
 
     tied = recipe.tied_output_head(config)
-    objects = inventory.stored_objects(config, tied_output_head=tied)
+    objects = inventory.stored_objects(geometry, tied_output_head=tied)
     tensor_specs = inventory.tensor_specs(objects)
-    recipes = {r.object_name: r for r in recipe.build_recipes(config)}
+    recipes = {r.object_name: r for r in recipe.build_recipes(geometry)}
 
     # What the GGUF can serve as it stores it. `native` is a whole object read verbatim,
     # `halves` a fused parent whose two halves carry different K-quant types, `planned` the
@@ -190,9 +152,10 @@ def convert(
         output.parent.mkdir(parents=True, exist_ok=True)
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="gemma4_moe"),
             plan.specs,
-            geometry=_geometry_block(geometry),
+            geometry=_geometry_block(geometry, token_domain=tokenizer_domain(model)),
+            layer_types=geometry.layer_types,
             external=external,
         ) as writer:
             total = len(plan.specs)
@@ -228,7 +191,7 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
+    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="gemma4_moe")
     report = family_conversion.build_conversion_report(
         identity=identity,
         target_key=inventory.TARGET_KEY,
@@ -299,40 +262,8 @@ def load_resources(model_dir: Path) -> tuple[ResourcePayload, ...]:
     return tuple(payloads)
 
 
-def _geometry_block(geometry: inventory.Geometry) -> dict[str, float]:
-    """The dimensions the artifact states about itself.
-
-    Two feed-forward widths, and they are named as `family::TextGeometry` names them:
-    `intermediate` is the **routed experts'** width and `dense_intermediate` the dense
-    branch's. Every other mixture here alternates dense layers with routed ones, so those two
-    members describe different layers; on Gemma 4 they describe two halves of the *same* layer,
-    which changes nothing about what either number means.
-
-    The expert count and the top-k are not here. They are the registered `SparseMoeGeometry`'s,
-    compiled into the kernels, and a number in this object that the engine reads for a
-    dimension the kernels fixed would be a second place for it to be wrong. The conversion
-    report states them, where nothing loads them.
-    """
-    return {
-        "hidden": float(geometry.hidden),
-        "layers": float(geometry.layers),
-        "intermediate": float(geometry.expert_intermediate),
-        "dense_intermediate": float(geometry.intermediate),
-        "output_rows": float(geometry.vocab),
-        "token_domain": float(geometry.vocab),
-        "query_heads": float(geometry.query_heads),
-        "kv_heads": float(geometry.kv_heads),
-        "head_dim": float(geometry.head_dim),
-        "global_kv_heads": float(geometry.global_kv_heads),
-        "global_head_dim": float(geometry.global_head_dim),
-        "global_rotary_angles": float(geometry.partial_rotary_angles),
-        "sliding_window": float(geometry.sliding_window),
-        "rope_theta": float(geometry.rope_theta),
-        "sliding_rope_theta": float(geometry.sliding_rope_theta),
-        "logit_softcap": float(geometry.final_logit_softcapping),
-        "embedding_scale": float(geometry.embedding_scale),
-        "rms_epsilon": float(geometry.rms_epsilon),
-    }
+def _geometry_block(geometry: inventory.Geometry, *, token_domain: int) -> dict[str, int | float]:
+    return geometry_block(geometry, token_domain=token_domain)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

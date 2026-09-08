@@ -77,6 +77,7 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                    g.hidden);
     out.down = materialized_weight(materialized, plan.down, g.hidden,
                                    g.intermediate);
+    out.rms_epsilon = g.rms_epsilon;
     out.post_feedforward_norm =
         materialized_norm(materialized, plan.post_feedforward_norm, g.hidden);
     return out;
@@ -138,7 +139,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // The checkpoint's own dimensions, where it states them: absent members keep the
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.
-    out.geometry = family::TextGeometry::declared<TextConfig>(binder.reader().geometry());
+    out.geometry = family::TextGeometry::resolved_gemma3(binder.reader().geometry(), binder.reader().layer_types());
     const family::TextGeometry& g = out.geometry;
     out.frontend     = family::bind_text_only_frontend_resources(binder);
     out.features     = features;
@@ -218,6 +219,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                          g.hidden),
             .post_attention_norm = materialized_norm(
                 backing, source.attention.post_attention_norm, g.hidden),
+            .rms_epsilon = g.rms_epsilon,
         };
         target.query_norm =
             materialized_norm(backing, source.attention.query_norm, g.head_dim);

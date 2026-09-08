@@ -39,19 +39,18 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
-      # The serve tests import torch, numpy, safetensors and gguf, and nothing that needs a
-      # GPU. Installing the project itself would build the CUDA extension, which this runner
-      # has no toolkit for, so the dependencies go in directly.
+      # Install the CPU suite's dependencies directly. Installing the project itself would
+      # build the CUDA extension, which this runner has no toolkit for.
       - name: Install test dependencies
         run: |
           uv venv
-          uv pip install pytest numpy safetensors gguf jinja2 \
+          uv pip install pytest numpy safetensors gguf jinja2 "sentencepiece>=0.2.0" \
             torch --torch-backend=cpu
 
       - name: Run the serve suite
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: uv run pytest -q tests/serve tests/test_serve_contract.py
+        run: .venv/bin/python -m pytest -q tests/serve tests/test_serve_contract.py
 
       # The declaration is the single source of truth for what a serving artifact holds, and
       # the emitters prove it by regenerating the committed targets. Run separately so a
@@ -60,4 +59,4 @@ jobs:
       - name: Check the targets still regenerate from the declaration
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: uv run pytest -q tests/test_serve_contract.py -k "regenerat or derives or declaration"
+        run: .venv/bin/python -m pytest -q tests/test_serve_contract.py -k "regenerat or derives or declaration"

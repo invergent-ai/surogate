@@ -729,6 +729,8 @@ int main() {
     }
 
     int failures = 0;
+    failures += run_case({24, 32, 8192}, 3, 4, {0, 1, 2, 3}, 1791U);
+    failures += run_case({3, 32, 8192}, 6, 2, {2, 5}, 1792U);
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U);
     failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
     failures += run_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);

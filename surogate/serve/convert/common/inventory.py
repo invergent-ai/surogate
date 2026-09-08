@@ -46,7 +46,6 @@ FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8, NVFP4, FP8, FP8_BLOCK, FP8_ROW_
 LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT, BLOCK_SCALE_LAYOUT, ROW_SCALE_LAYOUT, GGML_BLOCKS_LAYOUT,
                 BLOCK128_LAYOUT, ROW_SCALE_F32_LAYOUT)
 
-VISION_LAYERS = tuple(range(27))
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,23 +138,15 @@ RESOURCE_SPECS = tuple(
 def build_vision_specs(
     text_width: int,
     *,
-    layers: int = 27,
-    hidden: int = 1152,
-    intermediate: int = 4304,
-    qkv_rows: int = 3456,
-    patch_rows: int = 1536,
-    position_embeddings: int = 2304,
-    merger_hidden: int = 4608,
+    layers: int,
+    hidden: int,
+    intermediate: int,
+    qkv_rows: int,
+    patch_rows: int,
+    position_embeddings: int,
+    merger_hidden: int,
 ) -> tuple[TensorSpec, ...]:
-    """Build a vision inventory for a target's own tower.
-
-    The defaults are the Qwen3.6 tower (27 layers of 1152) that the 27B and 35B
-    carry. They are only defaults: the Qwen3.5 targets have towers of their own —
-    the 0.8B is 12 layers of 768, the 2B and 4B are 24 of 1024 — and serving
-    carries the tower on every target, so the geometry has to be a parameter
-    rather than a constant. The DSL declaration is where each target's numbers
-    come from; `tests/test_serve_contract.py` checks that these agree with it.
-    """
+    """Build the tower inventory from its resolved checkpoint dimensions."""
 
     specs: list[TensorSpec] = [
         tensor_spec("vision/patch_embedding", (hidden, patch_rows), Q6),
@@ -201,7 +192,7 @@ def tied_duplicate_objects(recipes_by_name, specs) -> tuple[str, ...]:
 
     A tied language-model head is the whole of this today: the checkpoint has no
     `lm_head.weight` and the recipe reads `embed_tokens.weight`, so the artifact would carry
-    the vocabulary table twice -- on a 2B Q4_K_M that is 417 MB of 2,050, and every one of
+    the vocabulary table twice, and every one of
     those bytes is read again on each decode step. The loader binds the survivor once and
     points both plans at it; an artifact that predates this still carries both and still loads.
     """
@@ -239,7 +230,6 @@ __all__ = [
     "ResourceSpec",
     "StoredObjectSpec",
     "TensorSpec",
-    "VISION_LAYERS",
     "W8",
     "build_vision_specs",
     "tensor_spec",

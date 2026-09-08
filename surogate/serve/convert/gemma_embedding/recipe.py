@@ -150,20 +150,17 @@ def geometry_from_config(config: Mapping[str, object]) -> inventory.Geometry:
     256 by coincidence here and be wrong for the next size of this encoder.
     """
 
-    head_dim = config.get("head_dim")
-    if not head_dim:
-        raise ValueError(
-            "config declares no head_dim; Gemma 3 does not derive it from "
-            "hidden_size // num_attention_heads and the value cannot be guessed"
-        )
+    from surogate.serve.convert.common.checkpoint import resolve_dense
+
+    declared = resolve_dense(inventory.DECLARATION, config)
+    resolved = declared.config
+    if resolved["num_kv_heads"] != 1:
+        raise ValueError("the embedding backend currently requires exactly one key/value head")
     return inventory.Geometry(
-        layers=int(config["num_hidden_layers"]),
-        hidden=int(config["hidden_size"]),
-        intermediate=int(config["intermediate_size"]),
-        vocab=int(config["vocab_size"]),
-        query_heads=int(config["num_attention_heads"]),
-        kv_heads=int(config["num_key_value_heads"]),
-        head_dim=int(head_dim),
+        layers=int(resolved["n_layers"]), hidden=int(resolved["d_model"]),
+        intermediate=int(resolved["d_ff"]), vocab=int(resolved["vocab_size"]),
+        query_heads=int(resolved["num_query_heads"]), kv_heads=int(resolved["num_kv_heads"]),
+        head_dim=int(resolved["head_size"]), declared=declared,
     )
 
 
@@ -173,7 +170,7 @@ def geometry_from_config(config: Mapping[str, object]) -> inventory.Geometry:
 
 
 def build_recipes(
-    geometry: inventory.Geometry = inventory.GEOMETRY,
+    geometry: inventory.Geometry,
 ) -> tuple[TensorRecipe, ...]:
     """Where every artifact object comes from, for a checkpoint of this geometry.
 
@@ -193,14 +190,9 @@ def build_recipes(
     )
 
 
-#: The registered size's recipes, for callers that have no checkpoint in hand.
-RECIPE_SPECS = build_recipes()
-RECIPES_BY_NAME = {item.object_name: item for item in RECIPE_SPECS}
-
-
 def validate_recipe_coverage(
-    recipes: Sequence[TensorRecipe] = RECIPE_SPECS,
-    geometry: inventory.Geometry = inventory.GEOMETRY,
+    recipes: Sequence[TensorRecipe],
+    geometry: inventory.Geometry,
 ) -> None:
     """Every declared object has a source, and every source names a declared object.
 
@@ -218,6 +210,3 @@ def validate_recipe_coverage(
             f"declared but unsourced {sorted(declared - named)}, "
             f"sourced but undeclared {sorted(named - declared)}"
         )
-
-
-validate_recipe_coverage()

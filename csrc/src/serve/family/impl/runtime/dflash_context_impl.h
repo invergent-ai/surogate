@@ -11,21 +11,21 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
       full(backing, layout.full), prefill_features(layout.prefill_features.bind(backing)),
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
-    if (local.layer_count() != DFlashConfig::local_layers ||
-        rewrite_checkpoint_local.layer_count() != DFlashConfig::local_layers ||
-        local.capacity() != DFlashConfig::local_capacity ||
-        rewrite_checkpoint_local.capacity() != DFlashConfig::local_capacity || full.layers() != 1 ||
+    if (local.layer_count() != layout.geometry.local_layers ||
+        rewrite_checkpoint_local.layer_count() != layout.geometry.local_layers ||
+        local.capacity() != layout.geometry.local_capacity ||
+        rewrite_checkpoint_local.capacity() != layout.geometry.local_capacity || full.layers() != 1 ||
         full.max_context() != layout.full.max_context || full.pool().plane_count() != 2 ||
-        local.num_kv_heads() != DFlashConfig::kv_heads ||
-        rewrite_checkpoint_local.num_kv_heads() != DFlashConfig::kv_heads ||
-        local.head_dim() != DFlashConfig::head_dim ||
-        rewrite_checkpoint_local.head_dim() != DFlashConfig::head_dim ||
+        local.num_kv_heads() != layout.geometry.kv_heads ||
+        rewrite_checkpoint_local.num_kv_heads() != layout.geometry.kv_heads ||
+        local.head_dim() != layout.geometry.head_dim ||
+        rewrite_checkpoint_local.head_dim() != layout.geometry.head_dim ||
         local.lane_capacity() != rewrite_checkpoint_local.lane_capacity() ||
         local.lane_capacity() != full.pool().table_row_count() ||
         full.pool().plane(0).dtype != DType::BF16 ||
-        full.pool().plane(0).ne[0] != DFlashConfig::head_dim ||
+        full.pool().plane(0).ne[0] != layout.geometry.head_dim ||
         full.pool().plane(0).ne[1] != kPagedKVPageSize ||
-        full.pool().plane(0).ne[3] != DFlashConfig::kv_heads) {
+        full.pool().plane(0).ne[3] != layout.geometry.kv_heads) {
         throw std::invalid_argument("DFlash persistent cache layout is invalid");
     }
 }

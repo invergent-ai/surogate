@@ -1,17 +1,7 @@
-"""Single-source recipe for a ModelOpt NVFP4 export of this family, at any size.
+"""Matrix row programs for hybrid projections at resolved checkpoint dimensions.
 
-``AxionML/Qwen3.5-4B-NVFP4`` was the first: every linear weight ships as packed E2M1 codes
-with per-16 E4M3 block scales, a global weight divisor and a calibrated activation divisor,
-while the norms, the convolution and the tied embedding stay BF16 in the same file. So one
-checkpoint supplies the whole artifact - the NVFP4 blocks pass through untouched, and only
-the embedding is re-encoded (FP8 row-scaled, as the byte-wide head this target expects).
-The 0.8B and 2B releases are the same export at other dimensions and under the VL-style
-``model.language_model.`` root, so the recipes are built from the checkpoint's own
-`config.json` and tensor names rather than restated per size.
-
-ModelOpt spells its fields ``weight`` / ``weight_scale`` / ``weight_scale_2``
-where compressed-tensors exports use ``weight_packed`` / ``weight_scale`` /
-``weight_global_scale``; the materializers below read the ModelOpt names.
+These source ranges also serve FP8 and mixed storage. Encodings are resolved by the
+checkpoint reader; no object list is constructed until a Geometry is supplied.
 """
 
 from __future__ import annotations
@@ -26,15 +16,12 @@ from surogate.serve.convert.common.safetensors import ShardReader
 from .. import inventory as family_inventory
 
 
-QUANTIZED_REPOSITORY = "AxionML/Qwen3.5-4B-NVFP4" # the export this recipe was written against
-
 WEIGHT_FIELD = "weight"
 SCALE_FIELD = "weight_scale"
 GLOBAL_SCALE_FIELD = "weight_scale_2"
 INPUT_SCALE_FIELD = "input_scale"
 
-#: Where a checkpoint keeps its decoder: the 4B under ``model.``, the VL-style 0.8B and 2B
-#: under ``model.language_model.``. Read off the tensor names, never off the size.
+#: Resolve the decoder prefix from checkpoint tensor names.
 SOURCE_ROOTS = ("model.language_model.", "model.")
 
 

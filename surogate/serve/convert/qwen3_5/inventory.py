@@ -1,8 +1,6 @@
 """Persistent-object contract for every export of the interleaved gated-delta family.
 
-Two things vary and nothing else does: the checkpoint's dimensions, and what its export did
-to the weights. Both are parameters here — `Geometry` and `Export` — so one object list serves
-Qwen3.5, Qwen3.6 and Qwen3.8 at every published size and quantisation.
+Resolved checkpoint dimensions and observed weight storage are explicit inputs.
 
 This module contains only target storage roles. Source-checkpoint mapping and materialization
 live in the sibling conversion recipe.
@@ -38,7 +36,6 @@ from surogate.serve.convert.common.inventory import (
     ResourceSpec,
     StoredObjectSpec,
     TensorSpec,
-    VISION_LAYERS,
     W8,
     build_vision_specs as _family_vision_specs,
     tensor_spec as _family_tensor_spec,
@@ -47,220 +44,23 @@ from surogate.serve.convert.common.inventory import FP8_BLOCK as FP8_BLOCK_FORMA
 from surogate.serve.convert.common.inventory import FP8_ROW_F32 as FP8_ROW_F32_FORMAT, ROW_SCALE_F32_LAYOUT
 
 
-#: The identity of the checkpoint being converted. One converter serves the family, so this
-#: is resolved per checkpoint by `model_id_for`; the constant is the registered size.
-MODEL_ID = "qwen3.5-2b"
+from surogate.serve.convert.common.qwen3_5 import (
+    Geometry, geometry_from_config, geometry_from_checkpoint, vision_tower,
+)
+
+MODEL_ID = "qwen3_5"
 WEIGHTS_ID = "groupwise-int"
 TARGET_KEY = "qwen3_5"
 
-#: The width at which this family becomes the 27B. It is a size key, not a dimension any
-#: shape is built from: two things about a registered artifact follow the generation rather
-#: than the numbers — the vision tower it carries and whether its checkpoint ties the output
-#: head — and `is_27b` is the single place that decides them.
-_HIDDEN_27B = 5120
 
-#: Source `model_type` spellings that mean Qwen3.8. It shares every dimension with the 3.6,
-#: so only what the checkpoint calls itself tells the two apart.
-_QWEN3_8_MODEL_TYPES = ("qwen3_8", "qwen38")
-QWEN3_8_MODEL_ID = "qwen3.8-27b"
-
-
-def model_id_for(geometry: "Geometry", model_type: str | None = None) -> str:
-    """The model id an artifact of this size claims, which the engine resolves its profile
-    from. The family's target answers for every size.
-
-    Qwen3.8-27B is dimensionally identical to Qwen3.6-27B and differs only in how its
-    exports quantise, so the source's own `model_type` is what separates them; without one,
-    a 27B checkpoint is taken for the 3.6.
-    """
-    declared = model_type or geometry.model_type
-    if geometry.hidden == _HIDDEN_27B and str(declared) in _QWEN3_8_MODEL_TYPES:
-        return QWEN3_8_MODEL_ID
-    return {
-        1024: "qwen3.5-0.8b",
-        2048: "qwen3.5-2b",
-        2560: "qwen3.5-4b",
-        _HIDDEN_27B: "qwen3.6-27b",
-    }.get(geometry.hidden, MODEL_ID)
-
-
-@dataclass(frozen=True)
-class Geometry:
-    """The dimensions the object list depends on, read from `config.json` at convert time.
-
-    One converter serves every size of this family: the numbers below are the 2B's, and they
-    are the defaults only so a caller that has no checkpoint in hand still gets a valid list.
-
-    `model_type` is not a dimension and takes no part in equality — it only carries what the
-    source called itself, for the one decision the dimensions cannot make.
-    """
-
-    layers: int = 24
-    hidden: int = 2048
-    intermediate: int = 6144
-    vocab: int = 248320
-    query_heads: int = 8
-    kv_heads: int = 2
-    head_dim: int = 256
-    gdn_key_heads: int = 16
-    gdn_key_head_dim: int = 128
-    gdn_value_heads: int = 16
-    gdn_value_head_dim: int = 128
-    gdn_conv_kernel: int = 4
-    full_attention_interval: int = 4
-    model_type: str | None = field(default=None, compare=False)
-
-    @property
-    def query_size(self) -> int:
-        return self.query_heads * self.head_dim
-
-    @property
-    def kv_size(self) -> int:
-        return self.kv_heads * self.head_dim
-
-    @property
-    def key_dim(self) -> int:
-        return self.gdn_key_heads * self.gdn_key_head_dim
-
-    @property
-    def value_dim(self) -> int:
-        return self.gdn_value_heads * self.gdn_value_head_dim
-
-    @property
-    def convolution_dim(self) -> int:
-        return 2 * self.key_dim + self.value_dim
-
-    @property
-    def full_attention_layers(self) -> tuple[int, ...]:
-        return tuple(range(3, self.layers, self.full_attention_interval))
-
-    @property
-    def gdn_layers(self) -> tuple[int, ...]:
-        full = set(self.full_attention_layers)
-        return tuple(layer for layer in range(self.layers) if layer not in full)
-
-
-def is_27b(geometry: Geometry) -> bool:
-    """Whether this is the family's 27B, whose checkpoint differs by more than its numbers:
-    it unties the output head, and it carries the 27-layer vision tower where every smaller
-    size carries a 24-layer one."""
-    return geometry.hidden == _HIDDEN_27B
-
-
-def geometry_from_config(config) -> Geometry:
-    """The dimensions this checkpoint declares. `config` is the whole `config.json`."""
-    text = config.get("text_config", config)
-    return Geometry(
-        layers=int(text["num_hidden_layers"]),
-        hidden=int(text["hidden_size"]),
-        intermediate=int(text["intermediate_size"]),
-        vocab=int(text["vocab_size"]),
-        query_heads=int(text["num_attention_heads"]),
-        kv_heads=int(text["num_key_value_heads"]),
-        head_dim=int(text["head_dim"]),
-        gdn_key_heads=int(text["linear_num_key_heads"]),
-        gdn_key_head_dim=int(text["linear_key_head_dim"]),
-        gdn_value_heads=int(text["linear_num_value_heads"]),
-        gdn_value_head_dim=int(text["linear_value_head_dim"]),
-        gdn_conv_kernel=int(text["linear_conv_kernel_dim"]),
-        full_attention_interval=int(text.get("full_attention_interval", 4)),
-        # The root type is the family identity; the nested one is its "_text" variant.
-        model_type=config.get("model_type", text.get("model_type")),
-    )
+def model_id_for(geometry: Geometry, model_type: str | None = None) -> str:
+    """Descriptive architecture identity; dimensions never select an artifact name."""
+    return TARGET_KEY
 
 
 def hf_config_for(geometry: Geometry) -> dict:
-    """The `config.json` a checkpoint of these dimensions would carry, for callers that
-    have a geometry and no checkpoint — the recipes are derived from the declaration
-    compiled against a config, so the inverse of `geometry_from_config` is what lets
-    them be built for a registered size. The flat text architecture is used: recipes
-    are written in the flat dialect either way."""
-    return declaration.text_config(
-        "Qwen3_5ForCausalLM",
-        geometry.model_type or "qwen3_5",
-        layers=geometry.layers,
-        hidden=geometry.hidden,
-        intermediate=geometry.intermediate,
-        vocab=geometry.vocab,
-        query_heads=geometry.query_heads,
-        kv_heads=geometry.kv_heads,
-        head_dim=geometry.head_dim,
-        **{
-        "linear_num_key_heads": geometry.gdn_key_heads,
-        "linear_key_head_dim": geometry.gdn_key_head_dim,
-        "linear_num_value_heads": geometry.gdn_value_heads,
-        "linear_value_head_dim": geometry.gdn_value_head_dim,
-        "linear_conv_kernel_dim": geometry.gdn_conv_kernel,
-        "full_attention_interval": geometry.full_attention_interval,
-        "layer_types": [
-            "full_attention" if layer in set(geometry.full_attention_layers) else "linear_attention"
-            for layer in range(geometry.layers)
-        ],
-        # The smaller sizes tie the output head to the embedding; the 27B ships its own.
-        "tie_word_embeddings": not is_27b(geometry),
-        },
-    )
-
-
-#: GGUF architecture strings this family is exported under, and the `model_type` each means.
-#: 3.5 and 3.6 share one string; 3.8 has its own, which is the only thing that tells it from
-#: the 3.6 at the same dimensions.
-_GGUF_ARCHITECTURES = (("qwen35", "qwen3_5"), ("qwen38", "qwen3_8"))
-
-
-def geometry_from_gguf(kv) -> Geometry:
-    """The dimensions this GGUF declares, for the repack plan.
-
-    The plan is made before the bridge writes a `config.json`, so the numbers come from the
-    file's own key-values. `ssm.group_count` is the linear-attention head count and
-    `ssm.state_size` its head width; the value heads follow from the inner size.
-    """
-    for arch, model_type in _GGUF_ARCHITECTURES:
-        blocks = int(kv(f"{arch}.block_count", 0) or 0)
-        # llama.cpp counts the MTP (nextn) block among the blocks; the text core is the rest.
-        blocks -= int(kv(f"{arch}.nextn_predict_layers", 0) or 0)
-        if blocks:
-            break
-    else:
-        raise ValueError("GGUF declares no architecture of this family")
-    heads = int(kv(f"{arch}.attention.head_count"))
-    key_heads = int(kv(f"{arch}.ssm.group_count"))
-    key_head_dim = int(kv(f"{arch}.ssm.state_size"))
-    inner = int(kv(f"{arch}.ssm.inner_size"))
-    return Geometry(
-        layers=blocks,
-        hidden=int(kv(f"{arch}.embedding_length")),
-        intermediate=int(kv(f"{arch}.feed_forward_length")),
-        query_heads=heads,
-        kv_heads=int(kv(f"{arch}.attention.head_count_kv")),
-        head_dim=int(kv(f"{arch}.attention.key_length")),
-        gdn_key_heads=key_heads,
-        gdn_key_head_dim=key_head_dim,
-        gdn_value_heads=inner // key_head_dim,
-        gdn_value_head_dim=key_head_dim,
-        gdn_conv_kernel=int(kv(f"{arch}.ssm.conv_kernel")),
-        model_type=model_type,
-    )
-
-
-GEOMETRY = Geometry()
-
-#: The 27B. Named because the exports that only exist at that size state their per-layer
-#: exceptions in its layer numbering.
-GEOMETRY_27B = Geometry(
-    layers=64,
-    hidden=_HIDDEN_27B,
-    intermediate=17408,
-    vocab=248320,
-    query_heads=24,
-    kv_heads=4,
-    head_dim=256,
-    gdn_key_heads=16,
-    gdn_key_head_dim=128,
-    gdn_value_heads=48,
-    gdn_value_head_dim=128,
-    gdn_conv_kernel=4,
-)
+    """The checkpoint resolved for this conversion, without reconstructing size presets."""
+    return geometry.declared.hf_config
 
 
 # ---------------------------------------------------------------------------
@@ -283,15 +83,12 @@ FP8_BLOCK = "fp8-block"
 FP8_CHANNEL = "fp8-channel"
 PROFILES = (GROUPWISE_INT, NVFP4_MIXED_BF16, NVFP4_UNIFORM, NVFP4_MLP_ONLY, NVFP4_ALL, FP8_BLOCK, FP8_CHANNEL)
 
-#: The `weights_id` half of the artifact identity each profile writes. The engine resolves
-#: the profile back from (model_id, weights_id), so these strings are the contract: `nvfp4`
-#: means two different profiles and is told apart by the model id, exactly as
-#: `Package::resolve_weights` does it.
+#: Each stored weight profile has an unambiguous identity, independent of model name.
 WEIGHTS_IDS = {
     GROUPWISE_INT: "groupwise-int",
     NVFP4_UNIFORM: "nvfp4-mixed",
-    NVFP4_MIXED_BF16: "nvfp4",
-    NVFP4_MLP_ONLY: "nvfp4",
+    NVFP4_MIXED_BF16: "nvfp4-mixed-bf16",
+    NVFP4_MLP_ONLY: "nvfp4-mlp-only",
     NVFP4_ALL: "nvfp4-all",
     FP8_BLOCK: "fp8-block",
     FP8_CHANNEL: "fp8-channel",
@@ -302,14 +99,13 @@ def weights_id_for(profile: str) -> str:
     return WEIGHTS_IDS[profile]
 
 
-def profile_for(model_id: str, weights_id: str) -> str:
-    """The profile an artifact of this identity was written with; the engine's own rule."""
-    if weights_id == "nvfp4":
-        return NVFP4_MLP_ONLY if model_id == QWEN3_8_MODEL_ID else NVFP4_MIXED_BF16
+def profile_for(weights_id: str) -> str:
+    """Resolve storage from its explicit profile, without interpreting a model label."""
     for profile, published in WEIGHTS_IDS.items():
-        if published == weights_id and profile != NVFP4_MLP_ONLY:
+        if published == weights_id:
             return profile
-    raise ValueError(f"no profile writes {model_id!r}/{weights_id!r}")
+    raise ValueError(f"unknown weights profile {weights_id!r}; rebuild the serving cache")
+
 
 
 #: How the fused projections are cut into objects. The engine binds whichever it finds, so
@@ -328,8 +124,7 @@ class Export:
 
     `attention_input`, `gdn_input` and `mlp` carry one format per object stored for that
     role, so a storage choice and the widths that go with it cannot drift apart.
-    `exceptions` names the layers an export left at another width — measured from the
-    published file, not derived, because nothing in the checkpoint states them.
+    `exceptions` names layers stored at another width, derived from the checkpoint tensors.
     """
 
     attention_storage: str
@@ -343,7 +138,7 @@ class Export:
     gdn_output: str
     mlp: tuple[str, str]
     exceptions: Mapping[str, tuple[str, tuple[int, ...]]] = field(default_factory=dict)
-    #: What the export ships. The 4B NVFP4 release carries neither draft block nor tower.
+    #: Whether this conversion profile includes optional sections when available.
     mtp: bool = True
     vision: bool = True
 
@@ -352,17 +147,6 @@ class Export:
         if exception is not None and layer in exception[1]:
             return exception[0]
         return default
-
-
-#: The 3.6-27B additive NVFP4 export left these layers in BF16, and the 3.8 MLP-only export
-#: left its last eight MLPs in FP8. Both are properties of the published files -- which is
-#: exactly why they must be checked against the file in hand rather than trusted: see
-#: `exception_disagreement` below, and the note there on the two published 27B NVFP4 exports
-#: that match neither table.
-_BF16_ATTENTION_INPUT_LAYERS = (3, 7, 11, 15, 19, 23)
-_BF16_ATTENTION_OUTPUT_LAYERS = (3, 7)
-_BF16_GDN_OUTPUT_LAYERS = (4,)
-_FP8_MLP_LAYERS = tuple(range(56, 64))
 
 
 #: Which checkpoint modules carry each role the export table names exceptions for. A role is
@@ -376,61 +160,34 @@ _ROLE_MODULES = {
 }
 
 
-def exception_disagreement(export: "Export", observed) -> dict[str, tuple[tuple[int, ...], tuple[int, ...]]]:
-    """Where an export table's exception layers differ from the checkpoint's own tensors.
-
-    The tables were measured from published files and written down, and a written-down
-    measurement goes stale silently. Both `nvidia/Qwen3.6-27B-NVFP4` and
-    `unsloth/Qwen3.6-27B-NVFP4` quantise every attention and MLP layer, so neither matches
-    `_BF16_ATTENTION_INPUT_LAYERS`; whatever file those were taken from, it is not either of
-    the ones published today. This turns that into a raise instead of a wrong artifact.
-
-    Returns {role: (declared_by_the_table, found_in_the_file)} for the roles that differ.
-    """
-    out: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
-    for role, (width, layers) in export.exceptions.items():
-        modules = _ROLE_MODULES.get(role)
-        if modules is None:
-            continue
-        # What an exception layer looks like in the file follows the width the table gives
-        # it: NVFP4 codes are packed, FP8 keeps a full-width weight beside its scale (the
-        # scanner files both under "quantised"), and anything else is a bare weight. The
-        # check used to look among the bare weights whatever the width, so an FP8 exception
-        # was never found and every such table was refused.
-        lowered = str(width).lower()
-        kind = "packed" if "nvfp4" in lowered else "scaled" if "fp8" in lowered else "plain"
-        found: set[int] = set()
-        for module in modules:
-            found.update(observed.layers_of_kind(module, kind))
-        if tuple(sorted(found)) != tuple(sorted(layers)):
-            out[role] = (tuple(sorted(layers)), tuple(sorted(found)))
-    return out
+def _observed_exceptions(g: Geometry, profile: str) -> dict:
+    if profile not in (NVFP4_MIXED_BF16, NVFP4_MLP_ONLY):
+        return {}
+    observed = g.observed_scope
+    if observed is None:
+        raise ValueError(f"{profile} requires checkpoint tensor metadata to determine storage")
+    roles = ("mlp",) if profile == NVFP4_MLP_ONLY else tuple(_ROLE_MODULES)
+    kind, width = ("scaled", FP8) if profile == NVFP4_MLP_ONLY else ("plain", BF16)
+    exceptions = {}
+    for role in roles:
+        sets = [set(observed.layers_of_kind(module, kind)) for module in _ROLE_MODULES[role]]
+        if any(layers != sets[0] for layers in sets[1:]):
+            raise ValueError(f"cannot fuse {role} components stored in different formats")
+        if sets[0]:
+            exceptions[role] = (width, tuple(sorted(sets[0])))
+    return exceptions
 
 
-def export_for(profile: str, geometry: Geometry = GEOMETRY) -> Export:
-    """The export table for one profile at one size.
-
-    Only the group-wise profile varies with the checkpoint, and only in what the endpoints
-    and the fused projections are stored as: a K-quant repack of the 27B types the halves of
-    each projection apart and writes a Q6 vocabulary, the 3.8 writes the same graph with a
-    byte-wide one, and every smaller size is byte-wide throughout.
-    """
+def export_for(profile: str, geometry: Geometry) -> Export:
+    """Storage policy plus exceptions observed in this checkpoint's tensors."""
     if profile == GROUPWISE_INT:
-        if not is_27b(geometry):
-            return Export(
-                attention_storage=FUSED, gdn_storage=FUSED, control_storage=SPLIT_A_B,
-                vocabulary=W8, draft_head=W8,
-                attention_input=(W8,), attention_output=W8,
-                gdn_input=(W8,), gdn_output=W8, mlp=(W8, W8),
-            )
-        vocabulary = W8 if model_id_for(geometry) == QWEN3_8_MODEL_ID else Q6
+        # Dense source conversion uses a uniform policy. GGUF repacking replaces these
+        # formats with the source tensors' actual formats, including split fused parents.
         return Export(
-            attention_storage=QUERY_KEY_AND_GATE_VALUE,
-            gdn_storage=QUERY_KEY_AND_VALUE_Z,
-            control_storage=SPLIT_A_B,
-            vocabulary=vocabulary, draft_head=Q4,
-            attention_input=(Q4, Q5), attention_output=Q5,
-            gdn_input=(Q4, Q5), gdn_output=Q5, mlp=(Q4, Q5),
+            attention_storage=FUSED, gdn_storage=FUSED, control_storage=SPLIT_A_B,
+            vocabulary=W8, draft_head=W8,
+            attention_input=(W8,), attention_output=W8,
+            gdn_input=(W8,), gdn_output=W8, mlp=(W8, W8),
         )
     if profile == NVFP4_UNIFORM:
         return Export(
@@ -446,11 +203,7 @@ def export_for(profile: str, geometry: Geometry = GEOMETRY) -> Export:
             vocabulary=W8, draft_head=Q4,
             attention_input=(NVFP4,), attention_output=NVFP4,
             gdn_input=(NVFP4,), gdn_output=NVFP4, mlp=(NVFP4, NVFP4),
-            exceptions={
-                "attention_input": (BF16, _BF16_ATTENTION_INPUT_LAYERS),
-                "attention_output": (BF16, _BF16_ATTENTION_OUTPUT_LAYERS),
-                "gdn_output": (BF16, _BF16_GDN_OUTPUT_LAYERS),
-            },
+            exceptions=_observed_exceptions(geometry, profile),
         )
     if profile == NVFP4_MLP_ONLY:
         return Export(
@@ -458,7 +211,7 @@ def export_for(profile: str, geometry: Geometry = GEOMETRY) -> Export:
             vocabulary=FP8, draft_head=Q4,
             attention_input=(FP8,), attention_output=FP8,
             gdn_input=(FP8,), gdn_output=FP8, mlp=(NVFP4, NVFP4),
-            exceptions={"mlp": (FP8, _FP8_MLP_LAYERS)},
+            exceptions=_observed_exceptions(geometry, profile),
         )
     if profile == FP8_CHANNEL:
         return Export(
@@ -560,7 +313,7 @@ def gdn_control_roles(g: Geometry, export: Export) -> tuple[tuple[str, tuple[int
             ("gdn/b_projection", (g.gdn_value_heads, g.hidden)))
 
 
-def build_text_core_specs(g: Geometry = GEOMETRY,
+def build_text_core_specs(g: Geometry,
                           profile: str = GROUPWISE_INT) -> tuple[TensorSpec, ...]:
     export = export_for(profile, g)
     full = set(g.full_attention_layers)
@@ -599,7 +352,7 @@ def build_text_core_specs(g: Geometry = GEOMETRY,
             for (role, shape), width in zip(gdn_input_roles(g, export), export.gdn_input):
                 _weight(specs, prefix, role, shape,
                         export.width("gdn_input", layer, width))
-            specs.append(_tensor(prefix + "gdn/norm", (g.gdn_key_head_dim,), BF16))
+            specs.append(_tensor(prefix + "gdn/norm", (g.gdn_value_head_dim,), BF16))
             _weight(specs, prefix, "gdn/output", (g.hidden, g.value_dim),
                     export.width("gdn_output", layer, export.gdn_output))
 
@@ -618,19 +371,15 @@ def build_text_core_specs(g: Geometry = GEOMETRY,
     return tuple(specs)
 
 
-#: The draft head's shortlist: a fixed count of frequent tokens, not a model dimension.
-DRAFT_VOCAB = 131072
-
-
-def build_draft_head_specs(g: Geometry = GEOMETRY,
+def build_draft_head_specs(g: Geometry,
                            profile: str = GROUPWISE_INT) -> tuple[TensorSpec, ...]:
     return (
-        _tensor("text/draft_head", (DRAFT_VOCAB, g.hidden), export_for(profile, g).draft_head),
-        _tensor("text/draft_head_token_ids", (DRAFT_VOCAB,), I32),
+        _tensor("text/draft_head", (g.draft_vocab, g.hidden), export_for(profile, g).draft_head),
+        _tensor("text/draft_head_token_ids", (g.draft_vocab,), I32),
     )
 
 
-def build_mtp_specs(g: Geometry = GEOMETRY) -> tuple[TensorSpec, ...]:
+def build_mtp_specs(g: Geometry) -> tuple[TensorSpec, ...]:
     # The draft block is byte-wide under every export: it is one layer, and the widths the
     # quantised exports chose for the stack buy nothing here.
     return (
@@ -650,28 +399,19 @@ def build_mtp_specs(g: Geometry = GEOMETRY) -> tuple[TensorSpec, ...]:
     )
 
 
-def vision_tower(g: Geometry) -> dict[str, int]:
-    """The tower this size carries. Its dimensions do not follow the text size — only the
-    width it projects into does — so each size registers one rather than deriving it."""
-    if is_27b(g):
-        return dict(layers=27, hidden=1152, intermediate=4304, qkv_rows=3456,
-                    merger_hidden=4608)
-    return dict(layers=24, hidden=1024, intermediate=4096, qkv_rows=3072,
-                merger_hidden=4096)
+def build_vision_specs(g: Geometry) -> tuple[TensorSpec, ...]:
+    tower = vision_tower(g)
+    return _family_vision_specs(g.hidden, **tower) if tower else ()
 
 
-def build_vision_specs(g: Geometry = GEOMETRY) -> tuple[TensorSpec, ...]:
-    return _family_vision_specs(g.hidden, **vision_tower(g))
-
-
-def build_tensor_specs(geometry: Geometry = GEOMETRY, *, profile: str = GROUPWISE_INT,
+def build_tensor_specs(geometry: Geometry, *, profile: str = GROUPWISE_INT,
                        mtp: bool | None = None,
                        vision: bool | None = None) -> tuple[TensorSpec, ...]:
     """The tensor list for one checkpoint and export, which a repack plan is made against."""
     export = export_for(profile, geometry)
     tensors = (build_text_core_specs(geometry, profile)
                + build_draft_head_specs(geometry, profile))
-    if export.mtp if mtp is None else mtp:
+    if (export.mtp if mtp is None else mtp) and geometry.mtp_layers:
         tensors += build_mtp_specs(geometry)
     if export.vision if vision is None else vision:
         tensors += build_vision_specs(geometry)
@@ -683,7 +423,7 @@ def build_tensor_specs(geometry: Geometry = GEOMETRY, *, profile: str = GROUPWIS
 # and only refuses `--vision` against an artifact without it, so the artifact may omit the
 # vision/* objects entirely.
 def active_specs(*, mtp: bool | None = None, vision: bool | None = None,
-                 geometry: Geometry = GEOMETRY,
+                 geometry: Geometry,
                  profile: str = GROUPWISE_INT) -> tuple[tuple, tuple]:
     """(tensor_specs, object_specs) for the requested artifact variant."""
     tensors = build_tensor_specs(geometry, profile=profile, mtp=mtp, vision=vision)
@@ -695,7 +435,7 @@ def active_specs(*, mtp: bool | None = None, vision: bool | None = None,
 # ---------------------------------------------------------------------------
 
 
-def build_logical_row_views(g: Geometry = GEOMETRY,
+def build_logical_row_views(g: Geometry,
                             profile: str = GROUPWISE_INT) -> tuple[LogicalRowViewSpec, ...]:
     """The fixed row windows a kernel reads out of a stored parent.
 
@@ -786,11 +526,11 @@ def build_logical_row_views(g: Geometry = GEOMETRY,
             view(mtp + "mlp/up", mtp + "mlp/gate_up", g.intermediate, g.intermediate, None),
         )
     )
-    return tuple(views)
+    return tuple(v for v in views if g.mtp_layers or not v.name_pattern.startswith("mtp/"))
 
 
-def build_alias_specs(g: Geometry = GEOMETRY) -> tuple[LogicalAliasSpec, ...]:
-    return (
+def build_alias_specs(g: Geometry) -> tuple[LogicalAliasSpec, ...]:
+    aliases = (
         LogicalAliasSpec("mtp/token_embedding", ("text/token_embedding",)),
         LogicalAliasSpec("mtp/full_output_head", ("text/output_head",)),
         LogicalAliasSpec(
@@ -804,47 +544,7 @@ def build_alias_specs(g: Geometry = GEOMETRY) -> tuple[LogicalAliasSpec, ...]:
             axis_order=(1, 0),
         ),
     )
-
-
-# ---------------------------------------------------------------------------
-# The registered size, for callers with no checkpoint in hand
-# ---------------------------------------------------------------------------
-
-FULL_ATTENTION_LAYERS = GEOMETRY.full_attention_layers
-GDN_LAYERS = GEOMETRY.gdn_layers
-
-TEXT_CORE_TENSOR_SPECS = build_text_core_specs()
-DRAFT_HEAD_TENSOR_SPECS = build_draft_head_specs()
-MTP_TENSOR_SPECS = build_mtp_specs()
-VISION_TENSOR_SPECS = build_vision_specs()
-
-TENSOR_SPECS = (
-    TEXT_CORE_TENSOR_SPECS
-    + DRAFT_HEAD_TENSOR_SPECS
-    + MTP_TENSOR_SPECS
-    + VISION_TENSOR_SPECS
-)
-OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
-
-# surogate vendor patch (PATCHES.md #15): community GGUF exports frequently
-# strip the MTP (nextn) block; such checkpoints convert to an artifact that
-# omits the mtp/* objects entirely (the loader binds MTP only when present
-# and MTP speculation is refused with a clear error). The draft head stays:
-# it derives from the embedding, which every export carries.
-TENSOR_SPECS_NO_MTP = TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS + VISION_TENSOR_SPECS
-OBJECT_SPECS_NO_MTP: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS_NO_MTP
-
-FORMAT_COUNTS = {
-    numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)
-    for numeric_format in FORMAT_NAMES
-}
-LAYOUT_COUNTS = {
-    layout: sum(spec.layout == layout for spec in TENSOR_SPECS)
-    for layout in LAYOUT_NAMES
-}
-
-LOGICAL_ROW_VIEW_SPECS = build_logical_row_views()
-ALIAS_SPECS = build_alias_specs()
+    return tuple(a for a in aliases if g.mtp_layers or not a.role_pattern.startswith("mtp/"))
 
 
 # ---------------------------------------------------------------------------
@@ -964,7 +664,7 @@ class ExportInventory:
             )
 
 
-def export_inventory(profile: str = GROUPWISE_INT, geometry: Geometry = GEOMETRY, *,
+def export_inventory(profile: str, geometry: Geometry, *,
                      mtp: bool | None = None,
                      vision: bool | None = None) -> ExportInventory:
     """The complete inventory for one checkpoint converted under one export profile."""
@@ -983,7 +683,3 @@ def export_inventory(profile: str = GROUPWISE_INT, geometry: Geometry = GEOMETRY
         LOGICAL_ROW_VIEW_SPECS=build_logical_row_views(geometry, profile),
         ALIAS_SPECS=build_alias_specs(geometry),
     )
-
-
-#: The 27B geometry a Qwen3.8 checkpoint has, which its exports are described against.
-GEOMETRY_QWEN3_8 = Geometry(**{**vars(GEOMETRY_27B), "model_type": "qwen3_8"})

@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from surogate.serve.convert.common.declaration import declare, derive_recipes
+from surogate.serve.convert.common.declaration import derive_recipes
 from surogate.serve.convert.common.recipe import (
     SourcePreflight,
     TensorRecipe,
@@ -44,15 +44,17 @@ def tied_output_head(config: Mapping[str, object]) -> bool:
     return bool(value)
 
 
-def build_recipes(config: Mapping[str, object]) -> tuple[TensorRecipe, ...]:
+def build_recipes(geometry: inventory.Geometry) -> tuple[TensorRecipe, ...]:
     """Every object's source, in object order, for one checkpoint's config."""
-    declared = declare(inventory.architecture_of(config), dict(config))
+    declared = geometry.declared
+    tied = tied_output_head(declared.hf_config)
     return tuple(
-        derive_recipes(
+        recipe for recipe in derive_recipes(
             declared,
             capabilities=set(inventory.CAPABILITIES),
-            tied_output_head=tied_output_head(config),
+            tied_output_head=tied,
         )
+        if not tied or recipe.object_name not in inventory.ALIASED_OBJECT_NAMES
     )
 
 

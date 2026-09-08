@@ -189,12 +189,19 @@ namespace {
 // that does not fit is halved until it does.
 inline constexpr std::uint32_t kAutoContextProbe = 2048;
 
+family::VisionGeometry declared_vision_geometry(const artifact::Reader& reader) {
+    return reader.vision_geometry().empty() ? family::VisionGeometry{}
+                                            : family::VisionGeometry::resolved(reader.vision_geometry());
+}
+
 template <class Target>
 std::uint32_t resolve_automatic_context(DeviceContext& device, const EngineOptions& options,
                                         typename Target::WeightsProfile weights_profile,
                                         const family::TextGeometry& geometry,
-                                        std::size_t budget_bytes) {
-    const std::uint32_t native = Target::maximum_context();
+                                        std::size_t budget_bytes,
+                                        const family::VisionGeometry& vision_geometry) {
+    if (geometry.max_context <= 0) { throw std::invalid_argument("checkpoint context capacity is required"); }
+    const std::uint32_t native = static_cast<std::uint32_t>(geometry.max_context);
     if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
         // The operator fixed the pool: one sequence may use all of it, nothing more.
         const std::uint32_t fixed =
@@ -208,7 +215,7 @@ std::uint32_t resolve_automatic_context(DeviceContext& device, const EngineOptio
         EngineOptions probe   = options;
         probe.max_context     = context;
         probe.prefill_chunk   = std::min(options.prefill_chunk, context);
-        return Target::make_sequence_planner(device, probe, weights_profile, geometry)
+        return Target::make_sequence_planner(device, probe, weights_profile, geometry, vision_geometry)
             .capacity_curve();
     };
 
@@ -244,7 +251,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     // The dimensions to plan and bind against: this target's compiled config with whatever
     // the artifact declares laid over it.
     const family::TextGeometry geometry            = Target::declared_geometry(reader);
-    const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
+    const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(Target::model_id);
 
     artifact::Binder binder(reader);
     auto load_plan = Target::plan_load(binder, options, weights_profile);
@@ -257,12 +264,12 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     EngineOptions effective = options;
     if (effective.max_context == 0) {
         effective.max_context = resolve_automatic_context<Target>(
-            device, options, weights_profile, geometry, preflight_runtime_bytes);
+            device, options, weights_profile, geometry, preflight_runtime_bytes, declared_vision_geometry(reader));
         effective.prefill_chunk = std::min(options.prefill_chunk, effective.max_context);
     }
     if (effective.elastic_kv_overcommit) { effective.elastic_kv = true; }
     auto sequence_planner =
-        Target::make_sequence_planner(device, effective, weights_profile, geometry);
+        Target::make_sequence_planner(device, effective, weights_profile, geometry, declared_vision_geometry(reader));
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     // Overcommit: the physical cap is a guaranteed floor of one full-context request; every
     // page past it is entitled through the device gate at admission. An automatic policy
@@ -348,14 +355,17 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (identity.architecture.empty()) {
+        throw std::invalid_argument("artifact has no resolved architecture; rebuild the serving cache");
+    }
     // Every package answers the same two questions -- do you serve this checkpoint, and what
     // do you call yourself when you do -- so adding a target is one line here.
     const auto dispatch = [&]<class Target, class Loaded, class Instance>(
                               std::optional<ConstructedTarget>& out) {
-        if (out.has_value() || !family::package_serves<Target>(identity.model_id)) { return; }
+        if (out.has_value() || identity.architecture != Target::target_key) { return; }
         out = construct_registered<Target, Loaded, Instance>(
             options, device, reader, load_start,
-            family::package_target_key_for<Target>(identity.model_id));
+            Target::target_key);
     };
     std::optional<ConstructedTarget> constructed;
     dispatch.template operator()<Gemma3, LoadedGemma3, Gemma3Instance>(constructed);
@@ -527,7 +537,7 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
     sized.prefill_chunk = std::min(stage.prefill_chunk, max_context);
     if (sized.elastic_kv_overcommit) { sized.elastic_kv = true; }
     const runtime::SequenceCapacityCurve curve =
-        Target::make_sequence_planner(probe, sized, weights_profile, geometry).capacity_curve();
+        Target::make_sequence_planner(probe, sized, weights_profile, geometry, declared_vision_geometry(reader)).capacity_curve();
     const KvCapacityPolicy policy =
         sized.elastic_kv_overcommit && sized.kv_capacity.mode == KvCapacityMode::Automatic
             ? KvCapacityPolicy::explicit_capacity(sized.max_context)
@@ -556,7 +566,7 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
             stage_fit<Target>(reader, stage_options[s], weights_profile, geometry, probe, 0);
         if (options.max_context != 0) { continue; }
         const std::uint32_t resolved = resolve_automatic_context<Target>(
-            probe, stage_options[s], weights_profile, geometry, fit.budget_bytes);
+            probe, stage_options[s], weights_profile, geometry, fit.budget_bytes, declared_vision_geometry(reader));
         out.max_context = out.max_context == 0 ? resolved : std::min(out.max_context, resolved);
     }
     if (options.max_context != 0) { out.max_context = options.max_context; }
@@ -775,12 +785,15 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
     const auto load_start = Clock::now();
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (identity.architecture.empty()) {
+        throw std::invalid_argument("artifact has no resolved architecture; rebuild the serving cache");
+    }
     const auto dispatch = [&]<class Target, class Loaded, class Instance>(
                               std::optional<ConstructedTarget>& out) {
-        if (out.has_value() || !family::package_serves<Target>(identity.model_id)) { return; }
+        if (out.has_value() || identity.architecture != Target::target_key) { return; }
         out = construct_pipeline<Target, Loaded, Instance>(
             options, reader, load_start,
-            family::package_target_key_for<Target>(identity.model_id),
+            Target::target_key,
             Target::declared_geometry(reader).layers);
     };
     std::optional<ConstructedTarget> constructed;

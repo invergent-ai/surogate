@@ -207,7 +207,7 @@ void Variant::attention_projection(const Tensor& hidden,
     const std::int32_t heads     = kv_rows / head_dim;
     Tensor value_per_head        = value.view({head_dim, heads * columns});
     if (weights.value_is_key) {
-        ops::rmsnorm_unweighted(key.view({head_dim, heads * columns}), TextConfig::rms_epsilon,
+        ops::rmsnorm_unweighted(key.view({head_dim, heads * columns}), weights.rms_epsilon,
                                 value_per_head, stream);
     } else {
         // Its own projection, then the same norm. The raw output needs a plane of its own:
@@ -216,7 +216,7 @@ void Variant::attention_projection(const Tensor& hidden,
         Tensor raw = workspace.alloc(DType::BF16, {kv_rows, columns});
         ops::linear(hidden, weights.value, raw, kTextPolicy, workspace, stream);
         apply_lora(weights.value, kValuePort, hidden, raw, stream);
-        ops::rmsnorm_unweighted(raw.view({head_dim, heads * columns}), TextConfig::rms_epsilon,
+        ops::rmsnorm_unweighted(raw.view({head_dim, heads * columns}), weights.rms_epsilon,
                                 value_per_head, stream);
     }
 }
@@ -238,7 +238,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     // residual add that read it back existed only because `ops::rmsnorm` forbids aliasing
     // its output with its inputs; the fused form is bit-identical to that pair, which
     // sinfer_rmsnorm_test pins.
-    ops::rmsnorm_add(projected, weights.post_attention_norm, TextConfig::rms_epsilon,
+    ops::rmsnorm_add(projected, weights.post_attention_norm, weights.rms_epsilon,
                      /*unit_offset*/ false, residual, stream);
 }
 
@@ -284,16 +284,16 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     apply_lora(weights.gate, kGatePort, hidden, gate, stream);
     ops::linear(hidden, weights.up, up, kTextPolicy, workspace, stream);
     apply_lora(weights.up, kUpPort, hidden, up, stream);
-    Variant::debug_probe("ffn_gate", gate, stream);
-    Variant::debug_probe("ffn_up", up, stream);
+    Variant::debug_probe("ffn_gate", gate, weights.probe_layer_count, stream);
+    Variant::debug_probe("ffn_up", up, weights.probe_layer_count, stream);
     ops::gelu_mul(gate, up, kMlpActivation, activation, stream);
-    Variant::debug_probe("ffn_act", activation, stream);
+    Variant::debug_probe("ffn_act", activation, weights.probe_layer_count, stream);
     ops::linear(activation, weights.down, dense, kTextPolicy, workspace, stream);
     apply_lora(weights.down, kDownPort, activation, dense, stream);
     // Four probes the dense target has no use for. The family already brackets the whole
     // feed-forward (`post_attention_norm` in, `post_mlp_residual` out), which localises a
     // mismatch to "the mixture" and no further; these say which branch.
-    Variant::debug_probe("ffn_dense_out", dense, stream);
+    Variant::debug_probe("ffn_dense_out", dense, weights.probe_layer_count, stream);
 
     // ---- the routed branch -----------------------------------------------------------
     //
@@ -304,17 +304,17 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     Tensor routed_input = workspace.alloc(DType::BF16, {width, columns});
     Tensor router_input = workspace.alloc(DType::BF16, {width, columns});
     Tensor routed       = workspace.alloc(DType::BF16, {width, columns});
-    ops::rmsnorm(residual, weights.pre_feedforward_norm_routed, TextConfig::rms_epsilon,
+    ops::rmsnorm(residual, weights.pre_feedforward_norm_routed, weights.rms_epsilon,
                  /*unit_offset*/ false, routed_input, stream);
     // The router's own view of the token: `Gemma4RMSNorm(with_scale=False)` times a learned
     // per-channel vector times `hidden ** -0.5`. The first two are one weighted RMSNorm --
     // Gemma 4 applies `normed * w` with no unit offset, so a weightless norm followed by a
     // per-channel multiply *is* a weighted norm with that vector as the weight. Only the
     // scalar is left over, and it is a function of the width rather than a stored tensor.
-    ops::rmsnorm(residual, weights.router_scale, TextConfig::rms_epsilon,
+    ops::rmsnorm(residual, weights.router_scale, weights.rms_epsilon,
                  /*unit_offset*/ false, router_input, stream);
     ops::scale(router_input, router_input_scale(width), stream);
-    Variant::debug_probe("ffn_router_in", router_input, stream);
+    Variant::debug_probe("ffn_router_in", router_input, weights.probe_layer_count, stream);
 
     // `AddResidual` is the op's only epilogue, and the routed output has to reach its own norm
     // before it reaches anything else -- so it accumulates onto zero rather than onto the
@@ -324,7 +324,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     {
         auto moe_scope           = workspace.scope();
         const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
-            kMoeGeometry, weights.op.routed_gate_up.qtype, weights.op.routed_down.qtype, columns,
+            ops::sparse_moe_geometry(weights.op), weights.op.routed_gate_up.qtype, weights.op.routed_down.qtype, columns,
             columns));
         WorkspaceArena moe_workspace(storage);
         ops::sparse_moe(routed_input, router_input, weights.op,
@@ -332,7 +332,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                         ops::SparseMoeRoundHook{});
     }
 
-    Variant::debug_probe("ffn_routed_out", routed, stream);
+    Variant::debug_probe("ffn_routed_out", routed, weights.probe_layer_count, stream);
 
     // ---- the two branches meet -------------------------------------------------------
     //
@@ -341,12 +341,12 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     // sum, onto the residual. `rmsnorm_add` accumulates, so the second call adds the routed
     // half onto the first's result rather than through a fifth plane.
     Tensor combined = workspace.alloc(DType::BF16, {width, columns});
-    ops::rmsnorm(dense, weights.post_feedforward_norm_dense, TextConfig::rms_epsilon,
+    ops::rmsnorm(dense, weights.post_feedforward_norm_dense, weights.rms_epsilon,
                  /*unit_offset*/ false, combined, stream);
-    ops::rmsnorm_add(routed, weights.post_feedforward_norm_routed, TextConfig::rms_epsilon,
+    ops::rmsnorm_add(routed, weights.post_feedforward_norm_routed, weights.rms_epsilon,
                      /*unit_offset*/ false, combined, stream);
-    Variant::debug_probe("ffn_combined", combined, stream);
-    ops::rmsnorm_add(combined, weights.post_feedforward_norm, TextConfig::rms_epsilon,
+    Variant::debug_probe("ffn_combined", combined, weights.probe_layer_count, stream);
+    ops::rmsnorm_add(combined, weights.post_feedforward_norm, weights.rms_epsilon,
                      /*unit_offset*/ false, residual, stream);
     // And the last thing a Gemma 4 block does: scale its whole output. The reference
     // multiplies the residual *after* the feed-forward's add, so this is a scale on
@@ -368,11 +368,19 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
     const std::size_t planes =
         std::max(post_mixer_workspace_bytes(geometry, qtype, first, last),
                  post_mixer_workspace_bytes(geometry, QType::Q4_K, first, last));
+    const ops::SparseMoeGeometry moe_geometry{
+        .hidden = geometry.hidden,
+        .experts = geometry.experts,
+        .experts_per_token = geometry.experts_per_token,
+        .intermediate = geometry.intermediate,
+        .activation = ops::GatedActivation::GeluTanh,
+        .per_expert_scaled = true,
+    };
     const std::size_t mixture = std::max({
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, qtype, qtype, first, last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q4_K, first,
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry, qtype, qtype, first, last),
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry, QType::Q4_K, QType::Q4_K, first,
                                                  last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q6_K, first,
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry, QType::Q4_K, QType::Q6_K, first,
                                                  last),
     });
     return planes + mixture;
@@ -391,10 +399,10 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
 // target's own refusal messages.
 SINFER_FAMILY_UNRUNNABLE_LEAVES(no_linear_layers, no_speculation)
 
-void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream) {
     // Only the magic is this target's: 'G4MX'. Everything else -- which rounds are
     // captured, how the occurrence is counted, the header layout -- is the family's.
-    family::debug_probe_dump(0x47344D58, tag, tensor, TextConfig::layers, stream);
+    family::debug_probe_dump(0x47344D58, tag, tensor, layer_count, stream);
 }
 
 } // namespace sinfer::targets::gemma4_moe::detail

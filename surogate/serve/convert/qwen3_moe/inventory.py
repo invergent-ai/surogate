@@ -13,10 +13,12 @@ row to fuse.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from surogate.serve.convert.common import declaration
+from surogate.serve.convert.common.checkpoint import positive_int
+from copy import deepcopy
 from surogate.serve.convert.common.inventory import (
     BF16,
     DIRECT_FORMATS,
@@ -48,6 +50,11 @@ class Geometry:
     vocab: int
     experts: int
     experts_per_token: int
+    declared: declaration.Declaration = field(repr=False, compare=False)
+
+    @property
+    def layer_types(self) -> tuple[str, ...]:
+        return ("full_attention",) * self.layers
 
     @property
     def query_size(self) -> int:
@@ -73,14 +80,25 @@ class Geometry:
 def geometry_from_config(config: Mapping[str, Any]) -> Geometry:
     """The geometry the checkpoint's own config states, read through the declaration so the
     resolution rules are training's rather than a second copy of them."""
-    declared = declaration.declare(ARCHITECTURE, dict(config))
+    source = deepcopy(dict(config))
+    for name in ("hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads", "vocab_size"):
+        positive_int(source, name)
+    if source["num_attention_heads"] % source["num_key_value_heads"]:
+        raise ValueError("config.num_attention_heads must be divisible by num_key_value_heads")
+    for name in ("head_dim", "moe_intermediate_size", "num_experts", "num_experts_per_tok"):
+        positive_int(source, name)
+    if source["num_experts_per_tok"] > source["num_experts"]:
+        raise ValueError("config.num_experts_per_tok exceeds num_experts")
+    if source.get("norm_topk_prob", True) is not True:
+        raise ValueError("the Qwen3-MoE backend requires normalized top-k router probabilities")
+    declared = declaration.declare(ARCHITECTURE, source)
     resolved = declared.config
     shared = int(resolved.get("shared_expert_intermediate", 0) or 0)
     if shared:
         raise ValueError(
             "this checkpoint declares a shared expert of width "
             f"{shared}; the qwen3_moe target serves the routed-only mixture "
-            "(Qwen3-30B-A3B and its siblings), whose router has one row per expert and no "
+            "whose router has one row per expert and no "
             "shared gate. Serving it here would drop that expert's contribution silently."
         )
     return Geometry(
@@ -93,13 +111,13 @@ def geometry_from_config(config: Mapping[str, Any]) -> Geometry:
         vocab=int(resolved["vocab_size"]),
         experts=int(resolved["num_experts"]),
         experts_per_token=int(resolved["num_experts_per_tok"]),
+        declared=declared,
     )
 
 
-def declared_objects(config: Mapping[str, Any]) -> list[declaration.DeclaredObject]:
+def declared_objects(geometry: Geometry) -> list[declaration.DeclaredObject]:
     """Every object the artifact stores, in declaration order."""
-    declared = declaration.declare(ARCHITECTURE, dict(config))
-    return list(declared.objects(capabilities=set(CAPABILITIES)))
+    return list(geometry.declared.objects(capabilities=set(CAPABILITIES)))
 
 
 def tensor_specs(objects: Sequence[declaration.DeclaredObject]) -> tuple[TensorSpec, ...]:
@@ -119,13 +137,13 @@ def tensor_specs(objects: Sequence[declaration.DeclaredObject]) -> tuple[TensorS
     return tuple(out)
 
 
-def build_tensor_specs(config: Mapping[str, Any]) -> tuple[TensorSpec, ...]:
+def build_tensor_specs(geometry: Geometry) -> tuple[TensorSpec, ...]:
     """The artifact's tensor specs for one checkpoint's config.
 
-    The GGUF repack planner's spelling of `tensor_specs(declared_objects(config))`: it holds a
+    The GGUF repack planner's spelling of `tensor_specs(declared_objects(geometry))`: it holds a
     config and wants the specs, and every converter it plans against offers this name.
     """
-    return tensor_specs(declared_objects(config))
+    return tensor_specs(declared_objects(geometry))
 
 
 __all__ = [

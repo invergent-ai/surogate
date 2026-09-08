@@ -100,3 +100,15 @@ def test_target_key_rejects_an_unknown_architecture(tmp_path):
     writer.write_tensors_to_file()
     writer.close()
     assert gguf_target_key(path) is None
+
+
+def test_glm_native_target_is_selected_from_architecture(tmp_path):
+    path = tmp_path / "renamed.gguf"
+    writer = GGUFWriter(str(path), "glm5next")
+    writer.add_block_count(3)
+    writer.add_embedding_length(128)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    assert gguf_target_key(path) == "glm5_next"

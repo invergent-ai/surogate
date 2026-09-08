@@ -3,15 +3,12 @@
 #
 # GGUF ingest for `surogate serve` (design/serve-engine-plan.md §5.1, §5.2b).
 #
-# Strategy (v0): bridge GGUF to the exact input the vendored converter already
+# Bridge GGUF to the input the checkpoint converter already
 # accepts — a temporary HF-layout directory with BF16 safetensors shards. Fully
 # offline: the tokenizer and chat template are reconstructed from the GGUF's
-# own KV metadata (frontend.py), the checkpoint-invariant config files come
-# from vendored per-target resources (surogate/serve/resources/), and family
+# own KV metadata (frontend.py), configuration is resolved from that metadata, and family
 # modules (qwen35.py) invert llama.cpp's export transforms. The converter then
-# runs with its own preflight checks (SINFER_ALLOW_DERIVED_FRONTEND downgrades
-# the tokenizer pinned-hash check to a recorded warning — the reconstruction is
-# semantically equivalent, not byte-identical). Costs one temporary BF16
+# runs its source and shape preflight checks. Costs one temporary BF16
 # materialization on disk (~2 bytes/param, deleted after conversion); a
 # reader-injection path that avoids the temp copy is a tracked follow-up.
 # K-quant sources are dequantized to BF16 and re-encoded by the recipe (one
@@ -20,21 +17,7 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
-
-# Checkpoint-invariant static resources per registered target, vendored under
-# surogate/serve/resources/<target_key>/ (see its README for provenance). The
-# tokenizer and chat template are NOT static files — they are reconstructed
-# from the GGUF itself (frontend.py) so local GGUF serving stays fully offline.
-_RESOURCES_DIR = Path(__file__).resolve().parent.parent / "resources"
-
-_STATIC_RESOURCE_FILES = [
-    "config.json",
-    "generation_config.json",
-    "preprocessor_config.json",
-    "video_preprocessor_config.json",
-]
 
 _SHARD_BYTES = 8 << 30
 
@@ -240,13 +223,19 @@ def _rounded_eps(value: float) -> float:
 def synthesised_config(reader, arch: str) -> dict | None:
     """`config.json` for an architecture the GGUF fully describes, or None.
 
-    The Qwen3.5 family's config carries things no GGUF holds (per-layer `layer_types`, the
-    attention output gate), so those targets vendor a file under `serve/resources/`. A plain
-    dense decoder does not: every member its converter reads is either a constant of the
-    architecture or a number in the GGUF's own metadata. Synthesising it keeps a family from
-    needing one vendored config per model size, and keeps us from vendoring config files whose
-    licence is not ours to vendor.
+    Dimensions and execution settings come from GGUF metadata. Family-specific normalization
+    translates those fields into the same configuration consumed by safetensors conversion.
     """
+    if arch in ("qwen35", "qwen35moe", "qwen38", "qwen3_5", "qwen3_6",
+                "qwen3_8", "qwen3_5_moe", "qwen3_6_moe"):
+        from surogate.serve.convert.common.qwen3_5 import config_from_gguf
+        config = config_from_gguf(reader, arch)
+        for key in ("eos_token_id", "bos_token_id"):
+            value = reader.kv(f"tokenizer.ggml.{key}")
+            if value is not None:
+                config[key] = value
+        return config
+
     def kv(key, default=None):
         return _arch_kv(reader, arch, key, default)
 
@@ -330,10 +319,12 @@ def synthesised_config(reader, arch: str) -> dict | None:
         return {**common, "architectures": ["LlamaForCausalLM"], "model_type": "llama",
                 "hidden_act": "silu", "mlp_bias": False, "pretraining_tp": 1}
     if arch == "gemma3":
+        from surogate.serve.gguf.frontend import extract_generation_config
         # Gemma 3 alternates five sliding-window layers with one full-attention layer. The GGUF
         # states the window but not the period, because llama.cpp holds the same 6 as a constant
         # of the architecture; the converter accepts that period in place of a `layer_types` list.
         return {**common,
+                "eos_token_id": extract_generation_config(reader)["eos_token_id"],
                 "architectures": ["Gemma3ForCausalLM"],
                 "model_type": "gemma3_text",
                 "hidden_activation": "gelu_pytorch_tanh",
@@ -532,66 +523,6 @@ def _unpermute(tensor, heads: int):
 
 
 
-def _apply_gguf_dimensions(config: dict, reader, arch: str) -> bool:
-    """Overwrite a vendored config's text dimensions with this GGUF's own. True if any moved.
-
-    A vendored config is one size of a family. The file being converted may be another, and
-    every dimension the converter reads has to describe the file, not the template.
-    """
-    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
-
-    def kv(suffix, default=None):
-        try:
-            value = reader.kv(f"{arch}.{suffix}")
-        except Exception:
-            return default
-        return default if value is None else int(value)
-
-    heads = kv("attention.head_count")
-    inner = kv("ssm.inner_size")
-    state = kv("ssm.state_size")
-    moved = False
-    updates = {
-        # the text core: llama.cpp counts the MTP (nextn) block among the blocks
-        "num_hidden_layers": (kv("block_count") or 0) - (kv("nextn_predict_layers") or 0),
-        "hidden_size": kv("embedding_length"),
-        "intermediate_size": kv("feed_forward_length"),
-        "num_attention_heads": heads,
-        "num_key_value_heads": kv("attention.head_count_kv"),
-        "head_dim": kv("attention.key_length"),
-        "linear_num_key_heads": kv("ssm.group_count"),
-        "linear_key_head_dim": state,
-        "linear_value_head_dim": state,
-        "linear_conv_kernel_dim": kv("ssm.conv_kernel"),
-        "linear_num_value_heads": (inner // state) if inner and state else None,
-    }
-    for name, value in updates.items():
-        if value is None or name not in text or text[name] == value:
-            continue
-        text[name] = value
-        moved = True
-    # The layer schedule is one entry per layer, so a template written for another size states
-    # the wrong number of them. It is not free-form: full attention falls on every fourth layer
-    # from the fourth, and the converter refuses a list that says otherwise.
-    layers = updates["num_hidden_layers"]
-    if layers and isinstance(text.get("layer_types"), list) and len(text["layer_types"]) != layers:
-        interval = 4
-        text["layer_types"] = [
-            "full_attention" if layer >= interval - 1 and (layer - (interval - 1)) % interval == 0
-            else "linear_attention"
-            for layer in range(layers)
-        ]
-        moved = True
-    # Two generations share these dimensions and differ only in how their exports quantise, so
-    # the architecture is the only thing that tells them apart.
-    if arch in ("qwen38", "qwen3_8"):
-        for holder in (config, text):
-            if holder.get("model_type", "").startswith("qwen3_5"):
-                holder["model_type"] = holder["model_type"].replace("qwen3_5", "qwen3_8")
-                moved = True
-    return moved
-
-
 def build_hf_dir_from_gguf(
     gguf_path: Path,
     target_key: str,
@@ -621,35 +552,15 @@ def build_hf_dir_from_gguf(
     payload_mm = np.memmap(gguf_path, dtype=np.uint8, mode="r")
     arch = reader.get_field("general.architecture").contents()
 
-    # 1. Frontend: tokenizer + chat template reconstructed from the GGUF
-    #    itself (fully offline); checkpoint-invariant config files from the
-    #    vendored per-target resources.
+    # Frontend and configuration both come from this GGUF's metadata.
     from surogate.serve.gguf.frontend import write_frontend
 
     write_frontend(reader, arch, work_dir, echo=echo)
-    static_dir = _RESOURCES_DIR / target_key
-    for fname in _STATIC_RESOURCE_FILES:
-        src = static_dir / fname
-        if src.is_file():
-            shutil.copy(src, work_dir / fname)
-    if (work_dir / "config.json").is_file():
-        # A vendored config describes one size of the family -- the tower, the rope
-        # parameters, the special token ids -- and this file may be another size. Take the
-        # dimensions from the GGUF, which is the checkpoint actually being converted, and
-        # leave everything else as vendored.
-        vendored = json.loads((work_dir / "config.json").read_text(encoding="utf-8"))
-        if _apply_gguf_dimensions(vendored, reader, arch):
-            (work_dir / "config.json").write_text(json.dumps(vendored, indent=2))
-            echo("surogate serve: config dimensions taken from the GGUF, the rest vendored")
-    else:
-        derived = synthesised_config(reader, arch)
-        if derived is None:
-            raise SystemExit(
-                f"surogate serve: missing vendored config.json for target '{target_key}' "
-                f"(expected at {static_dir}), and architecture '{arch}' has no synthesised one."
-            )
-        (work_dir / "config.json").write_text(json.dumps(derived, indent=2))
-        echo(f"surogate serve: config.json synthesised from the GGUF's own metadata ({arch})")
+    derived = synthesised_config(reader, arch)
+    if derived is None:
+        raise SystemExit(f"surogate serve: architecture '{arch}' has no checkpoint config normalizer")
+    (work_dir / "config.json").write_text(json.dumps(derived, indent=2))
+    echo(f"surogate serve: config.json synthesized from the GGUF's own metadata ({arch})")
 
     # 2. Dequantize tensors to BF16 and write sharded safetensors with HF names.
     n_layers = int(_arch_kv(reader, arch, "block_count", 0))
@@ -891,4 +802,6 @@ def gguf_target_key(gguf_path: Path, reader=None):
     if arch == "qwen4exp":
         # Qwen3.8-Flash-Next: converted straight from the GGUF (no HF bridge).
         return "qwen4exp"
+    if arch == "glm5next" and hidden > 0 and layers > 0:
+        return "glm5_next"
     return None

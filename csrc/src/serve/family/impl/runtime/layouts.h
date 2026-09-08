@@ -23,6 +23,7 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 using TensorLayout = TensorRegion;
 
 struct DFlashPersistentLayout {
+    family::DFlashGeometry geometry;
     CyclicKVCacheLayout local;
     CyclicKVCacheLayout rewrite_checkpoint_local;
     family::PagedKVCacheLayout full;
@@ -68,7 +69,8 @@ struct SequencePlanningInputs {
     WeightsProfile weights_profile;
     /// The dimensions to plan against. Every buffer this sizes -- the KV pool, the hidden
     /// staging, the logits -- follows the checkpoint rather than the compiled constants.
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry{};
+    family::VisionGeometry vision_geometry{};
     std::uint32_t capacity                 = 0;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
@@ -98,8 +100,8 @@ namespace sinfer::family::detail {
 template <>
 struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     typename SINFER_FAMILY_VARIANT::WeightsProfile weights_profile;
-    family::TextGeometry geometry =
-        family::TextGeometry::compiled<typename SINFER_FAMILY_VARIANT::TextConfig>();
+    family::TextGeometry geometry{};
+    family::VisionGeometry vision_geometry{};
     std::uint32_t capacity                 = 0;
     std::uint32_t kv_capacity              = 0;
     std::uint32_t main_page_groups         = 0;
@@ -149,7 +151,7 @@ using SequencePlanImpl = family::detail::SequencePlanImpl<Variant>;
 [[nodiscard]] std::unique_ptr<family::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
-                           const family::TextGeometry& geometry);
+                           const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<family::detail::SequencePlannerImpl<Variant>> planner,
                             std::uint32_t main_page_groups);

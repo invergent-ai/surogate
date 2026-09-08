@@ -194,9 +194,9 @@ void test_common_validation() {
             Reader reader(fixture.path);
         } catch (const sinfer::artifact::ArtifactError& error) {
             if (std::string_view(error.what())
-                    .find("python -m surogate.serve.artifact.migrate_v1_to_v2 <artifact>") ==
+                    .find("rebuild the serving artifact from its source checkpoint") ==
                 std::string_view::npos) {
-                throw std::runtime_error("v1 rejection omitted the migration command");
+                throw std::runtime_error("v1 rejection omitted checkpoint rebuild guidance");
             }
             return;
         }

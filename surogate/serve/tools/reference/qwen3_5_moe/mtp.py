@@ -7,7 +7,6 @@ from typing import Iterable
 
 import torch
 
-from .config import CFG
 from .moe import forward as sparse_moe
 from .ops import apply_rope, linear, residual_add, rmsnorm, sigmoid_mul
 
@@ -64,18 +63,15 @@ def forward(
     attention_weights = layer_weights.attention
 
     embeddings = model.embed(ids) if input_embeddings is None else input_embeddings
-    embedding_input = rmsnorm(
-        embeddings,
-        model.weight(mtp_weights.embedding_norm),
-    )
-    hidden_input = rmsnorm(hidden, model.weight(mtp_weights.hidden_norm))
+    embedding_input = rmsnorm(embeddings, model.weight(mtp_weights.embedding_norm), eps=model.config.rms_eps)
+    hidden_input = rmsnorm(hidden, model.weight(mtp_weights.hidden_norm), eps=model.config.rms_eps)
     x = linear(
         torch.cat((embedding_input, hidden_input), dim=-1),
         model.weight(mtp_weights.input_projection, small_t=small_t),
         small_t=small_t,
     )
 
-    h = rmsnorm(x, model.weight(layer_weights.input_norm))
+    h = rmsnorm(x, model.weight(layer_weights.input_norm), eps=model.config.rms_eps)
     projected = linear(
         h,
         model.block_weight(
@@ -84,43 +80,37 @@ def forward(
         ),
         small_t=small_t,
     )
-    q1 = CFG.q_size
-    k1 = q1 + CFG.kv_size
-    gate1 = k1 + CFG.q_size
-    q = projected[:, :q1].reshape(-1, CFG.q_heads, CFG.head_dim)
-    k = projected[:, q1:k1].reshape(-1, CFG.kv_heads, CFG.head_dim)
-    gate = projected[:, k1:gate1].reshape(-1, CFG.q_heads, CFG.head_dim)
-    value = projected[:, gate1:].reshape(-1, CFG.kv_heads, CFG.head_dim)
+    q1 = model.config.q_size
+    k1 = q1 + model.config.kv_size
+    gate1 = k1 + model.config.q_size
+    q = projected[:, :q1].reshape(-1, model.config.q_heads, model.config.head_dim)
+    k = projected[:, q1:k1].reshape(-1, model.config.kv_heads, model.config.head_dim)
+    gate = projected[:, k1:gate1].reshape(-1, model.config.q_heads, model.config.head_dim)
+    value = projected[:, gate1:].reshape(-1, model.config.kv_heads, model.config.head_dim)
     q = apply_rope(
-        rmsnorm(q, model.weight(attention_weights.query_norm)),
-        positions,
+        rmsnorm(q, model.weight(attention_weights.query_norm), eps=model.config.rms_eps), positions, cfg=model.config
     )
     k = apply_rope(
-        rmsnorm(k, model.weight(attention_weights.key_norm)),
-        positions,
+        rmsnorm(k, model.weight(attention_weights.key_norm), eps=model.config.rms_eps), positions, cfg=model.config
     )
     attended = model._gqa(q, k, value, 0, start, mtp=True)
     x = residual_add(
         x,
         linear(
-            sigmoid_mul(gate, attended).reshape(-1, CFG.q_size),
+            sigmoid_mul(gate, attended).reshape(-1, model.config.q_size),
             model.weight(attention_weights.output, small_t=small_t),
             small_t=small_t,
         ),
     )
 
-    h = rmsnorm(x, model.weight(layer_weights.post_attention_norm))
+    h = rmsnorm(x, model.weight(layer_weights.post_attention_norm), eps=model.config.rms_eps)
     x = residual_add(
         x,
         sparse_moe(model, layer_weights.moe, h, small_t=small_t).output,
     )
-    output = rmsnorm(x, model.weight(mtp_weights.final_norm))
+    output = rmsnorm(x, model.weight(mtp_weights.final_norm), eps=model.config.rms_eps)
     token = (
-        int(
-            torch.argmax(
-                model.logits_last(output, draft=model.draft_head)[: CFG.token_domain]
-            ).item()
-        )
+        int(torch.argmax(model.logits_last(output, draft=model.draft_head)[: model.config.token_domain]).item())
         if sample
         else None
     )

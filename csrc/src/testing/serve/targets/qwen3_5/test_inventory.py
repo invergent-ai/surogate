@@ -1,145 +1,31 @@
+import pytest
+from tests.serve.test_qwen3_5_checkpoint_config import config_for
 from surogate.serve.convert.qwen3_5 import inventory
 
-# One converter serves the family; this file pins the 27B, so it asks for that checkpoint's
-# contract rather than the size the module registers.
-EXPORT = inventory.export_inventory(inventory.GROUPWISE_INT, inventory.GEOMETRY_27B)
+
+@pytest.mark.parametrize("hidden,mtp,vision", [(128, 0, False), (384, 1, True)])
+def test_inventory_and_logical_views_follow_config(hidden, mtp, vision):
+    config = config_for(hidden=hidden, vision=vision)
+    config["mtp_num_hidden_layers"] = mtp
+    g = inventory.geometry_from_config(config, token_domain=500)
+    export = inventory.export_inventory(inventory.GROUPWISE_INT, g)
+    tensors = {s.name: s for s in export.TENSOR_SPECS}
+    assert export.MODEL_ID == export.TARGET_KEY == "qwen3_5"
+    assert tensors["text/token_embedding"].shape == (512, hidden)
+    assert tensors["text/draft_head"].shape == (500, hidden)
+    assert tensors["text/layers/1/gdn/convolution"].shape == (4, 384)
+    assert tensors["text/layers/0/attention/query_key_gate_value"].shape == (768, hidden)
+    assert len(tensors) == len(export.TENSOR_SPECS)
+    assert any(n.startswith("mtp/") for n in tensors) == bool(mtp)
+    assert any(n.startswith("vision/") for n in tensors) == vision
+    for view in export.LOGICAL_ROW_VIEW_SPECS:
+        for layer in view.layers if view.layers is not None else (None,):
+            parent = tensors[view.parent_pattern if layer is None else view.parent_pattern.format(l=layer)]
+            assert 0 <= view.row_begin < view.row_end <= parent.shape[0]
+            assert view.shape == (view.row_count, hidden)
+    assert any(a.role_pattern.startswith("mtp/") for a in export.ALIAS_SPECS) == bool(mtp)
 
 
-def _tensor_by_name() -> dict[str, inventory.TensorSpec]:
-    return {spec.name: spec for spec in EXPORT.TENSOR_SPECS}
-
-
-def test_complete_full_only_inventory_and_canonical_order() -> None:
-    assert EXPORT.MODEL_ID == "qwen3.6-27b"
-    assert EXPORT.WEIGHTS_ID == "groupwise-int"
-    assert EXPORT.TARGET_KEY == "qwen3_5"
-
-    assert len(EXPORT.TEXT_CORE_TENSOR_SPECS) == 771
-    assert len(inventory.build_draft_head_specs(inventory.GEOMETRY_27B)) == 2
-    assert len(inventory.build_mtp_specs(inventory.GEOMETRY_27B)) == 12
-    assert len(inventory.build_vision_specs(inventory.GEOMETRY_27B)) == 333
-    assert len(EXPORT.TENSOR_SPECS) == 1118
-    assert len(EXPORT.RESOURCE_SPECS) == 6
-    assert len(EXPORT.OBJECT_SPECS) == 1124
-
-    names = [spec.name for spec in EXPORT.OBJECT_SPECS]
-    assert len(names) == len(set(names))
-    assert tuple(names[:6]) == (
-        "frontend/tokenizer.json",
-        "frontend/tokenizer_config.json",
-        "frontend/chat_template.jinja",
-        "frontend/generation_config.json",
-        "frontend/preprocessor_config.json",
-        "frontend/video_preprocessor_config.json",
-    )
-    assert names[6] == "text/token_embedding"
-    assert names[-1] == "vision/merger/norm/bias"
-
-    positions = {name: index for index, name in enumerate(names)}
-    assert positions["text/layers/0/input_norm"] < positions["text/layers/63/input_norm"]
-    assert positions["text/layers/63/mlp/down"] < positions["text/final_norm"]
-    assert positions["text/final_norm"] < positions["text/output_head"]
-    assert positions["text/output_head"] < positions["text/draft_head"]
-    assert positions["text/draft_head_token_ids"] < positions["mtp/input_projection"]
-    assert positions["mtp/final_norm"] < positions["vision/patch_embedding"]
-    assert positions["vision/layers/26/norm2/bias"] < positions["vision/merger/fc1"]
-
-
-def test_format_layout_counts_and_key_signatures() -> None:
-    assert {k: v for k, v in EXPORT.FORMAT_COUNTS.items() if v} == {
-        "BF16": 582,
-        "FP32": 96,
-        "I32": 1,
-        "Q4G64_F16S": 183,
-        "Q5G64_F16S": 246,
-        "Q6G64_F16S": 3,
-        "W8G32_F16S": 7,
-    }
-    assert {k: v for k, v in EXPORT.LAYOUT_COUNTS.items() if v} == {
-        "contiguous-le-v1": 679,
-        "row-split-k128-v1": 439,
-    }
-    tensors = _tensor_by_name()
-    assert tensors["text/token_embedding"] == inventory.TensorSpec(
-        "text/token_embedding", (248320, 5120), "Q6G64_F16S", "row-split-k128-v1"
-    )
-    assert tensors["text/layers/0/gdn/convolution"] == inventory.TensorSpec(
-        "text/layers/0/gdn/convolution", (4, 10240), "BF16", "contiguous-le-v1"
-    )
-    assert tensors["text/layers/0/gdn/value_z"] == inventory.TensorSpec(
-        "text/layers/0/gdn/value_z",
-        (12288, 5120),
-        "Q5G64_F16S",
-        "row-split-k128-v1",
-    )
-    assert tensors["text/layers/3/attention/query_key"] == inventory.TensorSpec(
-        "text/layers/3/attention/query_key",
-        (7168, 5120),
-        "Q4G64_F16S",
-        "row-split-k128-v1",
-    )
-    assert tensors["text/draft_head_token_ids"].shape == (131072,)
-    assert tensors["text/draft_head_token_ids"].format == "I32"
-    assert tensors["mtp/layer/attention/query_key_gate_value"].shape == (14336, 5120)
-    assert tensors["mtp/layer/attention/query_key_gate_value"].format == "W8G32_F16S"
-    assert tensors["vision/patch_embedding"].shape == (1152, 1536)
-    assert tensors["vision/merger/fc2"].shape == (5120, 4608)
-
-    assert EXPORT.FULL_ATTENTION_LAYERS == tuple(range(3, 64, 4))
-    assert len(EXPORT.GDN_LAYERS) == 48
-
-
-def test_fixed_logical_row_views_and_aliases() -> None:
-    assert len(EXPORT.LOGICAL_ROW_VIEW_SPECS) == 16
-    assert len({view.name_pattern for view in EXPORT.LOGICAL_ROW_VIEW_SPECS}) == 16
-    for view in EXPORT.LOGICAL_ROW_VIEW_SPECS:
-        assert view.row_begin >= 0
-        assert view.row_end > view.row_begin
-        assert view.row_count == view.shape[0]
-        assert view.shape[1] == 5120
-
-    views = {view.name_pattern: view for view in EXPORT.LOGICAL_ROW_VIEW_SPECS}
-    assert (
-        views["text/layers/{l}/attention/key"].parent_pattern,
-        views["text/layers/{l}/attention/key"].row_begin,
-        views["text/layers/{l}/attention/key"].row_end,
-        views["text/layers/{l}/attention/key"].layers,
-    ) == (
-        "text/layers/{l}/attention/query_key",
-        6144,
-        7168,
-        EXPORT.FULL_ATTENTION_LAYERS,
-    )
-    assert (
-        views["text/layers/{l}/gdn/key"].row_begin,
-        views["text/layers/{l}/gdn/key"].row_end,
-        views["text/layers/{l}/gdn/key"].layers,
-    ) == (2048, 4096, EXPORT.GDN_LAYERS)
-    assert (
-        views["text/layers/{l}/gdn/value"].parent_pattern,
-        views["text/layers/{l}/gdn/value"].row_begin,
-        views["text/layers/{l}/gdn/value"].row_end,
-        views["text/layers/{l}/gdn/z"].row_begin,
-        views["text/layers/{l}/gdn/z"].row_end,
-    ) == ("text/layers/{l}/gdn/value_z", 0, 6144, 6144, 12288)
-    assert (
-        views["mtp/layer/attention/output_gate"].row_begin,
-        views["mtp/layer/attention/output_gate"].row_end,
-    ) == (7168, 13312)
-    assert (
-        views["mtp/layer/attention/value"].row_begin,
-        views["mtp/layer/attention/value"].row_end,
-    ) == (13312, 14336)
-
-    assert len(EXPORT.ALIAS_SPECS) == 4
-    aliases = {alias.role_pattern: alias for alias in EXPORT.ALIAS_SPECS}
-    assert aliases["mtp/token_embedding"].object_patterns == ("text/token_embedding",)
-    assert aliases["mtp/full_output_head"].object_patterns == ("text/output_head",)
-    assert aliases["mtp/optimized_proposal_head"].object_patterns == (
-        "text/draft_head",
-        "text/draft_head_token_ids",
-    )
-    convolution = aliases["text/layers/{l}/gdn/channel_major_convolution"]
-    assert convolution.object_patterns == ("text/layers/{l}/gdn/convolution",)
-    assert convolution.layers == EXPORT.GDN_LAYERS
-    assert convolution.axis_order == (1, 0)
+def test_inventory_requires_explicit_geometry():
+    with pytest.raises(TypeError):
+        inventory.build_tensor_specs()

@@ -16,7 +16,7 @@ import torch
 
 from surogate.serve.convert.common.safetensors import ShardReader
 
-from .inventory import FP32, TensorSpec, VISION_LAYERS
+from .inventory import FP32, TensorSpec
 
 
 SOURCE_DTYPE = "BF16"
@@ -128,15 +128,16 @@ def attention_qproj_part(
     *,
     num_heads: int,
     hidden_size: int,
+    head_dim: int,
 ) -> Expression:
     """Extract query or output-gate rows from head-interleaved Q projection."""
 
-    source_tensor = source(source_name, (num_heads * 512, hidden_size))
-    per_head = Reshape(source_tensor, (num_heads, 512, hidden_size))
-    begin = 256 if gate else 0
+    source_tensor = source(source_name, (num_heads * 2 * head_dim, hidden_size))
+    per_head = Reshape(source_tensor, (num_heads, 2 * head_dim, hidden_size))
+    begin = head_dim if gate else 0
     return Reshape(
-        Slice(per_head, 1, begin, begin + 256),
-        (num_heads * 256, hidden_size),
+        Slice(per_head, 1, begin, begin + head_dim),
+        (num_heads * head_dim, hidden_size),
     )
 
 
@@ -369,7 +370,7 @@ def preflight_sources(
     model_dir: str | Path,
     recipes: Sequence[TensorRecipe],
 ) -> SourcePreflight:
-    with ShardReader(model_dir) as reader:
+    with ShardReader.for_directory(model_dir) as reader:
         return preflight_source_reader(reader, recipes)
 
 

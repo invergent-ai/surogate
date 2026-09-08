@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from surogate.serve.convert.common.declaration import declare, derive_recipes
+from surogate.serve.convert.common.declaration import derive_recipes
 from surogate.serve.convert.common.recipe import (
     SourcePreflight,
     TensorRecipe,
@@ -24,16 +24,17 @@ from surogate.serve.convert.common.safetensors import ShardReader
 from . import inventory
 
 
-def build_recipes(config: Mapping[str, object]) -> tuple[TensorRecipe, ...]:
+def build_recipes(geometry: inventory.Geometry) -> tuple[TensorRecipe, ...]:
     """Every object's source, in object order, for one checkpoint's config."""
-    declared = declare(inventory.ARCHITECTURE, dict(config))
+    declared = geometry.declared
+    config = declared.hf_config
     return tuple(
         derive_recipes(
             declared,
             capabilities=set(inventory.CAPABILITIES),
             # LFM2 has no `lm_head.weight`: the declaration says the head is tied
             # to the embedding, and the converter reads one weight for both.
-            tied_output_head=True,
+            tied_output_head=bool(config.get("tie_word_embeddings", True)),
         )
     )
 

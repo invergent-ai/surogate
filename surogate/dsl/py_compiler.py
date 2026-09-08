@@ -1865,10 +1865,13 @@ def compile_block_spec(
             raise DSLSyntaxError(f"invalid block schema for {spec.name}: {'; '.join(errors)}")
         ir.block_schema = asdict(spec.schema)
 
-    # Create instance first so we can build dim_map for param resolution
-    instance = None
+    # Keep the dimensions used to trace an nn.Block. Reconstructing it from the
+    # model's config can substitute constructor defaults for per-block overrides.
+    instance = getattr(spec, "_traced_instance", None)
     dim_map: dict[str, str] = {}
-    if spec.python_class:
+    if instance is not None:
+        dim_map = _build_dim_map(instance)
+    elif spec.python_class:
         try:
             instance = object.__new__(spec.python_class)
             for key, value in config.items():

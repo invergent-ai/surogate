@@ -1,4 +1,4 @@
-"""Qwen3.6 multimodal prompt metadata and visual-embedding alignment."""
+"""Hybrid multimodal prompt metadata and visual-embedding alignment."""
 
 from __future__ import annotations
 
@@ -80,14 +80,14 @@ class MultimodalBatch:
 
         if image_count:
             assert image_embeddings is not None
-            token_embeddings[device_types == 1] = image_embeddings[
-                image_begin : image_begin + image_count
-            ].to(device=token_embeddings.device, dtype=token_embeddings.dtype)
+            token_embeddings[device_types == 1] = image_embeddings[image_begin : image_begin + image_count].to(
+                device=token_embeddings.device, dtype=token_embeddings.dtype
+            )
         if video_count:
             assert video_embeddings is not None
-            token_embeddings[device_types == 2] = video_embeddings[
-                video_begin : video_begin + video_count
-            ].to(device=token_embeddings.device, dtype=token_embeddings.dtype)
+            token_embeddings[device_types == 2] = video_embeddings[video_begin : video_begin + video_count].to(
+                device=token_embeddings.device, dtype=token_embeddings.dtype
+            )
         return token_embeddings
 
 
@@ -95,20 +95,13 @@ def load_messages(path: str | Path) -> list[dict[str, Any]]:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(value, Mapping) and "messages" in value:
         value = value["messages"]
-    if not isinstance(value, list) or not value or not all(
-        isinstance(item, dict) for item in value
-    ):
-        raise ValueError(
-            "messages JSON must be a non-empty message array or an object containing it"
-        )
+    if not isinstance(value, list) or not value or not all(isinstance(item, dict) for item in value):
+        raise ValueError("messages JSON must be a non-empty message array or an object containing it")
     return value
 
 
-def _vision_position_ids(
-    start: int, grid: Sequence[int], device: torch.device
-) -> torch.Tensor:
+def _vision_position_ids(start: int, grid: Sequence[int], device: torch.device, *, merge: int) -> torch.Tensor:
     t, h, w = (int(value) for value in grid)
-    merge = VISION_SPATIAL_MERGE
     if t <= 0 or h <= 0 or w <= 0 or h % merge or w % merge:
         raise ValueError(f"invalid vision grid {tuple(grid)}")
     gh, gw = h // merge, w // merge
@@ -125,9 +118,13 @@ def build_mrope_positions(
     mm_token_type_ids: torch.Tensor,
     image_grid_thw: torch.Tensor | None,
     video_grid_thw: torch.Tensor | None,
+    *,
+    spatial_merge: int = VISION_SPATIAL_MERGE,
 ) -> tuple[torch.Tensor, int]:
     """Reproduce the checkpoint's three-axis RoPE index for one prompt."""
 
+    if spatial_merge <= 0:
+        raise ValueError("spatial_merge must be positive")
     types = mm_token_type_ids.to(dtype=torch.long).flatten()
     if types.numel() == 0:
         raise ValueError("multimodal prompt must not be empty")
@@ -163,24 +160,18 @@ def build_mrope_positions(
                 label = "image" if modality == 1 else "video"
                 raise ValueError(f"more {label} placeholder runs than grid entries") from exc
             consumed[modality] += 1
-            expected = int(grid[0]) * (int(grid[1]) // VISION_SPATIAL_MERGE) * (
-                int(grid[2]) // VISION_SPATIAL_MERGE
-            )
+            expected = int(grid[0]) * (int(grid[1]) // spatial_merge) * (int(grid[2]) // spatial_merge)
             if length != expected:
                 label = "image" if modality == 1 else "video"
-                raise ValueError(
-                    f"{label} placeholder run has {length} tokens, expected {expected} "
-                    f"for grid {grid}"
-                )
-            parts.append(_vision_position_ids(current, grid, device))
-            current += max(int(grid[1]), int(grid[2])) // VISION_SPATIAL_MERGE
+                raise ValueError(f"{label} placeholder run has {length} tokens, expected {expected} for grid {grid}")
+            parts.append(_vision_position_ids(current, grid, device, merge=spatial_merge))
+            current += max(int(grid[1]), int(grid[2])) // spatial_merge
         begin = end
 
     for modality, label in ((1, "image"), (2, "video")):
         if consumed[modality] != available[modality]:
             raise ValueError(
-                f"{label} grid count {available[modality]} does not match placeholder runs "
-                f"{consumed[modality]}"
+                f"{label} grid count {available[modality]} does not match placeholder runs {consumed[modality]}"
             )
     positions = torch.cat(parts, dim=1)
     delta = int(positions.max().item()) + 1 - len(values)
@@ -192,7 +183,9 @@ def _optional_cpu(output: Mapping[str, Any], name: str) -> torch.Tensor | None:
     return None if value is None else value.cpu()
 
 
-def batch_from_processor_output(output: Mapping[str, Any]) -> MultimodalBatch:
+def batch_from_processor_output(
+    output: Mapping[str, Any], *, spatial_merge: int = VISION_SPATIAL_MERGE
+) -> MultimodalBatch:
     """Bind one library processor result to the target's execution metadata."""
 
     input_ids = output["input_ids"]
@@ -203,8 +196,7 @@ def batch_from_processor_output(output: Mapping[str, Any]) -> MultimodalBatch:
         raise ValueError("processor did not return mm_token_type_ids matching input_ids")
     attention_mask = output.get("attention_mask")
     if attention_mask is not None and (
-        attention_mask.shape != input_ids.shape
-        or not bool(torch.all(attention_mask == 1))
+        attention_mask.shape != input_ids.shape or not bool(torch.all(attention_mask == 1))
     ):
         raise ValueError("reference inference requires one unpadded prompt")
 
@@ -212,7 +204,7 @@ def batch_from_processor_output(output: Mapping[str, Any]) -> MultimodalBatch:
     mm_types = mm_types[0].cpu()
     image_grid = _optional_cpu(output, "image_grid_thw")
     video_grid = _optional_cpu(output, "video_grid_thw")
-    positions, delta = build_mrope_positions(mm_types, image_grid, video_grid)
+    positions, delta = build_mrope_positions(mm_types, image_grid, video_grid, spatial_merge=spatial_merge)
     return MultimodalBatch(
         input_ids=input_ids,
         mm_token_type_ids=mm_types,

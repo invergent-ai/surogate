@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,8 @@ CONFIG_ONLY_TOKENS = {
 
 
 class _OfficialSourceBinding:
+    config = SimpleNamespace(token_domain=248077)
+    vision_config = SimpleNamespace(spatial_merge=2)
     frontend = SimpleNamespace(
         tokenizer_json=MODEL / "tokenizer.json",
         tokenizer_config_json=MODEL / "tokenizer_config.json",
@@ -33,6 +36,7 @@ class _OfficialSourceBinding:
         return resource.read_bytes()
 
 
+@pytest.mark.skipif(not (MODEL / "tokenizer.json").is_file(), reason="official tokenizer fixture is not available")
 def test_reference_consumes_the_raw_official_resource_pair():
     frontend = Frontend(_OfficialSourceBinding())
 

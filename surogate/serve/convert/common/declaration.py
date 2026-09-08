@@ -401,6 +401,9 @@ class Declaration:
     #: settled convention, and changing it would change every name its GGUF repack plan
     #: and its preflight match against.
     flat_sources: bool = True
+    # Optional sections can come from separate checkpoints (for example DFlash).
+    # Their resolved values belong to this declaration, not the model class defaults.
+    section_config: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @cached_property
     def module(self) -> dict[str, Any]:
@@ -408,7 +411,7 @@ class Declaration:
 
     @cached_property
     def config(self) -> dict[str, Any]:
-        return ir_config(self.ir)
+        return ir_config(self.ir) | self.section_config
 
     @cached_property
     def hf_mapping(self) -> dict[str, Any]:

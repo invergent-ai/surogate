@@ -199,7 +199,7 @@ void Variant::attention_projection(const Tensor& hidden,
     const std::int32_t heads     = kv_rows / head_dim;
     Tensor value_per_head        = value.view({head_dim, heads * columns});
     if (weights.value_is_key) {
-        ops::rmsnorm_unweighted(key.view({head_dim, heads * columns}), TextConfig::rms_epsilon,
+        ops::rmsnorm_unweighted(key.view({head_dim, heads * columns}), weights.rms_epsilon,
                                 value_per_head, stream);
     } else {
         // Its own projection, then the same norm. The raw output needs a plane of its own:
@@ -208,7 +208,7 @@ void Variant::attention_projection(const Tensor& hidden,
         Tensor raw = workspace.alloc(DType::BF16, {kv_rows, columns});
         ops::linear(hidden, weights.value, raw, kTextPolicy, workspace, stream);
         apply_lora(weights.value, kValuePort, hidden, raw, stream);
-        ops::rmsnorm_unweighted(raw.view({head_dim, heads * columns}), TextConfig::rms_epsilon,
+        ops::rmsnorm_unweighted(raw.view({head_dim, heads * columns}), weights.rms_epsilon,
                                 value_per_head, stream);
     }
 }
@@ -230,7 +230,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     // residual add that read it back existed only because `ops::rmsnorm` forbids aliasing
     // its output with its inputs; the fused form is bit-identical to that pair, which
     // sinfer_rmsnorm_test pins.
-    ops::rmsnorm_add(projected, weights.post_attention_norm, TextConfig::rms_epsilon,
+    ops::rmsnorm_add(projected, weights.post_attention_norm, weights.rms_epsilon,
                      /*unit_offset*/ false, residual, stream);
 }
 
@@ -282,7 +282,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     // The second half of the FFN sandwich: `post_feedforward_layernorm` over the MLP's
     // output, before it reaches the residual. No unit offset, for the reason
     // `attention_output_projection` gives.
-    ops::rmsnorm_add(projected, weights.post_feedforward_norm, TextConfig::rms_epsilon,
+    ops::rmsnorm_add(projected, weights.post_feedforward_norm, weights.rms_epsilon,
                      /*unit_offset*/ false, residual, stream);
     // And the last thing a Gemma 4 block does: scale its whole output.
     //
@@ -316,10 +316,10 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
 // target's own refusal messages.
 SINFER_FAMILY_UNRUNNABLE_LEAVES(no_linear_layers, no_speculation)
 
-void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream) {
     // Only the magic is this target's: 'G4PB'. Everything else -- which rounds are
     // captured, how the occurrence is counted, the header layout -- is the family's.
-    family::debug_probe_dump(0x47345042, tag, tensor, TextConfig::layers, stream);
+    family::debug_probe_dump(0x47345042, tag, tensor, layer_count, stream);
 }
 
 } // namespace sinfer::targets::gemma4::detail

@@ -33,8 +33,6 @@ using RequestBasePlan = family::RequestBasePlan<Variant>;
 using RequestPlan     = family::RequestPlan<Variant>;
 using Program         = family::Program<Variant>;
 
-inline constexpr float kAttentionScale                   = Variant::attention_scale;
-inline constexpr float kGdnScale                         = Variant::gdn_scale;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = Variant::prefill_chunk_alignment;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = Variant::maximum_mtp_draft_tokens;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dflash_draft_tokens;

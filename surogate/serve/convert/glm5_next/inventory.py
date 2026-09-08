@@ -1,32 +1,9 @@
-"""What a GLM-5.3-Flash serving artifact holds, and where its dimensions come from.
-
-The GGUF *is* the source here. gguf-py has no `glm5next` name map, so there is no bridge to
-route through and no synthesised `config.json` to read; the checkpoint states its own geometry
-in its key-values and this module reads them, then hands the declaration a config in the
-spelling training uses. Everything about the object list -- which objects a block kind has,
-their shapes, which are quantised -- stays the declaration's answer rather than a second copy
-of it here.
-
-Four block kinds, because the two axes are independent: a layer runs either Kimi Delta
-Attention or multi-head latent attention, and its feed-forward is either dense or the mixture.
-The released 45-layer checkpoint uses three of them -- three leading dense KDA layers, then KDA
-and MLA layers over the mixture.
-
-The NextN draft head (`blk.45.nextn.*`, one MLA layer over the mixture plus three norms and a
-fold) is carried under `mtp/` when the file has it: it is the checkpoint's own speculative
-draft head, and `--spec mtp` runs it. One thing the released file carries that this artifact
-does not:
-
-- **the sparse indexer** (`blk.N.indexer.*`). It selects 512 pools of four tokens each, so for
-  any context at or below `index_topk` every visible token is selected and full attention is
-  exactly what the indexer would have asked for. Past that bound they differ, which is why the
-  artifact records the bound and the engine refuses beyond it rather than quietly attending to
-  more than the model was trained to.
-"""
+"""Serving objects derived from a GLM checkpoint's GGUF configuration."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Mapping, Sequence
 
 from surogate.serve.convert.common import declaration
@@ -51,7 +28,6 @@ CAPABILITIES = ("text",)
 #: The Hub repository the frontend (tokenizer, chat template, generation config) comes from.
 #: The weights are not fetched from it -- they are the GGUF's -- but a GGUF carries a token
 #: table and not a `tokenizer.json`, and the engine's frontend reads the latter.
-FRONTEND_REPO = "zai-org/GLM-5.3-Flash"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +62,49 @@ class Geometry:
     attention_layers: tuple[int, ...]
     dense_layers: tuple[int, ...]
     nextn_layers: int
+    max_context: int
+    index_pool: int
+    declared: declaration.Declaration = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        from surogate.serve.convert.common.checkpoint import positive_int
+
+        required = ("hidden", "layers", "query_heads", "dense_intermediate", "expert_intermediate",
+                    "vocab", "experts", "experts_per_token", "hc_streams", "hc_sinkhorn_iterations",
+                    "kda_heads", "kda_head_dim", "kda_conv_kernel", "kda_gate_rank", "q_lora_rank",
+                    "kv_lora_rank", "qk_head_dim", "v_head_dim", "max_context", "index_topk", "index_pool")
+        for name in required:
+            positive_int({name: getattr(self, name)}, name)
+        if self.layers > 256 or self.nextn_layers not in (0, 1):
+            raise ValueError("GLM serving supports at most 256 text layers and one NextN layer")
+        if self.experts_per_token > self.experts:
+            raise ValueError("expert_used_count exceeds expert_count")
+        if self.shared_intermediate < 0 or self.shared_intermediate % self.expert_intermediate:
+            raise ValueError("shared expert width must be a nonnegative multiple of expert width")
+        for name in ("rms_epsilon", "hc_epsilon", "routed_scale"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite")
+        if not math.isfinite(self.swiglu_limit) or self.swiglu_limit < 0:
+            raise ValueError("swiglu_limit must be finite and nonnegative")
+        if not math.isfinite(self.kda_lower_bound) or self.kda_lower_bound >= 0:
+            raise ValueError("kda.gate_lower_bound must be finite and negative")
+        for schedule in (self.attention_layers, self.dense_layers):
+            if len(set(schedule)) != len(schedule) or any(i < 0 or i >= self.layers for i in schedule):
+                raise ValueError("invalid GLM layer schedule")
+        if self.dense_layers != tuple(range(len(self.dense_layers))):
+            raise ValueError("GLM GGUF serving requires leading dense layers")
+        object.__setattr__(self, "declared", declaration.declare(ARCHITECTURE, config_from_geometry(self)))
+
+    @property
+    def layer_types(self) -> tuple[str, ...]:
+        return tuple("full_attention" if self.is_attention(i) else "linear_attention"
+                     for i in range(self.layers))
+
+    @property
+    def serving_context(self) -> int:
+        # Without the sparse indexer, all complete pools and the unfinished tail fit here.
+        return min(self.max_context, self.index_topk + self.index_pool - 1)
 
     @property
     def residual(self) -> int:
@@ -133,8 +152,18 @@ def geometry_from_gguf(kv: Callable[[str, Any], Any]) -> Geometry:
             )
         return value
 
-    blocks = int(need("block_count"))
-    nextn = int(kv(f"{GGUF_ARCHITECTURE}.nextn_predict_layers", 0) or 0)
+    def integer(value):
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2147483647:
+            raise ValueError("GGUF dimensions must be nonnegative int32 values")
+        return value
+
+    def number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("GGUF execution settings must be finite numbers")
+        return value
+
+    blocks = integer(need("block_count"))
+    nextn = integer(kv(f"{GGUF_ARCHITECTURE}.nextn_predict_layers", 0))
     layers = blocks - nextn
     kv_heads = list(need("attention.head_count_kv"))
     if len(kv_heads) != blocks:
@@ -142,42 +171,52 @@ def geometry_from_gguf(kv: Callable[[str, Any], Any]) -> Geometry:
             f"`attention.head_count_kv` has {len(kv_heads)} entries for {blocks} blocks; it is "
             f"this file's attention schedule and has to name every one"
         )
-    leading_dense = int(need("leading_dense_block_count"))
-    if int(need("rope.dimension_count")) != 0:
+    leading_dense = integer(need("leading_dense_block_count"))
+    if not 0 <= leading_dense <= layers:
+        raise ValueError("leading_dense_block_count must be within the text layer count")
+    if any(integer(value) not in (0, 1) for value in kv_heads):
+        raise ValueError("GLM absorbed attention requires head_count_kv entries of zero or one")
+    clamps = list(need("swiglu_clamp_exp"))
+    shared_clamps = list(need("swiglu_clamp_shexp"))
+    if len(clamps) != blocks or len(shared_clamps) != blocks or len(set(clamps + shared_clamps)) != 1:
+        raise ValueError("GLM serving currently requires one SwiGLU clamp shared by all layers and experts")
+    if integer(need("rope.dimension_count")) != 0:
         raise ValueError(
             "this checkpoint rotates its latent attention; every released GLM-5.3 is the NoPE "
             "variant and the served attention applies no rotary at all"
         )
     return Geometry(
-        hidden=int(need("embedding_length")),
+        hidden=integer(need("embedding_length")),
         layers=layers,
-        query_heads=int(need("attention.head_count")),
-        dense_intermediate=int(need("feed_forward_length")),
-        expert_intermediate=int(need("expert_feed_forward_length")),
-        shared_intermediate=int(kv(f"{GGUF_ARCHITECTURE}.expert_shared_feed_forward_length", 0) or 0)
-        * int(kv(f"{GGUF_ARCHITECTURE}.expert_shared_count", 0) or 0),
-        vocab=int(need("vocab_size")),
-        experts=int(need("expert_count")),
-        experts_per_token=int(need("expert_used_count")),
-        routed_scale=float(kv(f"{GGUF_ARCHITECTURE}.expert_weights_scale", 1.0) or 1.0),
-        swiglu_limit=float(list(need("swiglu_clamp_exp"))[0]),
-        hc_streams=int(need("hyper_connection.count")),
-        hc_sinkhorn_iterations=int(need("hyper_connection.sinkhorn_iterations")),
-        hc_epsilon=float(need("hyper_connection.epsilon")),
-        kda_heads=int(need("attention.head_count")),
-        kda_head_dim=int(need("kda.head_dim")),
-        kda_conv_kernel=int(need("ssm.conv_kernel")),
-        kda_gate_rank=int(need("kda.head_dim")),
-        kda_lower_bound=float(need("kda.gate_lower_bound")),
-        q_lora_rank=int(need("attention.q_lora_rank")),
-        kv_lora_rank=int(need("attention.kv_lora_rank")),
-        qk_head_dim=int(need("attention.key_length_mla")),
-        v_head_dim=int(need("attention.value_length_mla")),
-        rms_epsilon=float(need("attention.layer_norm_rms_epsilon")),
-        index_topk=int(need("attention.indexer.top_k")),
+        query_heads=integer(need("attention.head_count")),
+        dense_intermediate=integer(need("feed_forward_length")),
+        expert_intermediate=integer(need("expert_feed_forward_length")),
+        shared_intermediate=integer(kv(f"{GGUF_ARCHITECTURE}.expert_shared_feed_forward_length", 0))
+        * integer(kv(f"{GGUF_ARCHITECTURE}.expert_shared_count", 0)),
+        vocab=integer(need("vocab_size")),
+        experts=integer(need("expert_count")),
+        experts_per_token=integer(need("expert_used_count")),
+        routed_scale=number(kv(f"{GGUF_ARCHITECTURE}.expert_weights_scale", 1.0)),
+        swiglu_limit=number(clamps[0]),
+        hc_streams=integer(need("hyper_connection.count")),
+        hc_sinkhorn_iterations=integer(need("hyper_connection.sinkhorn_iterations")),
+        hc_epsilon=number(need("hyper_connection.epsilon")),
+        kda_heads=integer(need("attention.head_count")),
+        kda_head_dim=integer(need("kda.head_dim")),
+        kda_conv_kernel=integer(need("ssm.conv_kernel")),
+        kda_gate_rank=integer(need("kda.head_dim")),
+        kda_lower_bound=number(need("kda.gate_lower_bound")),
+        q_lora_rank=integer(need("attention.q_lora_rank")),
+        kv_lora_rank=integer(need("attention.kv_lora_rank")),
+        qk_head_dim=integer(need("attention.key_length_mla")),
+        v_head_dim=integer(need("attention.value_length_mla")),
+        rms_epsilon=number(need("attention.layer_norm_rms_epsilon")),
+        index_topk=integer(need("attention.indexer.top_k")),
         attention_layers=tuple(i for i in range(layers) if int(kv_heads[i]) > 0),
         dense_layers=tuple(range(min(leading_dense, layers))),
         nextn_layers=nextn,
+        max_context=integer(need("context_length")),
+        index_pool=integer(need("attention.indexer.kpool")),
     )
 
 
@@ -224,6 +263,9 @@ def config_from_geometry(geometry: Geometry) -> dict[str, Any]:
         "linear_conv_kernel_dim": geometry.kda_conv_kernel,
         "linear_lower_bound": geometry.kda_lower_bound,
         "index_topk": geometry.index_topk,
+        "index_kpool": geometry.index_pool,
+        "index_kpool_always_select_tail": True,
+        "max_position_embeddings": geometry.max_context,
         "nextn_predict_layers": geometry.nextn_layers,
         "first_k_dense_replace": len(geometry.dense_layers),
         "layer_types": [
@@ -243,8 +285,7 @@ def config_from_geometry(geometry: Geometry) -> dict[str, Any]:
 
 
 def declared_objects(geometry: Geometry) -> list[declaration.DeclaredObject]:
-    declared = declaration.declare(ARCHITECTURE, config_from_geometry(geometry))
-    return list(declared.objects(capabilities=set(CAPABILITIES)))
+    return list(geometry.declared.objects(capabilities=set(CAPABILITIES)))
 
 
 def tensor_specs(objects: Sequence[declaration.DeclaredObject]) -> tuple[TensorSpec, ...]:
@@ -254,7 +295,7 @@ def tensor_specs(objects: Sequence[declaration.DeclaredObject]) -> tuple[TensorS
     for the objects that do not stay in the file's own K-quant format, which is most of the
     bytes. The norms, the router bias, the convolution taps, the per-head decay and the three
     hyper-connection scalars stay in the precision the declaration names: a router that picks
-    eight of 288 experts and a decay that is exponentiated are both places where a coarse width
+    a subset of its experts and a decay that is exponentiated are both places where a coarse width
     costs far more than the bytes it saves.
     """
     out: list[TensorSpec] = []
@@ -278,7 +319,6 @@ __all__ = [
     "ARCHITECTURE",
     "BF16",
     "CAPABILITIES",
-    "FRONTEND_REPO",
     "GGUF_ARCHITECTURE",
     "Geometry",
     "MODEL_ID",

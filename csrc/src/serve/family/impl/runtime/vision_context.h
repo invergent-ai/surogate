@@ -25,24 +25,13 @@ struct VisionItemView {
     const family::VisionItemControl* control = nullptr;
 };
 
-/// The tower this target compiles, as a value. The schedule reads every dimension from a
-/// `VisionGeometry` it is handed rather than from `VisionConfig`, so a context sizes its buffers
-/// from the tower the weights carry; this is the fallback for a caller that has no weights yet.
-[[nodiscard]] inline family::VisionGeometry compiled_vision_geometry() {
-    return family::VisionGeometry::compiled<VisionConfig>();
-}
-
-/// A tower as the schedule must run it. `output_hidden` is the width the merger projects into,
-/// and that is the text model's hidden state -- merged visual tokens join the residual stream --
-/// so it is taken from the text geometry rather than from the tower's own config. Only the text
-/// side knows that width at the checkpoint's size, and the family's shared tower config cannot
-/// name it at all; leaving it compiled while the text hidden moved is a mismatch the merger's
-/// last GEMM finds, and only there.
+/// A tower's output must match the text model it was bound with.
 [[nodiscard]] inline family::VisionGeometry
 bound_vision_geometry(const family::VisionGeometry& tower, const family::TextGeometry& text) {
-    family::VisionGeometry geometry = tower;
-    geometry.output_hidden          = text.hidden;
-    return geometry;
+    if (tower.layers <= 0 || tower.output_hidden != text.hidden) {
+        throw std::invalid_argument("vision geometry is missing or disagrees with the text width");
+    }
+    return tower;
 }
 
 class VisionContext {

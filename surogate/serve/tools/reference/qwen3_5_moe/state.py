@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .config import CFG
+from .config import ModelConfig
 
 
 class KVCache:
@@ -16,11 +16,18 @@ class KVCache:
         capacity: int,
         device: torch.device,
         dtype: str = "bf16",
+        *,
+        kv_heads: int,
+        head_dim: int,
     ):
         if dtype not in {"bf16", "int8"}:
             raise ValueError(f"kv dtype must be bf16/int8, got {dtype!r}")
         if capacity <= 0:
             raise ValueError("KV capacity must be positive")
+        self.kv_heads = kv_heads
+        self.head_dim = head_dim
+        if dtype == "int8" and head_dim % 64:
+            raise ValueError("int8 KV storage requires head_dim divisible by 64")
         self.layers = layers
         self.capacity = capacity
         self.device = device
@@ -34,46 +41,30 @@ class KVCache:
     def _allocate(self, layer: int) -> None:
         if layer in self._k:
             return
-        shape = (self.capacity, CFG.kv_heads, CFG.head_dim)
+        shape = (self.capacity, self.kv_heads, self.head_dim)
         if self.dtype == "bf16":
-            self._k[layer] = torch.empty(
-                shape, device=self.device, dtype=torch.bfloat16
-            )
-            self._v[layer] = torch.empty(
-                shape, device=self.device, dtype=torch.bfloat16
-            )
+            self._k[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
+            self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
         else:
             self._k[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
             self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
-            scales = (self.capacity, CFG.kv_heads, CFG.head_dim // 64)
-            self._ks[layer] = torch.empty(
-                scales, device=self.device, dtype=torch.float16
-            )
-            self._vs[layer] = torch.empty(
-                scales, device=self.device, dtype=torch.float16
-            )
+            scales = (self.capacity, self.kv_heads, self.head_dim // 64)
+            self._ks[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
+            self._vs[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
 
     @staticmethod
     def _quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        groups = x.float().reshape(*x.shape[:-1], CFG.head_dim // 64, 64)
+        groups = x.float().reshape(*x.shape[:-1], x.shape[-1] // 64, 64)
         scale = (groups.abs().amax(dim=-1) / 127.0).to(torch.float16)
         safe_scale = torch.where(scale == 0, torch.ones_like(scale), scale).float()
-        code = (
-            torch.round(groups / safe_scale.unsqueeze(-1))
-            .clamp(-127, 127)
-            .to(torch.int8)
-        )
+        code = torch.round(groups / safe_scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
         code = torch.where((scale == 0).unsqueeze(-1), 0, code).to(torch.int8)
         return code.reshape_as(x), scale
 
     @staticmethod
     def _dequantize(code: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        groups = code.float().reshape(*code.shape[:-1], CFG.head_dim // 64, 64)
-        return (
-            (groups * scale.float().unsqueeze(-1))
-            .reshape_as(code)
-            .to(torch.bfloat16)
-        )
+        groups = code.float().reshape(*code.shape[:-1], code.shape[-1] // 64, 64)
+        return (groups * scale.float().unsqueeze(-1)).reshape_as(code).to(torch.bfloat16)
 
     def write(
         self,
@@ -118,6 +109,7 @@ class ModelState:
     device: torch.device
     capacity: int
     kv_dtype: str
+    config: ModelConfig
     kv: KVCache = field(init=False)
     mtp_kv: KVCache = field(init=False)
     conv: list[torch.Tensor] = field(init=False)
@@ -127,27 +119,36 @@ class ModelState:
     mrope: bool = False
 
     def __post_init__(self) -> None:
-        self.kv = KVCache(CFG.full_layers, self.capacity, self.device, self.kv_dtype)
-        self.mtp_kv = KVCache(1, self.capacity, self.device, self.kv_dtype)
+        self.kv = KVCache(
+            self.config.full_layers,
+            self.capacity,
+            self.device,
+            self.kv_dtype,
+            kv_heads=self.config.kv_heads,
+            head_dim=self.config.head_dim,
+        )
+        self.mtp_kv = KVCache(
+            1, self.capacity, self.device, self.kv_dtype, kv_heads=self.config.kv_heads, head_dim=self.config.head_dim
+        )
         self.conv = [
             torch.zeros(
-                CFG.conv_dim,
-                CFG.conv_width - 1,
+                self.config.conv_dim,
+                self.config.conv_width - 1,
                 device=self.device,
                 dtype=torch.bfloat16,
             )
-            for _ in range(CFG.gdn_layers)
+            for _ in range(self.config.gdn_layers)
         ]
         self.ssm = [
             torch.zeros(
                 1,
-                CFG.gdn_v_heads,
-                CFG.gdn_k_dim,
-                CFG.gdn_v_dim,
+                self.config.gdn_v_heads,
+                self.config.gdn_k_dim,
+                self.config.gdn_v_dim,
                 device=self.device,
                 dtype=torch.float32,
             )
-            for _ in range(CFG.gdn_layers)
+            for _ in range(self.config.gdn_layers)
         ]
 
     def snapshot(self) -> StateSnapshot:

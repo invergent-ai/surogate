@@ -95,7 +95,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
             }
             store.register_module(index, "o_proj",
                                   Binding{attention.output.qdata, family::kOutputPort,
-                                          g.query_heads * TextConfig::v_head_dim, g.hidden});
+                                          g.query_heads * g.v_head_dim, g.hidden});
         } else {
             ++kda_index;
             for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
@@ -164,7 +164,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "w8-mhc-v1") {
+    if (identity.architecture == target_key && identity.weights_id == "w8-mhc-v1") {
         return WeightsProfile::GroupwiseInt;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -209,8 +209,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     // where nothing is banked, and set on every plan so a candidate never inherits the last.
     family::ExpertCache::configure_pool_floor(
         banks_experts(options)
-            ? family::ExpertCache::pool_floor_bytes(ops::kSparseMoeGlm53Geometry,
-                                                    detail::TextConfig::layers + 1,
+            ? family::ExpertCache::pool_floor_bytes(detail::moe_geometry(plan.bindings.geometry),
+                                                    plan.bindings.geometry.layers + plan.bindings.geometry.mtp_layers,
                                                     options.expert_slots)
             : 0);
     if (banks_experts(options)) {
@@ -251,9 +251,10 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile,
-                                                        const family::TextGeometry& geometry) {
+                                                        const family::TextGeometry& geometry,
+                                                        const family::VisionGeometry& vision_geometry) {
     auto planner = family::make_sequence_planner<detail::Variant>(device, options,
-                                                                  weights_profile, geometry);
+                                                                  weights_profile, geometry, vision_geometry);
     // The stream mixings travel between a site's collapse and its scatter in a device buffer
     // this target owns, and every device that runs a layer needs its own before the first
     // forward -- a pipeline stage plans on the device it will run on, so this is where it is
@@ -265,7 +266,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(device.device));
-        detail::Variant::prewarm_device_scratch();
+        detail::Variant::prewarm_device_scratch(geometry);
         if (banks_experts(options)) {
             // The runtime's floor and the load's staging are never resident together, so the
             // pool leaves room for the larger, on top of the weights.
@@ -290,9 +291,9 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                              static_cast<double>(family::ExpertCache::load_staging()) /
                                  (1024.0 * 1024.0 * 1024.0));
             }
-            family::ExpertCache::configure(options, runtime_floor, detail::TextConfig::experts);
+            family::ExpertCache::configure(options, runtime_floor, geometry.experts);
             (void)family::ExpertCache::for_current_device(
-                ops::kSparseMoeGlm53Geometry, geometry.layers + geometry.mtp_layers);
+                detail::moe_geometry(geometry), geometry.layers + geometry.mtp_layers);
         }
         CUDA_CHECK(cudaSetDevice(previous));
     }
@@ -317,7 +318,7 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(device.device));
         ops::detail::bf16_cublaslt_prewarm();
-        detail::Variant::prewarm_device_scratch();
+        detail::Variant::prewarm_device_scratch(model.impl_->data.runtime.geometry);
         if (model.impl_->data.host_bank != nullptr) {
             // This stage banked experts (the bank exists exactly when it holds something).
             // `--cpu-moe-share auto`: the split's share is measured on the first banked
@@ -337,7 +338,7 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
                 }
             }
             family::ExpertCache& cache = family::ExpertCache::for_current_device(
-                ops::kSparseMoeGlm53Geometry, runtime.geometry.layers + runtime.geometry.mtp_layers);
+                detail::moe_geometry(runtime.geometry), runtime.geometry.layers + runtime.geometry.mtp_layers);
             cache.prepare_split(banked == nullptr
                                     ? family::BankedMixture{}
                                     : family::BankedMixture{banked->layer, banked->layers,

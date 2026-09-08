@@ -1,4 +1,4 @@
-"""Run the Qwen3.6-35B-A3B artifact-native reference CLI."""
+"""Run the hybrid MoE artifact-native reference CLI."""
 
 from .cli import main
 

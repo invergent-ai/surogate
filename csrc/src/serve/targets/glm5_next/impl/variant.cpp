@@ -19,6 +19,7 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,8 +42,6 @@ namespace {
 using family::apply_lora;
 
 constexpr ops::LinearPolicy kTextPolicy = ops::LinearPolicy::A16Only;
-constexpr ops::SparseMoeGeometry kMoeGeometry = ops::kSparseMoeGlm53Geometry;
-constexpr std::int32_t kStreams = TextConfig::hc_streams;
 
 // --------------------------------------------------------------------------------------------
 // The mixings, from a site's collapse to its scatter
@@ -62,29 +61,30 @@ struct MixingScratch {
 
 /// Enough for `post` [S,T] and `comb` [S,S,T] at the widest round this engine plans.
 constexpr std::size_t kMaximumMixingTokens = 65536;
-constexpr std::size_t kMixingScratchBytes =
-    static_cast<std::size_t>(kStreams) * (1 + kStreams) * kMaximumMixingTokens * sizeof(float);
+
 
 std::mutex& mixing_mutex() {
     static std::mutex value;
     return value;
 }
 
-std::unordered_map<int, MixingScratch>& mixing_scratch() {
-    static std::unordered_map<int, MixingScratch> value;
+std::unordered_map<std::uint64_t, MixingScratch>& mixing_scratch() {
+    static std::unordered_map<std::uint64_t, MixingScratch> value;
     return value;
 }
 
-MixingScratch& mixing_scratch_for_current_device() {
+MixingScratch& mixing_scratch_for_current_device(std::int32_t streams) {
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     std::lock_guard<std::mutex> lock(mixing_mutex());
-    return mixing_scratch()[device];
+    return mixing_scratch()[(static_cast<std::uint64_t>(device) << 32U) |
+                             static_cast<std::uint32_t>(streams)];
 }
 
 thread_local Tensor t_post;
 thread_local Tensor t_comb;
 thread_local int t_mixing_device = -1;
+thread_local std::int32_t t_probe_layer_count = 0;
 /// The value half of the layer's latent expansion, set by `attention_projection` for the
 /// output hook that follows it: the family hands that hook the output weight alone, and the
 /// attended latent has to be unfolded through this before the output weight can read it.
@@ -104,36 +104,37 @@ void check_device_handoff(const char* what, int recorded) {
 void mix_into(const Tensor& residual, const HyperConnectionPayload& hc, const Tensor& norm,
               float eps, Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t tokens = residual.ne[1];
-    const MixingScratch& scratch = mixing_scratch_for_current_device();
-    const std::size_t needed = static_cast<std::size_t>(kStreams) * (1 + kStreams) *
+    const MixingScratch& scratch = mixing_scratch_for_current_device(hc.streams);
+    const std::size_t needed = static_cast<std::size_t>(hc.streams) * (1 + hc.streams) *
                                static_cast<std::size_t>(tokens) * sizeof(float);
     if (scratch.data == nullptr || needed > scratch.bytes) {
         throw std::logic_error("glm5_next: the mixing scratch is missing or too small for this "
                                "forward");
     }
-    Tensor post(scratch.data, DType::FP32, {kStreams, tokens});
+    Tensor post(scratch.data, DType::FP32, {hc.streams, tokens});
     Tensor comb(static_cast<char*>(scratch.data) +
-                    static_cast<std::size_t>(kStreams) * tokens * sizeof(float),
-                DType::FP32, {kStreams, kStreams, tokens});
+                    static_cast<std::size_t>(hc.streams) * tokens * sizeof(float),
+                DType::FP32, {hc.streams, hc.streams, tokens});
     auto scope = workspace.scope();
-    Tensor collapsed = workspace.alloc(DType::BF16, {residual.ne[0] / kStreams, tokens});
+    Tensor collapsed = workspace.alloc(DType::BF16, {residual.ne[0] / hc.streams, tokens});
     if (hc.weights.mix.n <= 0) {
         throw std::logic_error(
             "glm5_next: the hyper-connection of layer " + std::to_string(hc.layer) +
             " is not bound on this stage, so this round is running a layer the stage does not "
             "hold");
     }
-    ops::manifold_hyper_connection_mix(residual, hc.weights, kStreams, eps,
-                                       TextConfig::hc_epsilon,
-                                       TextConfig::hc_sinkhorn_iterations, collapsed, post, comb,
+    ops::manifold_hyper_connection_mix(residual, hc.weights, hc.streams, eps,
+                                       hc.epsilon,
+                                       hc.sinkhorn_iterations, collapsed, post, comb,
                                        workspace, stream);
     ops::rmsnorm(collapsed, norm, eps, /*unit_offset=*/false, hidden, stream);
     // Parity probes. Under SUROGATE_SERVE_DUMP_RESIDUAL these are the only tensors of this
     // stack a reference implementation can be compared against directly: the stream collapse,
     // the two mixings it produced, and (below) the residual the recombination left.
-    Variant::debug_probe("hc_collapsed", collapsed, stream);
-    Variant::debug_probe("hc_normed", hidden, stream);
-    Variant::debug_probe("hc_post", post, stream);
+    Variant::debug_probe("hc_collapsed", collapsed, hc.probe_layer_count, stream);
+    Variant::debug_probe("hc_normed", hidden, hc.probe_layer_count, stream);
+    Variant::debug_probe("hc_post", post, hc.probe_layer_count, stream);
+    t_probe_layer_count = hc.probe_layer_count;
     t_post = post;
     t_comb = comb;
     CUDA_CHECK(cudaGetDevice(&t_mixing_device));
@@ -145,10 +146,10 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
         throw std::logic_error("glm5_next: a combine without a matching collapse");
     }
     check_device_handoff("the stream mixings", t_mixing_device);
-    Variant::debug_probe("block_output", block_output, stream);
-    ops::manifold_hyper_connection_combine(block_output, t_post, t_comb, kStreams, residual,
+    Variant::debug_probe("block_output", block_output, t_probe_layer_count, stream);
+    ops::manifold_hyper_connection_combine(block_output, t_post, t_comb, t_post.ne[0], residual,
                                            stream);
-    Variant::debug_probe("residual", residual, stream);
+    Variant::debug_probe("residual", residual, t_probe_layer_count, stream);
     t_post          = Tensor{};
     t_comb          = Tensor{};
     t_mixing_device = -1;
@@ -218,7 +219,7 @@ void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, 
                     WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
-        kMoeGeometry, weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1],
+        ops::sparse_moe_geometry(weights), weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1],
         hidden.ne[1]));
     WorkspaceArena leaf_workspace(storage);
     ops::sparse_moe(hidden, weights, ops::SparseMoeEpilogue::AddResidual, out, leaf_workspace,
@@ -265,11 +266,14 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t,
     return {};
 }
 
-void Variant::prewarm_device_scratch() {
-    MixingScratch& scratch = mixing_scratch_for_current_device();
-    if (scratch.data == nullptr) {
-        CUDA_CHECK(cudaMalloc(&scratch.data, kMixingScratchBytes));
-        scratch.bytes = kMixingScratchBytes;
+void Variant::prewarm_device_scratch(const family::TextGeometry& geometry) {
+    MixingScratch& scratch = mixing_scratch_for_current_device(geometry.hc_streams);
+    const auto streams = static_cast<std::size_t>(geometry.hc_streams);
+    const auto bytes = streams * (1 + streams) * kMaximumMixingTokens * sizeof(float);
+    if (scratch.bytes < bytes) {
+        if (scratch.data != nullptr) { CUDA_CHECK(cudaFree(scratch.data)); }
+        CUDA_CHECK(cudaMalloc(&scratch.data, bytes));
+        scratch.bytes = bytes;
     }
 }
 
@@ -281,7 +285,7 @@ void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& 
     Tensor embedded =
         workspace.alloc(DType::BF16, {model.geometry.hidden, ids.ne[0]});
     ops::embedding(ids, model.token_embedding, embedded, stream);
-    ops::broadcast_streams(embedded, kStreams, residual, stream);
+    ops::broadcast_streams(embedded, model.geometry.hc_streams, residual, stream);
 }
 
 void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
@@ -289,7 +293,7 @@ void Variant::final_residual_mix(const ModelView& model, const Tensor& residual,
     auto scope = workspace.scope();
     Tensor mean = workspace.alloc(DType::BF16, {model.geometry.hidden, residual.ne[1]});
     // The stack ends with an unweighted mean of the streams, not another mixing.
-    ops::collapse_streams_mean(residual, kStreams, mean, stream);
+    ops::collapse_streams_mean(residual, model.geometry.hc_streams, mean, stream);
     ops::rmsnorm(mean, model.final_norm, model.geometry.rms_epsilon, /*unit_offset=*/false, hidden,
                  stream);
 }
@@ -334,7 +338,8 @@ void absorbed_query(const Tensor& hidden, const Payload& weights, Tensor& query,
                  stream);
     project("mla/query_b", q_low, weights.query_b, q_heads, workspace, stream);
     const std::int32_t heads = weights.k_b.n / weights.kv_a.n;
-    ops::head_linear(q_heads, weights.k_b, heads, kAbsorbScale, query, stream);
+    ops::head_linear(q_heads, weights.k_b, heads, std::sqrt(static_cast<float>(weights.kv_a.n) /
+                                    (weights.query_b.n / heads)), query, stream);
 }
 
 /// The attended latent back through the value half, per head, then the output projection.
@@ -355,11 +360,11 @@ std::size_t absorbed_query_capacity(const family::TextGeometry& geometry,
     // The query low rank and the heads `query_b` produces; the absorption is a per-head kernel
     // with no transient of its own.
     return plane_bytes(geometry.q_lora_rank, last, DType::BF16) +
-           plane_bytes(geometry.query_heads * TextConfig::qk_head_dim, last, DType::BF16) +
+           plane_bytes(geometry.query_heads * geometry.qk_head_dim, last, DType::BF16) +
            std::max(linear_capacity(weights_profile, geometry.q_lora_rank, geometry.hidden, first,
                                     last),
                     linear_capacity(weights_profile,
-                                    geometry.query_heads * TextConfig::qk_head_dim,
+                                    geometry.query_heads * geometry.qk_head_dim,
                                     geometry.q_lora_rank, first, last));
 }
 
@@ -372,9 +377,9 @@ std::size_t latent_key_capacity(const family::TextGeometry& geometry,
 std::size_t unfold_capacity(const family::TextGeometry& geometry, WeightsProfile weights_profile,
                             std::int32_t first, std::int32_t last) {
     // The unfolded heads, then the output projection's transient.
-    return plane_bytes(geometry.query_heads * TextConfig::v_head_dim, last, DType::BF16) +
+    return plane_bytes(geometry.query_heads * geometry.v_head_dim, last, DType::BF16) +
            linear_capacity(weights_profile, geometry.hidden,
-                           geometry.query_heads * TextConfig::v_head_dim, first, last);
+                           geometry.query_heads * geometry.v_head_dim, first, last);
 }
 
 } // namespace
@@ -561,7 +566,7 @@ void dense_feed_forward(const Tensor& hidden, const FeedForwardPayload& weights,
     ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
     ops::linear_rows(hidden, weights.gate_up, width, up, &workspace, stream);
     // Clamped, like every other SwiGLU this model has.
-    ops::silu_mul(gate, up, gate, kMoeGeometry.swiglu_limit, stream);
+    ops::silu_mul(gate, up, gate, weights.moe.swiglu_limit, stream);
     project("mlp/down", gate, weights.down, out, workspace, stream);
 }
 
@@ -572,12 +577,12 @@ std::size_t feed_forward_capacity(const family::TextGeometry& geometry,
     // Whichever of the two feed-forwards is larger. A layer is one or the other, but the
     // layout is planned for the stack rather than per layer.
     const std::size_t mixture = std::max({
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, qtype, qtype, first, last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q4_K, first,
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), qtype, qtype, first, last),
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), QType::Q4_K, QType::Q4_K, first,
                                                  last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q4_K, QType::Q6_K, first,
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), QType::Q4_K, QType::Q6_K, first,
                                                  last),
-        ops::sparse_moe_workspace_capacity_bytes(kMoeGeometry, QType::Q5_K, QType::Q6_K, first,
+        ops::sparse_moe_workspace_capacity_bytes(moe_geometry(geometry), QType::Q5_K, QType::Q6_K, first,
                                                  last),
     });
     const std::size_t dense =
@@ -611,7 +616,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         // takes the plain route; the pool holds nothing it would want.
         family::ExpertCache* cache =
             mixture.banked()
-                ? &family::ExpertCache::for_current_device(kMoeGeometry, weights.layers)
+                ? &family::ExpertCache::for_current_device(ops::sparse_moe_geometry(weights.moe), weights.layers)
                 : nullptr;
         if (cache != nullptr && cache->enabled()) {
             cache->run(mixture, hidden, out, workspace, stream);
@@ -790,9 +795,9 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(const family::TextG
 // rule, and its draft head runs above.
 SINFER_FAMILY_UNRUNNABLE_SHORT_CONV_LEAVES(no_short_conv)
 
-void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream) {
     // Only the magic is this target's: 'G53F'.
-    family::debug_probe_dump(0x47353346, tag, tensor, 2 * TextConfig::layers, stream);
+    family::debug_probe_dump(0x47353346, tag, tensor, 2 * layer_count, stream);
 }
 
 } // namespace sinfer::targets::glm5_next::detail

@@ -237,9 +237,9 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(
 SINFER_FAMILY_UNRUNNABLE_GDN_LEAVES(no_delta_net)
 SINFER_FAMILY_UNRUNNABLE_MTP_LEAVES(no_speculation)
 
-void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream) {
     // Only the magic is this target's: 'LF2B'.
-    family::debug_probe_dump(0x4C463242, tag, tensor, TextConfig::layers, stream);
+    family::debug_probe_dump(0x4C463242, tag, tensor, layer_count, stream);
 }
 
 } // namespace sinfer::targets::lfm2::detail

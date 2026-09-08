@@ -1,159 +1,73 @@
 import torch
 from safetensors.torch import save_file
+from surogate.serve.convert.common.safetensors import ShardReader
+from tests.serve.test_qwen3_5_moe_checkpoint_config import config_for, draft_config
+from surogate.serve.convert.qwen3_5_moe import inventory, recipe
+from surogate.serve.convert.common import dflash
 
-from surogate.serve.convert.qwen3_5_moe import recipe
+G = inventory.geometry_from_config(config_for(), token_domain=500)
+D = dflash.geometry_from_config(draft_config(G), G)
+RECIPES = {r.object_name: r for r in recipe.build_recipes(G, dflash=D)}
 
 
 class TensorReader:
-    def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
+    def __init__(self, tensors):
         self.tensors = tensors
-
-    def get(self, name: str) -> torch.Tensor:
+    def get(self, name):
         return self.tensors[name]
-
-    def has(self, name: str) -> bool:
-        # A recipe picks between alternative source spellings by asking, so the double
-        # has to answer the same question the real reader does.
+    def has(self, name):
         return name in self.tensors
 
 
-def test_attention_recipe_materializes_q_k_gate_v_row_order() -> None:
-    prefix = "model.language_model.layers.3.self_attn."
-    q_rows = torch.arange(8192, dtype=torch.int32).view(-1, 1).expand(-1, 2048)
-    key = torch.full((512, 1), -1, dtype=torch.int32).expand(-1, 2048)
-    value = torch.full((512, 1), -2, dtype=torch.int32).expand(-1, 2048)
-    fused = recipe.materialize_recipe(
-        recipe.RECIPES_BY_NAME["text/layers/3/attention/query_key_gate_value"],
-        TensorReader(
-            {
-                prefix + "q_proj.weight": q_rows,
-                prefix + "k_proj.weight": key,
-                prefix + "v_proj.weight": value,
-            }
-        ),
-    )
-
-    query_rows = torch.cat(
-        [torch.arange(head * 512, head * 512 + 256) for head in range(16)]
-    ).to(torch.int32)
-    gate_rows = torch.cat(
-        [torch.arange(head * 512 + 256, head * 512 + 512) for head in range(16)]
-    ).to(torch.int32)
-    assert fused.shape == (9216, 2048)
-    assert torch.equal(fused[:4096, 0], query_rows)
-    assert torch.all(fused[4096:4608, 0] == -1)
-    assert torch.equal(fused[4608:8704, 0], gate_rows)
-    assert torch.all(fused[8704:, 0] == -2)
+def test_attention_materializes_query_key_gate_value_order():
+    p = "model.layers.0.self_attn."
+    q = torch.arange(512).view(-1, 1).expand(-1, 128)
+    k, v = torch.full((128, 128), -1), torch.full((128, 128), -2)
+    got = recipe.materialize_recipe(RECIPES["text/layers/0/attention/query_key_gate_value"],
+        TensorReader({p + "q_proj.weight": q, p + "k_proj.weight": k, p + "v_proj.weight": v}))
+    assert torch.equal(got, torch.cat((q[:128], q[256:384], k, q[128:256], q[384:], v)))
 
 
-def test_moe_recipe_preserves_expert_major_half_split_rows() -> None:
-    prefix = "model.language_model.layers.0.mlp."
-    gate_up_rows = (
-        torch.arange(256 * 1024, dtype=torch.int32)
-        .reshape(256, 1024, 1)
-        .expand(-1, -1, 2048)
-    )
-    routed_gate_up = recipe.materialize_recipe(
-        recipe.RECIPES_BY_NAME["text/layers/0/moe/routed_gate_up"],
-        TensorReader({prefix + "experts.gate_up_proj": gate_up_rows}),
-    )
-    for expert, projection, row in (
-        (0, 0, 0),
-        (0, 1, 0),
-        (7, 1, 511),
-        (255, 1, 511),
-    ):
-        physical_row = expert * 1024 + projection * 512 + row
-        assert int(routed_gate_up[physical_row, 0]) == physical_row
-        assert int(routed_gate_up[physical_row, -1]) == physical_row
-
-    down_rows = (
-        torch.arange(256 * 2048, dtype=torch.int32)
-        .reshape(256, 2048, 1)
-        .expand(-1, -1, 512)
-    )
-    routed_down = recipe.materialize_recipe(
-        recipe.RECIPES_BY_NAME["text/layers/0/moe/routed_down"],
-        TensorReader({prefix + "experts.down_proj": down_rows}),
-    )
-    for expert, row in ((0, 0), (9, 123), (255, 2047)):
-        physical_row = expert * 2048 + row
-        assert int(routed_down[physical_row, 0]) == physical_row
+def test_moe_keeps_expert_major_half_split_rows():
+    p = "model.layers.0.mlp.experts."
+    gate_up = torch.arange(4 * 128).reshape(4, 128, 1).expand(-1, -1, 128)
+    down = torch.arange(4 * 128).reshape(4, 128, 1).expand(-1, -1, 64)
+    reader = TensorReader({p + "gate_up_proj": gate_up, p + "down_proj": down})
+    got = recipe.materialize_recipe(RECIPES["text/layers/0/moe/routed_gate_up"], reader)
+    assert torch.equal(got, gate_up.reshape(512, 128))
+    got = recipe.materialize_recipe(RECIPES["text/layers/0/moe/routed_down"], reader)
+    assert torch.equal(got, down.reshape(512, 64))
 
 
-def test_gdn_recipe_materializes_half_split_ab_and_qkvz() -> None:
-    prefix = "model.language_model.layers.0.linear_attn."
-    a = torch.full((32, 1), 1, dtype=torch.uint8).expand(-1, 2048)
-    b = torch.full((32, 1), 2, dtype=torch.uint8).expand(-1, 2048)
-    ab = recipe.materialize_recipe(
-        recipe.RECIPES_BY_NAME["text/layers/0/gdn/a_b_projection"],
-        TensorReader(
-            {
-                prefix + "in_proj_a.weight": a,
-                prefix + "in_proj_b.weight": b,
-            }
-        ),
-    )
-    assert torch.all(ab[:32] == 1)
-    assert torch.all(ab[32:] == 2)
-
-    qkv = torch.arange(8192, dtype=torch.int32).view(-1, 1).expand(-1, 2048)
-    z = torch.full((4096, 1), -1, dtype=torch.int32).expand(-1, 2048)
-    qkvz = recipe.materialize_recipe(
-        recipe.RECIPES_BY_NAME["text/layers/0/gdn/query_key_value_z"],
-        TensorReader(
-            {
-                prefix + "in_proj_qkv.weight": qkv,
-                prefix + "in_proj_z.weight": z,
-            }
-        ),
-    )
-    assert torch.equal(qkvz[:8192, 0], torch.arange(8192, dtype=torch.int32))
-    assert torch.all(qkvz[8192:, 0] == -1)
+def test_gdn_keeps_control_halves_and_projection_order():
+    p = "model.layers.1.linear_attn."
+    a, b = torch.ones((4, 128)), torch.full((4, 128), 2.)
+    qkv, z = torch.arange(384).view(-1, 1).expand(-1, 128), torch.full((256, 128), -1)
+    reader = TensorReader({p + "in_proj_a.weight": a, p + "in_proj_b.weight": b,
+                           p + "in_proj_qkv.weight": qkv, p + "in_proj_z.weight": z})
+    got = recipe.materialize_recipe(RECIPES["text/layers/1/gdn/a_b_projection"], reader)
+    assert torch.equal(got, torch.cat((a, b)))
+    got = recipe.materialize_recipe(RECIPES["text/layers/1/gdn/query_key_value_z"], reader)
+    assert torch.equal(got, torch.cat((qkv, z)))
 
 
-def test_dflash_recipe_materializes_q_k_v_and_gate_up_row_order() -> None:
-    prefix = "layers.0."
-    query = torch.full((4096, 1), 1, dtype=torch.uint8).expand(-1, 2048)
-    key = torch.full((1024, 1), 2, dtype=torch.uint8).expand(-1, 2048)
-    value = torch.full((1024, 1), 3, dtype=torch.uint8).expand(-1, 2048)
-    qkv = recipe.materialize_recipe(
-        recipe.DFLASH_RECIPES_BY_NAME[
-            "dflash/layers/0/attention/query_key_value"
-        ],
-        TensorReader(
-            {
-                prefix + "self_attn.q_proj.weight": query,
-                prefix + "self_attn.k_proj.weight": key,
-                prefix + "self_attn.v_proj.weight": value,
-            }
-        ),
-    )
-    assert qkv.shape == (6144, 2048)
-    assert torch.all(qkv[:4096] == 1)
-    assert torch.all(qkv[4096:5120] == 2)
-    assert torch.all(qkv[5120:] == 3)
-
-    gate = torch.full((6144, 1), 4, dtype=torch.uint8).expand(-1, 2048)
-    up = torch.full((6144, 1), 5, dtype=torch.uint8).expand(-1, 2048)
-    gate_up = recipe.materialize_recipe(
-        recipe.DFLASH_RECIPES_BY_NAME["dflash/layers/0/mlp/gate_up"],
-        TensorReader(
-            {
-                prefix + "mlp.gate_proj.weight": gate,
-                prefix + "mlp.up_proj.weight": up,
-            }
-        ),
-    )
-    assert gate_up.shape == (12288, 2048)
-    assert torch.all(gate_up[:6144] == 4)
-    assert torch.all(gate_up[6144:] == 5)
+def test_dflash_uses_its_own_projection_widths():
+    p = "layers.0."
+    q, k, v = torch.ones((256, 128)), torch.full((128, 128), 2.), torch.full((128, 128), 3.)
+    gate, up = torch.full((192, 128), 4.), torch.full((192, 128), 5.)
+    reader = TensorReader({p + "self_attn.q_proj.weight": q, p + "self_attn.k_proj.weight": k,
+                           p + "self_attn.v_proj.weight": v, p + "mlp.gate_proj.weight": gate,
+                           p + "mlp.up_proj.weight": up})
+    got = recipe.materialize_recipe(RECIPES["dflash/layers/0/attention/query_key_value"], reader)
+    assert torch.equal(got, torch.cat((q, k, v)))
+    got = recipe.materialize_recipe(RECIPES["dflash/layers/0/mlp/gate_up"], reader)
+    assert torch.equal(got, torch.cat((gate, up)))
 
 
 def test_single_file_reader_is_explicit_and_lazy(tmp_path) -> None:
     path = tmp_path / "dflash.safetensors"
     save_file({"weight": torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)}, path)
-    with recipe.ShardReader.from_file(path) as reader:
+    with ShardReader.from_file(path) as reader:
         assert reader.names == ("weight",)
         metadata = reader.metadata(("weight",))["weight"]
         assert metadata.shape == (2, 4)

@@ -32,6 +32,8 @@ than the checkpoint being refused for keys its exporter could not have written.
 
 from __future__ import annotations
 
+from surogate.serve.convert.common.checkpoint import tokenizer_domain
+
 import argparse
 import json
 import os
@@ -80,7 +82,6 @@ _REQUIRED_CONFIG = {
     "model_type": "llama",
     "hidden_act": "silu",
     "attention_bias": False,
-    "rms_norm_eps": 1e-5,
     "rope_scaling": None,
 }
 
@@ -238,43 +239,15 @@ class ConversionPreflight:
         return {tensor_recipe.object_name: tensor_recipe for tensor_recipe in self.recipes}
 
 
-def geometry_block(preflight: "ConversionPreflight") -> dict[str, float]:
-    """The artifact's `geometry` member: the dimensions the engine reads at load, which is
-    what lets one target serve every size of this family."""
-    geometry = preflight.geometry
-    text = preflight.config_summary["text"]
-    return {
-        "hidden": geometry.hidden,
-        "layers": geometry.layers,
-        "intermediate": geometry.intermediate,
-        "output_rows": geometry.vocab,
-        "token_domain": geometry.vocab,
-        "query_heads": geometry.query_heads,
-        "kv_heads": geometry.kv_heads,
-        "head_dim": geometry.head_dim,
-        "rotary_dim": geometry.head_dim,
-        "rms_epsilon": float(text["rms_norm_eps"]),
-        "rope_theta": float(text["rope_theta"]),
-    }
+def geometry_block(preflight: "ConversionPreflight", *, token_domain: int) -> dict[str, float]:
+    """Serialize the checkpoint's resolved dimensions and execution settings."""
+    from surogate.serve.convert.common.checkpoint import dense_geometry
 
-def preflight_inventory() -> None:
-    """The inventory the recipe and the writer agree to produce."""
-
-    expected_tensors = 1 + inventory.LAYERS * inventory.LAYER_OBJECT_COUNT + 2
-    if len(inventory.TENSOR_SPECS) != expected_tensors:
-        raise ValueError(
-            f"registered inventory holds {len(inventory.TENSOR_SPECS)} tensors, "
-            f"expected {expected_tensors}"
-        )
-    if len(inventory.RESOURCE_SPECS) != 4:
-        raise ValueError("registered inventory does not hold the four text resources")
-    if len(inventory.OBJECT_SPECS) != expected_tensors + 4:
-        raise ValueError("registered object inventory is incomplete")
-    recipe.validate_recipe_coverage()
+    return dense_geometry(preflight.geometry, token_domain=token_domain)
 
 
 def build_object_plan(
-    resources: Mapping[str, bytes], geometry: inventory.Geometry = inventory.GEOMETRY,
+    resources: Mapping[str, bytes], geometry: inventory.Geometry,
     *, native=None, object_specs=None
 ) -> ObjectPlan:
     """`native` names the objects a GGUF serves as it stores them, with their format
@@ -322,7 +295,6 @@ def preflight_conversion(
     model = Path(model_dir)
     config = family_conversion.load_json(model / "config.json")
     geometry, summary = validate_config(config)
-    preflight_inventory()
     # What the checkpoint says about its own quantisation: refused where the serving path
     # cannot honour it, reported where the declaration disagrees with the checkpoint's own
     # tensors. A claim about a file is not the file.
@@ -495,9 +467,10 @@ def convert(
     with recipe.open_reader(model) as reader:
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="llama"),
             preflight.object_plan.specs,
-            geometry=geometry_block(preflight),
+            geometry=geometry_block(preflight, token_domain=tokenizer_domain(model)),
+            layer_types=["full_attention"] * geometry.layers,
             external=external,
         ) as writer:
             if writer.objects != preflight.object_plan.objects:

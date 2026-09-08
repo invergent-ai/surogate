@@ -53,45 +53,6 @@ Tensor materialized_norm(const artifact::MaterializedArtifact& materialized,
     return artifact::materialized_tensor(materialized, handle, NumericFormat::BF16, {width});
 }
 
-/// The first extent of a tensor object the artifact carries, or zero where it carries no
-/// such object.
-std::uint64_t declared_rows(const artifact::Reader& reader, const std::string& name) {
-    const artifact::ObjectDescriptor* object = reader.find(name);
-    if (object == nullptr) { return 0; }
-    const auto* tensor = std::get_if<artifact::TensorDescriptor>(object);
-    if (tensor == nullptr || tensor->shape.empty()) { return 0; }
-    return tensor->shape.front();
-}
-
-/// Which head geometry this layer attends at, read off the artifact.
-///
-/// The schedule is not compiled, unlike Gemma 3's: this target serves a 48-layer 12B and a
-/// 60-layer 31B, and one compiled array cannot be both. It is read from the width of the
-/// layer's own query norm, which *is* its head dimension -- 256 windowed, 512 global. That
-/// makes the artifact the single source of truth for the schedule, the way LFM2 reads which
-/// of its layers attend from which of them carry a query/key/value projection.
-///
-/// Deliberately not read from whether the layer carries a value projection: that
-/// distinguishes the two only on a `k_eq_v` checkpoint, and a dense Gemma 4 without the
-/// flag would come out with every layer called windowed and half its cache sized wrong.
-bool layer_is_windowed(const artifact::Reader& reader, const family::TextGeometry& g,
-                       std::size_t layer) {
-    const std::string name =
-        "text/layers/" + std::to_string(layer) + "/attention/query_norm";
-    const std::uint64_t width = declared_rows(reader, name);
-    if (width == 0) {
-        throw std::runtime_error("gemma4: the artifact carries no " + name +
-                                 ", so the layer's head geometry cannot be read");
-    }
-    if (width == static_cast<std::uint64_t>(g.head_dim)) { return true; }
-    if (width == static_cast<std::uint64_t>(g.head_dim_for(false))) { return false; }
-    throw std::runtime_error(
-        "gemma4: layer " + std::to_string(layer) + " normalises a head of " +
-        std::to_string(width) + ", which is neither the windowed geometry's " +
-        std::to_string(g.head_dim) + " nor the global geometry's " +
-        std::to_string(g.head_dim_for(false)));
-}
-
 /// One BF16 element of device memory, as a host float.
 ///
 /// A synchronous copy, which is what this wants to be: it runs once per layer at load, and
@@ -115,6 +76,7 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized,
                                const family::TextGeometry& g) {
     DensePostMixerPayload out;
+    out.rms_epsilon = g.rms_epsilon;
     out.gate = materialized_weight(materialized, plan.gate, g.intermediate, g.hidden);
     out.up   = materialized_weight(materialized, plan.up, g.intermediate, g.hidden);
     out.down = materialized_weight(materialized, plan.down, g.hidden, g.intermediate);
@@ -134,7 +96,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
     for (std::size_t layer = 0; layer < layers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
-        // Declared once, by `declare_attention_schedule`, before anything is bound.
+        // The schedule is read from checkpoint metadata before binding.
         const bool windowed      = g.layer_is_windowed(static_cast<std::int32_t>(layer));
 
         const std::int32_t head_dim  = g.head_dim_for(windowed);
@@ -164,7 +126,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
         // A `k_eq_v` global layer ships no value projection: its value is the key
         // projection's raw output, normalised without a weight. The artifact carries no
         // such object, so there is nothing to bind and the value path re-reads the key.
-        target.attention.value_is_key = !binder.has(prefix + "attention/value");
+        target.attention.value_is_key = !windowed && g.attention_k_eq_v != 0;
         if (!target.attention.value_is_key) {
             target.attention.value = bind_weight(binder, prefix + "attention/value", weights,
                                                  {static_cast<std::uint64_t>(kv_rows),
@@ -203,36 +165,16 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
 
 } // namespace
 
-void declare_attention_schedule(const artifact::Reader& reader, family::TextGeometry& geometry) {
-    for (std::int32_t layer = 0; layer < geometry.layers; ++layer) {
-        if (layer_is_windowed(reader, geometry, static_cast<std::size_t>(layer))) {
-            geometry.declare_windowed_layer(layer);
-        }
-    }
-}
-
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
-    // The checkpoint's own dimensions, where it states them: absent members keep the
-    // target's compiled value. For this target that includes the second head geometry and
-    // the embedding scale, neither of which can be compiled for two sizes.
-    out.geometry = family::TextGeometry::declared<TextConfig>(binder.reader().geometry());
-    declare_attention_schedule(binder.reader(), out.geometry);
+    out.geometry = family::TextGeometry::resolved_gemma4(
+        binder.reader().geometry(), binder.reader().layer_types(), false, false);
     const family::TextGeometry& g = out.geometry;
     out.frontend = family::bind_text_only_frontend_resources(binder);
     out.features = features;
 
-    if (!g.has_global_attention_geometry()) {
-        // Both dense Gemma 4 checkpoints attend at two geometries. An artifact declaring
-        // one is either not a Gemma 4 or was written by a converter that dropped the
-        // global members, and either way every global layer below would be bound -- and
-        // cached -- at the windowed geometry.
-        throw std::runtime_error(
-            "gemma4: this artifact declares one attention geometry; the dense Gemma 4 "
-            "checkpoints attend at two (global_head_dim, global_kv_heads)");
-    }
     if (features.vision) {
         // The 12B runs its vision through the same decoder stack rather than a tower, and
         // this target binds the text stack only.
@@ -312,6 +254,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             .windowed     = windowed,
             .value_is_key = source.attention.value_is_key,
             .head_dim     = head_dim,
+            .rms_epsilon  = g.rms_epsilon,
         };
         target.query_norm = materialized_norm(backing, source.attention.query_norm, head_dim);
         target.key_norm   = materialized_norm(backing, source.attention.key_norm, head_dim);

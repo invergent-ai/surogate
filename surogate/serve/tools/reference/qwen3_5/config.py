@@ -1,15 +1,7 @@
-"""The dimensions of one hybrid GDN/attention decoder, as a value.
+"""Resolved reference-model configuration; defaults below are numerical test fixtures only.
 
-One reference program serves every size of this architecture, so the numbers
-below are data rather than constants: the defaults describe the smallest
-checkpoint, and a loaded artifact replaces them with its own.  This mirrors
-`family::TextGeometry` and `family::VisionGeometry` on the engine side, down to
-the member names the artifact's `geometry` and `vision_geometry` declarations use,
-so a checkpoint that moves a dimension moves it identically on both sides.
-
-Only primary dimensions are fields.  Everything derived from them -- `key_dim`,
-`conv_dim`, the MTP row counts -- is a property, so a checkpoint that declares
-`gdn_k_heads` cannot leave a stale `key_dim` behind.
+Artifact loading requires complete metadata and an explicit layer schedule. It never uses
+fixture dimensions to fill an absent checkpoint field.
 """
 
 from __future__ import annotations
@@ -20,7 +12,7 @@ from math import isqrt
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """The text decoder's dimensions.  Defaults describe the 0.8B checkpoint."""
+    """Dimensions for one decoder; artifact constructors supply every checkpoint field."""
 
     hidden: int = 1024
     layers: int = 24
@@ -32,6 +24,11 @@ class ModelConfig:
     head_dim: int = 256
     rotary_dim: int = 64
     full_interval: int = 4
+    layer_types: tuple[str, ...] = ()
+    attention_scale_value: float | None = None
+    gdn_scale_value: float | None = None
+    mtp_layers: int = 1
+    draft_vocab: int = 131072
     gdn_k_heads: int = 16
     gdn_v_heads: int = 16
     gdn_k_dim: int = 128
@@ -83,28 +80,30 @@ class ModelConfig:
 
     @property
     def full_layers(self) -> int:
-        return self.layers // self.full_interval
+        return sum(self.is_full(i) for i in range(self.layers))
 
     @property
     def gdn_layers(self) -> int:
         return self.layers - self.full_layers
 
     def is_full(self, layer: int) -> bool:
-        return (layer + 1) % self.full_interval == 0
+        return (
+            self.layer_types[layer] == "full_attention" if self.layer_types else (layer + 1) % self.full_interval == 0
+        )
 
     def full_index(self, layer: int) -> int:
-        return (layer + 1) // self.full_interval - 1
+        return sum(self.is_full(i) for i in range(layer + 1)) - 1
 
     def gdn_index(self, layer: int) -> int:
-        return layer - (layer + 1) // self.full_interval
+        return sum(not self.is_full(i) for i in range(layer + 1)) - 1
 
     @property
     def attention_scale(self) -> float:
-        return self.head_dim ** -0.5
+        return self.attention_scale_value if self.attention_scale_value is not None else self.head_dim**-0.5
 
     @property
     def gdn_scale(self) -> float:
-        return self.gdn_k_dim ** -0.5
+        return self.gdn_scale_value if self.gdn_scale_value is not None else self.gdn_k_dim**-0.5
 
 
 @dataclass(frozen=True)
@@ -113,7 +112,7 @@ class VisionConfig:
 
     `out_hidden` is the width the merger projects into -- the text model's hidden
     state -- so it belongs to the tower's output contract rather than to the tower,
-    and :func:`vision_config_for` sets it from the text geometry.
+    and :func:`vision_config_for` validates it against the text geometry.
     """
 
     depth: int = 27
@@ -128,6 +127,7 @@ class VisionConfig:
     position_embeddings: int = 2304
     rope_theta: float = 10000.0
     norm_eps: float = 1.0e-6
+    patch_dim_value: int | None = None
 
     @property
     def head_dim(self) -> int:
@@ -135,7 +135,11 @@ class VisionConfig:
 
     @property
     def patch_dim(self) -> int:
-        return self.in_channels * self.temporal_patch * self.patch * self.patch
+        return (
+            self.patch_dim_value
+            if self.patch_dim_value is not None
+            else self.in_channels * self.temporal_patch * self.patch * self.patch
+        )
 
     @property
     def merge_unit(self) -> int:
@@ -167,14 +171,20 @@ _TEXT_GEOMETRY_KEYS: dict[str, str] = {
     "gdn_key_head_dim": "gdn_k_dim",
     "gdn_value_heads": "gdn_v_heads",
     "gdn_value_head_dim": "gdn_v_dim",
+    "max_context": "max_position_embeddings",
+    "mtp_layers": "mtp_layers",
+    "draft_vocab": "draft_vocab",
 }
 
 _TEXT_GEOMETRY_FLOAT_KEYS: dict[str, str] = {
+    "attention_scale": "attention_scale_value",
+    "gdn_scale": "gdn_scale_value",
     "rms_epsilon": "rms_eps",
     "rope_theta": "rope_theta",
 }
 
 _VISION_GEOMETRY_KEYS: dict[str, str] = {
+    "patch_dim": "patch_dim_value",
     "layers": "depth",
     "hidden": "hidden",
     "intermediate": "intermediate",
@@ -190,95 +200,51 @@ _VISION_GEOMETRY_FLOAT_KEYS: dict[str, str] = {
 }
 
 
-def _overridden(
-    base, declared, int_keys: dict[str, str], float_keys: dict[str, str]
-):
-    """`base` with every dimension the artifact declares laid over it.
+def _required_fields(declared, int_keys, float_keys, *, vision=False):
+    from surogate.serve.artifact.geometry import validate_geometry
 
-    An absent key keeps the default, so an artifact written before the member
-    existed loads exactly as it did; an unknown key is ignored, so an artifact may
-    name a dimension a future reference reads and this one does not.
-    """
-
-    if not declared:
-        return base
-    changes: dict[str, object] = {}
-    for key, field in int_keys.items():
-        if key in declared:
-            changes[field] = int(declared[key])
-    for key, field in float_keys.items():
-        if key in declared:
-            changes[field] = float(declared[key])
-    return replace(base, **changes) if changes else base
+    values = validate_geometry(declared or {}, vision=vision)
+    missing = sorted((int_keys.keys() | float_keys.keys()) - values.keys())
+    if missing:
+        raise ValueError(f"missing checkpoint geometry fields: {', '.join(missing)}; rebuild the artifact")
+    return {
+        **{field: int(values[key]) for key, field in int_keys.items()},
+        **{field: float(values[key]) for key, field in float_keys.items()},
+    }
 
 
-def model_config_from_declared(
-    declared: dict[str, float] | None, base: ModelConfig | None = None
-) -> ModelConfig:
-    """The text geometry an artifact declares, over `base`."""
+def model_config_from_declared(declared, base=None, *, layer_types) -> ModelConfig:
+    from surogate.serve.artifact.geometry import validate_resolved_geometry
 
-    return _overridden(
-        base if base is not None else ModelConfig(),
-        declared,
-        _TEXT_GEOMETRY_KEYS,
-        _TEXT_GEOMETRY_FLOAT_KEYS,
-    )
-
-
-def vision_config_from_declared(
-    declared: dict[str, float] | None, base: VisionConfig | None = None
-) -> VisionConfig:
-    """The vision geometry an artifact declares, over `base`."""
-
-    return _overridden(
-        base if base is not None else VisionConfig(),
-        declared,
-        _VISION_GEOMETRY_KEYS,
-        _VISION_GEOMETRY_FLOAT_KEYS,
-    )
+    values = validate_resolved_geometry(declared or {})
+    schedule = tuple(layer_types)
+    if len(schedule) != values["layers"] or any(k not in ("full_attention", "linear_attention") for k in schedule):
+        raise ValueError("hybrid reference requires the complete checkpoint layer_types schedule")
+    changes = _required_fields(values, _TEXT_GEOMETRY_KEYS, _TEXT_GEOMETRY_FLOAT_KEYS)
+    if values["rotary_dim"] != 64 or values.get("mtp_layers") not in (0, 1):
+        raise ValueError("hybrid reference requires rotary_dim 64 and zero or one MTP layer")
+    return replace(base if base is not None else ModelConfig(), **changes, layer_types=schedule)
 
 
-def vision_config_for(cfg: ModelConfig, base: VisionConfig | None = None) -> VisionConfig:
-    """A tower whose merger projects into `cfg`'s residual stream."""
-
-    return replace(base if base is not None else VisionConfig(), out_hidden=cfg.hidden)
-
-
-def model_config_from_config(config: dict) -> ModelConfig:
-    """The dimensions a checkpoint's `config.json` declares.
-
-    `config` is the whole file; a multimodal checkpoint nests the decoder's numbers
-    under `text_config`.
-    """
-
-    text = config.get("text_config", config)
-    base = ModelConfig()
-    return ModelConfig(
-        hidden=int(text["hidden_size"]),
-        layers=int(text["num_hidden_layers"]),
-        intermediate=int(text["intermediate_size"]),
-        vocab=int(text.get("vocab_size", base.vocab)),
-        token_domain=int(text.get("token_domain", base.token_domain)),
-        q_heads=int(text["num_attention_heads"]),
-        kv_heads=int(text["num_key_value_heads"]),
-        head_dim=int(text["head_dim"]),
-        rotary_dim=int(text.get("partial_rotary_dim", base.rotary_dim)),
-        full_interval=int(text.get("full_attention_interval", base.full_interval)),
-        gdn_k_heads=int(text["linear_num_key_heads"]),
-        gdn_v_heads=int(text["linear_num_value_heads"]),
-        gdn_k_dim=int(text["linear_key_head_dim"]),
-        gdn_v_dim=int(text["linear_value_head_dim"]),
-        conv_width=int(text["linear_conv_kernel_dim"]),
-        rms_eps=float(text.get("rms_norm_eps", base.rms_eps)),
-        rope_theta=float(text.get("rope_theta", base.rope_theta)),
-        max_position_embeddings=int(
-            text.get("max_position_embeddings", base.max_position_embeddings)
-        ),
-    )
+def vision_config_from_declared(declared, base=None) -> VisionConfig:
+    changes = _required_fields(declared, _VISION_GEOMETRY_KEYS, _VISION_GEOMETRY_FLOAT_KEYS, vision=True)
+    return replace(base if base is not None else VisionConfig(), **changes)
 
 
-#: The family default, for a caller that has no checkpoint in hand.  A loaded artifact
-#: carries its own geometry on the binding; nothing on the model path reads this.
+def vision_config_for(cfg: ModelConfig, base: VisionConfig) -> VisionConfig:
+    if base.out_hidden != cfg.hidden:
+        raise ValueError("vision output width disagrees with text checkpoint")
+    return base
+
+
+def model_config_from_config(config: dict, *, token_domain: int) -> ModelConfig:
+    from surogate.serve.convert.common import qwen3_5
+
+    g = qwen3_5.geometry_from_config(config, token_domain=token_domain)
+    return model_config_from_declared(qwen3_5.geometry_block(g), layer_types=g.layer_types)
+
+
+#: Explicit numerical fixtures. Loaded artifacts always use required checkpoint metadata.
 CFG = ModelConfig()
 VISION_CFG = VisionConfig()
 ATTN_SCALE = CFG.attention_scale

@@ -131,7 +131,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
+    if (identity.architecture == target_key && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -169,13 +169,14 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile,
-                                                        const family::TextGeometry& geometry) {
+                                                        const family::TextGeometry& geometry,
+                                                        const family::VisionGeometry& vision_geometry) {
     return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                         geometry);
+                                                         geometry, vision_geometry);
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    return family::TextGeometry::declared<detail::TextConfig>(reader.geometry());
+    return family::TextGeometry::resolved(reader.geometry(), reader.layer_types());
 }
 
 std::unique_ptr<Package::Program>

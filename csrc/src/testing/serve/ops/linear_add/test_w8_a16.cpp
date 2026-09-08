@@ -29,6 +29,15 @@ using sinfer::test::linear_add::WeightFormat;
 int w8_a16_conformance() {
     int failures = 0;
 
+    constexpr std::array<std::int32_t, 0> kGenericStarts{};
+    constexpr std::array<std::int32_t, 3> kGenericTokens{1, 17, 128};
+    for (const auto& [n, k] : std::array<std::pair<int, int>, 3>{
+             {{1024, 1024}, {128, 256}, {768, 1152}}}) {
+        failures += sinfer::test::linear_add::run_shape(
+            "W8_A16 LinearAdd fallback", WeightFormat::W8G32F16S,
+            ShapeCase{n, k, 469U, kGenericStarts, kGenericTokens});
+    }
+
     constexpr std::array<std::int32_t, 4> kK4096RouteStarts{2, 49, 129, 641};
     constexpr std::array<std::int32_t, 5> kK4096RouteInteriors{1, 24, 96, 256, 1024};
     failures += sinfer::test::linear_add::run_shape(

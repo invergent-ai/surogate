@@ -12,6 +12,8 @@ plan order.
 
 from __future__ import annotations
 
+from surogate.serve.convert.common.checkpoint import tokenizer_domain
+
 import argparse
 import json
 import time
@@ -79,9 +81,9 @@ def convert(
         config, geometry, model, what=family_conversion.checkpoint_label(model)
     )
 
-    objects = inventory.declared_objects(config)
+    objects = inventory.declared_objects(geometry)
     tensor_specs = inventory.tensor_specs(objects)
-    recipes = {r.object_name: r for r in recipe.build_recipes(config)}
+    recipes = {r.object_name: r for r in recipe.build_recipes(geometry)}
 
     resources = family_conversion.load_resources(model, inventory.RESOURCE_SPECS)
     resource_payloads = {item.name: item.data for item in resources}
@@ -100,9 +102,10 @@ def convert(
         output.parent.mkdir(parents=True, exist_ok=True)
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="lfm2"),
             plan.specs,
-            geometry=_geometry_block(geometry),
+            geometry=_geometry_block(geometry, token_domain=tokenizer_domain(model)),
+            layer_types=geometry.layer_types,
         ) as writer:
             total = len(plan.specs)
             for index, spec in enumerate(plan.specs, start=1):
@@ -120,7 +123,7 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
+    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="lfm2")
     report = family_conversion.build_conversion_report(
         identity=identity,
         target_key=inventory.TARGET_KEY,
@@ -152,19 +155,13 @@ def convert(
     return report_path
 
 
-def _geometry_block(geometry: inventory.Geometry) -> dict[str, float]:
-    """The dimensions the artifact states about itself, which the engine's binder
-    validates its compiled constants against."""
-    return {
-        "hidden": float(geometry.hidden),
-        "layers": float(geometry.layers),
-        "query_heads": float(geometry.query_heads),
-        "kv_heads": float(geometry.kv_heads),
-        "head_dim": float(geometry.head_dim),
-        "intermediate": float(geometry.intermediate),
-        "vocab": float(geometry.vocab),
-        "conv_kernel": float(geometry.conv_kernel),
-    }
+def _geometry_block(geometry: inventory.Geometry, *, token_domain: int) -> dict[str, float]:
+    """Serialize dimensions and execution settings from the resolved checkpoint."""
+    from surogate.serve.convert.common.checkpoint import dense_geometry
+
+    metadata = dense_geometry(geometry, token_domain=token_domain)
+    metadata.update(gdn_conv_kernel=geometry.conv_kernel)
+    return metadata
 
 
 def main(argv: Sequence[str] | None = None) -> None:

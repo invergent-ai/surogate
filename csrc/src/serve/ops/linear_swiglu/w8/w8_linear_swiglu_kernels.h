@@ -6,6 +6,9 @@
 
 namespace sinfer::ops::detail {
 
+void w8_linear_swiglu_generic_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                      cudaStream_t stream);
+
 void w8_linear_swiglu_decode_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream);
 void w8_linear_swiglu_decode_pair_r4_launch(const Tensor& x, const Weight& w, Tensor& out,

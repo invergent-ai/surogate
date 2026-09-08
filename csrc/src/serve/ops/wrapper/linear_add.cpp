@@ -1,6 +1,7 @@
 #include "api/ops/linear_add.h"
 
 #include "api/ops/residual_add.h"
+#include "core/layout.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
@@ -129,13 +130,15 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("linear_add workspace: W8 admits A16 or A8");
         }
-        // The W8 route is a table of registered exact problems. A shape it does not serve
-        // takes no workspace from it -- a profile whose W8 export this route never binds (the
-        // 27B's, whose trunk is groupwise Q4/Q5) is sized for what it does bind, and a W8
-        // weight of such a shape is refused where it would run, with the route's own message.
+        // Shapes without a fused kernel compose the general projection and residual add.
         if (!detail::w8_linear_add_admits({output_rows, input_rows, input_rows, min_tokens}) ||
             !detail::w8_linear_add_admits({output_rows, input_rows, input_rows, max_tokens})) {
-            return 0;
+            WorkspaceLayoutBuilder layout;
+            (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
+            const auto projection_bytes = linear_workspace_capacity_bytes(
+                qtype, output_rows, input_rows, LinearPolicy::A16Only, min_tokens, max_tokens);
+            if (projection_bytes != 0) { (void)layout.alloc_bytes(projection_bytes); }
+            return layout.peak_bytes(1);
         }
         // surogate vendor patch (PATCHES.md #17): AllowA8 large-T runs the
         // W8A8-int IMMA residual path.
@@ -258,16 +261,17 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("W8 linear_add admits A16 or A8");
         }
         require_w8(w);
-        // The plan owns the shape list; the same call validated this geometry
-        // at load through linear_add_workspace_capacity_bytes.
-        if (!detail::w8_linear_add_admits({w.n, w.k, w.padded_shape[1], t})) {
-            throw std::invalid_argument("linear_add: unsupported W8 shape (n " +
-                                        std::to_string(w.n) + ", k " + std::to_string(w.k) + ")");
-        }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
             !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 16)) {
             throw std::invalid_argument(
                 "linear_add: W8 requires 16-byte x/residual/code/scale alignment");
+        }
+        if (!detail::w8_linear_add_admits({w.n, w.k, w.padded_shape[1], t})) {
+            auto scope = ws.scope();
+            Tensor projected = ws.alloc(DType::BF16, {w.n, t});
+            linear(x, w, projected, LinearPolicy::A16Only, ws, stream);
+            residual_add(projected, residual_out, stream);
+            return;
         }
         // surogate vendor patch (PATCHES.md #17): large-T prefill under
         // AllowA8 runs the W8A8-int IMMA residual path.

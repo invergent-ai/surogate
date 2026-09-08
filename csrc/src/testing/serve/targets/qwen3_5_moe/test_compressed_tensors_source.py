@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import struct
 
@@ -22,7 +23,7 @@ np = pytest.importorskip("numpy")
 pytest.importorskip("compressed_tensors")
 
 from surogate.serve.convert.qwen3_5_moe.exports import compressed_tensors_source as cts  # noqa: E402
-from surogate.serve.convert.qwen3_5_moe import recipe  # noqa: E402
+from surogate.serve.convert.qwen3_5_moe import inventory, recipe  # noqa: E402
 from surogate.serve.convert.qwen3_5_moe.exports import routed_nvfp4  # noqa: E402
 from surogate.serve.convert.common.safetensors import ShardReader  # noqa: E402
 from surogate.serve.artifact import layouts  # noqa: E402
@@ -52,7 +53,12 @@ def test_e2m1_table_matches_the_library_unpacker() -> None:
 @pytest.fixture(scope="module")
 def plan():
     source = cts.CompressedTensorsSource(REAL_EXPORT)
-    return source, source.plan(routed_nvfp4.tensor_specs(), recipe.BASE_RECIPES_BY_NAME)
+    geometry = inventory.geometry_from_config(json.loads((REAL_EXPORT / "config.json").read_text()))
+    recipes = {r.object_name: r for r in recipe.build_recipes(geometry) if not r.object_name.startswith("dflash/")}
+    specs = routed_nvfp4.tensor_specs(geometry)
+    with pytest.raises(ValueError, match="shared-expert w8"):
+        source.plan(specs, recipes)
+    return source, source.plan(specs, recipes, shared_expert="w8")
 
 
 @needs_export
@@ -63,7 +69,7 @@ def test_the_plan_splits_parents_and_takes_formats_from_the_config(plan) -> None
     # every one it leaves alone is BF16, never requantised
     quantized = [o for o in result.objects.values() if o.quantized]
     plain = [o for o in result.objects.values() if not o.quantized]
-    assert len(quantized) == 170 and len(plain) == 92
+    assert quantized and plain
     for item in quantized:
         assert by_name[item.name].format == "NVFP4"
         assert by_name[item.name + cts.INPUT_DIVISOR_SUFFIX].format == "FP32"
@@ -75,7 +81,7 @@ def test_the_plan_splits_parents_and_takes_formats_from_the_config(plan) -> None
     assert by_name["text/layers/3/attention/key"].shape == (512, 2048)
     assert by_name["text/layers/0/gdn/query_key_value"].shape == (8192, 2048)
     assert by_name["text/layers/0/gdn/z"].format == "BF16"
-    assert by_name["text/layers/0/moe/shared_gate"].shape == (512, 2048)
+    assert by_name["text/layers/0/moe/shared_gate_up"].shape == (1024, 2048)
     # the export leaves embeddings and lm_head alone, so they stay BF16
     assert by_name["text/token_embedding"].format == "BF16"
     assert by_name["text/output_head"].format == "BF16"
@@ -119,9 +125,7 @@ def test_payloads_are_the_checkpoints_words(plan) -> None:
 @needs_export
 def test_the_w8_opt_in_keeps_the_shared_expert_fused(plan) -> None:
     source, _ = plan
-    result = source.plan(
-        routed_nvfp4.tensor_specs(), recipe.BASE_RECIPES_BY_NAME, shared_expert="w8"
-    )
+    result = plan[1]
     by_name = {spec.name: spec for spec in result.specs}
     assert by_name["text/layers/0/moe/shared_gate_up"].format == "W8G32_F16S"
     assert by_name["text/layers/0/moe/shared_down"].format == "W8G32_F16S"

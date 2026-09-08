@@ -1,4 +1,4 @@
-"""Budget-aware tensor materialization over the typed 35B binding."""
+"""Budget-aware tensor materialization over the typed checkpoint binding."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from surogate.serve.artifact import (
     split_row_planes,
 )
 
+from ..common.direct_rows import direct_rows
+
 from .bindings import (
     ArtifactBinding,
     AxisView,
@@ -25,7 +27,7 @@ from .bindings import (
     RowAddressable,
     WeightObject,
 )
-from .config import CFG
+from .config import CFG, ModelConfig
 
 
 GIB = 1 << 30
@@ -66,40 +68,31 @@ def estimate_fixed_bytes(
     text: bool,
     mtp: bool,
     prefill_chunk: int,
+    cfg: ModelConfig,
 ) -> int:
     """Estimate target state plus the bounded Text/MTP workspace."""
 
     if not text and not mtp:
         return 0
-    kv_layers = (CFG.full_layers if text else 0) + (1 if mtp else 0)
+    kv_layers = (cfg.full_layers if text else 0) + (1 if mtp else 0)
     if kv_dtype == "bf16":
-        kv_per_layer_token = 2 * CFG.kv_heads * CFG.head_dim * 2
+        kv_per_layer_token = 2 * cfg.kv_heads * cfg.head_dim * 2
     elif kv_dtype == "int8":
-        kv_per_layer_token = 2 * CFG.kv_heads * (
-            CFG.head_dim + CFG.head_dim // 64 * 2
-        )
+        kv_per_layer_token = 2 * cfg.kv_heads * (cfg.head_dim + cfg.head_dim // 64 * 2)
     else:
         raise ValueError(f"unsupported KV dtype: {kv_dtype!r}")
     kv = capacity * kv_layers * kv_per_layer_token
     if text:
-        ssm = (
-            CFG.gdn_layers
-            * CFG.gdn_v_heads
-            * CFG.gdn_k_dim
-            * CFG.gdn_v_dim
-            * 4
-        )
-        conv = (
-            CFG.gdn_layers
-            * CFG.conv_dim
-            * (CFG.conv_width - 1)
-            * CFG.conv_state_bytes
-        )
+        ssm = cfg.gdn_layers * cfg.gdn_v_heads * cfg.gdn_k_dim * cfg.gdn_v_dim * 4
+        conv = cfg.gdn_layers * cfg.conv_dim * (cfg.conv_width - 1) * cfg.conv_state_bytes
     else:
         ssm = 0
         conv = 0
-    workspace_chunks = max(1, (prefill_chunk + CFG.prefill_chunk - 1) // CFG.prefill_chunk)
-    workspace = workspace_chunks * PROGRAM_WORKSPACE_BYTES
+    workspace_chunks = max(1, (prefill_chunk + cfg.prefill_chunk - 1) // cfg.prefill_chunk)
+    workspace = max(
+        workspace_chunks * PROGRAM_WORKSPACE_BYTES,
+        prefill_chunk * (cfg.hidden + 2 * cfg.shared_intermediate + 2 * cfg.expert_intermediate) * 4,
+    )
     return kv + ssm + conv + workspace
 
 
@@ -134,6 +127,9 @@ class WeightStore:
         if not any((text, mtp, draft_head, vision, dflash)):
             raise ValueError("at least one weight component must be selected")
 
+        for enabled, component in ((mtp, "mtp"), (vision, "vision"), (dflash, "dflash")):
+            if enabled and getattr(binding, component) is None:
+                raise ValueError(f"checkpoint has no {component} weights")
         self.binding = binding
         self.device = torch.device(device)
         self.compile_codec = compile_codec
@@ -141,9 +137,7 @@ class WeightStore:
         self._decoded: dict[int, torch.Tensor] = {}
         self._axis_decoded: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
         self._representation: dict[int, str] = {}
-        self._expert_block_ids = frozenset(
-            bank.block.tensor_id for bank in binding.expert_banks
-        )
+        self._expert_block_ids = frozenset(bank.block.tensor_id for bank in binding.expert_banks)
 
         selected: dict[int, PhysicalBlock] = {}
 
@@ -175,6 +169,7 @@ class WeightStore:
             text=text,
             mtp=mtp,
             prefill_chunk=prefill_chunk,
+            cfg=binding.config,
         )
         if self.device.type == "cuda":
             with torch.cuda.device(self.device):
@@ -186,11 +181,12 @@ class WeightStore:
         budget = max(0, available - headroom_bytes - fixed)
         used = 0
 
-        controls = [
-            block for block in blocks if block.layout == "contiguous-le-v1"
-        ]
+        controls = [block for block in blocks if block.layout == "contiguous-le-v1"]
         for block in controls:
             size = self._decoded_size(block)
+            if block.tensor_id in self._expert_block_ids:
+                self._representation[block.tensor_id] = "stream"
+                continue
             if block.component == "vision":
                 self._representation[block.tensor_id] = "decoded"
                 used += size
@@ -200,12 +196,8 @@ class WeightStore:
             if representation == "decoded":
                 used += size
 
-        quantized = [
-            block for block in blocks if block.layout == "row-split-k128-v1"
-        ]
-        for block in sorted(
-            quantized, key=lambda item: item.payload_bytes, reverse=True
-        ):
+        quantized = [block for block in blocks if block.layout == "row-split-k128-v1"]
+        for block in sorted(quantized, key=lambda item: item.payload_bytes, reverse=True):
             if block.component == "vision":
                 self._representation[block.tensor_id] = "stream"
             elif used + block.payload_bytes <= budget:
@@ -215,20 +207,10 @@ class WeightStore:
                 self._representation[block.tensor_id] = "stream"
 
         decoded = sum(
-            self._decoded_size(block)
-            for block in blocks
-            if self._representation[block.tensor_id] == "decoded"
+            self._decoded_size(block) for block in blocks if self._representation[block.tensor_id] == "decoded"
         )
-        packed = sum(
-            block.payload_bytes
-            for block in blocks
-            if self._representation[block.tensor_id] == "packed"
-        )
-        streamed = sum(
-            block.payload_bytes
-            for block in blocks
-            if self._representation[block.tensor_id] == "stream"
-        )
+        packed = sum(block.payload_bytes for block in blocks if self._representation[block.tensor_id] == "packed")
+        streamed = sum(block.payload_bytes for block in blocks if self._representation[block.tensor_id] == "stream")
         self.plan = MemoryPlan(
             free_bytes=free,
             headroom_bytes=headroom_bytes,
@@ -237,15 +219,9 @@ class WeightStore:
             decoded_bytes=decoded,
             packed_bytes=packed,
             streamed_bytes=streamed,
-            decoded_blocks=sum(
-                value == "decoded" for value in self._representation.values()
-            ),
-            packed_blocks=sum(
-                value == "packed" for value in self._representation.values()
-            ),
-            streamed_blocks=sum(
-                value == "stream" for value in self._representation.values()
-            ),
+            decoded_blocks=sum(value == "decoded" for value in self._representation.values()),
+            packed_blocks=sum(value == "packed" for value in self._representation.values()),
+            streamed_blocks=sum(value == "stream" for value in self._representation.values()),
         )
 
     @staticmethod
@@ -278,9 +254,7 @@ class WeightStore:
         if cached is not None:
             return cached
         if self.device.type == "cpu":
-            payload = torch.frombuffer(
-                bytearray(self.binding.payload(block)), dtype=torch.uint8
-            )
+            payload = torch.frombuffer(bytearray(self.binding.payload(block)), dtype=torch.uint8)
         else:
             payload = self._stream_tensor(block)
         if self.representation(block) == "packed":
@@ -300,22 +274,12 @@ class WeightStore:
             return cached
         representation = self.representation(block)
         if block.layout == "contiguous-le-v1":
-            source = (
-                self._upload(block)
-                if representation == "decoded"
-                else self._stream_tensor(block)
-            )
-            decoded = decode_direct(
-                source, block.format, block.shape, device=self.device
-            )
+            source = self._upload(block) if representation == "decoded" else self._stream_tensor(block)
+            decoded = decode_direct(source, block.format, block.shape, device=self.device)
             if representation == "stream" and self.device.type == "cpu":
                 decoded = decoded.clone()
         else:
-            source = (
-                self._upload(block)
-                if representation == "packed"
-                else self._stream_tensor(block)
-            )
+            source = self._upload(block) if representation == "packed" else self._stream_tensor(block)
             decoded = dequantize_row_split(
                 source,
                 block.format,
@@ -341,10 +305,14 @@ class WeightStore:
             cached = self._axis_decoded.get(key)
             if cached is not None:
                 return cached
-            decoded = self._decode_block(
-                value.block,
-                dequant_dtype=dequant_dtype,
-            ).permute(value.axes).contiguous()
+            decoded = (
+                self._decode_block(
+                    value.block,
+                    dequant_dtype=dequant_dtype,
+                )
+                .permute(value.axes)
+                .contiguous()
+            )
             if tuple(decoded.shape) != value.shape:
                 raise RuntimeError("axis view produced an unexpected shape")
             if self.representation(value.block) == "decoded":
@@ -363,14 +331,8 @@ class WeightStore:
                 dequant_dtype=dequant_dtype,
             )[value.row_begin : value.row_end]
         geometry = row_split_geometry(block.format, block.shape)
-        source = (
-            self._upload(block)
-            if self.representation(block) == "packed"
-            else self.binding.payload(block)
-        )
-        planes = split_row_planes(
-            source, geometry, value.row_begin, value.row_count
-        )
+        source = self._upload(block) if self.representation(block) == "packed" else self.binding.payload(block)
+        planes = split_row_planes(source, geometry, value.row_begin, value.row_count)
         return dequantize_row_split(
             planes,
             block.format,
@@ -418,7 +380,7 @@ class WeightStore:
         dequant_dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         block, row_begin, row_count = self._row_span(value)
-        if block.layout != "row-split-k128-v1":
+        if block.layout not in ("row-split-k128-v1", "contiguous-le-v1"):
             raise ValueError("block is not row-addressable")
         relative = self._relative_rows(
             rows,
@@ -430,16 +392,19 @@ class WeightStore:
         else:
             absolute = tuple(row_begin + row for row in relative)
 
-        if self.representation(block) == "decoded":
-            indices = torch.as_tensor(
-                absolute, dtype=torch.long, device=self.device
+        if block.layout == "contiguous-le-v1":
+            return direct_rows(
+                self.binding.payload(block),
+                block.shape,
+                block.format,
+                absolute,
+                device=self.device,
+                dtype=dequant_dtype,
             )
+        if self.representation(block) == "decoded":
+            indices = torch.as_tensor(absolute, dtype=torch.long, device=self.device)
             return self._decode_block(block).index_select(0, indices)
-        source = (
-            self._upload(block)
-            if self.representation(block) == "packed"
-            else self.binding.payload(block)
-        )
+        source = self._upload(block) if self.representation(block) == "packed" else self.binding.payload(block)
         geometry = row_split_geometry(block.format, block.shape)
         planes = gather_row_planes(source, geometry, absolute)
         return dequantize_row_split(
@@ -461,10 +426,26 @@ class WeightStore:
         if rows <= 0:
             raise ValueError("chunk rows must be positive")
         block, row_begin, row_count = self._row_span(value)
-        if block.layout != "row-split-k128-v1":
+        if block.layout not in ("row-split-k128-v1", "contiguous-le-v1"):
             raise ValueError("block is not row-addressable")
         if block.tensor_id in self._expert_block_ids:
             raise ValueError("expert banks are addressed by selected rows, not chunks")
+        if block.layout == "contiguous-le-v1":
+            for begin in range(0, row_count, rows):
+                end = min(row_count, begin + rows)
+                yield (
+                    begin,
+                    end,
+                    direct_rows(
+                        self.binding.payload(block),
+                        block.shape,
+                        block.format,
+                        range(row_begin + begin, row_begin + end),
+                        device=self.device,
+                        dtype=dequant_dtype,
+                    ),
+                )
+            return
         if self.representation(block) == "decoded":
             decoded = self._decode_block(block)
             for local_begin in range(0, row_count, rows):
@@ -476,18 +457,12 @@ class WeightStore:
                 )
             return
 
-        source = (
-            self._upload(block)
-            if self.representation(block) == "packed"
-            else self.binding.payload(block)
-        )
+        source = self._upload(block) if self.representation(block) == "packed" else self.binding.payload(block)
         geometry = row_split_geometry(block.format, block.shape)
         for local_begin in range(0, row_count, rows):
             local_end = min(row_count, local_begin + rows)
             count = local_end - local_begin
-            planes = split_row_planes(
-                source, geometry, row_begin + local_begin, count
-            )
+            planes = split_row_planes(source, geometry, row_begin + local_begin, count)
             decoded = dequantize_row_split(
                 planes,
                 block.format,

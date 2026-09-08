@@ -11,6 +11,13 @@ add_test(NAME sinfer_public_api_test COMMAND sinfer_public_api_test)
 # in the one test that predates the helper.
 set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_public_api_test)
 
+# Metadata validation has no device dependency and must also work in a standalone reader.
+add_executable(sinfer_checkpoint_geometry_test test_checkpoint_geometry.cpp)
+target_include_directories(sinfer_checkpoint_geometry_test PRIVATE ${SERVE_ROOT})
+target_compile_options(sinfer_checkpoint_geometry_test PRIVATE -UNDEBUG -fno-fast-math)
+add_test(NAME sinfer_checkpoint_geometry_test COMMAND sinfer_checkpoint_geometry_test)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_checkpoint_geometry_test)
+
 function(sinfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
@@ -89,6 +96,11 @@ function(sinfer_add_fused_linear_test name source common)
 endfunction()
 
 # Artifact framing and model-independent runtime contracts.
+sinfer_add_test(sinfer_checkpoint_identity_test SOURCES test_checkpoint_identity.cpp)
+target_compile_options(sinfer_checkpoint_identity_test PRIVATE -UNDEBUG)
+sinfer_add_test(sinfer_checkpoint_workspace_test SOURCES test_checkpoint_workspace.cpp)
+target_compile_options(sinfer_checkpoint_workspace_test PRIVATE -UNDEBUG)
+
 sinfer_add_test(sinfer_artifact_reader_test
   SOURCES test_sinfer_artifact_reader.cpp
   LIBRARIES sinfer_artifact)
@@ -368,6 +380,10 @@ sinfer_add_linear_test(sinfer_linear_fp8_generic_test ops/linear/test_fp8_generi
 sinfer_add_op_test(sinfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES sinfer_ops)
+sinfer_add_op_test(sinfer_checkpoint_projection_test
+  SOURCES ops/test_checkpoint_projection.cpp
+  LIBRARIES sinfer_ops CUDA::cudart)
+
 sinfer_add_op_test(sinfer_attn_input_proj_test
   SOURCES ops/test_attn_input_proj.cpp
   LIBRARIES sinfer_ops)

@@ -43,7 +43,6 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     /// Rows of the compacted proposal head. This target has no draft head at all; the value
     /// names the only head this model has, so the unreachable branch is at least sized.
-    static constexpr std::int32_t draft_head_rows              = TextConfig::output_rows;
 
     /// The non-attending layers convolve. Read through `linear_mixer<Variant>()`, which every
     /// other target leaves at the family default.
@@ -59,7 +58,7 @@ struct Variant {
 
     /// Parity probe: under SUROGATE_SERVE_DUMP_RESIDUAL the family loop's intermediates are
     /// written out, tagged and numbered by the order the layers run in. A no-op otherwise.
-    static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
+    static void debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream);
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,

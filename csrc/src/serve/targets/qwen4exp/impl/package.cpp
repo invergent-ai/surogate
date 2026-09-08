@@ -52,7 +52,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "w8-hc-v1") {
+    if (identity.architecture == target_key && identity.weights_id == "w8-hc-v1") {
         return WeightsProfile::W8HyperConnection;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -110,8 +110,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     // much to offload; zero otherwise, set on every plan.
     family::ExpertCache::configure_pool_floor(
         options.host_moe_layers != 0 || options.gpu_layers != 0
-            ? family::ExpertCache::pool_floor_bytes(ops::kSparseMoeFlashNextGeometry,
-                                                    detail::TextConfig::expert_layers,
+            ? family::ExpertCache::pool_floor_bytes(detail::moe_geometry(plan.bindings.geometry),
+                                                    plan.bindings.geometry.layers + plan.bindings.geometry.mtp_layers,
                                                     options.expert_slots)
             : 0);
     // ...and what the load holds only while it runs, which is the pool's other neighbour.
@@ -125,8 +125,8 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 namespace {
 
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
-    family::bind_lora_moe_hybrid<detail::TextConfig>(runtime, options, [](std::size_t layer) {
-        return detail::TextConfig::is_full_attention(static_cast<int>(layer));
+    family::bind_lora_moe_hybrid(runtime, options, [&](std::size_t layer) {
+        return runtime.geometry.layer_attends(static_cast<int>(layer));
     });
 }
 
@@ -149,14 +149,15 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile,
-                                                        const family::TextGeometry& geometry) {
+                                                        const family::TextGeometry& geometry,
+                                                        const family::VisionGeometry& vision_geometry) {
     // The expert slot pool is device memory the KV planner must not count as free: create it
     // here, before the engine measures free memory for `--kv-capacity auto`. The planner is
     // built first because its capacity curve says the least the runtime must be left --
     // KV floor, round state, workspaces -- and a pool that sizes itself must leave that,
     // plus the automatic headroom, or the engine refuses to start once it asks for it.
     auto planner = family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                                 geometry);
+                                                                 geometry, vision_geometry);
     // The runtime's floor and the load's staging are never resident together, so the
     // pool leaves room for the larger, on top of the weights.
     const std::size_t runtime_floor =
@@ -164,19 +165,19 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
         std::max(planner.capacity_curve().minimum_device_reservation_bytes +
                      options.kv_capacity.automatic_headroom_bytes,
                  family::ExpertCache::load_staging());
-    family::ExpertCache::configure(options, runtime_floor, detail::TextConfig::experts);
+    family::ExpertCache::configure(options, runtime_floor, geometry.experts);
     {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(device.device));
-        detail::Variant::prewarm_device_scratch();
+        detail::Variant::prewarm_device_scratch(geometry);
         CUDA_CHECK(cudaSetDevice(previous));
     }
     return planner;
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    return family::TextGeometry::declared<detail::TextConfig>(reader.geometry());
+    return family::TextGeometry::resolved_qwen4exp(reader.geometry(), reader.layer_types());
 }
 
 std::unique_ptr<Package::Program>
@@ -185,7 +186,7 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     // The program captures its decode graphs at construction; the cuBLASLt route must own its
     // handle and workspace before any capture (plans themselves are host-side).
     ops::detail::bf16_cublaslt_prewarm();
-    detail::Variant::prewarm_device_scratch();
+    detail::Variant::prewarm_device_scratch(model.impl_->data.runtime.geometry);
     detail::Variant::prepare_expert_split(model.impl_->data.runtime);
     return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);

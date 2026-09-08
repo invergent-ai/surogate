@@ -1,4 +1,4 @@
-"""Library-backed Qwen3.6 frontend loaded from artifact resources."""
+"""Library-backed hybrid frontend loaded from artifact resources."""
 
 from __future__ import annotations
 
@@ -10,15 +10,6 @@ from typing import Any, Iterable
 from .multimodal import MultimodalBatch, batch_from_processor_output
 
 
-_SPECIAL_TOKEN_IDS = {
-    "<|vision_start|>": 248053,
-    "<|vision_end|>": 248054,
-    "<|image_pad|>": 248056,
-    "<|video_pad|>": 248057,
-}
-_TOKENIZER_SIZE = 248077
-
-
 def _fetch_videos_opencv(_processor, video_or_videos, sample_indices_fn=None):
     """Use the Transformers sampler with its local OpenCV decoder."""
 
@@ -26,10 +17,7 @@ def _fetch_videos_opencv(_processor, video_or_videos, sample_indices_fn=None):
 
     if isinstance(video_or_videos, list):
         fetched = [
-            _fetch_videos_opencv(
-                _processor, item, sample_indices_fn=sample_indices_fn
-            )
-            for item in video_or_videos
+            _fetch_videos_opencv(_processor, item, sample_indices_fn=sample_indices_fn) for item in video_or_videos
         ]
         return list(zip(*fetched))
     return load_video(
@@ -44,14 +32,14 @@ class Frontend:
 
     def __init__(self, binding: Any):
         try:
-            from transformers import AutoProcessor, GenerationConfig
+            from transformers import AutoProcessor, AutoTokenizer, GenerationConfig
             from transformers.utils import is_torchcodec_available
         except ImportError as exc:
-            raise RuntimeError(
-                "Qwen3.6 reference inference requires Transformers with Qwen3-VL support"
-            ) from exc
+            raise RuntimeError("hybrid reference inference requires Transformers with Qwen3-VL support") from exc
 
         resources = binding.frontend
+        self.vision_config = binding.vision_config
+        self.token_domain = binding.config.token_domain
         files: tuple[tuple[str, Any], ...] = (
             ("tokenizer.json", resources.tokenizer_json),
             ("tokenizer_config.json", resources.tokenizer_config_json),
@@ -66,45 +54,28 @@ class Frontend:
         with tempfile.TemporaryDirectory(prefix="sinfer-frontend-") as temporary:
             directory = Path(temporary)
             for filename, resource in files:
-                (directory / filename).write_bytes(binding.resource_bytes(resource))
-            self.processor = AutoProcessor.from_pretrained(
-                directory, local_files_only=True
-            )
-            self.generation_config = GenerationConfig.from_pretrained(
-                directory, local_files_only=True
-            )
+                if resource is not None:
+                    (directory / filename).write_bytes(binding.resource_bytes(resource))
+            if self.vision_config is not None:
+                self.processor = AutoProcessor.from_pretrained(directory, local_files_only=True)
+                self.tokenizer = self.processor.tokenizer
+            else:
+                self.tokenizer = AutoTokenizer.from_pretrained(directory, local_files_only=True)
+                self.processor = self.tokenizer
+            self.generation_config = GenerationConfig.from_pretrained(directory, local_files_only=True)
 
-        self.tokenizer = self.processor.tokenizer
-        if not is_torchcodec_available():
-            self.processor.video_processor.fetch_videos = MethodType(
-                _fetch_videos_opencv, self.processor.video_processor
-            )
-
-        names = set(self.processor.model_input_names)
-        required = {
-            "pixel_values",
-            "image_grid_thw",
-            "pixel_values_videos",
-            "video_grid_thw",
-            "mm_token_type_ids",
-        }
-        missing = sorted(required - names)
-        if missing:
-            raise RuntimeError(
-                "the installed Transformers processor lacks Qwen3.6 inputs: "
-                f"{missing}"
-            )
-        if len(self.tokenizer) != _TOKENIZER_SIZE:
-            raise ValueError(
-                f"artifact tokenizer has {len(self.tokenizer)} addressable IDs; "
-                f"expected {_TOKENIZER_SIZE}"
-            )
-        for token, expected in _SPECIAL_TOKEN_IDS.items():
-            actual = self.tokenizer.convert_tokens_to_ids(token)
-            if actual != expected:
-                raise ValueError(
-                    f"artifact tokenizer maps {token} to {actual}; expected {expected}"
-                )
+        video_processor = getattr(self.processor, "video_processor", None)
+        if video_processor is not None and not is_torchcodec_available():
+            video_processor.fetch_videos = MethodType(_fetch_videos_opencv, video_processor)
+        vocabulary = self.tokenizer.get_vocab()
+        domain = max(vocabulary.values(), default=-1) + 1
+        if domain != self.token_domain:
+            raise ValueError(f"artifact tokenizer has ID domain {domain}; checkpoint declares {self.token_domain}")
+        if self.vision_config is not None:
+            for name in ("image_processor", "video_processor"):
+                processor = getattr(self.processor, name, None)
+                if processor is not None and getattr(processor, "merge_size", None) != self.vision_config.spatial_merge:
+                    raise ValueError(f"{name} merge_size disagrees with checkpoint vision geometry")
 
     @property
     def default_stop_token_ids(self) -> set[int]:
@@ -115,9 +86,7 @@ class Frontend:
             return {values}
         return {int(value) for value in values}
 
-    def process(
-        self, messages: list[dict[str, Any]], *, thinking: bool
-    ) -> MultimodalBatch:
+    def process(self, messages: list[dict[str, Any]], *, thinking: bool) -> MultimodalBatch:
         output = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -126,7 +95,13 @@ class Frontend:
             return_tensors="pt",
             enable_thinking=thinking,
         )
-        return batch_from_processor_output(output)
+        if self.vision_config is None and "mm_token_type_ids" not in output:
+            import torch
+
+            output["mm_token_type_ids"] = torch.zeros_like(output["input_ids"])
+        return batch_from_processor_output(
+            output, spatial_merge=self.vision_config.spatial_merge if self.vision_config else 1
+        )
 
     def process_text(self, text: str, *, thinking: bool) -> MultimodalBatch:
         if not text.strip():
@@ -136,12 +111,8 @@ class Frontend:
             thinking=thinking,
         )
 
-    def decode(
-        self, token_ids: Iterable[int], *, skip_special_tokens: bool = True
-    ) -> str:
-        return self.tokenizer.decode(
-            list(token_ids), skip_special_tokens=skip_special_tokens
-        )
+    def decode(self, token_ids: Iterable[int], *, skip_special_tokens: bool = True) -> str:
+        return self.tokenizer.decode(list(token_ids), skip_special_tokens=skip_special_tokens)
 
 
 __all__ = ["Frontend"]

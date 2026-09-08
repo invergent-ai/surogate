@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "transformers>=5.5.0",
     "huggingface-hub>=1.4.1",
+    "sentencepiece>=0.2.0",
     "hf-transfer>=0.1.9",
     "datasets>=4.3.0",
     "addict",

@@ -17,51 +17,56 @@ __global__ void gdn_projected_conv_kernel(
     const __nv_bfloat16* __restrict__ state_read, const std::int32_t* __restrict__ valid_columns,
     const std::int32_t* __restrict__ initial_state_slots, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t width,
-    Publish publish) {
+    Publish publish, std::int32_t runtime_channels = 0, std::int32_t runtime_query_rows = 0,
+    std::int32_t runtime_key_rows = 0, std::int32_t runtime_value_rows = 0) {
     static_assert(Channels == QueryRows + KeyRows + ValueRows);
+    const std::int32_t channels = Channels ? Channels : runtime_channels;
+    const std::int32_t query_rows = Channels ? QueryRows : runtime_query_rows;
+    const std::int32_t key_rows = Channels ? KeyRows : runtime_key_rows;
+    const std::int32_t value_rows = Channels ? ValueRows : runtime_value_rows;
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= Channels) { return; }
+    if (row >= channels) { return; }
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
     if constexpr (StaticWidth != 0) { width = StaticWidth; }
 
     std::int32_t valid                 = valid_columns == nullptr ? width : valid_columns[batch];
     valid                              = valid < 0 ? 0 : (valid > width ? width : valid);
-    constexpr std::int64_t slot_stride = static_cast<std::int64_t>(Channels) * 3;
+    const std::int64_t slot_stride = static_cast<std::int64_t>(channels) * 3;
     const std::int64_t initial_base =
         static_cast<std::int64_t>(initial_state_slots[batch]) * slot_stride;
     float s0       = __bfloat162float(state_read[initial_base + row]);
-    float s1       = __bfloat162float(state_read[initial_base + Channels + row]);
-    float s2       = __bfloat162float(state_read[initial_base + 2LL * Channels + row]);
+    float s1       = __bfloat162float(state_read[initial_base + channels + row]);
+    float s2       = __bfloat162float(state_read[initial_base + 2LL * channels + row]);
     const float w0 = __bfloat162float(conv_weight[row]);
-    const float w1 = __bfloat162float(conv_weight[Channels + row]);
-    const float w2 = __bfloat162float(conv_weight[2LL * Channels + row]);
-    const float w3 = __bfloat162float(conv_weight[3LL * Channels + row]);
+    const float w1 = __bfloat162float(conv_weight[channels + row]);
+    const float w2 = __bfloat162float(conv_weight[2LL * channels + row]);
+    const float w3 = __bfloat162float(conv_weight[3LL * channels + row]);
 
     for (std::int32_t token = 0; token < width; ++token) {
         const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
         if (token >= valid) {
-            if (row < QueryRows) {
-                query[column * QueryRows + row] = __float2bfloat16_rn(0.0F);
-            } else if (row < QueryRows + KeyRows) {
-                key[column * KeyRows + row - QueryRows] = __float2bfloat16_rn(0.0F);
+            if (row < query_rows) {
+                query[column * query_rows + row] = __float2bfloat16_rn(0.0F);
+            } else if (row < query_rows + key_rows) {
+                key[column * key_rows + row - query_rows] = __float2bfloat16_rn(0.0F);
             } else {
-                value[column * ValueRows + row - QueryRows - KeyRows] = __float2bfloat16_rn(0.0F);
+                value[column * value_rows + row - query_rows - key_rows] = __float2bfloat16_rn(0.0F);
             }
             continue;
         }
 
-        const float p              = __bfloat162float(projected[column * Channels + row]);
+        const float p              = __bfloat162float(projected[column * channels + row]);
         float conv                 = fmaf(w0, s0, 0.0F);
         conv                       = fmaf(w1, s1, conv);
         conv                       = fmaf(w2, s2, conv);
         conv                       = fmaf(w3, p, conv);
         const __nv_bfloat16 output = __float2bfloat16_rn(silu(conv));
-        if (row < QueryRows) {
-            query[column * QueryRows + row] = output;
-        } else if (row < QueryRows + KeyRows) {
-            key[column * KeyRows + row - QueryRows] = output;
+        if (row < query_rows) {
+            query[column * query_rows + row] = output;
+        } else if (row < query_rows + key_rows) {
+            key[column * key_rows + row - query_rows] = output;
         } else {
-            value[column * ValueRows + row - QueryRows - KeyRows] = output;
+            value[column * value_rows + row - query_rows - key_rows] = output;
         }
         publish.publish(token, batch, row, s1, s2, p);
         s0 = s1;
@@ -141,7 +146,23 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
                                         initial_state_slots, query, key, value, publish, stream);
         return;
     }
-    throw std::invalid_argument("GDN projected-conv received an unregistered geometry");
+    const auto channels = projected.ne[0];
+    if (channels <= 0 || query.ne[0] <= 0 || key.ne[0] <= 0 || value.ne[0] <= 0 ||
+        static_cast<std::int64_t>(query.ne[0]) + key.ne[0] + value.ne[0] != channels) {
+        throw std::invalid_argument("GDN projected-conv outputs do not cover the projected channels");
+    }
+    constexpr int threads = 256;
+    const dim3 grid((channels + threads - 1) / threads, static_cast<unsigned>(projected.ne[2]));
+    gdn_projected_conv_kernel<0, 0, 0, 0, 0><<<grid, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(projected.data),
+        static_cast<const __nv_bfloat16*>(conv_weight.data),
+        static_cast<const __nv_bfloat16*>(state_read.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<const std::int32_t*>(initial_state_slots.data),
+        static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+        static_cast<__nv_bfloat16*>(value.data), projected.ne[1], publish,
+        channels, query.ne[0], key.ne[0], value.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace

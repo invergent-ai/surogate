@@ -24,10 +24,6 @@
 
 namespace sinfer::targets::qwen3_5_moe::detail {
 
-inline constexpr std::size_t kTextLayers          = 40;
-inline constexpr std::size_t kFullAttentionLayers = 10;
-inline constexpr std::size_t kGdnLayers           = 30;
-inline constexpr std::size_t kDFlashLayers        = 6;
 
 struct MoePlan {
     artifact::ObjectHandle router_shared_gate;
@@ -120,31 +116,32 @@ struct DFlashLayerPlan {
 struct DFlashPlan {
     artifact::ObjectHandle feature_projection;
     artifact::ObjectHandle context_norm;
-    std::array<DFlashLayerPlan, kDFlashLayers> layers;
+    std::vector<DFlashLayerPlan> layers;
     artifact::ObjectHandle final_norm;
 };
 
 struct BindingPlan {
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry;
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
     /// Which weight formats the artifact carries; decided by the identity, read by both the
     /// binder (which object formats to expect) and the loader (which Weights to build).
     WeightsProfile weights = WeightsProfile::GroupwiseInt;
     artifact::LinearBinding token_embedding;
-    std::array<TextLayerPlan, kTextLayers> text_layers;
+    std::vector<TextLayerPlan> text_layers;
     artifact::ObjectHandle final_norm;
     artifact::LinearBinding output_head;
     artifact::LinearBinding draft_head; // format read from the artifact
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
     bool has_mtp = false;
+    family::VisionGeometry vision_geometry;
     family::VisionBackbonePlan vision_backbone;
     bool has_vision = false;
     family::VisionMergerInputPlan vision_merger_input;
-    artifact::ObjectHandle vision_merger_fc2;
+    artifact::LinearBinding vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
     family::VisionMergerNormPlan vision_merger_norm;
     DFlashPlan dflash;
@@ -160,6 +157,8 @@ struct ArtifactLoadPlan {
     BindingPlan bindings;
     artifact::MaterializationPlan materialization;
 };
+
+family::TextGeometry resolved_geometry(const artifact::Reader& reader);
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
                                WeightsProfile weights, std::uint32_t host_moe_layers = 0,
@@ -177,6 +176,7 @@ struct SplitAttentionWeights {
 };
 
 struct AttentionProjectionPayload {
+    std::int32_t head_dim = 0;
     /// The fused parent when `split` is empty; unused otherwise.
     Weight query_key_gate_value;
     std::optional<SplitAttentionWeights> split;
@@ -199,7 +199,7 @@ struct GdnProjectionPayload {
 using RuntimeModelView =
     family::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
                        AttentionProjectionPayload, SparseMoePayload,
-                       family::DFlashWeights<kDFlashLayers>>;
+                       family::DFlashWeights>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

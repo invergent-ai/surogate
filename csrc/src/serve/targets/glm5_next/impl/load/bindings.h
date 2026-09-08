@@ -24,6 +24,13 @@
 
 namespace sinfer::targets::glm5_next::detail {
 
+[[nodiscard]] inline ops::SparseMoeGeometry moe_geometry(const family::TextGeometry& g) {
+    return {.hidden = g.hidden, .experts = g.experts, .experts_per_token = g.experts_per_token,
+            .intermediate = g.intermediate, .gating = ops::SparseMoeGating::SigmoidBiasTopK,
+            .routed_scale = g.routed_scale, .shared_gated = false,
+            .shared_intermediate = g.shared_intermediate, .swiglu_limit = g.swiglu_limit};
+}
+
 struct WeightPlan {
     artifact::ObjectHandle object;
     artifact::NumericFormat format = artifact::NumericFormat::BF16;
@@ -119,7 +126,7 @@ struct MtpPlan {
 };
 
 struct BindingPlan {
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry{};
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
@@ -166,6 +173,10 @@ struct HyperConnectionPayload {
     /// the shape alone: on a pipeline stage the interesting question about an unbound weight is
     /// always "which layer, and does this stage run it".
     std::int32_t layer = -1;
+    std::int32_t probe_layer_count = 0;
+    std::int32_t streams = 0;
+    std::int32_t sinkhorn_iterations = 0;
+    float epsilon = 0.0F;
 };
 
 /// The attention site's payload: its hyper-connection and the latent projections.
@@ -246,7 +257,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     family::ModelView<LatentAttentionPayload, KdaProjectionPayload, FeedForwardPayload,
-                      MtpAttentionPayload, FeedForwardPayload, family::DFlashWeights<1>>;
+                      MtpAttentionPayload, FeedForwardPayload, family::DFlashWeights>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using KdaWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

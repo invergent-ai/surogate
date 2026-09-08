@@ -1,330 +1,82 @@
-"""Verify the additive Qwen3.6-27B NVFP4 artifact against both source roles."""
+"""Verify a quantized hybrid artifact against its checkpoint configuration and source words."""
 
-from __future__ import annotations
-
-import argparse
-from collections import Counter
-from dataclasses import asdict, dataclass
-import json
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Sequence
+import struct
 
-from safetensors import safe_open
-import torch
-
-from surogate.serve.artifact.container import (
-    Artifact,
-    ArtifactIdentity,
-    ResourceObject,
-    TensorObject,
-    object_alignment,
-)
-from surogate.serve.artifact.layouts import (
-    align_up,
-    decode_direct,
-    decode_nvfp4_words,
-    encoded_size,
-)
-from surogate.serve.artifact.numeric import valid_positive_fp32_word
+from surogate.serve.artifact.container import Artifact, ResourceObject, TensorObject
+from surogate.serve.convert.common import conversion, qwen3_5 as checkpoint
 from surogate.serve.convert.common.safetensors import ShardReader
-
-from . import convert_nvfp4_mixed_bf16 as base_nvfp4_convert
-from . import recipe_nvfp4_mixed_bf16 as recipe
-from .. import verify as base_verify
-
-from .. import inventory as family_inventory
-from .. import recipe as family_recipe
+from .. import inventory as inv
+from .. import recipe as base_recipe
+from .. import draft_head
+from ..convert import _tools_root
+from . import quantized
 
 
-#: This export exists only for the 27B.
-GEOMETRY = family_inventory.GEOMETRY_27B
-EXPORT = family_inventory.export_inventory(
-    family_inventory.NVFP4_MIXED_BF16, GEOMETRY)
-#: The BF16 checkpoint's recipes at this size, for the objects this export
-#: does not quantise.
-BASE_RECIPES = {item.object_name: item
-                for item in family_recipe.build_recipes(GEOMETRY)}
+def verify_artifact(artifact, base_dir, nvfp4_dir=None, *, device="cpu"):
+    root = Path(base_dir)
+    primary = root if nvfp4_dir is None else Path(nvfp4_dir)
+    if artifact.identity.architecture != inv.TARGET_KEY:
+        raise ValueError("artifact architecture does not match this checkpoint family")
+    profile = inv.profile_for(artifact.identity.weights_id)
+    with ExitStack() as stack:
+        reader = stack.enter_context(ShardReader.for_directory(primary))
+        fallback = stack.enter_context(ShardReader.for_directory(root)) if primary != root else None
+        sources = quantized.Sources(reader, fallback)
+        g = quantized._geometry(conversion.load_json(root / "config.json"), root, sources,
+                                mtp=bool(artifact.geometry["mtp_layers"]), vision=bool(artifact.vision_geometry))
+        plan = quantized.build(g, profile, sources)
+        if artifact.geometry != checkpoint.geometry_block(g) or tuple(artifact.layer_types) != g.layer_types:
+            raise ValueError("artifact geometry does not match the source checkpoint")
+        resources = {r.name: r.data for r in conversion.load_resources(root, inv.RESOURCE_SPECS)}
+        expected = [s for s in plan.objects if isinstance(s, inv.TensorSpec) or s.name in resources]
+        if [obj.name for obj in artifact.objects] != [s.name for s in expected]:
+            raise ValueError("artifact inventory does not match the source checkpoint")
+        draft = draft_head.compute_shortlist(_tools_root() / draft_head.DEFAULT_RANKING, root, geometry=g)
+        derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_head.materialize_draft_head_token_ids(draft)}
+        for spec in expected:
+            obj = artifact.find(spec.name)
+            if isinstance(spec, inv.ResourceSpec):
+                if not isinstance(obj, ResourceObject):
+                    raise ValueError(f"{spec.name}: expected a resource")
+                payload = resources[spec.name]
+            else:
+                if not isinstance(obj, TensorObject) or (obj.shape, obj.format, obj.layout) != (spec.shape, spec.format, spec.layout):
+                    raise ValueError(f"{spec.name}: tensor signature disagrees with checkpoint")
+                if spec.name in plan.divisors:
+                    payload = struct.pack("<f", quantized._same_divisor(sources, plan.divisors[spec.name].parts, "input_scale"))
+                elif spec.name in plan.matrices:
+                    payload = quantized.encode_matrix(plan.matrices[spec.name], sources, device)
+                else:
+                    payload = quantized.dense_payload(spec, plan.base_recipes[spec.name], sources, derived, device)
+            chunks = (payload,) if isinstance(payload, (bytes, bytearray, memoryview)) else payload
+            stored = artifact.payload(obj)
+            try:
+                offset = 0
+                for chunk in chunks:
+                    if stored[offset:offset + len(chunk)] != chunk:
+                        raise ValueError(f"{spec.name}: artifact bytes differ from checkpoint source words")
+                    offset += len(chunk)
+                if offset != len(stored):
+                    raise ValueError(f"{spec.name}: artifact payload size differs from checkpoint")
+            finally:
+                stored.release()
+    return {"objects": len(expected), "architecture": inv.TARGET_KEY, "weights_id": artifact.identity.weights_id}
 
 
-class VerificationError(ValueError):
-    """The artifact does not satisfy the registered NVFP4 contract."""
-
-
-@dataclass(frozen=True, slots=True)
-class VerificationSummary:
-    objects: int
-    tensors: int
-    resources: int
-    w8_endpoint_weights: int
-    w8_endpoint_rows: int
-    w8_endpoint_groups: int
-    nvfp4_weights: int
-    bf16_text_matrices: int
-    input_divisors: int
-    payload_bytes: int
-
-
-def _error(message: str) -> None:
-    raise VerificationError(message)
-
-
-def validate_structure(artifact: Artifact) -> int:
-    expected_identity = ArtifactIdentity(EXPORT.MODEL_ID, EXPORT.WEIGHTS_ID)
-    if artifact.identity != expected_identity:
-        _error(
-            f"artifact identity is {artifact.identity!r}, expected "
-            f"{expected_identity!r}"
-        )
-    if len(artifact.objects) != len(EXPORT.OBJECT_SPECS):
-        _error(
-            f"artifact has {len(artifact.objects)} objects, "
-            f"expected {len(EXPORT.OBJECT_SPECS)}"
-        )
-    cursor = 0
-    formats: Counter[str] = Counter()
-    layouts: Counter[str] = Counter()
-    for position, (actual, expected) in enumerate(
-        zip(artifact.objects, EXPORT.OBJECT_SPECS)
-    ):
-        if actual.name != expected.name:
-            _error(
-                f"object {position} is {actual.name!r}, expected {expected.name!r}"
-            )
-        expected_offset = align_up(cursor, object_alignment(actual))
-        if actual.offset != expected_offset:
-            _error(
-                f"{actual.name}: offset {actual.offset}, expected {expected_offset}"
-            )
-        if isinstance(expected, EXPORT.TensorSpec):
-            if not isinstance(actual, TensorObject):
-                _error(f"{actual.name}: expected tensor descriptor")
-            signature = (actual.shape, actual.format, actual.layout)
-            registered = (expected.shape, expected.format, expected.layout)
-            if signature != registered:
-                _error(
-                    f"{actual.name}: signature {signature} != {registered}"
-                )
-            if actual.bytes != encoded_size(
-                actual.layout, actual.format, actual.shape
-            ):
-                _error(f"{actual.name}: encoded byte count is invalid")
-            formats[actual.format] += 1
-            layouts[actual.layout] += 1
-        else:
-            if not isinstance(actual, ResourceObject):
-                _error(f"{actual.name}: expected resource descriptor")
-            if actual.encoding != expected.encoding:
-                _error(f"{actual.name}: resource encoding is invalid")
-        cursor = actual.offset + actual.bytes
-    if dict(formats) != EXPORT.FORMAT_COUNTS:
-        _error(f"numeric-format counts are {dict(formats)}")
-    if dict(layouts) != EXPORT.LAYOUT_COUNTS:
-        _error(f"layout counts are {dict(layouts)}")
-    payload_bytes = artifact.file_bytes - artifact.payload_offset
-    if cursor != payload_bytes:
-        _error(f"payload ends at {cursor}, file contains {payload_bytes} bytes")
-    return payload_bytes
-
-
-def _verify_resources(artifact: Artifact, base_dir: Path) -> None:
-    for spec in EXPORT.RESOURCE_SPECS:
-        obj = artifact.find(spec.name)
-        if not isinstance(obj, ResourceObject):
-            _error(f"{spec.name}: expected resource")
-        source = (base_dir / spec.name.removeprefix("frontend/")).read_bytes()
-        if bytes(artifact.payload(obj)) != source:
-            _error(f"{spec.name}: resource payload differs from base source")
-
-
-W8_ENDPOINT_SPECS = tuple(
-    spec
-    for spec in EXPORT.TENSOR_SPECS
-    if spec.name in ("text/token_embedding", "text/output_head")
-)
-
-
-def _source_rows(
-    reader: ShardReader,
-    source: family_recipe.SourceTensor,
-    rows: Sequence[int],
-) -> torch.Tensor:
-    shard = reader.weight_map[source.name]
-    with safe_open(
-        str(reader.model_dir / shard),
-        framework="pt",
-        device="cpu",
-    ) as handle:
-        tensor_slice = handle.get_slice(source.name)
-        pieces = [tensor_slice[row : row + 1] for row in rows]
-    return torch.cat(pieces, dim=0)
-
-
-def _verify_w8_endpoints(
-    artifact: Artifact,
-    reader: ShardReader,
-) -> tuple[int, int]:
-    verified_rows = 0
-    verified_groups = 0
-    for spec in W8_ENDPOINT_SPECS:
-        obj = artifact.find(spec.name)
-        if not isinstance(obj, TensorObject):
-            _error(f"{spec.name}: expected tensor")
-        expression = BASE_RECIPES[spec.name].expression
-        if not isinstance(expression, family_recipe.SourceTensor):
-            _error(f"{spec.name}: endpoint source must be one direct BF16 matrix")
-        rows = tuple(dict.fromkeys((0, spec.shape[0] // 2, spec.shape[0] - 1)))
-        source_rows = _source_rows(reader, expression, rows)
-        try:
-            verified_groups += base_verify.verify_quantized_rows(
-                artifact.payload(obj),
-                obj.format,
-                obj.shape,
-                rows,
-                source_rows,
-            )
-        except base_verify.VerificationError as error:
-            _error(f"{spec.name}: {error}")
-        verified_rows += len(rows)
-    return verified_rows, verified_groups
-
-
-def _verify_nvfp4_weights(
-    artifact: Artifact,
-    reader: ShardReader,
-) -> None:
-    for selected in recipe.NVFP4_WEIGHT_RECIPES:
-        obj = artifact.find(selected.object_name)
-        if not isinstance(obj, TensorObject):
-            _error(f"{selected.object_name}: expected tensor")
-        packed, scales, divisor = recipe.materialize_nvfp4_weight(
-            selected, reader
-        )
-        stored_packed, stored_scales, stored_divisor = decode_nvfp4_words(
-            artifact.payload(obj), obj.shape
-        )
-        if not torch.equal(stored_packed, packed):
-            _error(f"{obj.name}: packed E2M1 words differ from source")
-        if not torch.equal(stored_scales, scales):
-            _error(f"{obj.name}: E4M3FN scale words differ from source")
-        if bytes(stored_divisor.reshape(1).view(torch.uint8).numpy()) != divisor:
-            _error(f"{obj.name}: weight divisor differs from source")
-
-
-def _verify_input_divisors(
-    artifact: Artifact,
-    reader: ShardReader,
-) -> None:
-    for selected in recipe.INPUT_DIVISOR_RECIPES:
-        obj = artifact.find(selected.object_name)
-        if not isinstance(obj, TensorObject):
-            _error(f"{selected.object_name}: expected tensor")
-        expected = recipe.materialize_input_divisor(selected, reader)
-        stored = decode_direct(artifact.payload(obj), obj.format, obj.shape)
-        word = int(stored.view(torch.int32).item()) & 0xFFFFFFFF
-        if not valid_positive_fp32_word(word):
-            _error(f"{obj.name}: input divisor is not finite and positive")
-        if not torch.equal(
-            stored.view(torch.int32), expected.view(torch.int32)
-        ):
-            _error(f"{obj.name}: input divisor differs from source")
-
-
-def _bf16_text_matrix_specs() -> tuple[EXPORT.TensorSpec, ...]:
-    result = []
-    for spec in EXPORT.TEXT_CORE_TENSOR_SPECS:
-        if spec.format != EXPORT.BF16 or len(spec.shape) != 2:
-            continue
-        if (
-            spec.name.endswith("/gdn/a_projection")
-            or spec.name.endswith("/gdn/b_projection")
-            or spec.name.endswith("/attention/query_key_gate_value")
-            or spec.name.endswith("/attention/output")
-            or spec.name.endswith("/gdn/output")
-        ):
-            result.append(spec)
-    return tuple(result)
-
-
-BF16_TEXT_MATRIX_SPECS = _bf16_text_matrix_specs()
-
-
-def _verify_bf16_text_matrices(
-    artifact: Artifact,
-    reader: ShardReader,
-) -> None:
-    for spec in BF16_TEXT_MATRIX_SPECS:
-        obj = artifact.find(spec.name)
-        if not isinstance(obj, TensorObject):
-            _error(f"{spec.name}: expected tensor")
-        if spec.name.endswith("/attention/query_key_gate_value"):
-            prefix = spec.name.removesuffix("query_key_gate_value")
-            expected = torch.cat(
-                (
-                    family_recipe.materialize_recipe(
-                        BASE_RECIPES[prefix + "query_key"],
-                        reader,
-                    ),
-                    family_recipe.materialize_recipe(
-                        BASE_RECIPES[prefix + "gate_value"],
-                        reader,
-                    ),
-                ),
-                dim=0,
-            )
-        else:
-            expected = family_recipe.materialize_recipe(
-                BASE_RECIPES[spec.name], reader
-            )
-        stored = decode_direct(artifact.payload(obj), obj.format, obj.shape)
-        if not torch.equal(
-            stored.view(torch.int16), expected.view(torch.int16)
-        ):
-            _error(f"{obj.name}: BF16 words differ from base source")
-
-
-def verify_artifact(
-    artifact: Artifact,
-    base_dir: str | Path,
-    nvfp4_dir: str | Path,
-) -> VerificationSummary:
-    base = Path(base_dir)
-    nvfp4 = Path(nvfp4_dir)
-    payload_bytes = validate_structure(artifact)
-    base_nvfp4_convert.preflight_conversion(base, nvfp4)
-    _verify_resources(artifact, base)
-    with ShardReader(base) as base_reader:
-        w8_endpoint_rows, w8_endpoint_groups = _verify_w8_endpoints(
-            artifact, base_reader
-        )
-        _verify_bf16_text_matrices(artifact, base_reader)
-    with ShardReader(nvfp4) as nvfp4_reader:
-        _verify_nvfp4_weights(artifact, nvfp4_reader)
-        _verify_input_divisors(artifact, nvfp4_reader)
-    return VerificationSummary(
-        objects=len(artifact.objects),
-        tensors=len(EXPORT.TENSOR_SPECS),
-        resources=len(EXPORT.RESOURCE_SPECS),
-        w8_endpoint_weights=len(W8_ENDPOINT_SPECS),
-        w8_endpoint_rows=w8_endpoint_rows,
-        w8_endpoint_groups=w8_endpoint_groups,
-        nvfp4_weights=len(recipe.NVFP4_WEIGHT_RECIPES),
-        bf16_text_matrices=len(BF16_TEXT_MATRIX_SPECS),
-        input_divisors=len(recipe.INPUT_DIVISOR_RECIPES),
-        payload_bytes=payload_bytes,
-    )
-
-
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv=None):
+    import argparse
+    import json
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
-    parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--nvfp4-model", type=Path, required=True)
-    arguments = parser.parse_args(argv)
-    with Artifact.open(arguments.artifact) as artifact:
-        summary = verify_artifact(
-            artifact, arguments.model, arguments.nvfp4_model
-        )
-    print(json.dumps(asdict(summary), indent=2, sort_keys=True))
+    parser.add_argument("--model", "--base", required=True, type=Path)
+    parser.add_argument("--quantized-model", "--nvfp4", type=Path)
+    parser.add_argument("--device", default="cpu")
+    args = parser.parse_args(argv)
+    with Artifact.open(args.artifact) as artifact:
+        result = verify_artifact(artifact, args.model, args.quantized_model, device=args.device)
+    print(json.dumps(result, indent=2))
     return 0
 
 

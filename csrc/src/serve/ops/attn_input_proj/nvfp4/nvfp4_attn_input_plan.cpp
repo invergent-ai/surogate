@@ -66,13 +66,10 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
         throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    // Generic shapes have no A16 ladder: they always run W4A4 through cuBLASLt (#84).
-    if (is_nvfp4_generic_problem(output_rows, input_rows)) {
-        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
-    }
-    return resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A4
-               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
-               : 0;
+    // The parent dimensions alone do not determine q/k/gate/v widths. Reserve the generic
+    // route's scratch as well, for checkpoints with another split of a registered parent.
+    (void)output_rows;
+    return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
 }
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -81,11 +78,13 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
     // One token on the hidden-2560 family: the decode GEMV, instantiated for that family and
     // nothing wider (Nvfp4GemvOnlyProblem). Every other width of a generic shape stays on
     // cuBLASLt, so the served wide rounds do not move.
-    if (x.ne[1] == 1 && is_nvfp4_gemv_only_problem(weight.n, weight.k)) {
+    if (x.ne[1] == 1 && is_nvfp4_gemv_only_problem(weight.n, weight.k) &&
+        q.ne[0] == 4096 && k.ne[0] == 1024) {
         nvfp4_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
         return;
     }
-    if (!is_nvfp4_generic_problem(weight.n, weight.k) &&
+    if (weight.n == 14336 && weight.k == 5120 && q.ne[0] == 6144 && k.ne[0] == 1024 &&
+        !is_nvfp4_generic_problem(weight.n, weight.k) &&
         resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
         launch_a16(x, weight, q, gate, k, v, stream);
         return;

@@ -19,9 +19,7 @@ namespace {
 
 using artifact::NumericFormat;
 
-/// The mixture's compiled geometry. Its shapes are a closed registry in the op, so the target
-/// names the one entry it serves rather than deriving numbers the kernels cannot honour.
-inline constexpr ops::SparseMoeGeometry kMoeGeometry = ops::kSparseMoeGlm53Geometry;
+
 
 /// Placement of the layer being bound: Device for the layers this stage runs, ValidateOnly for
 /// another stage's -- validated, never uploaded. A 200 GB checkpoint does not fit on one card,
@@ -96,11 +94,11 @@ void bind_feed_forward(artifact::Binder& binder, const std::string& prefix, bool
                                    static_cast<std::uint64_t>(g.dense_intermediate)});
         return;
     }
-    const auto experts = static_cast<std::uint64_t>(kMoeGeometry.experts);
+    const auto experts = static_cast<std::uint64_t>(moe_geometry(g).experts);
     // The router is BF16 and its bias FP32: a router that picks eight of 288 is the one place
     // in this model where a coarse width changes which experts run rather than by how much.
     out.router      = bind_weight(binder, prefix + "moe/router", NumericFormat::BF16,
-                                  {static_cast<std::uint64_t>(kMoeGeometry.router_rows()),
+                                  {static_cast<std::uint64_t>(moe_geometry(g).router_rows()),
                                    static_cast<std::uint64_t>(g.hidden)});
     out.router_bias = bind_layer_tensor(binder, prefix + "moe/router_bias", NumericFormat::FP32,
                                         {experts});
@@ -112,20 +110,22 @@ void bind_feed_forward(artifact::Binder& binder, const std::string& prefix, bool
         if (outer == artifact::TensorPlacement::Device) { g_layer_placement = g_expert_placement; }
         out.routed_gate_up =
             bind_weight(binder, prefix + "moe/routed_gate_up", weights,
-                        {experts * static_cast<std::uint64_t>(kMoeGeometry.expert_rows()),
+                        {experts * static_cast<std::uint64_t>(moe_geometry(g).expert_rows()),
                          static_cast<std::uint64_t>(g.hidden)});
         out.routed_down = bind_weight(binder, prefix + "moe/routed_down", weights,
                                       {experts * static_cast<std::uint64_t>(g.hidden),
-                                       static_cast<std::uint64_t>(kMoeGeometry.intermediate)});
+                                       static_cast<std::uint64_t>(moe_geometry(g).intermediate)});
         g_layer_placement = outer;
     }
+    if (g.shared_intermediate > 0) {
     out.shared_gate_up =
         bind_weight(binder, prefix + "moe/shared_gate_up", weights,
-                    {static_cast<std::uint64_t>(kMoeGeometry.shared_rows()),
+                    {static_cast<std::uint64_t>(moe_geometry(g).shared_rows()),
                      static_cast<std::uint64_t>(g.hidden)});
     out.shared_down = bind_weight(binder, prefix + "moe/shared_down", weights,
                                   {static_cast<std::uint64_t>(g.hidden),
-                                   static_cast<std::uint64_t>(kMoeGeometry.shared_intermediate)});
+                                   static_cast<std::uint64_t>(moe_geometry(g).shared_intermediate)});
+    }
 }
 
 void bind_latent_attention(artifact::Binder& binder, const std::string& prefix,
@@ -138,7 +138,7 @@ void bind_latent_attention(artifact::Binder& binder, const std::string& prefix,
                                          {static_cast<std::uint64_t>(g.q_lora_rank)});
     mla.query_b      = bind_weight(binder, prefix + "mla/query_b", weights,
                                    {static_cast<std::uint64_t>(g.query_heads) *
-                                        TextConfig::qk_head_dim,
+                                        g.qk_head_dim,
                                     static_cast<std::uint64_t>(g.q_lora_rank)});
     mla.kv_a         = bind_weight(binder, prefix + "mla/kv_a", weights,
                                    {static_cast<std::uint64_t>(g.kv_lora_rank),
@@ -151,13 +151,13 @@ void bind_latent_attention(artifact::Binder& binder, const std::string& prefix,
     // file's own Q8_0.
     mla.k_b    = bind_weight(binder, prefix + "mla/k_b", weights,
                              {static_cast<std::uint64_t>(g.latent_key_rows()),
-                              static_cast<std::uint64_t>(TextConfig::qk_head_dim)});
+                              static_cast<std::uint64_t>(g.qk_head_dim)});
     mla.v_b    = bind_weight(binder, prefix + "mla/v_b", weights,
-                             {static_cast<std::uint64_t>(g.query_heads) * TextConfig::v_head_dim,
+                             {static_cast<std::uint64_t>(g.query_heads) * g.v_head_dim,
                               static_cast<std::uint64_t>(g.kv_lora_rank)});
     mla.output = bind_weight(binder, prefix + "mla/output", weights,
                              {static_cast<std::uint64_t>(g.hidden),
-                              static_cast<std::uint64_t>(g.query_heads) * TextConfig::v_head_dim});
+                              static_cast<std::uint64_t>(g.query_heads) * g.v_head_dim});
 }
 
 /// The NextN draft head, bound where the trunk's layers are and placed by whether the run asked
@@ -172,7 +172,7 @@ void bind_mtp_head(artifact::Binder& binder, NumericFormat weights,
                    family::StartupFeatures features, bool holds_head, BindingPlan& out) {
     const family::TextGeometry& g = out.geometry;
     MtpPlan& mtp                  = out.mtp;
-    mtp.present                   = binder.has("mtp/input_projection");
+    mtp.present                   = g.mtp_layers > 0;
     if (!mtp.present) {
         if (features.mtp()) {
             throw std::runtime_error(
@@ -201,7 +201,7 @@ void bind_mtp_head(artifact::Binder& binder, NumericFormat weights,
     mtp.post_attention_norm = bind_layer_tensor(binder, layer + "post_attention_norm",
                                                 NumericFormat::BF16,
                                                 {static_cast<std::uint64_t>(g.hidden)});
-    const bool sparse = binder.reader().find(layer + "moe/router") != nullptr;
+    const bool sparse = true;
     bind_feed_forward(binder, layer, sparse, weights, g, mtp.feed_forward);
     mtp.final_norm = bind_layer_tensor(binder, prefix + "final_norm", NumericFormat::BF16,
                                        {static_cast<std::uint64_t>(g.hidden)});
@@ -236,7 +236,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
         g_layer_placement  = !target.resident ? artifact::TensorPlacement::ValidateOnly
                              : on_card       ? artifact::TensorPlacement::Device
                                              : artifact::TensorPlacement::HostBank;
-        const bool sparse_layer = binder.has(prefix + "moe/router");
+        const bool sparse_layer = layer >= g.leading_dense_layers;
         const bool offload_experts =
             target.resident && sparse_layer && stage_mixture_seen < host_moe_layers;
         if (target.resident && sparse_layer) { ++stage_mixture_seen; }
@@ -294,7 +294,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
                                                        {static_cast<std::uint64_t>(g.hidden)});
         // Which layers are dense is the artifact's to say too, and it says it the same way:
         // a layer holding a router is a mixture layer.
-        const bool sparse = binder.reader().find(prefix + "moe/router") != nullptr;
+        const bool sparse = layer >= g.leading_dense_layers;
         bind_feed_forward(binder, prefix, sparse, weights, g, target.feed_forward);
     }
     g_layer_placement = artifact::TensorPlacement::Device;
@@ -305,6 +305,10 @@ HyperConnectionPayload load_hyper_connection(const artifact::MaterializedArtifac
                                              const family::TextGeometry& g, std::int32_t layer) {
     HyperConnectionPayload out;
     out.layer         = layer;
+    out.probe_layer_count = g.layers;
+    out.streams = g.hc_streams;
+    out.sinkhorn_iterations = g.hc_sinkhorn_iterations;
+    out.epsilon = g.hc_epsilon;
     out.weights.mix   = materialized_weight(backing, plan.mix, g.hyper_connection_mix_rows(),
                                             g.residual);
     out.weights.base  = artifact::materialized_tensor(
@@ -322,6 +326,7 @@ void load_feed_forward_weights(const artifact::MaterializedArtifact& backing,
                                const FeedForwardPlan& source, const family::TextGeometry& g,
                                const family::HostBank* bank, const family::HostBankPlan* bank_plan,
                                std::int32_t layer, FeedForwardPayload& out) {
+    out.moe.swiglu_limit = g.swiglu_limit;
     out.sparse = source.sparse;
     out.layer  = layer;
     out.layers = g.layers + g.mtp_layers;
@@ -332,10 +337,10 @@ void load_feed_forward_weights(const artifact::MaterializedArtifact& backing,
         return;
     }
     out.moe.router_shared_gate = materialized_weight(backing, source.router,
-                                                     kMoeGeometry.router_rows(), g.hidden);
+                                                     moe_geometry(g).router_rows(), g.hidden);
     out.moe.router_bias        = static_cast<const float*>(
         artifact::materialized_tensor(backing, source.router_bias, NumericFormat::FP32,
-                                      {static_cast<std::uint64_t>(kMoeGeometry.experts)})
+                                      {static_cast<std::uint64_t>(moe_geometry(g).experts)})
             .data);
     // Resident, the weight is the artifact's. Banked, it is what the bank made of the object
     // as it filled: the file's blocks as they lie (the bank has given the artifact the mapped
@@ -364,18 +369,20 @@ void load_feed_forward_weights(const artifact::MaterializedArtifact& backing,
     };
     const std::byte* host_gate_up = nullptr;
     const std::byte* host_down    = nullptr;
-    out.moe.routed_gate_up = routed(source.routed_gate_up, kMoeGeometry.routed_gate_rows(),
+    out.moe.routed_gate_up = routed(source.routed_gate_up, moe_geometry(g).routed_gate_rows(),
                                     g.hidden, host_gate_up, out.gate_up_planes);
-    out.moe.routed_down    = routed(source.routed_down, kMoeGeometry.routed_down_rows(),
-                                    kMoeGeometry.intermediate, host_down, out.down_planes);
+    out.moe.routed_down    = routed(source.routed_down, moe_geometry(g).routed_down_rows(),
+                                    moe_geometry(g).intermediate, host_down, out.down_planes);
+    if (g.shared_intermediate > 0) {
     out.moe.shared_gate_up = materialized_weight(backing, source.shared_gate_up,
-                                                 kMoeGeometry.shared_rows(), g.hidden);
+                                                 moe_geometry(g).shared_rows(), g.hidden);
     out.moe.shared_down    = materialized_weight(backing, source.shared_down, g.hidden,
-                                                 kMoeGeometry.shared_intermediate);
-    out.moe.experts_per_token = kMoeGeometry.experts_per_token;
-    out.moe.routed_scale      = kMoeGeometry.routed_scale;
-    out.moe.shared_gated      = kMoeGeometry.shared_gated;
-    out.moe.swiglu_limit      = kMoeGeometry.swiglu_limit;
+                                                 moe_geometry(g).shared_intermediate);
+    }
+    out.moe.experts_per_token = moe_geometry(g).experts_per_token;
+    out.moe.routed_scale      = moe_geometry(g).routed_scale;
+    out.moe.shared_gated      = moe_geometry(g).shared_gated;
+    out.moe.swiglu_limit      = moe_geometry(g).swiglu_limit;
     // A layer is banked as a pair, so either both pointers are set or neither.
     if (host_gate_up != nullptr && host_down != nullptr) {
         out.host_gate_up = host_gate_up;
@@ -411,34 +418,47 @@ void load_latent_projection(const artifact::MaterializedArtifact& backing,
         backing, source.query_a_norm, NumericFormat::BF16,
         {static_cast<std::uint64_t>(g.q_lora_rank)});
     payload.query_b      = materialized_weight(backing, source.query_b,
-                                               g.query_heads * TextConfig::qk_head_dim,
+                                               g.query_heads * g.qk_head_dim,
                                                g.q_lora_rank);
     payload.kv_a         = materialized_weight(backing, source.kv_a, g.kv_lora_rank, g.hidden);
     payload.kv_a_norm    = artifact::materialized_tensor(
         backing, source.kv_a_norm, NumericFormat::BF16,
         {static_cast<std::uint64_t>(g.kv_lora_rank)});
     payload.k_b = materialized_weight(backing, source.k_b, g.latent_key_rows(),
-                                      TextConfig::qk_head_dim);
+                                      g.qk_head_dim);
     payload.v_b = materialized_weight(backing, source.v_b,
-                                      g.query_heads * TextConfig::v_head_dim, g.kv_lora_rank);
+                                      g.query_heads * g.v_head_dim, g.kv_lora_rank);
 }
 
 } // namespace
 
 family::TextGeometry declared_geometry_with_schedule(const artifact::Reader& reader) {
-    family::TextGeometry geometry = family::TextGeometry::declared<TextConfig>(reader.geometry());
-    // Which layers attend is read off the objects, not off a number: a layer holding a latent
-    // key/value projection attends. A checkpoint whose layer count the artifact declares
-    // therefore brings its own schedule with it, and the two cannot disagree.
-    for (std::int32_t layer = 0; layer < geometry.layers; ++layer) {
-        const std::string name = "text/layers/" + std::to_string(layer) + "/mla/kv_a";
-        if (reader.find(name) != nullptr) { geometry.declare_attention_layer(layer); }
+    auto geometry = family::TextGeometry::resolved_moe(reader.geometry(), reader.layer_types());
+    const auto require = [&](const char* name, bool positive = true) {
+        const auto found = reader.geometry().find(name);
+        if (found == reader.geometry().end() || (positive && found->second <= 0)) {
+            throw std::invalid_argument(std::string("missing or invalid geometry.") + name);
+        }
+    };
+    for (const char* name : {"hc_streams", "hc_sinkhorn_iterations", "hc_epsilon", "q_lora_rank",
+                             "kv_lora_rank", "qk_head_dim", "v_head_dim", "gdn_conv_kernel",
+                             "gdn_key_heads", "gdn_key_head_dim", "gdn_value_heads",
+                             "gdn_value_head_dim", "kda_gate_rank", "kda_gate_bound", "gdn_scale",
+                             "dense_intermediate", "routed_scale"}) { require(name); }
+    for (const char* name : {"leading_dense_layers", "shared_intermediate", "swiglu_limit", "mtp_layers"}) {
+        require(name, false);
     }
-    if (!geometry.attention_schedule_declared) {
-        throw std::runtime_error(
-            "glm5_next: this artifact holds no latent-attention layer at all; every GLM-5.3 "
-            "checkpoint attends at some of its layers, so the objects it carries do not "
-            "describe this architecture");
+    const auto& g = geometry;
+    if (g.kv_heads != 1 || g.rotary_dim != 0 || g.head_dim != g.kv_lora_rank ||
+        static_cast<std::int64_t>(g.hc_streams) * g.hidden != g.residual ||
+        g.gdn_key_heads != g.gdn_value_heads || g.gdn_key_head_dim != g.gdn_value_head_dim ||
+        g.leading_dense_layers > g.layers || g.mtp_layers > 1) {
+        throw std::invalid_argument("inconsistent GLM checkpoint geometry");
+    }
+    for (const auto width : {g.qk_head_dim, g.v_head_dim, g.kv_lora_rank}) {
+        if (static_cast<std::int64_t>(g.query_heads) * width > INT32_MAX) {
+            throw std::invalid_argument("GLM latent projection width exceeds int32");
+        }
     }
     return geometry;
 }
@@ -514,9 +534,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         const auto* tensor = stored != nullptr ? std::get_if<artifact::TensorDescriptor>(stored)
                                                : nullptr;
         if (tensor == nullptr) { continue; }
-        const std::int64_t rows = gate_up ? kMoeGeometry.routed_gate_rows()
-                                          : kMoeGeometry.routed_down_rows();
-        const std::int32_t columns = gate_up ? g.hidden : kMoeGeometry.intermediate;
+        const std::int64_t rows = gate_up ? moe_geometry(g).routed_gate_rows()
+                                          : moe_geometry(g).routed_down_rows();
+        const std::int32_t columns = gate_up ? g.hidden : moe_geometry(g).intermediate;
         family::bank_as_planes(object, rows, columns, artifact::qtype_for(tensor->format),
                                bank_planes);
     }
@@ -571,7 +591,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             // No per-head query or key norm: this attention normalises its two low ranks
             // instead, and those live in the projection payload.
             target.output = materialized_weight(backing, source.attention.output, g.hidden,
-                                                g.query_heads * TextConfig::v_head_dim);
+                                                g.query_heads * g.v_head_dim);
             target.post_attention_norm = post_norm;
             target.post_mixer = load_feed_forward(backing, source, g, host_bank.get(),
                                                   &plan.host_bank, post_norm, layer);
@@ -582,7 +602,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             payload.hc               = load_hyper_connection(backing, source.attention_hc, g,
                                                                 layer);
             payload.rms_epsilon      = g.rms_epsilon;
-            payload.gate_lower_bound = TextConfig::kda_gate_lower_bound;
+            payload.gate_lower_bound = -g.kda_gate_bound;
             payload.query_key_value = materialized_weight(backing, source.kda.query_key_value,
                                                           g.convolution_dim(), g.hidden);
             payload.decay_a = materialized_weight(backing, source.kda.decay_a, g.kda_gate_rank,
@@ -635,7 +655,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         // No per-head query or key norm and no output gate, as in the trunk: the family's
         // tail skips both for this target and the two norm slots stay empty.
         mtp.output = materialized_weight(backing, plan.mtp.attention.output, g.hidden,
-                                         g.query_heads * TextConfig::v_head_dim);
+                                         g.query_heads * g.v_head_dim);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16,
             {static_cast<std::uint64_t>(g.hidden)});

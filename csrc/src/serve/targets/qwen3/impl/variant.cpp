@@ -179,11 +179,11 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
 // target's own refusal messages.
 SINFER_FAMILY_UNRUNNABLE_LEAVES(no_linear_layers, no_speculation)
 
-void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream) {
     // Only the magic is this target's: 'Q3PB'. Everything else -- which rounds
     // are captured, how the occurrence is counted, the header layout -- is the
     // family's, and lived in nine byte-identical copies before it moved there.
-    family::debug_probe_dump(0x51335042, tag, tensor, TextConfig::layers, stream);
+    family::debug_probe_dump(0x51335042, tag, tensor, layer_count, stream);
 }
 
 } // namespace sinfer::targets::qwen3::detail

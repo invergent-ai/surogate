@@ -54,7 +54,7 @@ std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maxi
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
     const bool family_model =
-        std::find(model_ids.begin(), model_ids.end(), identity.model_id) != model_ids.end();
+        identity.architecture == target_key;
     if (!family_model) {
         throw std::runtime_error("artifact identity '" + identity.model_id + "/" +
                                  identity.weights_id + "' is not supported by target '" +
@@ -66,12 +66,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.weights_id == "fp8-block" || identity.weights_id == "fp8-channel") {
         return WeightsProfile::Fp8Block; // one route, two scale grids
     }
-    if (identity.weights_id == "nvfp4") {
-        // Asked before the family-wide rule: the 3.8 export leaves attention and GDN in FP8
-        // and only the MLP in NVFP4, which is a different set of objects to bind.
-        return identity.model_id == qwen3_8_model_id ? WeightsProfile::Nvfp4MlpOnly
-                                                     : WeightsProfile::Nvfp4MixedBf16;
-    }
+    if (identity.weights_id == "nvfp4-mlp-only") { return WeightsProfile::Nvfp4MlpOnly; }
+    if (identity.weights_id == "nvfp4-mixed-bf16") { return WeightsProfile::Nvfp4MixedBf16; }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
@@ -104,7 +100,7 @@ namespace {
 /// with its name: an adapter half-applied is a model that is neither the base nor
 /// the fine-tune, and it would answer fluently either way.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
-    family::bind_lora_hybrid<detail::TextConfig, detail::FusedAttentionProjectionPayload>(
+    family::bind_lora_hybrid<detail::FusedAttentionProjectionPayload>(
         runtime, options, [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; });
 }
 
@@ -127,13 +123,14 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile,
-                                                        const family::TextGeometry& geometry) {
+                                                        const family::TextGeometry& geometry,
+                                                        const family::VisionGeometry& vision_geometry) {
     return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                         geometry);
+                                                         geometry, vision_geometry);
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    return family::TextGeometry::declared<detail::TextConfig>(reader.geometry());
+    return detail::resolved_geometry(reader);
 }
 
 std::unique_ptr<Package::Program>

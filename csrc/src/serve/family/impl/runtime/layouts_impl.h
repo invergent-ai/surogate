@@ -39,10 +39,7 @@ namespace {
 [[nodiscard]] inline std::int32_t geometry_full_attention_layers(const family::TextGeometry& g) {
     std::int32_t count = 0;
     for (std::int32_t layer = 0; layer < g.layers; ++layer) {
-        const bool attends =
-            g.attention_schedule_declared
-                ? g.layer_attends(layer)
-                : TextConfig::is_full_attention(static_cast<int>(layer));
+        const bool attends = g.layer_attends(layer);
         // A layer that shares an earlier layer's keys and values holds no planes of its own,
         // so it is not one of the cache's layers. The Gemma 4 E-series ends in a run of
         // twenty such layers out of thirty-five; sizing the pool for all of them would
@@ -53,29 +50,12 @@ namespace {
 }
 
 [[nodiscard]] inline std::int32_t geometry_gdn_layers(const family::TextGeometry& g) {
-    return g.layers - geometry_full_attention_layers(g);
+    return g.linear_layer_count();
 }
 
-/// Whether this layer looks through the window, from the artifact's schedule where it
-/// declares one and from the target's compiled predicate otherwise -- the same precedence
-/// `geometry_full_attention_layers` uses, and it has to be the same: a layer counted as
-/// windowed here and global there is a layer whose cache is sized for the wrong geometry.
-///
-/// A target with no window at all has no such predicate and every layer is global, which is
-/// what the `requires` probe answers for every family but Gemma.
-///
-/// A template over the config, not a plain function: `if constexpr` only discards a branch in
-/// a template, so a non-template probe would still type-check `TextConfig::is_windowed_attention`
-/// and fail to compile for every target that has no window.
-template <class Config = TextConfig>
 [[nodiscard]] inline bool geometry_layer_is_windowed(const family::TextGeometry& g,
                                                      std::int32_t layer) {
-    if (g.windowed_schedule_declared) { return g.layer_is_windowed(layer); }
-    if constexpr (requires { Config::is_windowed_attention(0); }) {
-        return Config::is_windowed_attention(static_cast<int>(layer));
-    } else {
-        return false;
-    }
+    return g.layer_is_windowed(layer);
 }
 
 /// The full-attention layers that attend at the *second* geometry, in the numbering the KV
@@ -88,10 +68,7 @@ geometry_global_geometry_layers(const family::TextGeometry& g) {
     if (!g.has_global_attention_geometry()) { return out; }
     std::uint32_t kv_layer = 0;
     for (std::int32_t layer = 0; layer < g.layers; ++layer) {
-        const bool attends =
-            g.attention_schedule_declared
-                ? g.layer_attends(layer)
-                : TextConfig::is_full_attention(static_cast<int>(layer));
+        const bool attends = g.layer_attends(layer);
         // Owners only, in the same order and by the same rule the pool is built with.
         if (!attends || !g.layer_owns_kv(layer)) { continue; }
         if (!geometry_layer_is_windowed(g, layer)) { out.push_back(kv_layer); }
@@ -113,27 +90,27 @@ namespace {
 // Transient bytes one full-attention layer's QSA indexer needs for `tokens` columns over a
 // history of `keys` cells; zero for a target without an indexer.
 template <class V>
-[[nodiscard]] std::size_t variant_indexer_workspace_bytes(std::int32_t tokens,
+[[nodiscard]] std::size_t variant_indexer_workspace_bytes(const family::TextGeometry& g, std::int32_t tokens,
                                                           std::int32_t keys) noexcept {
-    if constexpr (!requires { V::indexer_head_dim; }) {
+    if constexpr (!requires { V::has_qsa_indexer; }) {
         (void)tokens;
         (void)keys;
         return 0;
     } else {
         const auto columns = static_cast<std::size_t>(std::max(tokens, 1));
-        const auto width   = static_cast<std::size_t>(V::indexer_head_dim);
-        const auto heads   = static_cast<std::size_t>(V::indexer_heads);
+        const auto width   = static_cast<std::size_t>(g.indexer_head_dim);
+        const auto heads   = static_cast<std::size_t>(g.indexer_heads);
         const std::size_t raw_keys  = round_up_256(columns * width * sizeof(std::uint16_t));
         const std::size_t queries   = round_up_256(columns * width * heads * sizeof(std::uint16_t));
-        const ops::QsaIndexerGeometry geometry{.head_dim   = V::indexer_head_dim,
-                                               .heads      = V::indexer_heads,
-                                               .block      = V::indexer_block,
-                                               .top_k      = V::indexer_top_k,
+        const ops::QsaIndexerGeometry geometry{.head_dim   = g.indexer_head_dim,
+                                               .heads      = g.indexer_heads,
+                                               .block      = g.indexer_block,
+                                               .top_k      = g.indexer_top_k,
                                                .rotary_dim = 0,
                                                .rope_theta = 0.0F,
                                                .rms_eps    = 0.0F};
         const std::size_t mask = round_up_256(
-            static_cast<std::size_t>(ops::qsa_block_mask_words(keys, V::indexer_block)) * columns *
+            static_cast<std::size_t>(ops::qsa_block_mask_words(keys, g.indexer_block)) * columns *
             sizeof(std::int32_t));
         const std::size_t scores =
             ops::qsa_indexer_select_workspace_capacity_bytes(static_cast<std::int32_t>(columns),
@@ -142,14 +119,6 @@ template <class V>
     }
 }
 
-template <class V>
-[[nodiscard]] constexpr std::int32_t variant_indexer_head_dim() noexcept {
-    if constexpr (requires { V::indexer_head_dim; }) {
-        return static_cast<std::int32_t>(V::indexer_head_dim);
-    } else {
-        return 0;
-    }
-}
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
@@ -265,6 +234,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .global_geometry_layers    = geometry_global_geometry_layers(plan.geometry),
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
+                     .indexer_head_dim          = plan.geometry.indexer_head_dim,
                      .kv_skip_layers            = plan.kv_skip_layers,
                      .enable_mtp                = plan.features.mtp(),
                      .elastic_kv                = plan.elastic_kv,
@@ -296,7 +266,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .slot_count     = linear_state_slots,
                              .conv_dtype     = DType::BF16,
                          },
-                     .ple = ResidualHooks<Variant>::ple_state_spec(linear_state_slots),
+                     .ple = ResidualHooks<Variant>::ple_state_spec(plan.geometry, linear_state_slots),
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
@@ -318,13 +288,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
-            dflash.local = plan_cyclic_kv_cache(builder, DFlashConfig::local_layers,
-                                                DFlashConfig::local_capacity,
-                                                DFlashConfig::kv_heads, DFlashConfig::head_dim,
+            dflash.geometry = plan.geometry.dflash;
+            dflash.local = plan_cyclic_kv_cache(builder, plan.geometry.dflash.local_layers,
+                                                plan.geometry.dflash.local_capacity,
+                                                plan.geometry.dflash.kv_heads, plan.geometry.dflash.head_dim,
                                                 static_cast<std::int32_t>(plan.max_concurrency));
             dflash.rewrite_checkpoint_local = plan_cyclic_kv_cache(
-                builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
-                DFlashConfig::kv_heads, DFlashConfig::head_dim,
+                builder, plan.geometry.dflash.local_layers, plan.geometry.dflash.local_capacity,
+                plan.geometry.dflash.kv_heads, plan.geometry.dflash.head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
             PagedKVPoolSpec full_pool{
                 .page_group_count      = plan.main_page_groups,
@@ -333,26 +304,26 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .plane_order           = PagedKVPlaneOrder::HeadMajor,
                 .planes =
                     {
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        {DType::BF16, plan.geometry.dflash.head_dim, plan.geometry.dflash.kv_heads, 256},
+                        {DType::BF16, plan.geometry.dflash.head_dim, plan.geometry.dflash.kv_heads, 256},
                     },
             };
             dflash.full = family::PagedKVCacheLayout{
                 .pool        = plan_paged_kv_pool(builder, full_pool),
                 .layers      = 1,
                 .max_context = plan.capacity,
-                .kv_heads    = DFlashConfig::kv_heads,
-                .head_dim    = DFlashConfig::head_dim,
+                .kv_heads    = plan.geometry.dflash.kv_heads,
+                .head_dim    = plan.geometry.dflash.head_dim,
                 .dtype       = DType::BF16,
                 .quant_group = 0,
             };
             dflash.prefill_features = add_tensor(
-                builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},
+                builder, DType::BF16, {plan.geometry.dflash.feature_rows, effective_prefill_chunk},
                 "DFlash prefill target features");
             dflash.prefill_positions = add_tensor(builder, DType::I32, {effective_prefill_chunk},
                                                   "DFlash prefill target positions");
             dflash.pending_features  = add_tensor(builder, DType::BF16,
-                                                  {DFlashConfig::feature_rows,
+                                                  {plan.geometry.dflash.feature_rows,
                                                    static_cast<std::int32_t>(plan.draft_window + 1U),
                                                    static_cast<std::int32_t>(plan.max_concurrency)},
                                                   "DFlash pending target features");
@@ -458,7 +429,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         // has an indexer — the selection engages only past its budget, but the append runs for
         // every column of every round, and a short workspace would be a hard failure.
         scratch(layout, variant_indexer_workspace_bytes<Variant>(
-                            last, static_cast<std::int32_t>(envelope.max_visible_keys)));
+                            plan.geometry, last, static_cast<std::int32_t>(envelope.max_visible_keys)));
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             plan.geometry.head_dim, plan.geometry.query_heads,
                             plan.geometry.kv_heads, plan.kv_dtype, envelope,
@@ -528,7 +499,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             matrix(layout, DType::I32, 1, last);
             matrix(layout, DType::I32, 1, last);
             scratch(layout,
-                    ResidualHooks<Variant>::layer_prologue_workspace_capacity_bytes(first, last));
+                    ResidualHooks<Variant>::layer_prologue_workspace_capacity_bytes(plan.geometry, first, last));
         }
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
         // A pure-attention target has no linear mixer, so it needs none of the
@@ -556,7 +527,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
-            matrix(layout, DType::BF16, Variant::draft_head_rows, columns);
+            matrix(layout, DType::BF16, plan.geometry.draft_vocab, columns);
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -719,45 +690,45 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             const auto dflash_context_capacity = [&](std::int32_t tokens, bool compact_input) {
                 WorkspaceLayoutBuilder layout;
                 if (compact_input) {
-                    matrix(layout, DType::BF16, DFlashConfig::feature_rows, tokens);
+                    matrix(layout, DType::BF16, plan.geometry.dflash.feature_rows, tokens);
                 }
-                (void)workspace_recipe::dflash_context<DFlashConfig>(layout, tokens);
+                (void)workspace_recipe::dflash_context(layout, tokens, plan.geometry.dflash);
                 {
                     auto layer = layout.scope();
-                    (void)workspace_recipe::dflash_context_layer<DFlashConfig>(layout, tokens);
+                    (void)workspace_recipe::dflash_context_layer(layout, tokens, plan.geometry.dflash);
                 }
                 return finish(layout);
             };
             const auto dflash_proposal_capacity = [&](std::int32_t width, std::int32_t batch) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens = width * batch;
-                matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
+                matrix(layout, DType::BF16, plan.geometry.dflash.hidden, tokens);
                 {
                     auto attention = layout.scope();
-                    (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
+                    (void)workspace_recipe::dflash_attention(layout, tokens, plan.geometry.dflash);
                     scratch(layout,
                             std::max(ops::swa_workspace_capacity_bytes({0, plan.capacity}, width,
                                                                        width, batch),
                                      ops::bidirectional_gqa_attention_workspace_capacity_bytes(
                                          {0, plan.capacity}, width, width, batch)));
                     scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::query_size, tokens, tokens));
+                                        QType::W8G32_F16S, plan.geometry.dflash.hidden,
+                                        plan.geometry.dflash.query_size(), tokens, tokens));
                 }
                 {
                     auto mlp = layout.scope();
-                    (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
+                    (void)workspace_recipe::dflash_mlp(layout, tokens, plan.geometry.dflash);
                     scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                        DFlashConfig::hidden, tokens, tokens));
+                                        QType::W8G32_F16S, 2 * plan.geometry.dflash.intermediate,
+                                        plan.geometry.dflash.hidden, tokens, tokens));
                     scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::intermediate, tokens, tokens));
+                                        QType::W8G32_F16S, plan.geometry.dflash.hidden,
+                                        plan.geometry.dflash.intermediate, tokens, tokens));
                 }
-                matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
-                matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
+                matrix(layout, DType::BF16, plan.geometry.dflash.hidden, drafts * batch);
+                matrix(layout, DType::BF16, plan.geometry.dflash.hidden, drafts * batch);
                 if (plan.proposal_head == ProposalHead::Optimized) {
-                    matrix(layout, DType::BF16, Variant::draft_head_rows, drafts * batch);
+                    matrix(layout, DType::BF16, plan.geometry.draft_vocab, drafts * batch);
                 } else {
                     matrix(layout, DType::BF16, plan.geometry.output_rows, drafts * batch);
                 }
@@ -786,11 +757,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         constexpr std::uint32_t kFrontendMergedLimit  = 32768;
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = std::min(plan.capacity, kFrontendMergedLimit);
-        // The planner has no artifact in hand, so it sizes the envelope for the tower this
-        // target compiles. A checkpoint that declares a wider one is caught at admission,
-        // where the item's own workspace is measured against this capacity.
+        // Reserve the workspace of the tower declared by this checkpoint.
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
-            schedule::compiled_vision_geometry(), merged,
+            plan.vision_geometry, merged,
             std::min(merged, kFrontendSegmentLimit));
     }
 
@@ -799,9 +768,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
-void validate_target_options(DeviceContext& device, const EngineOptions& options) {
-    if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
-        throw std::invalid_argument("max_context exceeds the variant native context capacity");
+void validate_target_options(DeviceContext& device, const EngineOptions& options,
+                             const family::TextGeometry& geometry) {
+    if (geometry.max_context <= 0 || !geometry.attention_schedule_declared || !geometry.windowed_schedule_declared) {
+        throw std::invalid_argument("sequence planning requires complete checkpoint geometry");
+    }
+    const auto maximum = static_cast<std::uint32_t>(geometry.max_context);
+    if (options.max_context == 0 || options.max_context > maximum) {
+        throw std::invalid_argument("max_context exceeds the checkpoint context capacity");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
@@ -848,6 +822,10 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     case SpeculativeBackend::DFlash:
+        if (geometry.dflash.layers == 0 || options.max_context > geometry.dflash.max_context ||
+            options.speculative.draft_tokens >= geometry.dflash.block_size) {
+            throw std::invalid_argument("DFlash options exceed the checkpoint context or block size");
+        }
         if (kMaximumDFlashDraftTokens == 0) {
             throw std::invalid_argument("DFlash is not supported by this target");
         }
@@ -873,6 +851,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     auto impl                 = std::make_unique<SequencePlanImpl>();
     impl->weights_profile     = inputs.weights_profile;
     impl->geometry            = inputs.geometry;
+    impl->vision_geometry = inputs.vision_geometry;
     impl->capacity            = inputs.capacity;
     impl->main_page_groups    = main_page_groups;
     // Elastic: lay out the virtual maximum (every lane at full context); the physical cap
@@ -913,11 +892,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     if (impl->features.vision) {
         constexpr std::uint32_t kFrontendMergedLimit = 32768;
         const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
-        // The planner has no artifact in hand, so it reserves for the tower this target
-        // compiles -- but at the text width the checkpoint declared, since that is what the
-        // merger writes and what every per-request transient will be measured against.
-        const family::VisionGeometry vision = schedule::bound_vision_geometry(
-            schedule::compiled_vision_geometry(), impl->geometry);
+        const family::VisionGeometry& vision = impl->vision_geometry;
         impl->request_transient_capacity_bytes =
             schedule::VisionContext::output_transient_bytes(vision, merged);
     }
@@ -979,8 +954,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 std::unique_ptr<family::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
-                           const family::TextGeometry& geometry) {
-    validate_target_options(device, options);
+                           const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry) {
+    validate_target_options(device, options, geometry);
+    if (options.enable_vision && (vision_geometry.layers <= 0 || vision_geometry.output_hidden != geometry.hidden)) {
+        throw std::invalid_argument("vision planning requires the checkpoint's vision geometry");
+    }
     const KvCacheStorage kv_storage = resolve_kv_storage(options.kv_cache, geometry);
     if (kv_storage == KvCacheStorage::Fp8E4M3 &&
         options.speculative.backend == SpeculativeBackend::DFlash) {
@@ -995,6 +973,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .geometry            = geometry,
+        .vision_geometry     = vision_geometry,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),

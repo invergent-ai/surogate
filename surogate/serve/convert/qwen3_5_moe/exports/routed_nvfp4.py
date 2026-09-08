@@ -1,57 +1,7 @@
-"""Routed experts in NVFP4 for the Qwen3.6-35B-A3B target.
-
-The 35B is the last model whose routed experts come from a groupwise-int export
-(Q4 gate/up, Q5 or Q6 down), and the board's own reading is that on this hardware
-the weight format is worth more than any scheduling lever.  This module builds the
-routed half of a second artifact profile — ``routed-nvfp4`` — from an NVFP4
-checkpoint, leaving every other object exactly as ``convert`` already writes it.
-
-Two things make the routed case different from the dense NVFP4 export the 27B
-uses:
-
-* **The experts are stacked.**  The checkpoint stores one tensor per expert per
-  projection; the artifact stores one matrix per layer with the experts as row
-  blocks.  Codes concatenate verbatim (they are row-major nibble pairs either
-  way), and the block scales are swizzled once over the stacked matrix — an
-  expert is 1,024 rows of gate/up and 2,048 of down, both multiples of the
-  layout's 128-row tile, so no expert straddles a tile.
-
-* **The second level does not stack.**  NVFP4 pairs an e4m3 scale per 16 values
-  with a global scale, and the checkpoint stores that global scale per expert and
-  per projection.  Measured over one layer's 256 experts it takes 96-118 distinct
-  values spanning 3.3-7.0x, so it cannot be folded into the single per-tensor
-  divisor the NVFP4 payload carries, and re-deriving the e4m3 block scales around
-  a shared global scale would re-round every block on a four-bit format.  It is
-  therefore written as a separate FP32 object per layer and applied by the MoE
-  kernels once per expert dot (``ops::SparseMoeWeights::routed_gate_up_scale``).
-
-Row order within an expert's gate/up block is **[up; gate]** (see ``build_gate_up``).
-The checkpoint's global scale *divides* (compressed-tensors computes it as
-``6 * 448 / amax``); the engine's arrays *multiply*, so this module writes the
-reciprocal.  Only compressed-tensors ``nvfp4-pack-quantized`` is accepted — a
-ModelOpt export spells the same numbers differently and inverts that convention,
-so it is refused by name rather than mis-scaled silently.
-
-The experts are served by a W4A4 runner, which quantises the activations too, so
-two more per-expert arrays per projection come out of the checkpoint:
-
-* ``*_act_scale`` — the checkpoint's ``input_global_scale`` verbatim, the
-  multiplier the runner applies to a row before rounding it to e2m1.  It is the
-  *large* number (``6 * 448 / amax`` of the calibration activations), which is
-  what puts the e4m3 block scale it derives in that format's normal range.
-* ``*_alpha`` — ``1 / (input_global_scale * weight_global_scale)``, the epilogue
-  factor that undoes both global scales after the block-scaled MMA.  The product
-  ``act_scale * alpha * weight_global_scale`` is 1 by construction; only where
-  the e4m3 rounding happens distinguishes this pairing from its reciprocal.
-
-The runner carries one alpha and one activation scale per expert per projection,
-not one per row half, so gate and up must agree on both.  They do in the
-published checkpoint; a source where they do not is refused rather than served
-with one of the two silently applied to both.
-"""
-
+"""Preserve routed NVFP4 words and per-expert calibration from the checkpoint."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
@@ -67,13 +17,6 @@ from .. import inventory
 NVFP4 = "NVFP4"
 BLOCK_SCALE_LAYOUT = "blockscale-k16-m128x4-v1"
 WEIGHTS_ID = "routed-nvfp4"
-
-EXPERTS = 256
-HIDDEN = 2048
-MOE_INTERMEDIATE = 512
-
-GATE_UP_SHAPE = (EXPERTS * 2 * MOE_INTERMEDIATE, HIDDEN)
-DOWN_SHAPE = (EXPERTS * HIDDEN, MOE_INTERMEDIATE)
 
 GATE_UP_SUFFIX = "/moe/routed_gate_up"
 DOWN_SUFFIX = "/moe/routed_down"
@@ -91,7 +34,7 @@ def _nvfp4_spec(name: str, shape: tuple[int, ...]) -> TensorSpec:
     )
 
 
-def tensor_specs() -> tuple[TensorSpec, ...]:
+def tensor_specs(g: inventory.Geometry, *, dflash=None) -> tuple[TensorSpec, ...]:
     """The target's tensor specs with the text routed experts in NVFP4.
 
     Every other object — including the MTP block's own W8 experts, which this
@@ -99,28 +42,28 @@ def tensor_specs() -> tuple[TensorSpec, ...]:
     """
 
     specs: list[TensorSpec] = []
-    for spec in inventory.TENSOR_SPECS:
+    for spec in inventory.build_tensor_specs(g, dflash=dflash):
         if spec.name.startswith("text/layers/") and spec.name.endswith(GATE_UP_SUFFIX):
             specs.append(_nvfp4_spec(spec.name, spec.shape))
             specs.append(
-                tensor_spec(spec.name + SCALE_SUFFIX, (2 * EXPERTS,), inventory.FP32)
+                tensor_spec(spec.name + SCALE_SUFFIX, (2 * g.experts,), inventory.FP32)
             )
             specs.append(
-                tensor_spec(spec.name + ACT_SCALE_SUFFIX, (EXPERTS,), inventory.FP32)
+                tensor_spec(spec.name + ACT_SCALE_SUFFIX, (g.experts,), inventory.FP32)
             )
             specs.append(
-                tensor_spec(spec.name + ALPHA_SUFFIX, (EXPERTS,), inventory.FP32)
+                tensor_spec(spec.name + ALPHA_SUFFIX, (g.experts,), inventory.FP32)
             )
         elif spec.name.startswith("text/layers/") and spec.name.endswith(DOWN_SUFFIX):
             specs.append(_nvfp4_spec(spec.name, spec.shape))
             specs.append(
-                tensor_spec(spec.name + SCALE_SUFFIX, (EXPERTS,), inventory.FP32)
+                tensor_spec(spec.name + SCALE_SUFFIX, (g.experts,), inventory.FP32)
             )
             specs.append(
-                tensor_spec(spec.name + ACT_SCALE_SUFFIX, (EXPERTS,), inventory.FP32)
+                tensor_spec(spec.name + ACT_SCALE_SUFFIX, (g.experts,), inventory.FP32)
             )
             specs.append(
-                tensor_spec(spec.name + ALPHA_SUFFIX, (EXPERTS,), inventory.FP32)
+                tensor_spec(spec.name + ALPHA_SUFFIX, (g.experts,), inventory.FP32)
             )
         else:
             specs.append(spec)
@@ -145,7 +88,7 @@ def layer_of(name: str) -> int:
     return int(name.split("/")[2])
 
 
-def validate_config(config: Mapping[str, object]) -> dict[str, object]:
+def validate_config(config: Mapping[str, object], geometry: inventory.Geometry) -> dict[str, object]:
     """Refuse anything but a compressed-tensors NVFP4 checkpoint.
 
     ``quantization_config`` is the authority, not the tensor names: a ModelOpt
@@ -180,11 +123,13 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
     text = config.get("text_config", config)
     layers = text.get("num_hidden_layers")
     experts = text.get("num_experts")
-    if layers != len(inventory.TEXT_LAYERS) or experts != EXPERTS:
-        raise ValueError(
-            f"routed NVFP4 source has {layers} layers and {experts} experts, "
-            f"expected {len(inventory.TEXT_LAYERS)} and {EXPERTS}"
-        )
+    resolved = inventory.geometry_from_config(config, token_domain=geometry.token_domain)
+    for name in ("layers", "hidden", "intermediate", "experts", "experts_per_token", "shared_intermediate",
+                 "vocab", "layer_types", "head_dim", "query_heads", "kv_heads"):
+        if getattr(resolved, name) != getattr(geometry, name):
+            raise ValueError(f"routed NVFP4 source disagrees with the target checkpoint: {name}")
+    if geometry.hidden % 16 or geometry.intermediate % 16:
+        raise ValueError("routed NVFP4 requires hidden and expert widths divisible by 16")
     return {
         "quant_method": method,
         "format": sorted(formats)[0],
@@ -195,7 +140,7 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
 
 def _positive(tensor: torch.Tensor, what: str) -> float:
     value = float(tensor.reshape(()).to(torch.float32))
-    if not (value > 0.0) or value != value:
+    if not (value > 0.0) or not math.isfinite(value):
         raise ValueError(f"{what} is {value}, expected finite positive")
     return value
 
@@ -226,10 +171,10 @@ def _require_shape(tensor: torch.Tensor, shape: tuple[int, int], what: str) -> N
         raise ValueError(f"{what} has shape {tuple(tensor.shape)}, expected {shape}")
 
 
-def source_names(layer: int) -> Iterator[str]:
+def source_names(layer: int, g: inventory.Geometry) -> Iterator[str]:
     """Every source tensor one layer's routed experts read, for preflight."""
 
-    for expert in range(EXPERTS):
+    for expert in range(g.experts):
         for projection in ("gate_proj", "up_proj", "down_proj"):
             base = f"model.layers.{layer}.mlp.experts.{expert}.{projection}."
             yield base + "weight_packed"
@@ -238,12 +183,32 @@ def source_names(layer: int) -> Iterator[str]:
             yield base + "input_global_scale"
 
 
+def preflight_source(reader: ShardReader, g: inventory.Geometry) -> None:
+    """Validate every expert signature and scalar calibration before opening the artifact."""
+    for layer in range(g.layers):
+        metadata = reader.metadata(tuple(source_names(layer, g)))
+        for expert in range(g.experts):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                n, k = (g.hidden, g.intermediate) if projection == "down_proj" else (g.intermediate, g.hidden)
+                base = f"model.layers.{layer}.mlp.experts.{expert}.{projection}."
+                for suffix, shape, dtype in (("weight_packed", (n, k // 2), "U8"),
+                                              ("weight_scale", (n, k // 16), "F8_E4M3")):
+                    actual = metadata[base + suffix]
+                    if actual.shape != shape or actual.dtype != dtype:
+                        raise ValueError(f"{base + suffix}: stored signature disagrees with checkpoint dimensions")
+                for suffix in ("weight_global_scale", "input_global_scale"):
+                    actual = metadata[base + suffix]
+                    if math.prod(actual.shape) != 1 or actual.dtype not in ("BF16", "F16", "F32"):
+                        raise ValueError(f"{base + suffix}: expected one floating-point scale")
+                    _positive(reader.get(base + suffix), base + suffix)
+
+
 def build_gate_up(
-    reader: ShardReader, layer: int
+    reader: ShardReader, layer: int, g: inventory.Geometry
 ) -> tuple[bytes, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One layer's stacked up/gate experts: the payload and its three scale arrays.
 
-    Rows run ``expert * 1024 + half * 512 + row`` with **up first, gate second** —
+    Rows run ``(expert * 2 + half) * intermediate + row`` with **up first, gate second** —
     the order TensorRT-LLM's fused MoE runner reads (``linear`` from the first half,
     ``gate`` from the second; vLLM performs the same swap in
     ``reorder_w1w3_to_w3w1`` before handing it that kernel). This is the opposite of
@@ -255,25 +220,25 @@ def build_gate_up(
     a source where they do not is refused rather than half-applied.
     """
 
-    rows = EXPERTS * 2 * MOE_INTERMEDIATE
-    codes = torch.empty((rows, HIDDEN // 2), dtype=torch.uint8)
-    scales = torch.empty((rows, HIDDEN // _BLOCK), dtype=torch.uint8)
-    second = torch.empty(2 * EXPERTS, dtype=torch.float32)
-    act_scale = torch.empty(EXPERTS, dtype=torch.float32)
-    alpha = torch.empty(EXPERTS, dtype=torch.float32)
-    for expert in range(EXPERTS):
+    rows = g.experts * 2 * g.intermediate
+    codes = torch.empty((rows, g.hidden // 2), dtype=torch.uint8)
+    scales = torch.empty((rows, g.hidden // _BLOCK), dtype=torch.uint8)
+    second = torch.empty(2 * g.experts, dtype=torch.float32)
+    act_scale = torch.empty(g.experts, dtype=torch.float32)
+    alpha = torch.empty(g.experts, dtype=torch.float32)
+    for expert in range(g.experts):
         halves: list[tuple[float, float]] = []
         for half, projection in enumerate(("up_proj", "gate_proj")):
             plane, scale_plane, global_scale, activation = _projection(
                 reader, layer, expert, projection
             )
-            _require_shape(plane, (MOE_INTERMEDIATE, HIDDEN // 2), f"L{layer} e{expert} {projection} codes")
+            _require_shape(plane, (g.intermediate, g.hidden // 2), f"L{layer} e{expert} {projection} codes")
             _require_shape(
-                scale_plane, (MOE_INTERMEDIATE, HIDDEN // _BLOCK), f"L{layer} e{expert} {projection} scales"
+                scale_plane, (g.intermediate, g.hidden // _BLOCK), f"L{layer} e{expert} {projection} scales"
             )
-            begin = (expert * 2 + half) * MOE_INTERMEDIATE
-            codes[begin : begin + MOE_INTERMEDIATE] = plane
-            scales[begin : begin + MOE_INTERMEDIATE] = scale_plane
+            begin = (expert * 2 + half) * g.intermediate
+            codes[begin : begin + g.intermediate] = plane
+            scales[begin : begin + g.intermediate] = scale_plane
             second[expert * 2 + half] = 1.0 / global_scale
             halves.append((global_scale, activation))
         (up_weight, up_act), (gate_weight, gate_act) = halves
@@ -285,36 +250,36 @@ def build_gate_up(
             )
         act_scale[expert] = up_act
         alpha[expert] = 1.0 / (up_act * up_weight)
-    payload = encode_nvfp4(codes, scales, torch.tensor(1.0, dtype=torch.float32), GATE_UP_SHAPE)
+    payload = encode_nvfp4(codes, scales, torch.tensor(1.0, dtype=torch.float32), (g.experts * 2 * g.intermediate, g.hidden))
     return payload, second, act_scale, alpha
 
 
 def build_down(
-    reader: ShardReader, layer: int
+    reader: ShardReader, layer: int, g: inventory.Geometry
 ) -> tuple[bytes, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One layer's stacked down experts: the payload and its three scale arrays."""
 
-    rows = EXPERTS * HIDDEN
-    codes = torch.empty((rows, MOE_INTERMEDIATE // 2), dtype=torch.uint8)
-    scales = torch.empty((rows, MOE_INTERMEDIATE // _BLOCK), dtype=torch.uint8)
-    second = torch.empty(EXPERTS, dtype=torch.float32)
-    act_scale = torch.empty(EXPERTS, dtype=torch.float32)
-    alpha = torch.empty(EXPERTS, dtype=torch.float32)
-    for expert in range(EXPERTS):
+    rows = g.experts * g.hidden
+    codes = torch.empty((rows, g.intermediate // 2), dtype=torch.uint8)
+    scales = torch.empty((rows, g.intermediate // _BLOCK), dtype=torch.uint8)
+    second = torch.empty(g.experts, dtype=torch.float32)
+    act_scale = torch.empty(g.experts, dtype=torch.float32)
+    alpha = torch.empty(g.experts, dtype=torch.float32)
+    for expert in range(g.experts):
         plane, scale_plane, global_scale, activation = _projection(
             reader, layer, expert, "down_proj"
         )
-        _require_shape(plane, (HIDDEN, MOE_INTERMEDIATE // 2), f"L{layer} e{expert} down codes")
+        _require_shape(plane, (g.hidden, g.intermediate // 2), f"L{layer} e{expert} down codes")
         _require_shape(
-            scale_plane, (HIDDEN, MOE_INTERMEDIATE // _BLOCK), f"L{layer} e{expert} down scales"
+            scale_plane, (g.hidden, g.intermediate // _BLOCK), f"L{layer} e{expert} down scales"
         )
-        begin = expert * HIDDEN
-        codes[begin : begin + HIDDEN] = plane
-        scales[begin : begin + HIDDEN] = scale_plane
+        begin = expert * g.hidden
+        codes[begin : begin + g.hidden] = plane
+        scales[begin : begin + g.hidden] = scale_plane
         second[expert] = 1.0 / global_scale
         act_scale[expert] = activation
         alpha[expert] = 1.0 / (activation * global_scale)
-    payload = encode_nvfp4(codes, scales, torch.tensor(1.0, dtype=torch.float32), DOWN_SHAPE)
+    payload = encode_nvfp4(codes, scales, torch.tensor(1.0, dtype=torch.float32), (g.experts * g.hidden, g.intermediate))
     return payload, second, act_scale, alpha
 
 
@@ -325,8 +290,9 @@ class LayerCache:
     checkpoint, but the writer asks for them one object at a time.
     """
 
-    def __init__(self, reader: ShardReader) -> None:
+    def __init__(self, reader: ShardReader, geometry: inventory.Geometry) -> None:
         self._reader = reader
+        self._geometry = geometry
         self._layer: int | None = None
         self._objects: dict[str, object] = {}
 
@@ -334,9 +300,9 @@ class LayerCache:
         layer = layer_of(name)
         if layer != self._layer:
             gate_up, gate_up_scale, gate_up_act, gate_up_alpha = build_gate_up(
-                self._reader, layer
+                self._reader, layer, self._geometry
             )
-            down, down_scale, down_act, down_alpha = build_down(self._reader, layer)
+            down, down_scale, down_act, down_alpha = build_down(self._reader, layer, self._geometry)
             prefix = f"text/layers/{layer}"
             self._objects = {
                 prefix + GATE_UP_SUFFIX: gate_up,

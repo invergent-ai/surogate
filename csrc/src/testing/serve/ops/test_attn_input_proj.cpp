@@ -618,6 +618,17 @@ int run_w8_ungated_case(DevicePackedWeight& parent, std::int32_t hidden, std::in
 
 int run_w8_ungated() {
     int failures = 0;
+    // Unregistered parent widths and a different split of a registered parent.
+    for (const auto& shape : std::array<std::array<std::int32_t, 3>, 3>{
+             {{{1024, 1024, 512}}, {{256, 128, 64}}, {{1024, 1024, 1536}}}}) {
+        const auto [hidden, q_rows, kv_rows] = shape;
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(
+            QType::W8G32_F16S, q_rows + 2 * kv_rows, hidden, 619U));
+        for (const std::int32_t tokens : {1, 17, 128}) {
+            failures += run_w8_ungated_case(parent, hidden, q_rows, kv_rows,
+                                             "generic split", 621U, tokens);
+        }
+    }
     // qwen3-0.6b: 16 query heads and 8 KV heads at head dim 128 over hidden 1024.
     {
         DevicePackedWeight parent(

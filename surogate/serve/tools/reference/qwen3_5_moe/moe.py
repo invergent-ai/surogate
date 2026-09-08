@@ -1,4 +1,4 @@
-"""Sparse-MoE oracle over the selected rows of the 35B expert banks."""
+"""Sparse-MoE oracle over the selected rows of the checkpoint expert banks."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from typing import Any, cast
 import torch
 
 from .bindings import ExpertBank, MoeBinding
-from .config import CFG
 from .ops import bf16
 
 
@@ -20,8 +19,8 @@ class MoeResult:
     expert_ids: torch.Tensor
 
 
-def route(router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select lower-id-stable top-8 logits and normalize only the selected set."""
+def route(router_logits: torch.Tensor, *, experts_per_token: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the configured stable top-k logits and normalize the selected set."""
 
     logits = router_logits.float()
     expert_ids = torch.argsort(
@@ -29,7 +28,7 @@ def route(router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         dim=-1,
         descending=True,
         stable=True,
-    )[:, : CFG.experts_per_token]
+    )[:, :experts_per_token]
     selected = torch.gather(logits, -1, expert_ids)
     return torch.softmax(selected, dim=-1), expert_ids
 
@@ -75,16 +74,16 @@ def forward(
         x,
         model.block_weight(weights.router_shared_gate, small_t=small_t),
     )
-    router_logits = router_shared[:, : CFG.experts]
-    shared_scale = torch.sigmoid(router_shared[:, CFG.experts :].float())
-    route_weights, expert_ids = route(router_logits)
+    router_logits = router_shared[:, : model.config.experts]
+    shared_scale = torch.sigmoid(router_shared[:, model.config.experts :].float())
+    route_weights, expert_ids = route(router_logits, experts_per_token=model.config.experts_per_token)
 
     shared_gate_up = _linear_fp32(
         x,
         model.block_weight(weights.shared_gate_up, small_t=small_t),
     )
     shared_gate, shared_up = shared_gate_up.split(
-        CFG.shared_intermediate,
+        model.config.shared_intermediate,
         dim=-1,
     )
     shared_hidden = _silu_mul_fp32(shared_gate, shared_up)
@@ -94,7 +93,7 @@ def forward(
     )
 
     routed_accum = torch.zeros(
-        (x.shape[0], CFG.hidden),
+        (x.shape[0], model.config.hidden),
         device=x.device,
         dtype=torch.float32,
     )
@@ -131,7 +130,7 @@ def forward(
             expert_down.float() * selected_weights.float().unsqueeze(-1),
         )
 
-    output = bf16(routed_accum + shared_scale * shared_down.float())
+    output = bf16(model.config.routed_scale * routed_accum + shared_scale * shared_down.float())
     return MoeResult(output, router_logits, route_weights, expert_ids)
 
 

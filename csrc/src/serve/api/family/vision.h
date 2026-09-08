@@ -39,13 +39,13 @@ struct VisionBackboneConfig {
 };
 
 struct VisionLayerPlan {
-    artifact::ObjectHandle qkv;
+    artifact::LinearBinding qkv;
     artifact::ObjectHandle qkv_bias;
-    artifact::ObjectHandle output;
+    artifact::LinearBinding output;
     artifact::ObjectHandle output_bias;
-    artifact::ObjectHandle fc1;
+    artifact::LinearBinding fc1;
     artifact::ObjectHandle fc1_bias;
-    artifact::ObjectHandle fc2;
+    artifact::LinearBinding fc2;
     artifact::ObjectHandle fc2_bias;
     artifact::ObjectHandle norm1_weight;
     artifact::ObjectHandle norm1_bias;
@@ -56,7 +56,7 @@ struct VisionLayerPlan {
 // Sized when the plan is bound, not by the type: a plan whose layer array is 27
 // long cannot describe a 24-layer tower, and the count is the geometry's to give.
 struct VisionBackbonePlan {
-    artifact::ObjectHandle patch_embedding;
+    artifact::LinearBinding patch_embedding;
     artifact::ObjectHandle patch_embedding_bias;
     artifact::ObjectHandle position_embedding;
     std::vector<VisionLayerPlan> layers;
@@ -69,7 +69,7 @@ template <class Config>
 using VisionBackbonePlanFor = VisionBackbonePlan;
 
 struct VisionMergerInputPlan {
-    artifact::ObjectHandle fc1;
+    artifact::LinearBinding fc1;
     artifact::ObjectHandle fc1_bias;
 };
 
@@ -129,8 +129,7 @@ inline VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
     };
 
     VisionBackbonePlan out;
-    out.patch_embedding = bind("vision/patch_embedding", NumericFormat::Q6G64_F16S,
-                               {geometry.hidden, geometry.patch_dim});
+    out.patch_embedding = artifact::bind_linear(binder, "vision/patch_embedding", geometry.hidden, geometry.patch_dim, placement);
     out.patch_embedding_bias =
         bind("vision/patch_embedding_bias", NumericFormat::BF16, {geometry.hidden});
     out.position_embedding =
@@ -141,20 +140,16 @@ inline VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
     for (std::size_t layer = 0; layer < out.layers.size(); ++layer) {
         VisionLayerPlan& target  = out.layers[layer];
         const std::string prefix = "vision/layers/" + std::to_string(layer) + "/";
-        target.qkv               = bind(prefix + "attention/qkv", NumericFormat::Q4G64_F16S,
-                                        {3 * geometry.hidden, geometry.hidden});
+        target.qkv               = artifact::bind_linear(binder, prefix + "attention/qkv", 3 * geometry.hidden, geometry.hidden, placement);
         target.qkv_bias          = bind(prefix + "attention/qkv_bias", NumericFormat::BF16,
                                         {3 * geometry.hidden});
-        target.output            = bind(prefix + "attention/output", NumericFormat::Q5G64_F16S,
-                                        {geometry.hidden, geometry.hidden});
+        target.output            = artifact::bind_linear(binder, prefix + "attention/output", geometry.hidden, geometry.hidden, placement);
         target.output_bias       = bind(prefix + "attention/output_bias", NumericFormat::BF16,
                                         {geometry.hidden});
-        target.fc1               = bind(prefix + "mlp/fc1", NumericFormat::Q4G64_F16S,
-                                        {geometry.intermediate, geometry.hidden});
+        target.fc1               = artifact::bind_linear(binder, prefix + "mlp/fc1", geometry.intermediate, geometry.hidden, placement);
         target.fc1_bias          = bind(prefix + "mlp/fc1_bias", NumericFormat::BF16,
                                         {geometry.intermediate});
-        target.fc2               = bind(prefix + "mlp/fc2", NumericFormat::Q5G64_F16S,
-                                        {geometry.hidden, geometry.intermediate});
+        target.fc2               = artifact::bind_linear(binder, prefix + "mlp/fc2", geometry.hidden, geometry.intermediate, placement);
         target.fc2_bias =
             bind(prefix + "mlp/fc2_bias", NumericFormat::BF16, {geometry.hidden});
         target.norm1_weight =
@@ -181,8 +176,7 @@ inline VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder,
     // end, so both extents are `merger_hidden` -- which equals the tower's MLP
     // width on a 1024-wide tower and has nothing to do with it.
     return VisionMergerInputPlan{
-        .fc1      = bind("vision/merger/fc1", NumericFormat::W8G32_F16S,
-                         {geometry.merger_hidden(), geometry.merger_hidden()}),
+        .fc1      = artifact::bind_linear(binder, "vision/merger/fc1", geometry.merger_hidden(), geometry.merger_hidden(), placement),
         .fc1_bias = bind("vision/merger/fc1_bias", NumericFormat::BF16,
                          {geometry.merger_hidden()}),
     };
@@ -213,8 +207,8 @@ inline VisionCommonWeights materialize_vision_common(
     using artifact::NumericFormat;
 
     VisionCommonWeights out;
-    out.patch_embedding = artifact::materialized_weight(
-        materialized, backbone.patch_embedding, NumericFormat::Q6G64_F16S, geometry.hidden,
+    out.patch_embedding = artifact::materialized_linear(
+        materialized, backbone.patch_embedding, geometry.hidden,
         geometry.patch_dim);
     out.patch_embedding_bias =
         artifact::materialized_tensor(materialized, backbone.patch_embedding_bias,
@@ -229,24 +223,24 @@ inline VisionCommonWeights materialize_vision_common(
     for (std::size_t layer = 0; layer < out.layers.size(); ++layer) {
         const VisionLayerPlan& source = backbone.layers[layer];
         VisionLayerWeights& target    = out.layers[layer];
-        target.qkv                    = artifact::materialized_weight(
-            materialized, source.qkv, NumericFormat::Q4G64_F16S, 3 * geometry.hidden,
+        target.qkv                    = artifact::materialized_linear(
+        materialized, source.qkv, 3 * geometry.hidden,
             geometry.hidden);
         target.qkv_bias = artifact::materialized_tensor(
             materialized, source.qkv_bias, NumericFormat::BF16, {3 * geometry.hidden});
-        target.output = artifact::materialized_weight(
-            materialized, source.output, NumericFormat::Q5G64_F16S, geometry.hidden,
+        target.output = artifact::materialized_linear(
+        materialized, source.output, geometry.hidden,
             geometry.hidden);
         target.output_bias = artifact::materialized_tensor(
             materialized, source.output_bias, NumericFormat::BF16, {geometry.hidden});
-        target.fc1 = artifact::materialized_weight(
-            materialized, source.fc1, NumericFormat::Q4G64_F16S, geometry.intermediate,
+        target.fc1 = artifact::materialized_linear(
+        materialized, source.fc1, geometry.intermediate,
             geometry.hidden);
         target.fc1_bias =
             artifact::materialized_tensor(materialized, source.fc1_bias, NumericFormat::BF16,
                                           {geometry.intermediate});
-        target.fc2 = artifact::materialized_weight(
-            materialized, source.fc2, NumericFormat::Q5G64_F16S, geometry.hidden,
+        target.fc2 = artifact::materialized_linear(
+        materialized, source.fc2, geometry.hidden,
             geometry.intermediate);
         target.fc2_bias = artifact::materialized_tensor(
             materialized, source.fc2_bias, NumericFormat::BF16, {geometry.hidden});
@@ -260,8 +254,8 @@ inline VisionCommonWeights materialize_vision_common(
             materialized, source.norm2_bias, NumericFormat::BF16, {geometry.hidden});
     }
 
-    out.merger_fc1 = artifact::materialized_weight(
-        materialized, merger_input.fc1, NumericFormat::W8G32_F16S, geometry.merger_hidden(),
+    out.merger_fc1 = artifact::materialized_linear(
+        materialized, merger_input.fc1, geometry.merger_hidden(),
         geometry.merger_hidden());
     out.merger_fc1_bias =
         artifact::materialized_tensor(materialized, merger_input.fc1_bias, NumericFormat::BF16,
@@ -271,35 +265,6 @@ inline VisionCommonWeights materialize_vision_common(
     out.merger_norm_bias = artifact::materialized_tensor(
         materialized, merger_norm.bias, NumericFormat::BF16, {geometry.hidden});
     return out;
-}
-
-// The compiled-config entry points: a target that has no declared tower to lay over
-// its own constants names its `VisionConfig` here and gets the same numbers it always
-// had, as a value.
-template <class Config>
-inline VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
-                                               artifact::TensorPlacement placement) {
-    return bind_vision_backbone(binder, placement, VisionGeometry::compiled<Config>());
-}
-
-template <class Config>
-inline VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder,
-                                                      artifact::TensorPlacement placement) {
-    return bind_vision_merger_input(binder, placement, VisionGeometry::compiled<Config>());
-}
-
-template <class Config>
-inline VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder,
-                                                    artifact::TensorPlacement placement) {
-    return bind_vision_merger_norm(binder, placement, VisionGeometry::compiled<Config>());
-}
-
-template <class Config>
-inline VisionCommonWeights materialize_vision_common(
-    const artifact::MaterializedArtifact& materialized, const VisionBackbonePlan& backbone,
-    const VisionMergerInputPlan& merger_input, const VisionMergerNormPlan& merger_norm) {
-    return materialize_vision_common(materialized, backbone, merger_input, merger_norm,
-                                     VisionGeometry::compiled<Config>());
 }
 
 } // namespace sinfer::family

@@ -112,7 +112,7 @@ struct BindingPlan {
     /// The dimensions bound against: the compiled config with the artifact's `geometry`
     /// member laid over it. For this target that member also carries the *second* head
     /// geometry and the window schedule, because neither can be compiled for two sizes.
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    family::TextGeometry geometry{};
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 
@@ -133,18 +133,6 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-/// Declare on `geometry` which layers attend through the window, read off the artifact's own
-/// objects: each layer's query norm is as wide as its head, 256 windowed against 512 global.
-///
-/// Called from **two** places, and it has to be: `bind_artifact` needs it to bind each layer's
-/// weights at that layer's width, and `Package::declared_geometry` needs it because the KV pool
-/// is sized from *that* geometry, before any binding happens. They agreed only by accident
-/// while the compiled schedule matched the artifact's -- and the compiled array is one size's.
-/// A 60-layer 31B indexes a 48-entry array; a two-layer fixture reads a schedule that is not
-/// its own. Either way one half sizes a layer's cache for a geometry the other half does not
-/// run it at, and `gqa_attention` is what notices.
-void declare_attention_schedule(const artifact::Reader& reader, family::TextGeometry& geometry);
-
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features);
 
@@ -159,6 +147,7 @@ struct DensePostMixerPayload {
     /// rather than dereferenced on the device every round.
     Tensor layer_scalar;
     float layer_scalar_value = 1.0F;
+    float rms_epsilon = 0.0F;
 };
 
 struct AttentionProjectionPayload {
@@ -178,6 +167,7 @@ struct AttentionProjectionPayload {
     /// to view a `[kv_heads * head_dim, columns]` plane as `[head_dim, kv_heads * columns]`,
     /// and a static leaf has no runtime config to ask.
     std::int32_t head_dim = 0;
+    float rms_epsilon = 0.0F;
 };
 
 /// The linear-mixer payload the shared ModelView still names. This target has no linear
@@ -204,7 +194,7 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     family::ModelView<AttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                      MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<1>>;
+                      MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

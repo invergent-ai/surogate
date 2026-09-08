@@ -130,12 +130,11 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Geometry>
-void launch_replay_fold_fixed(const GdnReplayRecords& records,
+void launch_replay_fold_resolved(const GdnReplayRecords& records,
                               LinearAttentionStateAllLayersView states,
                               const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                               cudaStream_t stream) {
-    const FoldAccess<Geometry> access{
+    const FoldAccess<> access{
         static_cast<const __nv_bfloat16*>(records.key.data),
         static_cast<const __nv_bfloat16*>(records.value.data),
         reinterpret_cast<const uint2*>(records.gate.data),
@@ -147,13 +146,16 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
         states.conv_layer_stride_bytes / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
         records.spec.record_capacity,
         records.spec.width,
+        records.spec.qk_heads,
+        records.spec.value_heads,
+        records.spec.conv_channels,
         rows,
     };
-    const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
+    const dim3 grid(static_cast<unsigned>(records.spec.value_heads),
                     static_cast<unsigned>(active_rows),
-                    static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
+                    static_cast<unsigned>(records.spec.layers * (kStateDim / kBlockDv)));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_fold_kernel<Geometry><<<grid, block, 0, stream>>>(access);
+    recurrent_fold_kernel<><<<grid, block, 0, stream>>>(access);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -269,35 +271,7 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream) {
-    if (records.spec.layers == FoldGeometry48x48::kLayers &&
-        records.spec.qk_heads == FoldGeometry48x48::kQkHeads &&
-        records.spec.value_heads == FoldGeometry48x48::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry48x48::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows, stream);
-        return;
-    }
-    if (records.spec.layers == FoldGeometry36x48::kLayers &&
-        records.spec.qk_heads == FoldGeometry36x48::kQkHeads &&
-        records.spec.value_heads == FoldGeometry36x48::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry36x48::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry36x48>(records, states, rows, active_rows, stream);
-        return;
-    }
-    if (records.spec.layers == FoldGeometry30x32::kLayers &&
-        records.spec.qk_heads == FoldGeometry30x32::kQkHeads &&
-        records.spec.value_heads == FoldGeometry30x32::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry30x32::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows, stream);
-        return;
-    }
-    if (records.spec.layers == FoldGeometry18x16::kLayers &&
-        records.spec.qk_heads == FoldGeometry18x16::kQkHeads &&
-        records.spec.value_heads == FoldGeometry18x16::kValueHeads &&
-        records.spec.conv_channels == FoldGeometry18x16::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry18x16>(records, states, rows, active_rows, stream);
-        return;
-    }
-    throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
+    launch_replay_fold_resolved(records, states, rows, active_rows, stream);
 }
 
 } // namespace sinfer::ops::detail::gated_delta_net

@@ -192,7 +192,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     // write and the residual add that read it back existed only because
     // `ops::rmsnorm` forbids aliasing its output with its inputs; the fused form
     // is bit-identical to that pair, which sinfer_rmsnorm_test pins.
-    ops::rmsnorm_add(projected, weights.post_attention_norm, TextConfig::rms_epsilon,
+    ops::rmsnorm_add(projected, weights.post_attention_norm, weights.rms_epsilon,
                      /*unit_offset*/ true, residual, stream);
 }
 
@@ -243,7 +243,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     apply_lora(weights.down, kDownPort, activation, projected, stream);
     // The second half of the FFN sandwich: `post_feedforward_layernorm` over the
     // MLP's output, before it reaches the residual.
-    ops::rmsnorm_add(projected, weights.post_feedforward_norm, TextConfig::rms_epsilon,
+    ops::rmsnorm_add(projected, weights.post_feedforward_norm, weights.rms_epsilon,
                      /*unit_offset*/ true, residual, stream);
 }
 
@@ -269,11 +269,11 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
 // target's own refusal messages.
 SINFER_FAMILY_UNRUNNABLE_LEAVES(no_linear_layers, no_speculation)
 
-void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+void Variant::debug_probe(const char* tag, const Tensor& tensor, std::int32_t layer_count, cudaStream_t stream) {
     // Only the magic is this target's: 'G3PB'. Everything else -- which rounds
     // are captured, how the occurrence is counted, the header layout -- is the
     // family's, and lived in nine byte-identical copies before it moved there.
-    family::debug_probe_dump(0x47335042, tag, tensor, TextConfig::layers, stream);
+    family::debug_probe_dump(0x47335042, tag, tensor, layer_count, stream);
 }
 
 } // namespace sinfer::targets::gemma3_270m::detail

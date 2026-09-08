@@ -46,13 +46,13 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
+    if (identity.architecture == target_key && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
     }
-    if (identity.model_id == model_id && identity.weights_id == "routed-nvfp4") {
+    if (identity.architecture == target_key && identity.weights_id == "routed-nvfp4") {
         return WeightsProfile::RoutedNvfp4;
     }
-    if (identity.model_id == model_id && identity.weights_id == "compressed-tensors") {
+    if (identity.architecture == target_key && identity.weights_id == "compressed-tensors") {
         return WeightsProfile::CompressedTensors;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -73,7 +73,7 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 namespace {
 
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
-    family::bind_lora_moe_hybrid<detail::TextConfig>(
+    family::bind_lora_moe_hybrid(
         runtime, options, [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; });
 }
 
@@ -96,13 +96,14 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile,
-                                                        const family::TextGeometry& geometry) {
+                                                        const family::TextGeometry& geometry,
+                                                        const family::VisionGeometry& vision_geometry) {
     return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                         geometry);
+                                                         geometry, vision_geometry);
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    return family::TextGeometry::declared<detail::TextConfig>(reader.geometry());
+    return detail::resolved_geometry(reader);
 }
 
 std::unique_ptr<Package::Program>

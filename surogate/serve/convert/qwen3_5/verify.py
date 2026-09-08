@@ -1,7 +1,7 @@
 """Structural and representative-source verification for one `.sinfer` artifact.
 
 One converter serves every size of the family, so every check here is made against the
-geometry of the checkpoint in hand rather than against the size this module registers.
+geometry of the source checkpoint.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from surogate.serve.artifact.layouts import (
 )
 from surogate.serve.artifact.numeric import QuantFormat, get_format
 from surogate.serve.convert.common.safetensors import ShardReader
+from surogate.serve.convert.common import conversion, qwen3_5 as checkpoint
 
 from . import draft_head, inventory, recipe
 
@@ -48,24 +49,14 @@ DIRECT_PROBE_OBJECTS = (
 )
 
 
-def quant_probe_objects(g: inventory.Geometry = inventory.GEOMETRY) -> tuple[str, ...]:
-    """One quantized probe per distinct storage role, named as this size stores it."""
-    projections = (
-        ("text/layers/3/attention/query_key", "text/layers/0/gdn/value_z")
-        if inventory.is_27b(g)
-        else (
-            "text/layers/3/attention/query_key_gate_value",
-            "text/layers/0/gdn/query_key_value_z",
-        )
-    )
-    return projections + (
-        "vision/patch_embedding",
-        "mtp/layer/attention/query_key_gate_value",
-        "text/draft_head",
-    )
+def quant_probe_objects(g: inventory.Geometry) -> tuple[str, ...]:
+    names = []
+    if g.full_attention_layers:
+        names.append(f"text/layers/{g.full_attention_layers[0]}/attention/query_key_gate_value")
+    if g.gdn_layers:
+        names.append(f"text/layers/{g.gdn_layers[0]}/gdn/query_key_value_z")
+    return tuple(names) + ("vision/patch_embedding", "mtp/layer/attention/query_key_gate_value", "text/draft_head")
 
-
-QUANT_PROBE_OBJECTS = quant_probe_objects()
 
 _FP16_MIN_SUBNORMAL = 2.0**-24
 
@@ -114,7 +105,7 @@ def _object_index(objects: Sequence[ResourceObject | TensorObject]):
 
 def validate_logical_bindings(
     objects: Sequence[ResourceObject | TensorObject],
-    geometry: inventory.Geometry = inventory.GEOMETRY,
+    geometry: inventory.Geometry,
 ) -> tuple[int, int]:
     """Validate every fixed row view and alias against bound physical objects."""
 
@@ -150,6 +141,9 @@ def validate_logical_bindings(
                 for pattern in alias.object_patterns
             )
             bound = [index.get(name) for name in names]
+            if geometry.tied_embeddings:
+                bound = [index.get("text/token_embedding") if name == "text/output_head" and obj is None else obj
+                         for name, obj in zip(names, bound)]
             if any(obj is None for obj in bound):
                 _contract_error(f"logical alias has a missing object: {alias.role_pattern}")
             if alias.axis_order is not None:
@@ -168,7 +162,7 @@ def validate_logical_bindings(
 
 def validate_structure(
     artifact: Artifact,
-    geometry: inventory.Geometry = inventory.GEOMETRY,
+    geometry: inventory.Geometry,
     *,
     mtp: bool = True,
     vision: bool = True,
@@ -176,10 +170,17 @@ def validate_structure(
     """Validate the complete directory without reading tensor payload values."""
 
     _, object_specs = inventory.active_specs(mtp=mtp, vision=vision, geometry=geometry)
+    present = _object_index(artifact.objects)
+    required_resources = {"frontend/tokenizer.json", "frontend/tokenizer_config.json", "frontend/generation_config.json"}
+    object_specs = tuple(s for s in object_specs
+                         if not (isinstance(s, inventory.ResourceSpec) and s.name not in required_resources and s.name not in present)
+                         and not (s.name == "text/output_head" and geometry.tied_embeddings and s.name not in present))
     expected_identity = ArtifactIdentity(
         inventory.model_id_for(geometry), inventory.WEIGHTS_ID
-    )
-    if artifact.identity != expected_identity:
+    , architecture="qwen3_5")
+    if (artifact.identity.architecture, artifact.identity.weights_id) != (
+        expected_identity.architecture, expected_identity.weights_id
+    ):
         _contract_error(
             f"artifact identity is {artifact.identity!r}, expected "
             f"{expected_identity!r}"
@@ -300,17 +301,19 @@ class _SourceSlices:
     """Read only selected first-axis rows from recipe source tensors."""
 
     def __init__(self, reader: ShardReader) -> None:
+        self.reader = reader
         self.model_dir = reader.model_dir
         self.weight_map = reader.weight_map
 
     def rows(self, source: recipe.SourceTensor, rows: Sequence[int]) -> torch.Tensor:
-        shard = self.weight_map[source.name]
+        resolved = self.reader._resolve(source.name)
+        shard = self.weight_map[resolved]
         with safe_open(
             str(self.model_dir / shard),
             framework="pt",
             device="cpu",
         ) as handle:
-            tensor_slice = handle.get_slice(source.name)
+            tensor_slice = handle.get_slice(self.reader._stored_name(resolved))
             pieces = [tensor_slice[row : row + 1] for row in rows]
         return torch.cat(pieces, dim=0)
 
@@ -355,6 +358,10 @@ def _materialize_rows(
     if len(shape) != 2:
         raise TypeError(f"row probes require a matrix expression, got {shape}")
 
+    from surogate.serve.convert.common.recipe import resolve_options
+    resolved = resolve_options(expression, sources.reader.has)
+    if resolved != expression:
+        return _materialize_rows(resolved, rows, sources, draft_ids)
     if isinstance(expression, recipe.SourceTensor):
         return sources.rows(expression, rows)
 
@@ -515,35 +522,34 @@ def verify_quantized_rows(
     return len(row_indices) * len(group_indices)
 
 
-def validate_draft_token_ids(token_ids: torch.Tensor) -> None:
-    if token_ids.dtype != torch.int32 or tuple(token_ids.shape) != (draft_head.DRAFT_HEAD_N,):
-        _contract_error("draft token IDs must be I32[131072]")
-    if int(token_ids.min()) < 0 or int(token_ids.max()) >= draft_head.TOKENIZER_VOCAB_SIZE:
+def validate_draft_token_ids(token_ids: torch.Tensor, geometry: inventory.Geometry) -> None:
+    if token_ids.dtype != torch.int32 or tuple(token_ids.shape) != (geometry.draft_vocab,):
+        _contract_error("draft token IDs disagree with the resolved shortlist shape")
+    if int(token_ids.min()) < 0 or int(token_ids.max()) >= geometry.token_domain:
         _contract_error("draft token IDs are outside the tokenizer domain")
-    if torch.unique(token_ids).numel() != draft_head.DRAFT_HEAD_N:
+    if torch.unique(token_ids).numel() != geometry.draft_vocab:
         _contract_error("draft token IDs are not unique")
 
 
 def _load_and_validate_draft_ids(
     artifact: Artifact,
     model_dir: Path,
+    geometry: inventory.Geometry,
 ) -> torch.Tensor:
     obj = artifact.find(draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT)
     if not isinstance(obj, TensorObject):
         _contract_error("draft token ID object is not a tensor")
     token_ids = decode_direct(artifact.payload(obj), obj.format, obj.shape)
-    validate_draft_token_ids(token_ids)
+    validate_draft_token_ids(token_ids, geometry)
 
-    draft_expression = recipe.RECIPES_BY_NAME[
-        draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT
-    ].expression
+    recipes = {r.object_name: r for r in recipe.build_recipes(geometry)}
+    draft_expression = recipes[draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT].expression
     if not isinstance(draft_expression, recipe.DraftHeadTokenIds):
         _contract_error("draft ID recipe is not the registered derivation")
     context = draft_head.compute_shortlist(
         TOOLS_ROOT / draft_expression.ranking_path,
         model_dir,
-        n=draft_expression.rows,
-        vocab=draft_expression.vocab_rows,
+        geometry=geometry,
     )
     expected = draft_head.materialize_draft_head_token_ids(context)
     if not torch.equal(token_ids, expected):
@@ -556,29 +562,30 @@ def _verify_resources_and_frontend(
     model_dir: Path,
 ) -> tuple[str, str]:
     payloads: dict[str, bytes] = {}
-    for spec in inventory.RESOURCE_SPECS:
-        obj = artifact.find(spec.name)
+    for resource in conversion.load_resources(model_dir, inventory.RESOURCE_SPECS):
+        obj = artifact.find(resource.name)
         if not isinstance(obj, ResourceObject):
-            _contract_error(f"{spec.name} is not a resource")
+            _contract_error(f"{resource.name} is not a resource")
         payload = bytes(artifact.payload(obj))
-        filename = spec.name.removeprefix("frontend/")
-        source = (model_dir / filename).read_bytes()
+        filename = resource.name.removeprefix("frontend/")
+        source = resource.data
         if payload != source:
-            _contract_error(f"frontend resource differs from source: {spec.name}")
+            _contract_error(f"frontend resource differs from source: {resource.name}")
         payloads[filename] = payload
 
-    from transformers import AutoProcessor, GenerationConfig
+    from transformers import AutoProcessor, AutoTokenizer, GenerationConfig
 
     with tempfile.TemporaryDirectory(prefix="sinfer-frontend-") as temporary:
         directory = Path(temporary)
         for filename, payload in payloads.items():
             (directory / filename).write_bytes(payload)
-        processor = AutoProcessor.from_pretrained(directory, local_files_only=True)
+        factory = AutoProcessor if "preprocessor_config.json" in payloads else AutoTokenizer
+        processor = factory.from_pretrained(directory, local_files_only=True)
         generation_config = GenerationConfig.from_pretrained(
             directory,
             local_files_only=True,
         )
-        if getattr(processor, "tokenizer", None) is None:
+        if factory is AutoProcessor and getattr(processor, "tokenizer", None) is None:
             _contract_error("AutoProcessor did not construct its tokenizer")
         return type(processor).__name__, type(generation_config).__name__
 
@@ -602,15 +609,14 @@ def _probe_rows(object_name: str, rows: int,
 def verify_payloads(
     artifact: Artifact,
     model_dir: str | Path,
-    device: str | torch.device = "cpu",
-    geometry: inventory.Geometry = inventory.GEOMETRY,
+    device: str | torch.device,
+    geometry: inventory.Geometry,
 ) -> PayloadSummary:
     """Verify representative values without requantizing complete matrices."""
 
     source_dir = Path(model_dir)
     recipes = {item.object_name: item for item in recipe.build_recipes(geometry)}
-    recipe.preflight_sources(source_dir, recipes)
-    draft_ids = _load_and_validate_draft_ids(artifact, source_dir)
+    draft_ids = _load_and_validate_draft_ids(artifact, source_dir, geometry)
     target = torch.device(device)
 
     # A text-only or no-MTP export carries no object for some probes; the artifact states
@@ -621,8 +627,13 @@ def verify_payloads(
     )
     quant_groups = 0
     quant_rows = 0
-    with ShardReader(source_dir) as source_reader:
-        for object_name in DIRECT_PROBE_OBJECTS:
+    direct_probes = ["text/layers/0/input_norm"]
+    if geometry.gdn_layers:
+        direct_probes.extend(f"text/layers/{geometry.gdn_layers[0]}/gdn/{role}" for role in ("a_log", "convolution"))
+    with ShardReader.for_directory(source_dir) as source_reader:
+        from surogate.serve.convert.common.recipe import preflight_source_reader
+        preflight_source_reader(source_reader, tuple(recipes.values()))
+        for object_name in direct_probes:
             _verify_direct_probe(artifact, source_reader, object_name, recipes)
 
         source_slices = _SourceSlices(source_reader)
@@ -652,12 +663,12 @@ def verify_payloads(
         source_dir,
     )
     return PayloadSummary(
-        direct_probes=len(DIRECT_PROBE_OBJECTS),
+        direct_probes=len(direct_probes),
         quant_probes=len(quant_probes),
         quant_rows=quant_rows,
         quant_groups=quant_groups,
         draft_rows=draft_ids.numel(),
-        resources=len(inventory.RESOURCE_SPECS),
+        resources=sum(isinstance(obj, ResourceObject) for obj in artifact.objects),
         processor_class=processor_class,
         generation_config_class=generation_config_class,
     )
@@ -672,10 +683,16 @@ def verify_artifact(
     # The source checkpoint states the size, and the artifact must be the artifact of that
     # checkpoint, so its own config is what the contract is read at.
     if geometry is None:
-        geometry = inventory.geometry_from_config(
-            json.loads((Path(model_dir) / "config.json").read_text())
-        )
-    structure = validate_structure(artifact, geometry)
+        from .exports.quantized import Sources, _geometry
+        with ShardReader.for_directory(model_dir) as source:
+            geometry = _geometry(conversion.load_json(Path(model_dir) / "config.json"), model_dir, Sources(source),
+                                 mtp=bool(artifact.geometry["mtp_layers"]), vision=bool(artifact.vision_geometry))
+    if artifact.geometry != checkpoint.geometry_block(geometry) or tuple(artifact.layer_types) != geometry.layer_types:
+        _contract_error("artifact geometry does not match the source checkpoint")
+    if any(getattr(obj, "runs", ()) for obj in artifact.objects):
+        _contract_error("native GGUF artifacts require verification against their original GGUF source")
+    structure = validate_structure(artifact, geometry, mtp=bool(geometry.mtp_layers),
+                                   vision=bool(inventory.vision_tower(geometry)))
     payload = verify_payloads(artifact, model_dir, device, geometry)
     return VerificationSummary(structure=structure, payload=payload)
 

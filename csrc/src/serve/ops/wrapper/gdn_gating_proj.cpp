@@ -1,4 +1,5 @@
 #include "api/ops/gdn_gating_proj.h"
+#include "api/ops/rmsnorm.h"
 
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
@@ -48,30 +49,11 @@ struct GdnControlParentGeometry {
 };
 
 GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
-    if (parent.n == 96 && parent.k == 5120) {
-        require_bf16_weight(parent, 96, 5120, "ab_weight");
-        return {.input_rows = 5120, .heads = 48};
+    if (parent.n <= 0 || parent.n % 2 != 0 || parent.k <= 0) {
+        throw std::invalid_argument("gdn_gating_proj: ab_weight must have shape [2*H,K]");
     }
-    if (parent.n == 64 && parent.k == 2048) {
-        require_bf16_weight(parent, 64, 2048, "ab_weight");
-        return {.input_rows = 2048, .heads = 32};
-    }
-    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b (16 GDN heads, 1024 hidden).
-    if (parent.n == 32 && parent.k == 1024) {
-        require_bf16_weight(parent, 32, 1024, "ab_weight");
-        return {.input_rows = 1024, .heads = 16};
-    }
-    // surogate vendor patch (PATCHES.md #16): qwen3.5-2b (16 GDN heads, 2048 hidden).
-    if (parent.n == 32 && parent.k == 2048) {
-        require_bf16_weight(parent, 32, 2048, "ab_weight");
-        return {.input_rows = 2048, .heads = 16};
-    }
-    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b (32 GDN heads, 2560 hidden).
-    if (parent.n == 64 && parent.k == 2560) {
-        require_bf16_weight(parent, 64, 2560, "ab_weight");
-        return {.input_rows = 2560, .heads = 32};
-    }
-    throw std::invalid_argument("gdn_gating_proj: unsupported ab_weight geometry");
+    require_bf16_weight(parent, parent.n, parent.k, "ab_weight");
+    return {.input_rows = parent.k, .heads = parent.n / 2};
 }
 
 void require_vector_tensor(const Tensor& t, DType dtype, std::int32_t n0, const char* op,
@@ -84,7 +66,7 @@ void require_vector_tensor(const Tensor& t, DType dtype, std::int32_t n0, const 
 
 void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t tokens,
                              const char* op, const char* name) {
-    if (t.dtype != dtype || t.ne[0] != n0 || t.ne[1] != tokens || t.ne[2] != 1 || t.ne[3] != 1 ||
+    if (tokens <= 0 || t.dtype != dtype || t.ne[0] != n0 || t.ne[1] != tokens || t.ne[2] != 1 || t.ne[3] != 1 ||
         !t.is_contiguous() || !aligned_to(t.data, dtype == DType::FP32 ? 4 : 16)) {
         throw std::invalid_argument(std::string(op) + ": invalid " + name);
     }
@@ -95,6 +77,10 @@ void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std:
 std::size_t gdn_gating_proj_workspace_capacity_bytes(std::int32_t heads, std::int32_t input_rows,
                                                      std::int32_t min_tokens,
                                                      std::int32_t max_tokens) {
+    if (heads <= 0 || input_rows <= 0 || min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("gdn_gating_proj: invalid dimensions or token interval");
+    }
+    if (!detail::bf16_gdn_gating_admits({heads, input_rows, min_tokens})) { return 0; }
     return detail::bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
                                                             max_tokens);
 }
@@ -103,6 +89,10 @@ std::size_t gdn_norm_gating_proj_workspace_capacity_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_tokens,
                                                           std::int32_t max_tokens) {
+    if (heads <= 0 || input_rows <= 0 || min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("gdn_norm_gating_proj: invalid dimensions or token interval");
+    }
+    if (!detail::bf16_gdn_gating_admits({heads, input_rows, min_tokens})) { return 0; }
     return detail::bf16_gdn_norm_gating_capacity_workspace_bytes(heads, input_rows, min_tokens,
                                                                  max_tokens);
 }
@@ -112,13 +102,10 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
                      Tensor& beta, cudaStream_t stream) {
     constexpr const char* op  = "gdn_gating_proj";
     const std::int32_t tokens = x.ne[1];
-    // surogate vendor patch (PATCHES.md #13): geometry from the weights
-    // (27B 48/5120; qwen3.5-0.8b 16/1024).
     const std::int32_t heads = a_weight.n;
     const std::int32_t rows  = a_weight.k;
-    if (!((heads == 48 && rows == 5120) || (heads == 16 && rows == 1024) ||
-          (heads == 16 && rows == 2048) || (heads == 32 && rows == 2560))) {
-        throw std::invalid_argument(std::string(op) + ": unsupported gating geometry");
+    if (heads <= 0 || rows <= 0 || tokens <= 0) {
+        throw std::invalid_argument(std::string(op) + ": dimensions must be positive");
     }
     require_sequence_tensor(x, DType::BF16, rows, tokens, op, "x");
     require_vector_tensor(A_log, DType::FP32, heads, op, "A_log");
@@ -128,7 +115,12 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     require_bf16_weight(a_weight, heads, rows, "a_weight");
     require_bf16_weight(b_weight, heads, rows, "b_weight");
 
-    detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    if (detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
+        detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    } else {
+        detail::bf16_gdn_gating_proj_generic_launch(x, a_weight, b_weight, A_log, dt_bias,
+                                                   g, beta, stream);
+    }
 }
 
 void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_log,
@@ -145,7 +137,12 @@ void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_l
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
-    detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    if (detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
+        detail::bf16_gdn_gating_dispatch(x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+    } else {
+        detail::bf16_gdn_gating_proj_generic_launch(x, a_weight, b_weight, A_log, dt_bias,
+                                                   g, beta, stream);
+    }
 }
 
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
@@ -154,13 +151,10 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           Tensor& beta, cudaStream_t stream) {
     constexpr const char* op  = "gdn_norm_gating_proj";
     const std::int32_t tokens = x.ne[1];
-    // surogate vendor patch (PATCHES.md #13): geometry from the weights
-    // (27B 48/5120; qwen3.5-0.8b 16/1024).
     const std::int32_t heads = a_weight.n;
     const std::int32_t rows  = a_weight.k;
-    if (!((heads == 48 && rows == 5120) || (heads == 16 && rows == 1024) ||
-          (heads == 16 && rows == 2048) || (heads == 32 && rows == 2560))) {
-        throw std::invalid_argument(std::string(op) + ": unsupported gating geometry");
+    if (heads <= 0 || rows <= 0 || tokens <= 0) {
+        throw std::invalid_argument(std::string(op) + ": dimensions must be positive");
     }
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
         throw std::invalid_argument("gdn_norm_gating_proj: eps must be positive and finite");
@@ -175,8 +169,14 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     require_bf16_weight(a_weight, heads, rows, "a_weight");
     require_bf16_weight(b_weight, heads, rows, "b_weight");
 
-    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, stream);
+    if (detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
+        detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
+                                              dt_bias, ws, g, beta, stream);
+    } else {
+        rmsnorm(x, norm_weight, eps, true, h, stream);
+        detail::bf16_gdn_gating_proj_generic_launch(h, a_weight, b_weight, A_log, dt_bias,
+                                                   g, beta, stream);
+    }
 }
 
 void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
@@ -199,8 +199,14 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
 
     const Weight a_weight = bf16_row_view(ab_weight, 0, geometry.heads);
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
-    detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
-                                          dt_bias, ws, g, beta, stream);
+    if (detail::bf16_gdn_gating_admits({g.ne[0], x.ne[0], tokens})) {
+        detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
+                                              dt_bias, ws, g, beta, stream);
+    } else {
+        rmsnorm(x, norm_weight, eps, true, h, stream);
+        detail::bf16_gdn_gating_proj_generic_launch(h, a_weight, b_weight, A_log, dt_bias,
+                                                   g, beta, stream);
+    }
 }
 
 } // namespace sinfer::ops

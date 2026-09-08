@@ -450,10 +450,10 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor a_batch        = a.view({cfg_.head_dim, cfg_.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-                           *active_backend_kv_table_rows_, kAttnScale,
+                           *active_backend_kv_table_rows_, cfg_.attention_scale,
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
     } else {
-        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
+        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, cfg_.attention_scale,
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
     // A head whose attention writes no gate rows skips the multiply, as the trunk does.
@@ -553,7 +553,7 @@ void TextContext::mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidde
     block.mlp            = MlpW{&source.post_mixer};
     {
         auto mixer_scope = work_.scope();
-        attn_mix(block, x, 0, TextConfig::layers, Phase::Verify, KvPlane::Mtp);
+        attn_mix(block, x, 0, cfg_.n_layers, Phase::Verify, KvPlane::Mtp);
     }
     mark(2);
     {
@@ -562,7 +562,7 @@ void TextContext::mtp_forward_trunk_block(const Tensor& ids, const Tensor& hidde
         // the same one past the end that `attn_mix` above is given. Nothing reads it -- a
         // block epilogue belongs to a family with per-layer inputs, and none of those has a
         // draft head -- but a real index would name a layer this block is not.
-        mlp_tail(block.post_attn_norm, block.mlp, x, TextConfig::layers, Phase::Verify);
+        mlp_tail(block.post_attn_norm, block.mlp, x, cfg_.n_layers, Phase::Verify);
     }
     mark(3);
 
@@ -704,7 +704,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         }
 
         Tensor a = work_.alloc(DType::BF16, {cfg_.head_dim, cfg_.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
+        ops::gqa_attention_cached(qn, last_position, cfg_.attention_scale, mtp_kv_.layer_view(0), envelope,
                                   work_, a, s);
         if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
 
@@ -929,6 +929,14 @@ Tensor TextContext::lm_head_view(const Tensor& stored, cudaStream_t stream) {
         }
     }
     return stored;
+}
+
+void TextContext::logits_from_hidden(const Tensor& hidden, Tensor& logits) {
+    require_tensor_shape(hidden, DType::BF16, {round_hidden_width(), 1}, "cached hidden");
+    require_tensor_shape(logits, DType::BF16, {cfg_.vocab, 1}, "cached hidden logits");
+    auto scope = work_.scope();
+    ops::linear(lm_head_view(hidden, ctx_.stream), *lm_head_, logits, ctx_.stream);
+    apply_logit_softcap(cfg_, logits, ctx_.stream);
 }
 
 /// Writes the round's hidden output and the logits that follow it.
@@ -1163,9 +1171,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     const auto projection = workspace_recipe::text_attention_projection(
         work_, cfg_.hidden, cfg_.layer_q_size(layer), cfg_.layer_kv_size(layer), T);
     Tensor h              = projection.hidden;
-    debug_probe<Variant>("residual_in", x, s);
+    debug_probe<Variant>("residual_in", x, cfg_.n_layers, s);
     Hooks::attention_norm(x, *w.input_norm, cfg_.rms_eps, *w.projection, h, work_, s);
-    debug_probe<Variant>("post_input_norm", h, s);
+    debug_probe<Variant>("post_input_norm", h, cfg_.n_layers, s);
 
     const int layer_head_dim = cfg_.layer_head_dim(layer);
     const int layer_n_kv     = cfg_.layer_n_kv(layer);
@@ -1181,9 +1189,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     Tensor v_flat    = v.view({layer_kv_size, T});
     Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
                                   s);
-    debug_probe<Variant>("q_proj_raw", q_flat, s);
-    debug_probe<Variant>("k_proj_raw", k_flat, s);
-    debug_probe<Variant>("v_proj_raw", v_flat, s);
+    debug_probe<Variant>("q_proj_raw", q_flat, cfg_.n_layers, s);
+    debug_probe<Variant>("k_proj_raw", k_flat, cfg_.n_layers, s);
+    debug_probe<Variant>("v_proj_raw", v_flat, cfg_.n_layers, s);
 
     const auto results = workspace_recipe::text_attention_results(
         work_, cfg_.layer_q_size(layer), cfg_.layer_kv_size(layer), T);
@@ -1204,8 +1212,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
             ops::rmsnorm(k, *w.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
         }
     }
-    debug_probe<Variant>("q_post_headnorm", qn.view({layer_q_size, T}), s);
-    debug_probe<Variant>("k_post_headnorm", kn.view({layer_kv_size, T}), s);
+    debug_probe<Variant>("q_post_headnorm", qn.view({layer_q_size, T}), cfg_.n_layers, s);
+    debug_probe<Variant>("k_post_headnorm", kn.view({layer_kv_size, T}), cfg_.n_layers, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
@@ -1213,10 +1221,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     if constexpr (applies_rotary<Variant>()) {
         ops::rope(rope_for_op, cfg_.layer_rotary_dim(layer), cfg_.layer_rotary_pairs(layer),
-                  layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn, s);
+                  layer_rope_theta(layer, weights_.geometry), qn, kn, s);
     }
-    debug_probe<Variant>("q_post_rope", qn.view({layer_q_size, T}), s);
-    debug_probe<Variant>("k_post_rope", kn.view({layer_kv_size, T}), s);
+    debug_probe<Variant>("q_post_rope", qn.view({layer_q_size, T}), cfg_.n_layers, s);
+    debug_probe<Variant>("k_post_rope", kn.view({layer_kv_size, T}), cfg_.n_layers, s);
 
     Tensor a = results.attention.view({layer_head_dim, cfg_.n_q, T});
     const Tensor& kv_table_rows =
@@ -1248,7 +1256,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     // The draft head is not a stack layer, so it has no layer index to key a window on; no
     // target with a draft head declares one, and one that grows both must decide it here.
     layer_envelope.sliding_window =
-        mtp ? 0 : layer_sliding_window<TextConfig>(layer, weights_.geometry);
+        mtp ? 0 : layer_sliding_window(layer, weights_.geometry);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1262,24 +1270,24 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (owns_kv) {
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                               kAttnScale, kv_view, layer_envelope, work_, a_batch, s, selection);
+                               cfg_.attention_scale, kv_view, layer_envelope, work_, a_batch, s, selection);
         } else {
-            ops::gqa_attention_cached(q_batch, position_batch, valid, kv_table_rows, kAttnScale,
+            ops::gqa_attention_cached(q_batch, position_batch, valid, kv_table_rows, cfg_.attention_scale,
                                       kv_view, layer_envelope, work_, a_batch, s, selection);
         }
     } else if (owns_kv) {
-        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
+        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, cfg_.attention_scale,
                            kv_view, layer_envelope, work_, a, s, selection);
     } else {
-        ops::gqa_attention_cached(qn, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
+        ops::gqa_attention_cached(qn, cache_positions, Tensor{}, kv_table_rows, cfg_.attention_scale,
                                   kv_view, layer_envelope, work_, a, s, selection);
     }
     // A dense stack writes no gate rows; see attention_output_gate<Variant>().
     if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
 
-    debug_probe<Variant>("attn_core", a.view({layer_q_size, T}), s);
+    debug_probe<Variant>("attn_core", a.view({layer_q_size, T}), cfg_.n_layers, s);
     Hooks::attention_output(a.view({layer_q_size, T}), *w.o_proj, *w.projection, x, ph, work_, s);
-    debug_probe<Variant>("post_attention_residual", x, s);
+    debug_probe<Variant>("post_attention_residual", x, cfg_.n_layers, s);
 }
 
 struct PrefillFamilyTimer {
@@ -1403,7 +1411,7 @@ void TextContext::short_conv_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase 
 
     Variant::short_conv_projection(x, *w.input_norm, cfg_.rms_eps, *w.projection, bcx, ph, work_,
                                    s);
-    debug_probe<Variant>("short_conv_in", bcx, s);
+    debug_probe<Variant>("short_conv_in", bcx, cfg_.n_layers, s);
 
     if (ph == Phase::Verify) {
         if (active_sequence_batch_ == 0 || active_linear_state_slots_ == nullptr) {
@@ -1424,7 +1432,7 @@ void TextContext::short_conv_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase 
     } else {
         Tensor conv_state =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        debug_probe<Variant>("short_conv_state_in", conv_state, s);
+        debug_probe<Variant>("short_conv_state_in", conv_state, cfg_.n_layers, s);
         if (graph_pad_valid_ != nullptr) {
             // Bucket-padded graph body: the window this round leaves behind must end at the
             // real token count, not at the captured width.
@@ -1434,7 +1442,7 @@ void TextContext::short_conv_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase 
             ops::short_conv(bcx, *w.conv1d, conv_state, convolved, cfg_.hidden, s);
         }
     }
-    debug_probe<Variant>("short_conv_out", convolved, s);
+    debug_probe<Variant>("short_conv_out", convolved, cfg_.n_layers, s);
 
     // The same linear-add the delta net ends with, and the same leaf: an output projection is an
     // output projection whichever mixer produced the value it reads.
@@ -1562,14 +1570,14 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor qkv_c = conv.convolved;
         Tensor conv_state =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        debug_probe<Variant>("gdn_conv_state_in", conv_state, s);
+        debug_probe<Variant>("gdn_conv_state_in", conv_state, cfg_.n_layers, s);
         if (graph_pad_valid_ != nullptr) {
             ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c,
                                     *graph_pad_valid_, s);
         } else {
             ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
         }
-        debug_probe<Variant>("gdn_conv", qkv_c, s);
+        debug_probe<Variant>("gdn_conv", qkv_c, cfg_.n_layers, s);
         if (sub_timing) { sub_lap(ftimer.g_conv, sub_conv); }
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, cfg_.key_dim, kc, s);
@@ -1603,22 +1611,22 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             // refuses there.
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
             family::detail::linear_recurrence_record<Variant>(
-                q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,
+                q_batch, k_batch, v_batch, g_batch, beta_batch, cfg_.gdn_scale, recurrent_states, valid,
                 *active_linear_state_slots_, records, out_batch, s);
         } else {
             family::detail::linear_recurrence_snapshot<Variant>(
-                q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states, valid,
+                q_batch, k_batch, v_batch, g_batch, beta_batch, cfg_.gdn_scale, recurrent_states, valid,
                 *active_linear_state_slots_, *active_linear_state_slots_, out_batch, s);
         }
     } else {
         Tensor recurrent_state =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        debug_probe<Variant>("gdn_recurrent_state_in", recurrent_state, s);
+        debug_probe<Variant>("gdn_recurrent_state_in", recurrent_state, cfg_.n_layers, s);
         family::detail::linear_recurrence<Variant>(
             q_recurrent, k_recurrent, vv,
             family::detail::linear_gate_view<Variant>(g, cfg_.gdn_v_dim, cfg_.gdn_v_heads, T), beta,
-            kGdnScale, work_, recurrent_state, o, s);
-        debug_probe<Variant>("gdn_o", o, s);
+            cfg_.gdn_scale, work_, recurrent_state, o, s);
+        debug_probe<Variant>("gdn_o", o, cfg_.n_layers, s);
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output(work_, cfg_geometry(), T).view(
@@ -1744,14 +1752,14 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, in
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden(work_, cfg_geometry(), T);
     Hooks::post_mixer_norm(x, *post_norm, cfg_.rms_eps, *m.payload, h, work_, s);
-    debug_probe<Variant>("post_attention_norm", h, s);
+    debug_probe<Variant>("post_attention_norm", h, cfg_.n_layers, s);
 
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
     // What a block does after its feed-forward, for a family that does anything: Gemma 4's
     // E-series folds in this layer's per-layer input here, between the feed-forward's residual
     // add and the layer scalar. A no-op for every other target.
     Hooks::layer_epilogue(weights_, layer, active_ids_, active_embedded_, x, work_, s);
-    debug_probe<Variant>("post_mlp_residual", x, s);
+    debug_probe<Variant>("post_mlp_residual", x, cfg_.n_layers, s);
 }
 
 // Per-family prefill timing behind SUROGATE_SERVE_PREFILL_TIMING: events
@@ -1874,14 +1882,14 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
                                                       std::int32_t columns_per_row,
                                                       std::int32_t keys,
                                                       PagedKVBatchLayerView cache) {
-    if constexpr (!requires { V::indexer_head_dim; }) {
+    if constexpr (!requires { V::has_qsa_indexer; }) {
         return ops::GqaBlockMask{};
     } else {
         const ops::QsaIndexerGeometry geometry{
-            .head_dim   = V::indexer_head_dim,
-            .heads      = V::indexer_heads,
-            .block      = V::indexer_block,
-            .top_k      = V::indexer_top_k,
+            .head_dim   = cfg_geometry().indexer_head_dim,
+            .heads      = cfg_geometry().indexer_heads,
+            .block      = cfg_geometry().indexer_block,
+            .top_k      = cfg_geometry().indexer_top_k,
             .rotary_dim = cfg_.rotary_dim,
             .rope_theta = cfg_.rope_theta,
             .rms_eps    = cfg_.rms_eps,
@@ -2150,7 +2158,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     active_ids_ = ids_device;
     if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
     capture_per_layer_source(x, s);
-    debug_probe<Variant>("mixed_embed_out", x, s);
+    debug_probe<Variant>("mixed_embed_out", x, cfg_.n_layers, s);
 
     PrefillFamilyTimer& timer = prefill_family_timer();
     cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
@@ -2175,6 +2183,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         if (cfg_.is_full(layer)) {
             const int fidx         = cfg_.full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
+            const bool owns_kv = cfg_.layer_owns_kv(layer);
+            const auto kv_view = batch_text_kv_->batch_layer_view(cfg_.kv_plane_index(layer));
             {
                 auto mixer_scope      = work_.scope();
                 if (timing) { cudaEventRecord(timer.begin, s); }
@@ -2182,10 +2192,10 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     work_, cfg_.hidden, cfg_.layer_q_size(layer), cfg_.layer_kv_size(layer),
                     total);
                 Tensor h = projection.hidden;
-                debug_probe<Variant>("residual_in", x, s);
+                debug_probe<Variant>("residual_in", x, cfg_.n_layers, s);
                 Hooks::attention_norm(x, *full.input_norm, cfg_.rms_eps, *full.projection, h,
                                       work_, s);
-                debug_probe<Variant>("post_input_norm", h, s);
+                debug_probe<Variant>("post_input_norm", h, cfg_.n_layers, s);
                 const int layer_head_dim = cfg_.layer_head_dim(layer);
                 const int layer_n_kv     = cfg_.layer_n_kv(layer);
                 const int layer_q_size   = cfg_.layer_q_size(layer);
@@ -2200,9 +2210,9 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 Tensor v_flat    = v.view({layer_kv_size, total});
                 Variant::attention_projection(h, *full.projection, q_flat, gate_flat, k_flat,
                                               v_flat, Phase::Prefill, work_, s);
-                debug_probe<Variant>("q_proj_raw", q_flat, s);
-                debug_probe<Variant>("k_proj_raw", k_flat, s);
-                debug_probe<Variant>("v_proj_raw", v_flat, s);
+                debug_probe<Variant>("q_proj_raw", q_flat, cfg_.n_layers, s);
+                debug_probe<Variant>("k_proj_raw", k_flat, cfg_.n_layers, s);
+                debug_probe<Variant>("v_proj_raw", v_flat, cfg_.n_layers, s);
 
                 const auto results = workspace_recipe::text_attention_results(
                     work_, cfg_.layer_q_size(layer), cfg_.layer_kv_size(layer),
@@ -2215,10 +2225,12 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                 : k;
                 if constexpr (attention_qk_norm<Variant>()) {
                     ops::rmsnorm(q, *full.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
-                    ops::rmsnorm(k, *full.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                    if (owns_kv) {
+                        ops::rmsnorm(k, *full.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                    }
                 }
-                debug_probe<Variant>("q_post_headnorm", qn.view({layer_q_size, total}), s);
-                debug_probe<Variant>("k_post_headnorm", kn.view({layer_kv_size, total}), s);
+                debug_probe<Variant>("q_post_headnorm", qn.view({layer_q_size, total}), cfg_.n_layers, s);
+                debug_probe<Variant>("k_post_headnorm", kn.view({layer_kv_size, total}), cfg_.n_layers, s);
 
                 Tensor rope_positions = roots.positions;
                 if (rope_delta_ != 0) {
@@ -2235,13 +2247,13 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 if constexpr (applies_rotary<Variant>()) {
                     ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
                               cfg_.layer_rotary_pairs(layer),
-                              layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn, s);
+                              layer_rope_theta(layer, weights_.geometry), qn, kn, s);
                 }
                 // A windowed layer looks at fewer keys than the round is sized for;
                 // see layer_sliding_window() in residual_policy.h.
-                const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer, weights_.geometry);
-                debug_probe<Variant>("q_post_rope", qn.view({layer_q_size, total}), s);
-                debug_probe<Variant>("k_post_rope", kn.view({layer_kv_size, total}), s);
+                const std::int32_t layer_window = layer_sliding_window(layer, weights_.geometry);
+                debug_probe<Variant>("q_post_rope", qn.view({layer_q_size, total}), cfg_.n_layers, s);
+                debug_probe<Variant>("k_post_rope", kn.view({layer_kv_size, total}), cfg_.n_layers, s);
 
                 Tensor a = results.attention.view({layer_head_dim, cfg_.n_q, total});
                 for (std::size_t sg = 0; sg < segments.size(); ++sg) {
@@ -2258,10 +2270,15 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     Tensor ka = kn.slice(2, off, len);
                     Tensor va = v.slice(2, off, len);
                     Tensor aa = a.slice(2, off, len);
-                    ops::gqa_attention(qa, ka, va, positions.slice(0, off, len), Tensor{},
-                                       io_.text_kv_table_row, kAttnScale,
-                                       batch_text_kv_->batch_layer_view(fidx), envelope, work_, aa,
-                                       s);
+                    if (owns_kv) {
+                        ops::gqa_attention(qa, ka, va, positions.slice(0, off, len), Tensor{},
+                                           io_.text_kv_table_row, cfg_.attention_scale,
+                                           kv_view, envelope, work_, aa, s);
+                    } else {
+                        ops::gqa_attention_cached(qa, positions.slice(0, off, len), Tensor{},
+                                                  io_.text_kv_table_row, cfg_.attention_scale,
+                                                  kv_view, envelope, work_, aa, s);
+                    }
                 }
                 if (batch > 0) {
                     Tensor qb = qn.slice(2, prefill_cols, batch)
@@ -2278,12 +2295,19 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                         full, h.slice(1, prefill_cols, batch), batch, decode.cache_positions,
                         rope_all.slice(0, prefill_cols, batch), decode.kv_table_rows, 1,
                         static_cast<std::int32_t>(decode.envelope.max_visible_keys),
-                        batch_text_kv_->batch_layer_view(fidx));
+                        kv_view);
                     ops::GqaExecutionEnvelope decode_layer_envelope = decode.envelope;
                     decode_layer_envelope.sliding_window                = layer_window;
-                    ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
-                                       kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                       decode_layer_envelope, work_, ab, s, decode_selection);
+                    if (owns_kv) {
+                        ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
+                                           cfg_.attention_scale, kv_view, decode_layer_envelope,
+                                           work_, ab, s, decode_selection);
+                    } else {
+                        ops::gqa_attention_cached(qb, position_batch, Tensor{}, decode.kv_table_rows,
+                                                  cfg_.attention_scale, kv_view,
+                                                  decode_layer_envelope, work_, ab, s,
+                                                  decode_selection);
+                    }
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
                 if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
@@ -2334,7 +2358,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 Tensor vc = projection.value;
                 const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), total);
                 Tensor qkv      = conv.projected;
-                debug_probe<Variant>("mixed_gdn_in", x, s);
+                debug_probe<Variant>("mixed_gdn_in", x, cfg_.n_layers, s);
                 Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
                 Tensor qkv_c = conv.convolved;
                 if (timing) { lap(timer.begin, timer.g_proj, acc_g_proj); cudaEventRecord(timer.begin, s); }
@@ -2362,7 +2386,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                      decode.linear_state_slots, qkv_cb, s);
                 }
                 if (timing) { lap(timer.begin, timer.g_conv, acc_g_conv); cudaEventRecord(timer.begin, s); }
-                debug_probe<Variant>("mixed_gdn_conv", qkv_c, s);
+                debug_probe<Variant>("mixed_gdn_conv", qkv_c, cfg_.n_layers, s);
                 ops::extract_bf16_columns(qkv_c, 0, qc, s);
                 ops::extract_bf16_columns(qkv_c, cfg_.key_dim, kc, s);
                 ops::extract_bf16_columns(qkv_c, 2 * cfg_.key_dim, vc, s);
@@ -2387,7 +2411,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     Tensor recurrent_state = state_.recurrent_slot(
                         static_cast<std::uint32_t>(gidx),
                         static_cast<std::uint32_t>(segments[sg].state_slot));
-                    family::detail::linear_recurrence<Variant>(qa, ka, va, ga, ba, kGdnScale,
+                    family::detail::linear_recurrence<Variant>(qa, ka, va, ga, ba, cfg_.gdn_scale,
                                                               work_, recurrent_state, oa, s);
                     }
                 }
@@ -2406,7 +2430,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     Tensor ob = o.slice(2, prefill_cols, batch)
                                     .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1, batch});
                     family::detail::linear_recurrence_snapshot<Variant>(
-                        qb, kb, vb, gb, bb, kGdnScale,
+                        qb, kb, vb, gb, bb, cfg_.gdn_scale,
                         state_.recurrent.at(static_cast<std::size_t>(gidx)), Tensor{},
                         decode.linear_state_slots, decode.linear_state_slots, ob, s);
                 }
@@ -2473,7 +2497,6 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                    cudaMemcpyDeviceToDevice, s));
         Tensor logits_decode = decode.logits;
         ops::linear(xl_decode, *lm_head_, logits_decode, s);
-    apply_logit_softcap(cfg_, logits_decode, s);
         apply_logit_softcap(cfg_, logits_decode, s);
     }
 
@@ -2752,6 +2775,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         if (cfg_.is_full(layer)) {
             const int fidx         = cfg_.full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
+            const bool owns_kv = cfg_.layer_owns_kv(layer);
+            const auto kv_view = batch_text_kv_->batch_layer_view(cfg_.kv_plane_index(layer));
             {
                 auto mixer_scope      = work_.scope();
                 const auto projection = workspace_recipe::text_attention_projection(
@@ -2786,7 +2811,9 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                 : k;
                 if constexpr (attention_qk_norm<Variant>()) {
                     ops::rmsnorm(q, *full.q_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), qn, s);
-                    ops::rmsnorm(k, *full.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                    if (owns_kv) {
+                        ops::rmsnorm(k, *full.k_norm, cfg_.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                    }
                 }
 
                 Tensor rope_positions = roots.positions;
@@ -2801,11 +2828,11 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 if constexpr (applies_rotary<Variant>()) {
                     ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
                               cfg_.layer_rotary_pairs(layer),
-                              layer_rope_theta<TextConfig>(layer, weights_.geometry), qn, kn, s);
+                              layer_rope_theta(layer, weights_.geometry), qn, kn, s);
                 }
                 // A windowed layer looks at fewer keys than the round is sized for;
                 // see layer_sliding_window() in residual_policy.h.
-                const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer, weights_.geometry);
+                const std::int32_t layer_window = layer_sliding_window(layer, weights_.geometry);
                 ops::GqaExecutionEnvelope prefill_layer_envelope = prefill_envelope;
                 prefill_layer_envelope.sliding_window                = layer_window;
                 ops::GqaExecutionEnvelope decode_layer_envelope = decode_envelope;
@@ -2822,11 +2849,17 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                         full, h.slice(1, 0, prefill_cols), prefill_cols, positions_prefill,
                         rope_all.slice(0, 0, prefill_cols), io_.text_kv_table_row, prefill_cols,
                         static_cast<std::int32_t>(prefill_envelope.max_visible_keys),
-                        batch_text_kv_->batch_layer_view(fidx));
-                    ops::gqa_attention(qa, ka, va, positions_prefill, Tensor{},
-                                       io_.text_kv_table_row, kAttnScale,
-                                       batch_text_kv_->batch_layer_view(fidx),
-                                       prefill_layer_envelope, work_, aa, s, segment_selection);
+                        kv_view);
+                    if (owns_kv) {
+                        ops::gqa_attention(qa, ka, va, positions_prefill, Tensor{},
+                                           io_.text_kv_table_row, cfg_.attention_scale, kv_view,
+                                           prefill_layer_envelope, work_, aa, s, segment_selection);
+                    } else {
+                        ops::gqa_attention_cached(qa, positions_prefill, Tensor{},
+                                                  io_.text_kv_table_row, cfg_.attention_scale,
+                                                  kv_view, prefill_layer_envelope, work_, aa, s,
+                                                  segment_selection);
+                    }
                 }
                 if (batch > 0) {
                     Tensor qb = qn.slice(2, prefill_cols, batch)
@@ -2843,10 +2876,17 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                         full, h.slice(1, prefill_cols, batch), batch, decode.cache_positions,
                         rope_all.slice(0, prefill_cols, batch), decode.kv_table_rows, 1,
                         static_cast<std::int32_t>(decode_envelope.max_visible_keys),
-                        batch_text_kv_->batch_layer_view(fidx));
-                    ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
-                                       kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                       decode_layer_envelope, work_, ab, s, decode_selection);
+                        kv_view);
+                    if (owns_kv) {
+                        ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
+                                           cfg_.attention_scale, kv_view, decode_layer_envelope,
+                                           work_, ab, s, decode_selection);
+                    } else {
+                        ops::gqa_attention_cached(qb, position_batch, Tensor{}, decode.kv_table_rows,
+                                                  cfg_.attention_scale, kv_view,
+                                                  decode_layer_envelope, work_, ab, s,
+                                                  decode_selection);
+                    }
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
                 if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
@@ -2933,7 +2973,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     Tensor recurrent_state =
                         state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
                                               linear_state_current_slot_);
-                    family::detail::linear_recurrence<Variant>(qa, ka, va, ga, ba, kGdnScale,
+                    family::detail::linear_recurrence<Variant>(qa, ka, va, ga, ba, cfg_.gdn_scale,
                                                               work_, recurrent_state, oa, s);
                 }
                 if (batch > 0) {
@@ -2951,7 +2991,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     Tensor ob = o.slice(2, prefill_cols, batch)
                                     .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1, batch});
                     family::detail::linear_recurrence_snapshot<Variant>(
-                        qb, kb, vb, gb, bb, kGdnScale,
+                        qb, kb, vb, gb, bb, cfg_.gdn_scale,
                         state_.recurrent.at(static_cast<std::size_t>(gidx)), Tensor{},
                         decode.linear_state_slots, decode.linear_state_slots, ob, s);
                 }

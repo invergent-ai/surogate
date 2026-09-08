@@ -285,11 +285,11 @@ struct DFlashContextRoots {
     Tensor normalized;
 };
 
-template <class Config, class Allocator>
-DFlashContextRoots dflash_context(Allocator& allocator, std::int32_t tokens) {
+template <class Allocator>
+DFlashContextRoots dflash_context(Allocator& allocator, std::int32_t tokens, const family::DFlashGeometry& config) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, config.hidden, tokens),
+        matrix(allocator, DType::BF16, config.hidden, tokens),
     };
 }
 
@@ -299,12 +299,12 @@ struct DFlashContextLayerRoots {
     Tensor key;
 };
 
-template <class Config, class Allocator>
-DFlashContextLayerRoots dflash_context_layer(Allocator& allocator, std::int32_t tokens) {
+template <class Allocator>
+DFlashContextLayerRoots dflash_context_layer(Allocator& allocator, std::int32_t tokens, const family::DFlashGeometry& config) {
     return {
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, config.kv_size(), tokens),
+        matrix(allocator, DType::BF16, config.kv_size(), tokens),
+        matrix(allocator, DType::BF16, config.kv_size(), tokens),
     };
 }
 
@@ -314,12 +314,12 @@ struct DFlashProposalRoots {
     Tensor residual;
 };
 
-template <class Config, class Allocator>
-DFlashProposalRoots dflash_proposal(Allocator& allocator, std::int32_t tokens) {
+template <class Allocator>
+DFlashProposalRoots dflash_proposal(Allocator& allocator, std::int32_t tokens, const family::DFlashGeometry& config) {
     return {
         vector(allocator, DType::I32, tokens),
         vector(allocator, DType::I32, tokens),
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, config.hidden, tokens),
     };
 }
 
@@ -333,16 +333,16 @@ struct DFlashAttentionRoots {
     Tensor attention;
 };
 
-template <class Config, class Allocator>
-DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens) {
+template <class Allocator>
+DFlashAttentionRoots dflash_attention(Allocator& allocator, std::int32_t tokens, const family::DFlashGeometry& config) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
-        matrix(allocator, DType::BF16, Config::kv_size, tokens),
-        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, config.hidden, tokens),
+        matrix(allocator, DType::BF16, config.query_size(), tokens),
+        matrix(allocator, DType::BF16, config.kv_size(), tokens),
+        matrix(allocator, DType::BF16, config.kv_size(), tokens),
+        matrix(allocator, DType::BF16, config.query_size(), tokens),
+        matrix(allocator, DType::BF16, config.kv_size(), tokens),
+        matrix(allocator, DType::BF16, config.query_size(), tokens),
     };
 }
 
@@ -351,11 +351,11 @@ struct DFlashMlpRoots {
     Tensor intermediate;
 };
 
-template <class Config, class Allocator>
-DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
+template <class Allocator>
+DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens, const family::DFlashGeometry& config) {
     return {
-        matrix(allocator, DType::BF16, Config::hidden, tokens),
-        matrix(allocator, DType::BF16, Config::intermediate, tokens),
+        matrix(allocator, DType::BF16, config.hidden, tokens),
+        matrix(allocator, DType::BF16, config.intermediate, tokens),
     };
 }
 

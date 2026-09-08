@@ -40,9 +40,6 @@ using family::host_tensor;
 using family::host_w8_weight;
 
 
-inline constexpr std::size_t kTextLayers          = TextConfig::layers;
-inline constexpr std::size_t kFullAttentionLayers = TextConfig::full_attention_layers();
-inline constexpr std::size_t kGdnLayers           = TextConfig::gdn_layers();
 
 struct HyperConnectionPlan {
     artifact::ObjectHandle norm;
@@ -135,27 +132,25 @@ struct MtpPlan {
 };
 
 struct BindingPlan {
-    /// The dimensions bound against: the compiled config with the artifact's
-    /// `geometry` member laid over it.
-    family::TextGeometry geometry = family::TextGeometry::compiled<TextConfig>();
+    /// The validated checkpoint dimensions used to bind and load this artifact.
+    family::TextGeometry geometry;
+    family::VisionGeometry vision_geometry;
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
     artifact::ObjectHandle token_embedding;
-    std::array<TextLayerPlan, kTextLayers> text_layers;
+    std::vector<TextLayerPlan> text_layers;
     HyperConnectionPlan output_mix;
     artifact::ObjectHandle output_head;
     artifact::ObjectHandle ple_table;
     // The hash constants are read out of the artifact at bind time (the reader is gone by
     // the time the model is constructed).
-    std::array<std::uint64_t, TextConfig::ple_ngram> ple_multipliers{};
-    std::array<std::int32_t, TextConfig::ple_heads> ple_head_offsets{};
-    std::array<std::int32_t, TextConfig::ple_heads> ple_head_vocab_sizes{};
-    // The vision tower. Flash-Next ships the same 27x1152 tower the Qwen3.6 targets
-    // do, so the family's default VisionBackboneConfig describes it exactly and no
-    // per-target geometry is needed here.
+    std::vector<std::uint64_t> ple_multipliers{};
+    std::vector<std::int32_t> ple_head_offsets{};
+    std::vector<std::int32_t> ple_head_vocab_sizes{};
+    // Optional vision objects are bound with their declared tower dimensions.
     family::VisionBackbonePlan vision_backbone;
     family::VisionMergerInputPlan vision_merger_input;
-    artifact::ObjectHandle vision_merger_fc2;
+    artifact::LinearBinding vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
     family::VisionMergerNormPlan vision_merger_norm;
     //: false when the source carried no tower (GGUF exports drop it).
@@ -190,12 +185,14 @@ struct IndexerWeights {
 };
 
 struct AttentionProjectionPayload {
+    family::TextGeometry geometry;
     Weight query_key_gate_value;
     ops::HyperConnectionWeights mix;
     IndexerWeights indexer;
 };
 
 struct GdnProjectionPayload {
+    family::TextGeometry geometry;
     Tensor a_log;
     Tensor dt_bias;
     Weight a_b_projection;
@@ -204,6 +201,7 @@ struct GdnProjectionPayload {
 };
 
 struct SparseMoePayload {
+    family::TextGeometry geometry;
     ops::SparseMoeWeights op;
     ops::HyperConnectionWeights mix;
     /// What the bank holds each routed half as (`family::BankPlanes`): Q4 or Q5 planes are a
@@ -228,7 +226,7 @@ struct PleWeights {
 using FamilyModelView =
     family::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
                        AttentionProjectionPayload, SparseMoePayload,
-                       family::DFlashWeights<1>>;
+                       family::DFlashWeights>;
 
 /// The NextN draft head, as the runtime sees it. The block is a trunk full-attention layer --
 /// the same type, run by the same code -- and the four tensors around it are the head's own:

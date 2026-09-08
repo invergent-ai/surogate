@@ -101,7 +101,8 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
     const std::int32_t tokens = x.ne[1];
     // Shapes outside the registered geometry have no in-house ladder; the segments are taken
     // from the output views so any q|k|gate|v split works (#84).
-    if (is_nvfp4_generic_problem(weight.n, weight.k)) {
+    if (is_nvfp4_generic_problem(weight.n, weight.k) || q.ne[0] != kQueryRows ||
+        k.ne[0] != kKeyRows || gate.ne[0] != kGateRows || v.ne[0] != kKeyRows) {
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
         const std::int32_t q_rows    = q.ne[0];
         const std::int32_t k_rows    = k.ne[0];

@@ -11,6 +11,8 @@ check the checkpoint has what the recipes name, then write each object in plan o
 
 from __future__ import annotations
 
+from surogate.serve.convert.common.checkpoint import tokenizer_domain
+
 import argparse
 import json
 import os
@@ -33,20 +35,10 @@ from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.recipe import expression_sources, materialize_recipe
 
 from . import inventory, recipe
+from surogate.serve.convert.common.gemma4 import geometry_block
 
 RECIPE_ID = "gemma4-v1"
 
-#: What the config must state for the artifact to be shaped at all. Everything the
-#: declaration derives -- the layer schedule, the second attention geometry's
-#: defaults -- is left to it.
-_REQUIRED_CONFIG = (
-    "hidden_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "vocab_size",
-    "head_dim",
-)
 
 
 def _plan_repack(repack, recipes_by_name, tensor_specs, native) -> tuple[str, ...]:
@@ -76,25 +68,7 @@ def _plan_repack(repack, recipes_by_name, tensor_specs, native) -> tuple[str, ..
 
 
 def validate_config(config: Mapping[str, object]) -> inventory.Geometry:
-    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
-    absent = [name for name in _REQUIRED_CONFIG if text.get(name) is None]
-    if absent:
-        raise ValueError(
-            "this checkpoint's config.json does not state "
-            + ", ".join(absent)
-            + "; a Gemma 4 artifact cannot be shaped without them"
-        )
-    geometry = inventory.geometry_from_config(config)
-    # The two head geometries are what this target exists to carry. A checkpoint that
-    # states one and means both would otherwise convert into an artifact whose global
-    # layers are sized like its windowed ones, which loads and is wrong.
-    if geometry.global_head_dim <= 0 or geometry.global_kv_heads <= 0:
-        raise ValueError(
-            "this checkpoint states no global attention geometry "
-            f"(global_head_dim={geometry.global_head_dim}, "
-            f"num_global_key_value_heads={geometry.global_kv_heads})"
-        )
-    return geometry
+    return inventory.geometry_from_config(config)
 
 
 def convert(
@@ -121,9 +95,9 @@ def convert(
     # What the artifact writes, which on a tied checkpoint is one object fewer than the
     # model has: the head is the embedding table and the binder fills both roles from it.
     tied = recipe.tied_output_head(config)
-    objects = inventory.stored_objects(config, tied_output_head=tied)
+    objects = inventory.stored_objects(geometry, tied_output_head=tied)
     tensor_specs = inventory.tensor_specs(objects)
-    recipes = {r.object_name: r for r in recipe.build_recipes(config)}
+    recipes = {r.object_name: r for r in recipe.build_recipes(geometry)}
 
     # What the GGUF can serve as it stores it. `native` is a whole object read verbatim,
     # `halves` a fused parent whose two halves carry different K-quant types, `planned` the
@@ -180,9 +154,10 @@ def convert(
         output.parent.mkdir(parents=True, exist_ok=True)
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="gemma4"),
             plan.specs,
-            geometry=_geometry_block(geometry),
+            geometry=_geometry_block(geometry, token_domain=tokenizer_domain(model)),
+            layer_types=geometry.layer_types,
             external=external,
         ) as writer:
             total = len(plan.specs)
@@ -218,7 +193,7 @@ def convert(
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
-    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID)
+    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture="gemma4")
     report = family_conversion.build_conversion_report(
         identity=identity,
         target_key=inventory.TARGET_KEY,
@@ -293,38 +268,8 @@ def load_resources(model_dir: Path) -> tuple[ResourcePayload, ...]:
     return tuple(payloads)
 
 
-def _geometry_block(geometry: inventory.Geometry) -> dict[str, float]:
-    """The dimensions the artifact states about itself, which the engine's binder
-    validates its compiled constants against.
-
-    The global members are why this target's artifact says more than the other dense
-    ones: `head_dim` and `kv_heads` describe the windowed layers only, and a binder
-    that read them for every layer would size half the cache wrong.
-    """
-    return {
-        "hidden": float(geometry.hidden),
-        "layers": float(geometry.layers),
-        "intermediate": float(geometry.intermediate),
-        # `output_rows` is what the head is padded to and `token_domain` what the tokenizer
-        # can address. Gemma 4 pads neither, so both are the vocabulary.
-        "output_rows": float(geometry.vocab),
-        "token_domain": float(geometry.vocab),
-        "query_heads": float(geometry.query_heads),
-        "kv_heads": float(geometry.kv_heads),
-        "head_dim": float(geometry.head_dim),
-        "global_kv_heads": float(geometry.global_kv_heads),
-        "global_head_dim": float(geometry.global_head_dim),
-        "global_rotary_angles": float(geometry.partial_rotary_angles),
-        "sliding_window": float(geometry.sliding_window),
-        "rope_theta": float(geometry.rope_theta),
-        "sliding_rope_theta": float(geometry.sliding_rope_theta),
-        # Named as `family::TextGeometry` names them: the binder lays this object over the
-        # target's compiled constants by member name, so a key that does not match is a
-        # dimension the engine silently keeps its own value for.
-        "logit_softcap": float(geometry.final_logit_softcapping),
-        "embedding_scale": float(geometry.embedding_scale),
-        "rms_epsilon": float(geometry.rms_epsilon),
-    }
+def _geometry_block(geometry: inventory.Geometry, *, token_domain: int) -> dict[str, int | float]:
+    return geometry_block(geometry, token_domain=token_domain)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

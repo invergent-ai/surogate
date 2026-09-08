@@ -60,7 +60,7 @@ struct Package {
     /// ships as one model; the registry asks every package the same question.
     static constexpr std::array<std::string_view, 1> model_ids{"qwen3.6-35b-a3b"};
     static constexpr std::string_view model_id = model_ids[0];
-    static constexpr std::string_view target_key = "qwen3_6_moe";
+    static constexpr std::string_view target_key = "qwen3_5_moe";
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a
     /// constant: `detail::Variant` is only forward-declared here.
@@ -89,7 +89,8 @@ struct Package {
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,
                                                                WeightsProfile weights_profile,
-                                                               const family::TextGeometry& geometry);
+                                                               const family::TextGeometry& geometry,
+                                                               const family::VisionGeometry& vision_geometry = {});
     /// The dimensions this artifact declares, over this target's compiled config.
     [[nodiscard]] static family::TextGeometry declared_geometry(const artifact::Reader& reader);
     [[nodiscard]] static std::unique_ptr<Program>

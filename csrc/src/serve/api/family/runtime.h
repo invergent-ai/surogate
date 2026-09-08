@@ -6,6 +6,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/contract/round_lifecycle.h"
 #include <api/family/text_geometry.h>
+#include <api/family/vision_geometry.h>
 #include <api/family/prepared_prompt.h>
 
 #include <cstddef>
@@ -120,7 +121,7 @@ public:
     template <class V>
     friend SequencePlanner<V> make_sequence_planner(DeviceContext&, const EngineOptions&,
                                                     typename V::WeightsProfile,
-                                                    const TextGeometry&);
+                                                    const TextGeometry&, const VisionGeometry&);
 };
 
 template <class Variant>
@@ -273,7 +274,7 @@ template <class Variant>
 [[nodiscard]] SequencePlanner<Variant>
 make_sequence_planner(DeviceContext& device, const EngineOptions& options,
                       typename Variant::WeightsProfile weights_profile,
-                      const TextGeometry& geometry);
+                      const TextGeometry& geometry, const VisionGeometry& vision_geometry = {});
 
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
