@@ -525,7 +525,30 @@ void require_geometry(const Geometry& geometry) {
 
 } // namespace
 
-bool available() noexcept { return true; }
+/// Whether this process can run the runner: the kernels are in the binary *and* the device is
+/// one they have a cubin for.
+///
+/// The build used to be the whole answer -- these translation units existed only in an sm_120a
+/// build, so their presence implied the hardware. One binary for the RTX line ends that: an
+/// Ada card loads the same library, and the FP4 instantiations carry no sm_89 cubin. Asking the
+/// device is what turns "no kernel image is available for execution" into the refusal in
+/// `sparse_moe.cpp`, which names the artifact and the architecture.
+bool available() noexcept {
+    static const bool supported = [] {
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) { return false; }
+        int major = 0;
+        int minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) !=
+                cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) !=
+                cudaSuccess) {
+            return false;
+        }
+        return major * 10 + minor >= 120;
+    }();
+    return supported;
+}
 
 std::int32_t bucket_of(std::int32_t tokens) {
     if (tokens < 1 || tokens > kMaxTokens) {

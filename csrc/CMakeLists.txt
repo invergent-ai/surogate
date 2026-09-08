@@ -99,8 +99,18 @@ option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer
 option(SUROGATE_BUILD_SERVE "Expose the serve engine targets" ON)
 option(SUROGATE_SERVE_TESTS "Expose the serve engine test targets" OFF)
 option(SUROGATE_SERVE_BENCH "Expose the serve engine bench targets" OFF)
-set(SUROGATE_SERVE_CUDA_ARCHS "120a" CACHE STRING
-    "CUDA architectures for the serve engine targets (RTX consumer set)")
+# One binary for the RTX line the engine is built for: Ada (RTX 4090) and consumer/workstation
+# Blackwell (RTX 5090, RTX PRO 6000). The driver picks the cubin; nothing chooses at build time.
+# Hopper and datacenter Blackwell are deliberately absent: this engine's shape -- experts banked
+# in host memory, pipeline stages and expert gathers over PCIe -- is a PCIe machine's, and on
+# NVLink hardware neither the design nor the competition is the same.
+#
+# A kernel family that only one of these architectures can run stays that architecture's alone
+# *inside* the one binary: `set_target_properties(<target> PROPERTIES CUDA_ARCHITECTURES 120a)`
+# below does that for the FP4 families, which keeps the fatbin from carrying an sm_89 copy of a
+# kernel sm_89 cannot execute.
+set(SUROGATE_SERVE_CUDA_ARCHS "89;120a" CACHE STRING
+    "CUDA architectures for the serve engine targets (the RTX line: Ada and Blackwell)")
 # A build machine missing FFmpeg or libcurl drops the serve targets with a status
 # line, which is right for a training-only tree and wrong for a wheel: it would
 # publish a package whose `surogate serve` exits 127 and say nothing. The wheel
@@ -921,6 +931,7 @@ target_link_libraries(sinfer_artifact PUBLIC sinfer_core)
 # sm_120-only hardware (TMA + cluster + block-scaled FP4 MMA). Port builds for
 # other architectures link a loud-failure stub instead.
 if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+  set(SINFER_NVFP4_TMA_REAL ON)
   add_library(sinfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
     ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
@@ -932,6 +943,13 @@ sinfer_internal_includes(sinfer_nvfp4_tma)
 set_target_properties(sinfer_nvfp4_tma PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+# TMA, cluster launch and block-scaled FP4 MMA are sm_120 hardware. In a multi-architecture
+# build the rest of the engine is compiled for every listed architecture and this is not:
+# an sm_89 cubin of a kernel sm_89 cannot run is fatbin weight and a compile that has to be
+# guarded instruction by instruction. `w4fp4_plane` admits these routes at CC 120 and above.
+if(SINFER_NVFP4_TMA_REAL)
+  set_target_properties(sinfer_nvfp4_tma PROPERTIES CUDA_ARCHITECTURES 120a)
+endif()
 target_compile_options(sinfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_link_libraries(sinfer_nvfp4_tma PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
@@ -960,6 +978,7 @@ target_link_libraries(sinfer_nvfp4_cutlass PRIVATE sinfer_core CUDA::cudart CUDA
 # loud-failure stub.
 set(TRTLLM_MOE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/trtllm_moe)
 if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+  set(SINFER_TRTLLM_MOE_REAL ON)
   file(GLOB TRTLLM_MOE_GENERATED ${TRTLLM_MOE_ROOT}/cutlass_instantiations/120/gemm_grouped/120/*.generated.cu)
   add_library(sinfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
     ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu
@@ -1013,6 +1032,11 @@ set_target_properties(sinfer_trtllm_moe PROPERTIES
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF
   CUDA_STANDARD 17
   CXX_STANDARD 17)
+# The instantiations vendored here are FlashInfer's for architecture 120, and the kernels are
+# NVFP4: sm_120 alone, like the TMA archive above, whatever else the binary is built for.
+if(SINFER_TRTLLM_MOE_REAL)
+  set_target_properties(sinfer_trtllm_moe PROPERTIES CUDA_ARCHITECTURES 120a)
+endif()
 target_link_libraries(sinfer_trtllm_moe PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
@@ -1546,8 +1570,11 @@ set_target_properties(sinfer_shared PROPERTIES
   # `gcc -c`, and the whole-archive block below reaches it as input files.
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF
   POSITION_INDEPENDENT_CODE ON)
+# Comma-joined: the architecture list is a CMake list, and a `;` inside a compile definition
+# splits it into two definitions and an unterminated quote.
+string(REPLACE ";" "," SINFER_BUILD_CUDA_ARCHS_TEXT "${SUROGATE_SERVE_CUDA_ARCHS}")
 target_compile_definitions(sinfer_shared PRIVATE
-  SINFER_BUILD_CUDA_ARCHS="${SUROGATE_SERVE_CUDA_ARCHS}")
+  SINFER_BUILD_CUDA_ARCHS="${SINFER_BUILD_CUDA_ARCHS_TEXT}")
 target_include_directories(sinfer_shared PUBLIC ${SERVE_ROOT})
 # The products compile serve headers that reach for cuda_runtime.h, and call the
 # runtime themselves. They used to inherit that from whichever archive they linked

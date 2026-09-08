@@ -59,10 +59,16 @@ SERVE_BUILD_DIR ?= csrc/build-serve
 # the project dependency, and these tests need none of it.
 PYTEST ?= .venv/bin/python -m pytest
 
+# One engine binary for the RTX line: Ada (4090) and Blackwell (5090, PRO 6000). The kernels
+# that only Blackwell can run carry only its cubin -- csrc/CMakeLists.txt pins those targets --
+# so the second architecture costs what it actually uses rather than doubling the fatbin.
+SERVE_CUDA_ARCHS ?= 89;120a
+
 serve-configure:
 	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_CUDA_ARCHITECTURES=120a \
+		-DCMAKE_CUDA_ARCHITECTURES="$(SERVE_CUDA_ARCHS)" \
+		-DSUROGATE_SERVE_CUDA_ARCHS="$(SERVE_CUDA_ARCHS)" \
 		-DPYTHON_BINDING=ON $(CCACHE_FLAGS)
 
 serve-build: serve-configure
