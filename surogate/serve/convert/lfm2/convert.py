@@ -1,8 +1,8 @@
-"""Build an LFM2 serving artifact from a HuggingFace checkpoint.
+"""Build an LFM2 serving artifact from safetensors or a bridged GGUF checkpoint.
 
-Safetensors in, artifact out. There is no GGUF repack path here yet: LFM2 GGUFs
-exist, but reading one in place is a separate piece of work from serving the
-architecture at all, and the two are better landed apart.
+Compatible GGUF linear weights are repacked into W8 without changing their values.
+Other quantizations are dequantized by the bridge and encoded into the same W8
+profile. Norms, embeddings and convolution taps use BF16.
 
 What is worth saying about the shape is said in `inventory.py`, which derives it
 from the declaration rather than restating it. This module is the driver: read the
@@ -25,7 +25,8 @@ import torch
 from surogate.serve.artifact.container import ArtifactIdentity, ArtifactWriter
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common.quantize import pick_device
-from surogate.serve.convert.common.recipe import materialize_recipe
+from surogate.serve.convert.common.gguf_repack import GgufRepackSource, RepackError
+from surogate.serve.convert.common.recipe import expression_sources, materialize_recipe
 
 from . import inventory, recipe
 
@@ -63,12 +64,6 @@ def convert(
     gguf_repack: str | Path | None = None,
 ) -> Path:
     """Run the conversion and return the path of its report."""
-    if gguf_repack is not None:
-        raise NotImplementedError(
-            "the LFM2 target converts from safetensors; reading a GGUF in place is "
-            "not implemented for this architecture yet"
-        )
-
     started = time.perf_counter()
     model = Path(model_dir)
     output = Path(out_path)
@@ -84,6 +79,16 @@ def convert(
     objects = inventory.declared_objects(geometry)
     tensor_specs = inventory.tensor_specs(objects)
     recipes = {r.object_name: r for r in recipe.build_recipes(geometry)}
+    repack = GgufRepackSource(gguf_repack) if gguf_repack is not None else None
+    planned = repack.plan(recipes, tensor_specs) if repack is not None else ()
+    covered = set(planned)
+    remaining = tuple(r for name, r in recipes.items() if name not in covered)
+    if repack is not None:
+        stray = {s.name for r in remaining for s in expression_sources(r.expression)
+                 if s.name in repack.sources}
+        if stray:
+            raise RepackError("repack map names sources still needed by materialized recipes: "
+                              + ", ".join(sorted(stray)))
 
     resources = family_conversion.load_resources(model, inventory.RESOURCE_SPECS)
     resource_payloads = {item.name: item.data for item in resources}
@@ -92,7 +97,7 @@ def convert(
     )
 
     with recipe.open_reader(model) as reader:
-        source = recipe.preflight_sources(reader, tuple(recipes.values()))
+        source = recipe.preflight_sources(reader, remaining)
         print(
             f"preflight complete: {len(plan.objects)} objects, "
             f"{source.source_tensor_count} source tensors, device={resolved_device}",
@@ -111,6 +116,8 @@ def convert(
             for index, spec in enumerate(plan.specs, start=1):
                 if spec.name in resource_payloads:
                     payload = resource_payloads[spec.name]
+                elif repack is not None and spec.name in planned:
+                    payload = repack.payload_for(spec, recipes[spec.name], None)
                 else:
                     tensor = materialize_recipe(recipes[spec.name], reader)
                     payload = family_conversion.encode_tensor_payload(
@@ -132,7 +139,8 @@ def convert(
         ranking_path=model,
         model_dir=model,
         out_path=output,
-        arguments={"model": str(model_dir), "out": str(out_path), "device": requested_device},
+        arguments={"model": str(model_dir), "out": str(out_path), "device": requested_device,
+                   "gguf_repack": str(gguf_repack) if gguf_repack is not None else None},
         config_summary={
             "architecture": inventory.ARCHITECTURE,
             "hidden": geometry.hidden,
@@ -169,8 +177,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--gguf-repack", type=Path,
+                        help="GGUF source map written by the ingestion bridge")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device)
+    convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack)
 
 
 if __name__ == "__main__":

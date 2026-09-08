@@ -23,6 +23,11 @@ from surogate.serve.convert.common.safetensors import ShardReader
 
 from . import inventory
 
+# LFM's validated execution profile is W8. Native GGML MLP execution changes generation on
+# the tested checkpoints; exact row-split repacks are supported, while other types are
+# materialized and encoded into the established profile.
+GGUF_NATIVE = False
+
 
 def build_recipes(geometry: inventory.Geometry) -> tuple[TensorRecipe, ...]:
     """Every object's source, in object order, for one checkpoint's config."""

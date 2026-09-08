@@ -104,7 +104,7 @@ The family is detected automatically. Available formats and optional features va
 | Llama | Includes TinyLlama |
 | Gemma 3 | Text generation |
 | Gemma 4 | Text generation with dense, E-series, and mixture-of-experts models |
-| LFM2 | Text generation from Hugging Face safetensors; GGUF input is not yet supported |
+| LFM2 / LFM2.5 | Dense text models from Hugging Face safetensors or GGUF |
 | Qwen3.5/3.6/3.8 | Includes BF16 and NVFP4 exports |
 | Qwen3.5/3.6 MoE | Includes 35B-A3B; optional speculative decoding |
 | Qwen3.8 Flash-Next | GGUF; supports CPU offload |
@@ -113,6 +113,10 @@ The family is detected automatically. Available formats and optional features va
 
 Model size is detected from the checkpoint. Its format and features must still be supported;
 unsupported checkpoints are refused with an error message.
+
+LFM2 and LFM2.5 GGUF files include their configuration, tokenizer, and chat template, so no
+separate Hugging Face download is needed. They are prepared as 8-bit serving weights;
+lower-bit GGUFs can therefore require more disk space and memory after preparation.
 
 ## Hardware
 

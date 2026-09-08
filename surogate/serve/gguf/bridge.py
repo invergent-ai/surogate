@@ -75,6 +75,13 @@ def read_gguf_summary(gguf_path: Path, reader=None) -> dict:
 #: Where the alias it lands on is not the one the converter's recipe names, say so here. These
 #: are substring rewrites on the HF side of the map, applied after it is built.
 _HF_ALIAS_FIXUPS: dict[str, tuple[tuple[str, str], ...]] = {
+    "lfm2": (("model.pre_ln", "model.embedding_norm"),
+             (".input_layernorm", ".operator_norm"),
+             (".post_attention_layernorm", ".ffn_norm"),
+             ("self_attn.o_proj", "self_attn.out_proj"),
+             ("mlp.gate_proj", "feed_forward.w1"),
+             ("mlp.down_proj", "feed_forward.w2"),
+             ("mlp.up_proj", "feed_forward.w3")),
     # Qwen3's per-head norms are `q_norm`/`k_norm` in the checkpoint; the generic map reaches
     # them by their `q_layernorm`/`k_layernorm` alias.
     "qwen3": (("self_attn.q_layernorm", "self_attn.q_norm"),
@@ -226,6 +233,9 @@ def synthesised_config(reader, arch: str) -> dict | None:
     Dimensions and execution settings come from GGUF metadata. Family-specific normalization
     translates those fields into the same configuration consumed by safetensors conversion.
     """
+    if arch == "lfm2":
+        from surogate.serve.gguf.lfm2 import config_from_gguf
+        return config_from_gguf(reader)
     if arch in ("qwen35", "qwen35moe", "qwen38", "qwen3_5", "qwen3_6",
                 "qwen3_8", "qwen3_5_moe", "qwen3_6_moe"):
         from surogate.serve.convert.common.qwen3_5 import config_from_gguf
@@ -472,6 +482,8 @@ def _gemma4_config(reader, kv, common: dict, layers: int, heads: int) -> dict:
 def _has_export_transform(arch: str, hf_name: str) -> bool:
     """Whether reading this tensor back means undoing something, which decides whether it can
     be moved into the artifact bit-exactly or has to go through the dequantise path."""
+    if arch == "lfm2":
+        return hf_name.endswith(".conv.conv.weight")
     if arch == "gemma3":
         return hf_name.endswith("norm.weight")
     if arch == "llama":
@@ -498,6 +510,9 @@ def _invert_export_transform(arch: str, hf_name: str, tensor, heads: int, kv_hea
     Left alone, neither is loud: TinyLlama answered "The capital of France is" with fluent,
     confident, wrong text, and Gemma 3 produced multilingual noise.
     """
+    if arch == "lfm2" and hf_name.endswith(".conv.conv.weight"):
+        # llama.cpp squeezes the depthwise channel axis: [hidden, 1, taps] -> [hidden, taps].
+        return tensor.unsqueeze(1) if tensor.ndim == 2 else tensor
     if arch == "gemma3":
         # Every norm, and only norms: `_norm.weight` covers input/post/pre/final and the
         # per-head q_norm/k_norm, all of which Gemma's converter folds.
@@ -783,6 +798,8 @@ def gguf_target_key(gguf_path: Path, reader=None):
         return "qwen3"
     if arch == "llama" and hidden > 0 and layers > 0:
         return "llama"
+    if arch == "lfm2" and hidden > 0 and layers > 0:
+        return "lfm2"
     if arch == "gemma3" and hidden > 0 and layers > 0:
         return "gemma3"
     # Gemma 4. llama.cpp gives all five published checkpoints one architecture string, exactly

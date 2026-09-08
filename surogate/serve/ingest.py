@@ -84,7 +84,7 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     # LFM2 interleaves attention with a short convolution; which layer is which is
     # in the checkpoint, so the architecture is the only gate here too.
     if model_type == "lfm2" and hidden > 0 and layers > 0:
-        return ConverterTarget("lfm2", "surogate.serve.convert.lfm2.convert", "LFM2")
+        return ConverterTarget("lfm2", "surogate.serve.convert.lfm2.convert", "LFM2", gguf_repack=True)
     # Qwen3-MoE: the same attention as the dense Qwen3 over a routed mixture with no
     # always-on expert. Its GGUF keeps its experts as K-quants, so it takes the repack path.
     if model_type == "qwen3_moe" and hidden > 0 and layers > 0:
@@ -266,18 +266,12 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     target_key = serve_gguf.gguf_target_key(gguf_path, reader)
     if target_key is None:
         s = serve_gguf.read_gguf_summary(gguf_path, reader)
-        if s["architecture"] == "lfm2":
-            raise SystemExit(
-                "surogate serve: LFM2 currently requires Hugging Face safetensors weights.\n"
-                "  Pass the model's Hugging Face repository or local safetensors directory;\n"
-                "  LFM2 GGUF input is not supported yet."
-            )
         raise SystemExit(
             "surogate serve: this GGUF is not yet supported by the native engine.\n"
             f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
             f"layers={s['num_hidden_layers']} quants={s['quant_types']}\n"
             "  Registered today: Qwen3.5/3.6/3.8 (dense and MoE), Qwen3.8-Flash-Next,\n"
-            "  Qwen3 (dense and MoE), Gemma 3/4, Llama/TinyLlama and GLM-5-Next. A target reads its\n"
+            "  Qwen3 (dense and MoE), Gemma 3/4, Llama/TinyLlama, LFM2 and GLM-5-Next. A target reads its\n"
             "  dimensions from the artifact, so what has to match is the architecture rather\n"
             "  than the size -- a family with no target here has none yet."
         )
@@ -479,10 +473,11 @@ def _repack_planner(root: Path, target_key: str):
                 recipes_by_name,
                 tensor_specs,
                 exclude_suffixes=getattr(recipe, "NATIVE_EXCLUDE_SUFFIXES", ()),
-            )
+            ) if getattr(recipe, "GGUF_NATIVE", True) else {}
             # A fused parent stored as two typed halves keeps its sources too, or the bridge
             # dequantises them and the converter can no longer see the types it split on.
-            halves = source.plan_native_halves(recipes_by_name, tensor_specs)
+            halves = (source.plan_native_halves(recipes_by_name, tensor_specs)
+                      if getattr(recipe, "GGUF_NATIVE", True) else {})
             covered = set(planned) | set(native) | set(halves)
             # Recipes and the bridge may spell one tensor differently; resolve each wanted
             # source to the candidate that actually holds it before intersecting, or nothing
