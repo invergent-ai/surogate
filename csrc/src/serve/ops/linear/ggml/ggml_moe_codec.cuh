@@ -76,6 +76,40 @@ __host__ __device__ __forceinline__ void decode_eight<GgmlType::Q3_K>(const void
     }
 }
 
+/// A lane's eight consecutive bytes as one word pair, loaded as widely as the block's
+/// alignment allows. Where the run is 8-byte aligned -- Q4_K (144-byte blocks), Q5_K (176),
+/// IQ4_XS (136), with the tensor 16-byte aligned as GGUF's 32 guarantees -- that is one load
+/// where eight byte loads were; a 2-aligned run (Q6_K's 210-byte block, Q8_0's 34) takes four
+/// halfword loads. Measured on the sparse-MoE decode: the eight byte loads were the kernel's
+/// instruction stream, not its bandwidth. The host path keeps byte reads: the CPU expert
+/// route decodes the same blocks and gains nothing from the width.
+template <int Align>
+__host__ __device__ __forceinline__ void load_eight_bytes(const std::uint8_t* q, std::uint32_t& lo,
+                                                          std::uint32_t& hi) {
+#if defined(__CUDA_ARCH__)
+    if constexpr (Align >= 8) {
+        const uint2 v = *reinterpret_cast<const uint2*>(q);
+        lo = v.x;
+        hi = v.y;
+    } else if constexpr (Align >= 2) {
+        const std::uint16_t* h = reinterpret_cast<const std::uint16_t*>(q);
+        lo = static_cast<std::uint32_t>(h[0]) | (static_cast<std::uint32_t>(h[1]) << 16);
+        hi = static_cast<std::uint32_t>(h[2]) | (static_cast<std::uint32_t>(h[3]) << 16);
+    } else {
+        lo = static_cast<std::uint32_t>(q[0]) | (static_cast<std::uint32_t>(q[1]) << 8) |
+             (static_cast<std::uint32_t>(q[2]) << 16) | (static_cast<std::uint32_t>(q[3]) << 24);
+        hi = static_cast<std::uint32_t>(q[4]) | (static_cast<std::uint32_t>(q[5]) << 8) |
+             (static_cast<std::uint32_t>(q[6]) << 16) | (static_cast<std::uint32_t>(q[7]) << 24);
+    }
+#else
+    lo = static_cast<std::uint32_t>(q[0]) | (static_cast<std::uint32_t>(q[1]) << 8) |
+         (static_cast<std::uint32_t>(q[2]) << 16) | (static_cast<std::uint32_t>(q[3]) << 24);
+    hi = static_cast<std::uint32_t>(q[4]) | (static_cast<std::uint32_t>(q[5]) << 8) |
+         (static_cast<std::uint32_t>(q[6]) << 16) | (static_cast<std::uint32_t>(q[7]) << 24);
+#endif
+}
+
+
 template <>
 __host__ __device__ __forceinline__ void decode_eight<GgmlType::Q4_K>(const void* blocks, std::int64_t ib,
                                                              int lane, float (&w)[8]) {
@@ -88,12 +122,15 @@ __host__ __device__ __forceinline__ void decode_eight<GgmlType::Q4_K>(const void
     std::uint8_t sc = 0;
     std::uint8_t m  = 0;
     get_scale_min_k4(2 * il + hi, x->scales, sc, m);
-    const float d = __low2float(x->dm) * sc;
+    const float d  = __low2float(x->dm) * sc;
     const float mo = __high2float(x->dm) * m;
-    const std::uint8_t* q = x->qs + 32 * il + r;
+    std::uint32_t lo, hi_word;
+    load_eight_bytes<8>(x->qs + 32 * il + r, lo, hi_word);
+    const std::uint32_t shift = hi ? 4u : 0u;
 #pragma unroll
     for (int l = 0; l < 8; ++l) {
-        const int code = hi ? (q[l] >> 4) : (q[l] & 0xF);
+        const std::uint32_t word = l < 4 ? lo : hi_word;
+        const int code = static_cast<int>((word >> (8 * (l & 3) + shift)) & 0xFu);
         w[l]           = d * code - mo;
     }
 }
@@ -112,12 +149,17 @@ __host__ __device__ __forceinline__ void decode_eight<GgmlType::Q5_K>(const void
     get_scale_min_k4(2 * il + hi, x->scales, sc, m);
     const float d  = __low2float(x->dm) * sc;
     const float mo = __high2float(x->dm) * m;
-    const std::uint8_t* q  = x->qs + 32 * il + r;
-    const std::uint8_t* qh = x->qh + r;
-    const std::uint8_t bit = static_cast<std::uint8_t>(1u << (2 * il + hi));
+    std::uint32_t q_lo, q_hi, h_lo, h_hi;
+    load_eight_bytes<8>(x->qs + 32 * il + r, q_lo, q_hi);
+    load_eight_bytes<8>(x->qh + r, h_lo, h_hi);
+    const std::uint32_t shift = hi ? 4u : 0u;
+    const std::uint32_t bit   = 1u << (2 * il + hi);
 #pragma unroll
     for (int l = 0; l < 8; ++l) {
-        const int code = (hi ? (q[l] >> 4) : (q[l] & 0xF)) + ((qh[l] & bit) ? 16 : 0);
+        const std::uint32_t q = l < 4 ? q_lo : q_hi;
+        const std::uint32_t h = l < 4 ? h_lo : h_hi;
+        const int code = static_cast<int>((q >> (8 * (l & 3) + shift)) & 0xFu) +
+                         (((h >> (8 * (l & 3))) & bit) ? 16 : 0);
         w[l]           = d * code - mo;
     }
 }
@@ -132,6 +174,9 @@ __host__ __device__ __forceinline__ void decode_eight<GgmlType::Q6_K>(const void
     const int t   = rem >> 5;        // which of the four interleaved stripes
     const int il  = rem & 31;
     const float d = __half2float(x->d) * x->scales[8 * ip + il / 16 + 2 * t];
+    // Byte loads, deliberately: a Q6_K block is 210 bytes, so its runs are only 2-byte
+    // aligned, and four halfword loads plus the shifts to unpack them measured 4.5 % slower
+    // than these on GLM-5.3-Flash's 2048-wide down projection (5090, cold).
     const std::uint8_t* ql = x->ql + 64 * ip + il + 32 * (t & 1);
     const std::uint8_t* qh = x->qh + 32 * ip + il;
     const int shift = 2 * t;
@@ -159,8 +204,14 @@ __host__ __device__ __forceinline__ void decode_eight<GgmlType::Q8_0>(const void
     // block and `lane` its eighth-of-a-block, exactly as the callers already index.
     const block_q8_0* x = static_cast<const block_q8_0*>(blocks) + ib;
     const float d       = __half2float(x->d);
+    std::uint32_t lo, hi;
+    load_eight_bytes<2>(reinterpret_cast<const std::uint8_t*>(x->qs) + lane * 8, lo, hi);
 #pragma unroll
-    for (int l = 0; l < 8; ++l) { w[l] = d * static_cast<float>(x->qs[lane * 8 + l]); }
+    for (int l = 0; l < 8; ++l) {
+        // Shifting the byte to the top of the word and back sign-extends it.
+        const int code = static_cast<int>(((l < 4 ? lo : hi) << (24 - 8 * (l & 3)))) >> 24;
+        w[l]           = d * static_cast<float>(code);
+    }
 }
 
 /// The plain 32-value blocks. Four lanes cover one, and eight consecutive values never
@@ -373,11 +424,16 @@ __host__ __device__ __forceinline__ void decode_eight<GgmlType::IQ4_XS>(const vo
     const int b    = v0 / 32;          // the 32-value run
     const int r    = v0 % 32;          // 0, 8 (low nibbles) or 16, 24 (high nibbles)
     const bool high = r >= 16;
-    const std::uint8_t* q4 = x.qs + 16 * b + (high ? r - 16 : r);
     const float d = __half2float(x.d) *
                     ((((x.scales_l[b / 2] >> 4 * (b % 2)) & 0xF) | (((x.scales_h >> 2 * b) & 3) << 4)) - 32);
+    std::uint32_t lo, hi;
+    load_eight_bytes<8>(x.qs + 16 * b + (high ? r - 16 : r), lo, hi);
+    const std::uint32_t shift = high ? 4u : 0u;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) { w[j] = d * kIq4nlValues[high ? (q4[j] >> 4) : (q4[j] & 0xF)]; }
+    for (int j = 0; j < 8; ++j) {
+        const std::uint32_t q = j < 4 ? lo : hi;
+        w[j] = d * kIq4nlValues[(q >> (8 * (j & 3) + shift)) & 0xFu];
+    }
 }
 
 /// The ternary pair, through the scalar decoders.
@@ -454,6 +510,10 @@ struct GgmlMoeCodec {
     /// each; Q8_0 is 32, so four lanes do. The body's packed loop derives its lane split from
     /// this, so both fall out of the same code.
     static constexpr int kGroupK = block_values(type);
+    /// A stored row is `k / kGroupK` of these, contiguous. The decode bodies stage a row's
+    /// blocks into shared memory with wide loads and decode from there, which is why the
+    /// size is a trait here: it is what makes a codec stageable.
+    static constexpr int kBlockBytes = block_bytes(type);
     /// `ggml-blocks-v1` stores K exactly -- a superblock format carries its scales inside the
     /// block and the layout requires K to be a whole number of blocks -- so a stored row is as
     /// wide as the math reads. The row-split codecs pad to 128 and say so.
