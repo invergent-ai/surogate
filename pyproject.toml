@@ -98,7 +98,8 @@ CMAKE_CUDA_ARCHITECTURES = {env="CUDAARCHS"}
 # The wheel serves as well as trains, so a build host without FFmpeg or libcurl must fail
 # here rather than publish a package whose `surogate serve` exits 127. Note this governs
 # only the host libraries: the serve engine's device code is built for
-# SUROGATE_SERVE_CUDA_ARCHS (120a), independently of CUDAARCHS above.
+# SUROGATE_SERVE_CUDA_ARCHS -- the RTX line, Ada and Blackwell -- independently of CUDAARCHS
+# above, so one published wheel serves a 4090, a 5090 and an RTX PRO 6000.
 SUROGATE_REQUIRE_SERVE = "ON"
 
 [tool.uv]
