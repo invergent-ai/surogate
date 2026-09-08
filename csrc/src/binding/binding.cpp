@@ -2394,6 +2394,25 @@ NB_MODULE(_surogate, m) {
             "                Provide position_ids for packed sequences where positions reset.\n\n"
             "Returns: float32 log-probabilities shaped [B, T].\n"
             "         Masked positions (target==-100) receive 0.")
+        .def("next_token_logits", [](MultiGPUPyTrainer* trainer,
+                                     nb::ndarray<const int32_t, nb::numpy, nb::ndim<2>, nb::c_contig, nb::device::cpu> ids,
+                                     nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> positions) {
+            if (positions.shape(0) != ids.shape(0)) {
+                throw std::invalid_argument("last_positions must contain one index per input row");
+            }
+            std::vector<float> logits;
+            {
+                nb::gil_scoped_release release;
+                logits = trainer->next_token_logits(ids.data(), positions.data(),
+                                                     static_cast<int>(ids.shape(0)), static_cast<int>(ids.shape(1)));
+            }
+            const auto B = ids.shape(0), V = logits.size() / B;
+            auto* data = new float[logits.size()];
+            std::copy(logits.begin(), logits.end(), data);
+            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {B, V}, owner);
+        }, nb::arg("input_ids"), nb::arg("last_positions"),
+        "Return float32 next-token logits from the resident policy, one selected position per batch row.")
         .def_prop_ro("world_size", &MultiGPUPyTrainer::world_size, "Number of participating GPUs.")
         .def_prop_ro("batch_size", &MultiGPUPyTrainer::batch_size, "Per-GPU batch size configured for this trainer.")
         .def_prop_ro("seq_length", &MultiGPUPyTrainer::seq_length, "Sequence length configured for this trainer.")

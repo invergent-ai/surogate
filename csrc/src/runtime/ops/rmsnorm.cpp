@@ -27,7 +27,7 @@ void CompiledExecutor::dispatch_rmsnorm(const CompiledOp& op) {
     const int total_rows = static_cast<int>(x.nelem() / C);
     const float eps = op.attrs.eps;
 
-    Tensor& y = ensure_output_tensor(op.outputs[0]);
+    Tensor y = ensure_output_tensor(op.outputs[0]);
     // rstd must be FP32; allocate temp if the slot is wrong dtype
     Tensor& rstd_ref = ensure_output_tensor(op.outputs[1]);
     Tensor rstd = rstd_ref;
@@ -46,6 +46,7 @@ void CompiledExecutor::dispatch_rmsnorm(const CompiledOp& op) {
         mTemps.push_back(y);
     }
 
+    y = view_tensor(y, std::vector<long>(x.Sizes.begin(), x.Sizes.begin() + x.Rank));
     rmsnorm_forward(y, rstd, x, weight, /*abs_max_ptr=*/nullptr, eps, total_rows, 1, C, mRunState.MainStream);
     store_tensor(op.outputs[0], y);
     store_tensor(op.outputs[1], rstd);
@@ -76,7 +77,14 @@ void CompiledExecutor::dispatch_rmsnorm_backward(const CompiledOp& op) {
     Tensor& weight = *weight_ptr;
     Tensor& rstd = resolve_tensor(op.inputs[3]);
 
-    Tensor& d_x = ensure_output_tensor(op.outputs[0]);
+    Tensor d_x = ensure_output_tensor(op.outputs[0]);
+    const std::vector<long> x_shape(x.Sizes.begin(), x.Sizes.begin() + x.Rank);
+    if (d_x.nelem() < x.nelem() || d_x.DType != x.DType) {
+        d_x = mRunState.temp_alloc(x.DType, x_shape, "rmsnorm_dx");
+        mTemps.push_back(d_x);
+    } else {
+        d_x = view_tensor(d_x, x_shape);
+    }
 
     // d_weight accumulation
     Tensor d_weight_buf;
@@ -84,8 +92,13 @@ void CompiledExecutor::dispatch_rmsnorm_backward(const CompiledOp& op) {
         d_weight_buf = ensure_output_tensor(op.outputs[1]);
     }
 
-    const int C = static_cast<int>(d_out.Sizes[d_out.Rank - 1]);
-    const int total_rows = static_cast<int>(d_out.nelem() / C);
+    // Gradient slots can flatten heads into the hidden dimension. The
+    // normalization width belongs to the weight, not that storage view.
+    const int C = static_cast<int>(weight.nelem());
+    const int total_rows = static_cast<int>(x.nelem() / C);
+    if (x.nelem() % C || d_out.nelem() < x.nelem() || rstd.nelem() < total_rows) {
+        throw std::runtime_error("rmsnorm_backward: input, gradient and row statistics dimensions disagree");
+    }
 
     // Reuse the pre-sized global RMSNorm scratch buffer. The kernel requires
     // get_rmsnorm_backward_scratch_size(C, device) bytes; a tiny ad-hoc temp
@@ -117,6 +130,7 @@ void CompiledExecutor::dispatch_rmsnorm_backward(const CompiledOp& op) {
                      C,
                      mRunState.DeviceProp,
                      mRunState.MainStream);
+    store_tensor(op.outputs[0], d_x);
 }
 
 namespace {

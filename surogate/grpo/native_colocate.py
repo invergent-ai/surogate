@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 from surogate.grpo.shared_weights import adapter_modules, borrow_weights, write_shared_artifact
+from surogate.grpo.shared_model import SharedModelServer, shared_execution
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -26,7 +27,7 @@ def validate_configs(train, infer, orch):
         if getattr(train, name, False):
             raise ValueError(f"native GRPO colocate does not support {name}")
     if getattr(train, "ep_size", 1) != 1:
-        raise ValueError("native GRPO colocate currently supports dense models only")
+        raise ValueError("native GRPO colocate requires ep_size: 1")
     if train.noise_scheduler and train.noise_scheduler.enabled:
         raise ValueError("native GRPO colocate does not yet support QeRL weight noise")
     if train.transport_type != "filesystem" or orch.rollout_transport.type != "filesystem":
@@ -60,8 +61,11 @@ def validate_configs(train, infer, orch):
     if getattr(train, "lora_dropout", 0):
         raise ValueError("native GRPO colocate requires lora_dropout: 0 for policy scoring")
     config = json.loads((Path(train.model_dir) / "config.json").read_text())
-    if config.get("architectures") != ["Qwen3ForCausalLM"] or config.get("quantization_config"):
-        raise ValueError("native GRPO colocate currently supports BF16 dense Qwen3 safetensors checkpoints")
+    shared_execution(config, train.lora_target_modules)
+    text = config.get("text_config", config)
+    if (text.get("num_experts", text.get("num_local_experts", 0)) and
+            getattr(train, "lora_dtype", "fp32") != "bf16"):
+        raise ValueError("MoE shared-model GRPO requires lora_dtype: bf16 for expert adapter training")
 
 
 class SharedPolicy:
@@ -107,7 +111,8 @@ class SharedPolicy:
                 return  # the existing trainer also publishes once at final teardown
             if not self.training or step != self.version + 1:
                 raise RuntimeError(f"unexpected policy publication {step} after {self.version}")
-            self.server.publish(self.name, adapter_modules(trainer, self.scale), step)
+            modules = [] if getattr(self.server, "uses_live_adapter", False) else adapter_modules(trainer, self.scale)
+            self.server.publish(self.name, modules, step)
             self.version = step
             self.training = False
             self._report("rollouts")
@@ -146,7 +151,6 @@ class SharedInferencePool:
 
 def grpo_native_colocate(train_config, infer_config, orch_config):
     validate_configs(train_config, infer_config, orch_config)
-    from surogate import _surogate_serve
     from surogate.grpo.trainer import GRPOTrainer
 
     # Interleaving requires a complete batch from one policy before its update.
@@ -167,13 +171,26 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
     # Enforce the local server address; both components live in this process.
     orch_config.client.base_url = [f"http://127.0.0.1:{settings['port']}/v1"]
     trainer, server = None, None
+    config = json.loads((Path(train_config.model_dir) / "config.json").read_text())
+    generation_config = Path(train_config.model_dir) / "generation_config.json"
+    if generation_config.is_file():
+        eos = json.loads(generation_config.read_text()).get("eos_token_id")
+        if eos is not None:
+            settings["eos_token_id"] = eos
+    execution = shared_execution(config, train_config.lora_target_modules)
     with tempfile.TemporaryDirectory(prefix="surogate-shared-grpo-") as temporary:
         artifact = Path(temporary) / "model.sinfer"
-        bindings = write_shared_artifact(train_config.model_dir, artifact)
+        bindings = write_shared_artifact(train_config.model_dir, artifact) if execution == "serve" else None
         try:
             trainer = GRPOTrainer(train_config)
-            weights = borrow_weights(trainer.trainer, bindings)
-            server = _surogate_serve.SharedServer(str(artifact), weights, settings)
+            if execution == "serve":
+                from surogate import _surogate_serve
+                weights = borrow_weights(trainer.trainer, bindings)
+                server = _surogate_serve.SharedServer(str(artifact), weights, settings)
+            else:
+                logger.info("Shared-model rollouts use the training runtime and recompute the prefix for each token. "
+                            "Start with short contexts and a small rollout batch.")
+                server = SharedModelServer(trainer.trainer, train_config.tokenizer, config, settings)
             policy = SharedPolicy(server, train_config, orch_config)
             trainer.phase_controller = policy
             trainer.broadcast = policy

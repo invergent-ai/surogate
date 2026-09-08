@@ -1,4 +1,4 @@
-"""Real trainer/serving parity and handoff checks; opt in with a BF16 Qwen3 model."""
+"""Real trainer/serving parity and handoff checks for supported shared models."""
 
 import concurrent.futures
 import gc
@@ -25,17 +25,26 @@ def test_shared_generation_adapter_update_and_owner_lifetime(tmp_path):
     options = _surogate.RuntimeOptions(use_cuda_graphs=False, master_dtype="bf16", offload_master=False,
                                        offload_grads=False, offload_optimizer=False)
     options.dsl_ir_json = build_dsl_ir_for_model(MODEL)
+    from surogate.kernels.jit_compile import compile_jit_kernels
+    manifests = compile_jit_kernels(options.dsl_ir_json)
+    if manifests:
+        options.jit_kernel_manifests = manifests
     config = _surogate.PretrainedConfig.from_pretrained(MODEL, "bf16")
+    hf_config = json.loads((Path(MODEL) / "config.json").read_text())
+    # Hybrid BF16 recurrence and different prefill batch widths amplify rounding.
+    # On 0.8B, independent HF comparisons put the final hidden-state difference
+    # at 2–3%, with a 0.26 logprob spread between training and graphed serving.
+    score_tolerance = .30 if "Qwen3_5" in hf_config["architectures"][0] else .15
+    targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     lora = _surogate.LoRAAdapterConfig(rank=8, alpha=16, dropout=0., dtype="fp32",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+        target_modules=targets)
     trainer = _surogate.SurogateTrainer(ngpu=1, config=config, options=options, batch_size=1,
                                        seq_len=128, grad_accum=1, lora_config=lora)
     trainer.import_weights(get_model_weights_path(MODEL))
     artifact = tmp_path / "shared.sinfer"
     weights = borrow_weights(trainer, write_shared_artifact(MODEL, artifact))
     base = trainer.get_shared_base_weights()
-    hf_config = json.loads((Path(MODEL) / "config.json").read_text())
-    if hf_config.get("tie_word_embeddings"):
+    if hf_config.get("text_config", hf_config).get("tie_word_embeddings", hf_config.get("tie_word_embeddings")):
         assert torch.from_dlpack(base["embedding"]).data_ptr() == torch.from_dlpack(base["lm_head"]).data_ptr()
     settings = dict(host="127.0.0.1", port=int(os.environ.get("SUROGATE_SHARED_PORT", "18653")), device=0,
                     model="qwen3", max_context=256, prefill_chunk=128, max_concurrency=4,
@@ -73,12 +82,13 @@ def test_shared_generation_adapter_update_and_owner_lifetime(tmp_path):
     try:
         assert requests.post(url, json=body | {"model": "qwen3"}, timeout=10).status_code == 429
         server.publish("default", adapter_modules(trainer, 2.), 0)
+        assert {m["module"] for m in adapter_modules(trainer, 2.)} == set(targets)
         first = generate()
         assert server.summary()["base_upload_bytes"] == 0
         assert server.summary()["serving_base_allocated_bytes"] == 0
         server.begin_training()
         initial_scores = score_in_trainer(first)
-        np.testing.assert_allclose(serving_scores(first), initial_scores, atol=.15, rtol=0)
+        np.testing.assert_allclose(serving_scores(first), initial_scores, atol=score_tolerance, rtol=0)
 
         # Update every projection, including the opposite halves of the fused
         # training MLP; publishing stale tensors or swapped halves breaks parity.
@@ -98,11 +108,22 @@ def test_shared_generation_adapter_update_and_owner_lifetime(tmp_path):
         server.begin_training()
         updated_scores = score_in_trainer(updated)
         (tmp_path / "scores.json").write_text(json.dumps(dict(response=updated, trainer=updated_scores.tolist())))
-        np.testing.assert_allclose(serving_scores(updated), updated_scores, atol=.15, rtol=0)
+        np.testing.assert_allclose(serving_scores(updated), updated_scores, atol=score_tolerance, rtol=0)
         assert not np.allclose(score_in_trainer(first), initial_scores, atol=1e-3, rtol=0)
         with pytest.raises(ValueError, match="version"):
             server.publish("default", adapter_modules(trainer, 2.), 1)
         server.publish("default", adapter_modules(trainer, 2.), 2)
+
+        # Concurrent prompts exercise independent recurrent states and prefix
+        # reuse after publication.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            repeated = list(executor.map(lambda _: generate(), range(4)))
+        assert all(result["choices"][0]["token_ids"] == updated["choices"][0]["token_ids"] for result in repeated)
+
+        fresh_body = body | dict(messages=[dict(role="user", content="What is the capital of France?")])
+        fresh = generate(fresh_body)
+        server.begin_training()
+        server.publish("default", adapter_modules(trainer, 2.), 3)
 
         # Pause while a streamed response is in flight. Already-admitted work
         # must finish before sleeping; the worker must not park before draining.
@@ -112,16 +133,25 @@ def test_shared_generation_adapter_update_and_owner_lifetime(tmp_path):
             response.raise_for_status()
             lines = response.iter_lines()
             next(line for line in lines if line.startswith(b"data:"))
+            # A new prompt arriving during decode must retain its adapter too.
+            overlapping = generate(fresh_body)
+            assert overlapping["choices"][0]["token_ids"] == fresh["choices"][0]["token_ids"]
+            # Prefill retains its shape; decode now uses a wider BF16 batch.
+            np.testing.assert_allclose(serving_scores(overlapping)[:1], serving_scores(fresh)[:1], atol=1e-3, rtol=0)
+            np.testing.assert_allclose(serving_scores(overlapping), serving_scores(fresh),
+                                       atol=score_tolerance, rtol=0)
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 paused = executor.submit(server.begin_training)
                 assert any(line == b"data: [DONE]" for line in lines)
                 paused.result(timeout=15)
         assert server.summary()["sleeping"]
         assert requests.post(url, json=body, timeout=10).status_code == 429
-        server.publish("default", adapter_modules(trainer, 2.), 3)
+        server.publish("default", adapter_modules(trainer, 2.), 4)
         del live, base, weights, trainer
         gc.collect()
-        assert generate()["choices"] == updated["choices"]
+        after_release = generate()
+        assert after_release["choices"][0]["token_ids"] == updated["choices"][0]["token_ids"]
+        np.testing.assert_allclose(serving_scores(after_release), serving_scores(updated), atol=.05, rtol=0)
     finally:
         server.close()
         server.close()

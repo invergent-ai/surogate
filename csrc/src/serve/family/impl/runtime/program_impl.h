@@ -2560,6 +2560,10 @@ std::string ProgramImplCore::last_mixed_round_description(std::size_t row) const
 }
 
 bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
+    // Mixed rounds do not yet publish adapter selections for every prefill and
+    // decode column. Keep adapter requests on the ordinary paths, which install
+    // the LoRA round for both phases and are safe under graph replay.
+    if (ops::lora_active()) { return false; }
     if (speculative_backend == SpeculativeBackend::DFlash || prefill_lane >= max_concurrency) {
         return false;
     }

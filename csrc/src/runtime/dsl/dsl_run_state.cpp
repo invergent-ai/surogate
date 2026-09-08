@@ -637,10 +637,13 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     if (mRunStateRequirements.rope_freqs && max_seq_len > 0) {
         const int head_size = cfg.head_size();
         const RopeInvFreq rope_params = compute_rope_inv_freq(cfg, head_size, max_seq_len);
+        // fill_rope_freqs packs one rotary_dim-wide row per position. Fused
+        // norm/RoPE reads the row stride from this shape, so it must describe
+        // those rows rather than the old oversized allocation.
         if (dtype == ETensorDType::BF16) {
             mNonBlockActivations.freq_cis =
-                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
-            std::vector<nv_bfloat16> freq_cpu(static_cast<std::size_t>(max_seq_len) * 2 * head_size);
+                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, rope_params.dim});
+            std::vector<nv_bfloat16> freq_cpu(static_cast<std::size_t>(max_seq_len) * rope_params.dim);
             fill_rope_freqs(freq_cpu, rope_params, head_size, max_seq_len);
             CUDA_CHECK(cudaMemcpy(mNonBlockActivations.freq_cis.Data,
                                   freq_cpu.data(),
@@ -648,8 +651,8 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
                                   cudaMemcpyHostToDevice));
         } else if (dtype == ETensorDType::FP32) {
             mNonBlockActivations.freq_cis =
-                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
-            std::vector<float> freq_cpu(static_cast<std::size_t>(max_seq_len) * 2 * head_size);
+                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, rope_params.dim});
+            std::vector<float> freq_cpu(static_cast<std::size_t>(max_seq_len) * rope_params.dim);
             fill_rope_freqs(freq_cpu, rope_params, head_size, max_seq_len);
             CUDA_CHECK(cudaMemcpy(mNonBlockActivations.freq_cis.Data,
                                   freq_cpu.data(),
@@ -658,7 +661,7 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
         } else {
             // Default: allocate in model dtype and leave zeroed.
             mNonBlockActivations.freq_cis =
-                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, 2 * head_size});
+                mAllocator->allocate(dtype, "freq_cis", EAllocationType::ON_DEVICE, {max_seq_len, rope_params.dim});
             fill_zero(mNonBlockActivations.freq_cis, MainStream);
         }
 

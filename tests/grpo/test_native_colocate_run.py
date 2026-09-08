@@ -15,12 +15,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.mark.skipif(not MODEL, reason="set SUROGATE_SHARED_MODEL and CUDA_VISIBLE_DEVICES to one test GPU")
 def test_native_colocate_trains_without_reloading_base(tmp_path):
+    targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     out = tmp_path / "out"
     train = dict(model=MODEL, output_dir=str(out), gpus=1, per_device_train_batch_size=1,
                  sequence_len=2048, max_steps=2, logging_steps=1, learning_rate=1e-4,
                  lr_scheduler_type="constant", warmup_steps=0, recipe="bf16", optimizer="adamw",
                  lora=True, lora_rank=8, lora_alpha=16,
-                 lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                 lora_target_modules=targets,
                  save_steps=0, merge_adapter=False)
     infer = dict(model=MODEL, backend="surogate", enable_lora=True, max_model_len=2048,
                  max_num_seqs=4, port=int(os.environ.get("SUROGATE_SHARED_PORT", "18652")))
@@ -55,4 +56,7 @@ def test_native_colocate_trains_without_reloading_base(tmp_path):
     from safetensors.torch import load_file
     tensors = load_file(str(adapters[-1]))
     assert any(t.float().abs().max().item() > 0 for name, t in tensors.items() if "lora_B" in name)
+    for module in targets:
+        assert any(t.float().abs().max().item() > 0 for name, t in tensors.items()
+                   if name.endswith(f".{module}.lora_B.weight")), module
     assert "Traceback" not in re.sub(r"\x1b\[[0-9;]*m", "", log)

@@ -194,7 +194,18 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
 void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
     Tensor& d_permuted = resolve_tensor(op.inputs[0]);
     Tensor& scatter_indices_saved = resolve_tensor(op.inputs[1]);  // Saved from forward
-    Tensor& d_input = ensure_output_tensor(op.outputs[0]);
+    Tensor d_input = ensure_output_tensor(op.outputs[0]);
+    if (scatter_indices_saved.Data && op.attrs.top_k > 0) {
+        const long tokens = scatter_indices_saved.nelem() / op.attrs.top_k;
+        const long hidden = d_permuted.Sizes[d_permuted.Rank - 1];
+        if (d_input.nelem() < static_cast<std::size_t>(tokens * hidden)) {
+            d_input = mRunState.temp_alloc(d_permuted.DType, {tokens, hidden}, "moe_permute_dinput");
+            mTemps.push_back(d_input);
+        }
+        d_input.Rank = 2;
+        d_input.Sizes[0] = tokens;
+        d_input.Sizes[1] = hidden;
+    }
 
     Tensor* scatter_indices = nullptr;
     if (scatter_indices_saved.Data != nullptr && scatter_indices_saved.DType == ETensorDType::INT32) {

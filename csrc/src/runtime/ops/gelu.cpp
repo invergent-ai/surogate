@@ -37,15 +37,14 @@ void CompiledExecutor::dispatch_gelu_backward(const CompiledOp& op) {
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& inp = resolve_tensor(op.inputs[1]);
 
-    Tensor& d_inp = (op.outputs[0].shape.empty() && inp.Rank > 0) ? [&]() -> Tensor& {
-        std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
-        Tensor t = mRunState.temp_alloc(inp.DType, shape, "gelu_backward_d_inp");
-        fill_zero(t, mRunState.MainStream);
-        mTemps.push_back(t);
-        store_tensor(op.outputs[0], t);
-        return mTensors[op.outputs[0].tensor_id];
-    }()
-        : ensure_output_tensor(op.outputs[0]);
+    Tensor d_inp = ensure_output_tensor(op.outputs[0]);
+    std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
+    if (d_inp.nelem() != inp.nelem() || d_inp.DType != inp.DType) {
+        d_inp = mRunState.temp_alloc(inp.DType, shape, "gelu_backward_d_inp");
+        mTemps.push_back(d_inp);
+    } else {
+        d_inp = view_tensor(d_inp, shape);
+    }
 
     const long N = static_cast<long>(inp.nelem());
     if (op.attrs.gelu_exact) gelu_exact_backward(d_inp, inp, d_out, N, mRunState.MainStream);

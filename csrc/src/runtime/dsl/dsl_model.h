@@ -380,6 +380,11 @@ public:
                                         const std::int32_t* position_ids = nullptr,
                                         const float* temperatures = nullptr);
 
+    /// Evaluate selected next-token logits using the resident policy, without saving backward activations.
+    std::vector<float> next_token_logits(const std::int32_t* input_ids,
+                                         const std::int32_t* last_positions,
+                                         int B, int T, NCCLCommunicator& comm);
+
     /// Run one training micro-step with externally-computed per-token gradient multipliers.
     ///
     /// Equivalent to forward() + backward() but replaces the standard d_loss=1.0 seeding

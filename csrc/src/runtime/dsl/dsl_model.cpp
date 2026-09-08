@@ -288,7 +288,9 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.layer_type_names = get_string_list_attr(cfg, "layer_types");
     view.num_experts = get_long_attr(cfg, "num_experts");
     view.num_experts_per_tok = get_long_attr(cfg, "num_experts_per_tok");
+    if (!view.num_experts_per_tok) view.num_experts_per_tok = get_long_attr(cfg, "top_k_experts");
     view.moe_intermediate_size = get_long_attr(cfg, "moe_intermediate_size");
+    if (!view.moe_intermediate_size) view.moe_intermediate_size = get_long_attr(cfg, "moe_d_ff");
     view.norm_topk_prob = get_bool_attr(cfg, "norm_topk_prob");
     view.use_shared_expert = get_bool_attr(cfg, "use_shared_expert");
     view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate");
@@ -523,7 +525,7 @@ void apply_arch_from_hf_config(PretrainedConfig& cfg, const Module& module) {
 }
 
 /// Parse a standardised hybrid pattern string into per-layer overrides.
-/// Standard alphabet: M=Mamba, A=Attention, P=MLP, E=MoE, C=Conv.
+/// M=Mamba, A=Attention, P=MLP, E=MoE, C=Conv; a/c add MoE to attention/conv.
 std::vector<modules::LayerOverride> parse_hybrid_pattern_to_overrides(const std::string& pattern) {
     std::vector<modules::LayerOverride> overrides;
     overrides.reserve(pattern.size());
@@ -534,9 +536,17 @@ std::vector<modules::LayerOverride> parse_hybrid_pattern_to_overrides(const std:
             case 'P': overrides.push_back(modules::LayerOverride::mlp(i)); break;
             case 'E': overrides.push_back(modules::LayerOverride::moe(i)); break;
             case 'C': overrides.push_back(modules::LayerOverride::conv(i)); break;
+            case 'a':
+            case 'c': {
+                auto layer = pattern[i] == 'a' ? modules::LayerOverride::attention(i)
+                                               : modules::LayerOverride::conv(i);
+                layer.is_moe = true;
+                overrides.push_back(layer);
+                break;
+            }
             default:
                 throw std::runtime_error(fmt::format("Invalid character '{}' at index {} in hybrid_pattern. "
-                                                     "Expected 'M', 'A', 'P', 'E', or 'C'.",
+                                                     "Expected 'M', 'A', 'P', 'E', 'C', 'a', or 'c'.",
                                                      pattern[i],
                                                      i));
         }
@@ -693,7 +703,7 @@ build_model_config(const Module& module, const PretrainedConfig& base, const Dsl
         // Propagate global MoE config to MoE layer overrides
         if (cfg.moe_config.has_value()) {
             for (auto& ov : overrides) {
-                if (ov.block_type == modules::BlockType::MoE) {
+                if (ov.block_type == modules::BlockType::MoE || ov.is_moe) {
                     ov.is_moe = true;
                     ov.num_experts = cfg.moe_config->num_experts;
                     ov.top_k = cfg.moe_config->top_k;

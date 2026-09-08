@@ -53,7 +53,7 @@ void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
     g.resize(a.size());
     beta.resize(b.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
-        const std::size_t head = i % kHeads;
+        const std::size_t head = i % a_log.size();
         const double av        = static_cast<double>(a[i]);
         const double bv        = static_cast<double>(b[i]);
         const double bias      = static_cast<double>(dt_bias[head]);
@@ -63,9 +63,9 @@ void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
     }
 }
 
-int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals) {
-    const std::size_t elements = static_cast<std::size_t>(kHeads) * tokens;
-    std::vector<float> a(elements), b(elements), a_log(kHeads), dt_bias(kHeads);
+int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals, std::int32_t heads = kHeads) {
+    const std::size_t elements = static_cast<std::size_t>(heads) * tokens;
+    std::vector<float> a(elements), b(elements), a_log(heads), dt_bias(heads);
     fill_uniform(a, seed, -8.0F, 8.0F);
     fill_uniform(b, seed + 1u, -8.0F, 8.0F);
     fill_uniform(a_log, seed + 2u, -2.0F, 1.0F);
@@ -94,12 +94,12 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     device_g.fill(0xff);
     device_beta.fill(0xff);
 
-    Tensor tensor_a(device_a.p, DType::BF16, {kHeads, tokens});
-    Tensor tensor_b(device_b.p, DType::BF16, {kHeads, tokens});
-    Tensor tensor_a_log(device_a_log.p, DType::FP32, {kHeads});
-    Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {kHeads});
-    Tensor tensor_g(device_g.data(), DType::FP32, {kHeads, tokens});
-    Tensor tensor_beta(device_beta.data(), DType::FP32, {kHeads, tokens});
+    Tensor tensor_a(device_a.p, DType::BF16, {heads, tokens});
+    Tensor tensor_b(device_b.p, DType::BF16, {heads, tokens});
+    Tensor tensor_a_log(device_a_log.p, DType::FP32, {heads});
+    Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {heads});
+    Tensor tensor_g(device_g.data(), DType::FP32, {heads, tokens});
+    Tensor tensor_beta(device_beta.data(), DType::FP32, {heads, tokens});
 
     ops::gdn_gating(tensor_a, tensor_b, tensor_a_log, tensor_dt_bias, tensor_g, tensor_beta,
                     nullptr);
@@ -216,6 +216,11 @@ int main() {
     failures += run_case(128, 0x303u, false);
     failures += run_case(4096, 0x404u, false);
     failures += run_case(17, 0x505u, true);
+
+    for (int heads : {1, 7, 16, 32, 64}) {
+        failures += run_case(1, 0xA01u, false, heads);
+        failures += run_case(129, 0xA02u, true, heads);
+    }
 
     // GLM-5.3's shape, and two others so the head/channel split is exercised rather than
     // assumed: the decay is indexed by channel and the update gate by head.

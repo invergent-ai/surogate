@@ -122,7 +122,9 @@ void CompiledExecutor::dispatch_concat(const CompiledOp& op) {
         for (int d = 0; d < rank; ++d) {
             if (d == dim) continue;
             if (t.Sizes[d] != first.Sizes[d]) {
-                throw std::runtime_error("dispatch_concat: non-concat dimensions must match");
+                throw std::runtime_error("dispatch_concat: non-concat dimension " + std::to_string(d) +
+                    " differs between " + op.inputs[0].name + " (" + std::to_string(first.Sizes[d]) +
+                    ") and " + op.inputs[i].name + " (" + std::to_string(t.Sizes[d]) + ")");
             }
         }
     }

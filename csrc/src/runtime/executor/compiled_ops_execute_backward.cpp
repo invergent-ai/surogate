@@ -937,7 +937,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (ref.name.empty()) {
                 continue;
             }
-            const Tensor* t = try_get_tensor(ref.name);
+            const Tensor* t = nullptr;
+            if (ref.tensor_id >= 0 && static_cast<std::size_t>(ref.tensor_id) < mTensors.size())
+                t = &mTensors[ref.tensor_id];
+            if (!t || !t->Data) t = try_get_tensor(ref.name);
             if (!t || !t->Data) {
                 continue;
             }
@@ -1277,6 +1280,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         try {
                             op.fn(*this, op, static_cast<const void*>(hook));
                             sync_after_backward_op(op);
+                            check_nonfinite_refs(op, op.outputs);
                         } catch (const std::exception& e) {
                             std::ostringstream oss;
                             oss << "execute_backward stream op=" << i << " type=" << op_type_to_string(op.type)

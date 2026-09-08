@@ -6409,6 +6409,11 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                         }
                     }
                     long num_tokens = total_tokens / top_k;
+                    // Expert buffers may reserve extra rows for routing. The
+                    // scatter map describes the actual (un-padded) token set.
+                    if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                        num_tokens = shape_nelem(compiled.inputs[1].shape) / top_k;
+                    }
                     ref.shape = {num_tokens, hidden_size};
                 } else if (compiled.type == CompiledOpType::MoEUnpermuteBackward) {
                     // inputs: d_out, saved.expert_out, saved.routing_weights, saved.scatter_indices
@@ -6652,11 +6657,16 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                 if (compiled.inputs.size() > 1 && compiled.inputs[1].shape.size() >= 2) {
                     emb_dim = compiled.inputs[1].shape.back();
                 }
-                const bool is_main_embedding = (emb_dim == mConfig.HiddenSize);
+                const bool is_main_embedding = ref.slot == TensorSlot::Encoded;
                 if (is_main_embedding) {
                     ref.slot = TensorSlot::Encoded;
                 }
-                ref.shape = {Bdim, Tdim, emb_dim};
+                if (!compiled.inputs.empty() && !compiled.inputs[0].shape.empty()) {
+                    ref.shape = compiled.inputs[0].shape;
+                    ref.shape.push_back(emb_dim);
+                } else {
+                    ref.shape = {Bdim, Tdim, emb_dim};
+                }
             }
 
             if (const char* env = std::getenv("SUROGATE_DEBUG_DTYPES")) {

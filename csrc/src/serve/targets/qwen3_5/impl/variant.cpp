@@ -4,6 +4,9 @@
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
+#include "api/ops/gdn_gating.h"
+#include "api/ops/rmsnorm.h"
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "api/ops/linear.h"
 #include "api/ops/linear_add.h"
 #include <cstdlib>
@@ -202,6 +205,24 @@ void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    if (const auto* native = std::get_if<NativeAttentionProjectionPayload>(&weights)) {
+        auto scope = workspace.scope();
+        Tensor packed = workspace.alloc(DType::BF16, {native->query_gate.n, hidden.ne[1]});
+        ops::linear(hidden, native->query_gate, packed, stream);
+        apply_lora(native->query_gate, family::kQueryPort, hidden, packed, stream);
+        const std::size_t head_bytes = native->head_dim * sizeof(std::uint16_t);
+        const std::size_t heads = query.numel() / native->head_dim;
+        CUDA_CHECK(cudaMemcpy2DAsync(query.data, head_bytes, packed.data, 2 * head_bytes,
+                                     head_bytes, heads, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(gate.data, head_bytes,
+                                     static_cast<const std::byte*>(packed.data) + head_bytes,
+                                     2 * head_bytes, head_bytes, heads, cudaMemcpyDeviceToDevice, stream));
+        ops::linear(hidden, native->key, key, stream);
+        ops::linear(hidden, native->value, value, stream);
+        apply_lora(native->key, family::kKeyPort, hidden, key, stream);
+        apply_lora(native->value, family::kValuePort, hidden, value, stream);
+        return;
+    }
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
                              text_policy(split->query_key), workspace, stream);
@@ -297,6 +318,17 @@ void Variant::gdn_input_projection_snapshot(
     Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slot,
     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
     Tensor& output_gate, family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (weights.native_storage) {
+        auto scope = workspace.scope();
+        const auto& input = std::get<QkvPlusZGdnInputProjectionPayload>(weights.input_projection);
+        Tensor projected = workspace.alloc(DType::BF16, {input.query_key_value.n, hidden.ne[1], hidden.ne[2]});
+        Tensor flat = hidden.view({hidden.ne[0], hidden.ne[1] * hidden.ne[2]});
+        Tensor qkv = projected.view({projected.ne[0], flat.ne[1]});
+        gdn_input_projection(flat, weights, qkv, output_gate, family::TextPhase::Prefill, workspace, stream);
+        ops::detail::gdn_projected_conv_snapshot_launch(projected, conv_weight, conv_states, valid_columns,
+            initial_slot, snapshot_base_slot, query, key, value, stream);
+        return;
+    }
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_snapshot_workspace_bytes(hidden, weights));
     WorkspaceArena leaf_workspace(storage);
@@ -332,6 +364,14 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                           Tensor& conv_record, Tensor& query, Tensor& key,
                                           Tensor& value, Tensor& output_gate, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
+    if (weights.native_storage) {
+        Tensor flat = hidden.view({hidden.ne[0], hidden.ne[1] * hidden.ne[2]});
+        Tensor qkv = conv_record.view({conv_record.ne[0], flat.ne[1]});
+        gdn_input_projection(flat, weights, qkv, output_gate, family::TextPhase::Prefill, workspace, stream);
+        ops::detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states,
+            valid_columns, initial_slots, query, key, value, stream);
+        return;
+    }
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights));
     WorkspaceArena leaf_workspace(storage);
@@ -371,6 +411,17 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                                           float eps, const GdnProjectionWeights& weights,
                                           Tensor& hidden, Tensor& g, Tensor& beta,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
+    if (weights.native_storage) {
+        auto scope = workspace.scope();
+        const auto& control = std::get<SplitGdnControlProjectionPayload>(weights.control_projection);
+        ops::rmsnorm(residual, norm_weight, eps, true, hidden, stream);
+        Tensor a = workspace.alloc(DType::BF16, {control.a_projection.n, hidden.ne[1]});
+        Tensor b = workspace.alloc(DType::BF16, {control.b_projection.n, hidden.ne[1]});
+        ops::linear(hidden, control.a_projection, a, stream);
+        ops::linear(hidden, control.b_projection, b, stream);
+        ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, g, beta, stream);
+        return;
+    }
     if (const auto* split =
             std::get_if<SplitGdnControlProjectionPayload>(&weights.control_projection)) {
         ops::gdn_norm_gating_proj(residual, norm_weight, eps, split->a_projection,
@@ -387,6 +438,19 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope = workspace.scope();
+    if (weights.gate.qdata != nullptr) {
+        Tensor gate = workspace.alloc(DType::BF16, {weights.gate.n, hidden.ne[1]});
+        Tensor up = workspace.alloc(DType::BF16, {weights.up.n, hidden.ne[1]});
+        Tensor activation = workspace.alloc(DType::BF16, {weights.gate.n, hidden.ne[1]});
+        ops::linear(hidden, weights.gate, gate, stream);
+        ops::linear(hidden, weights.up, up, stream);
+        apply_lora(weights.gate, family::kGatePort, hidden, gate, stream);
+        apply_lora(weights.up, family::kUpPort, hidden, up, stream);
+        ops::silu_mul(gate, up, activation, stream);
+        ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace, stream);
+        apply_lora(weights.down, family::kDownPort, activation, residual, stream);
+        return;
+    }
     if (family::swiglu_mlp_down_add(hidden, weights.gate_up, weights.down, residual,
                                     text_policy(weights.gate_up), /*limit=*/0.0F, workspace,
                                     stream)) {
@@ -442,6 +506,11 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(const family:
     WeightsProfile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
     return text_layers_workspace(geometry, WorkspaceLayers::Attention, [&](const std::string& prefix) {
+        if (geometry.linear_storage.contains(prefix + "attention/query_gate")) {
+            WorkspaceLayoutBuilder layout;
+            (void)layout.alloc(DType::BF16, {2 * geometry.query_size(), last});
+            return layout.peak_bytes(1);
+        }
         if (geometry.linear_storage.contains(prefix + "attention/query_key")) {
             // The two-parent attention op uses row views at A16.
             const auto rows = [&](QType type, int n, int k) {
@@ -556,14 +625,22 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(const 
 
 std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                           std::int32_t last) {
-    return ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.gdn_value_heads,
-                                                              geometry.hidden, first, last);
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {geometry.gdn_value_heads, last});
+    (void)layout.alloc(DType::BF16, {geometry.gdn_value_heads, last});
+    return std::max(layout.peak_bytes(1), ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+        geometry.gdn_value_heads, geometry.hidden, first, last));
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry,
     WeightsProfile, family::TextPhase, std::int32_t first, std::int32_t last) {
     family::validate_token_interval(first, last);
     return text_layers_workspace(geometry, WorkspaceLayers::All, [&](const std::string& prefix) {
+        if (geometry.linear_storage.contains(prefix + "mlp/gate")) {
+            WorkspaceLayoutBuilder layout;
+            for (int i = 0; i < 3; ++i) { (void)layout.alloc(DType::BF16, {geometry.intermediate, last}); }
+            return layout.peak_bytes(1);
+        }
         const auto& gate_up = family::require_linear_storage(geometry, prefix + "mlp/gate_up");
         const auto& down = family::require_linear_storage(geometry, prefix + "mlp/down");
         std::size_t peak = 0;

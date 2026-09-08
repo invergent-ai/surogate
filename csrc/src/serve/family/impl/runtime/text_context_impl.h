@@ -17,6 +17,7 @@
 #include <api/family/vision_control.h>
 #include "api/ops/argmax.h"
 #include "api/ops/next_token_nll.h"
+#include "api/ops/sampled_logprob.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/causal_conv1d_silu.h"
@@ -3158,6 +3159,9 @@ bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int 
         if (sampling_config_ != nullptr) {
             ops::sample(logits, io_.token, cfg_.token_domain, sampling_config_, io_.pos,
                         ops::kSamplePurposePrefill, work_, s);
+            if (io_.logprob.data != nullptr) {
+                ops::sampled_logprob(logits, io_.token, io_.logprob, cfg_.token_domain, sampling_config_, s);
+            }
         } else {
             ops::argmax(logits, io_.token, cfg_.token_domain, s);
         }
@@ -3371,6 +3375,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 if (sampling_config_ != nullptr) {
                     ops::sample(logits, io_.token, cfg_.token_domain, sampling_config_, io_.pos,
                                 ops::kSamplePurposePrefill, work_, s);
+                    if (io_.logprob.data != nullptr) {
+                        ops::sampled_logprob(logits, io_.token, io_.logprob, cfg_.token_domain, sampling_config_, s);
+                    }
                 } else {
                     ops::argmax(logits, io_.token, cfg_.token_domain, s);
                 }

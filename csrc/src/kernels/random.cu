@@ -28,7 +28,7 @@
  *
  * @tparam floatX Output data type (float or nv_bfloat16).
  * @param[out] dst Destination array to fill with random values.
- * @param count Number of elements (must be multiple of 4).
+ * @param count Number of elements.
  * @param mean Mean of the normal distribution.
  * @param std Standard deviation of the normal distribution.
  * @param seed Random seed for reproducibility.
@@ -52,7 +52,11 @@ __global__ void rng_normal_kernel(floatX* dst,
     cvt[1] = static_cast<floatX>(normal.y * std + mean);
     cvt[2] = static_cast<floatX>(normal.z * std + mean);
     cvt[3] = static_cast<floatX>(normal.w * std + mean);
-    cvt.store(dst + id);
+    if (id + 4 <= count) {
+        cvt.store(dst + id);
+    } else {
+        for (int i = 0; id + i < count; ++i) dst[id + i] = cvt[i];
+    }
 }
 
 /**
@@ -63,7 +67,7 @@ __global__ void rng_normal_kernel(floatX* dst,
  *
  * @tparam floatX Output data type (float or nv_bfloat16).
  * @param[out] dst Destination array to fill.
- * @param count Number of elements (must be multiple of 4).
+ * @param count Number of elements.
  * @param mean Mean of the normal distribution.
  * @param std Standard deviation of the normal distribution.
  * @param seed Random seed for reproducibility.
@@ -78,7 +82,7 @@ void rng_normal_imp(floatX* dst,
                     unsigned long long seed,
                     unsigned long long subsequence,
                     cudaStream_t stream) {
-    assert(count % 4 == 0);
+    if (count == 0) return;
     rng_normal_kernel<<<div_ceil(count, static_cast<std::size_t>(4 * 256)), 256, 0, stream>>>(dst,
                                                                                               count,
                                                                                               mean,
@@ -92,7 +96,7 @@ void rng_normal_imp(floatX* dst,
  * @brief Fills an FP32 array with normally distributed random values.
  *
  * @param[out] dst Destination FP32 array.
- * @param count Number of elements (must be multiple of 4).
+ * @param count Number of elements.
  * @param mean Mean of the normal distribution.
  * @param std Standard deviation of the normal distribution.
  * @param seed Random seed for reproducibility.
@@ -115,7 +119,7 @@ void fill_normal(float* dst,
  * Values are generated in FP32, transformed, then converted to BF16.
  *
  * @param[out] dst Destination BF16 array.
- * @param count Number of elements (must be multiple of 4).
+ * @param count Number of elements.
  * @param mean Mean of the normal distribution.
  * @param std Standard deviation of the normal distribution.
  * @param seed Random seed for reproducibility.

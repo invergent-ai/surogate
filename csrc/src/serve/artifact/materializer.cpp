@@ -173,10 +173,11 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             const auto found = bindings.find(descriptor.name);
             if (found == bindings.end()) { throw ArtifactError("missing borrowed tensor: " + descriptor.name); }
             const auto& tensor = *found->second;
-            if (descriptor.format != NumericFormat::BF16 ||
+            const auto format = tensor.dtype == SharedWeightDType::FP32 ? NumericFormat::FP32 : NumericFormat::BF16;
+            if (descriptor.format != format ||
                 descriptor.layout != StorageLayout::ContiguousLeV1 || tensor.shape != descriptor.shape ||
                 tensor.bytes != placement.bytes || tensor.device != device.device || tensor.data == nullptr) {
-                throw ArtifactError("borrowed tensor must match contiguous BF16 shape, bytes and device: " + descriptor.name);
+                throw ArtifactError("borrowed tensor must match contiguous dtype, shape, bytes and device: " + descriptor.name);
             }
             cudaPointerAttributes attributes{};
             CUDA_CHECK(cudaPointerGetAttributes(&attributes, tensor.data));

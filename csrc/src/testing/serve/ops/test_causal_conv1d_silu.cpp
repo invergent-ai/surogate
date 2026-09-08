@@ -37,6 +37,16 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     return result;
 }
 
+std::vector<std::uint16_t> stored_weight_bits(const std::vector<float>& values, int channels, bool native) {
+    auto bits = bf16_bits(values);
+    if (!native) { return bits; }
+    auto result = bits;
+    for (int c = 0; c < channels; ++c) {
+        for (int tap = 0; tap < 4; ++tap) { result[c * 4 + tap] = bits[tap * channels + c]; }
+    }
+    return result;
+}
+
 std::vector<float> make_values(std::size_t count, std::uint32_t seed, float low, float high) {
     std::vector<float> values(count);
     fill_uniform(values, seed, low, high);
@@ -160,12 +170,12 @@ const char* call_name(StateCall call) {
     return "unknown";
 }
 
-int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t seed) {
+int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t seed, bool native_taps = false) {
     const LogicalInput input       = make_input(C, T, seed);
     const std::vector<float> state = make_state(C, seed + 2U);
     const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
     const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
-    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> weight_bits = stored_weight_bits(input.weight, C, native_taps);
     const std::vector<std::uint16_t> state_bits  = bf16_bits(state);
     const std::vector<std::uint16_t> final_bits  = bf16_bits(oracle.final_state);
 
@@ -185,7 +195,8 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
     output.fill(kOutputPoison);
 
     Tensor tx(x.data(), DType::BF16, {C, T});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tw = native_taps ? Tensor(weight.data(), DType::BF16, {4, C}).permute({1, 0, 2, 3})
+                            : Tensor(weight.data(), DType::BF16, {C, 4});
     Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
     Tensor ts_out(state_out == nullptr ? state_in.data() : state_out->data(), DType::BF16, {C, 3});
     Tensor tout(output.data(), DType::BF16, {C, T});
@@ -364,7 +375,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
                           const std::vector<std::int32_t>& initial_slots,
                           const std::vector<std::int32_t>& snapshot_bases,
                           const std::vector<std::int32_t>& valid_columns, std::int32_t slots,
-                          std::uint32_t seed) {
+                          std::uint32_t seed, bool native_taps = false) {
     const std::int32_t batch        = static_cast<std::int32_t>(initial_slots.size());
     const bool masked               = !valid_columns.empty();
     const LogicalInput input        = make_input(C, width * batch, seed);
@@ -401,7 +412,7 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     }
 
     const std::vector<std::uint16_t> x_bits        = bf16_bits(input.x);
-    const std::vector<std::uint16_t> weight_bits   = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> weight_bits   = stored_weight_bits(input.weight, C, native_taps);
     const std::vector<std::uint16_t> state_bits    = bf16_bits(states);
     const std::vector<std::uint16_t> expected_bits = bf16_bits(expected_states);
 
@@ -424,7 +435,8 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     output.fill(kOutputPoison);
 
     Tensor tx(x.data(), DType::BF16, {C, width, batch});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tw = native_taps ? Tensor(weight.data(), DType::BF16, {4, C}).permute({1, 0, 2, 3})
+                            : Tensor(weight.data(), DType::BF16, {C, 4});
     Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
     Tensor tvalid;
     if (masked) { tvalid = Tensor(valid->data(), DType::I32, {batch}); }
@@ -519,6 +531,17 @@ int main() {
     // Row 0 reads slot 15 and overwrites it only after the final valid column. This is the
     // production same-row alias pattern; row 1 remains fully disjoint.
     failures += batched_snapshot_case(kQwen35Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
+
+    // The trainer's adjacent-tap storage uses the same numerical oracle and
+    // exact state/guard checks, including odd widths and masked concurrent rows.
+    for (int channels : {37, 6144}) {
+        for (int width : {1, 7, 32, 65, 257}) {
+            failures += ordinary_case(channels, width, StateCall::InPlaceEntry, 7000U + width, true);
+            failures += ordinary_case(channels, width, StateCall::DistinctEntry, 7100U + width, true);
+        }
+        failures += batched_snapshot_case(channels, 6, {18, 19, 20}, {0, 6, 12}, {6, 3, 1}, 21, 7200U, true);
+        failures += batched_snapshot_case(channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 7300U, true);
+    }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " causal_conv1d_silu\n";
     return failures == 0 ? 0 : 1;

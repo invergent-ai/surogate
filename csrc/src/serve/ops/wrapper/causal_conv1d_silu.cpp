@@ -110,9 +110,11 @@ std::int64_t validate_common(const Tensor& x, const Tensor& weight, const Tensor
 
 void require_non_empty_accessible(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
                                   const Tensor& out) {
-    if (!x.is_contiguous() || !weight.is_contiguous() || !conv_state.is_contiguous() ||
+    if (!x.is_contiguous() ||
+        (!weight.is_contiguous() && !(weight.nb[0] == 8 && weight.nb[1] == 2)) ||
+        !conv_state.is_contiguous() ||
         !out.is_contiguous()) {
-        throw std::invalid_argument("causal_conv1d: all tensors must be contiguous");
+        throw std::invalid_argument("causal_conv1d: activations and state must be contiguous; weights may also store adjacent taps");
     }
     if (x.data == nullptr || weight.data == nullptr || conv_state.data == nullptr ||
         out.data == nullptr) {

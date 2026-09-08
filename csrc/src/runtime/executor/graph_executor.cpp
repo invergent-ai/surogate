@@ -1297,6 +1297,11 @@ void GraphExecutor::execute_forward(long B,
         throw std::runtime_error("DSL graph executor: compiled forward graph not available");
     }
 
+    // Scoring has no backward consumer. In particular, hybrid view tensors
+    // may have expired by the end of a forward-only pass.
+    const bool save_forward = !mActiveExecutionRequest || !mActiveExecutionRequest->disable_forward_saves;
+    static const std::vector<std::string> no_saves;
+    const auto& save_list = save_forward ? mSaveList : no_saves;
     auto& rs = mRunState;
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
@@ -1317,8 +1322,8 @@ void GraphExecutor::execute_forward(long B,
     const bool capture_unsafe_split_allowed =
         !has_capture_unsafe_ops || env_flag_enabled("SUROGATE_ENABLE_CAPTURE_UNSAFE_SPLIT_GRAPHS");
     const bool use_split_attention =
-        needs_split && capture_unsafe_split_allowed && mOptions.UseCudaGraphs && !in_capture;
-    const bool use_graphs = mGraphsEnabled && !in_capture && !needs_split;
+        save_forward && needs_split && capture_unsafe_split_allowed && mOptions.UseCudaGraphs && !in_capture;
+    const bool use_graphs = save_forward && mGraphsEnabled && !in_capture && !needs_split;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;
@@ -1337,7 +1342,7 @@ void GraphExecutor::execute_forward(long B,
         // Preallocate persistent save buffers before CUDA graph capture to avoid cudaMalloc
         // inside save_tensors (which is not allowed during capture).
         mCompiledExecutor->set_dimensions(B, T);
-        mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
+        mCompiledExecutor->prepare_saved_buffers_for_capture(save_list, mCompiledForward.get());
         // Preallocate the replay-persist arena (256 MiB cudaMalloc) outside capture.
         mCompiledExecutor->prepare_replay_persist_arena_for_capture();
         // Preallocate the mem_eff attention scratch arena (~256 MiB) so
@@ -1360,7 +1365,7 @@ void GraphExecutor::execute_forward(long B,
         // capture, and pre-allocating the WHOLE graph's saves here would defeat the
         // per-stage residency (it allocated all num_layers worth -> OOM under recompute:false).
         mCompiledExecutor->set_dimensions(B, T);
-        mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
+        mCompiledExecutor->prepare_saved_buffers_for_capture(save_list, mCompiledForward.get());
 
         // Prime FP4 weight caches on first call. This covers split-attention mode
         // (sample_packing + CUDA graphs) where use_graphs is false but we still need
@@ -1396,7 +1401,7 @@ void GraphExecutor::execute_forward(long B,
         mCompiledExecutor->set_capturing(capturing);
         mCompiledExecutor->execute_forward(*mCompiledForward, comm, full, hook);
         // Save tensors for backward (same list as non-compiled path).
-        mCompiledExecutor->save_tensors(mSaveList);
+        mCompiledExecutor->save_tensors(save_list);
     };
 
     trace_or_execute_cuda_graph_with_stack(run_ops,
@@ -1410,7 +1415,7 @@ void GraphExecutor::execute_forward(long B,
     // point in the graph. Re-running save_tensors() after launch can recopy
     // from stack slots that have already been restored/reused.
     if (use_graphs && !capturing) {
-        mCompiledExecutor->save_tensors(mSaveList);
+        mCompiledExecutor->save_tensors(save_list);
     }
     mCompiledExecutor->set_capturing(false);
 }

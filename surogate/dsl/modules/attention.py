@@ -143,13 +143,11 @@ class GenericGQAttention(Module):
                 "q_norm_weight",
                 ("D",),
                 quantizable=False,
-                when="use_qk_norm",
             )
             tracer.register_param(
                 "k_norm_weight",
                 ("D",),
                 quantizable=False,
-                when="use_qk_norm",
             )
         tracer.register_param(
             "rope_freqs",
@@ -181,7 +179,6 @@ class GenericGQAttention(Module):
                 dtype="fp32",
                 save=True,
                 share_policy="when_recomputed",
-                when="use_qk_norm",
             )
             tracer.register_activation(
                 "k_rstd",
@@ -189,7 +186,6 @@ class GenericGQAttention(Module):
                 dtype="fp32",
                 save=True,
                 share_policy="when_recomputed",
-                when="use_qk_norm",
             )
         att_slot = tracer.register_activation(
             "att",
@@ -249,11 +245,17 @@ class GenericGQAttention(Module):
             rope_kwargs["mrope_section"] = mrope_section
         rope_kwargs["rotary_dim"] = self.rotary_dim if self.rotary_dim != self.head_size else "D"
 
+        q_norm, k_norm = tracer.prefixed("q_norm_weight"), tracer.prefixed("k_norm_weight")
+        if self.use_qk_norm and cfg.qk_norm_unit_offset:
+            ones = g.ones(shape=[self.D], dtype="bf16")
+            q_norm = g.add(q_norm, ones, out_name=tracer.prefixed("q_norm_weight_eff"))
+            k_norm = g.add(k_norm, ones, out_name=tracer.prefixed("k_norm_weight_eff"))
+
         if self.use_qk_norm and not self.is_mrope:
             qkv_rope, _q_rstd, _k_rstd = g.qkv_qk_norm_rope(
                 qkv,
-                tracer.prefixed("q_norm_weight"),
-                tracer.prefixed("k_norm_weight"),
+                q_norm,
+                k_norm,
                 tracer.prefixed("rope_freqs"),
                 position_ids.ref,
                 eps=cfg.eps,
@@ -265,8 +267,8 @@ class GenericGQAttention(Module):
             if self.use_qk_norm:
                 qkv, _q_rstd, _k_rstd = g.qkv_qk_norm(
                     qkv,
-                    tracer.prefixed("q_norm_weight"),
-                    tracer.prefixed("k_norm_weight"),
+                    q_norm,
+                    k_norm,
                     eps=cfg.eps,
                 )
             rope_op = g.mrope if self.is_mrope else g.rope

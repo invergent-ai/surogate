@@ -12,6 +12,7 @@
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "kernels/column_scale.h"
 #include "utilities/dtype.h"
 
 namespace dsl {
@@ -28,6 +29,7 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
     Tensor* big = &a;
     Tensor* small = &b;
     bool broadcast = false;
+    bool columns = false;
     if (a.nelem() != b.nelem()) {
         // Try to identify broadcast pattern: one tensor has trailing dim 1
         if (a.nelem() > b.nelem()) {
@@ -43,6 +45,8 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
             broadcast = true;
         } else if (big->Rank == 2 && small->Rank == 2 && big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
             broadcast = true;
+        } else if (big->Rank >= 2 && small->Rank == 1 && small->nelem() == big->Sizes[big->Rank - 1]) {
+            broadcast = columns = true;
         } else {
             throw std::runtime_error("dispatch_mul: shape mismatch and unsupported broadcast pattern"
                                      " (a.nelem=" +
@@ -75,6 +79,8 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
         } else {
             throw std::runtime_error("dispatch_mul: unsupported dtype");
         }
+    } else if (columns) {
+        column_scale(out, *big, *small, big->nelem() / small->nelem(), small->nelem(), mRunState.MainStream);
     } else if (small->nelem() == 1) {
         // Scalar broadcast: out = big * scalar. The scalar lives on device;
         // copying it to host here would sync the stream (fine eagerly, fatal
@@ -149,6 +155,7 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
     // Detect broadcast: one of a,b has nelem=1 (scalar) or trailing dim 1
     bool broadcast = false;
     bool scalar_broadcast = false;
+    bool column_broadcast = false;
     Tensor* big = &a;
     Tensor* small = &b;
     int big_input_idx = 0;
@@ -163,6 +170,8 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
             scalar_broadcast = true;
         } else if (big->Rank == 2 && small->Rank == 2 && big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
             broadcast = true;
+        } else if (big->Rank >= 2 && small->Rank == 1 && small->nelem() == big->Sizes[big->Rank - 1]) {
+            broadcast = column_broadcast = true;
         } else {
             std::ostringstream oss;
             oss << "dispatch_mul_backward: unsupported broadcast pattern. "
@@ -224,6 +233,16 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         }
         if (op.outputs.size() > 0 && !op.outputs[0].name.empty()) store_tensor(op.outputs[0], d_a);
         if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], d_b);
+    } else if (column_broadcast) {
+        Tensor d_big = allocate_like(big_input_idx, *big);
+        const long columns = small->nelem(), rows = big->nelem() / columns;
+        column_scale(d_big, d_out, *small, rows, columns, mRunState.MainStream);
+        if (!op.outputs[big_input_idx].name.empty()) store_tensor(op.outputs[big_input_idx], d_big);
+        if (!op.outputs[1 - big_input_idx].name.empty()) {
+            Tensor d_small = allocate_like(1 - big_input_idx, *small);
+            column_scale_gradient(d_small, d_out, *big, rows, columns, mRunState.MainStream);
+            store_tensor(op.outputs[1 - big_input_idx], d_small);
+        }
     } else if (scalar_broadcast) {
         // Scalar broadcast backward: forward was big * scalar -> out
         // d_big = d_out * scalar, d_scalar = sum(d_out * big). Same constraint

@@ -357,7 +357,8 @@ inline void apply_lora_contribution(Tensor& output,
                          BT,
                          rank,
                          EMMTranspose::TN,
-                         /*accumulate=*/true,
+                         /*alpha=*/b_alpha,
+                         /*beta=*/1.0f,
                          (int)total_out_features,
                          stream);
         return;
@@ -387,7 +388,8 @@ inline void apply_lora_contribution(Tensor& output,
            BT,
            rank,
            EMMTranspose::TN,
-           /*accumulate=*/false,
+           /*alpha=*/b_alpha,
+           /*beta=*/0.0f,
            stream);
     add_2d_slice(output, packed_delta, BT, total_out_features, out_features, output_offset, stream);
 }

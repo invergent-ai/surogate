@@ -146,6 +146,16 @@ encoder_forward_kernel3_nowpe(floatX* out, const int* inp, const floatX* wte, in
  * @param stream CUDA stream for asynchronous execution.
  */
 template <class floatX>
+__global__ void encoder_forward_scalar(floatX* out, const int* inp, const floatX* weight,
+                                        long count, int columns, int vocab) {
+    const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int token = inp[i / columns];
+    if (token < 0 || token >= vocab) __trap();
+    out[i] = weight[static_cast<long>(token) * columns + i % columns];
+}
+
+template <class floatX>
 void encoder_forward_imp(floatX* out,
                          const int* inp,
                          const floatX* wte,
@@ -158,6 +168,12 @@ void encoder_forward_imp(floatX* out,
     using x128 = GenericVector<floatX, 16 / sizeof(floatX)>;
     constexpr int block_size = 256;
     const long long N = (long long)B * T * C;
+    if (wpe == nullptr && (C % x128::size || reinterpret_cast<std::uintptr_t>(out) % 16 ||
+                           reinterpret_cast<std::uintptr_t>(wte) % 16)) {
+        encoder_forward_scalar<<<static_cast<unsigned>((N + 255) / 256), 256, 0, stream>>>(out, inp, wte, N, C, V);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const long long grid_ll = (N + (long long)block_size * x128::size - 1) / ((long long)block_size * x128::size);
     const int grid_size = (int)grid_ll;
     if (wpe == nullptr) {

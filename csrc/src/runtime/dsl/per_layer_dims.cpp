@@ -34,6 +34,7 @@ void derive_per_layer_block_dims(const Graph& graph,
     // qkv_weight row count is ambiguous (k_eq_v layers pack Hq+Hkv heads,
     // not Hq+2*Hkv), so derive from it only when no out_weight was seen.
     std::vector<bool> attn_from_out(static_cast<std::size_t>(num_layers), false);
+    std::vector<bool> dense_mlp(static_cast<std::size_t>(num_layers), false);
     for (const auto& [name, info] : graph.params) {
         int layer_idx = -1;
         std::string field;
@@ -48,9 +49,11 @@ void derive_per_layer_block_dims(const Graph& graph,
             if (global_hq > 0) d.head_size = s1 / global_hq;
             attn_from_out[static_cast<std::size_t>(layer_idx)] = true;
         } else if (field == "mlp_down_weight") {
+            dense_mlp[static_cast<std::size_t>(layer_idx)] = true;
             d.intermediate = s1;
             d.mlp_up = s1;
         } else if (field == "mlp_gate_weight") {
+            dense_mlp[static_cast<std::size_t>(layer_idx)] = true;
             d.intermediate = s0;
             d.mlp_up = s0;
         }
@@ -98,9 +101,15 @@ void derive_per_layer_block_dims(const Graph& graph,
         std::string field;
         if (!parse_block_param(name, layer_idx, field)) continue;
         if (layer_idx < 0 || layer_idx >= num_layers || info.shape.empty()) continue;
+        auto& d = dims[static_cast<std::size_t>(layer_idx)];
+        if (field == "experts_gate_up" && info.shape.size() == 3 &&
+            !dense_mlp[static_cast<std::size_t>(layer_idx)] && info.shape[1].kind == DimKind::Concrete) {
+            d.intermediate = info.shape[1].value / 2;
+            d.mlp_up = info.shape[1].value;
+            continue;
+        }
         long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
         if (s0 == 0) continue;
-        auto& d = dims[static_cast<std::size_t>(layer_idx)];
         if (field == "q_norm_weight" && info.shape.size() == 1) {
             d.head_size = s0;
         } else if (field == "k_proj_weight" && info.shape.size() >= 2) {

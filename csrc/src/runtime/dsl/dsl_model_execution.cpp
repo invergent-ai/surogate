@@ -673,6 +673,74 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
     return result;
 }
 
+std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
+                                               const std::int32_t* last_positions,
+                                               int B, int T, NCCLCommunicator& comm) {
+    if (!mExecutor || !mRunState || !lora_enabled() || mWeightManager || qlora_enabled()) {
+        throw std::runtime_error("next_token_logits requires initialized resident LoRA weights");
+    }
+    auto& rs = *mRunState;
+    const int V = mModelConfig.VocabSize;
+    for (int b = 0; b < B; ++b) {
+        if (last_positions[b] < 0 || last_positions[b] >= T) {
+            throw std::invalid_argument("generation position is outside the input sequence");
+        }
+    }
+    for (std::size_t i = 0; i < static_cast<std::size_t>(B) * T; ++i) {
+        if (input_ids[i] < 0 || input_ids[i] >= V) {
+            throw std::invalid_argument("generation input token is outside the model vocabulary");
+        }
+    }
+    const auto dtype = rs.non_block_activations().output.DType;
+    if (dtype != ETensorDType::BF16 && dtype != ETensorDType::FP32) {
+        throw std::runtime_error("generation requires BF16 or FP32 logits");
+    }
+    std::vector<std::byte> raw(static_cast<std::size_t>(B) * V * get_dtype_size(dtype));
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(B) * T), targets(positions.size(), -100);
+    for (int b = 0; b < B; ++b) {
+        std::iota(positions.begin() + b * T, positions.begin() + (b + 1) * T, 0);
+    }
+    auto cpu_tokens = [B, T](const std::int32_t* data) {
+        return Tensor::from_pointer(reinterpret_cast<std::byte*>(const_cast<std::int32_t*>(data)),
+                                    -1, ETensorDType::INT32, std::vector<long>{B, T});
+    };
+    const auto inputs = cpu_tokens(input_ids), pos = cpu_tokens(positions.data());
+    ensure_lora_run_state(comm, B, T);
+    const bool was_training = mLoRARunState->is_training;
+    mLoRARunState->is_training = false;
+    const bool masked = causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, pos);
+    auto request = causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, pos,
+                                                         cpu_tokens(targets.data()), 0);
+    request.mode = ExecutionMode::Forward;
+    request.reduce_loss_on_completion = false;
+    request.disable_forward_saves = true;
+    request.generation_positions_cpu = last_positions;
+    request.generation_logits_cpu = Tensor::from_pointer(raw.data(), -1, dtype, std::vector<long>{B, V});
+    try {
+        mExecutor->execute_forward(request, comm);
+        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+    } catch (...) {
+        cudaStreamSynchronize(rs.MainStream);
+        if (masked) mExecutor->clear_doc_masking();
+        mLoRARunState->is_training = was_training;
+        throw;
+    }
+    if (masked) mExecutor->clear_doc_masking();
+    mLoRARunState->is_training = was_training;
+    std::vector<float> result(static_cast<std::size_t>(B) * V);
+    if (dtype == ETensorDType::FP32) {
+        std::memcpy(result.data(), raw.data(), raw.size());
+    } else {
+        for (std::size_t i = 0; i < result.size(); ++i) {
+            std::uint16_t bf16;
+            std::memcpy(&bf16, raw.data() + i * sizeof(bf16), sizeof(bf16));
+            const std::uint32_t bits = static_cast<std::uint32_t>(bf16) << 16;
+            std::memcpy(&result[i], &bits, sizeof(bits));
+        }
+    }
+    return result;
+}
+
 void DslModel::step_with_custom_loss(Tensor inputs,
                                      Tensor position_ids,
                                      Tensor targets,

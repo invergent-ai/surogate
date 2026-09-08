@@ -33,11 +33,69 @@ int prefill_output_grid_for(std::int32_t C, std::int32_t T, int block) {
     return static_cast<int>(std::max<std::int64_t>(1, grid));
 }
 
+// A trainer keeps the four taps together for each channel. Read that storage
+// directly; the serving history and activations retain their usual layout.
+__global__ void native_taps_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+    const __nv_bfloat16* state_in, __nv_bfloat16* state_out, __nv_bfloat16* out,
+    int channels, int width, const std::int32_t* valid, const std::int32_t* initial,
+    const std::int32_t* snapshots) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) { return; }
+    const int batch = blockIdx.y;
+    const int count = valid ? max(0, min(width, valid[batch])) : width;
+    const std::int64_t stride = 3LL * channels;
+    const std::int64_t start = initial ? initial[batch] * stride : 0;
+    float s0 = __bfloat162float(state_in[start + c]);
+    float s1 = __bfloat162float(state_in[start + channels + c]);
+    float s2 = __bfloat162float(state_in[start + 2LL * channels + c]);
+    const float w0 = __bfloat162float(weight[4LL * c]);
+    const float w1 = __bfloat162float(weight[4LL * c + 1]);
+    const float w2 = __bfloat162float(weight[4LL * c + 2]);
+    const float w3 = __bfloat162float(weight[4LL * c + 3]);
+    for (int t = 0; t < width; ++t) {
+        const std::int64_t i = (static_cast<std::int64_t>(batch) * width + t) * channels + c;
+        if (t >= count) { out[i] = __float2bfloat16_rn(0.F); continue; }
+        const float value = __bfloat162float(x[i]);
+        float sum = fmaf(w0, s0, 0.F);
+        sum = fmaf(w1, s1, sum);
+        sum = fmaf(w2, s2, sum);
+        sum = fmaf(w3, value, sum);
+        out[i] = __float2bfloat16_rn(silu(sum));
+        s0 = s1; s1 = s2; s2 = value;
+        if (snapshots) {
+            const std::int64_t dst = (snapshots[batch] + t) * stride;
+            state_out[dst + c] = __float2bfloat16_rn(s0);
+            state_out[dst + channels + c] = __float2bfloat16_rn(s1);
+            state_out[dst + 2LL * channels + c] = __float2bfloat16_rn(s2);
+        }
+    }
+    if (!snapshots) {
+        state_out[c] = __float2bfloat16_rn(s0);
+        state_out[channels + c] = __float2bfloat16_rn(s1);
+        state_out[2LL * channels + c] = __float2bfloat16_rn(s2);
+    }
+}
+
+void native_taps_launch(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+    Tensor& state_out, Tensor& out, cudaStream_t stream, const std::int32_t* valid = nullptr,
+    const std::int32_t* initial = nullptr, const std::int32_t* snapshots = nullptr) {
+    const dim3 grid((x.ne[0] + 255) / 256, x.ne[2]);
+    native_taps_kernel<<<grid, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
+        static_cast<const __nv_bfloat16*>(state_in.data), static_cast<__nv_bfloat16*>(state_out.data),
+        static_cast<__nv_bfloat16*>(out.data), x.ne[0], x.ne[1], valid, initial, snapshots);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
                                   const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
                                   cudaStream_t stream, const std::int32_t* valid_len) {
+    if (!weight.is_contiguous()) {
+        native_taps_launch(x, weight, conv_state_in, conv_state_out, out, stream, valid_len);
+        return;
+    }
     constexpr int kOutputBlock  = 256;
     constexpr int kChannelBlock = 256;
     constexpr int kPairBlock    = 256;
@@ -79,6 +137,10 @@ void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
 
 void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+    if (!weight.is_contiguous()) {
+        native_taps_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+        return;
+    }
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
@@ -95,6 +157,10 @@ void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Te
 void causal_conv1d_sequence_launch(const Tensor& x, const Tensor& weight,
                                    const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
                                    cudaStream_t stream) {
+    if (!weight.is_contiguous()) {
+        native_taps_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+        return;
+    }
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     const int block      = T == 1 ? 256 : 32;
@@ -109,6 +175,10 @@ void causal_conv1d_sequence_launch(const Tensor& x, const Tensor& weight,
 
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+    if (!weight.is_contiguous()) {
+        native_taps_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+        return;
+    }
     constexpr int kBlock = 256;
     const std::int32_t C = x.ne[0];
 
@@ -175,6 +245,13 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
                                    const Tensor& valid_columns, const Tensor& initial_state_slots,
                                    const Tensor& snapshot_base_slots, Tensor& out,
                                    cudaStream_t stream) {
+    if (!weight.is_contiguous()) {
+        native_taps_launch(x, weight, conv_states, conv_states, out, stream,
+            static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<const std::int32_t*>(initial_state_slots.data),
+            static_cast<const std::int32_t*>(snapshot_base_slots.data));
+        return;
+    }
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     const std::int32_t B = x.ne[2];

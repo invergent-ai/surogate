@@ -531,6 +531,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe/moe_topk.cu
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
+    src/kernels/column_scale.cu
     src/kernels/rope.cu
     src/kernels/mrope.cu
     src/kernels/mask_scatter.cu
@@ -785,6 +786,7 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         src/testing/kernels/test-dpo-dloss.cu
         src/testing/kernels/test-chunked-attention.cu
         src/testing/kernels/test-spark-numerics.cu
+        src/testing/kernels/test-qwen35-shared.cu
         src/testing/tokenizer/test-chat-template.cpp
     )
     target_link_libraries(integration-tests PRIVATE

@@ -6,6 +6,9 @@
 
 namespace sinfer::ops {
 
+// Weight views may use the usual channel-contiguous layout or adjacent taps
+// (nb[0]=8, nb[1]=2) borrowed from a trainer, without transposing their storage.
+
 /**
  * Depthwise causal width-4 convolution followed by SiLU. Let u[c,-3..-1] be the three values in
  * the input state and u[c,t]=x[c,t] for t>=0. Then

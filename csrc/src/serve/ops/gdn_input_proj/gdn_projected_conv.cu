@@ -18,7 +18,8 @@ __global__ void gdn_projected_conv_kernel(
     const std::int32_t* __restrict__ initial_state_slots, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t width,
     Publish publish, std::int32_t runtime_channels = 0, std::int32_t runtime_query_rows = 0,
-    std::int32_t runtime_key_rows = 0, std::int32_t runtime_value_rows = 0) {
+    std::int32_t runtime_key_rows = 0, std::int32_t runtime_value_rows = 0,
+    std::int32_t weight_channel_stride = 1, std::int32_t weight_tap_stride = 0) {
     static_assert(Channels == QueryRows + KeyRows + ValueRows);
     const std::int32_t channels = Channels ? Channels : runtime_channels;
     const std::int32_t query_rows = Channels ? QueryRows : runtime_query_rows;
@@ -37,10 +38,12 @@ __global__ void gdn_projected_conv_kernel(
     float s0       = __bfloat162float(state_read[initial_base + row]);
     float s1       = __bfloat162float(state_read[initial_base + channels + row]);
     float s2       = __bfloat162float(state_read[initial_base + 2LL * channels + row]);
-    const float w0 = __bfloat162float(conv_weight[row]);
-    const float w1 = __bfloat162float(conv_weight[channels + row]);
-    const float w2 = __bfloat162float(conv_weight[2LL * channels + row]);
-    const float w3 = __bfloat162float(conv_weight[3LL * channels + row]);
+    const auto tap_stride = weight_tap_stride ? weight_tap_stride : channels;
+    const auto weight_row = static_cast<std::int64_t>(row) * weight_channel_stride;
+    const float w0 = __bfloat162float(conv_weight[weight_row]);
+    const float w1 = __bfloat162float(conv_weight[tap_stride + weight_row]);
+    const float w2 = __bfloat162float(conv_weight[2LL * tap_stride + weight_row]);
+    const float w3 = __bfloat162float(conv_weight[3LL * tap_stride + weight_row]);
 
     for (std::int32_t token = 0; token < width; ++token) {
         const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
@@ -119,13 +122,13 @@ template <class Publish>
 void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& state_read,
               const Tensor& valid_columns, const Tensor& initial_state_slots, Tensor& query,
               Tensor& key, Tensor& value, Publish publish, cudaStream_t stream) {
-    if (projected.ne[0] == 10240 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
+    if (conv_weight.is_contiguous() && projected.ne[0] == 10240 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
         value.ne[0] == 6144) {
         launch<10240, 2048, 2048, 6144>(projected, conv_weight, state_read, valid_columns,
                                         initial_state_slots, query, key, value, publish, stream);
         return;
     }
-    if (projected.ne[0] == 8192 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
+    if (conv_weight.is_contiguous() && projected.ne[0] == 8192 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
         value.ne[0] == 4096) {
         launch<8192, 2048, 2048, 4096>(projected, conv_weight, state_read, valid_columns,
                                        initial_state_slots, query, key, value, publish, stream);
@@ -133,14 +136,14 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
     }
     // qwen3_5 0.8B/2B share one GDN geometry (16x128 keys/values): required for
     // any max_concurrency > 1 (batch decode/verify snapshot path).
-    if (projected.ne[0] == 6144 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
+    if (conv_weight.is_contiguous() && projected.ne[0] == 6144 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
         value.ne[0] == 2048) {
         launch<6144, 2048, 2048, 2048>(projected, conv_weight, state_read, valid_columns,
                                        initial_state_slots, query, key, value, publish, stream);
         return;
     }
     // GLM-5.3-Flash's Kimi Delta Attention: 64 heads of 128 for q, k and v alike.
-    if (projected.ne[0] == 24576 && query.ne[0] == 8192 && key.ne[0] == 8192 &&
+    if (conv_weight.is_contiguous() && projected.ne[0] == 24576 && query.ne[0] == 8192 && key.ne[0] == 8192 &&
         value.ne[0] == 8192) {
         launch<24576, 8192, 8192, 8192>(projected, conv_weight, state_read, valid_columns,
                                         initial_state_slots, query, key, value, publish, stream);
@@ -161,7 +164,7 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
         static_cast<const std::int32_t*>(initial_state_slots.data),
         static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(value.data), projected.ne[1], publish,
-        channels, query.ne[0], key.ne[0], value.ne[0]);
+        channels, query.ne[0], key.ne[0], value.ne[0], conv_weight.nb[0] / 2, conv_weight.nb[1] / 2);
     CUDA_CHECK(cudaGetLastError());
 }
 

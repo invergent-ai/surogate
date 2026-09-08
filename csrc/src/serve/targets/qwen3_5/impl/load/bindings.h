@@ -34,6 +34,9 @@ struct WeightPlan {
 
 struct MlpPlan {
     WeightPlan gate_up;
+    WeightPlan gate;
+    WeightPlan up;
+    bool separate = false;
     WeightPlan down;
 };
 
@@ -46,8 +49,15 @@ struct FusedAttentionProjectionPlan {
     WeightPlan query_key_gate_value;
 };
 
+struct NativeAttentionProjectionPlan {
+    WeightPlan query_gate;
+    WeightPlan key;
+    WeightPlan value;
+};
+
 struct FullAttentionPlan {
-    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan> projection;
+    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan,
+                 NativeAttentionProjectionPlan> projection;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
     WeightPlan output;
@@ -90,6 +100,7 @@ struct GdnPlan {
     artifact::ObjectHandle a_log;
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
+    bool native_convolution = false;
     GdnControlProjectionPlan control_projection;
     std::variant<QkvPlusZGdnInputProjectionPlan, QkPlusVzGdnInputProjectionPlan,
                  FusedGdnInputProjectionPlan>
@@ -169,6 +180,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 struct DensePostMixerPayload {
     Weight gate_up;
+    Weight gate;
+    Weight up;
     Weight down;
 };
 
@@ -181,8 +194,16 @@ struct FusedAttentionProjectionPayload {
     Weight query_key_gate_value;
 };
 
+struct NativeAttentionProjectionPayload {
+    Weight query_gate;
+    Weight key;
+    Weight value;
+    std::int32_t head_dim = 0;
+};
+
 using FullAttentionProjectionPayload =
-    std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload>;
+    std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload,
+                 NativeAttentionProjectionPayload>;
 
 struct QkvPlusZGdnInputProjectionPayload {
     Weight query_key_value;
@@ -215,6 +236,7 @@ using GdnControlProjectionPayload =
     std::variant<SplitGdnControlProjectionPayload, FusedGdnControlProjectionPayload>;
 
 struct GdnProjectionPayload {
+    bool native_storage = false;
     Tensor a_log;
     Tensor dt_bias;
     GdnControlProjectionPayload control_projection;

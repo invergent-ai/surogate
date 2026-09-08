@@ -57,7 +57,7 @@ from ..activations import Activation
 from ..attention import AttentionConfig
 from ..block_schema import BlockSchema, ServeObject, SlotDecl
 from ..mlp import MLPConfig
-from ..modules import GenericGQAttention, GenericMLP, RMSNorm
+from ..modules import GenericGQAttention, GenericMLP, RMSNormPlus1
 
 
 GEMMA3_BLOCK_NAME_REMAP: dict[str, str] = {
@@ -109,6 +109,12 @@ GEMMA3_BLOCK_NAME_REMAP: dict[str, str] = {
     "post_ff_layernorm_rstd": "ln_post_ff_rstd",
     # --- res_att (canonical residual-after-attention slot) ---
     "res_att": "res_att",
+    "input_layernorm_weight_eff": "ln1_weight_eff",
+    "post_attn_layernorm_weight_eff": "ln_post_attn_weight_eff",
+    "pre_ff_layernorm_weight_eff": "ln2_weight_eff",
+    "post_ff_layernorm_weight_eff": "ln_post_ff_weight_eff",
+    "self_attn_q_norm_weight_eff": "q_norm_weight_eff",
+    "self_attn_k_norm_weight_eff": "k_norm_weight_eff",
 }
 
 
@@ -258,6 +264,7 @@ def _attention_config(*, sliding_window, causal, query_pre_attn_scalar, head_siz
     scalar = query_pre_attn_scalar if query_pre_attn_scalar else head_size
     return AttentionConfig(
         qk_norm=True,
+        qk_norm_unit_offset=True,
         sliding_window=sliding_window or 0,
         causal=causal,
         softmax_scale=float(scalar) ** -0.5,
@@ -285,7 +292,7 @@ class _Gemma3BlockBase(nn.Block):
         eps,
     ):
         _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads, d_ff, max_seq)
-        self.input_layernorm = RMSNorm(d_model, eps=eps)
+        self.input_layernorm = RMSNormPlus1(d_model, eps=eps)
         self.self_attn = GenericGQAttention(
             d_model,
             num_query_heads,
@@ -300,10 +307,10 @@ class _Gemma3BlockBase(nn.Block):
                 eps=eps,
             ),
         )
-        self.post_attn_layernorm = RMSNorm(d_model, eps=eps)
-        self.pre_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.post_attn_layernorm = RMSNormPlus1(d_model, eps=eps)
+        self.pre_ff_layernorm = RMSNormPlus1(d_model, eps=eps)
         self.mlp = GenericMLP(d_model, d_ff, config=_GEMMA3_GELU_MLP_CONFIG)
-        self.post_ff_layernorm = RMSNorm(d_model, eps=eps)
+        self.post_ff_layernorm = RMSNormPlus1(d_model, eps=eps)
 
     def forward(self, x, residual, position_ids):
         residual, h_post_attn = _sandwich_attn_phase(self, x, residual, position_ids)

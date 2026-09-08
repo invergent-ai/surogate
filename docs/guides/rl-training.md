@@ -52,7 +52,7 @@ The CLI is the source of truth for the trainer GPU count: `--trainer-gpus 4,5,6,
 
 ### Co-locate mode
 
-For BF16 dense Qwen3 models, native co-locate mode loads the base weights once
+For supported BF16 training models except Nemotron, native co-locate mode loads the base weights once
 and shares them between serving and LoRA training. It generates a batch of
 rollouts, pauses generation for the training update, then continues with the
 updated adapter. Adapter updates stay in GPU memory.

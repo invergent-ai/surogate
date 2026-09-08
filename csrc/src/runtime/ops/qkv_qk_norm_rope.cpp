@@ -381,11 +381,11 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
     bool accum_q = false;
     bool accum_k = false;
     const bool skip_norm_dweight = mRunState.is_lora_only_mode();
-    if (!skip_norm_dweight && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+    if ((!skip_norm_dweight || !mWeights.has(op.inputs[2].name)) && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
         d_q_norm = &ensure_output_tensor(op.outputs[1]);
         accum_q = mAccumulateTensors.count(op.outputs[1].name) > 0;
     }
-    if (!skip_norm_dweight && op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
+    if ((!skip_norm_dweight || !mWeights.has(op.inputs[3].name)) && op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
         d_k_norm = &ensure_output_tensor(op.outputs[2]);
         accum_k = mAccumulateTensors.count(op.outputs[2].name) > 0;
     }

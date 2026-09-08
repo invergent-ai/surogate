@@ -100,6 +100,42 @@ namespace {
 /// with its name: an adapter half-applied is a model that is neither the base nor
 /// the fine-tune, and it would answer fluently either way.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
+    const bool native = (!runtime.full_layers.empty() && runtime.full_layers.front().post_mixer.gate.qdata) ||
+                        (!runtime.gdn_layers.empty() && runtime.gdn_layers.front().post_mixer.gate.qdata);
+    if (native) {
+        if (!options.lora_enable && options.lora_payloads.empty()) { return; }
+        auto& store = ops::lora_store_for_current_device();
+        store.configure(std::max(options.lora_slots, 1U), std::max(options.lora_max_rank, 1U),
+                        std::max({options.prefill_chunk, options.max_concurrency, 1U}));
+        const auto bind = [&](int layer, const char* module, const Weight& weight, int port) {
+            store.register_module(layer, module, {weight.qdata, port, weight.k, weight.n});
+        };
+        std::size_t full_index = 0, gdn_index = 0;
+        for (int layer = 0; layer < runtime.geometry.layers; ++layer) {
+            const detail::DensePostMixerPayload* mlp;
+            if (runtime.geometry.layer_attends(layer)) {
+                const auto& full = runtime.full_layers.at(full_index++);
+                const auto& qkv = std::get<detail::NativeAttentionProjectionPayload>(full.projection);
+                bind(layer, "q_proj", qkv.query_gate, family::kQueryPort);
+                bind(layer, "k_proj", qkv.key, family::kKeyPort);
+                bind(layer, "v_proj", qkv.value, family::kValuePort);
+                bind(layer, "o_proj", full.output, family::kOutputPort);
+                mlp = &full.post_mixer;
+            } else {
+                const auto& linear = runtime.gdn_layers.at(gdn_index++);
+                mlp = &linear.post_mixer;
+            }
+            bind(layer, "gate_proj", mlp->gate, family::kGatePort);
+            bind(layer, "up_proj", mlp->up, family::kUpPort);
+            bind(layer, "down_proj", mlp->down, family::kDownPort);
+        }
+        store.ensure_banks();
+        for (const auto& p : options.lora_payloads) {
+            store.set_module_slot(p.layer, p.module, p.slot, p.a, p.b, p.rank, p.in_dim, p.out_dim, p.scale);
+        }
+        ops::lora_set_active(true);
+        return;
+    }
     family::bind_lora_hybrid<detail::FusedAttentionProjectionPayload>(
         runtime, options, [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; });
 }

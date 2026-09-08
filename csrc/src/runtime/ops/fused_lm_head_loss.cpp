@@ -258,6 +258,33 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     const int C = static_cast<int>(weight.Sizes[1]);
     const int P = V;
 
+    if (mExecutionRequest && mExecutionRequest->generation_positions_cpu) {
+        const auto& request = *mExecutionRequest;
+        Tensor logits = mRunState.non_block_activations().output;
+        if (request.generation_logits_cpu.DType != logits.DType) {
+            throw std::runtime_error("generation logits dtype does not match the output buffer");
+        }
+        logits.Rank = 2;
+        logits.Sizes[0] = 1;
+        logits.Sizes[1] = V;
+        const auto row_bytes = static_cast<std::size_t>(V) * get_dtype_size(logits.DType);
+        for (long b = 0; b < request.batch; ++b) {
+            const long row = b * request.sequence + request.generation_positions_cpu[b];
+            Tensor x = xF_flat;
+            x.Data += row * C * get_dtype_size(x.DType);
+            x.Rank = 2;
+            x.Sizes[0] = 1;
+            x.Sizes[1] = C;
+            lm_head_logits_matmul(logits, weight, x, op.inputs[1].name, V, C, 1);
+            if (op.attrs.softcap > 0.0f) {
+                softcap_logits(logits, op.attrs.softcap, 1, V, mRunState.MainStream);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(request.generation_logits_cpu.Data + b * row_bytes,
+                                       logits.Data, row_bytes, cudaMemcpyDeviceToHost, mRunState.MainStream));
+        }
+        return;
+    }
+
     // Drop rows whose target == -100 before the matmul (lm-head row compaction).
     // Skipped only in logprob-extraction mode or when xF/weight aren't BF16
     // (v1 supports BF16 only). FP8-hybrid works through here because

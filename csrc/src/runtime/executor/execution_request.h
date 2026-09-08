@@ -79,6 +79,10 @@ struct ExecutionRequest {
     const modules::BackwardHook* backward_hook = nullptr;
 
     float* logprobs_gpu = nullptr;
+    // Generation selects one position per batch row. Only these vocabulary
+    // vectors leave the GPU; the resident model and adapter stay in place.
+    const std::int32_t* generation_positions_cpu = nullptr;
+    Tensor generation_logits_cpu{};
     float* custom_dloss_gpu = nullptr;
     const float* inv_temperature_gpu = nullptr;
 

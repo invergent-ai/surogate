@@ -241,6 +241,9 @@ int main() {
         invalid = binding;
         invalid.device = 1;
         rejects({invalid});
+        invalid = binding;
+        invalid.dtype = sinfer::SharedWeightDType::FP32;
+        rejects({invalid});
         rejects({binding, binding});
         return 0;
     } catch (const std::exception& error) {

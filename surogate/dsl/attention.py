@@ -32,6 +32,7 @@ class AttentionConfig:
 
     # Norms
     qk_norm: bool = False
+    qk_norm_unit_offset: bool = False
     sandwich_norm: bool = False
 
     # Position encoding

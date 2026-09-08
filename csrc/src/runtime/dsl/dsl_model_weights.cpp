@@ -62,6 +62,10 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
             continue;
         }
         Tensor& param = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
+        if (name.ends_with("layer_scalar") || name.ends_with("per_expert_scale")) {
+            fill_constant(param, 1.f, param.nelem(), nullptr);
+            continue;
+        }
         if (internal::is_bias_param_name(name)) {
             fill_zero(param, nullptr);
             continue;
@@ -1053,8 +1057,9 @@ std::vector<std::pair<std::string, Tensor>> DslModel::shared_base_weights() {
     std::vector<std::pair<std::string, Tensor>> result;
     for (const auto& name : mParams->param_names()) {
         Tensor& tensor = mParams->get(name);
-        if (!tensor.Data || tensor.Device < 0 || tensor.DType != ETensorDType::BF16) {
-            throw std::runtime_error("shared base weight is not resident BF16: " + name);
+        if (!tensor.Data || tensor.Device < 0 ||
+            (tensor.DType != ETensorDType::BF16 && tensor.DType != ETensorDType::FP32)) {
+            throw std::runtime_error("shared base weight is not resident BF16 or FP32: " + name);
         }
         result.emplace_back(name, tensor);
     }

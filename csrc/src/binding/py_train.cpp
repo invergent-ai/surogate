@@ -3328,6 +3328,20 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_shared_base_w
     return result;
 }
 
+std::vector<float> MultiGPUPyTrainer::next_token_logits(const std::int32_t* input_ids,
+                                                       const std::int32_t* last_positions, int B, int T) {
+    if (mContexts.size() != 1 || B != batch_size() || T != seq_length()) {
+        throw std::invalid_argument("next_token_logits requires one GPU and the trainer's batch/sequence shape");
+    }
+    std::vector<float> result;
+    run_work([&](sThreadContext& ctx) {
+        auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!model) { throw std::runtime_error("next_token_logits requires a DSL model"); }
+        result = model->next_token_logits(input_ids, last_positions, B, T, *ctx.Communicator);
+    }, 0);
+    return result;
+}
+
 std::vector<float> MultiGPUPyTrainer::compute_logprobs(const std::int32_t* input_ids,
                                                        const std::int32_t* targets,
                                                        int B,

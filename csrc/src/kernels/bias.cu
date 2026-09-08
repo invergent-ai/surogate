@@ -280,6 +280,17 @@ int get_bias_backward_scratch_size(ETensorDType dtype, int OC, const cudaDeviceP
  * @throws std::logic_error If scale_a and scale_b are inconsistently null.
  */
 template <class floatX, class FloatY>
+__global__ void backward_bias_unaligned(floatX* dbias, const FloatY* dout,
+                                         const float* scale_a, const float* scale_b, long rows, int columns) {
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= columns) return;
+    float sum = 0.f;
+    for (long row = 0; row < rows; ++row) sum += static_cast<float>(dout[row * columns + column]);
+    if (scale_a) sum *= *scale_a * *scale_b;
+    dbias[column] = static_cast<floatX>(static_cast<float>(dbias[column]) + sum);
+}
+
+template <class floatX, class FloatY>
 void backward_bias_imp(floatX* dbias,
                        const FloatY* dout,
                        const float* scale_a,
@@ -304,6 +315,16 @@ void backward_bias_imp(floatX* dbias,
 
     if ((scale_a == nullptr) != (scale_b == nullptr)) {
         throw std::logic_error("backward_bias: scale_a and scale_b must be both nullptr or both non-nullptr");
+    }
+
+    // Router biases can have only a few channels. The vectorized path reads
+    // whole 16-byte vectors and requires aligned row strides and destinations.
+    if (OC % (16 / sizeof(FloatY)) || OC % (16 / sizeof(floatX)) ||
+        reinterpret_cast<std::uintptr_t>(dout) % 16 || reinterpret_cast<std::uintptr_t>(dbias) % 16) {
+        backward_bias_unaligned<<<div_ceil(OC, 256), 256, 0, stream>>>(
+            dbias, dout, scale_a, scale_b, static_cast<long>(B) * T, OC);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
 
     // If we have enough OC that we don't need cross-block reductions, we can skip the bias_buffer accumulation

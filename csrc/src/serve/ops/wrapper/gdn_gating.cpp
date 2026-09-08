@@ -33,15 +33,15 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
 }
 
 void require_gate_shape(const Tensor& t, const char* label) {
-    if (t.ne[0] != 48 || t.ne[2] != 1 || t.ne[3] != 1) {
+    if (t.ne[0] <= 0 || t.ne[2] != 1 || t.ne[3] != 1) {
         throw std::invalid_argument(std::string("gdn_gating: ") + label +
-                                    " must have shape [48,T]");
+                                    " must have shape [H,T] with positive H");
     }
 }
 
-void require_vector48_shape(const Tensor& t, const char* label) {
-    if (t.ne[0] != 48 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
-        throw std::invalid_argument(std::string("gdn_gating: ") + label + " must have shape [48]");
+void require_vector_shape(const Tensor& t, std::int32_t heads, const char* label) {
+    if (t.ne[0] != heads || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
+        throw std::invalid_argument(std::string("gdn_gating: ") + label + " must have shape [H] matching a");
     }
 }
 
@@ -79,8 +79,8 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     require_gate_shape(b, "b");
     require_gate_shape(g, "g");
     require_gate_shape(beta, "beta");
-    require_vector48_shape(A_log, "A_log");
-    require_vector48_shape(dt_bias, "dt_bias");
+    require_vector_shape(A_log, a.ne[0], "A_log");
+    require_vector_shape(dt_bias, a.ne[0], "dt_bias");
     require_same_gate_shape(a, b, "b");
     require_same_gate_shape(a, g, "g");
     require_same_gate_shape(a, beta, "beta");

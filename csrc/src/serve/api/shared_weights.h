@@ -6,7 +6,9 @@
 
 namespace sinfer {
 
-/// Immutable contiguous BF16 storage borrowed from an in-process trainer.
+enum class SharedWeightDType { BF16, FP32 };
+
+/// Immutable contiguous weight storage borrowed from an in-process trainer.
 /// The caller must retain the owner until the engine is destroyed.
 struct BorrowedTensor {
     std::string name;
@@ -14,6 +16,7 @@ struct BorrowedTensor {
     std::vector<std::uint64_t> shape;
     std::uint64_t bytes = 0;
     int device = -1;
+    SharedWeightDType dtype = SharedWeightDType::BF16;
 };
 
 struct DeviceAdapterModule {

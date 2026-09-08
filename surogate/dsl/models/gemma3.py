@@ -64,7 +64,7 @@ from .. import nn
 from ..block_schema import ServeObject
 from ..blocks.gemma3 import GEMMA3_BLOCK_NAME_REMAP, Gemma3FullBlock, Gemma3SlidingBlock
 from ..hf import fuse
-from ..modules import LMHead, RMSNorm, ScaledEmbedding
+from ..modules import LMHead, RMSNormPlus1, ScaledEmbedding
 from ..specs import ActivationScope
 
 
@@ -81,6 +81,7 @@ GEMMA3_MODEL_NAME_REMAP: dict[str, str] = {
     "lm_head_weight": "lm_head",
     "lm_head_loss": "loss",
     "lm_head_x_flat": "xF_flat",
+    "final_norm_weight_eff": "final_norm_eff",
 }
 
 
@@ -335,7 +336,7 @@ def _build_gemma3_model(
         block_types=cls.block_types,
         n_layers=n_layers,
     )
-    cls.final_norm = RMSNorm(d_model, eps=eps)
+    cls.final_norm = RMSNormPlus1(d_model, eps=eps)
     cls.lm_head = LMHead(vocab_size, d_model)
 
 

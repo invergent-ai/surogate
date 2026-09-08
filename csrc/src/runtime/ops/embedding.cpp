@@ -18,7 +18,7 @@ namespace dsl {
 void CompiledExecutor::dispatch_embedding(const CompiledOp& op) {
     Tensor& token_ids = resolve_tensor(op.inputs[0]);
     Tensor& emb = op.inputs.size() > 1 ? resolve_tensor(op.inputs[1]) : mWeights.get("embedding");
-    Tensor& out = ensure_output_tensor(op.outputs[0]);
+    Tensor out = ensure_output_tensor(op.outputs[0]);
 
     // Derive dims from the weight tensor so non-main embeddings (e.g.,
     // Gemma4 pli_embedding with weight [vocab, n_layers * PLI_D]) work
@@ -33,35 +33,44 @@ void CompiledExecutor::dispatch_embedding(const CompiledOp& op) {
     // Bounds checks — compile-time invariants that turn future layout bugs
     // into clean compile-path errors instead of async illegal-memory-access
     // reports in the encoder kernel.
-    const long expected_tokens = mB * mT;
-    if (token_ids.nelem() < static_cast<std::size_t>(expected_tokens)) {
-        throw std::runtime_error(
-            "dispatch_embedding: token_ids buffer too small — have " + std::to_string(token_ids.nelem()) +
-            " elements, need mB*mT=" + std::to_string(expected_tokens) + " (B=" + std::to_string(mB) +
-            ", T=" + std::to_string(mT) + ", input='" + op.inputs[0].name + "')");
+    const long expected_tokens = static_cast<long>(token_ids.nelem());
+    if (expected_tokens <= 0 || expected_tokens > std::numeric_limits<int>::max()) {
+        throw std::runtime_error("dispatch_embedding: unsupported index count");
     }
-    const long expected_out_elems = mB * mT * emb_dim;
-    if (out.nelem() < static_cast<std::size_t>(expected_out_elems)) {
-        throw std::runtime_error("dispatch_embedding: output buffer too small — have " + std::to_string(out.nelem()) +
-                                 " elements, need mB*mT*C=" + std::to_string(expected_out_elems) +
-                                 " (B=" + std::to_string(mB) + ", T=" + std::to_string(mT) +
-                                 ", C=" + std::to_string(emb_dim) + ", output='" + op.outputs[0].name + "')");
+    std::vector<long> out_shape(token_ids.Sizes.begin(), token_ids.Sizes.begin() + token_ids.Rank);
+    out_shape.push_back(emb_dim);
+    const long expected_out_elems = expected_tokens * emb_dim;
+    if (out.nelem() < static_cast<std::size_t>(expected_out_elems) || out.DType != emb.DType) {
+        out = mRunState.temp_alloc(emb.DType, out_shape, "embedding_out");
+        mTemps.push_back(out);
+    } else {
+        out = view_tensor(out, out_shape);
     }
 
     encoder_forward(out,
                     token_ids,
                     emb,
                     std::nullopt,
-                    static_cast<int>(mB),
-                    static_cast<int>(mT),
+                    1,
+                    static_cast<int>(expected_tokens),
                     emb_dim,
                     vocab,
                     mRunState.MainStream);
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_embedding_backward(const CompiledOp& op) {
-    // Skip embedding backward entirely in LoRA-only mode
+    // Base embedding weights stay frozen in LoRA-only mode.
     if (mRunState.is_lora_only_mode()) {
+        // Auxiliary tables can be views of frozen parameters. Their view
+        // backward still consumes a gradient even though no base weight is
+        // trainable. Materialize that intermediate without a table reduction.
+        if (!op.outputs.empty() && !op.outputs[0].name.empty() &&
+            !mWeights.has(op.outputs[0].name.substr(2))) {
+            Tensor out = ensure_output_tensor(op.outputs[0]);
+            fill_zero(out, mRunState.MainStream);
+            store_tensor(op.outputs[0], out);
+        }
         return;
     }
 

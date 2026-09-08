@@ -20,12 +20,15 @@ namespace {
 
 using Array = nb::ndarray<>;
 
-Array bf16_array(nb::handle value, int device) {
+Array bf16_array(nb::handle value, int device, bool allow_fp32 = false) {
     Array array = nb::cast<Array>(value);
+    const bool bf16 = array.dtype().code == static_cast<std::uint8_t>(nb::dlpack::dtype_code::Bfloat) &&
+                      array.dtype().bits == 16;
+    const bool fp32 = array.dtype().code == static_cast<std::uint8_t>(nb::dlpack::dtype_code::Float) &&
+                      array.dtype().bits == 32;
     if (array.device_type() != nb::device::cuda::value || array.device_id() != device ||
-        array.dtype().code != static_cast<std::uint8_t>(nb::dlpack::dtype_code::Bfloat) ||
-        array.dtype().bits != 16) {
-        throw std::invalid_argument("shared tensors must be BF16 on the serving CUDA device");
+        !(bf16 || (allow_fp32 && fp32))) {
+        throw std::invalid_argument("shared tensors must use the expected floating dtype on the serving CUDA device");
     }
     std::int64_t stride = 1;
     for (std::size_t i = array.ndim(); i-- > 0;) {
@@ -61,12 +64,14 @@ public:
         device_ = options.device;
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
         for (auto [key, value] : weights_owner_) {
-            const auto array = bf16_array(value, device_);
+            const auto array = bf16_array(value, device_, true);
             sinfer::BorrowedTensor tensor;
             tensor.name = nb::cast<std::string>(key);
             tensor.data = array.data();
             tensor.device = device_;
-            tensor.bytes = array.size() * 2;
+            tensor.bytes = array.size() * (array.dtype().bits / 8);
+            tensor.dtype = array.dtype().bits == 32 ? sinfer::SharedWeightDType::FP32
+                                                    : sinfer::SharedWeightDType::BF16;
             for (std::size_t i = 0; i < array.ndim(); ++i) { tensor.shape.push_back(array.shape(i)); }
             options.borrowed_weights.push_back(tensor);
             const auto begin = reinterpret_cast<std::uintptr_t>(tensor.data);
