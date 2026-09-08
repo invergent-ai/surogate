@@ -1,213 +1,319 @@
-<div align="center" style="padding: 2rem">
-<p align="center">
-  <a href="https://surogate.ai/#gh-dark-mode-only">
-    <img
-      alt="Surogate"
-      width="40%"
-      src="https://github.com/invergent-ai/surogate/raw/main/assets/logo-white.svg#gh-dark-mode-only"
-    />
-  </a>
+<div align="center">
 
-  <a href="https://surogate.ai/#gh-light-mode-only">
-    <img
-      alt="Surogate"
-      width="40%"
-      src="https://github.com/invergent-ai/surogate/raw/main/assets/logo-black.svg#gh-light-mode-only"
-    />
-  </a>
+<a href="https://surogate.ai">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-white.svg">
+    <img src="assets/logo-black.svg" alt="Surogate" width="420">
+  </picture>
+</a>
+
+<h1>Train at full throttle. Serve at full speed.</h1>
+
+<p><strong>Native C++/CUDA engines for LLM training and serving.<br>BF16. FP8. NVFP4. From your first fine-tune to hundreds of concurrent requests.</strong></p>
+
+<p>
+  <a href="https://surogate.ai">Website</a> ·
+  <a href="https://docs.surogate.ai">Documentation</a> ·
+  <a href="#speed-you-can-measure">Benchmarks</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#supported-models">Models</a> ·
+  <a href="examples">Examples</a>
 </p>
 
-<h3>⚡ FP8/FP4 Training, Fine-tuning and RL at the speed of light</h3>
-<h4></h4>
-<div>
-<a href="https://surogate.ai">Home</a> ·
-<a href="https://docs.surogate.ai">Docs</a> ·
-<a href="https://github.com/invergent-ai/surogate/tree/master/examples">Examples</a> ·
-<a href="https://docs.surogate.ai/reference/benchmarks">Benchmarks</a> ·
-<a href="https://github.com/invergent-ai/surogates">Managed Agents</a>
-</div>
-<br/>
-
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![C++ / CUDA](https://img.shields.io/badge/Engines-C%2B%2B_%2F_CUDA-76B900)](csrc/src)
 [![GitHub stars](https://img.shields.io/github/stars/invergent-ai/surogate?style=social)](https://github.com/invergent-ai/surogate)
-[![GitHub issues](https://img.shields.io/github/issues/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/issues)
-[![GitHub pull requests](https://img.shields.io/github/issues-pr/invergent-ai/surogate)](https://github.com/invergent-ai/surogate/pulls)
-[![Twitter Follow](https://img.shields.io/twitter/follow/surogate_ai?style=social)](https://x.com/surogate_ai)
+[![Follow on X](https://img.shields.io/twitter/follow/surogate_ai?style=social)](https://x.com/surogate_ai)
+
+<table>
+<tr>
+<td align="center"><strong>136,200 tok/s</strong><br>Training · 4× RTX 5090<br><sub>Qwen3-0.6B · FP4 LoRA</sub></td>
+<td align="center"><strong>2.53× training throughput</strong><br>vs. Unsloth · 1× H100<br><sub>Qwen3-0.6B · BF16 on both</sub></td>
+<td align="center"><strong>802 tok/s</strong><br>Serving · one user · 1× RTX 5090<br><sub>Qwen3.5-0.8B · native GGUF</sub></td>
+<td align="center"><strong>7.0× serving throughput</strong><br>vs. llama.cpp · 8× RTX 5090<br><sub>GLM-5.3-Flash · 16 users · decode</sub></td>
+</tr>
+</table>
+
+<sub>Selected results from the repository's <a href="docs/reference/benchmarks.md">training benchmarks</a> and <a href="surogate/serve/BENCHMARKS.md">serving benchmarks</a>. Workloads and comparison details below.</sub>
 
 </div>
 
-# Surogate Trainer
-Surogate Trainer is built for developers and enterprises that need fast experimentation — whether running on-premise or in the cloud.
+Surogate puts **training and serving in one toolkit**, with dedicated native engines built to push NVIDIA hardware. Pretrain a model, fine-tune with LoRA or QLoRA, optimize with GRPO or DPO, distill a teacher, and serve the result through familiar HTTP APIs.
 
-**⚡ The Surogate trainer surpasses all existing training frameworks in performance for single-GPU, multi-GPU and GPU+CPU by a large margin.**
+Speed drives the design: compiled training graphs, fused CUDA kernels, low-precision tensor cores, concurrent serving, and deliberate control over every byte of GPU memory. Scale from a single workstation to multiple GPUs and training clusters, or use system RAM to work with models larger than your cards.
 
-**✨ The native CPU offloading feature achieves superior performance and VRAM usage compared to QLoRA. You can fine-tune models at native bf16 precision, rendering QLoRA obsolete.**
+## Speed you can measure
 
-### Highlights
+### Training: more experiments per GPU-hour
 
-- **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA
-- [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning (GRPO and DPO)**](https://docs.surogate.ai/guides/rl-training): advanced GRPO training and evaluation with custom, deterministic environments
-- [**🔧 RL Environments***](https://docs.surogate.ai/guides/rl-environments): predictable environments for RL training
-- [**🖥️...🖥️ Native multi-GPU**](https://docs.surogate.ai/guides/multi-gpu) training with multi-threaded backend
-- [**🖥️...🖥️ Native multi-Node**](https://docs.surogate.ai/guides/multi-node) DDP training with Ray
-- **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
-- [**🔥 Python DSL**](https://docs.surogate.ai/about/dsl) with AOT auto-differentiation for adding new model architectures
-- [**⚖️ Smart CPU Offloading**](https://docs.surogate.ai/guides/offloading) for weights, gradients, activations, quants
-- **📜 Pre-built training recipes**:
-  - [**💎 BF16**](https://docs.surogate.ai/guides/precision-and-recipes#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
-  - [**🔥 FP8**](https://docs.surogate.ai/guides/precision-and-recipes#fp8-hybrid): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
-  - [**🔥 NVFP4**](https://docs.surogate.ai/guides/precision-and-recipes#fp4-nvfp4): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
-- [**⚡ BnB/FP8/NVFP4 QLoRA**](https://docs.surogate.ai/guides/qlora) Support for a variety of QLoRA configurations, including online quantization (FP8, NVFP4, BnB) or loading pre-quantized weights (FP8, NVFP4)
-- [**👌 Optimizers**](https://docs.surogate.ai/guides/optimizers): AdamW 8bit, !! NorMuon !!
-- **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
-- [**🧪 Mixed-precision training**](https://docs.surogate.ai/guides/precision-and-recipes#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
-- **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
-- [**🧬 Adaptive Training**](https://docs.surogate.ai/about/adaptive-training): built-in automated training monitoring with automatic phase detection, multi-criteria early stopping (convergence, compute-efficiency, divergence, plateau), auto LR management, MoE imbalance detection, Chinchilla token budgeting and dynamic epoch adjustment
-- [**🎨 Dedicated MoE Features**](https://docs.surogate.ai/guides/moe): Expert Parallelism, Least-Loaded EP load-balancing, MoE training metrics, Imbalance detection
-- **🥞 Stacked LoRA training**: Train a LoRA adapter on top of another LoRA adapter to skip offline merging into base model.
+**53,900 training tokens/s on a single H100. 136,200 on four RTX 5090s.**
 
----
+| Model | Hardware | Surogate | Unsloth | Throughput gain |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B | 1× H100 80 GB | **53,900 tok/s · BF16** | 21,300 tok/s · BF16 | **2.53×** |
+| Qwen3-0.6B | 1× RTX 5090 32 GB | **30,100 tok/s · BF16** | 22,100 tok/s · BF16 | **1.36×** |
+| Qwen3-8B | 1× RTX 5090 32 GB | **6,900 tok/s · FP4** | 3,500 tok/s · BF16 | **1.97×** |
 
-## 🧠 Supported Models:
-We support the following models. Please create a PR if you need a specific model
+Need more throughput? Qwen3-0.6B FP4 LoRA scales from **36,400 tok/s on one RTX 5090 to 136,200 tok/s on four**: 3.74× aggregate throughput. Qwen3-8B reaches **27,100 tok/s** on the same four-card setup.
 
-| Model              | Architecture                                            | Model Sizes                   |
-| ------------------ | ------------------------------------------------------- | ----------------------------- |
-| Qwen3              | Qwen3ForCausalLM                                        | 0.6B, 1.7B, 4B, 8B, 14B, 35B  |
-| Qwen3VL            | Qwen3VLForConditionalGeneration                         | 2B, 4B, 8B, 32B               |
-| Qwen3 MoE          | Qwen3MoeForCausalLM                                     | 30B-A3B, 235B-A22B            |
-| Qwen3.5            | Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration     | 0.8B, 2B 4B, 9B, 27B          |
-| Qwen3.5 Moe        | Qwen3MoeForCausalLM, Qwen3_5MoeForConditionalGeneration | 35B-A3B, 122B-A10B, 397B-A17B |
-| Qwen3.6            | Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration     | 27B                           |
-| Gemma 4            | Gemma4ForCausalLM, Gemma4ForConditionalGeneration       | 12B, 26B-A4B                  |
-| Nemotron Nano v3   | NemotronHForCausalLM                                    | 30B-A3B                       |
-| Nemotron Super v3  | NemotronHForCausalLM                                    | 120B-A12B                     |
-| Nemotron Cascade 2 | NemotronHForCausalLM                                    | 30B-A3B                       |
-| GPT-OSS            | GptOssForCausalLM                                       | 20B, 120B                     |
-| Laguna             | LagunaForCausalLM                                       | XS-2.1                        |
-| LFM2               | Lfm2ForCausalLM                                         | 350M, 700M, 1.2B, 2.6B        |
-| Llama 3.1          | LlamaForCausalLM                                        | 8B, 70B, 405B                     |
-| Llama 3.2          | LlamaForCausalLM                                        | 1B, 3B                      |
+These are total training tokens/s for packed 2,048-token sequences, batch size 2 per GPU, gradient accumulation 4, and LoRA rank 16 / alpha 32. The FP4 comparison uses different compute precision; recipe choice also affects accuracy. [Full results, configuration, and accuracy measurements →](docs/reference/benchmarks.md)
 
+### Serving: fast for one user. Fast under load.
 
-## 🚀 Quickstart
-You can interact with the Surogate High-Performance Training Engine at the framework level via the CLI.
+**Native GGUF decoding at 802 tokens/s on one RTX 5090. A 200 GB MoE serving 16 users at 7× llama.cpp's aggregate decode throughput on eight cards.**
 
-### Run the Surogate Training Engine:
+| Model / workload | RTX 5090 GPUs | Surogate decode | Baseline decode | Throughput gain |
+|---|---:|---:|---:|---:|
+| Qwen3.5-0.8B · 1 user | 1 | **802 tok/s** | vLLM: 346 tok/s | **2.32×** |
+| Qwen3.5-0.8B · 8 users | 1 | **2,765 tok/s** | llama.cpp: 683 tok/s | **4.05×** |
+| Qwen3.5-4B · 100 users | 1 | **5,345 tok/s** | vLLM: 4,481 tok/s | **1.19×** |
+| GLM-5.3-Flash · 16 users | 8 | **292.9 tok/s** | llama.cpp: 41.9 tok/s | **7.0×** |
 
-#### Option A: Run using Docker (recommended)
-Surogate provides 3 docker images for various CUDA versions. Currently only the `x86-64` architecture is supported.
+Responsiveness matters, too. At 100 users, Qwen3.5-4B delivers **40 ms median time to first token**, versus 230 ms for vLLM. At 16 users, GLM-5.3-Flash delivers **1.59 seconds**, versus 55.13 seconds for llama.cpp.
 
-| CUDA   | Image                                        | Recommended NVIDIA Driver | Minimum NVIDIA Driver |
-| ------ | -------------------------------------------- | ------------------------- | --------------------- |
-| 12.8.1 | `ghcr.io/invergent-ai/surogate:latest-cu128` | `>= 570.124.06`           | `>= 525`              |
-| 12.9.1 | `ghcr.io/invergent-ai/surogate:latest-cu129` | `>= 575.57.08`            | `>= 525`              |
-| 13.1   | `ghcr.io/invergent-ai/surogate:latest-cu130` | `>= 590.48.01`            | `>= 580`              |
+Selected measurements from August 30–September 7, 2026, using streaming HTTP clients, staggered requests, salted prompts, and a 512-input / 128-output token workload. Decode rates are generated tokens divided by wall time, summed across users. Model loading is excluded. The 0.8B runs use native Q4_K_M GGUF for Surogate and llama.cpp, and NVFP4 for vLLM; the 4B pair uses NVFP4; the GLM pair uses the same GGUF with resident weights. Baselines include vLLM 0.27.1 and CUDA llama.cpp builds.
 
-```bash
-docker run --gpus=all -v /my/local/config.yaml:/home/surogate/config.yaml -v /my/local/output_dir:<OUTPUT_DIR_FROM_CONFIG_YAML> <IMAGE> sft config.yaml
-```
+**These wins describe the measured configurations.** Performance varies with model, precision, context, concurrency, and offload. The full benchmark record includes engine flags, correctness checks, and workloads where another engine leads. [Full serving results and methodology →](surogate/serve/BENCHMARKS.md)
 
-#### Option B: Install via script
-The `install.sh` script auto-detects your CUDA version (12.8, 12.9, or 13.x) and installs the matching pre-built wheel into a local `.venv/`.
+## Two engines. One workflow.
 
-Install the latest release:
+### Training engine
+
+From raw text to specialized models, with Python configuration and native C++/CUDA execution.
+
+| Capability | What you get |
+|---|---|
+| **Pretraining & full fine-tuning** | Train from scratch, continue pretraining, or update the full model with SFT. |
+| **LoRA & QLoRA** | Adapter training with BF16 bases or FP8, NVFP4, and BnB/NF4 quantization; supported pre-quantized checkpoints and stacked LoRA adapters. |
+| **Native precision recipes** | BF16, hybrid FP8, and Blackwell NVFP4, with configurable model, gradient, and adapter precision. |
+| **GRPO reinforcement learning** | Reward environments, rollout orchestration, evaluation, and native policy updates; separate GPUs or single-GPU colocation with vLLM. |
+| **DPO preference training** | Learn from chosen/rejected pairs, with an inline frozen reference, optional length normalization, and differing-span masking. |
+| **Knowledge distillation** | Capture teacher top-K distributions, then train a student with KL divergence and optional cross-entropy. |
+| **Multi-GPU & multi-node** | Native threaded data parallelism, ZeRO sharding, communication overlap, and Ray for multi-node training. |
+| **Models beyond one GPU's capacity** | Dispatch pipeline parallelism streams frozen weights for LoRA across PCIe GPUs, including systems without NVLink or GPU-to-GPU P2P. |
+| **MoE training** | Expert parallelism, load balancing, routing metrics, and expert imbalance detection. |
+| **Memory control** | CPU offload for weights, gradients, optimizer state, activations, and quants; recomputation and tiled MLP execution for long contexts. |
+| **Multimodal fine-tuning** | Qwen3-VL and Qwen3.5 vision training examples, plus text-backbone training for supported multimodal checkpoints. |
+| **Optimizers & monitoring** | AdamW 8-bit, NorMuon, Weights & Biases, loss charts, checkpoints, and resume. |
+| **Adaptive training** | Phase detection, early stopping, learning-rate management, token budgeting, and dynamic epoch adjustment. |
+| **Extensible architectures** | Python DSL with ahead-of-time automatic differentiation, explicit graphs, and native kernel dispatch. |
+
+Explore [training modes](docs/getting-started/training-modes.md), [precision recipes](docs/guides/precision-and-recipes.md), [memory management](docs/guides/memory.md), [GRPO](docs/guides/rl-training.md), [DPO](docs/getting-started/quickstart-dpo.md), and [distillation](docs/guides/distillation.md).
+
+### Serving engine
+
+A native C++/CUDA HTTP server built for quick responses, concurrent workloads, and efficient model placement.
+
+| Capability | What you get |
+|---|---|
+| **Familiar APIs** | OpenAI-compatible Chat Completions, Completions, and Responses; Anthropic-compatible Messages. See the [API guide](docs/inference/api.md) for supported fields. |
+| **Streaming, reasoning & tools** | Streaming output, separate reasoning content, thinking controls, and model-specific function-call parsers. |
+| **Concurrent serving** | Continuous batching, chunked prompt processing, CUDA graphs, and up to 128 active sequences per model, with a configurable pending queue. |
+| **Prompt reuse** | Prefix caching and optional checkpoints for edited conversation turns. |
+| **Speculative decoding** | MTP, including supported multi-GPU models, and DFlash with a compatible drafter on a single GPU. |
+| **Native GGUF** | Supported K-quants, Q8_0, legacy and IQ formats; split-file loading and direct access to supported source weights. |
+| **Hugging Face checkpoints** | Repo IDs or local safetensors, with automatic preparation and caching; supported BF16, FP8, and NVFP4 exports. |
+| **KV memory on demand** | Elastic cache allocation, automatic capacity sizing, BF16/FP8 cache options, and shared spare cache memory across models. |
+| **Runtime LoRA** | Load and unload compatible PEFT adapters without restarting; select an adapter per request. |
+| **Several models on one GPU** | Named models, priorities, and optional sleep/wake to move idle models into system RAM. |
+| **Large models on available hardware** | Multi-GPU layer pipelines, CPU weight offload, and GPU expert caching with CPU/GPU expert compute sharing on supported MoE families. |
+| **Vision & embeddings** | Images and video for supported vision models; EmbeddingGemma on GPU or AVX-512 CPU through a separate embeddings server. |
+| **Operations** | API-key authentication, health checks, Prometheus metrics, request logs, tokenization, and cache statistics. |
+
+Formats, LoRA, vision, speculation, and placement options depend on the model family. Multi-model hosting, sleep mode, and DFlash currently require one GPU. [Serving guide →](docs/inference/index.md) · [CLI reference →](docs/inference/cli.md) · [Deployment examples →](docs/inference/serving-models.md)
+
+## Supported models
+
+Training and serving have different architecture coverage. Model dimensions come from the checkpoint; the examples below are representative sizes, with precision and memory requirements depending on the configuration.
+
+### Training
+
+| Family | Representative models / sizes | Examples or implementation |
+|---|---|---|
+| **Qwen3** | 0.6B, 1.7B, 4B, 8B, 14B, 32B | [BF16, FP8, FP4 & QLoRA](examples/sft/qwen3) |
+| **Qwen3 MoE** | 30B-A3B, 235B-A22B | [MoE recipes](examples/sft/qwen3moe) |
+| **Qwen3-VL** | 2B, 4B, 8B, 32B | [Vision & text training](examples/sft/qwen3vl) |
+| **Qwen3.5 / Qwen3.6 dense** | 3.5: 0.8B, 2B, 4B, 9B, 27B; 3.6: 27B | [Text, vision & pipeline examples](examples/sft/qwen35) |
+| **Qwen3.5 / Qwen3.6 MoE** | 35B-A3B; 3.5 also 122B-A10B, 397B-A17B | [MoE recipes](examples/sft/qwen35moe) |
+| **Llama 3.1 / 3.2** | 3.1: 8B, 70B, 405B; 3.2: 1B, 3B | [Llama example](examples/sft/llama) |
+| **Gemma 4** | E2B, 12B, 26B-A4B; text backbones | [LoRA recipes](examples/sft/gemma4) |
+| **Nemotron 3 / Cascade 2** | Nano 30B-A3B, Super 120B-A12B, Cascade 2 30B-A3B | [Nemotron recipes](examples/sft/nemotron3) |
+| **GPT-OSS** | 20B, 120B; MXFP4 checkpoints use QLoRA | [GPT-OSS recipes](examples/sft/gpt-oss) |
+| **Laguna** | Laguna-S-2.1 | [FP8 LoRA](examples/sft/laguna) |
+| **LFM2 / LFM2.5** | LFM2: 350M, 700M, 1.2B, 2.6B; LFM2.5-350M example | [BF16 & FP8 LoRA](examples/sft/lfm2) |
+
+Additional architecture definitions include [Gemma 3](surogate/dsl/models/gemma3.py), [LFM2-MoE](surogate/dsl/models/lfm2_moe.py), and [LFM2-VL](surogate/dsl/models/lfm2_vl.py). Check their implementation and validation coverage before using a new checkpoint. DeepSeek-V4, Flash-Next, and GLM-5.3-Flash training definitions still have deferred components and are not listed as ready-to-train models.
+
+### Serving
+
+| Family | Coverage |
+|---|---|
+| **Qwen3 / Qwen3 MoE** | Dense and mixture-of-experts text models. |
+| **Qwen3.5 / Qwen3.6 / Qwen3.8** | Dense hybrid models, including supported BF16, FP8, and NVFP4 exports. |
+| **Qwen3.5 / Qwen3.6 MoE** | Including 35B-A3B; optional speculative decoding with compatible draft weights. |
+| **Qwen3.8 Flash-Next** | GGUF, CPU offload, GPU expert caching, and multiple GPUs. |
+| **GLM-5.3-Flash** | GGUF, CPU/GPU expert compute, multiple GPUs, and MTP. |
+| **Llama** | Llama-family text models, including TinyLlama. |
+| **Gemma 3 / Gemma 4** | Text generation; Gemma 4 dense, E-series, and MoE variants. |
+| **LFM2 / LFM2.5** | Dense text models from safetensors or GGUF. |
+| **MiniCPM5** | Safetensors and GGUF, with thinking controls. |
+| **Spark-X2.5** | 1.7B and 4B safetensors, thinking controls, and `spark25` tool parsing; runtime LoRA is not yet supported. |
+| **EmbeddingGemma 300M** | Embeddings on NVIDIA GPU or AVX-512 CPU. |
+
+For per-family format support, conversion behavior, and hardware details, see the [serving model guide](docs/inference/index.md#model-families).
+
+## Quickstart
+
+### Install
+
+Use **Linux x86_64 and Python 3.12** with a supported NVIDIA GPU and CUDA 12.8, 12.9, or 13.x. See [hardware](#hardware) for the separate training and serving GPU targets.
+
 ```bash
 curl -LsSf https://github.com/invergent-ai/surogate/releases/latest/download/install.sh | bash
-```
-
-Or pin to a specific release (e.g. `v0.0.1`):
-```bash
-curl -LsSf https://github.com/invergent-ai/surogate/releases/download/v0.0.1/install.sh | bash
-```
-
-After installation:
-```bash
 source .venv/bin/activate
-surogate sft examples/sft/qwen3/qwen3-lora-bf16.yaml
 ```
 
-#### Option C: Build from source (dev / contributors)
-You need CUDA 12.8/12.9/13.x installed on your machine and NCCL development libraries libnccl-dev for your CUDA version (https://developer.nvidia.com/nccl/nccl-download)
+The installer selects a CUDA-specific wheel and downloads the example configurations.
+
+### Serve a model
 
 ```bash
-# ...clone repo...
-uv pip install -e .
+surogate serve Qwen/Qwen3.5-0.8B \
+  --served-model-name surogate \
+  --port 8080 --max-model-len 4096 \
+  --max-num-seqs 16 --kv-capacity auto
 ```
 
----
+The first launch prepares and caches the checkpoint. Later launches reuse that preparation. You can also pass a local safetensors directory or a supported `.gguf` file.
 
-## Quickstart (SFT)
+Send a streaming request from another terminal:
 
-1) Create a config (example):
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "surogate",
+    "messages": [{"role": "user", "content": "Explain why low latency matters."}],
+    "max_tokens": 256,
+    "stream": true
+  }'
+```
+
+Point existing OpenAI-compatible clients at `http://127.0.0.1:8080/v1`. To try a Blackwell NVFP4 checkpoint, use a supported export such as `nvidia/Qwen3.6-27B-NVFP4`. [More serving examples →](docs/inference/serving-models.md)
+
+### Train an adapter
+
+Save this as `train.yaml`:
 
 ```yaml
 model: Qwen/Qwen3-0.6B
 output_dir: ./output
 
-# training
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 4
-sequence_len: 2048
-learning_rate: 2e-4
-
-# LoRA / QLoRA
+recipe: bf16                  # fp8-hybrid for FP8; nvfp4 for Blackwell FP4
 lora: true
 lora_rank: 16
-# qlora_fp8: true  # optional, hardware-dependent
-# qlora_fp4: true  # Blackwell+
-# qlora_bnb: true  # Any GPU, lowest
+lora_alpha: 32
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+sequence_len: 2048
+sample_packing: true
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 2e-4
+max_steps: 100
+save_steps: 50
 
 datasets:
-  - path: "mlabonne/FineTome-100k"
+  - path: mlabonne/FineTome-100k
     type: auto
 ```
 
-2) Run:
 ```bash
-surogate sft config.yaml
+surogate sft train.yaml
 ```
 
-3) Outputs:
-- checkpoints, logs and artifacts are written under `output_dir`
+Choose a precision recipe for your GPU, or start with the checked-in [training examples](examples/sft). For memory-constrained runs, see [QLoRA](docs/guides/qlora.md) and [CPU offloading](docs/guides/offloading.md).
 
----
+### Serve what you trained
 
-## Hardware / Requirements
+The completed training run exports its final adapter directly to `output/`. Merge it into its base model, then start the server:
 
-- NVIDIA GPU + recent driver
-- CUDA **12.8, 12.9, 13**, NCCL, cuDNN
-- Linux x86_64
+```bash
+surogate merge \
+  --base-model Qwen/Qwen3-0.6B \
+  --checkpoint-dir output \
+  --output merged
 
-### Supported NVIDIA GPUs:
-- `SM80`: A100, A30
-- `SM86`: A2, A16, A10, A40, RTX3050, RTX3060, RTX 3070, RTX 3080, RTX 3090, A2000, A3000, A4000, A5000, A6000
-- `SM89`: L4, L40, L40S, RTX 4050, RTX 4060, RTX 4070, RTX 4080, RTX 4090, RTX 2000 Ada, RTX 4000 SFF Ada, RTX 4000 Ada, RTX 4500 Ada, RTX 5000 Ada, RTX 6000 Ada
-- `SM90`: H100, H200, GH200
-- `SM100`: B200, GB200
-- `SM103`: B300, GB300
-- `SM120`: RTX PRO 6000/5000/4000/2500/2000 Blackwell,  RTX 5050,  RTX 5060,  RTX 5070,  RTX 5080,  RTX 5090
-- `SM121`: DGX Spark
+surogate serve merged --served-model-name my-finetune --port 8080
+```
 
----
+Use `"model": "my-finetune"` in requests. To create a quantized GGUF for serving:
 
-## Documentation / Examples
+```bash
+surogate quantize --model merged --output merged-Q4_K_M.gguf --type q4_k_m
+surogate serve merged-Q4_K_M.gguf --served-model-name my-finetune
+```
 
-- Docs: https://docs.surogate.ai
-- Examples: https://github.com/invergent-ai/surogate/tree/master/examples
+Run one server at a time on the same port. Compatible adapters can also be [loaded at runtime](docs/inference/api.md#lora-adapters-at-runtime) with `--enable-lora`.
 
----
+<details>
+<summary><strong>Docker and source builds</strong></summary>
 
-## Contributing
+CUDA-specific containers are available as `ghcr.io/invergent-ai/surogate:latest-cu128`, `latest-cu129`, and `latest-cu130`.
 
-We welcome contributions across the entire ecosystem! If you are submitting a PR to the core framework, please ensure you include a clear description, steps to test locally, and relevant examples.
+```bash
+# From the directory containing train.yaml; output stays in ./output on the host.
+docker run --gpus all --rm \
+  -v "$PWD:/workspace" -w /workspace \
+  ghcr.io/invergent-ai/surogate:latest-cu129 sft train.yaml
+```
 
-If you’re adding kernels/recipes or touching build/tooling, please keep changes minimal and include:
-- a short description of the change,
-- how to reproduce/validate locally (`make test` where applicable),
-- and any GPU/arch assumptions.
+For development, clone the repository and install with a CUDA toolkit, NCCL development libraries, and FFmpeg/libcurl development packages for serving. See [CMake](csrc/CMakeLists.txt) for the full build configuration:
 
----
+```bash
+git clone https://github.com/invergent-ai/surogate.git
+cd surogate
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e .
+```
 
-## License
+`make serve-build` rebuilds the serving engine in a source checkout. [Installation details →](docs/getting-started/installation.md)
 
-Apache 2.0 — see [LICENSE](./LICENSE).
+</details>
+
+## Why it is fast
+
+- **Compiled training graphs.** A Python DSL defines the model; ahead-of-time autodiff produces its backward graph so the native runtime can plan execution and memory across both passes.
+- **Kernels that do more per launch.** Fused operations, specialized matrix multiplication, low-precision tensor cores, and CUDA graphs reduce dispatch overhead and memory traffic.
+- **Serving that keeps work moving.** Continuous batching, chunked prefill, prefix reuse, and speculative decoding improve throughput and latency for different request patterns.
+- **Memory treated as part of the engine.** Planned buffer reuse, asynchronous offload, elastic KV caches, and expert placement make more of the available GPU and system memory useful.
+
+Read [how training works](docs/about/how-it-works.md), the [DSL guide](docs/about/dsl.md), or the [serving benchmark analysis](surogate/serve/BENCHMARKS.md).
+
+## Hardware
+
+| Component | Current requirements / targets |
+|---|---|
+| **Platform** | Linux x86_64; published wheels target Python 3.12; CUDA 12.8, 12.9, or 13.x. |
+| **Training** | SM89+ in the current build: Ada (RTX 40 series, L4/L40), Hopper (H100/H200), and supported Blackwell targets. |
+| **FP8 / NVFP4 training** | FP8 requires SM89+; native NVFP4 requires a supported Blackwell GPU and matching build. |
+| **Generative serving** | Current default builds target **SM120a**: RTX 50 series and RTX PRO Blackwell. The SM89/Ada port compiles, with runtime validation pending. |
+| **CPU embeddings** | AVX-512 CPU; generative serving still requires a GPU when using CPU offload. |
+| **Multi-GPU / offload** | NCCL for distributed training; sufficient system RAM for offloaded weights and state. Dispatch-PP supports PCIe systems without NVLink. |
+
+The training and serving engines have separate CUDA build targets. Check the [build configuration](csrc/CMakeLists.txt) when targeting a GPU beyond the default serving build.
+
+## Explore and contribute
+
+| Start here | Go deeper |
+|---|---|
+| [Training examples](examples) | [Configuration reference](docs/reference/config.md) |
+| [Serving examples](docs/inference/serving-models.md) | [API reference](docs/inference/api.md) |
+| [Pretraining](docs/getting-started/quickstart-pretraining.md) | [Multi-GPU](docs/guides/multi-gpu.md) · [Multi-node](docs/guides/multi-node.md) · [Dispatch-PP](docs/guides/dispatch-pp.md) |
+| [GRPO](docs/getting-started/quickstart-grpo.md) · [DPO](docs/getting-started/quickstart-dpo.md) | [RL environments](docs/guides/rl-environments.md) · [Distillation](docs/guides/distillation.md) |
+| [Training benchmarks](docs/reference/benchmarks.md) | [Serving benchmarks](surogate/serve/BENCHMARKS.md) · [Benchmark tools](surogate/serve/tools/bench) |
+
+Contributions are welcome: model support, kernels, precision recipes, benchmarks, documentation, and bug fixes. Include the problem, how to reproduce or validate the change, and any GPU or architecture assumptions in your pull request. [Open an issue](https://github.com/invergent-ai/surogate/issues) or [send a PR](https://github.com/invergent-ai/surogate/pulls).
+
+**Apache 2.0** · [License](LICENSE) · Built by [Invergent](https://github.com/invergent-ai)
