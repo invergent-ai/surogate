@@ -326,7 +326,9 @@ def synthesised_config(reader, arch: str) -> dict | None:
                 "use_sliding_window": False,
                 "max_window_layers": layers}
     if arch == "llama":
+        from surogate.serve.gguf.frontend import extract_generation_config
         return {**common, "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+                "eos_token_id": extract_generation_config(reader)["eos_token_id"],
                 "hidden_act": "silu", "mlp_bias": False, "pretraining_tp": 1}
     if arch == "gemma3":
         from surogate.serve.gguf.frontend import extract_generation_config

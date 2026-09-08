@@ -78,6 +78,7 @@ constexpr Geometry kGeometries[] = {
     // single token fills the small-T lane step of 64 rows, and the first head
     // wider than 256, which the prompt kernel serves with a 16-key tile.
     {"glm5_3_flash_absorbed", 64, 1, 512},
+    {"minicpm5", 16, 2, 128},
 };
 
 struct AttentionCase {
@@ -1307,6 +1308,9 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
 
 int run_batch_cases() {
     int failures = 0;
+    failures += run_batch_case({"minicpm5", 16, 2, 128}, DType::BF16,
+                               {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1},
+                                MappingPattern::Fragmented, 498u});
     failures += run_batch_case(kGeometries[0], DType::I8,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
     failures += run_batch_case(kGeometries[0], DType::BF16,
@@ -1331,8 +1335,11 @@ int run_batch_cases() {
 int run_geometry(const Geometry& geometry) {
     int failures = 0;
     for (const DType dtype : {DType::BF16, DType::I8}) {
-        // int8 KV is not served past a query group of eight.
-        if (dtype == DType::I8 && geometry.query_group() > 8) { continue; }
+        // The optimized INT8 decode kernels serve 256-wide heads with groups of 4–8.
+        if (dtype == DType::I8 && (geometry.head_dim != 256 ||
+                                  geometry.query_group() < 4 || geometry.query_group() > 8)) {
+            continue;
+        }
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
             failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);

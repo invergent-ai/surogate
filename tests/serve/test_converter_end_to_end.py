@@ -12,16 +12,19 @@ from surogate.serve.convert.common.recipe import source_requirements
 from tests.serve.test_checkpoint_inventory import config_for
 
 
-@pytest.mark.parametrize("family", ["qwen3", "qwen3_moe"])
+@pytest.mark.parametrize("family", ["qwen3", "qwen3_moe", "llama"])
 def test_complete_checkpoint_conversion(tmp_path, family):
     converter = importlib.import_module(f"surogate.serve.convert.{family}.convert")
     recipe = importlib.import_module(f"surogate.serve.convert.{family}.recipe")
     config = {
-        **config_for("qwen3", layers=2, hidden=128, head_dim=32),
+        **config_for("llama" if family == "llama" else "qwen3",
+                     layers=2, hidden=128, head_dim=64 if family == "llama" else 32),
         "vocab_size": 256, "tie_word_embeddings": False, "hidden_act": "silu",
         "attention_bias": False, "rope_scaling": None, "sliding_window": None,
         "use_sliding_window": False,
     }
+    if family == "llama":
+        del config["attention_bias"]
     if family == "qwen3_moe":
         config.update(architectures=["Qwen3MoeForCausalLM"], model_type="qwen3_moe",
                       moe_intermediate_size=128, num_experts=4, num_experts_per_tok=2)

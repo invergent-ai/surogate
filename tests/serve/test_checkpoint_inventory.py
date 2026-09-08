@@ -70,6 +70,21 @@ def test_llama_derives_head_width_only_when_division_is_exact():
         geometry_from_config({**config, "hidden_size": 257})
 
 
+def test_llama_explicit_head_width_and_optional_bias():
+    from surogate.serve.convert.llama import convert, inventory
+
+    config = {**config_for("llama", hidden=384, head_dim=128),
+              "hidden_act": "silu", "rope_scaling": None, "tie_word_embeddings": False}
+    geometry, report = convert.validate_config(config)
+    specs = {spec.name: spec for spec in inventory.build_tensor_specs(geometry)}
+    assert geometry.head_dim == 128
+    assert geometry.query_size == 512
+    assert report["text"]["head_dim"] == 128
+    assert specs["text/layers/0/attention/output"].shape == (384, 512)
+    with pytest.raises(ValueError, match="attention_bias"):
+        convert.validate_config({**config, "attention_bias": True})
+
+
 @pytest.mark.parametrize("family", ["qwen3", "llama"])
 def test_runtime_metadata_uses_checkpoint_execution_parameters(family):
     from surogate.serve.convert.common.checkpoint import dense_geometry

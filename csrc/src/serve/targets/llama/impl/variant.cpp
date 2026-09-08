@@ -41,7 +41,7 @@ constexpr ops::LinearPolicy kTextPolicy = ops::LinearPolicy::A16Only;
 [[noreturn]] void no_linear_layers(const char* leaf) {
     throw std::logic_error(
         std::string("llama: ") + leaf +
-        " was called, but every one of this target's 22 layers is full attention; it has no "
+        " was called, but every layer is full attention; it has no "
         "linear-attention mixer, no convolution state and no gating projection. Reaching here "
         "means the family runtime resolved a layer to the GDN branch, which its topology "
         "(full_attention_interval == 1, gdn_layers() == 0) cannot produce.");
@@ -81,10 +81,8 @@ QType profile_qtype(WeightsProfile weights_profile) {
 
 std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
     // E+1 is the one-token visible window; the ranges follow the family's measured
-    // split-policy transitions until the producer grid reaches its fixed cap. This
-    // model's native context stops at 2,048, so only the first three ends are ever
-    // reached -- the tail is the family's policy, kept whole rather than truncated
-    // to today's checkpoint.
+    // split-policy transitions until the producer grid reaches its fixed cap.
+    // Extend the profiles through the capacity resolved from this checkpoint.
     return family::graph_profiles_through(capacity - 1, {127, 511, 2047, 4095, 8197, 16389, 32767});
 }
 

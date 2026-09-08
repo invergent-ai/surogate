@@ -25,8 +25,8 @@ from . import inventory
 def geometry_from_config(config: Mapping[str, object]) -> inventory.Geometry:
     """Read the artifact-shaping dimensions straight off `config.json`.
 
-    `head_dim` is derived: a Llama config in this dialect has no such key, and
-    the architecture fixes the width at `hidden_size // num_attention_heads`.
+    Use an explicit `head_dim` when present, otherwise derive the width from
+    `hidden_size // num_attention_heads`.
     """
 
     from surogate.serve.convert.common.checkpoint import resolve_dense

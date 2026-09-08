@@ -292,7 +292,10 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     // is byte-level BPE *and* prepends <|startoftext|>, which is a combination this check
     // refused although nothing about it goes unimplemented -- and refusing a checkpoint the
     // engine tokenizes correctly is the failure this check was meant to prevent, not cause.
-    if (!sentencepiece && tokenizer_config.value("add_prefix_space", false)) {
+    // Fast-tokenizer exports may write null to leave this option unset.
+    const auto prefix_space = tokenizer_config.find("add_prefix_space");
+    if (!sentencepiece && prefix_space != tokenizer_config.end() && !prefix_space->is_null() &&
+        prefix_space->get<bool>()) {
         throw std::invalid_argument(
             "tokenizer_config.json asks for add_prefix_space, which this frontend's byte-level "
             "path does not apply");

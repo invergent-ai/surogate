@@ -79,6 +79,25 @@ surogate quantize --model merged --output merged-Q4_K_M.gguf --type q4_k_m
 surogate serve merged-Q4_K_M.gguf
 ```
 
+## MiniCPM5
+
+Serve the Hugging Face checkpoint directly:
+
+```bash
+surogate serve openbmb/MiniCPM5-1B --port 8080
+```
+
+For GGUF, download a file from [openbmb/MiniCPM5-2B-GGUF](https://huggingface.co/openbmb/MiniCPM5-2B-GGUF)
+and pass its local path:
+
+```bash
+surogate serve ~/models/MiniCPM5-2B-Q4_K_M.gguf --port 8080
+```
+
+The GGUF includes its tokenizer and chat template. Use `--no-thinking` for direct answers,
+or set `"chat_template_kwargs": {"enable_thinking": false}` in an individual chat request.
+Set `enable_thinking` to `true` to request reasoning output.
+
 ## A model larger than the card
 
 Use system RAM for part of a model when its weights do not fit in GPU memory. This requires

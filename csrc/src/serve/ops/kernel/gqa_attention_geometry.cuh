@@ -60,6 +60,7 @@ using Gqa256_8q2   = GqaGeometry<256, 8, 2, 2>;  // qwen3.5-0.8b
 using Gqa256_16q4  = GqaGeometry<256, 16, 4, 2>; // qwen3.5-4b, qwen3.5-2b
 using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of twelve)
 using Gqa128_16q8  = GqaGeometry<128, 16, 8, 1>; // qwen3-0.6b (the first 128-wide head)
+using Gqa128_16q2  = GqaGeometry<128, 16, 2, 2>; // minicpm5
 // Qwen3-30B-A3B: 32 query heads over 4 KV heads at head dim 128. DecodeSplitScale 1 for the
 // reason the other four-KV-head shapes take it -- four KV heads reach the registry's modal
 // KVHeads*DecodeSplits at scale 1, and the grid takes its parallelism from that dimension.
@@ -133,6 +134,7 @@ using Gqa512_8q2   = GqaGeometry<512, 8, 2, 2>;  // gemma-4-e4b, global
     X(Gqa256_16q4)                                                                                 \
     X(Gqa256_24q2)                                                                                 \
     X(Gqa128_16q8)                                                                                 \
+    X(Gqa128_16q2)                                                                                 \
     X(Gqa128_32q4)                                                                                 \
     X(Gqa64_32q4)                                                                                 \
     X(Gqa64_32q8)                                                                                 \

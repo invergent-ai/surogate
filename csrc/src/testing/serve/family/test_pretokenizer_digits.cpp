@@ -11,6 +11,8 @@
 
 #include "family/impl/frontend/test_access.h"
 
+#include <nlohmann/json.hpp>
+
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -48,11 +50,11 @@ sinfer::family::FrontendResources resources(std::string_view digit_pattern) {
     return out;
 }
 
-void expect(const char* what, std::string_view pattern, std::string_view text,
-            const std::vector<int>& want) {
+void expect_resources(const char* what, const sinfer::family::FrontendResources& assets,
+                      std::string_view text, const std::vector<int>& want) {
     try {
         const std::vector<int> got =
-            sinfer::family::FrontendTestAccess::encode_with(resources(pattern), text);
+            sinfer::family::FrontendTestAccess::encode_with(assets, text);
         if (got != want) {
             std::cerr << what << ": got";
             for (int id : got) { std::cerr << ' ' << id; }
@@ -67,9 +69,47 @@ void expect(const char* what, std::string_view pattern, std::string_view text,
     }
 }
 
+void expect(const char* what, std::string_view pattern, std::string_view text,
+            const std::vector<int>& want) {
+    expect_resources(what, resources(pattern), text, want);
+}
+
+void check_split_sequence() {
+    using Json = nlohmann::json;
+    auto assets = resources(kUpToThreeDigits);
+    auto root = Json::parse(assets.tokenizer_json);
+    auto& stages = root["pre_tokenizer"]["pretokenizers"];
+    std::string pattern = stages[0]["pattern"]["Regex"];
+    pattern.replace(pattern.find("{1,3}"), 5, "+");
+    stages[0]["pattern"]["Regex"] = pattern;
+    stages.insert(stages.begin(), Json{{"type", "Split"}, {"pattern", {{"Regex", R"(\p{N}{1,3})"}}},
+                                      {"behavior", "Isolated"}, {"invert", false}});
+    root["model"]["vocab"]["Ġ"] = 7;
+    root["model"]["vocab"]["ĠĠ"] = 8;
+    root["model"]["merges"].push_back("Ġ Ġ");
+    root["normalizer"] = nullptr;
+    assets.tokenizer_json = root.dump();
+    // Isolating numbers first leaves the preceding spaces as one trailing-space piece.
+    expect_resources("ordered splits preserve spaces and digit groups", assets, "  1734", {8, 6, 1, 2});
+    // A direct vocabulary hit bypasses merges only when the checkpoint requests it.
+    root["model"]["vocab"]["134"] = 9;
+    assets.tokenizer_json = root.dump();
+    expect_resources("declared merges", assets, "134", {0, 5});
+    root["model"]["ignore_merges"] = true;
+    assets.tokenizer_json = root.dump();
+    expect_resources("ignore merges", assets, "134", {9});
+    // An absent normalizer must preserve decomposed text before byte encoding.
+    root["model"]["vocab"]["e"] = 10;
+    root["model"]["vocab"]["Ì"] = 11;
+    root["model"]["vocab"]["ģ"] = 12;
+    assets.tokenizer_json = root.dump();
+    expect_resources("identity normalization", assets, "e\u0301", {10, 11, 12});
+}
+
 } // namespace
 
 int main() {
+    check_split_sequence();
     // `17`: one word of two digits merges to the vocabulary's `17`; two words of one digit
     // cannot, whatever merges exist, because a merge never crosses a word boundary.
     expect("17 with \\p{N}{1,3}", kUpToThreeDigits, "17", {6});

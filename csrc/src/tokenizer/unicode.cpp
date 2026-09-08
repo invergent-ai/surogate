@@ -337,7 +337,8 @@ static std::vector<size_t> unicode_regex_split_custom_gpt2(const std::string& te
 
 // LLAMA3 system regex: "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string& text,
-                                                             const std::vector<size_t>& offsets) {
+                                                             const std::vector<size_t>& offsets,
+                                                             size_t max_digits = 3) {
     std::vector<size_t> bpe_offsets;      // store the offset of each word
     bpe_offsets.reserve(offsets.size());  // Reserve memory for the approximate size
 
@@ -414,7 +415,7 @@ static std::vector<size_t> unicode_regex_split_custom_llama3(const std::string& 
             if (flags.is_number) {
                 size_t ini = pos;
                 while (_get_flags(pos).is_number) {
-                    if (++pos - ini >= 3) {
+                    if (++pos - ini >= max_digits) {
                         _add_token(pos);
                         ini = pos;
                     }
@@ -1142,6 +1143,13 @@ unicode_regex_split_custom(const std::string& text, const std::string& regex_exp
                regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|"
                              "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
         bpe_offsets = unicode_regex_split_custom_llama3(text, offsets);
+    } else if (regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}+| "
+                             "?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
+               regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|"
+                             "\\p{N}+| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        // MiniCPM5 isolates digit groups in an earlier Split stage. This stage
+        // permits an unlimited run and must preserve those earlier boundaries.
+        bpe_offsets = unicode_regex_split_custom_llama3(text, offsets, text.size() + 1);
     } else if (regex_expr == "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| "
                              "?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" ||
                regex_expr == "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|"

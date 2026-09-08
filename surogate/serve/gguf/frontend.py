@@ -24,9 +24,14 @@ _NORMAL, _UNKNOWN, _CONTROL, _USER_DEFINED, _UNUSED, _BYTE = 1, 2, 3, 4, 5, 6
 
 # Pre-tokenizer split regexes, keyed by tokenizer.ggml.pre. Values are the
 # ORIGINAL tokenizer.json patterns, taken from llama.cpp's llama-vocab.cpp
-# comments (study/llama.cpp/src/llama-vocab.cpp) — llama.cpp preserves the
+# comments (study/llama.cpp-master/src/llama-vocab.cpp) — llama.cpp preserves the
 # upstream regex verbatim in a comment above its own case-folded rewrite.
+# A tuple preserves the order of multiple Split stages in tokenizer.json.
 _PRE_SPLIT_REGEX = {
+    "minicpm5": (
+        r"\p{N}{1,3}",
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    ),
     "lfm2": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
     # GLM groups decimal digits in threes (llama.cpp's CHATGLM4 pre-tokenizer).
     "glm4": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
@@ -197,17 +202,18 @@ def extract_tokenizer_json(reader) -> dict:
     types: list[int] = list(_field(reader, "tokenizer.ggml.token_type"))
     merges: list[str] = list(_field(reader, "tokenizer.ggml.merges"))
 
-    # Qwen-style added tokens follow the base vocabulary. LFM2 instead marks tokens already
+    # Qwen-style added tokens follow the base vocabulary. LFM2 and MiniCPM5 mark tokens already
     # inside model.vocab as special, preserving their existing IDs. Drop only trailing GGUF
     # padding in that case; a control token at ID zero must not erase the base vocabulary.
     added_ids = sorted(i for i in range(len(tokens)) if types[i] in (_CONTROL, _USER_DEFINED))
-    if pre == "lfm2":
+    overlapping_added_tokens = pre in ("lfm2", "minicpm5")
+    if overlapping_added_tokens:
         base = len(tokens)
         while base and types[base - 1] == _UNUSED:
             base -= 1
     else:
         base = min(added_ids) if added_ids else len(tokens)
-    if pre != "lfm2" and added_ids and added_ids != list(range(base, base + len(added_ids))):
+    if not overlapping_added_tokens and added_ids and added_ids != list(range(base, base + len(added_ids))):
         raise SystemExit(
             "surogate serve: GGUF added tokens are not contiguous after the base "
             "vocab; cannot reconstruct an HF tokenizer faithfully."
@@ -231,16 +237,18 @@ def extract_tokenizer_json(reader) -> dict:
         "truncation": None,
         "padding": None,
         "added_tokens": added,
-        "normalizer": None if pre == "lfm2" else {"type": "NFC"},
+        "normalizer": None if overlapping_added_tokens else {"type": "NFC"},
         "pre_tokenizer": {
             "type": "Sequence",
             "pretokenizers": [
                 {
                     "type": "Split",
-                    "pattern": {"Regex": split_regex},
+                    "pattern": {"Regex": pattern},
                     "behavior": "Isolated",
                     "invert": False,
-                },
+                }
+                for pattern in ((split_regex,) if isinstance(split_regex, str) else split_regex)
+            ] + [
                 {
                     "type": "ByteLevel",
                     "add_prefix_space": False,
@@ -264,7 +272,7 @@ def extract_tokenizer_json(reader) -> dict:
             "end_of_word_suffix": "",
             "fuse_unk": False,
             "byte_fallback": False,
-            "ignore_merges": False,
+            "ignore_merges": pre == "minicpm5",
             "vocab": vocab,
             "merges": merges,
         },
@@ -389,6 +397,12 @@ def extract_generation_config(reader) -> dict:
     # It ends an assistant turn, just as the EOS token ends a sequence.
     if _field(reader, "general.architecture") == "gemma3" and "<end_of_turn>" in tokens:
         end_of_turn = tokens.index("<end_of_turn>")
+        if end_of_turn not in stops:
+            stops.append(end_of_turn)
+    # MiniCPM5 exports omit eot_token_id, but retain the ChatML turn terminator.
+    # Resolve its ID from the vocabulary; no checkpoint-specific numeric ID is assumed.
+    if _field(reader, "tokenizer.ggml.pre") == "minicpm5" and "<|im_end|>" in tokens:
+        end_of_turn = tokens.index("<|im_end|>")
         if end_of_turn not in stops:
             stops.append(end_of_turn)
     if not stops:

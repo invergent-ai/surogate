@@ -79,6 +79,21 @@ void refuses(const char* label, std::string_view chat_template_member, std::stri
 } // namespace
 
 int main() {
+    for (const std::string_view prefix : {"null", "false", "true"}) {
+        auto assets = resources("{\"pad_token\":\"</s>\",\"add_prefix_space\":" +
+                                std::string(prefix) + "}");
+        assets.tokenizer_json = R"({"model":{"type":"BPE","byte_fallback":false}})";
+        bool rejected = false;
+        try {
+            sinfer::family::FrontendTestAccess::check_tokenizer_config(assets);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        if (rejected != (prefix == "true")) {
+            std::cerr << "incorrect handling of add_prefix_space: " << prefix << '\n';
+            ++failures;
+        }
+    }
     // The two forms a checkpoint may state, and the one it may omit.
     accepts("string, equal", R"("chat_template":"{{ messages }}")");
     accepts("absent", "");

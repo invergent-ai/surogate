@@ -2,6 +2,7 @@
 // The project tokenizer, shared with training. Included by path because this
 // file is itself a tokenizer.h and would otherwise find itself.
 #include "tokenizer/tokenizer.h"
+#include "tokenizer/unicode.h"
 
 #include "text/unicode.h"
 
@@ -611,6 +612,8 @@ void append_symbol_id(std::vector<int>& ids,
 
 void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_merges,
                     std::size_t max_digit_run,
+                    const std::vector<std::string>& split_patterns, bool normalize_nfc,
+                    bool ignore_merges,
                     const std::unordered_map<std::string, int>& merge_ranks,
                     const std::unordered_map<std::string, int>& token_to_id) {
     if (text.empty()) { return; }
@@ -619,9 +622,25 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
             "Tokenizer::encode ordinary BPE text requires embedded merges.txt");
     }
 
-    const std::string normalized = uni::normalize_nfc(text);
-    for (const std::string_view word : split_words(normalized, max_digit_run)) {
-        std::vector<std::string> symbols = byte_level_symbols(byte_level_encode(word));
+    const std::string normalized = normalize_nfc ? uni::normalize_nfc(text) : std::string(text);
+    std::vector<std::string> words;
+    if (!split_patterns.empty()) {
+        // The shared splitter applies every regex in order and returns byte-encoded pieces.
+        words = unicode_regex_split(normalized, split_patterns);
+    } else {
+        for (const auto word : split_words(normalized, max_digit_run)) {
+            words.push_back(byte_level_encode(word));
+        }
+    }
+    for (const std::string& word : words) {
+        if (ignore_merges) {
+            const auto found = token_to_id.find(word);
+            if (found != token_to_id.end()) {
+                ids.push_back(found->second);
+                continue;
+            }
+        }
+        std::vector<std::string> symbols = byte_level_symbols(word);
         while (symbols.size() > 1) {
             int best_rank              = std::numeric_limits<int>::max();
             std::size_t best_pair_left = symbols.size();
@@ -716,6 +735,29 @@ std::size_t declared_digit_run(const Json& root, std::string_view label) {
     return run;
 }
 
+std::vector<std::string> declared_split_sequence(const Json& root) {
+    std::vector<std::string> patterns;
+    if (!root.contains("pre_tokenizer") || !root.at("pre_tokenizer").is_object()) {
+        return patterns;
+    }
+    const auto& pre = root.at("pre_tokenizer");
+    if (pre.value("type", "") != "Sequence" || !pre.contains("pretokenizers")) {
+        return patterns;
+    }
+    for (const auto& item : pre.at("pretokenizers")) {
+        if (item.value("type", "") == "Split" && item.contains("pattern") &&
+            item.at("pattern").contains("Regex")) {
+            if (item.value("behavior", "") != "Isolated" || item.value("invert", false)) {
+                throw std::invalid_argument("BPE Split stages must use Isolated behavior");
+            }
+            patterns.push_back(item.at("pattern").at("Regex").get<std::string>());
+        }
+    }
+    // Keep the existing fast splitter for single-stage tokenizers.
+    if (patterns.size() < 2) { patterns.clear(); }
+    return patterns;
+}
+
 } // namespace
 
 Tokenizer::Tokenizer(Tokenizer&&) noexcept         = default;
@@ -733,6 +775,9 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         read_json_asset(resources.tokenizer_config_json, tokenizer_config_label);
     max_digit_run_    = declared_digit_run(root, tokenizer_label);
     const Json& model = require_object_field(root, "model", tokenizer_label);
+    ignore_merges_ = model.value("ignore_merges", false);
+    split_patterns_ = declared_split_sequence(root);
+    normalize_nfc_ = root.contains("normalizer") && !root.at("normalizer").is_null();
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
     id_to_token_                 = std::move(vocab_metadata.id_to_token);
@@ -821,7 +866,8 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     }
     if (!options.parse_added_tokens) {
         std::vector<int> ids;
-        append_bpe_ids(ids, text, has_bpe_merges_, max_digit_run_, bpe_merge_ranks_,
+        append_bpe_ids(ids, text, has_bpe_merges_, max_digit_run_,
+                       split_patterns_, normalize_nfc_, ignore_merges_, bpe_merge_ranks_,
                        vocab_token_to_id_);
         return ids;
     }
@@ -849,6 +895,7 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         if (pos > ordinary_begin) {
             append_bpe_ids(ids, text.substr(ordinary_begin, pos - ordinary_begin), has_bpe_merges_,
                            max_digit_run_,
+                           split_patterns_, normalize_nfc_, ignore_merges_,
                            bpe_merge_ranks_, vocab_token_to_id_);
         }
 
@@ -858,6 +905,7 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     }
     if (ordinary_begin < text.size()) {
         append_bpe_ids(ids, text.substr(ordinary_begin), has_bpe_merges_, max_digit_run_,
+                       split_patterns_, normalize_nfc_, ignore_merges_,
                        bpe_merge_ranks_,
                        vocab_token_to_id_);
     }

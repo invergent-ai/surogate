@@ -81,16 +81,15 @@ _REQUIRED_CONFIG = {
     "architectures": ["LlamaForCausalLM"],
     "model_type": "llama",
     "hidden_act": "silu",
-    "attention_bias": False,
     "rope_scaling": None,
 }
 
 #: Members that only some exporter versions write, with the value an absent key
-#: asserts. `mlp_bias` was added to the Llama config after this checkpoint was
-#: exported and defaults to false; `pretraining_tp` above 1 makes Hugging Face
+#: asserts. Both projection biases default to false; `pretraining_tp` above 1 makes Hugging Face
 #: split the projections into shards that this fused recipe does not reproduce,
 #: so a checkpoint that declares it is refused rather than silently mis-fused.
 _OPTIONAL_CONFIG = {
+    "attention_bias": False,
     "mlp_bias": False,
     "pretraining_tp": 1,
 }
@@ -149,7 +148,7 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
         )
         if name in config
     }
-    # Recorded as derived, because the file does not carry it.
+    # Preserve an explicit width; older configs derive it from hidden size and heads.
     text["head_dim"] = geometry.head_dim
     text["mlp_bias"] = bool(config.get("mlp_bias", False))
     summary = {
