@@ -16,19 +16,31 @@ jobs:
     strategy:
       matrix:
         include:
+          # `archs` is the *trainer's* architecture set (CUDAARCHS). The serve engine has its
+          # own, `SUROGATE_SERVE_CUDA_ARCHS`, defaulting to the RTX line it is built for --
+          # sm_89 and sm_120a, one binary for the 4090, the 5090 and the RTX PRO 6000. It is
+          # left at its default here and checked in the wheel afterwards; restating it in the
+          # workflow would only be a second place to be wrong.
+          #
+          # `serve` says whether this toolkit can build the engine at all: it needs CUDA 13.1,
+          # so the two older wheels are trainer-only and say so rather than dropping the engine
+          # quietly (SUROGATE_REQUIRE_SERVE turns a missing engine into a failed build).
           - cuda_version: "12.8"
             cuda_build_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu128"
             # sm_103 (Blackwell Ultra) needs CUDA 12.9+, so it is absent here.
             archs: "89;90a;100a;120a"
+            serve: false
           - cuda_version: "12.9"
             cuda_build_image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu129"
             archs: "89;90a;100a;103a;120a"
+            serve: false
           - cuda_version: "13.1"
             cuda_build_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu130"
             archs: "89;90a;100a;103a;120a"
+            serve: true
     env:
       CMAKE_GENERATOR: Ninja
       CMAKE_C_COMPILER: gcc-13
@@ -38,6 +50,9 @@ jobs:
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
       CMAKE_BUILD_PARALLEL_LEVEL: 8
       CUDAARCHS: ${{ matrix.archs }}
+      # pyproject asks for the engine unconditionally; a toolkit older than 13.1 cannot give it
+      # one, and that is a fact about the toolkit rather than a broken build host.
+      SKBUILD_CMAKE_DEFINE: SUROGATE_REQUIRE_SERVE=${{ matrix.serve && 'ON' || 'OFF' }}
       UV_NO_SYNC: 1
       CCACHE_DIR: /ccache
       CCACHE_MAXSIZE: 10G
@@ -100,6 +115,34 @@ jobs:
           mv repaired/*.whl wheelhouse/
           rm -f wheelhouse/*linux_x86_64*.whl
           ls -lh wheelhouse/
+
+      # An install-rule or component mistake produces a wheel that builds, installs, imports --
+      # and has no engine in it. The only way to know is to look inside the artifact.
+      - name: The wheel carries the engine, for both architectures
+        if: matrix.serve
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/wheel-check && mkdir -p /tmp/wheel-check
+          python3 -m zipfile -e wheelhouse/*.whl /tmp/wheel-check
+          for f in surogate/serve/_bin/surogate-engine \
+                   surogate/serve/_bin/surogate-engine-cli \
+                   surogate/serve/_bin/surogate-embed \
+                   surogate/libsinfer.so \
+                   surogate/serve/_llama_cpp/bin/llama-quantize; do
+            if [ ! -f "/tmp/wheel-check/$f" ]; then
+              echo "::error::the wheel is missing $f"
+              exit 1
+            fi
+          done
+          cuobjdump -lelf /tmp/wheel-check/surogate/libsinfer.so \
+            | grep -oE 'sm_[0-9]+a?' | sort | uniq -c | tee /tmp/wheel-cubins.txt
+          for arch in sm_89 sm_120a; do
+            if ! grep -q "$arch" /tmp/wheel-cubins.txt; then
+              echo "::error::the wheel's engine has no $arch cubins — it does not serve the whole RTX line"
+              exit 1
+            fi
+          done
+          rm -rf /tmp/wheel-check
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4

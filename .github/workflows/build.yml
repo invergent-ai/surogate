@@ -1,4 +1,15 @@
 name: Build
+
+# The engine gate. It builds the one binary the RTX line ships -- sm_89 for the 4090, sm_120a
+# for the 5090 and the RTX PRO 6000 -- and checks the result carries both, which is the property
+# a single binary is easy to lose silently: a kernel family pinned to one architecture, or a
+# build flag that quietly drops the other, still links and still passes every test on the
+# machine that built it.
+#
+# Self-hosted, because it has to be: this tree is ~300 CUDA translation units over CUTLASS, and
+# the CUDA 13.1 toolkit the serve engine requires. A GitHub-hosted runner has neither the disk
+# for the fatbin nor the time.
+
 on:
   workflow_dispatch:
   push:
@@ -10,44 +21,83 @@ on:
       - main
 
 jobs:
-  build:
-    name: Build wheel (${{ matrix.compiler.name }})
-    runs-on: ubuntu-24.04
+  engine:
+    name: Engine (sm_89 + sm_120a)
+    runs-on: self-hosted
     container:
-      image: nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
-    strategy:
-      matrix:
-        compiler:
-          - name: gcc
-            cc: gcc-13
-            cxx: g++-13
-            packages: gcc-13 g++-13
+      image: nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04
+      options: -v /var/cache/surogate-ccache/engine:/ccache
     env:
       CMAKE_GENERATOR: Ninja
-      CMAKE_C_COMPILER: ${{ matrix.compiler.cc }}
-      CMAKE_CXX_COMPILER: ${{ matrix.compiler.cxx }}
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CMAKE_CUDA_COMPILER_LAUNCHER: ccache
-      CUDAARCHS: "80;86;89;90;100a;120a"
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 20G
+      CCACHE_CUDA_PATHS: /usr/local/cuda
+      # The runner is a working machine. Leave it cores.
+      PARALLEL_JOBS: 16
+
     steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            git build-essential cmake ninja-build ccache python3-dev pkg-config \
+            libdw-dev libelf-dev libnuma-dev libcurl4-openssl-dev libssl-dev \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+            libnccl2 libnccl-dev
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Install deps
-        run: apt update && apt install -y git wget build-essential cmake ninja-build git python3-dev ccache ${{ matrix.compiler.packages }} libopenmpi-dev
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v7
+      - name: Setup ccache
+        run: |
+          mkdir -p /ccache
+          ccache --max-size=20G
+          ccache --zero-stats
 
-      - name: Build wheel
-        run: uv build --wheel
+      # Not `make serve-build`: that copies the module into a virtualenv this container has no
+      # reason to own. The targets are the products themselves.
+      - name: Configure
+        run: |
+          cmake -S csrc -B csrc/build-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSUROGATE_REQUIRE_SERVE=ON \
+            -DPYTHON_BINDING=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-      - name: Upload wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-${{ matrix.compiler.name }}
-          path: dist/*.whl
+      - name: Build the engine
+        run: cmake --build csrc/build-ci --parallel "${PARALLEL_JOBS}" --target surogate-engine surogate-engine-cli surogate-embed
+
+      - name: Show ccache stats
+        run: ccache --show-stats
+
+      # The point of the gate. `cuobjdump -lelf` lists every cubin in the library; both
+      # architectures must be there, and the Blackwell-only families (NVFP4 W4A4, the TMA
+      # kernels, the TRT-LLM MoE runner) are why the counts differ rather than match.
+      - name: The binary carries both architectures
+        run: |
+          set -euo pipefail
+          lib=csrc/build-ci/libsinfer.so
+          test -f "$lib"
+          cuobjdump -lelf "$lib" | grep -oE 'sm_[0-9]+a?' | sort | uniq -c | tee /tmp/cubins.txt
+          ada=$(grep -c 'sm_89'    /tmp/cubins.txt || true)
+          bw=$(grep -c 'sm_120a'   /tmp/cubins.txt || true)
+          if [ "$ada" -eq 0 ] || [ "$bw" -eq 0 ]; then
+            echo "::error::libsinfer.so is missing an architecture — the RTX line needs sm_89 and sm_120a"
+            exit 1
+          fi
+
+      - name: The products run
+        run: |
+          set -euo pipefail
+          for binary in surogate-engine surogate-engine-cli; do
+            csrc/build-ci/"$binary" --help > /dev/null
+          done
+          echo "engine, cli and embed link and start"

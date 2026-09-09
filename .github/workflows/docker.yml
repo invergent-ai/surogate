@@ -31,12 +31,18 @@ jobs:
         include:
           # Keep this matrix in step with the wheel matrix in wheel.yml —
           # each image installs the wheel built for the matching CUDA tag.
+          #
+          # `serve` mirrors that matrix too: the engine needs CUDA 13.1, so only the cu130 image
+          # has one, and only it is worth asking whether `surogate serve` can find its binary.
           - wheel_tag: "cu128"
             dockerfile: "Dockerfile.cu128"
+            serve: false
           - wheel_tag: "cu129"
             dockerfile: "Dockerfile.cu129"
+            serve: false
           - wheel_tag: "cu130"
             dockerfile: "Dockerfile.cu130"
+            serve: true
 
     steps:
       - name: Check if this CUDA version should be built
@@ -115,3 +121,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.wheel_tag }}
           cache-to: type=gha,mode=max,scope=${{ matrix.wheel_tag }}
+
+      # The image is the last place the packaging can go wrong, and the first place a user
+      # meets it: `surogate serve` execs a binary it has to find under the installed package.
+      # This asks the installed CLI the same question it asks itself, without a GPU.
+      - name: "`surogate serve` finds its engine in the image"
+        if: steps.should_build.outputs.build == 'true' && matrix.serve
+        run: |
+          set -euo pipefail
+          image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}"
+          docker run --rm --entrypoint python3 "$image" -c '
+          import sys
+          from surogate.cli.serve import _resolve_binary
+          missing = [m for m in ("server", "generate", "embed") if _resolve_binary(m) is None]
+          if missing:
+              sys.exit("surogate serve cannot find its binary for: " + ", ".join(missing))
+          print("engine resolved:", _resolve_binary("server"))
+          '
