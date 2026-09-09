@@ -159,6 +159,16 @@ def ple_table_spec(g: Geometry) -> TensorSpec:
 
 
 def build_vision_specs(g: Geometry, *, vision_storage: str = VISION_BF16) -> tuple[TensorSpec, ...]:
+    """The tower this checkpoint declares, at the width the export profile chooses.
+
+    Nothing this converter writes reaches here: its source is a GGUF, every published
+    export of this model drops the tower, and `convert` refuses one that carries it rather
+    than emitting a silent text-only artifact -- so both conversion paths ask for
+    `vision=False`. What does reach here is the declaration side, which is not nothing: the
+    inventory validator, the repack probe and the serve contract all build these specs, and
+    the contract compares their widths against what the model declares. `vision_storage` is
+    the knob that comparison is about.
+    """
     tower = vision_tower(g)
     return _vision_specs(g.hidden, storage=vision_storage, **tower) if tower else ()
 

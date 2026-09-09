@@ -22,5 +22,16 @@ deepstack indexes and produce none. This one also compares the planes to *each o
 three planes that were accidentally the same tensor pass every per-plane check, since each
 would then be compared against a copy of the right answer.
 
-Measured on Qwen3-VL-2B-Instruct, BF16 tower storage, random patches at three grid sizes:
-worst cosine 0.9916 (the merged plane), deepstack planes 0.9985–0.9999.
+Measured on Qwen3-VL-2B-Instruct, random patches at three grid sizes, both storages:
+
+| tower storage | artifact | worst cosine | deepstack planes |
+| --- | --- | --- | --- |
+| `bf16` (default) | 2.91 GB | 0.9916 | 0.9985–0.9999 |
+| `quantized` | 2.60 GB | 0.9942 | 0.9984–0.9999 |
+
+The quantized tower is not the less accurate of the two here, which is worth stating
+plainly: on this model the spread between grid sizes (0.9916–0.9983 for BF16 alone) is
+wider than the gap between the two storages, so these numbers do not show quantisation
+costing anything. They also do not reproduce the gap seen on the Qwen3.5-0.8B, whose
+quantized tower fell to 0.84–0.93 — a smaller tower, and 105 of its projections narrowed
+rather than 6.
