@@ -123,18 +123,40 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.wheel_tag }}
 
       # The image is the last place the packaging can go wrong, and the first place a user
-      # meets it: `surogate serve` execs a binary it has to find under the installed package.
-      # This asks the installed CLI the same question it asks itself, without a GPU.
-      - name: "`surogate serve` finds its engine in the image"
+      # meets it. Two questions, and neither answers the other.
+      #
+      # `_resolve_binary` is how `surogate serve` decides what to exec, but it only asks whether
+      # a file is there -- so it passes on a binary that cannot start, which is exactly what this
+      # image shipped: the engine links FFmpeg and libnuma, and nothing installed them. `ldd`
+      # asks the other half, whether the image carries what the binary loads, and it needs no GPU.
+      #
+      # libcuda.so.1 is the driver. The container runtime injects it under `--gpus`, so it is
+      # absent here by design and is the one permitted miss. Everything else that resolves here
+      # -- libcudart and libcublasLt out of the pip CUDA wheels included -- is a live check on
+      # the ld.so.conf.d paths written above, which is the other thing that has no test.
+      - name: The engine is whole in the image
         if: steps.should_build.outputs.build == 'true' && matrix.serve
         run: |
           set -euo pipefail
           image="ghcr.io/invergent-ai/surogate:${{ steps.version.outputs.version }}-${{ matrix.wheel_tag }}"
-          docker run --rm --entrypoint python3 "$image" -c '
-          import sys
+          docker run --rm -i --entrypoint python3 "$image" - <<'PY'
+          import subprocess, sys
           from surogate.cli.serve import _resolve_binary
-          missing = [m for m in ("server", "generate", "embed") if _resolve_binary(m) is None]
-          if missing:
-              sys.exit("surogate serve cannot find its binary for: " + ", ".join(missing))
-          print("engine resolved:", _resolve_binary("server"))
-          '
+
+          DRIVER = "libcuda.so.1"
+          problems = []
+          for mode in ("server", "generate", "embed"):
+              path = _resolve_binary(mode)
+              if path is None:
+                  problems.append(f"{mode}: surogate serve cannot find a binary to exec")
+                  continue
+              ldd = subprocess.run(["ldd", path], capture_output=True, text=True).stdout
+              missing = [ln.split("=>")[0].strip() for ln in ldd.splitlines()
+                         if "not found" in ln and DRIVER not in ln]
+              if missing:
+                  problems.append(f"{mode}: {path} cannot load " + ", ".join(missing))
+              else:
+                  print(f"ok: {mode} -> {path}")
+          if problems:
+              sys.exit("::error::" + "; ".join(problems))
+          PY
