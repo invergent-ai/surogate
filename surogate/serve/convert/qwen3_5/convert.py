@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, replace
-import hashlib
 import json
 from pathlib import Path
 import os
@@ -33,7 +32,6 @@ from surogate.serve.convert.common.gguf_repack import (
 from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
-from surogate.serve.convert.common.checkpoint import tokenizer_domain
 from surogate.serve.convert.common import qwen3_5 as checkpoint
 
 from . import draft_head, inventory, recipe

@@ -11,13 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
-from surogate.serve.convert.common import declaration
 from surogate.serve.convert.common.inventory import (
     tied_duplicate_objects,
     BF16,
     BLOCK_SCALE_LAYOUT,
     CONTIGUOUS_LAYOUT,
-    DIRECT_FORMATS,
     FORMAT_NAMES,
     FP8,
     FP32,
@@ -29,7 +27,6 @@ from surogate.serve.convert.common.inventory import (
     Q4,
     Q5,
     Q6,
-    RESOURCE_ENCODING,
     RESOURCE_SPECS,
     ROW_SCALE_LAYOUT,
     ROW_SPLIT_LAYOUT,
@@ -37,7 +34,6 @@ from surogate.serve.convert.common.inventory import (
     StoredObjectSpec,
     TensorSpec,
     VISION_BF16,
-    VISION_QUANTIZED,
     VISION_STORAGE,
     W8,
     build_vision_specs as _family_vision_specs,

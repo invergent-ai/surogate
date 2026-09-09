@@ -293,16 +293,3 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
         response.raise_for_status()
 
     await asyncio.gather(*[_load_lora_adapter(admin_client) for admin_client in admin_clients])
-
-
-async def unload_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) -> None:
-    """Ask the inference server to unload a LoRA adapter."""
-
-    async def _unload_lora_adapter(admin_client: AsyncClient) -> None:
-        logger.debug(f"Sending request to unload LoRA adapter {lora_name}")
-        await admin_client.post("/v1/unload_lora_adapter", json={"lora_name": lora_name})
-        # TODO: The first one can fail, but subsequent ones should succeed.
-        # response.raise_for_status()
-
-    await asyncio.gather(*[_unload_lora_adapter(admin_client) for admin_client in admin_clients])
-
