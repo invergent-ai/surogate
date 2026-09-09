@@ -80,10 +80,27 @@ def resolve_model_path() -> Path:
     return None
 
 
+def _mini_model_is_complete() -> bool:
+    """A cached mini model counts only if its weights are there and resolve."""
+    if not (MINI_MODEL_DIR / "config.json").is_file():
+        return False
+    single = MINI_MODEL_DIR / "model.safetensors"
+    index = MINI_MODEL_DIR / "model.safetensors.index.json"
+    if index.is_file():
+        shards = json.loads(index.read_text()).get("weight_map", {}).values()
+        return all((MINI_MODEL_DIR / shard).exists() for shard in set(shards))
+    return single.exists()  # follows the symlink: a dangling one is not a cache
+
+
 def prepare_mini_model(snapshot_dir: Path) -> Path:
     """Create a truncated Qwen3 model with NUM_LAYERS layers."""
-    if MINI_MODEL_DIR.exists():
+    if _mini_model_is_complete():
         return MINI_MODEL_DIR
+    # A directory without weights is a build that died partway -- an interrupted run, a
+    # full disk. Kept, it fails every later run with "no file named model.safetensors" and
+    # looks like a broken test rather than a broken cache, so it is rebuilt instead.
+    if MINI_MODEL_DIR.exists():
+        shutil.rmtree(MINI_MODEL_DIR)
     MINI_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     config = json.loads((snapshot_dir / "config.json").read_text())

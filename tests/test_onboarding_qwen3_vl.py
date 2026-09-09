@@ -81,10 +81,27 @@ def resolve_model_path() -> Path:
     return None
 
 
+def _mini_model_is_complete() -> bool:
+    """A cached mini model counts only if its weights are there and resolve."""
+    if not (MINI_MODEL_DIR / "config.json").is_file():
+        return False
+    single = MINI_MODEL_DIR / "model.safetensors"
+    index = MINI_MODEL_DIR / "model.safetensors.index.json"
+    if index.is_file():
+        shards = json.loads(index.read_text()).get("weight_map", {}).values()
+        return all((MINI_MODEL_DIR / shard).exists() for shard in set(shards))
+    return single.exists()  # follows the symlink: a dangling one is not a cache
+
+
 def prepare_mini_model(snapshot_dir: Path) -> Path:
     """Create a truncated Qwen3-VL model with NUM_LAYERS text layers."""
-    if MINI_MODEL_DIR.exists():
+    if _mini_model_is_complete():
         return MINI_MODEL_DIR
+    # A directory without weights is a build that died partway -- an interrupted run, a
+    # full disk. Kept, it fails every later run with "no file named model.safetensors" and
+    # looks like a broken test rather than a broken cache, so it is rebuilt instead.
+    if MINI_MODEL_DIR.exists():
+        shutil.rmtree(MINI_MODEL_DIR)
     MINI_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     config = json.loads((snapshot_dir / "config.json").read_text())
@@ -172,6 +189,19 @@ def make_inputs(vocab_size: int) -> dict[str, np.ndarray]:
     return {"inputs": inputs, "targets": targets}
 
 
+def vision_tower(model):
+    """The tower, wherever this transformers version keeps it.
+
+    Qwen3-VL used to hang `visual` off the top-level model and now hangs it off `.model`,
+    beside `language_model`. Reaching for the old place raises `AttributeError` at fixture
+    setup, which reads as four broken tests rather than one moved attribute.
+    """
+    for owner in (model, getattr(model, "model", None)):
+        if owner is not None and hasattr(owner, "visual"):
+            return owner.visual
+    raise AttributeError(f"{type(model).__name__} exposes no vision tower")
+
+
 def build_multimodal_payload(model, tokenizer) -> tuple[dict[str, np.ndarray], dict[str, torch.Tensor]]:
     device = next(model.parameters()).device
     config = model.config
@@ -182,8 +212,9 @@ def build_multimodal_payload(model, tokenizer) -> tuple[dict[str, np.ndarray], d
     if eos_id is None:
         eos_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
-    patch_size = model.visual.patch_size
-    merge = model.visual.spatial_merge_size
+    tower = vision_tower(model)
+    patch_size = tower.patch_size
+    merge = tower.spatial_merge_size
     grid_h = IMAGE_SIZE // patch_size
     grid_w = IMAGE_SIZE // patch_size
     image_grid_thw = torch.tensor([[1, grid_h, grid_w]], device=device, dtype=torch.long)
@@ -206,10 +237,13 @@ def build_multimodal_payload(model, tokenizer) -> tuple[dict[str, np.ndarray], d
     n_patches = grid_h * grid_w  # spatial patches (temporal already folded in grid)
     pixel_values = torch.zeros((n_patches, 3, temporal_ps, patch_size, patch_size), dtype=torch.float32, device=device)
     with torch.no_grad():
-        image_embeds, deepstack_image_embeds = model.get_image_features(pixel_values, image_grid_thw=image_grid_thw)
-    image_embeds = image_embeds[0]
+        vision_output = model.get_image_features(pixel_values, image_grid_thw=image_grid_thw)
+    # Read the planes by name. As a tuple this carries three fields now, not two, and
+    # unpacking positionally broke the moment `last_hidden_state` joined them.
+    image_embeds = vision_output.pooler_output[0]
+    deepstack_image_embeds = vision_output.deepstack_features
 
-    expected_layers = len(getattr(model.visual, "deepstack_visual_indexes", []))
+    expected_layers = len(getattr(tower, "deepstack_visual_indexes", []))
     if expected_layers and len(deepstack_image_embeds) != expected_layers:
         raise ValueError(f"deepstack layers mismatch: expected {expected_layers}, got {len(deepstack_image_embeds)}")
 
@@ -218,9 +252,13 @@ def build_multimodal_payload(model, tokenizer) -> tuple[dict[str, np.ndarray], d
     if num_visual_actual != image_embeds.shape[0]:
         raise ValueError(f"visual token mismatch: mask has {num_visual_actual}, embeds have {image_embeds.shape[0]}")
 
+    # MRoPE needs to be told which positions are visual; it no longer infers it from the
+    # token ids. Text is 0 and image is 1, the codes the processor writes.
+    mm_token_type_ids = (input_ids == image_token_id).to(torch.int32)
     rope_fn = model.get_rope_index if hasattr(model, "get_rope_index") else model.model.get_rope_index
     position_ids, _ = rope_fn(
         input_ids,
+        mm_token_type_ids,
         image_grid_thw=image_grid_thw,
         attention_mask=attention_mask,
     )
@@ -254,6 +292,7 @@ def build_multimodal_payload(model, tokenizer) -> tuple[dict[str, np.ndarray], d
         "attention_mask": attention_mask,
         "pixel_values": pixel_values,
         "image_grid_thw": image_grid_thw,
+        "mm_token_type_ids": mm_token_type_ids,
     }
     return payload, hf_inputs
 
@@ -400,6 +439,7 @@ def run_hf_forward_multimodal(model_dir: Path) -> tuple[dict[str, np.ndarray], d
             attention_mask=hf_inputs["attention_mask"],
             pixel_values=hf_inputs["pixel_values"],
             image_grid_thw=hf_inputs["image_grid_thw"],
+            mm_token_type_ids=hf_inputs["mm_token_type_ids"],
             use_cache=False,
         )
 
