@@ -61,6 +61,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
+                       static_cast<std::uint32_t>(options.pipeline_stage_first));
     const family::StartupFeatures features = family::startup_features(options);
     if (features.vision) {
         throw std::runtime_error("qwen3.8-flash-next: vision is not served by this target");
@@ -109,7 +111,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
     // What the pool will insist on where experts are banked, for a stage planner deciding how
     // much to offload; zero otherwise, set on every plan.
     family::ExpertCache::configure_pool_floor(
-        options.host_moe_layers != 0 || options.gpu_layers != 0
+        std::any_of(plan.bindings.host_bank.objects.begin(), plan.bindings.host_bank.objects.end(),
+            [](const auto& object) { return object.name.ends_with("/routed_gate_up"); })
             ? family::ExpertCache::pool_floor_bytes(detail::moe_geometry(plan.bindings.geometry),
                                                     plan.bindings.geometry.layers + plan.bindings.geometry.mtp_layers,
                                                     options.expert_slots)
@@ -158,6 +161,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     // plus the automatic headroom, or the engine refuses to start once it asks for it.
     auto planner = family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
                                                                  geometry, vision_geometry);
+    if (options.offload_planning_only) { return planner; }
     // The runtime's floor and the load's staging are never resident together, so the
     // pool leaves room for the larger, on top of the weights.
     const std::size_t runtime_floor =

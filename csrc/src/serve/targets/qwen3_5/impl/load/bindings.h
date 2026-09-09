@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/load/host_bank.h"
+
 #include <api/targets/qwen3_5/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
@@ -140,6 +142,7 @@ struct MtpPlan {
 };
 
 struct BindingPlan {
+    family::HostBankPlan host_bank;
     /// Whether this artifact carries the vision tower at all, which is a property of its
     /// source: the 0.8B ships none, and the community GGUF exports drop it everywhere.
     bool has_vision = false;
@@ -269,6 +272,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    std::shared_ptr<family::HostBank> host_bank;
     family::FrontendResources frontend;
     RuntimeModelView runtime;
 };

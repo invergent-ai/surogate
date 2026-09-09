@@ -124,6 +124,8 @@ struct EngineOptions {
     // Host expert pools per NUMA node (each device's stage uses the pool of its socket) instead
     // of one pool over every core; set by the pipeline constructor.
     bool cpu_moe_pool_per_socket       = false;
+    // Placement probes size a candidate without allocating its expert cache.
+    bool offload_planning_only         = false;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     // --chat-template: a Jinja template that replaces the artifact's. Empty keeps the
     // artifact's, which is the only one whose agreement with tokenizer_config.json the
@@ -190,21 +192,27 @@ struct EngineOptions {
     // resident. A dense layer on the host crosses PCIe for every byte on every token, where an
     // offloaded mixture crosses only the experts a token routes to, so prefer the latter where
     // a model has one.
+    static constexpr std::uint32_t kGpuLayersNone = 0xFFFFFFFEU;
     std::uint32_t gpu_layers           = 0;
+
+    [[nodiscard]] std::optional<std::uint32_t> resident_layer_limit() const noexcept {
+        if (gpu_layers == 0 || gpu_layers == 0xFFFFFFFFU) { return std::nullopt; }
+        return gpu_layers == kGpuLayersNone ? 0U : gpu_layers;
+    }
     // Expert slot cache for targets that stream MoE experts from the host: number of device
-    // expert slots (0 = experts are read from the host bank in place). Targets without a
+    // expert slots (0 = size automatically from free memory). Targets without a
     // host bank ignore it.
     std::uint32_t expert_slots         = 0;
     // Fraction [0,1] of a round's missing experts computed on the host instead of fetched into
     // the slot cache (0 = everything is fetched; -1 = measure host vs PCIe rates at startup and
-    // match them). Needs expert_slots > 0.
+    // match them). Requires offloaded experts and a device slot cache.
     float cpu_moe_share                = 0.0F;
     // Rounds narrower than this many columns keep every miss on the GPU (the host round-trip
     // costs more than it saves); 0 = the target's default.
     std::uint32_t cpu_moe_min_tokens   = 0;
     // Fraction [0,1] of a *prefill* round's missing experts computed on the host (batched
-    // kernel). -1 = default: 0.5 whenever the CPU split is on; 0 keeps the full gather for
-    // prefill. Needs expert_slots > 0.
+    // kernel). -1 = default: no CPU share during prefill; 0 explicitly disables it.
+    // Requires offloaded experts and a device slot cache.
     float cpu_moe_prefill_share        = -1.0F;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;

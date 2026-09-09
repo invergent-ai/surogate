@@ -111,6 +111,11 @@ void MaterializedArtifact::attach_host_object(ObjectHandle handle, const void* d
         throw ArtifactError("host bank attachment would replace a device-resident object");
     }
     objects_[handle.index].device = const_cast<void*>(device_pointer);
+    std::size_t offset = 0;
+    for (auto& segment : objects_[handle.index].segments) {
+        segment.qdata = static_cast<const std::byte*>(device_pointer) + offset;
+        offset += segment.bytes;
+    }
 }
 
 std::span<const WeightSegment> MaterializedArtifact::segments(ObjectHandle handle) const {
@@ -293,20 +298,40 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         total = checked_add(total, transform == PayloadTransform::None ? placement.bytes : run_bytes,
                             "artifact tensor byte count overflows u64");
     }
+    // Host tensors retain the same typed row metadata as resident tensors. Pointers are
+    // filled by attach_host_object once their pinned allocation exists.
+    for (const auto& placement : plan.bank_objects) {
+        const auto& tensor = std::get<TensorDescriptor>(reader.objects().at(placement.object.index));
+        auto& segments = out.objects_.at(placement.object.index).segments;
+        std::int32_t row = 0;
+        for (const auto& segment : tensor.segments) {
+            const std::array<std::uint64_t, 2> shape = {segment.rows, tensor.shape.at(1)};
+            segments.push_back(WeightSegment{
+                .row_begin = row, .rows = static_cast<std::int32_t>(segment.rows),
+                .qtype = qtype_for(segment.format), .qdata = nullptr,
+                .bytes = tensor_encoded_size(tensor.layout, segment.format, shape),
+            });
+            row += static_cast<std::int32_t>(segment.rows);
+        }
+    }
     if (ranges.empty()) { throw ArtifactError("materialization plan has no device tensors"); }
     // Column group maps the ops apply to activations: a ggml-blocks object read in the file's
     // column order carries one without a transform. They live as long as the weights do.
     {
         std::vector<std::int32_t> flat;
         std::vector<std::pair<std::size_t, std::size_t>> spans; // object index, offset
-        for (const DeviceMaterialization& placement : plan.device_objects) {
-            const auto* tensor = std::get_if<TensorDescriptor>(&reader.objects().at(placement.object.index));
-            if (tensor == nullptr || tensor->group_map.empty() || tensor->transform != PayloadTransform::None) {
-                continue;
+        const auto collect = [&](const auto& placements) {
+            for (const auto& placement : placements) {
+                const auto* tensor = std::get_if<TensorDescriptor>(&reader.objects().at(placement.object.index));
+                if (tensor == nullptr || tensor->group_map.empty() || tensor->transform != PayloadTransform::None) {
+                    continue;
+                }
+                spans.emplace_back(placement.object.index, flat.size());
+                flat.insert(flat.end(), tensor->group_map.begin(), tensor->group_map.end());
             }
-            spans.emplace_back(placement.object.index, flat.size());
-            flat.insert(flat.end(), tensor->group_map.begin(), tensor->group_map.end());
-        }
+        };
+        collect(plan.device_objects);
+        collect(plan.bank_objects);
         if (!flat.empty()) {
             out.input_maps_ = std::make_unique<DeviceArena>(flat.size() * sizeof(std::int32_t));
             auto* maps      = static_cast<std::int32_t*>(

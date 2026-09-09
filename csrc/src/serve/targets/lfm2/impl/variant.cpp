@@ -146,6 +146,9 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (family::run_banked_experts(weights.banked, weights.moe, hidden, residual, workspace, stream)) {
+        return;
+    }
     auto scope        = workspace.scope();
     if (weights.moe.experts_per_token) {
         auto storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(

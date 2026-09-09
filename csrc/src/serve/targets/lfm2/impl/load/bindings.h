@@ -1,5 +1,9 @@
 #pragma once
 
+#include "family/impl/moe/banked_experts.h"
+
+#include "family/impl/load/host_bank.h"
+
 #include <api/targets/lfm2/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
@@ -64,6 +68,7 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
+    family::HostBankPlan host_bank;
     family::TextGeometry geometry = {};
     family::VisionGeometry vision_geometry;
     family::VisionBackbonePlan vision_backbone;
@@ -95,6 +100,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 [[nodiscard]] family::TextGeometry declared_geometry_with_schedule(const artifact::Reader& reader);
 
 struct DensePostMixerPayload {
+    family::BankedExperts banked;
     Weight gate_up;
     Weight down;
     ops::SparseMoeWeights moe;
@@ -138,6 +144,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    std::shared_ptr<family::HostBank> host_bank;
     family::FrontendResources frontend;
     RuntimeModelView runtime;
 };

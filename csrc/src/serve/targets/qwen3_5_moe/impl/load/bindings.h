@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/moe/banked_experts.h"
+
 #include <api/targets/qwen3_5_moe/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
@@ -165,6 +167,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
                                std::uint32_t gpu_layers = 0, LoadProgress progress = {});
 
 struct SparseMoePayload {
+    family::BankedExperts banked;
     ops::SparseMoeWeights op;
 };
 

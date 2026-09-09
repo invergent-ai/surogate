@@ -14,6 +14,7 @@
 #include "api/ops/sparse_moe.h"
 
 #include "core/device.h"
+#include "core/engine_context.h"
 #include "family/impl/lora_hook.h"
 #include "family/impl/moe/expert_cache.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
@@ -25,6 +26,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -55,6 +57,7 @@ constexpr ops::LinearPolicy kTextPolicy = ops::LinearPolicy::A16Only;
 // --------------------------------------------------------------------------------------------
 
 struct MixingScratch {
+    std::unique_ptr<DeviceArena> storage;
     void* data       = nullptr;
     std::size_t bytes = 0;
 };
@@ -63,21 +66,17 @@ struct MixingScratch {
 constexpr std::size_t kMaximumMixingTokens = 65536;
 
 
-std::mutex& mixing_mutex() {
-    static std::mutex value;
-    return value;
-}
-
-std::unordered_map<std::uint64_t, MixingScratch>& mixing_scratch() {
-    static std::unordered_map<std::uint64_t, MixingScratch> value;
-    return value;
-}
+struct MixingRegistry {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, MixingScratch> buffers;
+};
 
 MixingScratch& mixing_scratch_for_current_device(std::int32_t streams) {
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
-    std::lock_guard<std::mutex> lock(mixing_mutex());
-    return mixing_scratch()[(static_cast<std::uint64_t>(device) << 32U) |
+    auto& registry = ops::engine_slot<MixingRegistry>();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    return registry.buffers[(static_cast<std::uint64_t>(device) << 32U) |
                              static_cast<std::uint32_t>(streams)];
 }
 
@@ -271,8 +270,8 @@ void Variant::prewarm_device_scratch(const family::TextGeometry& geometry) {
     const auto streams = static_cast<std::size_t>(geometry.hc_streams);
     const auto bytes = streams * (1 + streams) * kMaximumMixingTokens * sizeof(float);
     if (scratch.bytes < bytes) {
-        if (scratch.data != nullptr) { CUDA_CHECK(cudaFree(scratch.data)); }
-        CUDA_CHECK(cudaMalloc(&scratch.data, bytes));
+        scratch.storage = std::make_unique<DeviceArena>(bytes);
+        scratch.data = scratch.storage->base();
         scratch.bytes = bytes;
     }
 }

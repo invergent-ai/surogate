@@ -1,4 +1,6 @@
 #include "artifact/reader.h"
+
+#include <atomic>
 #include <api/family/text_geometry.h>
 #include <api/family/vision_geometry.h>
 
@@ -651,7 +653,10 @@ struct Reader::Impl {
     std::uint64_t payload_start = 0;
 };
 
-Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
+Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {
+    static std::atomic<std::uint64_t> next_id{1};
+    instance_id_ = next_id.fetch_add(1, std::memory_order_relaxed);
+}
 
 Reader::~Reader()                            = default;
 Reader::Reader(Reader&&) noexcept            = default;

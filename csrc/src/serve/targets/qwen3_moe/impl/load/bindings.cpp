@@ -98,11 +98,6 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile,
     for (std::size_t layer = 0; layer < out.text_layers.size(); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
-        // Past `gpu_layers` the whole layer is read from pinned host memory; below it, only the
-        // experts, and only if asked. Both counts are whole-model.
-        const artifact::ScopedPlacement placed(
-            gpu_layers != 0 && layer >= gpu_layers ? artifact::TensorPlacement::HostBank
-                                                   : artifact::TensorPlacement::Device);
         target.input_norm        = artifact::bind_device_tensor(
             binder, prefix + "input_norm", NumericFormat::BF16, {g.hidden});
         target.attention.query_key_value =
@@ -123,9 +118,6 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile,
             binder, prefix + "moe/router", NumericFormat::BF16,
             {static_cast<std::uint64_t>(g.experts),
              static_cast<std::uint64_t>(g.hidden)});
-        const artifact::ScopedPlacement experts(
-            layer < host_moe_layers ? artifact::TensorPlacement::HostBank
-                                    : artifact::ScopedPlacement::current());
         target.moe.routed_gate_up = artifact::bind_linear(
             binder, prefix + "moe/routed_gate_up", routed_gate_up_rows(g), g.hidden);
         target.moe.routed_down = artifact::bind_linear(
@@ -212,6 +204,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         target.post_attention_norm = artifact::materialized_tensor(
             backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
         target.post_mixer = load_moe(source.moe, backing, g);
+            target.post_mixer.banked = family::bind_banked_experts(
+                target.post_mixer.op, host_bank.get(), source.moe.routed_gate_up.object,
+                source.moe.routed_down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
     }
     static_assert(kGdnLayers == 0, "every layer of this architecture attends");
 

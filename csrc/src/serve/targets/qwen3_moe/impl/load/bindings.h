@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/moe/banked_experts.h"
+
 #include <api/targets/qwen3_moe/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
@@ -98,6 +100,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 /// The post-mixer is the mixture: one closed op over the registered geometry.
 struct SparseMoePayload {
+    family::BankedExperts banked;
     ops::SparseMoeWeights op;
 };
 

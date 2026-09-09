@@ -1,6 +1,9 @@
 #include "family/impl/moe/expert_cache.h"
 
 #include "core/device.h"
+#include "core/arena.h"
+#include "core/engine_context.h"
+#include <limits>
 #include "core/numa.h"
 #include "core/sleep.h"
 
@@ -26,6 +29,18 @@
 
 namespace sinfer::family {
 namespace {
+
+std::int32_t checked_slot_count(const ops::SparseMoeGeometry& geometry,
+                                std::int64_t requested) {
+    const auto rows = std::max(geometry.hidden, geometry.expert_rows());
+    const auto maximum = rows > 0 ? std::numeric_limits<std::int32_t>::max() / rows : 0;
+    if (requested < geometry.experts || requested > maximum) {
+        throw std::invalid_argument("--expert-slots must be between " +
+                                    std::to_string(geometry.experts) + " and " +
+                                    std::to_string(maximum) + " for this model");
+    }
+    return static_cast<std::int32_t>(requested);
+}
 
 // The two stream memory operations, resolved from the driver at runtime: the runtime header
 // does not declare them, and a driver without them just leaves the host-function path on.
@@ -262,53 +277,26 @@ struct PendingPartial {
 
 // --- what the run configured, per device, before the cache exists ---
 
-std::mutex& config_mutex() {
-    static std::mutex mutex;
-    return mutex;
-}
-std::unordered_map<int, std::uint32_t>& configured_expert_slots() {
-    static std::unordered_map<int, std::uint32_t> configured;
-    return configured;
-}
-std::unordered_map<int, float>& configured_cpu_share() {
-    static std::unordered_map<int, float> configured;
-    return configured;
-}
-std::unordered_map<int, std::pair<float, std::uint32_t>>& configured_cpu_prefill() {
-    static std::unordered_map<int, std::pair<float, std::uint32_t>> map;
-    return map;
-}
-bool& configured_cpu_pool_per_socket() {
-    static bool per_socket = false;
-    return per_socket;
-}
-/// What the runtime must be left after the pool: the KV floor and headroom the planner asked
-/// for. Zero when no planner said (a test, or a caller that sizes the pool by hand).
-std::unordered_map<int, std::size_t>& configured_derived_reserve() {
-    static std::unordered_map<int, std::size_t> reserves;
-    return reserves;
-}
-std::unordered_map<int, std::size_t>& configured_load_staging() {
-    static std::unordered_map<int, std::size_t> staging;
-    return staging;
-}
-std::unordered_map<int, std::size_t>& configured_runtime_floor() {
-    static std::unordered_map<int, std::size_t> floors;
-    return floors;
-}
-std::unordered_map<int, std::size_t>& configured_pool_floor() {
-    static std::unordered_map<int, std::size_t> floors;
-    return floors;
-}
-/// Two GiB, not one: the floor's largest term is a projection of the load's staging that is
-/// exact for the arena and blind to the allocator's granularity, the input maps and whatever
-/// else the load carves; on GLM's card one GiB left a pool that fit the weights by a few
-/// hundred MiB and refused a 2,048-token chunk.
+struct CacheConfiguration {
+    std::mutex mutex;
+    std::unordered_map<int, std::uint32_t> slots, min_tokens;
+    std::unordered_map<int, float> cpu_share;
+    std::unordered_map<int, std::pair<float, std::uint32_t>> prefill;
+    std::unordered_map<int, std::size_t> derived, staging, runtime, pool;
+    bool per_socket = false;
+};
+CacheConfiguration& configuration() { return ops::engine_slot<CacheConfiguration>(); }
+std::mutex& config_mutex() { return configuration().mutex; }
+auto& configured_expert_slots() { return configuration().slots; }
+auto& configured_cpu_share() { return configuration().cpu_share; }
+auto& configured_cpu_prefill() { return configuration().prefill; }
+auto& configured_cpu_pool_per_socket() { return configuration().per_socket; }
+auto& configured_derived_reserve() { return configuration().derived; }
+auto& configured_load_staging() { return configuration().staging; }
+auto& configured_runtime_floor() { return configuration().runtime; }
+auto& configured_pool_floor() { return configuration().pool; }
+auto& configured_cpu_min_tokens() { return configuration().min_tokens; }
 constexpr std::size_t kPoolMarginBytes = std::size_t{2} << 30;
-std::unordered_map<int, std::uint32_t>& configured_cpu_min_tokens() {
-    static std::unordered_map<int, std::uint32_t> configured;
-    return configured;
-}
 
 // The NUMA node of a CUDA device (its PCI function's `numa_node`), -1 when unknown.
 int device_numa_node(int device) {
@@ -454,6 +442,12 @@ struct ExpertCache::Impl {
                          handshake.used);
         }
         return created;
+    }
+    int allocation_device = -1;
+    std::vector<std::unique_ptr<DeviceArena>> allocations;
+    void allocate(void** pointer, std::size_t bytes) {
+        allocations.push_back(std::make_unique<DeviceArena>(bytes));
+        *pointer = allocations.back()->base();
     }
     bool enabled = false;
     std::int32_t slots     = 0;
@@ -614,7 +608,25 @@ struct ExpertCache::Impl {
         // The coordinator spins on flags this object owns; stop it before they go.
         handshake.stop.store(true, std::memory_order_relaxed);
         if (handshake.coordinator.joinable()) { handshake.coordinator.join(); }
-        if (handshake.ready != nullptr) { (void)cudaFreeHost(handshake.ready); }
+        int previous = 0;
+        (void)cudaGetDevice(&previous);
+        if (allocation_device >= 0) { (void)cudaSetDevice(allocation_device); }
+        for (auto event : {fake_fork, fake_join, fork_event, join_event, copied_event}) {
+            if (event != nullptr) { (void)cudaEventDestroy(event); }
+        }
+        for (auto stream : {fake_stream, cpu_stream}) {
+            if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+        }
+        for (auto pointer : {static_cast<void*>(handshake.ready), static_cast<void*>(x_host),
+                             static_cast<void*>(out_host), static_cast<void*>(x_check),
+                             static_cast<void*>(out_check)}) {
+            if (pointer != nullptr) { (void)cudaFreeHost(pointer); }
+        }
+        for (auto& mirror : mirrors) {
+            if (mirror.block != nullptr) { (void)cudaFreeHost(mirror.block); }
+        }
+        allocations.clear();
+        (void)cudaSetDevice(previous);
     }
     cudaStream_t fake_stream = nullptr; // SUROGATE_SERVE_CPU_MOE_FAKE_WAIT: timing-only fork/join
     cudaEvent_t fake_fork = nullptr, fake_join = nullptr;
@@ -1198,6 +1210,7 @@ struct ExpertCache::Impl {
     /// The pool, directory, miss list and -- when a share is configured -- the CPU split, sized
     /// from what the run configured for this device and what the card has free.
     void create(int device) {
+        allocation_device = device;
         // --expert-slots N wins when set; otherwise the environment knob; 0 keeps zero-copy.
         long requested = 0;
         if (auto configured = configured_expert_slots().find(device);
@@ -1270,7 +1283,7 @@ struct ExpertCache::Impl {
         }
         // A round can touch every expert of a layer, and resolve must never leave a routed
         // expert unmapped, so the pool holds at least one layer's worth of experts.
-        slots = std::max(static_cast<std::int32_t>(requested), geometry.experts);
+        slots = checked_slot_count(geometry, requested);
         const std::size_t pool_bytes = ops::expert_slot_pool_bytes(geometry, slots);
         const std::size_t dir_bytes =
             ops::expert_slot_directory_bytes(layers, geometry.experts, slots);
@@ -1280,9 +1293,10 @@ struct ExpertCache::Impl {
         // and a reader watching a stalled console should know what the engine is waiting on.
         std::fprintf(stderr, "expert cache: reserving a %.1f GiB expert slot pool (%d slots)...\n",
                      static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0), slots);
-        CUDA_CHECK(cudaMalloc(&pool_memory, pool_bytes));
-        CUDA_CHECK(cudaMalloc(&directory_memory, dir_bytes));
-        CUDA_CHECK(cudaMalloc(&miss_memory, miss_bytes));
+        allocate(&pool_memory, pool_bytes);
+        CUDA_CHECK(cudaMemset(pool_memory, 0, pool_bytes));
+        allocate(&directory_memory, dir_bytes);
+        allocate(&miss_memory, miss_bytes);
         pool = ops::create_expert_slot_pool(geometry, slots, pool_memory);
         // Scan resistance: reserve one expert-set of trailing slots for prefill scans when the
         // pool cannot hold every expert of its layers but is comfortably bigger than one scan.
@@ -1308,7 +1322,7 @@ struct ExpertCache::Impl {
                 // The counters live on the device and the resolve kernel increments them, so
                 // a captured decode keeps counting through every replay; the host only reads.
                 const std::size_t bytes = sizeof(long long) * ops::kExpertSlotStatCount;
-                CUDA_CHECK(cudaMalloc(&stats_memory, bytes));
+                allocate(&stats_memory, bytes);
                 CUDA_CHECK(cudaMemset(stats_memory, 0, bytes));
                 directory.stats = Tensor(stats_memory, DType::I64, {ops::kExpertSlotStatCount});
             }
@@ -1373,7 +1387,7 @@ struct ExpertCache::Impl {
             // Jobs per slice: a slice is at most a prefill chunk (or the decode lanes) wide.
             const std::int32_t capacity =
                 std::max(cpu_max_tokens, cpu_prefill_max_tokens) * geometry.experts_per_token;
-            CUDA_CHECK(cudaMalloc(&cpu_jobs_memory, ops::expert_cpu_job_list_bytes(capacity)));
+            allocate(&cpu_jobs_memory, ops::expert_cpu_job_list_bytes(capacity));
             cpu_jobs = ops::create_expert_cpu_job_list(capacity, cpu_jobs_memory);
             // The staging buffers are what this device DMAs through every round, so they go on
             // its own node rather than across both (core/numa.h). The expert bank, which every
@@ -1495,8 +1509,13 @@ ExpertCache& ExpertCache::for_current_device(const ops::SparseMoeGeometry& geome
         int device;
         std::unique_ptr<ExpertCache> cache;
     };
-    static std::mutex mutex;
-    static std::vector<Entry> registry;
+    struct Registry {
+        std::mutex mutex;
+        std::vector<Entry> entries;
+    };
+    auto& registry_state = ops::engine_slot<Registry>();
+    auto& mutex = registry_state.mutex;
+    auto& registry = registry_state.entries;
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     std::lock_guard<std::mutex> lock(mutex);
@@ -1532,27 +1551,10 @@ void ExpertCache::configure(const EngineOptions& options, std::size_t runtime_fl
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     std::lock_guard<std::mutex> lock(config_mutex());
+    (void)mixture_experts;
     configured_expert_slots()[device]  = options.expert_slots;
     configured_runtime_floor()[device] = runtime_floor_bytes;
-    {
-        // A pipeline stage whose pool holds (nearly) all of its layers' experts gains nothing
-        // from the CPU split -- every layer would still pay a host round trip -- so the split
-        // is off on a stage unless the share was given explicitly. (At 8 stages a 68 %-resident
-        // stage decodes faster without it: 514 vs 395 tok/s at 64 users.)
-        float share       = options.cpu_moe_share;
-        const bool staged = options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0;
-        if (staged && share < 0.0F && options.expert_slots > 0) {
-            const int stage_layers = options.pipeline_stage_last - options.pipeline_stage_first;
-            const auto stage_experts =
-                static_cast<std::uint64_t>(stage_layers) * static_cast<std::uint64_t>(mixture_experts);
-            share = 0.0F;
-            std::fprintf(stderr,
-                         "expert cache: pipeline stage holds %u of %llu experts; CPU split off "
-                         "(pass --cpu-moe-share to enable)\n",
-                         options.expert_slots, static_cast<unsigned long long>(stage_experts));
-        }
-        configured_cpu_share()[device] = share;
-    }
+    configured_cpu_share()[device] = options.cpu_moe_share;
     configured_cpu_min_tokens()[device] = options.cpu_moe_min_tokens;
     configured_cpu_prefill()[device]    = {options.cpu_moe_prefill_share, options.prefill_chunk};
     configured_cpu_pool_per_socket()    = options.cpu_moe_pool_per_socket;
@@ -1590,11 +1592,10 @@ std::size_t ExpertCache::pool_floor() {
 
 std::size_t ExpertCache::pool_floor_bytes(const ops::SparseMoeGeometry& geometry,
                                           std::int32_t layers, std::uint32_t requested_slots) {
-    // The derivation below never settles under one layer's experts, and an explicit request
-    // is honoured as given: the larger of the two is what the placement must leave.
-    const std::int32_t slots =
-        std::max(static_cast<std::int32_t>(std::min<std::uint32_t>(requested_slots, 1U << 30)),
-                 geometry.experts);
+    // Automatic sizing needs at least one layer; explicit counts must be representable by
+    // the slot pool's tensor dimensions and are never silently clamped.
+    const std::int32_t slots = checked_slot_count(
+        geometry, requested_slots == 0 ? geometry.experts : requested_slots);
     return ops::expert_slot_pool_bytes(geometry, slots) +
            ops::expert_slot_directory_bytes(layers, geometry.experts, slots) +
            ops::expert_miss_list_bytes(geometry.experts) + kPoolMarginBytes;
@@ -1618,7 +1619,7 @@ std::size_t ExpertCache::load_staging() {
 bool ExpertCache::enabled() const noexcept { return impl_->enabled; }
 
 void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor& destination,
-                      WorkspaceArena& workspace, cudaStream_t stream) {
+                      WorkspaceArena& workspace, cudaStream_t stream, const Tensor* router_input) {
     Impl& cache = *impl_;
     if (!cache.enabled) { throw std::logic_error("expert cache: run on a disabled cache"); }
     if (mixture.op == nullptr) {
@@ -1647,7 +1648,8 @@ void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor
         ops::expert_slot_weights(cache.pool, cache.directory, mixture.layer, op);
     cache.begin_round(layer, tokens);
     ops::SparseMoeRoundHook hook{&Impl::resolve_round, &layer};
-    ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, destination, leaf, stream,
+    ops::sparse_moe(hidden, router_input == nullptr ? hidden : *router_input,
+                    pooled, ops::SparseMoeEpilogue::AddResidual, destination, leaf, stream,
                     hook);
 
     static const int shadow_every = [] {
@@ -1665,7 +1667,8 @@ void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor
     const DeviceSpan storage2 = workspace.alloc_bytes(bytes);
     WorkspaceArena leaf2(storage2);
     ops::SparseMoeRoundHook shadow_hook{&Impl::resolve_round_shadow, &layer};
-    ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, shadow, leaf2, stream,
+    ops::sparse_moe(hidden, router_input == nullptr ? hidden : *router_input,
+                    pooled, ops::SparseMoeEpilogue::AddResidual, shadow, leaf2, stream,
                     shadow_hook);
     // The host partial is ready when its join event fires, or -- under the memop handshake --
     // when its done flag is raised. Wait without clearing the flag: the combine that follows

@@ -781,7 +781,13 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,8]");
+        throw std::invalid_argument("max_concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
+    }
+    for (const auto layer : options.kv_cache_skip_layers) {
+        if (layer >= static_cast<std::uint32_t>(geometry.layers) || !geometry.layer_attends(layer)) {
+            throw std::invalid_argument("--kv-cache-dtype-skip-layers must name attention layers in this model");
+        }
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);

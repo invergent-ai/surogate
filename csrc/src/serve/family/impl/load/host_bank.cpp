@@ -1,4 +1,5 @@
 #include "family/impl/load/host_bank.h"
+#include "family/impl/load/host_decode.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "core/numa.h"
 
@@ -83,6 +84,8 @@ HostBank::HostBank(const HostBankPlan& plan) {
         const ops::Q5BankPlanes q5_planes =
             q5 ? ops::q5_bank_planes(source.q5_rows, source.q5_k) : ops::Q5BankPlanes{};
         HostObject object;
+        object.planes = q4 ? BankPlanes::Q4 : q5 ? BankPlanes::Q5
+                           : source.decode_rows != 0 ? BankPlanes::W8 : BankPlanes::Native;
         object.bytes = q4 ? q4_planes.total_bytes : object_bytes(source);
         object.name  = source.name;
         if (object.bytes == 0 || (source.payload.empty() && source.parts.empty())) {
@@ -196,6 +199,38 @@ HostBank::HostBank(const HostBankPlan& plan) {
             CUDA_CHECK(cudaFree(blocks));
             CUDA_CHECK(cudaFree(planes));
             if (group_map != nullptr) { CUDA_CHECK(cudaFree(group_map)); }
+        } else if (source.generic_decode) {
+            const auto rows = source.decode_rows;
+            const auto k = source.decode_k;
+            auto* codes = static_cast<std::int8_t*>(object.host);
+            auto* scales = reinterpret_cast<std::uint16_t*>(
+                static_cast<std::byte*>(object.host) + rows * k);
+            const auto workers = std::max(1U, std::min(32U, std::thread::hardware_concurrency()));
+            const auto chunk = (rows + workers - 1) / workers;
+            std::vector<std::future<void>> jobs;
+            for (unsigned worker = 0; worker < workers && worker * chunk < rows; ++worker) {
+                jobs.push_back(std::async(std::launch::async, [&, worker] {
+                    std::vector<float> values(k);
+                    std::vector<std::int8_t> row_codes(k);
+                    std::vector<std::uint16_t> row_scales(k / 32);
+                    for (auto row = worker * chunk; row < std::min(rows, (worker + 1) * chunk); ++row) {
+                        decode_host_row(source, row, values.data());
+                        quantize_host_row(values.data(), k, row_codes.data(), row_scales.data());
+                        if (q4) {
+                            auto* base = static_cast<std::byte*>(object.host);
+                            ops::requantise_w8_expert_groups_to_q4(
+                                row_codes.data(), row_scales.data(), k / 32,
+                                reinterpret_cast<std::uint8_t*>(base) + row * (k / 2),
+                                reinterpret_cast<std::uint16_t*>(base + q4_planes.scales_offset) + row * (k / 32),
+                                reinterpret_cast<std::uint16_t*>(base + q4_planes.mins_offset) + row * (k / 32));
+                        } else {
+                            std::copy(row_codes.begin(), row_codes.end(), codes + row * k);
+                            std::copy(row_scales.begin(), row_scales.end(), scales + row * (k / 32));
+                        }
+                    }
+                }));
+            }
+            for (auto& job : jobs) { job.get(); }
         } else if (source.decode_rows != 0) {
             // Decode while copying. The blocks arrive as stretches of the GGUF in row order,
             // each a whole number of rows; a worker owns a contiguous row range and walks the
@@ -393,11 +428,15 @@ std::shared_ptr<HostBank> HostBank::shared(const HostBankPlan& plan) {
     static std::unordered_map<std::string, std::shared_future<std::shared_ptr<HostBank>>> building;
     std::string key;
     for (const auto& source : plan.objects) {
+        key += std::to_string(source.artifact_instance);
+        key += ':';
         key += source.name;
         key += ':';
         key += std::to_string(source.payload.size());
         if (source.q4_rows > 0) { key += ":q4"; }
         if (source.q5_rows > 0) { key += ":q5"; }
+        key += ":decode=" + std::to_string(source.decode_rows) + ":q8=" +
+               std::to_string(source.q8_rows);
         key += ';';
     }
     std::shared_future<std::shared_ptr<HostBank>> pending;
@@ -479,6 +518,8 @@ HostObjectPlan host_plan(artifact::Binder& binder, artifact::ObjectHandle handle
                          const std::string& name) {
     const auto runs = binder.runs(handle);
     HostObjectPlan plan{handle, {}, name};
+    plan.artifact_instance = binder.reader().instance_id();
+    plan.source_tensor = std::get<artifact::TensorDescriptor>(binder.descriptor(handle));
     if (runs.size() == 1) {
         plan.payload = binder.payload(handle).data;
         return plan;
@@ -549,20 +590,22 @@ Weight host_w8_weight(const HostObject& object, std::int32_t rows, std::int32_t 
                                                 static_cast<std::uint64_t>(columns)};
     const artifact::RowSplitGeometry geometry =
         artifact::row_split_geometry(artifact::NumericFormat::W8G32_F16S, shape);
-    if (geometry.encoded_bytes != object.bytes) {
+    const bool compact = object.planes == BankPlanes::W8;
+    const auto compact_bytes = static_cast<std::uint64_t>(rows) * columns * 34 / 32;
+    if ((compact ? compact_bytes : geometry.encoded_bytes) != object.bytes) {
         throw std::logic_error("host bank object " + object.name + " has an unexpected size");
     }
     const auto* bytes = static_cast<const std::byte*>(object.device);
     Weight out{};
     out.payload          = bytes;
-    out.payload_bytes    = geometry.encoded_bytes;
+    out.payload_bytes    = object.bytes;
     out.high_plane_bytes = geometry.high_plane_bytes;
     out.qtype            = QType::W8G32_F16S;
     out.layout           = QuantLayout::RowSplit;
     out.group_size       = static_cast<std::uint32_t>(geometry.group_size);
     out.qdata            = bytes;
     out.qhigh            = nullptr;
-    out.scales           = bytes + geometry.scale_plane_offset;
+    out.scales           = bytes + (compact ? static_cast<std::size_t>(rows) * columns : geometry.scale_plane_offset);
     out.n                = rows;
     out.k                = columns;
     out.group            = static_cast<std::int32_t>(geometry.group_size);
@@ -571,7 +614,7 @@ Weight host_w8_weight(const HostObject& object, std::int32_t rows, std::int32_t 
     out.shape[0]         = rows;
     out.shape[1]         = columns;
     out.padded_shape[0]  = rows;
-    out.padded_shape[1]  = static_cast<std::int32_t>(geometry.padded_columns);
+    out.padded_shape[1]  = compact ? columns : static_cast<std::int32_t>(geometry.padded_columns);
     return out;
 }
 
@@ -599,8 +642,29 @@ Weight host_q4_weight(const HostObject& object, std::int32_t rows, std::int32_t 
 
 BankPlanes bank_as_planes(HostObjectPlan& plan, std::int64_t rows, std::int32_t columns,
                           QType stored, BankPlanes planes) {
-    if (planes == BankPlanes::Native || !ops::detail::ggml::is_ggml_qtype(stored)) {
+    if (planes == BankPlanes::Native) { return planes; }
+    if (stored == QType::W8G32_F16S && columns % 128 == 0 && plan.q8_rows == 0 &&
+        plan.source_tensor.group_map.empty() && plan.source_tensor.segments.empty()) {
+        if (planes == BankPlanes::Q4) {
+            plan.q4_rows = rows;
+            plan.q4_k = columns;
+            plan.q4_w8_scale_offset = artifact::row_split_geometry(
+                artifact::NumericFormat::W8G32_F16S, plan.source_tensor.shape).scale_plane_offset;
+            return planes;
+        }
         return BankPlanes::Native;
+    }
+    const bool simple = (ops::detail::ggml::is_ggml_qtype(stored) || stored == QType::BF16_CTRL) &&
+                         plan.source_tensor.segments.empty() && plan.source_tensor.group_map.empty();
+    if (!simple) {
+        if (planes == BankPlanes::Auto || planes == BankPlanes::Q5) { planes = BankPlanes::W8; }
+        plan.generic_decode = true;
+        plan.decode_rows = rows;
+        plan.decode_k = columns;
+        plan.decode_type = stored;
+        plan.q8_rows = 0;
+        if (planes == BankPlanes::Q4) { plan.q4_rows = rows; plan.q4_k = columns; }
+        return planes;
     }
     const bool affine4 = stored == QType::Q4_K || stored == QType::Q4_0 || stored == QType::Q4_1;
     const bool affine5 = stored == QType::Q5_K || stored == QType::Q5_0 || stored == QType::Q5_1;

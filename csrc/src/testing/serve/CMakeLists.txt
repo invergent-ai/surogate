@@ -253,6 +253,12 @@ sinfer_add_test(sinfer_tool_call_parser_test
 sinfer_add_test(sinfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES sinfer_serve)
+sinfer_add_test(sinfer_host_offload_test
+  SOURCES test_host_offload.cpp
+  LIBRARIES sinfer_engine CUDA::cudart)
+sinfer_add_test(sinfer_cli_options_test
+  SOURCES test_cli_options.cpp ${SERVE_ROOT}/cli/options.cpp
+  LIBRARIES sinfer_serve)
 sinfer_add_test(sinfer_output_parsers_test
   SOURCES test_output_parsers.cpp
   LIBRARIES sinfer_serve)

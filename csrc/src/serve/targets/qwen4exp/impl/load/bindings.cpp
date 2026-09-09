@@ -38,7 +38,7 @@ artifact::ObjectHandle host_q4(artifact::Binder& binder, HostBankPlan& bank,
         artifact::bind_tensor(binder, name, format, shape, TensorPlacement::ValidateOnly);
     const artifact::RowSplitGeometry geometry = artifact::row_split_geometry(
         format, std::span<const std::uint64_t>(shape.begin(), shape.size()));
-    HostObjectPlan plan{handle, binder.payload(handle).data, name};
+    HostObjectPlan plan = family::host_plan(binder, handle, name);
     plan.q4_rows            = static_cast<std::int64_t>(*shape.begin());
     plan.q4_k               = static_cast<std::int32_t>(*(shape.begin() + 1));
     plan.q4_w8_scale_offset = geometry.scale_plane_offset;
@@ -111,6 +111,11 @@ MoePlan bind_moe(const family::TextGeometry& g, artifact::Binder& binder, HostBa
                             NumericFormat& format, family::BankPlanes& half) {
         const auto rows    = static_cast<std::int32_t>(*shape.begin());
         const auto columns = static_cast<std::int32_t>(*(shape.begin() + 1));
+        if (!binder.offloads(name) || g_layer_placement == TensorPlacement::ValidateOnly) {
+            const auto binding = artifact::bind_linear(binder, name, rows, columns, g_layer_placement);
+            format = binding.format;
+            return binding.object;
+        }
         if (planes == family::BankPlanes::Q4 && !ggml_artifact) {
             // The requantiser reads W8 planes, which is what a converted artifact stores.
             half = family::BankPlanes::Q4;
@@ -193,6 +198,9 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
     // own layout, copied straight through.
     const auto routed = [&](artifact::ObjectHandle handle, family::BankPlanes planes,
                             NumericFormat format, std::int32_t rows, std::int32_t columns) {
+        if (bank.find(handle) == nullptr) {
+            return artifact::materialized_weight(backing, handle, format, rows, columns);
+        }
         const HostObject& object = bank.object(handle);
         if (family::bank_planes_are_affine(planes)) {
             return family::host_affine_weight(planes, object, rows, columns);
@@ -218,8 +226,10 @@ SparseMoePayload load_moe(const family::TextGeometry& g, const artifact::Materia
                                                        g.hidden, g.shared_intermediate);
     out.op.experts_per_token = g.experts_per_token;
     out.mix                  = std::move(mix);
-    out.host_gate_up = static_cast<const std::byte*>(bank.object(plan.routed_gate_up).host);
-    out.host_down    = static_cast<const std::byte*>(bank.object(plan.routed_down).host);
+    if (const auto* object = bank.find(plan.routed_gate_up)) {
+        out.host_gate_up = static_cast<const std::byte*>(object->host);
+        out.host_down = static_cast<const std::byte*>(bank.object(plan.routed_down).host);
+    }
     return out;
 }
 
@@ -416,6 +426,13 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     }
 
     load_plan.materialization = binder.finish();
+    for (auto& object : out.host_bank.objects) {
+        object.artifact_instance = binder.reader().instance_id();
+    }
+    auto layer_bank = family::collect_host_bank(binder, load_plan.materialization);
+    out.host_bank.objects.insert(out.host_bank.objects.end(),
+                                 std::make_move_iterator(layer_bank.objects.begin()),
+                                 std::make_move_iterator(layer_bank.objects.end()));
     return load_plan;
 }
 
@@ -452,6 +469,7 @@ void load_full_attention(const family::TextGeometry& g, artifact::MaterializedAr
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)), host_bank(HostBank::shared(plan.host_bank)) {
+    host_bank->attach(backing);
     // The layer storage is sized here, not by the type: the counts come from the
     // geometry these weights were bound against.
     const auto& g = plan.geometry;

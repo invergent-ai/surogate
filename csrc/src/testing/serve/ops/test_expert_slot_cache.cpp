@@ -159,9 +159,18 @@ struct Fixture {
         const std::size_t sizes[4] = {bank.gate_codes, bank.gate_scales, bank.down_codes,
                                       bank.down_scales};
         for (int plane = 0; plane < 4; ++plane) {
-            const std::vector<std::uint8_t> got =
-                from_device<std::uint8_t>(planes[plane] + slot * sizes[plane], sizes[plane]);
-            std::vector<std::uint8_t> want(sizes[plane]);
+            const int k = plane < 2 ? kGeometry.hidden : kGeometry.intermediate;
+            const auto row_bytes = static_cast<std::size_t>(plane % 2 == 0 ? k : k / 32 * 2);
+            const int padded_k = (k + 127) / 128 * 128;
+            const auto padded_row_bytes = static_cast<std::size_t>(plane % 2 == 0 ? padded_k : padded_k / 32 * 2);
+            const auto rows = sizes[plane] / row_bytes;
+            const auto padded_bytes = rows * padded_row_bytes;
+            const auto storage = from_device<std::uint8_t>(planes[plane] + slot * padded_bytes, padded_bytes);
+            std::vector<std::uint8_t> got, want(sizes[plane]);
+            for (std::size_t row = 0; row < rows; ++row) {
+                got.insert(got.end(), storage.begin() + row * padded_row_bytes,
+                           storage.begin() + row * padded_row_bytes + row_bytes);
+            }
             for (std::size_t i = 0; i < sizes[plane]; ++i) { want[i] = pattern(plane, expert, i); }
             failures += verify_exact((label + " plane " + std::to_string(plane)).c_str(), got, want);
         }
@@ -359,18 +368,20 @@ int main() {
             for (int which = 0; which < 2; ++which) {
                 const Matrix& mx     = matrices[which];
                 const std::size_t groups_per_expert = mx.rows_per_expert * mx.k / 32;
-                const std::size_t codes_bytes       = groups_per_expert * 32;
+                const std::size_t padded_groups = mx.rows_per_expert * ((mx.k + 127) / 128 * 128) / 32;
+                const std::size_t codes_bytes = padded_groups * 32;
                 const std::vector<std::int8_t> got_codes = from_device<std::int8_t>(
                     mx.pool_codes + static_cast<std::size_t>(slot) * codes_bytes, codes_bytes);
                 const std::vector<std::uint16_t> got_scales = from_device<std::uint16_t>(
-                    mx.pool_scales + static_cast<std::size_t>(slot) * groups_per_expert * 2,
-                    groups_per_expert);
+                    mx.pool_scales + static_cast<std::size_t>(slot) * padded_groups * 2,
+                    padded_groups);
                 const auto* q4c = reinterpret_cast<const std::uint8_t*>(mx.src);
                 const auto* q4s = reinterpret_cast<const std::uint16_t*>(mx.src + mx.planes->scales_offset);
                 const auto* q4m = reinterpret_cast<const std::uint16_t*>(mx.src + mx.planes->mins_offset);
                 int bad = 0;
                 for (std::size_t g = 0; g < groups_per_expert && bad < 4; ++g) {
                     const std::size_t src_g = static_cast<std::size_t>(expert) * groups_per_expert + g;
+                    const auto dst_g = g / (mx.k / 32) * ((mx.k + 127) / 128 * 4) + g % (mx.k / 32);
                     const float step = fp16f(q4s[src_g]);
                     const float lo   = fp16f(q4m[src_g]);
                     float value[32];
@@ -384,15 +395,15 @@ int main() {
                     const float inv   = scale > 0.0F ? 1.0F / scale : 0.0F;
                     for (int i = 0; i < 32; ++i) {
                         const int want = static_cast<int>(std::nearbyint(value[i] * inv));
-                        if (static_cast<int>(got_codes[g * 32 + i]) != want) {
+                        if (static_cast<int>(got_codes[dst_g * 32 + i]) != want) {
                             std::cout << "FAIL q4 gather codes matrix " << which << " group " << g
-                                      << " lane " << i << " got " << int(got_codes[g * 32 + i])
+                                      << " lane " << i << " got " << int(got_codes[dst_g * 32 + i])
                                       << " want " << want << "\n";
                             ++bad;
                         }
                     }
                     // The kernel's __float2half_rn(scale): compare through the decoded value.
-                    const float got_scale = fp16f(got_scales[g]);
+                    const float got_scale = fp16f(got_scales[dst_g]);
                     if (std::fabs(got_scale - scale) > std::max(1e-3F * scale, 1e-8F)) {
                         std::cout << "FAIL q4 gather scale matrix " << which << " group " << g
                                   << " got " << got_scale << " want " << scale << "\n";
@@ -640,13 +651,13 @@ int main() {
             const auto vb = from_device<std::uint8_t>(b, bytes);
             failures += expect(va == vb ? 1 : 0, "mixed bank: " + what);
         };
-        same(p_mixed.gate_up_codes, p_q4.gate_up_codes, slots_gathered * gate_groups * 32,
+        same(p_mixed.gate_up_codes, p_q4.gate_up_codes, slots_gathered * kGeometry.expert_rows() * ((kGeometry.hidden + 127) / 128 * 128),
              "gate/up codes match the all-Q4 gather");
-        same(p_mixed.gate_up_scales, p_q4.gate_up_scales, slots_gathered * gate_groups * 2,
+        same(p_mixed.gate_up_scales, p_q4.gate_up_scales, slots_gathered * kGeometry.expert_rows() * ((kGeometry.hidden + 127) / 128 * 8),
              "gate/up scales match the all-Q4 gather");
-        same(p_mixed.down_codes, p_w8.down_codes, slots_gathered * down_groups * 32,
+        same(p_mixed.down_codes, p_w8.down_codes, slots_gathered * kGeometry.hidden * ((kGeometry.intermediate + 127) / 128 * 128),
              "down codes match the all-W8 gather");
-        same(p_mixed.down_scales, p_w8.down_scales, slots_gathered * down_groups * 2,
+        same(p_mixed.down_scales, p_w8.down_scales, slots_gathered * kGeometry.hidden * ((kGeometry.intermediate + 127) / 128 * 8),
              "down scales match the all-W8 gather");
         cudaFreeHost(gate_pinned);
         cudaFreeHost(down_pinned);

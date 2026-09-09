@@ -1,6 +1,8 @@
 target_sources(sinfer_engine PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/host_decode.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/load/host_bank.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/moe/expert_cache.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/moe/banked_experts.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/chat_template.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/digest.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/frontend.cpp

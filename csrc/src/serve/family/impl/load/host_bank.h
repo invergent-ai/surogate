@@ -28,6 +28,8 @@
 
 namespace sinfer::family {
 
+enum class BankPlanes : std::uint8_t { Native, W8, Q4, Auto, Q5 };
+
 struct HostObjectPlan {
     artifact::ObjectHandle handle;
     /// The artifact mapping, valid while the reader lives. An object read in place from a GGUF
@@ -64,6 +66,12 @@ struct HostObjectPlan {
     std::int32_t q8_columns        = 0;
     std::uint64_t q8_stored_bytes  = 0; // the planes' size, which is the object's size in the bank
     std::vector<std::int32_t> q8_group_map;
+    std::uint64_t artifact_instance = 0;
+    artifact::TensorDescriptor source_tensor{};
+    bool generic_decode = false;
+    std::int32_t swap_half_rows = 0;
+    std::int32_t scale_rows = 1;
+    std::vector<float> row_scales;
 };
 
 struct HostBankPlan {
@@ -77,6 +85,7 @@ struct HostBankPlan {
 
 /// One pinned allocation per host object; `device_pointer` is the mapped alias.
 struct HostObject {
+    BankPlanes planes = BankPlanes::Native;
     void* host             = nullptr;
     const void* device     = nullptr;
     std::size_t bytes      = 0;
@@ -106,7 +115,7 @@ public:
 
     /// The process-wide bank for this plan: pipeline stages of one model in one process share
     /// the pinned experts instead of pinning them once per device (keyed by the objects' names
-    /// and sizes, so the same artifact loaded for another stage reuses the live bank).
+    /// and sizes within one reader instance; independently loaded models remain isolated).
     [[nodiscard]] static std::shared_ptr<HostBank> shared(const HostBankPlan& plan);
 
     /// Point every banked object at its pinned bytes. After this the artifact resolves those
@@ -190,7 +199,7 @@ artifact::LinearBinding host_linear(artifact::Binder& binder, HostBankPlan& bank
 /// `Q5` is Q5G32AM, six bits a value, for the 5-bit affine sources (Q5_0, Q5_1, Q5_K); `Auto`
 /// picks it for exactly those, so a K_XL mixture's Q5 down halves cost 6 bits instead of W8's
 /// 8.5 and lose nothing.
-enum class BankPlanes : std::uint8_t { Native, W8, Q4, Auto, Q5 };
+
 
 /// Whether a resolved `BankPlanes` names planes only the expert cache can read (a base pointer
 /// and a geometry-derived layout, no `Weight` for them).

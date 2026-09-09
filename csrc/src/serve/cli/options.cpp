@@ -12,7 +12,7 @@ namespace sinfer::cli {
 namespace {
 
 std::uint64_t parse_u64(const char* text, std::string_view label) {
-    if (text == nullptr || *text == '\0' || *text == '-') {
+    if (text == nullptr || *text < '0' || *text > '9') {
         throw std::invalid_argument("invalid " + std::string(label) + ": " +
                                     (text == nullptr ? "" : text));
     }
@@ -81,10 +81,10 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.sinfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] "
-           "[--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank w8|q4] "
-           "[--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
+           "[--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank auto|w8|q4] "
+           "[--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices A,B,...]\n"
-           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all]\n"
+           "       [--kv-dtype auto|bf16|fp8|fp8_e4m3|int8] [--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -100,6 +100,7 @@ std::string usage_text(const char* argv0) {
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
+           "--gpu-layers aliases: -ngl, --n-gpu-layers. 0 offloads all decoder layers.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }
@@ -141,38 +142,38 @@ Options parse_options(int argc, char** argv) {
                 options.host_expert_bank = EngineOptions::HostExpertBank::Q4;
             } else if (text == "w8") {
                 options.host_expert_bank = EngineOptions::HostExpertBank::W8;
-            } else if (text != "auto") {
+            } else if (text == "auto") {
+                options.host_expert_bank = EngineOptions::HostExpertBank::Auto;
+            } else {
                 throw std::invalid_argument("--host-expert-bank must be w8, q4 or auto");
             }
         } else if (arg == "--gpu-layers" || arg == "-ngl" || arg == "--n-gpu-layers") {
             const std::string spec = value(arg);
-            options.gpu_layers = spec == "all" ? std::numeric_limits<std::uint32_t>::max()
-                                               : parse_u32(spec.c_str(), "gpu-layers");
+            options.gpu_layers = spec == "all" ? 0U
+                                               : parse_u32(spec.c_str(), "gpu-layers", true);
+            if (spec != "all" && options.gpu_layers == 0) {
+                options.gpu_layers = EngineOptions::kGpuLayersNone;
+            }
         } else if (arg == "--host-moe-layers") {
             const std::string spec = value(arg);
             options.host_moe_layers =
                 spec == "all"    ? std::numeric_limits<std::uint32_t>::max()
                 : spec == "auto" ? EngineOptions::kHostMoeLayersAuto
-                                 : parse_u32(spec.c_str(), "host-moe-layers");
+                                 : parse_u32(spec.c_str(), "host-moe-layers", true);
         } else if (arg == "--expert-slots") {
-            options.expert_slots = parse_u32(value(arg), "expert-slots");
+            options.expert_slots = parse_u32(value(arg), "expert-slots", true);
         } else if (arg == "--cpu-moe-min-tokens") {
-            options.cpu_moe_min_tokens = parse_u32(value(arg), "cpu-moe-min-tokens");
+            options.cpu_moe_min_tokens = parse_u32(value(arg), "cpu-moe-min-tokens", true);
         } else if (arg == "--cpu-moe-share") {
             const std::string text = value(arg);
             if (text == "auto") {
                 options.cpu_moe_share = -1.0F; // measured at startup (bandwidth-matched)
             } else {
-                options.cpu_moe_share = std::strtof(text.c_str(), nullptr);
-                if (options.cpu_moe_share < 0.0F || options.cpu_moe_share > 1.0F) {
-                    throw std::invalid_argument("--cpu-moe-share must be within [0, 1] or auto");
-                }
+                options.cpu_moe_share = parse_float(text.c_str(), "cpu-moe-share", 0.0F, 1.0F);
             }
         } else if (arg == "--cpu-moe-prefill-share") {
-            options.cpu_moe_prefill_share = std::strtof(value(arg), nullptr);
-            if (options.cpu_moe_prefill_share < 0.0F || options.cpu_moe_prefill_share > 1.0F) {
-                throw std::invalid_argument("--cpu-moe-prefill-share must be within [0, 1]");
-            }
+            options.cpu_moe_prefill_share = parse_float(
+                value(arg), "cpu-moe-prefill-share", 0.0F, 1.0F);
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -184,7 +185,8 @@ Options parse_options(int argc, char** argv) {
             while (start <= list.size()) {
                 const std::size_t comma = list.find(',', start);
                 const std::string item  = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-                if (!item.empty()) { options.devices.push_back(parse_device(item.c_str())); }
+                if (item.empty()) { throw std::invalid_argument("--devices contains an empty index"); }
+                { options.devices.push_back(parse_device(item.c_str())); }
                 if (comma == std::string::npos) { break; }
                 start = comma + 1;
             }
@@ -200,7 +202,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--spec-max-lanes") {
             const std::string spec = value(arg);
             options.speculative.max_lanes =
-                spec == "all" ? kSpeculateAtAnyWidth : parse_u32(spec.c_str(), "spec-max-lanes");
+                spec == "all" ? kSpeculateAtAnyWidth : parse_u32(spec.c_str(), "spec-max-lanes", true);
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {
@@ -259,6 +261,16 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
+    if (!options.devices.empty()) {
+        for (std::size_t i = 0; i < options.devices.size(); ++i) {
+            for (std::size_t j = 0; j < i; ++j) {
+                if (options.devices[i] == options.devices[j]) {
+                    throw std::invalid_argument("--devices must contain distinct GPUs");
+                }
+            }
+        }
+        options.device = options.devices.front();
+    }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }

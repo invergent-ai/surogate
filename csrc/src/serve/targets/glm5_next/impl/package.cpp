@@ -174,12 +174,14 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 /// Whether this run keeps any mixture's experts in the host bank -- the only case the expert
 /// cache has anything to hold. Sized from free device memory before the KV planner measures
 /// it, a pool on a run with every expert resident would only take room from the cache.
-bool banks_experts(const EngineOptions& options) noexcept {
-    return options.host_moe_layers != 0 || options.gpu_layers != 0;
+bool banks_experts() {
+    return family::ExpertCache::pool_floor() != 0;
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
+                       static_cast<std::uint32_t>(options.pipeline_stage_first));
     // The banked experts become planes as the bank fills. By default each object keeps the
     // narrowest planes that lose nothing: Q4G32AM where the file stores it 4-bit affine (this
     // file's gate and up experts, Q4_K), Q5G32AM where it is 5-bit affine (its down experts in
@@ -190,7 +192,20 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         options.host_expert_bank == EngineOptions::HostExpertBank::Q4   ? family::BankPlanes::Q4
         : options.host_expert_bank == EngineOptions::HostExpertBank::W8 ? family::BankPlanes::W8
                                                                          : family::BankPlanes::Auto;
-    if (banks_experts(options)) {
+    auto plan = detail::bind_artifact(binder, weights_profile, family::startup_features(options),
+                                      options.pipeline_stage_first, options.pipeline_stage_last,
+                                      options.host_moe_layers, options.gpu_layers, planes,
+                                      options.load_progress);
+    // What the pool will insist on, for a stage planner deciding how much to offload; zero
+    // where nothing is banked, and set on every plan so a candidate never inherits the last.
+    family::ExpertCache::configure_pool_floor(
+        std::any_of(plan.bindings.host_bank.objects.begin(), plan.bindings.host_bank.objects.end(),
+            [](const auto& object) { return object.name.ends_with("/routed_gate_up"); })
+            ? family::ExpertCache::pool_floor_bytes(detail::moe_geometry(plan.bindings.geometry),
+                                                    plan.bindings.geometry.layers + plan.bindings.geometry.mtp_layers,
+                                                    options.expert_slots)
+            : 0);
+    if (banks_experts()) {
         std::fprintf(stderr, "glm5_next: host expert bank %s\n",
                      planes == family::BankPlanes::Q4
                          ? "Q4G32AM planes throughout (requantised while loading; this file's "
@@ -201,19 +216,7 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                            "for the wider ones (repacked while loading; --host-expert-bank w8|q4 "
                            "forces one)");
     }
-    auto plan = detail::bind_artifact(binder, weights_profile, family::startup_features(options),
-                                      options.pipeline_stage_first, options.pipeline_stage_last,
-                                      options.host_moe_layers, options.gpu_layers, planes,
-                                      options.load_progress);
-    // What the pool will insist on, for a stage planner deciding how much to offload; zero
-    // where nothing is banked, and set on every plan so a candidate never inherits the last.
-    family::ExpertCache::configure_pool_floor(
-        banks_experts(options)
-            ? family::ExpertCache::pool_floor_bytes(detail::moe_geometry(plan.bindings.geometry),
-                                                    plan.bindings.geometry.layers + plan.bindings.geometry.mtp_layers,
-                                                    options.expert_slots)
-            : 0);
-    if (banks_experts(options)) {
+    if (banks_experts()) {
         // What the runtime will derive from the resident weights once they are on the device,
         // and the weights themselves, which at pool-sizing time are still in the artifact: an
         // automatic expert pool sizes itself before either is measured and has to leave both.
@@ -267,7 +270,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(device.device));
         detail::Variant::prewarm_device_scratch(geometry);
-        if (banks_experts(options)) {
+        if (banks_experts() && !options.offload_planning_only) {
             // The runtime's floor and the load's staging are never resident together, so the
             // pool leaves room for the larger, on top of the weights.
             const std::size_t runtime_floor =

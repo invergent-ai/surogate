@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -55,6 +56,12 @@ class Binder {
 public:
     explicit Binder(const Reader& reader);
 
+    /// Applies to decoder-layer tensors regardless of which target binds them.
+    /// nullopt keeps every layer on the GPU; zero offloads every decoder layer.
+    void set_offload(std::optional<std::uint32_t> gpu_layers,
+                     std::uint32_t host_moe_layers = 0, std::uint32_t stage_first = 0);
+    [[nodiscard]] bool offloads(std::string_view name) const;
+
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
                                 std::span<const std::uint64_t> shape);
     /// The tensor named, in whatever format the artifact stores it: only the
@@ -91,6 +98,8 @@ private:
     std::vector<bool> consumed_;
     std::vector<bool> planned_;
     MaterializationPlan materialization_;
+    std::optional<std::uint32_t> gpu_layers_;
+    std::vector<std::uint32_t> host_moe_layers_;
 };
 
 } // namespace sinfer::artifact

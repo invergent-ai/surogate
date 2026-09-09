@@ -103,7 +103,7 @@ public:
     /// is left pending: the caller joins it with `add_pending_partial` (or the wait/finish pair
     /// when it fuses the add into its own combine) before it reads `destination`.
     void run(const BankedMixture& mixture, const Tensor& hidden, Tensor& destination,
-             WorkspaceArena& workspace, cudaStream_t stream);
+             WorkspaceArena& workspace, cudaStream_t stream, const Tensor* router_input = nullptr);
 
     /// With `--cpu-moe-share auto`, times a PCIe gather and a host round of one layer's experts
     /// outside any capture and sets the share to host / (host + PCIe). Call once after the

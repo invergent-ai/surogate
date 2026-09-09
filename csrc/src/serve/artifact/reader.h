@@ -233,6 +233,8 @@ public:
     Reader& operator=(const Reader&) = delete;
 
     const ArtifactIdentity& identity() const noexcept;
+    /// Unique for this open artifact, shared by its pipeline-stage binders.
+    [[nodiscard]] std::uint64_t instance_id() const noexcept { return instance_id_; }
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
 
@@ -263,6 +265,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::uint64_t instance_id_ = 0;
 };
 
 } // namespace sinfer::artifact

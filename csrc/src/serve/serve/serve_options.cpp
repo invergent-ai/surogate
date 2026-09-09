@@ -36,7 +36,7 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
 }
 
 std::uint64_t parse_u64(const char* text, const char* label) {
-    if (text == nullptr || *text == '\0' || *text == '-') {
+    if (text == nullptr || *text < '0' || *text > '9') {
         throw std::invalid_argument(std::string("invalid ") + label + ": " +
                                     (text == nullptr ? "" : text));
     }
@@ -47,6 +47,14 @@ std::uint64_t parse_u64(const char* text, const char* label) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<std::uint64_t>(value);
+}
+
+std::uint32_t parse_model_count(const std::string& text, const char* key, bool allow_zero = false) {
+    const auto value = parse_u64(text.c_str(), key);
+    if ((!allow_zero && value == 0) || value > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(std::string("--model: invalid ") + key);
+    }
+    return static_cast<std::uint32_t>(value);
 }
 
 KvCacheStorage parse_kv_dtype(const char* text) {
@@ -78,7 +86,8 @@ std::vector<std::uint32_t> parse_kv_skip_layers(const char* text) {
         const std::size_t comma = value.find(',', begin);
         const std::string item =
             value.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
-        if (!item.empty()) {
+        if (item.empty()) { throw std::invalid_argument("empty KV skip-layer index"); }
+        {
             layers.push_back(static_cast<std::uint32_t>(
                 parse_nonnegative_int(item.c_str(), "kv-cache-dtype-skip-layers")));
         }
@@ -105,7 +114,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.sinfer> [--host H] [--port N] [--api-key KEY] "
-           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] [--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
+           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] [--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank auto|w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices A,B,...] "
@@ -115,11 +124,14 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-cache-dtype auto|fp8|int8] [--kv-cache-dtype-skip-layers L,...] "
+           "[--kv-cache-dtype auto|bf16|fp8|fp8_e4m3|int8] [--kv-cache-dtype-skip-layers L,...] "
            "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] "
            "[--default-max-tokens N] "
            "[--vision] [--enforce-eager] [--no-prefix-reuse] "
-           "[--enable-sleep-mode] [--no-elastic-kv] [--elastic-kv-overcommit] "
+           "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
+           "[--rewrite-checkpoints|--no-rewrite-checkpoints] "
+           "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
+           "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -140,18 +152,11 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
-           "       --kv-cache-dtype defaults to fp8 (e4m3), halving the cache; auto means the\n"
-           "         same, and bf16 asks for a full-precision cache. Note vLLM reads auto as\n"
-           "         the model dtype instead. Only\n"
-           "         full-attention layers hold a KV cache, so linear-attention layers are\n"
-           "         never quantized. --kv-cache-dtype-skip-layers holds named\n"
-           "         full-attention layers at bf16 (comma-separated indices)\n"
-           "       --rewrite-checkpoints keeps a per-lane GDN checkpoint so an edited last turn\n"
-           "         resumes from its prefix instead of re-prefilling it; one state slot per lane\n"
-           "         (72 MiB each on the 27B), off by default\n"
+           "       --kv-cache-dtype defaults to auto: BF16 for attention-only models, FP8 for hybrids.\n"
+           "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
+           "       --rewrite-checkpoints uses extra memory to speed up editing the last turn.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
-           "       --no-elastic-kv keeps the Main KV pool's planes in the arena; by default they are\n"
-           "                    mapped on demand and only pages in use (plus a small reserve) hold VRAM\n"
+           "       --no-elastic-kv reserves the full cache; --elastic-kv grows it with demand.\n"
            "       --elastic-kv-overcommit guarantees each model only its\n"
            "                    --kv-capacity (one full-context request when auto) and admits every\n"
            "                    page past that against the device's free memory, shared across models\n"
@@ -167,6 +172,12 @@ std::string serve_usage_text(const char* argv0) {
            "       --chat-template replaces the artifact's Jinja template with one read from FILE.\n"
            "       --enable-prefix-caching is this engine's default; the flag is accepted for\n"
            "         command-line compatibility, and --no-enable-prefix-caching turns it off.\n"
+           "       --gpu-layers N (aliases -ngl, --n-gpu-layers) keeps the first N decoder layers\n"
+           "         on the GPU; 0 offloads them all, all keeps them resident.\n"
+           "       --model adds a prepared model with optional kv-tokens, max-num-seqs,\n"
+           "         max-model-len, spec, draft-tokens, spec-max-lanes, priority and lora overrides.\n"
+           "       --enable-lora enables adapters; --lora-modules loads named adapters at startup.\n"
+           "         --max-loras defaults to 1 and --max-lora-rank to 32 per model.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
@@ -227,15 +238,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.host_expert_bank = EngineOptions::HostExpertBank::Q4;
             } else if (text == "w8") {
                 options.host_expert_bank = EngineOptions::HostExpertBank::W8;
-            } else if (text != "auto") {
+            } else if (text == "auto") {
+                options.host_expert_bank = EngineOptions::HostExpertBank::Auto;
+            } else {
                 throw std::invalid_argument("--host-expert-bank must be w8, q4 or auto");
             }
         } else if (arg == "--gpu-layers" || arg == "-ngl" || arg == "--n-gpu-layers") {
             const std::string spec = require_value(arg.c_str());
             options.gpu_layers =
-                spec == "all" ? std::numeric_limits<std::uint32_t>::max()
+                spec == "all" ? 0U
                               : static_cast<std::uint32_t>(
                                     parse_nonnegative_int(spec.c_str(), "gpu-layers"));
+            if (spec != "all" && options.gpu_layers == 0) {
+                options.gpu_layers = EngineOptions::kGpuLayersNone;
+            }
         } else if (arg == "--host-moe-layers") {
             // `all` is the whole stack: a model far larger than the cards then loads with only
             // its routers, norms, attention and shared experts resident.
@@ -256,16 +272,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (std::string(text) == "auto") {
                 options.cpu_moe_share = -1.0F; // measured at startup (bandwidth-matched)
             } else {
-                options.cpu_moe_share = std::strtof(text, nullptr);
-                if (options.cpu_moe_share < 0.0F || options.cpu_moe_share > 1.0F) {
-                    throw std::invalid_argument("--cpu-moe-share must be within [0, 1] or auto");
-                }
+                options.cpu_moe_share = parse_float_in(text, "cpu-moe-share", 0.0F, 1.0F);
             }
         } else if (arg == "--cpu-moe-prefill-share") {
-            options.cpu_moe_prefill_share = std::strtof(require_value("--cpu-moe-prefill-share"), nullptr);
-            if (options.cpu_moe_prefill_share < 0.0F || options.cpu_moe_prefill_share > 1.0F) {
-                throw std::invalid_argument("--cpu-moe-prefill-share must be within [0, 1]");
-            }
+            options.cpu_moe_prefill_share = parse_float_in(
+                require_value("--cpu-moe-prefill-share"), "cpu-moe-prefill-share", 0.0F, 1.0F);
         } else if (arg == "--max-num-seqs") {
             // vLLM's name for the same quantity: sequences run per iteration,
             // which here is the lane count. The engine speaks vLLM's option
@@ -341,7 +352,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             while (start <= list.size()) {
                 const std::size_t comma = list.find(',', start);
                 const std::string item  = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-                if (!item.empty()) { options.devices.push_back(parse_nonnegative_int(item.c_str(), "devices")); }
+                if (item.empty()) { throw std::invalid_argument("--devices contains an empty index"); }
+                { options.devices.push_back(parse_nonnegative_int(item.c_str(), "devices")); }
                 if (comma == std::string::npos) { break; }
                 start = comma + 1;
             }
@@ -381,6 +393,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.elastic_kv = true; // the default; kept so older launch lines still parse
         } else if (arg == "--no-elastic-kv") {
             options.elastic_kv = false;
+            options.elastic_kv_overcommit = false;
         } else if (arg == "--elastic-kv-overcommit") {
             options.elastic_kv            = true;
             options.elastic_kv_overcommit = true;
@@ -419,6 +432,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             ServeOptions::ExtraModel extra;
             std::size_t cursor = 0;
             bool first         = true;
+            bool draft_explicit = false;
             while (cursor <= value.size()) {
                 const std::size_t comma = value.find(',', cursor);
                 const std::string part =
@@ -435,11 +449,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     extra.artifact_path = val;
                     first               = false;
                 } else if (key == "kv-tokens") {
-                    extra.kv_tokens = static_cast<std::uint32_t>(std::stoul(val));
+                    extra.kv_tokens = parse_model_count(val, "kv-tokens");
                 } else if (key == "max-num-seqs") {
-                    extra.max_num_seqs = static_cast<std::uint32_t>(std::stoul(val));
+                    extra.max_num_seqs = parse_model_count(val, "max-num-seqs");
                 } else if (key == "max-model-len") {
-                    extra.max_context = static_cast<std::uint32_t>(std::stoul(val));
+                    extra.max_context = parse_model_count(val, "max-model-len");
                 } else if (key == "spec") {
                     if (val == "mtp") {
                         extra.speculative.backend = SpeculativeBackend::Mtp;
@@ -447,9 +461,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                         extra.speculative.backend = SpeculativeBackend::DFlash;
                     } else {
                         throw std::invalid_argument("--model: spec= takes mtp or dflash");
-                    }
-                    if (extra.speculative.draft_tokens == 0) {
-                        extra.speculative.draft_tokens = 3;
                     }
                 } else if (key == "priority") {
                     if (val == "high") {
@@ -468,12 +479,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     }
                     extra.lora.push_back({val.substr(0, colon), val.substr(colon + 1)});
                 } else if (key == "draft-tokens") {
-                    extra.speculative.draft_tokens =
-                        static_cast<std::uint32_t>(std::stoul(val));
+                    extra.speculative.draft_tokens = parse_model_count(val, "draft-tokens");
+                    draft_explicit = true;
                 } else if (key == "spec-max-lanes") {
                     extra.speculative.max_lanes =
                         val == "all" ? kSpeculateAtAnyWidth
-                                     : static_cast<std::uint32_t>(std::stoul(val));
+                                     : parse_model_count(val, "spec-max-lanes", true);
                 } else {
                     throw std::invalid_argument(
                         "--model: unknown key '" + key +
@@ -486,6 +497,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (extra.name.empty() || extra.artifact_path.empty()) {
                 throw std::invalid_argument("--model expects name=path[,key=value...]");
             }
+            if (!draft_explicit && extra.speculative.backend != SpeculativeBackend::None) {
+                extra.speculative.draft_tokens = 3;
+            }
+            product::validate_speculative_cli_options(extra.speculative);
             options.extra_models.push_back(std::move(extra));
         } else if (arg == "--enable-sleep-mode") {
             options.enable_sleep_mode = true;
@@ -554,6 +569,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
     }
     if (!max_context_explicit) { options.max_context = 0; } // auto by default
+    if (!options.devices.empty()) {
+        for (std::size_t i = 0; i < options.devices.size(); ++i) {
+            for (std::size_t j = 0; j < i; ++j) {
+                if (options.devices[i] == options.devices[j]) {
+                    throw std::invalid_argument("--devices must contain distinct GPUs");
+                }
+            }
+        }
+        options.device = options.devices.front();
+    }
     if (!kv_capacity_explicit) {
         options.kv_capacity = options.max_context == 0
                                   ? KvCapacityPolicy::automatic(kDefaultKvCapacityHeadroomBytes)
@@ -593,6 +618,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (!options.extra_models.empty()) {
         std::vector<std::string> names;
         for (const auto& extra : options.extra_models) {
+            if (extra.max_num_seqs > kMaximumConcurrency) {
+                throw std::invalid_argument("--model: max-num-seqs exceeds " +
+                                            std::to_string(kMaximumConcurrency));
+            }
+            const auto context = extra.max_context != 0 ? extra.max_context : options.max_context;
+            const auto kv = extra.kv_tokens != 0 ? extra.kv_tokens
+                : options.kv_capacity.mode == KvCapacityMode::Explicit
+                    ? options.kv_capacity.explicit_tokens : 0U;
+            if (kv != 0 && context != 0 && kv < context) {
+                throw std::invalid_argument("--model: cache capacity must cover max-model-len");
+            }
+            if (extra.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
+                throw std::invalid_argument("--model: spec=dflash cannot be combined with --vision");
+            }
+            if (!extra.lora.empty() &&
+                (options.max_loras == 0 || options.max_lora_rank == 0 ||
+                 extra.lora.size() > options.max_loras)) {
+                throw std::invalid_argument("--model: adapters exceed --max-loras or --max-lora-rank is zero");
+            }
             if (extra.kv_tokens == 0 && !options.elastic_kv) {
                 // With arena pools the split must be stated: an extra sized from whatever is
                 // free would take the primary's headroom. Elastic pools commit only a cap
@@ -620,6 +664,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         // involve the primary's artifact identity are enforced at attach, where
         // that identity is known.
         std::vector<std::string> reserved = names;
+        if (options.model_id_override) { reserved.push_back(*options.model_id_override); }
         for (const auto& module : options.lora_modules) { reserved.push_back(module.name); }
         for (const auto& extra : options.extra_models) {
             for (const auto& module : extra.lora) { reserved.push_back(module.name); }

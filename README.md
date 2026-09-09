@@ -116,7 +116,7 @@ A native C++/CUDA HTTP server built for quick responses, concurrent workloads, a
 | **KV memory on demand** | Elastic cache allocation, automatic capacity sizing, BF16/FP8 cache options, and shared spare cache memory across models. |
 | **Runtime LoRA** | Load and unload compatible PEFT adapters without restarting; select an adapter per request. |
 | **Several models on one GPU** | Named models, priorities, and optional sleep/wake to move idle models into system RAM. |
-| **Large models on available hardware** | Multi-GPU layer pipelines, CPU weight offload, and GPU expert caching with CPU/GPU expert compute sharing on supported MoE families. |
+| **Large models on available hardware** | Multi-GPU layer pipelines, CPU weight offload for every serving generation model, plus GPU expert caching and CPU/GPU expert compute sharing for every supported MoE family. |
 | **Vision & embeddings** | Images and video for supported vision models; EmbeddingGemma on GPU or AVX-512 CPU through a separate embeddings server. |
 | **Operations** | API-key authentication, health checks, Prometheus metrics, request logs, tokenization, and cache statistics. |
 

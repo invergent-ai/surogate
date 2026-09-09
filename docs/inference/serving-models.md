@@ -156,9 +156,12 @@ surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
 ```
 
 `--host-moe-layers all` puts all routed expert weights in system RAM; use a number to offload
-fewer layers. With several GPUs, `--host-moe-layers auto` chooses how much to offload on each
-GPU. `--gpu-layers N` is another option: it keeps N model layers on the GPU and uses RAM for
-the rest. For MoE models, offloading just the experts usually gives a better speed tradeoff.
+fewer MoE layers. `--host-moe-layers auto` chooses enough offload to fit, on one GPU or across
+several GPUs. Every supported generation model also accepts `--gpu-layers N`: it keeps the
+first N decoder layers on the GPU and uses RAM for the rest. `--gpu-layers 0` offloads every
+decoder layer; `--gpu-layers all` keeps them on the GPU. Other model weights and the request
+cache still need GPU memory. For MoE models, offloading just the experts usually gives a better
+speed tradeoff.
 
 Offloaded weight memory cannot be swapped out, so leave enough RAM for the operating system
 and other applications. Loading large offloaded models also takes time on every start, even
@@ -166,14 +169,14 @@ when model preparation is cached.
 
 ### Using CPU cores and an expert cache
 
-Flash-Next and GLM-5.3-Flash can cache frequently used offloaded experts on the GPU and send
-some expert computation to CPU cores. For example:
+Every supported MoE generation model can cache frequently used offloaded experts on the GPU
+and send some expert computation to CPU cores. For example:
 
 ```bash
 surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
   --port 8080 \
   --max-num-seqs 16 --max-model-len 4096 --kv-capacity auto \
-  --cpu-moe-share auto
+  --host-moe-layers all --cpu-moe-share auto
 ```
 
 The expert cache sizes itself from available GPU memory. Start with the automatic settings;

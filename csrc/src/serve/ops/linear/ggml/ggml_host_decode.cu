@@ -206,6 +206,14 @@ bool ggml_row_to_q4g32am(QType type, const void* blocks, std::int64_t k, std::ui
 bool ggml_decode_row_float(QType type, const void* blocks, std::int64_t k, float* out) noexcept {
     using T = detail::ggml::GgmlType;
     if (blocks == nullptr || out == nullptr || k <= 0 || k % 32 != 0) { return false; }
+    if (type == QType::BF16_CTRL) {
+        const auto* values = static_cast<const std::uint16_t*>(blocks);
+        for (std::int64_t i = 0; i < k; ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(values[i]) << 16;
+            std::memcpy(out + i, &bits, sizeof(float));
+        }
+        return true;
+    }
     switch (type) {
 #define SINFER_HOST_DECODE_FLOAT_CASE(NAME)                                                        \
     case QType::NAME:                                                                              \
@@ -224,6 +232,22 @@ bool ggml_decode_row_w8(QType type, const void* blocks, std::int64_t k, std::int
     if (blocks == nullptr || codes == nullptr || scales == nullptr || k <= 0 || k % 32 != 0) {
         return false;
     }
+    if (type == QType::BF16_CTRL) {
+        for (std::int64_t group = 0; group < k / 32; ++group) {
+            float values[32];
+            ggml_decode_row_float(type, static_cast<const std::uint16_t*>(blocks) + group * 32,
+                                  32, values);
+            float amax = 0.0F;
+            for (float value : values) { amax = std::fmax(amax, std::fabs(value)); }
+            const float scale = amax / 127.0F;
+            const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+            for (int i = 0; i < 32; ++i) {
+                codes[group * 32 + i] = static_cast<std::int8_t>(std::nearbyint(values[i] * inverse));
+            }
+            scales[group] = half_bits(scale);
+        }
+        return true;
+    }
     switch (type) {
 #define SINFER_HOST_DECODE_CASE(NAME)                                                              \
     case QType::NAME:                                                                              \
@@ -239,6 +263,7 @@ bool ggml_decode_row_w8(QType type, const void* blocks, std::int64_t k, std::int
 std::int64_t ggml_row_bytes(QType type, std::int64_t k) noexcept {
     using T = detail::ggml::GgmlType;
     if (k <= 0) { return 0; }
+    if (type == QType::BF16_CTRL) { return k * 2; }
     switch (type) {
 #define SINFER_HOST_ROW_BYTES_CASE(NAME)                                                           \
     case QType::NAME: {                                                                            \

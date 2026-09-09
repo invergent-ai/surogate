@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/load/host_bank.h"
+
 #include <api/targets/gemma4_e/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
@@ -129,6 +131,7 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
+    family::HostBankPlan host_bank;
     /// The dimensions bound against: the compiled config with the artifact's `geometry`
     /// member laid over it. For this target that member also carries the *second* head
     /// geometry and the window schedule, because neither can be compiled for two sizes.
@@ -248,6 +251,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    std::shared_ptr<family::HostBank> host_bank;
     family::FrontendResources frontend;
     RuntimeModelView runtime;
     /// The norm every layer's per-layer input projection passes through. One vector, held

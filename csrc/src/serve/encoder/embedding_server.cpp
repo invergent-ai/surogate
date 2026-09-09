@@ -24,6 +24,7 @@
 // It must be an environment variable because libgomp reads it before main.
 
 #include "core/device.h"
+#include "encoder/options.h"
 #include "encoder/cpu/cpu_gemma_embedding.h"
 #include "encoder/gemma_embedding.h"
 
@@ -82,32 +83,15 @@ json error_body(const std::string& message, const char* type) {
 
 int main(int argc, char** argv) {
     try {
-        std::string artifact;
-        std::string host   = "127.0.0.1";
-        std::string device = "0";
-        int port           = 8413;
-        for (int i = 1; i < argc; ++i) {
-            const std::string arg(argv[i]);
-            const auto next = [&](const char* what) -> std::string {
-                if (++i >= argc) { throw std::invalid_argument(std::string("missing ") + what); }
-                return argv[i];
-            };
-            if (!arg.empty() && arg.front() != '-') {
-                if (!artifact.empty()) {
-                    throw std::invalid_argument("unexpected extra argument: " + arg);
-                }
-                artifact = arg;
-            } else if (arg == "--host") {
-                host = next("--host");
-            } else if (arg == "--port") {
-                port = std::stoi(next("--port"));
-            } else if (arg == "--device") {
-                device = next("--device");
-            } else {
-                throw std::invalid_argument("unknown argument: " + arg);
-            }
+        const auto options = sinfer::encoder::parse_options(argc, argv);
+        if (options.help_requested) {
+            std::fputs(sinfer::encoder::usage_text(argv[0]).c_str(), stdout);
+            return 0;
         }
-        if (artifact.empty()) { throw std::invalid_argument("a model is required"); }
+        const auto& artifact = options.artifact;
+        const auto& host = options.host;
+        const auto& device = options.device;
+        const int port = options.port;
 
         // One of the two encoders, behind the same three calls the handler uses.
         std::unique_ptr<sinfer::DeviceContext> gpu_device;
@@ -120,7 +104,7 @@ int main(int argc, char** argv) {
                          static_cast<double>(host_model->weight_bytes()) / 1e6,
                          host_model->threads(), sinfer::encoder::cpu::gemm_backend_name());
         } else {
-            gpu_device = std::make_unique<sinfer::DeviceContext>(std::stoi(device));
+            gpu_device = std::make_unique<sinfer::DeviceContext>(options.device_index);
             gpu        = std::make_unique<sinfer::encoder::GemmaEmbedding>(
                 sinfer::encoder::GemmaEmbedding::load(artifact, *gpu_device));
             std::fprintf(stderr, "gpu %s: %.0f MB\n", device.c_str(),

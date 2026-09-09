@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/load/host_bank.h"
+
 #include <api/targets/gemma3/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
@@ -95,6 +97,7 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
+    family::HostBankPlan host_bank;
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
     family::TextGeometry geometry = {};
@@ -182,6 +185,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    std::shared_ptr<family::HostBank> host_bank;
     family::FrontendResources frontend;
     RuntimeModelView runtime;
 };

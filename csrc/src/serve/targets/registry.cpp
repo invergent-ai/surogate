@@ -9,6 +9,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/engine_context.h"
 #include "core/elastic_kv_region.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
@@ -189,6 +190,11 @@ namespace {
 // that does not fit is halved until it does.
 inline constexpr std::uint32_t kAutoContextProbe = 2048;
 
+std::uint32_t context_prefill(std::uint32_t requested, std::uint32_t context) {
+    return std::min(requested, std::max(128U, context / 128U * 128U));
+}
+
+
 family::VisionGeometry declared_vision_geometry(const artifact::Reader& reader) {
     return reader.vision_geometry().empty() ? family::VisionGeometry{}
                                             : family::VisionGeometry::resolved(reader.vision_geometry());
@@ -214,12 +220,13 @@ std::uint32_t resolve_automatic_context(DeviceContext& device, const EngineOptio
     const auto plan_at         = [&](std::uint32_t context) {
         EngineOptions probe   = options;
         probe.max_context     = context;
-        probe.prefill_chunk   = std::min(options.prefill_chunk, context);
+        probe.prefill_chunk   = context_prefill(options.prefill_chunk, context);
         return Target::make_sequence_planner(device, probe, weights_profile, geometry, vision_geometry)
             .capacity_curve();
     };
 
-    const runtime::SequenceCapacityCurve probe = plan_at(kAutoContextProbe);
+    const auto minimum_context = std::min(native, kAutoContextProbe);
+    const runtime::SequenceCapacityCurve probe = plan_at(minimum_context);
     std::uint32_t candidate                    = native;
     if (budget_bytes > headroom + probe.minimum_device_reservation_bytes &&
         probe.bytes_per_additional_main_page_group > 0) {
@@ -231,11 +238,11 @@ std::uint32_t resolve_automatic_context(DeviceContext& device, const EngineOptio
         candidate = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(native, pages * probe.main_page_tokens));
     }
-    candidate = std::max(candidate, kAutoContextProbe);
-    for (int attempt = 0; attempt < 8 && candidate > kAutoContextProbe; ++attempt) {
+    candidate = std::max(candidate, minimum_context);
+    for (int attempt = 0; attempt < 8 && candidate > minimum_context; ++attempt) {
         const runtime::SequenceCapacityCurve curve = plan_at(candidate);
         if (curve.minimum_device_reservation_bytes + headroom <= budget_bytes) { break; }
-        candidate = std::max(kAutoContextProbe, candidate / 2);
+        candidate = std::max(minimum_context, candidate / 2);
     }
     std::fprintf(stderr, "engine: max context auto-resolved to %u tokens (native %u)\n", candidate,
                  native);
@@ -246,12 +253,60 @@ template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
+    struct ContextBinding {
+        ops::EngineOpsContext* previous;
+        explicit ContextBinding(ops::EngineOpsContext* context)
+            : previous(const_cast<ops::EngineOpsContext*>(
+                  static_cast<const ops::EngineOpsContext*>(ops::current_ops_owner()))) {
+            ops::bind_ops_context(context);
+        }
+        ~ContextBinding() { ops::bind_ops_context(previous); }
+    } context_binding(options.ops_context);
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
     // The dimensions to plan and bind against: this target's compiled config with whatever
     // the artifact declares laid over it.
     const family::TextGeometry geometry            = Target::declared_geometry(reader);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(Target::model_id);
+
+    if (options.host_moe_layers == EngineOptions::kHostMoeLayersAuto) {
+        if (geometry.experts <= 0) {
+            throw std::invalid_argument("--host-moe-layers applies to MoE models only");
+        }
+        std::string last_error;
+        for (std::uint32_t count = 0; count <= static_cast<std::uint32_t>(geometry.layers); ++count) {
+            EngineOptions candidate = options;
+            candidate.host_moe_layers = count;
+            candidate.offload_planning_only = true;
+            try {
+                artifact::Binder probe(reader);
+                auto plan = Target::plan_load(probe, candidate, weights_profile);
+                const auto budget = subtract_saturating(
+                    runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
+                    projected_derived_residency_bytes(probe, plan.materialization(),
+                                                       target_linear_policy<Target>()) +
+                        family::ExpertCache::pool_floor());
+                if (candidate.max_context == 0) {
+                    candidate.max_context = std::min<std::uint32_t>(geometry.max_context,
+                        candidate.kv_capacity.mode == KvCapacityMode::Explicit
+                            ? candidate.kv_capacity.explicit_tokens : kAutoContextProbe);
+                }
+                candidate.prefill_chunk = context_prefill(candidate.prefill_chunk, candidate.max_context);
+                const auto curve = Target::make_sequence_planner(device, candidate, weights_profile,
+                    geometry, declared_vision_geometry(reader)).capacity_curve();
+                (void)runtime::resolve_kv_capacity(candidate.kv_capacity, curve, budget);
+            } catch (const std::exception& error) {
+                last_error = error.what();
+                continue;
+            }
+            candidate = options;
+            candidate.host_moe_layers = count;
+            std::fprintf(stderr, "engine: host MoE offload auto-resolved to %u layers\n", count);
+            return construct_registered<Target, Loaded, Instance>(candidate, device, reader,
+                                                                  load_start, target_key);
+        }
+        throw std::invalid_argument("--host-moe-layers auto cannot fit this model: " + last_error);
+    }
 
     artifact::Binder binder(reader);
     auto load_plan = Target::plan_load(binder, options, weights_profile);
@@ -266,7 +321,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     if (effective.max_context == 0) {
         effective.max_context = resolve_automatic_context<Target>(
             device, options, weights_profile, geometry, preflight_runtime_bytes, declared_vision_geometry(reader));
-        effective.prefill_chunk = std::min(options.prefill_chunk, effective.max_context);
+        effective.prefill_chunk = context_prefill(options.prefill_chunk, effective.max_context);
     }
     if (effective.elastic_kv_overcommit) { effective.elastic_kv = true; }
     auto sequence_planner =
@@ -540,7 +595,7 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
     if (max_context == 0) { return fit; }
     EngineOptions sized = stage;
     sized.max_context   = max_context;
-    sized.prefill_chunk = std::min(stage.prefill_chunk, max_context);
+    sized.prefill_chunk = context_prefill(stage.prefill_chunk, max_context);
     if (sized.elastic_kv_overcommit) { sized.elastic_kv = true; }
     const runtime::SequenceCapacityCurve curve =
         Target::make_sequence_planner(probe, sized, weights_profile, geometry, declared_vision_geometry(reader)).capacity_curve();
@@ -687,7 +742,7 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
         if (resolved_kv != 0) {
             stage_options.kv_capacity   = KvCapacityPolicy::explicit_capacity(resolved_kv);
             stage_options.max_context   = resolved_context;
-            stage_options.prefill_chunk = std::min(options.prefill_chunk, resolved_context);
+            stage_options.prefill_chunk = context_prefill(options.prefill_chunk, resolved_context);
             stage_options.host_moe_layers = stage_host_moe.empty()
                                                 ? stage_options.host_moe_layers
                                                 : stage_host_moe[static_cast<std::size_t>(s)];

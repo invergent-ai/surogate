@@ -258,11 +258,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                           : out.token_embedding;
 
     load_plan.materialization = binder.finish();
+    out.host_bank = family::collect_host_bank(binder, load_plan.materialization);
     return load_plan;
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+    : backing(std::move(materialized)),
+      host_bank(plan.host_bank.objects.empty() ? nullptr : family::HostBank::shared(plan.host_bank)) {
+    if (host_bank) { host_bank->attach(backing); }
     // The layer storage is sized here, not by the type: the counts come from the geometry
     // these weights were bound against.
     runtime.geometry              = plan.geometry;

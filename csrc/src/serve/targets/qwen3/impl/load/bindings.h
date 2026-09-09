@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/load/host_bank.h"
+
 #include <api/targets/qwen3/package.h>
 #include <api/family/frontend_resources.h>
 #include <api/family/text_geometry.h>
@@ -55,6 +57,7 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
+    family::HostBankPlan host_bank;
     struct DeepstackPlan {
         std::int32_t layer;
         artifact::LinearBinding fc1, fc2;
@@ -135,6 +138,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
+    std::shared_ptr<family::HostBank> host_bank;
     family::FrontendResources frontend;
     RuntimeModelView runtime;
 };

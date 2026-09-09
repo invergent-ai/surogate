@@ -363,7 +363,7 @@ def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *,
         echo("DRY: " + " ".join(cmd))
         raise SystemExit(0)
     env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    result = subprocess.run(cmd, cwd=root, env=env)
+    result = subprocess.run(cmd, cwd=root, env=env, stdout=sys.stderr)
     if result.returncode != 0 or not tmp.is_file():
         tmp.unlink(missing_ok=True)
         raise SystemExit(f"surogate serve: conversion failed (exit {result.returncode}).")
@@ -577,7 +577,7 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
         echo("DRY: " + " ".join(cmd))
         raise SystemExit(0)
     env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    result = subprocess.run(cmd, cwd=root, env=env)
+    result = subprocess.run(cmd, cwd=root, env=env, stdout=sys.stderr)
     if result.returncode != 0 or not tmp.is_file():
         tmp.unlink(missing_ok=True)
         raise SystemExit(f"surogate serve: conversion failed (exit {result.returncode}).")
@@ -684,7 +684,7 @@ def ensure_encoder_weights(spec: str, *, frontend: str | None = None,
     if os.environ.get("SUROGATE_SERVE_DRY"):
         echo("  (dry run) " + " ".join(cmd))
         return out
-    result = subprocess.run(cmd, cwd=str(root))
+    result = subprocess.run(cmd, cwd=str(root), stdout=sys.stderr)
     if result.returncode != 0 or not out.is_file():
         raise SystemExit(f"surogate serve: encoder conversion failed ({display}).")
     return out

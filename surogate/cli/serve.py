@@ -8,6 +8,8 @@
 # Python (and no Python CUDA context) stays in the serving process. It must run
 # BEFORE any CUDA-touching import in surogate.cli.main, mirroring jackalope.
 
+from contextlib import redirect_stdout
+
 import os
 import shutil
 import sys
@@ -34,8 +36,9 @@ Common server options (full list: surogate serve --engine-help):
   --host 0.0.0.0 --port 8080     bind address
   --max-model-len N              per-sequence context ceiling
   --kv-capacity N|auto           KV pool size ('auto' = free VRAM minus 1 GiB)
-  --max-num-seqs N               concurrent lanes (default 1)
-  --kv-cache-dtype auto|fp8|bf16 KV cache precision (default auto: bf16 for a pure-attention
+  --max-num-seqs N               simultaneous requests (default 1)
+  --kv-cache-dtype auto|fp8|bf16|int8
+                                KV cache precision (default auto: bf16 for a pure-attention
                                  model, fp8 where linear-attention layers carry the stack)
   --no-cache                     rebuild the conversion cache instead of reusing it
   --spec mtp --draft-tokens 3    speculative decoding
@@ -64,6 +67,104 @@ _MODES = {
     "generate": ("surogate-engine-cli", "SUROGATE_ENGINE_CLI_BIN"),
     "embed": ("surogate-embed", "SUROGATE_EMBED_BIN"),
 }
+
+# Arity is needed before preparing a model: an option value may itself start with
+# "--", and options may precede the positional model. Native parsers still own
+# value validation. Tests check this inventory against every native parser.
+_COMMON_VALUES = frozenset("""
+    --device --host-moe-layers --gpu-layers -ngl --n-gpu-layers --expert-slots
+    --host-expert-bank --cpu-moe-share --cpu-moe-prefill-share --cpu-moe-min-tokens
+    --devices --kv-capacity --spec --draft-tokens --spec-max-lanes
+    --temperature --top-p --top-k --min-p --presence-penalty --frequency-penalty --seed
+""".split())
+_COMMON_SWITCHES = frozenset("--vision --lm-head-draft --no-thinking --greedy".split())
+_VALUE_OPTIONS = {
+    "server": _COMMON_VALUES | frozenset("""
+        --host --port --api-key --served-model-name --max-model-len --max-num-seqs
+        --max-pending-requests --pending-timeout-ms --max-num-batched-tokens
+        --log-stats-interval-ms --max-request-mib --media-cache-mib --media-live-mib
+        --media-preprocess-threads --request-log-jsonl --response-store-max-records
+        --response-store-max-mib --kv-cache-dtype --kv-cache-dtype-skip-layers
+        --default-max-tokens --reasoning-parser --tool-call-parser --chat-template
+        --model-priority --model --lora-modules --max-loras --max-lora-rank
+    """.split()),
+    "generate": _COMMON_VALUES | frozenset("""
+        --prompt --messages --max-new --max-context --prefill-chunk --kv-dtype
+        --reasoning-effort --stop-token-id --stop --reasoning-stop
+    """.split()),
+    "embed": frozenset("--host --port --device".split()),
+}
+_SWITCH_OPTIONS = {
+    "server": _COMMON_SWITCHES | frozenset("""
+        --rewrite-checkpoints --no-rewrite-checkpoints --elastic-kv --no-elastic-kv
+        --elastic-kv-overcommit --enforce-eager --no-prefix-reuse
+        --enable-prefix-caching --no-enable-prefix-caching --enable-auto-tool-choice
+        --enable-sleep-mode --enable-lora --preserve-thinking --cors
+    """.split()),
+    "generate": _COMMON_SWITCHES | frozenset("""
+        --raw-output --print-token-ids --prefill-warmup --no-cuda-graph
+    """.split()),
+    "embed": frozenset(),
+}
+
+
+def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool, str | None]:
+    """Return mode, model, native options, cache policy and encoder frontend."""
+    values = frozenset().union(*_VALUE_OPTIONS.values(), {"--frontend"})
+    switches = frozenset().union(*_SWITCH_OPTIONS.values(), {
+        "--generate", "--embed", "--no-cache", "--engine-help", "--help", "-h",
+    })
+    parsed: list[tuple[str, str | None]] = []
+    models: list[str] = []
+    i = 0
+    while i < len(args):
+        token = args[i]
+        i += 1
+        if token == "--":
+            models.extend(args[i:])
+            break
+        if not token.startswith("-"):
+            models.append(token)
+            continue
+        flag, equals, inline = token.partition("=")
+        if flag in values:
+            if equals:
+                value = inline
+            elif i < len(args):
+                value = args[i]
+                i += 1
+            else:
+                raise ValueError(f"{flag} needs a value")
+            parsed.append((flag, value))
+        elif flag in switches and not equals:
+            parsed.append((flag, None))
+        else:
+            raise ValueError(f"unknown option: {flag}")
+
+    flags = {flag for flag, _ in parsed}
+    if {"--generate", "--embed"} <= flags:
+        raise ValueError("--embed and --generate are different modes")
+    mode = "embed" if "--embed" in flags else "generate" if "--generate" in flags else "server"
+    if flags & {"--engine-help", "--help", "-h"}:
+        return mode, None, ["--help"], True, None
+    if len(models) != 1 or not models[0]:
+        raise ValueError("exactly one model is required")
+    native: list[str] = []
+    frontend = None
+    for flag, value in parsed:
+        if flag in {"--generate", "--embed", "--no-cache"}:
+            continue
+        if flag == "--frontend" and mode == "embed":
+            if not value:
+                raise ValueError("--frontend needs a directory")
+            frontend = value
+            continue
+        if flag not in _VALUE_OPTIONS[mode] | _SWITCH_OPTIONS[mode]:
+            raise ValueError(f"{flag} is not supported in {mode} mode")
+        native.append(flag)
+        if value is not None:
+            native.append(value)
+    return mode, models[0], native, "--no-cache" not in flags, frontend
 
 
 # Where the wheel puts the product binaries (csrc/CMakeLists.txt, install component
@@ -99,21 +200,11 @@ def maybe_exec_serve() -> None:
         sys.stderr.write(_USAGE)
         sys.exit(0 if rest else 1)
 
-    # --generate switches to the one-shot CLI binary, --embed to the encoder
-    # server; --engine-help passes --help through so the binary's own option
-    # surface stays canonical.
-    mode = "server"
-    if "--generate" in rest:
-        rest = [a for a in rest if a != "--generate"]
-        mode = "generate"
-    if "--embed" in rest:
-        if mode == "generate":
-            sys.stderr.write("surogate serve: --embed and --generate are different modes.\n")
-            sys.exit(2)
-        rest = [a for a in rest if a != "--embed"]
-        mode = "embed"
-    if "--engine-help" in rest:
-        rest = ["--help" if a == "--engine-help" else a for a in rest]
+    try:
+        mode, model, rest, reuse_cache, frontend = _parse_invocation(rest)
+    except ValueError as error:
+        sys.stderr.write(f"surogate serve: {error}\n")
+        sys.exit(2)
 
     binary = _resolve_binary(mode)
     if binary is None:
@@ -125,52 +216,36 @@ def maybe_exec_serve() -> None:
         )
         sys.exit(127)
 
-    # `--no-cache` rebuilds the index instead of reusing one that is already there. It is
-    # for a converter change: the cache is keyed on the *checkpoint*, so editing a recipe
-    # leaves the stale entry looking valid. It is consumed here, not passed to the engine.
-    reuse_cache = "--no-cache" not in rest
-    rest = [a for a in rest if a != "--no-cache"]
+    if model is not None:
+        from surogate.serve.ingest import ensure_encoder_weights, ensure_engine_weights
 
-    # Resolve the model spec (first non-flag argument) through the ingest
-    # layer: safetensors dirs / HF repo ids convert transparently into the
-    # internal cache; GGUF and unsupported models get clear messages.
-    model_index = next(
-        (i for i, a in enumerate(rest) if not a.startswith("-")
-         and (i == 0 or not rest[i - 1].startswith("--") or "=" in rest[i - 1]
-              or rest[i - 1] in ("--vision", "--greedy", "--no-cuda-graph",
-                                 "--no-prefix-reuse", "--lm-head-draft",
-                                 "--no-thinking", "--preserve-thinking", "--cors",
-                                 "--raw-output", "--print-token-ids"))),
-        None,
-    )
-    if mode == "embed":
-        # The encoder server takes its model positionally, like the generative
-        # engine does; --frontend is a conversion input, consumed here.
-        frontend = None
-        if "--frontend" in rest:
-            i = rest.index("--frontend")
-            if i + 1 >= len(rest):
-                sys.stderr.write("surogate serve: --frontend needs a directory\n")
-                sys.exit(2)
-            frontend = rest[i + 1]
-            del rest[i:i + 2]
-            if model_index is not None and model_index > i:
-                model_index -= 2
-        if model_index is None:
-            sys.stderr.write("surogate serve --embed: a model is required\n")
-            sys.exit(2)
-        from surogate.serve.ingest import ensure_encoder_weights
-
-        resolved = ensure_encoder_weights(rest[model_index], frontend=frontend,
-                                          reuse_cache=reuse_cache,
-                                          echo=lambda m: print(m, file=sys.stderr))
-        rest = [*rest[:model_index], str(resolved), *rest[model_index + 1:]]
-    elif model_index is not None:
-        from surogate.serve.ingest import ensure_engine_weights
-
-        resolved = ensure_engine_weights(rest[model_index], reuse_cache=reuse_cache,
-                                         echo=lambda m: print(m, file=sys.stderr))
-        rest = [*rest[:model_index], str(resolved), *rest[model_index + 1:]]
+        # Preparation follows the same logical CUDA device as the native runtime.
+        # An explicit conversion override remains useful when CPU RAM is preferable.
+        selected = {}
+        i = 0
+        while i < len(rest):
+            flag = rest[i]
+            if flag in _VALUE_OPTIONS[mode]:
+                if flag in ("--device", "--devices"):
+                    selected[flag] = rest[i + 1]
+                i += 2
+            else:
+                i += 1
+        device = selected.get("--devices", selected.get("--device", "0")).split(",")[0]
+        conversion_device = "cpu" if device == "cpu" else f"cuda:{device}"
+        previous_conversion_device = os.environ.get("SUROGATE_CONVERT_DEVICE")
+        os.environ.setdefault("SUROGATE_CONVERT_DEVICE", conversion_device)
+        kwargs = dict(reuse_cache=reuse_cache, echo=lambda m: print(m, file=sys.stderr))
+        try:
+            with redirect_stdout(sys.stderr):
+                if mode == "embed":
+                    resolved = ensure_encoder_weights(model, frontend=frontend, **kwargs)
+                else:
+                    resolved = ensure_engine_weights(model, **kwargs)
+        finally:
+            if previous_conversion_device is None:
+                os.environ.pop("SUROGATE_CONVERT_DEVICE", None)
+        rest = [str(resolved), *rest]
 
     os.execv(binary, [binary] + rest)
 

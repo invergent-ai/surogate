@@ -27,23 +27,20 @@ int next_ops_slot_index() {
 
 EngineOpsContext::~EngineOpsContext() {
     for (auto it = slots_.rbegin(); it != slots_.rend(); ++it) {
-        if (it->value != nullptr && it->destroy != nullptr) { it->destroy(it->value); }
+        if (void* value = it->value.load(std::memory_order_relaxed); value != nullptr) { it->destroy(value); }
     }
 }
 
 void* EngineOpsContext::get_or_create(int index, void* (*create)(), void (*destroy)(void*)) {
     Slot& slot = slots_[static_cast<std::size_t>(index)];
-    // Fast path without the lock: the pointer is written once, under the lock,
-    // and read many times afterwards from the two threads that bind this
-    // context (construction, then the worker); both synchronize through the
-    // executor-thread handoff before any concurrent read.
-    if (slot.value != nullptr) { return slot.value; }
+    // Pipeline stages may create the same typed slot concurrently on different devices.
+    if (void* value = slot.value.load(std::memory_order_acquire)) { return value; }
     const std::lock_guard<std::mutex> lock(mutex_);
-    if (slot.value == nullptr) {
-        slot.value   = create();
-        slot.destroy = destroy;
-    }
-    return slot.value;
+    if (void* value = slot.value.load(std::memory_order_relaxed)) { return value; }
+    void* value = create();
+    slot.destroy = destroy;
+    slot.value.store(value, std::memory_order_release);
+    return value;
 }
 
 EngineOpsContext& current_ops_context() noexcept {

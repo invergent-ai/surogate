@@ -116,11 +116,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                   {g.output_rows, g.hidden});
 
     load_plan.materialization = binder.finish();
+    out.host_bank = family::collect_host_bank(binder, load_plan.materialization);
     return load_plan;
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+    : backing(std::move(materialized)),
+      host_bank(plan.host_bank.objects.empty() ? nullptr : family::HostBank::shared(plan.host_bank)) {
+    if (host_bank) { host_bank->attach(backing); }
     runtime.geometry              = plan.geometry;
     const family::TextGeometry& g = runtime.geometry;
     runtime.full_layers.resize(static_cast<std::size_t>(g.layers));

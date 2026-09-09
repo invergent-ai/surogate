@@ -22,6 +22,7 @@
 // file-scope globals with one struct and one accessor line.
 
 #include <array>
+#include <atomic>
 #include <mutex>
 
 namespace sinfer::ops {
@@ -39,7 +40,7 @@ public:
 
 private:
     struct Slot {
-        void* value = nullptr;
+        std::atomic<void*> value{nullptr};
         void (*destroy)(void*) = nullptr;
     };
     void* get_or_create(int index, void* (*create)(), void (*destroy)(void*));

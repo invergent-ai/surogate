@@ -318,10 +318,8 @@ int main(int argc, char** argv) {
         // absorbs one-time lazy work (FP8 plane derivation) so the measured
         // request reflects steady serving state.
         if (cli.prefill_warmup) {
-            std::string warm_text;
-            for (int i = 0; i < 300; ++i) { warm_text += "warm "; }
-            sinfer::PromptInput warm_input =
-                sinfer::product::prompt_from_text(warm_text, false);
+            // Warm the actual workload, whose prompt already obeys this model's context.
+            sinfer::PromptInput warm_input = input;
             sinfer::RequestOptions warm_request;
             warm_request.execution.requested_output_tokens = 1;
             warm_request.execution.allow_prefix_reuse      = false;
@@ -329,6 +327,7 @@ int main(int argc, char** argv) {
                 engine.submit(engine.prepare(std::move(warm_input)), std::move(warm_request));
             (void)warm_generation.wait(nullptr);
             engine.reset_memory_peaks();
+            request.execution.allow_prefix_reuse = false;
         }
 
         sinfer::PreparedPrompt prompt = engine.prepare(std::move(input));

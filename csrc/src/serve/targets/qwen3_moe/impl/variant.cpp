@@ -139,6 +139,9 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(const 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (family::run_banked_experts(weights.banked, weights.op, hidden, residual, workspace, stream)) {
+        return;
+    }
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 

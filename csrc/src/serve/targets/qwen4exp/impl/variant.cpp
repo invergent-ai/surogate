@@ -12,6 +12,7 @@
 #include "api/ops/scatter.h"
 #include "api/ops/sparse_moe.h"
 #include "core/device.h"
+#include "core/engine_context.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <stdexcept>
 #include <unordered_map>
@@ -73,17 +75,22 @@ inline void check_device_handoff(const char* what, int produced_on) {
 }
 
 struct InjectScratch {
+    std::unique_ptr<DeviceArena> storage;
     void* data        = nullptr;
     std::size_t bytes = 0;
 };
 
+struct InjectRegistry {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, InjectScratch> buffers;
+};
+
 InjectScratch& inject_scratch_for_current_device(std::int32_t streams) {
-    static std::mutex mutex;
-    static std::unordered_map<std::uint64_t, InjectScratch> registry;
+    auto& registry = ops::engine_slot<InjectRegistry>();
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
-    const std::lock_guard<std::mutex> lock(mutex);
-    return registry[(std::uint64_t(device) << 32U) | std::uint32_t(streams)];
+    const std::lock_guard<std::mutex> lock(registry.mutex);
+    return registry.buffers[(std::uint64_t(device) << 32U) | std::uint32_t(streams)];
 }
 
 std::vector<GraphExecutionProfile>
@@ -214,6 +221,14 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
     if (t_inject.data == nullptr || t_inject.ne[1] != residual.ne[1]) {
         throw std::logic_error("qwen4exp: combine without a matching mix");
     }
+    if (family::ExpertCache::pool_floor() == 0) {
+        ops::hyper_connection_combine(block_output, t_inject, residual, stream);
+        g_dump_block += 1;
+        check_device_handoff("the inject gates", t_inject_device);
+        t_inject_device = -1;
+        t_inject = Tensor{};
+        return;
+    }
     family::ExpertCache& cache = family::ExpertCache::for_current_device(
         moe_geometry(g), (g.layers + g.mtp_layers));
     cache.tick_combine();
@@ -281,30 +296,35 @@ void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& 
 }
 
 void Variant::prepare_expert_split(const ModelView& model) {
+    if (family::ExpertCache::pool_floor() == 0) { return; }
     const auto& g = model.geometry;
     family::ExpertCache& cache = family::ExpertCache::for_current_device(
         moe_geometry(g), (g.layers + g.mtp_layers));
-    // The first mixture layer whose experts are in the host bank: what the measurement runs on.
-    for (const auto& gdn : model.gdn_layers) {
-        const SparseMoePayload& payload = gdn.post_mixer;
-        if (payload.layer < 0 || payload.host_gate_up == nullptr) { continue; }
-        cache.prepare_split(family::BankedMixture{payload.layer, (g.layers + g.mtp_layers),
-                                                  &payload.op, payload.gate_up_planes,
-                                                  payload.down_planes, payload.host_gate_up,
-                                                  payload.host_down});
-        return;
-    }
-    cache.prepare_split(family::BankedMixture{});
+    const auto prepare = [&](const auto& layers) {
+        for (const auto& layer : layers) {
+            const auto& payload = layer.post_mixer;
+            if (payload.layer < 0 || payload.host_gate_up == nullptr) { continue; }
+            cache.prepare_split(family::BankedMixture{payload.layer, g.layers + g.mtp_layers,
+                &payload.op, payload.gate_up_planes, payload.down_planes,
+                payload.host_gate_up, payload.host_down});
+            return true;
+        }
+        return false;
+    };
+    if (!prepare(model.gdn_layers)) { (void)prepare(model.full_layers); }
+
 }
 
 void Variant::prewarm_device_scratch(const family::TextGeometry& g) {
     InjectScratch& scratch = inject_scratch_for_current_device(g.hc_streams);
     if (scratch.data == nullptr) {
         scratch.bytes = kInjectScratchTokens * g.hc_streams * sizeof(float);
-        CUDA_CHECK(cudaMalloc(&scratch.data, scratch.bytes));
+        scratch.storage = std::make_unique<DeviceArena>(scratch.bytes);
+        scratch.data = scratch.storage->base();
     }
-    (void)family::ExpertCache::for_current_device(moe_geometry(g),
-                                                  (g.layers + g.mtp_layers));
+    if (family::ExpertCache::pool_floor() != 0) {
+        (void)family::ExpertCache::for_current_device(moe_geometry(g), g.layers + g.mtp_layers);
+    }
 }
 
 void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
@@ -591,9 +611,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     // The MoE op adds into its destination; a zeroed plane turns that into a plain store.
     Tensor output = workspace.alloc(DType::BF16, {g.hidden, tokens});
     CUDA_CHECK(cudaMemsetAsync(output.data, 0, output.bytes(), stream));
-    family::ExpertCache& cache = family::ExpertCache::for_current_device(
-        moe_geometry(g), (g.layers + g.mtp_layers));
-    if (cache.enabled()) {
+    if (weights.host_gate_up != nullptr) {
+        auto& cache = family::ExpertCache::for_current_device(moe_geometry(g), g.layers + g.mtp_layers);
         // Routed experts come from the device slot pool, and the misses the split hands the
         // host come back as a partial the combine adds (family/impl/moe/expert_cache.h).
         cache.run(family::BankedMixture{weights.layer, (g.layers + g.mtp_layers), &weights.op,

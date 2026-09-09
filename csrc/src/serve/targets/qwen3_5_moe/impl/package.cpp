@@ -17,6 +17,14 @@ SINFER_TARGET_LOAD_PIMPL();
 } // namespace sinfer::targets::qwen3_5_moe::detail
 
 namespace sinfer::targets::qwen3_5_moe {
+
+namespace {
+ops::SparseMoeGeometry offload_geometry(const family::TextGeometry& g) {
+    ops::SparseMoeGeometry out{g.hidden, g.experts, g.experts_per_token, g.intermediate};
+    out.shared_intermediate = g.shared_intermediate;
+    return out;
+}
+} // namespace
 namespace {
 
 constexpr ModelSamplingDefaults kQwen3_6_35BA3BDefaults{
@@ -61,11 +69,16 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile,
-        detail::bind_artifact(binder, family::startup_features(options), weights_profile,
+    binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
+                       static_cast<std::uint32_t>(options.pipeline_stage_first));
+    auto plan = detail::bind_artifact(binder, family::startup_features(options), weights_profile,
                               options.host_moe_layers, options.gpu_layers,
-                              options.load_progress)));
+                              options.load_progress);
+    const auto& g = plan.bindings.geometry;
+    family::plan_banked_experts(binder, plan.bindings.host_bank, plan.materialization,
+                                options, offload_geometry(g), g.layers + g.mtp_layers,
+                                ops::LinearPolicy::AllowA4);
+    return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile, std::move(plan)));
 }
 
 SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
@@ -98,8 +111,12 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         WeightsProfile weights_profile,
                                                         const family::TextGeometry& geometry,
                                                         const family::VisionGeometry& vision_geometry) {
-    return family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
-                                                         geometry, vision_geometry);
+    auto planner = family::make_sequence_planner<detail::Variant>(device, options, weights_profile,
+                                                                  geometry, vision_geometry);
+    family::configure_banked_experts(device, options, offload_geometry(geometry),
+                                     geometry.layers + geometry.mtp_layers,
+                                     planner.capacity_curve().minimum_device_reservation_bytes);
+    return planner;
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
@@ -114,9 +131,18 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     // has to happen before the program captures its decode graphs; every layer shares the
     // geometry and the tactic, so tuning against one layer's weights tunes them all.
     if (model.impl_->weights_profile == WeightsProfile::RoutedNvfp4) {
-        ops::sparse_moe_prepare(model.impl_->data.runtime.gdn_layers.at(0).post_mixer.op,
-                                ops::kSparseMoeTrtllmPrepareWidth, device.stream);
+        const auto prepare = [&](const auto& layers) {
+            for (const auto& layer : layers) {
+                if (layer.post_mixer.op.routed_gate_up.qtype == QType::NVFP4) {
+                    ops::sparse_moe_prepare(layer.post_mixer.op, ops::kSparseMoeTrtllmPrepareWidth, device.stream);
+                    return;
+                }
+            }
+        };
+        prepare(model.impl_->data.runtime.gdn_layers);
+        prepare(model.impl_->data.runtime.full_layers);
     }
+    family::prepare_banked_experts(model.impl_->data.runtime);
     return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }

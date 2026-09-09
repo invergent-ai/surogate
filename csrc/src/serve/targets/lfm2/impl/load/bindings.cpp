@@ -203,11 +203,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_weight(binder, "text/output_head", vocabulary_format, {g.output_rows, g.hidden});
 
     load_plan.materialization = binder.finish();
+    out.host_bank = family::collect_host_bank(binder, load_plan.materialization);
     return load_plan;
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+    : backing(std::move(materialized)),
+      host_bank(plan.host_bank.objects.empty() ? nullptr : family::HostBank::shared(plan.host_bank)) {
+    if (host_bank) { host_bank->attach(backing); }
     runtime.geometry              = plan.geometry;
     const family::TextGeometry& g = runtime.geometry;
 
@@ -215,7 +218,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     // its own kind is its position among the layers of that kind, counted in order -- which is
     // exactly what the runtime's `full_idx` and `gdn_idx` compute for the same schedule.
     std::size_t attending = 0;
-    for (const TextLayerPlan& source : plan.text_layers) { attending += source.attends ? 1U : 0U; }
+    for (std::size_t layer = 0; layer < plan.text_layers.size(); ++layer) {
+        const TextLayerPlan& source = plan.text_layers[layer]; attending += source.attends ? 1U : 0U; }
     runtime.full_layers.resize(attending);
     runtime.gdn_layers.resize(plan.text_layers.size() - attending);
     frontend = family::take_frontend_resources(backing, plan.frontend);
@@ -228,7 +232,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     std::size_t full_index = 0;
     std::size_t conv_index = 0;
-    for (const TextLayerPlan& source : plan.text_layers) {
+    for (std::size_t layer = 0; layer < plan.text_layers.size(); ++layer) {
+        const TextLayerPlan& source = plan.text_layers[layer];
         const Tensor input_norm = artifact::materialized_tensor(backing, source.input_norm,
                                                                 NumericFormat::BF16, {g.hidden});
         const Tensor post_norm  = artifact::materialized_tensor(
@@ -248,6 +253,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 materialized_weight(backing, source.attention.output, g.hidden, g.query_size());
             target.post_attention_norm = post_norm;
             target.post_mixer          = load_mlp(source.mlp, backing, g);
+            target.post_mixer.banked = family::bind_banked_experts(
+                target.post_mixer.moe, host_bank.get(), source.mlp.gate_up.object,
+                source.mlp.down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
         } else {
             ConvWeights& target = runtime.gdn_layers.at(conv_index++);
             target.input_norm   = input_norm;
@@ -266,6 +274,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                              g.hidden, g.hidden);
             target.post_attention_norm = post_norm;
             target.post_mixer          = load_mlp(source.mlp, backing, g);
+            target.post_mixer.banked = family::bind_banked_experts(
+                target.post_mixer.moe, host_bank.get(), source.mlp.gate_up.object,
+                source.mlp.down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
         }
     }
 

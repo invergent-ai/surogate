@@ -73,7 +73,7 @@ struct W8Planes {
     out.shape[0]         = rows;
     out.shape[1]         = k;
     out.padded_shape[0]  = rows;
-    out.padded_shape[1]  = k;
+    out.padded_shape[1]  = static_cast<std::int32_t>(planes.codes_bytes_per_row);
     return out;
 }
 
@@ -307,6 +307,8 @@ struct GatherQ4Bank {
     std::uint64_t groups_per_expert = 0;
     std::uint64_t dst_codes_bytes   = 0; // per expert (pool stride)
     std::uint64_t dst_scales_bytes  = 0;
+    std::uint32_t source_row_groups = 0;
+    std::uint32_t destination_row_groups = 0;
 };
 
 struct GatherQ4Params {
@@ -361,10 +363,12 @@ __global__ void __launch_bounds__(kGatherThreads)
             }
             out[w] = packed_out;
         }
-        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + group * 32;
+        const auto destination_group = b.source_row_groups == 0 ? group :
+            (group / b.source_row_groups) * b.destination_row_groups + group % b.source_row_groups;
+        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + destination_group * 32;
         __stcs(reinterpret_cast<uint4*>(dst), make_uint4(out[0], out[1], out[2], out[3]));
         __stcs(reinterpret_cast<uint4*>(dst + 16), make_uint4(out[4], out[5], out[6], out[7]));
-        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + group * 2) =
+        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + destination_group * 2) =
             __float2half_rn(scale);
     }
 }
@@ -420,10 +424,12 @@ __global__ void __launch_bounds__(kGatherThreads)
             }
             out[w] = packed_out;
         }
-        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + group * 32;
+        const auto destination_group = b.source_row_groups == 0 ? group :
+            (group / b.source_row_groups) * b.destination_row_groups + group % b.source_row_groups;
+        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + destination_group * 32;
         __stcs(reinterpret_cast<uint4*>(dst), make_uint4(out[0], out[1], out[2], out[3]));
         __stcs(reinterpret_cast<uint4*>(dst + 16), make_uint4(out[4], out[5], out[6], out[7]));
-        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + group * 2) =
+        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + destination_group * 2) =
             __float2half_rn(scale);
     }
 }
@@ -441,6 +447,8 @@ struct GatherGgmlBank {
     std::uint64_t src_bytes_per_expert = 0;
     std::uint64_t dst_codes_bytes   = 0;
     std::uint64_t dst_scales_bytes  = 0;
+    std::uint32_t source_row_groups = 0;
+    std::uint32_t destination_row_groups = 0;
 };
 
 struct GatherGgmlIds {
@@ -482,10 +490,12 @@ __global__ void __launch_bounds__(kGatherThreads)
             }
             out[w] = packed_out;
         }
-        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + group * 32;
+        const auto destination_group = b.source_row_groups == 0 ? group :
+            (group / b.source_row_groups) * b.destination_row_groups + group % b.source_row_groups;
+        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + destination_group * 32;
         __stcs(reinterpret_cast<uint4*>(dst), make_uint4(out[0], out[1], out[2], out[3]));
         __stcs(reinterpret_cast<uint4*>(dst + 16), make_uint4(out[4], out[5], out[6], out[7]));
-        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + group * 2) =
+        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + destination_group * 2) =
             __float2half_rn(scale);
     }
 }
@@ -543,8 +553,8 @@ std::size_t expert_slot_pool_bytes(const SparseMoeGeometry& geometry, std::int32
     if (slots <= 0) { throw std::invalid_argument("expert_slot_cache: slots must be positive"); }
     const std::int64_t gate_rows = static_cast<std::int64_t>(slots) * geometry.expert_rows();
     const std::int64_t down_rows = static_cast<std::int64_t>(slots) * geometry.hidden;
-    const W8Planes gate = w8_planes(gate_rows, geometry.hidden);
-    const W8Planes down = w8_planes(down_rows, geometry.intermediate);
+    const W8Planes gate = w8_planes(gate_rows, (geometry.hidden + 127) / 128 * 128);
+    const W8Planes down = w8_planes(down_rows, (geometry.intermediate + 127) / 128 * 128);
     return align_up(gate.codes_plane_bytes) + align_up(gate.scales_plane_bytes) +
            align_up(down.codes_plane_bytes) + align_up(down.scales_plane_bytes);
 }
@@ -574,8 +584,8 @@ ExpertSlotPool create_expert_slot_pool(const SparseMoeGeometry& geometry, std::i
     }
     const std::int32_t gate_rows = slots * geometry.expert_rows();
     const std::int32_t down_rows = slots * geometry.hidden;
-    const W8Planes gate = w8_planes(gate_rows, geometry.hidden);
-    const W8Planes down = w8_planes(down_rows, geometry.intermediate);
+    const W8Planes gate = w8_planes(gate_rows, (geometry.hidden + 127) / 128 * 128);
+    const W8Planes down = w8_planes(down_rows, (geometry.intermediate + 127) / 128 * 128);
     auto* base = static_cast<std::byte*>(device_bytes);
     ExpertSlotPool pool;
     pool.slots          = slots;
@@ -749,7 +759,7 @@ void fill_bank_half(const SparseMoeGeometry& geometry, const ExpertBankHalfSourc
         return;
     }
     if (w.qtype == QType::W8G32_F16S && w.layout == QuantLayout::RowSplit) {
-        const W8Planes planes = w8_planes(rows_per_expert, k);
+        const W8Planes planes = w8_planes(rows_per_expert, w.padded_shape[1]);
         format       = ExpertBankFormat::W8G32;
         codes        = static_cast<const std::byte*>(w.qdata);
         scales       = static_cast<const std::byte*>(w.scales);
@@ -881,6 +891,27 @@ namespace {
 
 /// Gathers one half of the missed experts into the pool by that half's format. The pool
 /// always holds W8, so a W8 half is a copy and the other two decode a 32-group at a time.
+__global__ void gather_w8_rows(const std::byte* codes, const std::byte* scales,
+                               std::byte* destination_codes, std::byte* destination_scales,
+                               const int* slots, const int* experts, const long long* count,
+                               std::uint64_t groups_per_expert, int source_row_groups,
+                               int destination_row_groups, std::uint64_t destination_groups) {
+    const auto total = static_cast<std::uint64_t>(*count) * groups_per_expert;
+    for (std::uint64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const auto miss = i / groups_per_expert;
+        const auto group = i % groups_per_expert;
+        const auto source = experts[miss] * groups_per_expert + group;
+        const auto dest = slots[miss] * destination_groups +
+            group / source_row_groups * destination_row_groups + group % source_row_groups;
+        auto* output = reinterpret_cast<uint4*>(destination_codes + dest * 32);
+        const auto* input = reinterpret_cast<const uint4*>(codes + source * 32);
+        output[0] = input[0]; output[1] = input[1];
+        reinterpret_cast<std::uint16_t*>(destination_scales)[dest] =
+            reinterpret_cast<const std::uint16_t*>(scales)[source];
+    }
+}
+
 void gather_half(const ExpertHostBank& bank, bool gate_up, const ExpertMissList& misses,
                  ExpertSlotPool& pool, cudaStream_t stream) {
     const ExpertBankFormat format = gate_up ? bank.gate_up_format : bank.down_format;
@@ -899,10 +930,16 @@ void gather_half(const ExpertHostBank& bank, bool gate_up, const ExpertMissList&
     // The destination strides are the pool's, not the bank's: one group is 32 code bytes and
     // one f16 scale however many bytes the bank's form of it took.
     const std::uint64_t groups = scales_bytes / 2;
+    const Weight& destination = gate_up ? pool.routed_gate_up : pool.routed_down;
+    const auto rows_per_expert = destination.n / pool.slots;
+    const auto source_row_groups = static_cast<std::uint32_t>(groups / rows_per_expert);
+    const auto destination_row_groups = static_cast<std::uint32_t>(destination.padded_shape[1] / 32);
+    const auto destination_groups = static_cast<std::uint64_t>(rows_per_expert) * destination_row_groups;
     if (format == ExpertBankFormat::GgmlBlocks) {
         const GatherGgmlIds ids{miss_slots, miss_experts, miss_count};
         const GatherGgmlBank half{reinterpret_cast<const std::uint8_t*>(codes), dst_codes,
-                                  dst_scales, groups, codes_bytes, groups * 32, groups * 2};
+                                  dst_scales, groups, codes_bytes, destination_groups * 32, destination_groups * 2,
+                                  source_row_groups, destination_row_groups};
         launch_ggml_gather(gate_up ? bank.gate_up_ggml : bank.down_ggml, half, ids, stream);
         return;
     }
@@ -917,8 +954,9 @@ void gather_half(const ExpertHostBank& bank, bool gate_up, const ExpertMissList&
                       dst_codes,
                       dst_scales,
                       groups,
-                      groups * 32,
-                      groups * 2};
+                      destination_groups * 32,
+                      destination_groups * 2,
+                      source_row_groups, destination_row_groups};
         p.miss_slots   = miss_slots;
         p.miss_experts = miss_experts;
         p.miss_count   = miss_count;
@@ -927,6 +965,13 @@ void gather_half(const ExpertHostBank& bank, bool gate_up, const ExpertMissList&
         } else {
             gather_unpack_q5_kernel<<<kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
         }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (source_row_groups != destination_row_groups) {
+        gather_w8_rows<<<kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(
+            codes, scales, dst_codes, dst_scales, miss_slots, miss_experts, miss_count,
+            groups, source_row_groups, destination_row_groups, destination_groups);
         CUDA_CHECK(cudaGetLastError());
         return;
     }

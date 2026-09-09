@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 
 #include <algorithm>
+#include <charconv>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -9,6 +10,18 @@
 
 namespace sinfer::artifact {
 namespace {
+
+std::optional<std::uint32_t> decoder_layer(std::string_view name) {
+    constexpr std::string_view prefix = "text/layers/";
+    if (!name.starts_with(prefix)) { return std::nullopt; }
+    name.remove_prefix(prefix.size());
+    const auto slash = name.find('/');
+    if (slash == std::string_view::npos) { return std::nullopt; }
+    std::uint32_t layer = 0;
+    const auto result = std::from_chars(name.data(), name.data() + slash, layer);
+    if (result.ec != std::errc{} || result.ptr != name.data() + slash) { return std::nullopt; }
+    return layer;
+}
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     const std::uint64_t mask = alignment - 1;
@@ -24,6 +37,29 @@ Binder::Binder(const Reader& reader)
     : reader_(reader), consumed_(reader.objects().size(), false),
       planned_(reader.objects().size(), false) {
     materialization_.object_count = reader.objects().size();
+}
+
+void Binder::set_offload(std::optional<std::uint32_t> gpu_layers,
+                         std::uint32_t host_moe_layers, std::uint32_t stage_first) {
+    gpu_layers_ = gpu_layers;
+    host_moe_layers_.clear();
+    for (const auto& object : reader_.objects()) {
+        const auto name = object_name(object);
+        const auto layer = decoder_layer(name);
+        if (layer && *layer >= stage_first && name.ends_with("/routed_gate_up")) {
+            host_moe_layers_.push_back(*layer);
+        }
+    }
+    std::sort(host_moe_layers_.begin(), host_moe_layers_.end());
+    if (host_moe_layers_.size() > host_moe_layers) { host_moe_layers_.resize(host_moe_layers); }
+}
+
+bool Binder::offloads(std::string_view name) const {
+    const auto layer = decoder_layer(name);
+    if (!layer) { return false; }
+    if (gpu_layers_ && *layer >= *gpu_layers_) { return true; }
+    return (name.ends_with("/routed_gate_up") || name.ends_with("/routed_down")) &&
+           std::binary_search(host_moe_layers_.begin(), host_moe_layers_.end(), *layer);
 }
 
 bool Binder::has(std::string_view name) const noexcept {
@@ -113,6 +149,10 @@ void Binder::materialize_on_device(ObjectHandle handle) {
     if (tensor == nullptr) {
         throw ArtifactError("resource cannot be materialized as a device tensor");
     }
+    if (offloads(tensor->name)) {
+        bank_on_host(handle);
+        return;
+    }
     if (planned_[handle.index]) {
         throw ArtifactError("artifact object has more than one materialization placement: " +
                             std::string(tensor->name));
@@ -149,19 +189,6 @@ void Binder::bank_on_host(ObjectHandle handle) {
     if (planned_[handle.index]) {
         throw ArtifactError("artifact object has more than one materialization placement: " +
                             std::string(tensor->name));
-    }
-    // The bank holds an object's stored bytes. An object the device loader would *rearrange* on
-    // the way in -- a Q8_0 projection whose op reads row-split W8 planes, a tensor whose columns
-    // are permuted into the order the activation expects -- is not the same object once copied
-    // verbatim, and a kernel reading it would produce plausible garbage rather than fail. Until
-    // the bank can run those transforms on its way in, this is a refusal.
-    // A transform is honoured -- the bank runs the loader's own kernel and holds the rearranged
-    // planes -- but a column permutation without one is not: that map is uploaded beside the
-    // device weights and read at every launch, and a banked object has no equivalent.
-    if (tensor->transform == PayloadTransform::None && !tensor->group_map.empty()) {
-        throw ArtifactError("cannot bank " + std::string(tensor->name) +
-                            " in host memory: its columns are permuted at load, and the map that "
-                            "undoes it is built for device-resident weights only.");
     }
     materialization_.bank_objects.push_back(BankMaterialization{handle});
     planned_[handle.index] = true;

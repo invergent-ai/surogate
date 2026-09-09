@@ -269,11 +269,6 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     for (std::size_t layer = 0; layer < g.layers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
-        // Past `gpu_layers` the whole layer is read from pinned host memory; below it, only the
-        // routed experts, and only if `host_moe_layers` asked. Both counts are whole-model.
-        const artifact::ScopedPlacement placed(
-            gpu_layers != 0 && layer >= gpu_layers ? artifact::TensorPlacement::HostBank
-                                                   : artifact::TensorPlacement::Device);
         target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
                                                                 NumericFormat::BF16, {g.hidden});
         target.is_full_attention = g.layer_attends(layer);
@@ -327,8 +322,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
         target.moe = bind_moe(binder, prefix + "moe/",
                               artifact::ScopedPlacement::current(), g,
-                              layer < host_moe_layers ? artifact::TensorPlacement::HostBank
-                                                      : artifact::TensorPlacement::Device);
+                              artifact::TensorPlacement::Device);
     }
 
     out.final_norm =
@@ -518,6 +512,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             target.post_mixer = load_moe(source.moe, backing, g);
+            target.post_mixer.banked = family::bind_banked_experts(
+                target.post_mixer.op, host_bank.get(), source.moe.routed_gate_up.object,
+                source.moe.routed_down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
         } else {
             GdnWeights& target = gdn_layers.at(gdn_index++);
             target.input_norm  = artifact::materialized_tensor(backing, source.input_norm,
@@ -548,6 +545,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
             target.post_mixer = load_moe(source.moe, backing, g);
+            target.post_mixer.banked = family::bind_banked_experts(
+                target.post_mixer.op, host_bank.get(), source.moe.routed_gate_up.object,
+                source.moe.routed_down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
         }
     }
     if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {

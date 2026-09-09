@@ -264,11 +264,17 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (family::run_banked_experts(weights.banked, weights.op, hidden, residual, workspace, stream)) {
+        return;
+    }
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (family::run_banked_experts(weights.banked, weights.op, hidden, residual, workspace, stream)) {
+        return;
+    }
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 

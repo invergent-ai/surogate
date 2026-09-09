@@ -18,7 +18,8 @@ surogate serve ~/models/qwen3.6-27b-Q4_K_M.gguf
 
 From a source checkout, build serving support with `make serve-build`.
 `surogate serve --engine-help` prints server help. Add `--generate` or `--embed` to see the
-options for those modes.
+options for those modes. Help does not prepare or download a model. Options may appear before
+or after the model, and value options accept both `--flag value` and `--flag=value`.
 
 ## Server options
 
@@ -46,12 +47,13 @@ from earlier tokens; its capacity affects how many requests can run together.
 | `--kv-capacity N\|auto` | follows context | Total cache capacity in tokens; `auto` sizes from free GPU memory, leaving 1024 MiB |
 | `--kv-cache-dtype auto\|fp8\|bf16\|int8` | `auto` | Choose cache precision automatically for the model, or force a specific format |
 | `--kv-cache-dtype-skip-layers L,...` | none | Keep the listed attention layers' cache at BF16 |
+| `--elastic-kv` | on | Grow cache memory use with demand |
 | `--no-elastic-kv` | off | Reserve the full cache in GPU memory instead of growing memory use with demand |
 | `--elastic-kv-overcommit` | off | Let several models share unused GPU memory for their caches |
 | `--no-cache` | off | Rebuild the prepared model cache on disk |
 | `--no-prefix-reuse` | off | Disable reuse of compatible earlier prompts |
 | `--enable-prefix-caching`, `--no-enable-prefix-caching` | enabled | Alternative spellings for enabling or disabling prompt reuse |
-| `--rewrite-checkpoints` | off | Use extra memory to make editing and resending the last turn faster |
+| `--rewrite-checkpoints`, `--no-rewrite-checkpoints` | off | Enable or disable extra memory for faster editing and resending of the last turn |
 | `--enforce-eager` | off | Disable CUDA graphs for debugging |
 
 When `--max-model-len` is automatic, omitted `--kv-capacity` also defaults to `auto`. When
@@ -71,6 +73,10 @@ enough for one full-context request per model. See [Serving models](serving-mode
 | `--device N` | 0 | Use one GPU |
 | `--devices A,B,...` | — | Split a supported model across the listed GPUs |
 
+`--devices` takes precedence over `--device`; its first GPU is also used for model preparation.
+With one GPU, preparation follows `--device`. `SUROGATE_CONVERT_DEVICE` overrides the preparation
+device when needed. GPU indices follow `CUDA_VISIBLE_DEVICES`.
+
 Multiple GPUs are supported for GLM-5.3-Flash, Qwen3.8 Flash-Next, Qwen3.5/3.6/3.8 dense
 models, and Qwen3.5/3.6 MoE models. MTP can be used with these models when their checkpoint
 includes compatible MTP weights.
@@ -86,8 +92,12 @@ weights; that memory cannot be swapped out while the model is loaded.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--host-moe-layers N\|auto\|all` | off | Move MoE expert weights to RAM; with multiple GPUs, `auto` chooses how much to offload on each GPU |
-| `--gpu-layers N\|all`, `-ngl N` | all | Keep N model layers on the GPU and use RAM for the rest |
+| `--host-moe-layers N\|auto\|all` | off | Move experts from N MoE layers to RAM; `auto` chooses enough to fit on one GPU or each GPU in a multi-GPU run |
+| `--gpu-layers N\|all`, `-ngl N`, `--n-gpu-layers N` | all | Keep the first N decoder layers on the GPU; `0` offloads all decoder layers, and `all` keeps them resident |
+
+Whole-layer offload works with every supported generation model. Embeddings, the output head,
+and any enabled image encoder still need GPU memory. MoE-specific options apply only to MoE
+models and only affect experts that are offloaded.
 
 For a mixture-of-experts (MoE) model, try `--host-moe-layers` first. It generally transfers
 less data than offloading whole layers.
@@ -99,16 +109,20 @@ surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
 
 ### MoE expert cache
 
-Flash-Next and GLM-5.3-Flash can keep frequently used offloaded experts on the GPU and use CPU
-cores for some expert computation. These settings apply when the model has offloaded experts.
+Every supported MoE generation model can cache offloaded experts on the GPU and use CPU
+cores for some expert computation. Enable expert offload with `--host-moe-layers` or offload
+whole layers with `--gpu-layers` before using these settings.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--expert-slots N` | automatic where supported | Number of experts cached on the GPU; omitted or `0` lets the model choose based on available memory |
+| `--expert-slots N` | automatic | Number of experts cached on the GPU; omitted or `0` sizes the cache from available memory. An explicit count must hold at least one layer’s experts |
 | `--host-expert-bank auto\|w8\|q4` | `auto` | Precision of offloaded experts. `w8` uses eight bits throughout; `q4` uses four bits, saving RAM but potentially reducing quality |
 | `--cpu-moe-share F\|auto` | off | Fraction of expert work sent to CPU cores; `auto` measures the machine at startup |
-| `--cpu-moe-prefill-share F` | 0.5 when CPU sharing is on | CPU share during prompt processing; `0` disables it |
+| `--cpu-moe-prefill-share F` | 0 | CPU share during prompt processing; `0` disables it |
 | `--cpu-moe-min-tokens N` | model default | Minimum token count before CPU sharing is used |
+
+CPU shares must be numbers from `0` to `1`; decode also accepts `auto`. They apply to cache
+misses, so a fully cached expert does not need CPU execution.
 
 Automatic host precision keeps four-bit, five-bit, and wider source weights at suitable
 precisions. Force `q4` only when you want the RAM saving from reducing wider weights to four bits.
@@ -267,7 +281,7 @@ save only the answer. This mode uses `--max-context` instead of `--max-model-len
 | `--prefill-chunk N` | Prompt-processing size; default 2048 |
 | `--stop <text>`, `--stop-token-id N`, `--reasoning-stop <text>` | Repeatable stop conditions |
 | `--raw-output`, `--print-token-ids` | Verbatim output or token ids |
-| `--prefill-warmup` | Warm up before timing prompt processing |
+| `--prefill-warmup` | Run the supplied prompt once before timing; the measured run processes the prompt again |
 | `--no-cuda-graph` | Disable CUDA graphs for debugging |
 | `--reasoning-effort minimal\|low\|medium\|high\|xhigh\|max` | Reasoning setting, where the model supports it |
 
@@ -302,5 +316,5 @@ See [CPU embedding examples](serving-models.md#on-cpu).
 | Variable | Meaning |
 |---|---|
 | `SUROGATE_SERVE_CACHE` | Prepared-model cache directory; default `~/.cache/surogate/serve` |
-| `SUROGATE_CONVERT_DEVICE` | Device used during conversion, such as `cuda` or `cpu` |
+| `SUROGATE_CONVERT_DEVICE` | Override the preparation device, such as `cuda:1` or `cpu`; otherwise follows the serving GPU |
 | `SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB` | GPU memory kept free when sharing caches across models; default 1024 MiB |

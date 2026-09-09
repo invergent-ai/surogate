@@ -131,6 +131,7 @@ MixturePostMixerPayload load_mlp(const MlpPlan& plan,
 void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile,
                       std::uint32_t host_moe_layers, std::uint32_t gpu_layers, BindingPlan& out) {
     (void)gpu_layers;
+    (void)host_moe_layers;
     family::TextGeometry& g     = out.geometry;
     const std::size_t layers    = static_cast<std::size_t>(g.layers);
     out.text_layers.resize(layers);
@@ -223,9 +224,6 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile,
         // run for every token where an expert runs for one in sixteen, and together they are
         // 0.4 MB against the bank's 800.
         {
-            const artifact::ScopedPlacement experts(
-                layer < host_moe_layers ? artifact::TensorPlacement::HostBank
-                                        : artifact::ScopedPlacement::current());
             target.mlp.routed_gate_up = artifact::bind_linear(
                 binder, prefix + "moe/routed_gate_up", routed_gate_up_rows(g), g.hidden);
             target.mlp.routed_down = artifact::bind_linear(binder, prefix + "moe/routed_down",
@@ -350,6 +348,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         target.post_attention_norm =
             materialized_norm(backing, source.pre_feedforward_norm, g.hidden);
         target.post_mixer = load_mlp(source.mlp, backing, g);
+            target.post_mixer.banked = family::bind_banked_experts(
+                target.post_mixer.op, host_bank.get(), source.mlp.routed_gate_up.object,
+                source.mlp.routed_down.object, static_cast<std::int32_t>(layer), g.layers + g.mtp_layers);
     }
     static_assert(kGdnLayers == 0, "a Gemma 4 layer is never a linear mixer");
 

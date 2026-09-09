@@ -141,6 +141,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
+                       static_cast<std::uint32_t>(options.pipeline_stage_first));
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, family::startup_features(options))));

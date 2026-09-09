@@ -321,7 +321,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     // residual. The memset is one hidden-wide plane per layer; teaching the op a second
     // epilogue would touch four kernel families to save it.
     CUDA_CHECK(cudaMemsetAsync(routed.data, 0, routed.bytes(), stream));
-    {
+    if (!family::run_banked_experts(weights.banked, weights.op, routed_input, routed,
+                                    workspace, stream, &router_input)){
         auto moe_scope           = workspace.scope();
         const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
             ops::sparse_moe_geometry(weights.op), weights.op.routed_gate_up.qtype, weights.op.routed_down.qtype, columns,
