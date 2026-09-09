@@ -9,9 +9,8 @@
 
 Surogate requires a recent NVIDIA driver and CUDA libraries.
 
-Commonly used CUDA versions:
-- CUDA 12.8
-- CUDA 12.9
+Supported CUDA versions:
+- CUDA 12.8 or newer in the 12.x line
 - CUDA 13.x
 
 Multi-GPU training requires NCCL.
@@ -41,7 +40,7 @@ source .venv/bin/activate
 ## Option B: Build from source (developers)
 
 Prerequisites:
-- CUDA toolkit (12.8/12.9/13.x)
+- CUDA toolkit (12.8+ or 13.x)
 - NCCL development libraries
 
 From the repository root:

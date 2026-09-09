@@ -163,7 +163,7 @@ For per-family format support, conversion behavior, and hardware details, see th
 
 ### Install
 
-Use **Linux x86_64 and Python 3.12** with a supported NVIDIA GPU and CUDA 12.8, 12.9, or 13.x. See [hardware](#hardware) for the separate training and serving GPU targets.
+Use **Linux x86_64 and Python 3.12** with a supported NVIDIA GPU and CUDA 12.8+ or 13.x. See [hardware](#hardware) for the separate training and serving GPU targets.
 
 ```bash
 curl -LsSf https://github.com/invergent-ai/surogate/releases/latest/download/install.sh | bash
@@ -269,7 +269,7 @@ Training buffers remain reserved during generation, so choose a model and contex
 <details>
 <summary><strong>Docker and source builds</strong></summary>
 
-CUDA-specific containers are available as `ghcr.io/invergent-ai/surogate:latest-cu128` and `latest-cu130`. A CUDA 12.9 host uses the cu128 image.
+CUDA-specific containers are available as `ghcr.io/invergent-ai/surogate:latest-cu128` and `latest-cu130`.
 
 ```bash
 # From the directory containing train.yaml; output stays in ./output on the host.
@@ -305,7 +305,7 @@ Read [how training works](docs/about/how-it-works.md), the [DSL guide](docs/abou
 
 | Component | Current requirements / targets |
 |---|---|
-| **Platform** | Linux x86_64; published wheels target Python 3.12; CUDA 12.8, 12.9, or 13.x. |
+| **Platform** | Linux x86_64; published wheels target Python 3.12; CUDA 12.8+ or 13.x. |
 | **Training** | SM89+ in the current build: Ada (RTX 40 series, L4/L40), Hopper (H100/H200), and supported Blackwell targets. |
 | **FP8 / NVFP4 training** | FP8 requires SM89+; native NVFP4 requires a supported Blackwell GPU and matching build. |
 | **Generative serving** | Current default builds target **SM120a**: RTX 50 series and RTX PRO Blackwell. The SM89/Ada port compiles, with runtime validation pending. |
