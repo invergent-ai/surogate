@@ -39,9 +39,8 @@ jobs:
           #
           # Two wheels, not three. A binary built against 12.8 runs on any 12.x runtime -- CUDA
           # minor version compatibility -- and nothing here links torch, so there is no ABI
-          # tying a wheel to one toolkit. cu128 is what a CUDA 12.9 host installs. It also
-          # covers anyone whose driver predates CUDA 13, which is why it is not folded into
-          # cu130 as well.
+          # tying a wheel to one toolkit. cu128 covers the whole 12.x line, and anyone
+          # whose driver predates CUDA 13, which is why it is not folded into cu130 as well.
           - cuda_version: "12.8"
             cuda_build_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu128"

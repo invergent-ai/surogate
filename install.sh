@@ -80,27 +80,16 @@ fi
 
 install_cu128_deps() {
     local version="$1"
-    echo "Installing packages for CUDA 12.8..."
+    echo "Installing packages for CUDA 12.8+..."
     pip install "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" --index-url https://download.pytorch.org/whl/cu128
     pip install "vllm==0.25.1"
     install_surogate_wheel "$version" "cu128"
     pip install "nvidia-cuda-runtime-cu12==12.8.90" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.8.93" "nvidia-cudnn-cu12==9.19.0.56"
 }
 
-# CUDA 12.9 gets torch and the CUDA libraries built for 12.9, and the cu128 surogate wheel.
-# That is not a fallback: there is no cu129 wheel because there is nothing for one to do. A
-# binary built against 12.8 runs on any 12.x runtime, and nothing in the wheel links torch, so
-# no ABI ties it to a toolkit. The one thing 12.9 could compile that 12.8 could not was
-# sm_103a, which we do not target.
-install_cu129_deps() {
-    local version="$1"
-    echo "Installing packages for CUDA 12.9..."
-    pip install "torch==2.11.0+cu129" "torchvision==0.26.0+cu129" "torchaudio==2.11.0+cu129" --index-url https://download.pytorch.org/whl/cu129
-    pip install "vllm==0.25.1"
-    install_surogate_wheel "$version" "cu128"
-    pip install "nvidia-cuda-runtime-cu12==12.9.79" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.9.86" "nvidia-cudnn-cu12==9.19.0.56"
-}
-
+# One branch for the whole 12.x line. A binary built against 12.8 runs on any 12.x runtime
+# under CUDA minor version compatibility, and nothing in the wheel links torch, so no ABI ties
+# it to a toolkit.
 install_cu130_deps() {
     local version="$1"
     echo "Installing packages for CUDA 13+..."
@@ -205,8 +194,6 @@ fi
 
 if [[ "$CUDA_MAJOR" -ge 13 ]]; then
     install_cu130_deps "$VERSION"
-elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 9 ]]; then
-    install_cu129_deps "$VERSION"
 elif [[ "$CUDA_MAJOR" -eq 12 && "$CUDA_MINOR" -ge 8 ]]; then
     install_cu128_deps "$VERSION"
 else
