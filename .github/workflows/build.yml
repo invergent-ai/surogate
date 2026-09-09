@@ -26,9 +26,22 @@ on:
     branches:
       - main
       - release-*
+    # A release tag runs this too. The wheel builds its own engine and checks the wheel it
+    # produced, but two of the checks here have no equivalent there: that llama-quantize
+    # reports the revision we pinned, and that the products start at all.
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
+
+# One self-hosted runner takes one job at a time, so runs queue rather than pile onto the
+# machine -- but they still queue, and a full CUDA build is not quick. Superseding a branch or
+# pull request run is the right call; superseding a tag is not, because that run is the record
+# for a release, so tags are exempt from the cancellation.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   engine:
