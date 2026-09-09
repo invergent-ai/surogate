@@ -1,10 +1,20 @@
 name: Build
 
-# The engine gate. It builds the one binary the RTX line ships -- sm_89 for the 4090, sm_120a
-# for the 5090 and the RTX PRO 6000 -- and checks the result carries both, which is the property
-# a single binary is easy to lose silently: a kernel family pinned to one architecture, or a
-# build flag that quietly drops the other, still links and still passes every test on the
-# machine that built it.
+# The build gate: the serving engine, and the quantiser that ships beside it.
+#
+# The engine half builds the one binary the RTX line ships -- sm_89 for the 4090, sm_120a for
+# the 5090 and the RTX PRO 6000 -- and checks the result carries both, which is the property a
+# single binary is easy to lose silently: a kernel family pinned to one architecture, or a build
+# flag that quietly drops the other, still links and still passes every test on the machine that
+# built it.
+#
+# The quantiser half arrives here from a workflow of its own. `surogate quantize` drives
+# llama-quantize, which is fetched from llama.cpp at a pinned commit rather than vendored, and
+# the only other job that builds it is the release wheel -- which fires on a tag, far too late
+# to learn the pin no longer compiles. Its own job could never have told us either: it ran on a
+# hosted CPU runner, and this project declares CUDA a project language, so cmake goes looking
+# for nvcc and gives up before it reaches the quantiser at all. Here the toolkit is already
+# present and the ccache is already warm, so the check costs a fetch and a CPU build.
 #
 # Self-hosted, because it has to be: this tree is ~300 CUDA translation units over CUTLASS, and
 # the CUDA 13.1 toolkit the serve engine requires. A GitHub-hosted runner has neither the disk
@@ -22,7 +32,7 @@ on:
 
 jobs:
   engine:
-    name: Engine (sm_89 + sm_120a)
+    name: Engine (sm_89 + sm_120a) and quantiser
     runs-on: self-hosted
     container:
       image: nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04
@@ -69,11 +79,14 @@ jobs:
           cmake -S csrc -B csrc/build-ci -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DSUROGATE_REQUIRE_SERVE=ON \
+            -DSUROGATE_BUILD_QUANTIZER=ON \
             -DPYTHON_BINDING=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
-      - name: Build the engine
-        run: cmake --build csrc/build-ci --parallel "${PARALLEL_JOBS}" --target surogate-engine surogate-engine-cli surogate-embed
+      - name: Build the products
+        run: |
+          cmake --build csrc/build-ci --parallel "${PARALLEL_JOBS}" \
+            --target surogate-engine surogate-engine-cli surogate-embed llama-quantize
 
       - name: Show ccache stats
         run: ccache --show-stats
@@ -101,3 +114,40 @@ jobs:
             csrc/build-ci/"$binary" --help > /dev/null
           done
           echo "engine, cli and embed link and start"
+
+      # Installing is the half a wheel does, and where a wrong destination would show up: the
+      # binary, the converter, its conversion package and the `gguf` library the converter puts
+      # on sys.path all have to land inside `surogate/`, or an installed package has a command
+      # with nothing to run.
+      - name: The quantiser installs into the package
+        run: |
+          set -euo pipefail
+          cmake --install csrc/build-ci --prefix . --component quantizer
+          test -x surogate/serve/_llama_cpp/bin/llama-quantize
+          test -f surogate/serve/_llama_cpp/convert_hf_to_gguf.py
+          test -d surogate/serve/_llama_cpp/conversion
+          test -f surogate/serve/_llama_cpp/gguf-py/gguf/__init__.py
+          test -f surogate/serve/_llama_cpp/LICENSE
+
+      # The revision the binary reports has to be the revision we pinned. A tarball carries no
+      # git, so the commit reaches the binary through two CMake variables set by hand, and if the
+      # pin is bumped while they are not, every file this quantiser writes claims a provenance
+      # that never built it.
+      #
+      # There is no --version flag: it falls through to usage and exits 0, which is why the
+      # check this replaces could never have passed. `llama_print_build_info` runs after argument
+      # parsing and before the model is opened, so a dry run of a file that does not exist prints
+      # the build line and then fails on the missing model. That failure is the exit code, so it
+      # is deliberately discarded -- the assertion is the line, not the status.
+      - name: The quantiser reports the pinned revision
+        run: |
+          set -euo pipefail
+          pinned=$(grep -oP 'LLAMA_BUILD_COMMIT "\K[0-9a-f]+' csrc/cmake/llama_cpp_quantizer.cmake)
+          echo "pinned: $pinned"
+          surogate/serve/_llama_cpp/bin/llama-quantize --dry-run /nonexistent.gguf Q4_K \
+            > /tmp/build-info.txt 2>&1 || true
+          head -2 /tmp/build-info.txt
+          if ! grep -q "commit $pinned" /tmp/build-info.txt; then
+            echo "::error::llama-quantize reports a revision other than the pinned $pinned — LLAMA_BUILD_COMMIT and LLAMA_CPP_COMMIT are out of step"
+            exit 1
+          fi
