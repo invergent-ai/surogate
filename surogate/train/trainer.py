@@ -345,7 +345,7 @@ class SurogateTrainerWrapper:
             self.train_loader = None
             self.eval_loader = None
             (
-                self._mm_hf_model,
+                self._mm_vision,
                 self._mm_processor,
                 self._mm_template_processor,
                 self._mm_vision_device,
@@ -359,7 +359,7 @@ class SurogateTrainerWrapper:
             self.mm_batcher = OnTheFlyMultimodalBatcher(
                 dataset=self.mm_train_dataset,
                 template_processor=self._mm_template_processor,
-                hf_model=self._mm_hf_model,
+                vision=self._mm_vision,
                 vision_device=self._mm_vision_device,
                 rope_fn=self._mm_rope_fn,
                 batch_size=global_batch,
@@ -1138,7 +1138,7 @@ class SurogateTrainerWrapper:
         eval_batcher = OnTheFlyMultimodalBatcher(
             dataset=self.mm_eval_dataset,
             template_processor=self._mm_template_processor,
-            hf_model=self._mm_hf_model,
+            vision=self._mm_vision,
             vision_device=self._mm_vision_device,
             rope_fn=self._mm_rope_fn,
             batch_size=global_batch,

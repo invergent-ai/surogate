@@ -27,42 +27,65 @@ def _labels_to_input_mask(labels: np.ndarray) -> np.ndarray:
     return out
 
 
-def _extract_mm_feature_outputs(mm_out):
-    """Normalize HF multimodal feature outputs across model variants."""
-    pooled = getattr(mm_out, "pooler_output", None)
-    if pooled is None:
-        pooled_list = []
-    elif isinstance(pooled, torch.Tensor):
-        pooled_list = [pooled]
-    elif isinstance(pooled, (list, tuple)):
-        pooled_list = [p for p in pooled if isinstance(p, torch.Tensor)]
-    else:
-        pooled_list = []
+class EngineVisionTower:
+    """The serving engine's vision tower, standing in for the transformers one.
 
-    deepstack = getattr(mm_out, "deepstack_features", None)
-    if deepstack is None:
-        deepstack_list = []
-    elif isinstance(deepstack, torch.Tensor):
-        deepstack_list = [deepstack]
-    elif isinstance(deepstack, (list, tuple)):
-        deepstack_list = [d for d in deepstack if isinstance(d, torch.Tensor)]
-    else:
-        deepstack_list = []
+    Both read the same checkpoint, so they were two answers to one question -- and only one
+    of them is the answer the server gives. This is that one: the tower bound from the
+    serving artifact, running the engine's own kernels.
 
-    return pooled_list, deepstack_list
+    It replaces a `from_pretrained` that read every weight in the model to use one component
+    of it, then moved the language model back to the CPU to get the room back.
+    """
 
+    def __init__(self, artifact, device_index: int, hf_config):
+        from surogate import _surogate_serve
 
-def _find_visual(hf_model):
-    """Find the visual encoder module, checking common attribute paths."""
-    for path in ["visual", "model.visual", "vision_tower", "model.vision_tower"]:
-        obj = hf_model
-        try:
-            for attr in path.split("."):
-                obj = getattr(obj, attr)
-            return obj
-        except AttributeError:
-            continue
-    return None
+        self._encoder = _surogate_serve.VisionEncoder(str(artifact), device_index)
+        text = getattr(hf_config, "text_config", hf_config)
+        # The ids the prompt marks visual positions with. The tower produces one embedding
+        # per such token, so the batcher counts them to check the two agree.
+        self.image_token_id = getattr(hf_config, "image_token_id", None) or text.image_token_id
+        self.video_token_id = getattr(hf_config, "video_token_id", None) or text.video_token_id
+        geometry = self._encoder.geometry
+        self.merge = int(geometry["merge"])
+        self.patch_dim = int(geometry["patch_dim"])
+        self.deepstack_layers = int(geometry["deepstack_layers"])
+        #: The width the merger projects into, which is the text model's hidden size.
+        self.hidden_size = int(geometry["output_hidden"])
+
+    def features(self, pixel_values, grid_thw, *, modality: str):
+        """Merged visual tokens for a batch of items, as `(embeddings, deepstack)`.
+
+        `pixel_values` is every item's patches concatenated, the shape the processor returns;
+        `grid_thw` names each item's grid, one row apiece. The tower encodes one item at a
+        time, so the rows say where to cut.
+
+        `embeddings` is `[total_merged_tokens, hidden]`; `deepstack` is one tensor of that
+        shape per deepstack layer, empty when the tower has none.
+        """
+        patches = pixel_values.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy()
+        merged, stacks = [], [[] for _ in range(self.deepstack_layers)]
+        cursor = 0
+        for row in grid_thw.tolist():
+            temporal, height, width = (int(v) for v in row)
+            count = temporal * height * width
+            item = patches[cursor:cursor + count].reshape(-1)
+            if item.size != count * self.patch_dim:
+                raise ValueError(
+                    f"vision item wants {count * self.patch_dim} patch values, got {item.size}"
+                )
+            cursor += count
+            planes = torch.from_dlpack(
+                self._encoder.encode(item, temporal, height, width, modality)
+            )
+            merged.append(planes[0])
+            for layer in range(self.deepstack_layers):
+                stacks[layer].append(planes[1 + layer])
+        if cursor != patches.shape[0]:
+            raise ValueError("vision grid does not cover every patch the processor produced")
+        embeddings = torch.cat(merged) if merged else torch.empty((0, self.hidden_size))
+        return embeddings, [torch.cat(s) for s in stacks]
 
 
 class MultimodalEncoder:
@@ -249,62 +272,63 @@ class MultimodalEncoder:
 
 
 def init_mm_helpers(config):
-    """Initialize multimodal helpers: HF model, processor, encoder."""
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+    """Multimodal helpers: the processor, the label encoder, the vision tower, and MRoPE.
+
+    No checkpoint weights are read. The tower is the serving engine's, bound from the
+    artifact `surogate serve` builds and caches -- which now stores the tower as the
+    checkpoint ships it, so the features match what the source model produces.
+
+    The position indices still come from transformers, because they are not a model: given
+    token ids and a grid, `get_rope_index` returns where each visual token sits on the three
+    MRoPE axes, out of config values alone. The skeleton it is called on is built on the meta
+    device and allocates nothing.
+    """
+    import torch as _torch
+    from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
     model_dir = config.model_dir
-
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
 
-    model_kwargs = {"trust_remote_code": True}
-    if hasattr(config, "torch_dtype") and config.torch_dtype is not None:
-        model_kwargs["torch_dtype"] = config.torch_dtype
-
-    # Use the right Auto class: VL models need AutoModelForImageTextToText
-    auto_cls = AutoModelForCausalLM
-    if config.is_multimodal:
-        from transformers import AutoModelForImageTextToText
-
-        auto_cls = AutoModelForImageTextToText
-
-    hf_model = auto_cls.from_pretrained(model_dir, config=hf_config, **model_kwargs)
-    hf_model.eval()
-    hf_model.requires_grad_(False)
-
-    # Load processor (includes tokenizer + image processor)
     if os.path.exists(os.path.join(model_dir, "preprocessor_config.json")):
         processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
     else:
         processor = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
-    visual = _find_visual(hf_model)
-    if visual is None:
+    if not config.is_multimodal:
         raise ValueError(
-            f"train_vision=True but model '{type(hf_model).__name__}' has no visual encoder. "
-            f"Use train_vision=False for text-only models, or use a VL model variant."
+            "train_vision=True on a text-only model. Use train_vision=False, or a VL variant."
         )
 
-    vision_device = torch.device("cuda:0") if torch.cuda.is_available() and config.gpus > 0 else torch.device("cpu")
-    try:
-        visual.to(vision_device)
-    except Exception as exc:
-        logger.warning(f"Failed to move visual encoder to {vision_device}: {exc}. Falling back to CPU.")
-        vision_device = torch.device("cpu")
-        visual.to(vision_device)
+    use_cuda = _torch.cuda.is_available() and config.gpus > 0
+    if not use_cuda:
+        raise ValueError(
+            "train_vision=True needs a CUDA device: the vision tower runs on the serving "
+            "engine, which has no CPU path"
+        )
+    vision_device = _torch.device("cuda:0")
 
-    try:
-        hf_model.model.language_model.to("cpu")
-        if hasattr(hf_model, "lm_head"):
-            hf_model.lm_head.to("cpu")
-    except Exception:
-        pass
+    from surogate.serve.ingest import ensure_engine_weights
+
+    artifact = ensure_engine_weights(str(model_dir), echo=lambda message: logger.info(message))
+    vision = EngineVisionTower(artifact, vision_device.index or 0, hf_config)
+    logger.info(
+        f"vision tower: {vision.hidden_size}-wide output, merge {vision.merge}, "
+        f"{vision.deepstack_layers} deepstack layer(s), from {artifact}"
+    )
+
+    # The skeleton exists for `get_rope_index` and nothing else; on the meta device its
+    # parameters have shapes and no storage, so this reads no weights and costs no memory.
+    from transformers import AutoModelForImageTextToText
+
+    with _torch.device("meta"):
+        skeleton = AutoModelForImageTextToText.from_config(hf_config)
+    rope_fn = (skeleton.get_rope_index if hasattr(skeleton, "get_rope_index")
+               else skeleton.model.get_rope_index)
 
     loss_scale = getattr(config, "loss_scale", "default")
     encoder = MultimodalEncoder(processor, loss_scale=loss_scale)
 
-    rope_fn = hf_model.get_rope_index if hasattr(hf_model, "get_rope_index") else hf_model.model.get_rope_index
-
-    return hf_model, processor, encoder, vision_device, rope_fn
+    return vision, processor, encoder, vision_device, rope_fn
 
 
 def load_multimodal_datasets(config, *, node_rank=None, num_nodes=None):
@@ -360,7 +384,7 @@ class OnTheFlyMultimodalBatcher:
         *,
         dataset,
         template_processor,
-        hf_model,
+        vision,
         vision_device: torch.device,
         rope_fn,
         batch_size: int,
@@ -372,7 +396,7 @@ class OnTheFlyMultimodalBatcher:
     ) -> None:
         self.dataset = dataset
         self.template = template_processor
-        self.hf_model = hf_model
+        self.vision = vision
         self.vision_device = vision_device
         self.rope_fn = rope_fn
         self.batch_size = batch_size
@@ -382,17 +406,12 @@ class OnTheFlyMultimodalBatcher:
         self.shuffle = shuffle
         self.repeat = repeat
 
-        cfg = hf_model.config
-        self.image_token_id = cfg.image_token_id
-        self.video_token_id = cfg.video_token_id
-        self.hidden_size = cfg.text_config.hidden_size
-        visual = _find_visual(hf_model)
-        self.deepstack_layers = len(getattr(visual, "deepstack_visual_indexes", [])) if visual else 0
-        vision_cfg = getattr(cfg, "vision_config", None)
-        merge_size = getattr(visual, "spatial_merge_size", None) if visual else None
-        if merge_size is None and vision_cfg is not None:
-            merge_size = getattr(vision_cfg, "spatial_merge_size", None)
-        self._merge_length = int(merge_size) ** 2 if merge_size is not None else 1
+        # Everything vision-shaped comes from the tower that will produce the features.
+        self.image_token_id = vision.image_token_id
+        self.video_token_id = vision.video_token_id
+        self.hidden_size = vision.hidden_size
+        self.deepstack_layers = vision.deepstack_layers
+        self._merge_length = vision.merge ** 2
 
         self._epoch = 0
         self._samples_seen = 0
@@ -672,22 +691,16 @@ class OnTheFlyMultimodalBatcher:
                 if image_pixel_values_list:
                     if image_grid_thw_cpu is None:
                         raise ValueError("pixel_values present but image_grid_thw missing")
-                    pixel_values = torch.cat(image_pixel_values_list, dim=0).to(self.vision_device)
-                    image_grid_thw_vis = image_grid_thw_cpu.to(self.vision_device)
-                    _img_out = self.hf_model.get_image_features(pixel_values, image_grid_thw=image_grid_thw_vis)
-                    image_embeds_list, deepstack_image = _extract_mm_feature_outputs(_img_out)
-                    if len(image_embeds_list) > 0:
-                        image_embeds_flat = torch.cat(image_embeds_list, dim=0)
+                    pixel_values = torch.cat(image_pixel_values_list, dim=0)
+                    image_embeds_flat, deepstack_image = self.vision.features(
+                        pixel_values, image_grid_thw_cpu, modality="image")
 
                 if video_pixel_values_list:
                     if video_grid_thw_cpu is None:
                         raise ValueError("pixel_values_videos present but video_grid_thw missing")
-                    pixel_values_v = torch.cat(video_pixel_values_list, dim=0).to(self.vision_device)
-                    video_grid_thw_vis = video_grid_thw_cpu.to(self.vision_device)
-                    _vid_out = self.hf_model.get_video_features(pixel_values_v, video_grid_thw=video_grid_thw_vis)
-                    video_embeds_list, deepstack_video = _extract_mm_feature_outputs(_vid_out)
-                    if len(video_embeds_list) > 0:
-                        video_embeds_flat = torch.cat(video_embeds_list, dim=0)
+                    pixel_values_v = torch.cat(video_pixel_values_list, dim=0)
+                    video_embeds_flat, deepstack_video = self.vision.features(
+                        pixel_values_v, video_grid_thw_cpu, modality="video")
 
                 if self.deepstack_layers:
                     if deepstack_image and len(deepstack_image) != self.deepstack_layers:

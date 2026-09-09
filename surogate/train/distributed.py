@@ -188,7 +188,7 @@ class NodeTrainer:
         self._mm_batcher = None
         self._mm_train_dataset = None
         self._mm_eval_dataset = None
-        self._mm_hf_model = None
+        self._mm_vision = None
         self._mm_processor = None
         self._mm_template_processor = None
         self._mm_vision_device = None
@@ -526,7 +526,7 @@ class NodeTrainer:
 
         if self._train_vision:
             (
-                self._mm_hf_model,
+                self._mm_vision,
                 self._mm_processor,
                 self._mm_template_processor,
                 self._mm_vision_device,
@@ -541,7 +541,7 @@ class NodeTrainer:
             self._mm_batcher = OnTheFlyMultimodalBatcher(
                 dataset=self._mm_train_dataset,
                 template_processor=self._mm_template_processor,
-                hf_model=self._mm_hf_model,
+                vision=self._mm_vision,
                 vision_device=self._mm_vision_device,
                 rope_fn=self._mm_rope_fn,
                 batch_size=global_batch,
@@ -749,7 +749,7 @@ class NodeTrainer:
             eval_batcher = OnTheFlyMultimodalBatcher(
                 dataset=self._mm_eval_dataset,
                 template_processor=self._mm_template_processor,
-                hf_model=self._mm_hf_model,
+                vision=self._mm_vision,
                 vision_device=self._mm_vision_device,
                 rope_fn=self._mm_rope_fn,
                 batch_size=global_batch,
