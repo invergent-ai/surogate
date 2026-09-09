@@ -67,9 +67,12 @@ class StubTemplate:
 
 
 def _rope_fn(input_ids, **kwargs):
-    """Three MRoPE axes of plain positions -- shape is all the batcher uses."""
+    """Three MRoPE axes of plain positions -- shape is all the batcher uses.
+
+    The real one is `surogate.train.mrope`, checked against transformers in test_mrope.
+    """
     b, t = input_ids.shape
-    return torch.arange(t).view(1, 1, t).expand(3, b, t).contiguous(), None
+    return torch.arange(t).view(1, 1, t).expand(3, b, t).contiguous()
 
 
 def _item(*, n_image=0, n_video=0, prefix=2, suffix=2, video_first=False):

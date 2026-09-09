@@ -278,10 +278,9 @@ def init_mm_helpers(config):
     artifact `surogate serve` builds and caches -- which now stores the tower as the
     checkpoint ships it, so the features match what the source model produces.
 
-    The position indices still come from transformers, because they are not a model: given
-    token ids and a grid, `get_rope_index` returns where each visual token sits on the three
-    MRoPE axes, out of config values alone. The skeleton it is called on is built on the meta
-    device and allocates nothing.
+    The position indices are ours too, computed from the config by `surogate.train.mrope`:
+    they were never a model, and building a transformers architecture to reach a function
+    that reads no weights was the last thing on this path that did.
     """
     import torch as _torch
     from transformers import AutoConfig, AutoProcessor, AutoTokenizer
@@ -316,14 +315,9 @@ def init_mm_helpers(config):
         f"{vision.deepstack_layers} deepstack layer(s), from {artifact}"
     )
 
-    # The skeleton exists for `get_rope_index` and nothing else; on the meta device its
-    # parameters have shapes and no storage, so this reads no weights and costs no memory.
-    from transformers import AutoModelForImageTextToText
+    from surogate.train.mrope import rope_index_fn
 
-    with _torch.device("meta"):
-        skeleton = AutoModelForImageTextToText.from_config(hf_config)
-    rope_fn = (skeleton.get_rope_index if hasattr(skeleton, "get_rope_index")
-               else skeleton.model.get_rope_index)
+    rope_fn = rope_index_fn(hf_config)
 
     loss_scale = getattr(config, "loss_scale", "default")
     encoder = MultimodalEncoder(processor, loss_scale=loss_scale)
@@ -660,19 +654,13 @@ class OnTheFlyMultimodalBatcher:
                 length = min(row_mm_t.shape[0], T)
                 mm_token_type_ids[i, :length] = row_mm_t[:length]
 
-        rope_kwargs = dict(
+        position_ids = self.rope_fn(
+            input_ids_t,
+            mm_token_type_ids=mm_token_type_ids,
             image_grid_thw=image_grid_thw_cpu,
             video_grid_thw=video_grid_thw_cpu,
             attention_mask=attn_t,
         )
-        # Pass mm_token_type_ids if the rope function accepts it
-        import inspect
-
-        rope_params = inspect.signature(self.rope_fn).parameters
-        if "mm_token_type_ids" in rope_params:
-            rope_kwargs["mm_token_type_ids"] = mm_token_type_ids
-
-        position_ids, _ = self.rope_fn(input_ids_t, **rope_kwargs)
 
         visual_mask = (inputs == self.image_token_id) | (inputs == self.video_token_id)
         num_visual = int(visual_mask.sum())
