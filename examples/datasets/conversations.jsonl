@@ -1,0 +1,4 @@
+{"dialog": [{"role": "user", "content": "Return the opposite of yes."}, {"role": "assistant", "content": "no"}]}
+{"dialog": [{"role": "user", "content": "Return the opposite of inside."}, {"role": "assistant", "content": "outside"}]}
+{"dialog": [{"role": "user", "content": "Return the opposite of near."}, {"role": "assistant", "content": "far"}]}
+{"dialog": [{"role": "user", "content": "Return the opposite of light."}, {"role": "assistant", "content": "dark"}]}

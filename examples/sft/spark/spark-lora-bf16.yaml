@@ -1,7 +1,9 @@
 model: XHToken/Spark-X2.5-1.7B
-output_dir: ./output/spark
+output_dir: ./outputs/sft/spark/spark-lora-bf16
+resume_from_checkpoint: false
 
 recipe: bf16
+train_vision: false
 lora: true
 lora_rank: 16
 lora_alpha: 32

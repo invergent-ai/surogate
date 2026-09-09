@@ -14,7 +14,8 @@
 # support, driven by the shard's position_ids resets; no flash-attn needed.
 
 model: Qwen/Qwen3-0.6B
-output_dir: ./output
+output_dir: ./outputs/distillation/qwen3-kd
+resume_from_checkpoint: false
 
 distillation:
   teacher_model: Qwen/Qwen3-1.7B # capture-time only

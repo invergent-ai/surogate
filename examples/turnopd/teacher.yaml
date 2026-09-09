@@ -1,7 +1,0 @@
-# Teacher server for on-policy distillation — GPU 2.
-# Served via grpo-infer: teacher logprobs are fetched through the
-# /chat/completions/tokens endpoint.
-model: "Qwen/Qwen3.5-9B"
-enable_lora: false
-max_model_len: 4096
-port: 8008

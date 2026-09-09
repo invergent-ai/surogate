@@ -9,18 +9,18 @@ Example configs are in `examples/sft/`.
 For MiniCPM5 and Spark-X2.5 checkpoints, see the [fine-tuning guide](../guides/minicpm5-spark.md) for examples and LoRA target names.
 
 A reasonable default starting point:
-- `examples/sft/qwen3-lora-bf16.yaml`
+- `examples/sft/qwen3/qwen3-lora-bf16.yaml`
 
 ## 2) Run
 
 ```bash
-surogate sft examples/sft/qwen3-lora-bf16.yaml
+surogate sft examples/sft/qwen3/qwen3-lora-bf16.yaml
 ```
 
 If you use `uv` and want to guarantee you’re running inside the project environment:
 
 ```bash
-uv run surogate sft examples/sft/qwen3-lora-bf16.yaml
+uv run surogate sft examples/sft/qwen3/qwen3-lora-bf16.yaml
 ```
 
 ## 3) Outputs

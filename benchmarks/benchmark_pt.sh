@@ -1,15 +1,17 @@
-#!/bin/bash
-
-MODEL=$1
-RECIPE=$2
-
-if [ -z "$MODEL" ] || [ -z "$RECIPE" ]; then
-    echo "Usage: $0 <model_id: Qwen/Qwen3-0.6B> <recipe: bf16 | fp8 | fp4>"
-    exit 1
-fi
-
-rm -rf ./output/benchmark_pt_${RECIPE} /tmp/benchmark_${RECIPE}.yaml
-cp examples/pt/qwen3-lora-${RECIPE}.yaml /tmp/benchmark_${RECIPE}.yaml
-sed -i "s|^model: .*|model: ${MODEL}|" /tmp/benchmark_${RECIPE}.yaml
-sed -i "s|^output_dir: .*|output_dir: ./output/benchmark_pt_${RECIPE}|" /tmp/benchmark_${RECIPE}.yaml
-surogate pt /tmp/benchmark_${RECIPE}.yaml
+#!/usr/bin/env bash
+set -euo pipefail
+model=${1:?Usage: benchmark_pt.sh MODEL bf16|fp8|fp4}
+recipe=${2:?Specify a recipe}
+case "$recipe" in
+  bf16) compute=bf16 ;;
+  fp8) compute=fp8-hybrid ;;
+  fp4) compute=nvfp4 ;;
+  *) echo "Unknown recipe: $recipe" >&2; exit 2 ;;
+esac
+config=$(mktemp --suffix=.yaml)
+trap 'rm -f "$config"' EXIT
+cp examples/pt/qwen3.yaml "$config"
+sed -i "s|^model: .*|model: ${model}|" "$config"
+sed -i "s|^recipe: .*|recipe: ${compute}|" "$config"
+sed -i "s|^output_dir: .*|output_dir: ./outputs/benchmark_pt_${recipe}|" "$config"
+surogate pt "$config"

@@ -1,5 +1,6 @@
 model: surogate/Qwen3-0.6B-NVFP4
-output_dir: ./output
+output_dir: ./outputs/sft/qwen3/qwen3-lora-nvfp4
+resume_from_checkpoint: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
@@ -14,6 +15,7 @@ learning_rate: 2e-4
 warmup_ratio: 0.15
 
 recipe: fp8-hybrid
+train_vision: false
 
 lora: true
 lora_rank: 16

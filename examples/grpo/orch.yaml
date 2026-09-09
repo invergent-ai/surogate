@@ -1,47 +1,50 @@
-# GRPO Orchestrator Example
-
+# grpo: orch configuration. See README.md in this directory.
 model:
-  name: "Qwen/Qwen3-0.6B"
-  lora_adapter: "default"
-  lora_rank: 16
-  lora_alpha: 32
-
+  name: Qwen/Qwen3-0.6B
+  lora_adapter: default
 env:
-  - id: markdown-table-qa
-
+- id: markdown-table-qa
+  path: ./environments/markdown-table-qa
 batch_size: 8
 rollouts_per_example: 8
-seq_len: 2048
-max_steps: 6
-# Token-in rollouts: the next turn's prompt extends the ids the last one produced
-# instead of being re-rendered, which keeps a multi-turn trajectory one training
-# sample. Needs /tokenize and /v1/chat/completions/tokens, which the engine serves.
+max_steps: 20
 use_token_client: true
-
 sampling:
   max_tokens: 1024
-  # A thinking model needs room to finish before it can answer: too small a budget
-  # truncates every rollout, every reward is zero, and with no advantage to learn
-  # from the trainer never takes a step.
   min_tokens: 24
-  temperature: 1.0
   top_p: 1.0
   repetition_penalty: 1.05
   seed: 1234
   extra_body:
-    top_k: -1        # -1 means "do not truncate"
+    top_k: -1
     min_p: 0.02
     chat_template_kwargs:
       enable_thinking: true
-
+  temp_scheduler:
+    type: linear
+    start_temperature: 1.0
+    end_temperature: 0.7
+    total_steps: 20
 client:
   base_url:
-    - http://localhost:8007/v1
-
+  - http://localhost:8007/v1
 dump_metrics: true
-
-# Must be the trainer's `output_dir` plus its run name. The orchestrator writes the
-# training batches here and the trainer reads them from the same place; when the two
-# disagree neither errors -- the orchestrator simply waits for a policy update that
-# never comes, and the run hangs with both GPUs idle.
-output_dir: ./outputs/run_default
+output_dir: ./outputs/grpo/run_default
+sequence_len: 2048
+eval:
+  env:
+  - id: markdown-table-qa
+    path: ./environments/markdown-table-qa
+  num_examples: 16
+  rollouts_per_example: 4
+  interval: 10
+  eval_base_model: true
+buffer:
+  online_difficulty_filtering: true
+  easy_threshold: 1.0
+  hard_threshold: 0.0
+  easy_fraction: 0.1
+  hard_fraction: 0.1
+ckpt:
+  interval: 10
+  keep_last: 2

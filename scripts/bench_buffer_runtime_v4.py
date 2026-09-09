@@ -3,7 +3,7 @@
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 python scripts/bench_buffer_runtime_v4.py \
-        --config examples/sft/qwen3/qwen3-lora-bf16-bench.yaml \
+        --config tests/fixtures/training/qwen3-lora-bf16-bench.yaml \
         --mode stream
 
 Writes a single JSON result line to stdout so a driver can aggregate runs.

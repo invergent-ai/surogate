@@ -1,33 +1,27 @@
-# Examples Library
+# Examples library
 
-Surogate comes with a collection of pre-built training recipes and configurations for popular models and hardware setups. You can find these in the `examples/` directory of the repository.
+The [repository example index](../../examples/README.md) maps training and serving
+features to maintained configs, launch scripts, and API clients. Run commands from
+the repository root after installing Surogate.
 
-## Pre-training (PT)
-
-Pre-training examples for base models on large datasets.
-
-- **[Qwen 3 Dense (PT)](examples/pt/qwen3.md)**: Standard pre-training configuration for Qwen 3 using FP8 Mixed Precision and the NorMuon optimizer.
-
-## Supervised Fine-Tuning (SFT)
-
-Fine-tuning examples for chat and instruction models.
-
-- **[Qwen 3 LoRA (BF16)](examples/sft/qwen3-lora.md)**: Standard LoRA fine-tuning in BFloat16 precision.
-- **[Qwen 3 QLoRA (FP4/FP8)](examples/sft/qwen3-qlora.md)**: Memory-efficient fine-tuning using quantization on modern GPUs.
-- **[Qwen 3 MoE (QLoRA)](examples/sft/qwen3moe-lora.md)**: Fine-tuning Mixture-of-Experts models.
-
-## Knowledge Distillation (KD)
-
-Offline top-K logit distillation on the SFT path: capture teacher logprobs once, then train the student.
-
-- **Qwen 3 KD (BF16)**: `examples/distillation/qwen3-kd.yaml` — Qwen3-1.7B teacher distilled into a Qwen3-0.6B student (run `surogate distill-capture`, then `surogate sft`). See the [Knowledge Distillation guide](../guides/distillation.md).
-
-## How to use these examples
-
-All examples are provided as YAML configuration files. You can run them using the Surogate CLI:
+| Workflow | Examples |
+|---|---|
+| SFT, LoRA, QLoRA, precision and model families | [Model recipes](../../examples/README.md#model-and-precision-recipes) |
+| Full fine-tuning, adapters, distributed training, memory and monitoring | [Training features](../../examples/training/README.md) |
+| Scratch and continued pretraining | [Pretraining](../../examples/pt/README.md) |
+| Local data, column mapping, mixing and validation | [Datasets](../../examples/datasets/README.md) |
+| Preference optimization | [DPO](../../examples/dpo/README.md) |
+| Teacher capture and tokenizer transplantation | [Distillation](../../examples/distillation/README.md) |
+| Split/colocated GRPO, evaluation and checkpoints | [GRPO](../../examples/grpo/README.md) |
+| Judge rewards and multi-turn on-policy distillation | [RULER](../../examples/ruler/README.md), [TurnOPD](../../examples/turnopd/README.md) |
+| HTTP APIs, media, adapters, placement, caching and speculation | [Serving](../../examples/serve/README.md) |
 
 ```bash
-surogate [pt|sft] path/to/example.yaml
+surogate sft examples/sft/qwen3/qwen3-lora-bf16.yaml
+surogate dpo examples/dpo/qwen3.yaml
+bash examples/serve/launch.sh chat
 ```
 
-For more details on configuration options, see the [Configuration Guide](../guides/configuration.md).
+For every supported workflow and its prerequisites, use the
+[feature map](../../examples/README.md#feature-map). Benchmark fixtures are maintained
+separately from user-facing examples.

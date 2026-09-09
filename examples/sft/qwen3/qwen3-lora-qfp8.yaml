@@ -1,5 +1,6 @@
 model: Qwen/Qwen3-0.6B
-output_dir: ./output
+output_dir: ./outputs/sft/qwen3/qwen3-lora-qfp8
+resume_from_checkpoint: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
@@ -14,6 +15,7 @@ learning_rate: 2e-4
 warmup_ratio: 0.15
 
 recipe: fp8-hybrid
+train_vision: false
 qlora_fp8: true
 
 lora: true
@@ -32,4 +34,3 @@ dataloader_num_workers: 4
 datasets:
   - path: "OpenLLM-Ro/ro_gsm8k"
     type: auto
-

@@ -112,7 +112,7 @@ REGRESSION_MATRIX: tuple[RegressionCase, ...] = (
         "qwen3",
         "bf16",
         "single_gpu",
-        config="examples/sft/qwen3/qwen3-lora-bf16-1step.yaml",
+        config="tests/fixtures/training/qwen3-lora-bf16-1step.yaml",
         env_model_path="QWEN3_MODEL_PATH",
     ),
     RegressionCase(
@@ -150,7 +150,7 @@ REGRESSION_MATRIX: tuple[RegressionCase, ...] = (
         "qwen3_5",
         "bf16",
         "single_gpu",
-        config="examples/sft/qwen35/qwen35-text-lora-bf16-1step.yaml",
+        config="tests/fixtures/training/qwen35-text-lora-bf16-1step.yaml",
         env_model_path="QWEN3_5_MODEL_PATH",
     ),
     RegressionCase(
@@ -180,7 +180,7 @@ REGRESSION_MATRIX: tuple[RegressionCase, ...] = (
         "qwen3",
         "bf16",
         "2gpu_dp",
-        config="examples/sft/qwen3/qwen3-lora-bf16-bench.yaml",
+        config="tests/fixtures/training/qwen3-lora-bf16-bench.yaml",
         env_model_path="QWEN3_MODEL_PATH",
     ),
     RegressionCase(
@@ -196,7 +196,7 @@ REGRESSION_MATRIX: tuple[RegressionCase, ...] = (
         "fp8",
         "2gpu_dp_ep",
         op_kind="moe_grouped",
-        config="examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml",
+        config="examples/sft/qwen35moe/qwen36moe-lora-fp8.yaml",
         env_model_path="QWEN3_6_MOE_MODEL_PATH",
     ),
     RegressionCase(
@@ -204,7 +204,7 @@ REGRESSION_MATRIX: tuple[RegressionCase, ...] = (
         "bf16",
         "single_gpu",
         storage="cpu_stream",
-        config="examples/sft/qwen3/qwen3-lora-bf16-1step.yaml",
+        config="tests/fixtures/training/qwen3-lora-bf16-1step.yaml",
         env_model_path="QWEN3_MODEL_PATH",
     ),
     RegressionCase(

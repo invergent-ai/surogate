@@ -10,7 +10,7 @@
 # cudaMalloc cliff that's blocked on further memory-budget work.
 
 set -uo pipefail
-CFG=examples/sft/gemma4/gemma4-e2b-lora-mini.yaml
+CFG=tests/fixtures/training/gemma4-e2b-lora-mini.yaml
 LOG_A=/tmp/force_capture_mini_a.log
 LOG_B=/tmp/force_capture_mini_b.log
 METRICS=/tmp/force_capture_mini_metrics_$$.jsonl

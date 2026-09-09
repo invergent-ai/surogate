@@ -1,9 +1,8 @@
-# Rollout server for the GRPO example: this repository's own serving engine. It reads
-# a HuggingFace directory or a GGUF and builds its artifact on first use, cached.
-model: "Qwen/Qwen3-0.6B"
+# grpo: infer configuration. See README.md in this directory.
+model: Qwen/Qwen3-0.6B
 enable_lora: true
 max_lora_rank: 32
 max_loras: 4
 max_model_len: 2048
-max_num_seqs: 32
+max_num_seqs: 8
 port: 8007

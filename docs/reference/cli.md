@@ -17,7 +17,7 @@ If the YAML config file is missing, the CLI prints help and exits with a non-zer
 Supervised fine-tuning.
 
 ```bash
-surogate sft examples/sft/qwen3-lora-bf16.yaml
+surogate sft examples/sft/qwen3/qwen3-lora-bf16.yaml
 ```
 
 Options:

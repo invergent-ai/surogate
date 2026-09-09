@@ -13,7 +13,7 @@
       "SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT": "1"
     },
     "entrypoint": ".venv/bin/surogate sft",
-    "source_config": "examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml",
+    "source_config": "examples/sft/qwen35moe/qwen36moe-lora-fp8.yaml",
     "temp_config": "/tmp/qwen36moe-lora-fp8-5step-sync.C52wcD.yaml"
   },
   "convergence_curve": [

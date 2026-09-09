@@ -1,5 +1,6 @@
 model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-output_dir: ./output_nemo_ep4
+output_dir: ./outputs/sft/nemotron3/nemotron-nano3-qlora-bnb
+resume_from_checkpoint: false
 
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
@@ -10,12 +11,13 @@ sequence_len: 512
 gpus: 1
 ep_size: 1
 
-max_steps: 20
+max_steps: 100
 eval_steps: 25
 learning_rate: 2e-4
 warmup_ratio: 0.1
 
 recipe: bf16
+train_vision: false
 lmhead_chunks: 8
 
 lora: true

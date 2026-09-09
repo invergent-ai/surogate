@@ -1,7 +1,9 @@
 model: openbmb/MiniCPM5-1B
-output_dir: ./output/minicpm5
+output_dir: ./outputs/sft/minicpm5/minicpm5-lora-bf16
+resume_from_checkpoint: false
 
 recipe: bf16
+train_vision: false
 lora: true
 lora_rank: 16
 lora_alpha: 32

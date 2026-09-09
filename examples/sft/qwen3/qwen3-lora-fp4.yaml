@@ -1,5 +1,6 @@
 model: Qwen/Qwen3-0.6B
-output_dir: ./output
+output_dir: ./outputs/sft/qwen3/qwen3-lora-fp4
+resume_from_checkpoint: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
@@ -7,13 +8,14 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-max_steps: 10
+max_steps: 100
 eval_steps: 25
 
 learning_rate: 2e-4
 warmup_ratio: 0.15
 
 recipe: nvfp4
+train_vision: false
 fp4_backend: cutlass
 skip_quant_last_layers: 4
 
@@ -33,5 +35,3 @@ dataloader_num_workers: 4
 datasets:
   - path: "OpenLLM-Ro/ro_gsm8k"
     type: auto
-
-

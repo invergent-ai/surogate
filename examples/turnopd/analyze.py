@@ -1,6 +1,6 @@
-"""Summarize turn_stats.jsonl into the TurnOPD Table 1 comparison.
+"""Summarize turn_stats.jsonl by training phase and conversation depth.
 
-Usage: python examples/turnopd/analyze.py outputs/turnopd_diag/turn_stats.jsonl
+Usage: python examples/turnopd/analyze.py outputs/turnopd/turn_stats.jsonl
 """
 
 import json
@@ -87,7 +87,7 @@ def main(path):
     max_step = max(r["step"] for r in rows)
 
     print(f"\n{'=' * 92}")
-    print("TurnOPD Table 1 replication — our stack, our env")
+    print("Turn-level supervision by training phase")
     print(f"{'=' * 92}")
     hdr = f"{'Phase':<8}{'steps':>6}{'maxT':>6}{'deep/shallow KL':>18}{'deep support':>14}{'deep KL budget':>16}{'deep loss budget':>18}"
     print(hdr)
@@ -109,13 +109,6 @@ def main(path):
             f"{s['deep_shallow_kl']:>17.0%}{s['deep_support']:>14.1%}"
             f"{s['deep_kl_budget']:>16.1%}{s['deep_loss_budget']:>18.1%}"
         )
-
-    print("-" * 92)
-    print("Paper's reference values (ALFWorld / Multi-Hop Search):")
-    print(f"{'ALFWorld early':<26}{'31%':>17}{'23.0%':>14}{'3.6%':>16}")
-    print(f"{'ALFWorld late':<26}{'42%':>17}{'18.2%':>14}{'4.5%':>16}")
-    print(f"{'MultiHop early':<26}{'90%':>17}{'17.3%':>14}{'12.9%':>16}")
-    print(f"{'MultiHop late':<26}{'92%':>17}{'15.5%':>14}{'11.1%':>16}")
 
     # Per-turn detail, averaged over the run.
     print(f"\n{'=' * 92}")
@@ -152,4 +145,4 @@ def main(path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "outputs/turnopd_diag/turn_stats.jsonl")
+    main(sys.argv[1] if len(sys.argv) > 1 else "outputs/turnopd/turn_stats.jsonl")

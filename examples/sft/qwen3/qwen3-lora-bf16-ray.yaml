@@ -1,8 +1,9 @@
 model: Qwen/Qwen3-0.6B
-output_dir: ./output
+output_dir: ./outputs/sft/qwen3/qwen3-lora-bf16-ray
+resume_from_checkpoint: false
 
 distributed:
-  ray_address: "auto"      # or "ray://192.168.1.100:6379"
+  ray_address: "auto"      # connect to a running Ray cluster
   num_nodes: 2
   gpus_per_node: 4
  
@@ -19,6 +20,7 @@ learning_rate: 2e-4
 warmup_ratio: 0.15
 
 recipe: bf16
+train_vision: false
 
 lora: true
 lora_rank: 16

@@ -1,5 +1,6 @@
 model: nvidia/Nemotron-Cascade-2-30B-A3B
-output_dir: ./output_nemo
+output_dir: ./outputs/sft/nemotron3/nemotron-cascade2-qlora-bnb
+resume_from_checkpoint: false
 
 gpus: 1
 ep_size: 1
@@ -16,6 +17,7 @@ learning_rate: 2e-4
 warmup_ratio: 0.1
 
 recipe: fp8-hybrid
+train_vision: false
 lmhead_chunks: 8
 
 lora: true

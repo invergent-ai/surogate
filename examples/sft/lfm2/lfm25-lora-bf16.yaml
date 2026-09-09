@@ -1,5 +1,6 @@
 model: LiquidAI/LFM2.5-350M
-output_dir: ./output
+output_dir: ./outputs/sft/lfm2/lfm25-lora-bf16
+resume_from_checkpoint: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
@@ -13,6 +14,7 @@ eval_steps: 25
 learning_rate: 2e-4
 
 recipe: bf16
+train_vision: false
 warmup_ratio: 0.15
 
 lora: true

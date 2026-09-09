@@ -1,5 +1,6 @@
-model: PrimeIntellect/Qwen3-0.6B
-output_dir: ./reverse-text-qwen3-2
+model: Qwen/Qwen3-0.6B
+output_dir: ./outputs/sft/reverse-text-qwen3
+resume_from_checkpoint: false
 merge_adapter: true
 
 per_device_train_batch_size: 2
@@ -15,6 +16,7 @@ eval_steps: 25
 learning_rate: 2e-4
 
 recipe: fp8-hybrid
+train_vision: false
 warmup_ratio: 0.15
 
 lora: true

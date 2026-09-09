@@ -1,5 +1,6 @@
 model: sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP
-output_dir: ./output_q36
+output_dir: ./outputs/sft/qwen35/qwen36-text-lora-nvfp4
+resume_from_checkpoint: false
 
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
@@ -14,6 +15,7 @@ learning_rate: 2e-4
 warmup_ratio: 0.15
 
 recipe: nvfp4
+train_vision: false
 fp4_four_over_six: false
 cpu_training: true
 

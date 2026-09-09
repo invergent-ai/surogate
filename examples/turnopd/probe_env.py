@@ -6,7 +6,7 @@ failing to *reason* (walks the graph wrong / gives up)? Those need different
 fixes, so measure before changing anything.
 
 Usage:
-  python examples/turnopd/probe_env.py --port 8007 --model Qwen/Qwen3.5-0.8B -n 20
+  python examples/turnopd/probe_env.py --port 8007 --model Qwen/Qwen3.5-2B -n 20
 """
 
 import argparse

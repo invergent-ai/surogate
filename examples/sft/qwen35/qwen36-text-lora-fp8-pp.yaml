@@ -1,7 +1,8 @@
 # Dispatch Pipeline Parallelism (dispatch-PP) — single-node, model-parallel LoRA.
 #
 model: Qwen/Qwen3.6-27B
-output_dir: ./output_q36
+output_dir: ./outputs/sft/qwen35/qwen36-text-lora-fp8-pp
+resume_from_checkpoint: false
 
 # Size of the round-robin GPU pool. Set to your box's GPU count. The layers are split
 # into many SMALL stages
@@ -15,13 +16,14 @@ gradient_accumulation_steps: 8
 sample_packing: true
 sequence_len: 2048
 
-max_steps: 10
+max_steps: 100
 eval_steps: 25
 
 learning_rate: 1e-4
 warmup_ratio: 0.15
 
-recipe: fp8_hybrid
+recipe: fp8-hybrid
+train_vision: false
 
 # Opt-in model-parallel mode. Mutually exclusive with ZeRO sharding / cpu_training /
 # MoE-EP; CUDA graphs are auto-disabled (per-stage weight streaming can't be captured).

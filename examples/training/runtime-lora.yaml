@@ -1,35 +1,27 @@
+# Attention-only adapter supported by native Qwen3 serving.
 model: Qwen/Qwen3-0.6B
-output_dir: ./output_q3_bench_4gpu
-
+output_dir: ./outputs/training/runtime-lora
+resume_from_checkpoint: false
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
-
 sample_packing: true
 sequence_len: 2048
-gpus: 4
-
-max_steps: 20
-eval_steps: 0
-
+max_steps: 100
+eval_steps: 25
 learning_rate: 2e-4
-
 recipe: bf16
+train_vision: false
 warmup_ratio: 0.15
-
 lora: true
 lora_rank: 16
 lora_alpha: 32
 lora_dropout: 0
 lora_target_modules:
-  - q_proj
-  - k_proj
-  - v_proj
-  - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
-
+- q_proj
+- k_proj
+- v_proj
+- o_proj
 dataloader_num_workers: 4
 datasets:
-  - path: "OpenLLM-Ro/ro_gsm8k"
-    type: auto
+- path: OpenLLM-Ro/ro_gsm8k
+  type: auto

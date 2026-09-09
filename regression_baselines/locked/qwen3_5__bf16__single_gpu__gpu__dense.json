@@ -1,7 +1,7 @@
 {
   "artifacts": {},
   "case": {
-    "config": "examples/sft/qwen35/qwen35-text-lora-bf16-1step.yaml",
+    "config": "tests/fixtures/training/qwen35-text-lora-bf16-1step.yaml",
     "distribution": "single_gpu",
     "env_model_path": "QWEN3_5_MODEL_PATH",
     "model": "qwen3_5",
@@ -13,7 +13,7 @@
   "command": [
     "surogate",
     "sft",
-    "examples/sft/qwen35/qwen35-text-lora-bf16-1step.yaml"
+    "tests/fixtures/training/qwen35-text-lora-bf16-1step.yaml"
   ],
   "duration_s": 0.0,
   "metrics": {},

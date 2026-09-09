@@ -1,0 +1,37 @@
+# Dense tiled MLP, recomputation and activation offload at 8192 tokens.
+model: Qwen/Qwen3-0.6B
+output_dir: ./outputs/training/long-context
+resume_from_checkpoint: false
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+sample_packing: true
+sequence_len: 8192
+max_steps: 100
+eval_steps: 25
+learning_rate: 2e-4
+recipe: bf16
+train_vision: false
+warmup_ratio: 0.15
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0
+lora_target_modules:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+dataloader_num_workers: 4
+datasets:
+- path: OpenLLM-Ro/ro_gsm8k
+  type: auto
+long_context: true
+recompute: true
+offload_residual: true
+offload_saved_tensors: true
+lmhead_chunks: 16
+attn_bwd_chunks: 2
+lmhead_drop_ignored_rows: true

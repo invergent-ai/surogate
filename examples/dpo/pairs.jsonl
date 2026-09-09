@@ -1,0 +1,8 @@
+{"prompt": [{"role": "user", "content": "Correct the grammar: The birds is singing."}], "chosen": "The birds are singing.", "rejected": "The birds is singing.", "enable_thinking": false}
+{"prompt": [{"role": "user", "content": "Correct the grammar: She walk to school."}], "chosen": "She walks to school.", "rejected": "She walk to school.", "enable_thinking": false}
+{"prompt": [{"role": "user", "content": "Correct the grammar: They was ready."}], "chosen": "They were ready.", "rejected": "They was ready.", "enable_thinking": false}
+{"prompt": [{"role": "user", "content": "Correct the grammar: He have a bicycle."}], "chosen": "He has a bicycle.", "rejected": "He have a bicycle.", "enable_thinking": false}
+{"prompt": [{"role": "user", "content": "Correct the grammar: We is on time."}], "chosen": "We are on time.", "rejected": "We is on time.", "enable_thinking": false}
+{"prompt": [{"role": "user", "content": "Correct the grammar: The dogs runs fast."}], "chosen": "The dogs run fast.", "rejected": "The dogs runs fast.", "enable_thinking": false}
+{"prompt": [{"role": "user", "content": "Correct the grammar: I has a question."}], "chosen": "I have a question.", "rejected": "I has a question.", "enable_thinking": false}
+{"prompt": [{"role": "user", "content": "Correct the grammar: It are cold today."}], "chosen": "It is cold today.", "rejected": "It are cold today.", "enable_thinking": false}

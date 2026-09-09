@@ -1,0 +1,41 @@
+# Minimal grammar pairs: surogate dpo examples/dpo/qwen3.yaml
+model: Qwen/Qwen3-0.6B
+output_dir: ./outputs/dpo/qwen3
+resume_from_checkpoint: false
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 1
+sample_packing: false
+sequence_len: 256
+max_steps: 20
+eval_steps: 0
+learning_rate: 5.0e-07
+recipe: bf16
+train_vision: false
+warmup_ratio: 0
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0
+lora_target_modules:
+- q_proj
+- k_proj
+- v_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+dataloader_num_workers: 4
+datasets:
+- path: ./examples/dpo/pairs.jsonl
+  type: preference
+lr_scheduler_type: constant
+save_steps: 10
+validation_split_ratio: 0
+lora_dtype: fp32
+gradient_dtype: fp32
+loss:
+  type: dpo
+  dpo_beta: 0.1
+  span_mask: true
+  length_norm: false
+  reference_free: false

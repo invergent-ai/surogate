@@ -112,7 +112,7 @@ and the throughput knob.
 ## Example
 
 A complete config for Qwen3.6-27B on 4× 32 GB GPUs ships at
-[`examples/sft/qwen35/qwen36-text-lora-bf16-pp.yaml`](https://github.com/invergent-ai/surogate/blob/main/examples/sft/qwen35/qwen36-text-lora-bf16-pp.yaml).
+[`examples/sft/qwen35/qwen36-text-lora-fp8-pp.yaml`](https://github.com/invergent-ai/surogate/blob/main/examples/sft/qwen35/qwen36-text-lora-fp8-pp.yaml).
 
 ```yaml
 model: Qwen/Qwen3.6-27B

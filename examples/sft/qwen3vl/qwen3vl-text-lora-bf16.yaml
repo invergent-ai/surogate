@@ -1,5 +1,6 @@
 model: Qwen/Qwen3-VL-2B-Instruct
-output_dir: ./output_vl
+output_dir: ./outputs/sft/qwen3vl/qwen3vl-text-lora-bf16
+resume_from_checkpoint: false
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
@@ -11,6 +12,7 @@ learning_rate: 2e-4
 warmup_ratio: 0.15
 
 recipe: bf16
+train_vision: false
 
 lora: true
 lora_rank: 16
