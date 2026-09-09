@@ -403,7 +403,7 @@ bool DataLoader::has_next(int n) const {
     if (mFileIndex != mShuffledFiles.size() - 1) {
         return true;
     }
-    return mChunkIndex + n * mWorldSize - mRank < mChunkOffsets.size();
+    return mChunkIndex + n * mWorldSize - mRank <= mChunkOffsets.size();
 }
 
 /**
@@ -441,7 +441,7 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids,
 
     const long header_offset = 1024;
 
-    if (mChunkIndex + mWorldSize - mRank >= mChunkOffsets.size()) {
+    if (mChunkIndex + mWorldSize - mRank > mChunkOffsets.size()) {
         if (!advance_file()) {
             throw std::runtime_error("No more files to load");
         }

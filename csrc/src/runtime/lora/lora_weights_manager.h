@@ -64,6 +64,9 @@ public:
         /// (smaller) dims when a full-attention layer needs the larger ones lets
         /// apply_lora_contribution read past the end of lora_B (→ NaN/garbage).
         std::vector<dsl::BlockTypeDims> per_layer_dims;
+        std::vector<LoRAAttentionShapes> attention_shapes;
+        std::string tensor_prefix = "base_model.model.model.layers";
+        std::vector<std::array<std::string, 4>> attention_names;
 
         /// Per-layer MLP structure from the DSL graph (hybrid dense/sparse-MLP
         /// models like Laguna: layer 0 dense SwiGLU, remaining layers MoE).

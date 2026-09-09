@@ -278,6 +278,23 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     if (!mAllocator) {
         mAllocator = std::make_shared<TensorAllocator>();
     }
+    if (const auto* type = internal::find_key(&mModule->hf_config, "model_type");
+        type && internal::as_string(*type).value_or("") == "glm5_next") {
+        const auto* topk = internal::find_key(&mModule->config, "index_topk");
+        if (topk && T > internal::as_int(*topk).value_or(0))
+            throw std::runtime_error(
+                "GLM training currently requires sequence_len <= index_topk; sparse DSA selection is not implemented");
+        for (const char* name : {"n_group", "topk_group"}) {
+            const auto* value = internal::find_key(&mModule->config, name);
+            if (value && internal::as_int(*value).value_or(1) != 1)
+                throw std::runtime_error("GLM training currently requires n_group=topk_group=1");
+        }
+        for (const char* name : {"norm_topk_prob", "index_kpool_always_select_tail"}) {
+            const auto* value = internal::find_key(&mModule->config, name);
+            if (value && !internal::as_bool(*value).value_or(true))
+                throw std::runtime_error(std::string("GLM training currently requires ") + name + "=true");
+        }
+    }
     mOptions = options;
     if (qlora_enabled() && mQLoRAConfig.is_fp4()) {
         mOptions.UseCudaGraphs = false;
@@ -656,7 +673,19 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
     request.logprobs_gpu = logprobs_gpu;
     request.inv_temperature_gpu = inv_temperature_gpu;
     request.forward_hook = hook_ptr;
-    mExecutor->execute_forward(request, comm);
+    // Inline LoRA dispatch uses executor state, not the legacy hook pointer.
+    // Forward-only scoring is eager, so changing it cannot reuse a policy graph.
+    const bool reference_only = !use_lora && lora_enabled();
+    if (reference_only) mExecutor->set_lora_state(nullptr, nullptr, nullptr, nullptr);
+    try {
+        mExecutor->execute_forward(request, comm);
+    } catch (...) {
+        if (reference_only)
+            mExecutor->set_lora_state(&*mLoRAConfig, mLoRAWeights.get(), mLoRAGrads.get(), mLoRARunState.get());
+        throw;
+    }
+    if (reference_only)
+        mExecutor->set_lora_state(&*mLoRAConfig, mLoRAWeights.get(), mLoRAGrads.get(), mLoRARunState.get());
 
     CUDA_CHECK(cudaMemcpyAsync(scratch.host_inference_logprobs[staging_slot].Data,
                                logprobs_gpu,

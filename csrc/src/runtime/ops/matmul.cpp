@@ -765,8 +765,59 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     bool used_fp8 = false;
     bool has_dout_quant = false;
 
+    // Routers can produce FP32 logits from BF16 parameters/activations.
+    // Match that forward precision in backward, then cast the accumulated
+    // parameter gradient back to its storage dtype.
+    if (mode == EMMTranspose::NT && d_out.DType == ETensorDType::FP32 &&
+        (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32)) {
+        auto as_float = [&](const Tensor& source, bool copy = true) {
+            if (source.DType == ETensorDType::FP32) return source;
+            if (source.DType != ETensorDType::BF16)
+                throw std::runtime_error("FP32 matmul backward requires BF16/FP32 inputs");
+            Tensor result = mRunState.temp_alloc(ETensorDType::FP32,
+                                                 {source.Sizes.begin(), source.Sizes.begin() + source.Rank},
+                                                 "matmul_bwd_fp32");
+            mTemps.push_back(result);
+            if (copy)
+                convert_dtype(result.get<float>(), source.get<nv_bfloat16>(), source.nelem(), mRunState.MainStream);
+            return result;
+        };
+        Tensor af = flatten_bt(as_float(a), mB, mT), bf = as_float(b);
+        Tensor df = flatten_bt(d_out, mB, mT);
+        auto compute = [&](Tensor* target,
+                           const Tensor& left,
+                           const Tensor& right,
+                           EMMTranspose mode_rm,
+                           bool accumulate) {
+            if (!target) return;
+            Tensor result = as_float(*target, accumulate);
+            int M = 0, N = 0, K = 0;
+            matmul_dims(left, right, mode_rm, M, N, K);
+            matmul(result,
+                   right,
+                   left,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   swap_transpose(mode_rm),
+                   accumulate,
+                   mRunState.MainStream);
+            if (target->DType == ETensorDType::BF16)
+                convert_dtype(target->get<nv_bfloat16>(), result.get<float>(), result.nelem(), mRunState.MainStream);
+        };
+        compute(dA_ptr, df, bf, EMMTranspose::NN, false);
+        compute(dB_ptr, df, af, EMMTranspose::TN, do_accumulate);
+        used_recipe = true;
+    }
+
     const bool disable_qkv_recipe_bwd = is_qkv_op && skip_weight_grad && (mConfig.NumExperts > 0);
-    if (mRecipe && mode == EMMTranspose::NT && a.Sizes[0] == mB * mT && allow_quant && !disable_qkv_recipe_bwd) {
+    if (!used_recipe && mRecipe && mode == EMMTranspose::NT && a.Sizes[0] == mB * mT && allow_quant &&
+        !disable_qkv_recipe_bwd) {
         Tensor dA_tmp{};
         Tensor dB_tmp{};
         Tensor* dA_use = dA_ptr;

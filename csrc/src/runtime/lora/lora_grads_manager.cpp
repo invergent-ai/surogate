@@ -167,7 +167,18 @@ void ModularLoRAGradsManager::allocate_gradients() {
         // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
         const bool has_attention = (bt == BlockType::Dense || bt == BlockType::Attention ||
                                     ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
-        if (has_attention) {
+        if (static_cast<std::size_t>(l) < mConfig.attention_shapes.size()) {
+            const auto& shapes = mConfig.attention_shapes[l];
+            auto allocate = [&](int i, bool enabled, auto& full_proj, auto& shard_proj, const char* name) {
+                if (!enabled || shapes[i].input == 0 || shapes[i].output == 0) return;
+                full_proj = alloc_full(shapes[i].input, shapes[i].output, prefix + name);
+                shard_proj = alloc_shard(shapes[i].input, shapes[i].output, prefix + name + "_shard");
+            };
+            allocate(0, mConfig.lora_config.applies_to_q(), full.attention.q, shard.attention.q, "_q");
+            allocate(1, mConfig.lora_config.applies_to_k(), full.attention.k, shard.attention.k, "_k");
+            allocate(2, mConfig.lora_config.applies_to_v(), full.attention.v, shard.attention.v, "_v");
+            allocate(3, mConfig.lora_config.applies_to_o(), full.attention.o, shard.attention.o, "_o");
+        } else if (has_attention) {
             if (mConfig.lora_config.applies_to_q()) {
                 full.attention.q = alloc_full(C, q_lora_out, prefix + "_q");
                 shard.attention.q = alloc_shard(C, q_lora_out, prefix + "_q_shard");

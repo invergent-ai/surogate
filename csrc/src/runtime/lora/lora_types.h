@@ -16,6 +16,13 @@
 
 namespace modules {
 
+// Exact geometry for nonstandard Q/K/V/O projections (e.g. KDA and MLA).
+struct LoRAProjectionShape {
+    int input = 0;
+    int output = 0;
+};
+using LoRAAttentionShapes = std::array<LoRAProjectionShape, 4>;
+
 /**
  * @brief Type trait to detect if a weights struct has experts
  */

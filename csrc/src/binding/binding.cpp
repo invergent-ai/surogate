@@ -37,12 +37,36 @@
 #include "tokenizer/tok_profile.h"
 #include "tokenizer/tokenizer.h"
 #include "runtime/attention/mem_eff/mem_eff_dispatch.h"
+#include "kernels/glm5.h"
+#include "runtime/jit/kimi_delta_rule_kernels.h"
 
 namespace nb = nanobind;
 
 using TokenArray = nb::ndarray<std::int32_t, nb::shape<-1, -1>, nb::c_contig, nb::device::cpu>;
 using TokenArray3 = nb::ndarray<std::int32_t, nb::shape<-1, -1, -1>, nb::c_contig, nb::device::cpu>;
 using FloatArray = nb::ndarray<float, nb::shape<-1, -1>, nb::c_contig, nb::device::cpu>;
+
+template <typename Array>
+static Tensor glm_kernel_tensor(const Array& a) {
+    Tensor t;
+    if (a.ndim() > t.Sizes.size()) throw std::runtime_error("GLM kernel tensor rank is too large");
+    const auto dtype = a.dtype();
+    if (dtype.code == static_cast<std::uint8_t>(nb::dlpack::dtype_code::Bfloat) && dtype.bits == 16)
+        t.DType = ETensorDType::BF16;
+    else if (dtype.code == static_cast<std::uint8_t>(nb::dlpack::dtype_code::Float) && dtype.bits == 32)
+        t.DType = ETensorDType::FP32;
+    else if (dtype.code == static_cast<std::uint8_t>(nb::dlpack::dtype_code::Int) && dtype.bits == 32)
+        t.DType = ETensorDType::INT32;
+    else if (dtype.code == static_cast<std::uint8_t>(nb::dlpack::dtype_code::UInt) && dtype.bits == 8)
+        t.DType = ETensorDType::BYTE;
+    else
+        throw std::runtime_error("GLM kernel requires FP32/BF16 data or INT32 positions");
+    t.Rank = a.ndim();
+    t.Data = reinterpret_cast<std::byte*>(a.data());
+    for (int i = 0; i < t.Rank; ++i)
+        t.Sizes[i] = a.shape(i);
+    return t;
+}
 
 static std::optional<ETensorDType> opt_dtype_from_str(const std::string& dtype_str) {
     if (dtype_str.empty()) {
@@ -3620,6 +3644,70 @@ NB_MODULE(_surogate, m) {
             "Parameters:\n"
             "- batch: List of conversations, each a list of message dicts.\n"
             "- strategy: 'default', 'last_round', 'thinking_only', 'final_only', or 'all'.");
+
+    nb::class_<KimiDeltaRuleKernels>(m, "_KdaKernels")
+        .def(nb::init<>())
+        .def("load", &KimiDeltaRuleKernels::load)
+        .def_static("workspace_bytes", &KimiDeltaRuleKernels::workspace_bytes)
+        .def("run", [](const KimiDeltaRuleKernels& kernels, bool backward,
+                       const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+                       const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results,
+                       std::optional<nb::ndarray<std::int32_t, nb::ndim<1>, nb::device::cuda, nb::c_contig>> cu,
+                       nb::ndarray<nb::device::cuda, nb::c_contig> workspace,
+                       std::uintptr_t stream) {
+            std::vector<Tensor> in, out;
+            for (const auto& a : arrays) in.push_back(glm_kernel_tensor(a));
+            for (const auto& a : results) out.push_back(glm_kernel_tensor(a));
+            if (cu && cu->size() < 2) throw std::runtime_error("KDA cu_seqlens needs at least two entries");
+            kernels.run(backward, in, out, cu ? cu->data() : nullptr, cu ? cu->size() - 1 : 0,
+                        glm_kernel_tensor(workspace), reinterpret_cast<cudaStream_t>(stream));
+        }, nb::arg("backward"), nb::arg("inputs"), nb::arg("outputs"),
+           nb::arg("cu_seqlens").none(), nb::arg("workspace"), nb::arg("stream"));
+
+    // Standalone native kernels for numerical forward/backward regression tests.
+    m.def(
+        "_glm5_kernel",
+        [](int kind,
+           bool backward,
+           const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+           const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results,
+           nb::dict kwargs,
+           std::uintptr_t stream_ptr,
+           std::optional<nb::ndarray<float, nb::device::cuda, nb::c_contig>> checkpoints) {
+            std::vector<Tensor> in, out;
+            for (const auto& a : arrays)
+                in.push_back(glm_kernel_tensor(a));
+            for (const auto& a : results)
+                out.push_back(glm_kernel_tensor(a));
+            Glm5Options opts;
+            if (kwargs.contains("streams")) opts.streams = nb::cast<int>(kwargs["streams"]);
+            if (kwargs.contains("sinkhorn_iters")) opts.sinkhorn_iters = nb::cast<int>(kwargs["sinkhorn_iters"]);
+            if (kwargs.contains("hc_eps")) opts.hc_eps = nb::cast<float>(kwargs["hc_eps"]);
+            if (kwargs.contains("norm_eps")) opts.norm_eps = nb::cast<float>(kwargs["norm_eps"]);
+            if (kwargs.contains("lower_bound")) opts.lower_bound = nb::cast<float>(kwargs["lower_bound"]);
+            if (kwargs.contains("min")) opts.clamp_min = nb::cast<float>(kwargs["min"]);
+            if (kwargs.contains("max")) opts.clamp_max = nb::cast<float>(kwargs["max"]);
+            if (kwargs.contains("fused_gate_up")) opts.fused_gate_up = nb::cast<bool>(kwargs["fused_gate_up"]);
+            auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+            if (kind < 0 || kind > 5) throw std::runtime_error("invalid GLM kernel kind");
+            if (backward) {
+                if (kind == 3 && !checkpoints) throw std::runtime_error("KDA backward requires checkpoints");
+                glm5_backward(static_cast<Glm5Kernel>(kind),
+                              in,
+                              out,
+                              opts,
+                              checkpoints ? glm_kernel_tensor(*checkpoints) : Tensor{},
+                              stream);
+            } else
+                glm5_forward(static_cast<Glm5Kernel>(kind), in, out, opts, stream);
+        },
+        nb::arg("kind"),
+        nb::arg("backward"),
+        nb::arg("inputs"),
+        nb::arg("outputs"),
+        nb::arg("options"),
+        nb::arg("stream"),
+        nb::arg("checkpoints") = nb::none());
 
     // ----------------------------------------------------------------------
     // mem-efficient attention (Phase 4 attempt 1 port, see

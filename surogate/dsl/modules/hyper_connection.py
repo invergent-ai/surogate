@@ -239,9 +239,8 @@ class StreamBroadcast(Module):
             share_policy="per_layer",
             description="Initial residual streams (embedding broadcast)",
         )
-        x_flat = g.view(x.ref, shape=[B * T, self.C], out_name=tracer.prefixed("x_flat"))
-        # Distinct copy nodes per stream keep the concat backward unambiguous.
-        copies = [g.copy(x_flat) for _ in range(self.S)]
-        cat = g.concat(*copies, dim=1, split_size=[self.d_model] * self.S)
-        res = g.view(cat, shape=[B, T, self.SC], out_name=res_slot)
+        # Distinct outputs keep concat backward unambiguous. Scale by one is
+        # a materialized identity with a native forward and backward kernel.
+        copies = [g.scale(x.ref, factor=1.0) for _ in range(self.S)]
+        res = g.concat(*copies, dim=2, split_size=[self.d_model] * self.S, out_name=res_slot)
         return Proxy(res_slot, res)

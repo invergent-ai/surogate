@@ -350,6 +350,18 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MambaGatedRMSNorm: return "mamba_gated_rmsnorm";
         case CompiledOpType::MambaOutProj: return "mamba_out_proj";
         case CompiledOpType::ChunkGatedDeltaRule: return "chunk_gated_delta_rule";
+        case CompiledOpType::MhcMix: return "mhc_mix";
+        case CompiledOpType::MhcMixBackward: return "mhc_mix_backward";
+        case CompiledOpType::MhcCombine: return "mhc_combine";
+        case CompiledOpType::MhcCombineBackward: return "mhc_combine_backward";
+        case CompiledOpType::KdaDecay: return "kda_decay";
+        case CompiledOpType::KdaDecayBackward: return "kda_decay_backward";
+        case CompiledOpType::KimiDeltaRule: return "chunk_kimi_delta_rule";
+        case CompiledOpType::KimiDeltaRuleBackward: return "chunk_kimi_delta_rule_backward";
+        case CompiledOpType::GlmCausalConv1d: return "glm_causal_conv1d";
+        case CompiledOpType::GlmCausalConv1dBackward: return "glm_causal_conv1d_backward";
+        case CompiledOpType::Clamp: return "clamp";
+        case CompiledOpType::ClampBackward: return "clamp_backward";
         case CompiledOpType::Qwen3_5Decay: return "qwen3_5_decay";
         case CompiledOpType::RepeatInterleaveHeads: return "repeat_interleave_heads";
         case CompiledOpType::ChunkGatedDeltaRuleBackward: return "chunk_gated_delta_rule_backward";
@@ -389,6 +401,7 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
     // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
     if (!options.JitKernelManifests.empty()) {
         mGdrKernels.load(options.JitKernelManifests);
+        mKdaKernels.load(options.JitKernelManifests);
     }
 }
 

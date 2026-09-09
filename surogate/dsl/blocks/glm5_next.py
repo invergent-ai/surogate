@@ -33,40 +33,34 @@ by ``routed_scaling_factor`` (2.5). ``n_group``/``topk_group`` are both 1 in
 every released config, so the group-restricted selection degenerates to a plain
 top-k and is not modelled.
 
-NOT EXPRESSED HERE, deliberately:
-
-* ``swiglu_limit`` (10.0) — the reference clamps the SwiGLU gate to
-  ``(-inf, 10]`` and the up projection to ``[-10, 10]``, in both the experts and
-  the dense/shared MLPs. The DSL's ``swiglu``/``silu_mul`` ops take no clamp, so
-  the limit is carried in the config and *not* applied in the graph. It is a
-  real (if rarely-binding) numerical difference.
-* the DSA indexer and its k-pool tensors — see
-  :class:`~surogate.dsl.modules.glm5_next.Glm5NextLatentAttention`.
-* serve objects — no GLM-5.3 serve target exists, so no artifact layout is
-  declared rather than one being guessed at.
+The training graph includes the asymmetric SwiGLU clamp and resets recurrent
+state and convolution history at packed sequence boundaries. Sparse DSA
+selection, vision and MTP are serving-only declarations; text training currently
+requires sequences no longer than ``index_topk``.
 """
 
 from __future__ import annotations
 
 from .. import nn
 from ..block_schema import (
-    ServeObject,
     BlockSchema,
     DistributionDecl,
     EPTopology,
     RoutingSchema,
+    ServeObject,
     SlotDecl,
     StreamingHint,
 )
 from ..dim import B, Dim, T
-from ..modules import LagunaMoEExperts, MoESharedExpert, RMSNorm, SwiGLUMLP
+from ..modules import MoESharedExpert, RMSNorm
 from ..modules.glm5_next import (
+    Glm5NextDenseMLP,
     Glm5NextHyperConnection,
     Glm5NextHyperConnectionCombine,
     Glm5NextKimiDeltaMixer,
     Glm5NextLatentAttention,
+    Glm5NextMoEExperts,
 )
-
 
 #: Norms are registered by ``RMSNorm`` under the attribute name; the canonical
 #: (and checkpoint-facing) names are ``ln1``/``ln2`` as everywhere else.
@@ -114,7 +108,7 @@ def _hc_slots(site: str) -> tuple[SlotDecl, ...]:
         SlotDecl(f"hc_{site}_fn", kind="param", shape=("HcMix", "HcWidth")),
         SlotDecl(f"hc_{site}_base", kind="param", shape=("HcMix",), dtype="fp32"),
         SlotDecl(f"hc_{site}_scale", kind="param", shape=(3,), dtype="fp32"),
-        SlotDecl(f"hc_{site}_comb", shape=("B * T", "HcCount", "HcCount"), save_for_backward=True),
+        SlotDecl(f"hc_{site}_comb", shape=("B * T", "HcCount", "HcCount"), dtype="fp32", save_for_backward=True),
     )
 
 
@@ -334,8 +328,10 @@ class _Glm5NextBlockBase(nn.Block):
         hc_mult: int,
         hc_eps: float,
         hc_sinkhorn_iters: int,
+        swiglu_limit: float,
     ) -> None:
         self.d_model = d_model
+        self.swiglu_limit = swiglu_limit
         self.eps = eps
         self.C = Dim("C")
         self.HcCount = hc_mult
@@ -413,7 +409,7 @@ class _Glm5NextBlockBase(nn.Block):
     def _init_dense_ffn(self, *, d_model: int, intermediate_size: int) -> None:
         self.M = intermediate_size
         self.use_shared_expert = False
-        self.mlp = SwiGLUMLP(d_model, intermediate_size)
+        self.mlp = Glm5NextDenseMLP(d_model, intermediate_size, self.swiglu_limit)
 
     def _init_moe_ffn(
         self,
@@ -434,7 +430,7 @@ class _Glm5NextBlockBase(nn.Block):
         self.routed_scaling_factor = routed_scaling_factor
         self.ep_size = ep_size
         self.use_shared_expert = shared_expert_intermediate > 0
-        self.moe = LagunaMoEExperts(
+        self.moe = Glm5NextMoEExperts(
             d_model,
             moe_intermediate_size,
             num_experts,
@@ -442,12 +438,14 @@ class _Glm5NextBlockBase(nn.Block):
             routed_scaling_factor=routed_scaling_factor,
             ep_size=ep_size,
         )
+        self.moe.swiglu_limit = self.swiglu_limit
         if self.use_shared_expert:
             self.shared_expert = MoESharedExpert(d_model, shared_expert_intermediate)
+            self.shared_expert.swiglu_limit = self.swiglu_limit
 
     # -- forward pieces ------------------------------------------------------
 
-    def _mixer_out(self, h):
+    def _mixer_out(self, h, position_ids):
         raise NotImplementedError
 
     def _ffn_out(self, h):
@@ -473,11 +471,12 @@ class _Glm5NextBlockBase(nn.Block):
 
     def forward(self, x, residual, position_ids):
         del x  # Blocks read only the wide residual streams.
-        del position_ids  # NoPE: no rotary anywhere in the GLM-5.3 text stack.
+        self._register_activation("position_ids", ("B", "T"), dtype="int32")
+        self._register_activation("residual", ("B", "T", self.HcWidth))
 
         h, post_a, comb_a = self.hc_attn(residual)
         h = self.attn_norm(h)
-        a = self._mixer_out(h)
+        a = self._mixer_out(h, position_ids)
         residual = self.hc_attn_combine(residual, a, post_a, comb_a)
 
         h2, post_f, comb_f = self.hc_ffn(residual)
@@ -504,12 +503,14 @@ class Glm5NextKdaDenseBlock(_Glm5NextBlockBase):
         hc_mult: int = 4,
         hc_eps: float = 1e-6,
         hc_sinkhorn_iters: int = 20,
+        swiglu_limit: float = 10.0,
         chunk_size: int = 64,
         eps: float = 1e-5,
     ):
         super().__init__()
         self._init_common(
-            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters
+            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters,
+            swiglu_limit=swiglu_limit,
         )
         self._init_kda(
             d_model=d_model,
@@ -522,8 +523,8 @@ class Glm5NextKdaDenseBlock(_Glm5NextBlockBase):
         )
         self._init_dense_ffn(d_model=d_model, intermediate_size=intermediate_size)
 
-    def _mixer_out(self, h):
-        return self.kda(h)
+    def _mixer_out(self, h, position_ids):
+        return self.kda(h, position_ids)
 
     def _ffn_out(self, h):
         return self._dense_ffn(h)
@@ -550,13 +551,15 @@ class Glm5NextKdaMoEBlock(_Glm5NextBlockBase):
         hc_mult: int = 4,
         hc_eps: float = 1e-6,
         hc_sinkhorn_iters: int = 20,
+        swiglu_limit: float = 10.0,
         chunk_size: int = 64,
         eps: float = 1e-5,
         ep_size: int = 1,
     ):
         super().__init__()
         self._init_common(
-            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters
+            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters,
+            swiglu_limit=swiglu_limit,
         )
         self._init_kda(
             d_model=d_model,
@@ -577,8 +580,8 @@ class Glm5NextKdaMoEBlock(_Glm5NextBlockBase):
             ep_size=ep_size,
         )
 
-    def _mixer_out(self, h):
-        return self.kda(h)
+    def _mixer_out(self, h, position_ids):
+        return self.kda(h, position_ids)
 
     def _ffn_out(self, h):
         return self._moe_ffn(h)
@@ -607,11 +610,13 @@ class Glm5NextMlaDenseBlock(_Glm5NextBlockBase):
         hc_mult: int = 4,
         hc_eps: float = 1e-6,
         hc_sinkhorn_iters: int = 20,
+        swiglu_limit: float = 10.0,
         eps: float = 1e-5,
     ):
         super().__init__()
         self._init_common(
-            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters
+            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters,
+            swiglu_limit=swiglu_limit,
         )
         self._init_mla(
             d_model=d_model,
@@ -625,7 +630,7 @@ class Glm5NextMlaDenseBlock(_Glm5NextBlockBase):
         )
         self._init_dense_ffn(d_model=d_model, intermediate_size=intermediate_size)
 
-    def _mixer_out(self, h):
+    def _mixer_out(self, h, position_ids):
         return self.mla(h)
 
     def _ffn_out(self, h):
@@ -655,12 +660,14 @@ class Glm5NextMlaMoEBlock(_Glm5NextBlockBase):
         hc_mult: int = 4,
         hc_eps: float = 1e-6,
         hc_sinkhorn_iters: int = 20,
+        swiglu_limit: float = 10.0,
         eps: float = 1e-5,
         ep_size: int = 1,
     ):
         super().__init__()
         self._init_common(
-            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters
+            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters,
+            swiglu_limit=swiglu_limit,
         )
         self._init_mla(
             d_model=d_model,
@@ -682,7 +689,7 @@ class Glm5NextMlaMoEBlock(_Glm5NextBlockBase):
             ep_size=ep_size,
         )
 
-    def _mixer_out(self, h):
+    def _mixer_out(self, h, position_ids):
         return self.mla(h)
 
     def _ffn_out(self, h):

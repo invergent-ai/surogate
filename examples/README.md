@@ -28,6 +28,7 @@ quality or hardware-capacity guarantees.
 | Continued pretraining on raw text | [Continued pretraining](pt/qwen3-continue.yaml), run with `surogate sft` |
 | Full-parameter SFT; AdamW and FP32 masters | [Full fine-tuning](training/full-finetune.yaml) |
 | LoRA, BF16/FP8/NVFP4 compute | [Model and precision recipes](#model-and-precision-recipes) |
+| Local miniature GLM-5.3-Flash; native training and shared-policy checks | [Dummy GLM checkpoint](sft/glm/README.md) |
 | Online BnB NF4, FP8 and NVFP4 QLoRA; prequantized checkpoints | [Qwen3 recipes](sft/qwen3), [precision guidance](training/README.md) |
 | Import/continue and stack adapters; checkpoint resume, merge and export | [Adapter lifecycle](training/README.md#continue-an-adapter-stack-an-adapter-or-resume-a-run) |
 | Local/hub datasets, instruction/chat mapping, mixing, packing and validation | [Dataset examples](datasets/README.md), [split chat columns](sft/reverse-text-qwen3.yaml) |
@@ -64,6 +65,7 @@ more GPUs, host offload or quantization; inspect the selected config before laun
 |---|---|---|
 | Gemma 4 text backbones | [12b-lora-fp8](sft/gemma4/gemma4-12b-lora-fp8.yaml), [e2b-lora-bf16](sft/gemma4/gemma4-e2b-lora-bf16.yaml), [e2b-lora-fp8](sft/gemma4/gemma4-e2b-lora-fp8.yaml) | 1 |
 | GPT-OSS MXFP4 | [lora-mxfp4](sft/gpt-oss/gptoss-lora-mxfp4.yaml) | 4 |
+| GLM-5.3-Flash architecture fixture | [Generator and scope](sft/glm/README.md), [dummy-full](sft/glm/dummy-full.yaml), [dummy-lora](sft/glm/dummy-lora.yaml) | 1 |
 | Laguna-S | [lora-fp8](sft/laguna/laguna-s-lora-fp8.yaml) | 8 |
 | LFM2.5 | [lora-bf16](sft/lfm2/lfm25-lora-bf16.yaml), [lora-fp8](sft/lfm2/lfm25-lora-fp8.yaml) | 1 |
 | Llama 3.2 | [lora-bf16](sft/llama/llama32-lora-bf16.yaml) | 1 |

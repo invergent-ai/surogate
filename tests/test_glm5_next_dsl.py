@@ -18,7 +18,6 @@ import pytest
 import surogate.dsl.models  # noqa: F401 - registers nn-style models
 from surogate.dsl.py_compiler import compile_model_for_hf
 
-
 ARCH = "Glm5NextForConditionalGeneration"
 
 
@@ -147,7 +146,7 @@ class TestBlockSchedule:
             )
         )
         # Layer 3 is MLA and now dense -> the fourth block shape appears.
-        assert ir["config"]["hybrid_pattern"] == "KKKMkkkm"
+        assert ir["config"]["hybrid_pattern"] == "KKKAkkkm"
         assert ir["config"]["n_mla_blocks"] == 1
 
     def test_all_sparse_when_no_dense_prefix(self):
@@ -165,10 +164,11 @@ class TestGraph:
     def test_manifold_hyper_connections_on_every_layer_and_site(self, ir):
         ops = _ops(ir)
         # One mHC gate head per sublayer site: 8 layers x 2.
-        assert ops.count("mhc_gates") == 16
+        assert ops.count("mhc_mix") == 16
         text = json.dumps(ir)
-        assert "hc_attn_logits" in text
-        assert "hc_ffn_logits" in text
+        assert ops.count("mhc_combine") == 16
+        assert "hc_attn_mixed" in text
+        assert "hc_ffn_mixed" in text
         assert "hc_attn_combine_res" in text
         assert "hc_ffn_combine_res" in text
 
@@ -185,13 +185,13 @@ class TestGraph:
         assert ops.count("chunk_kimi_delta_rule") == 6
         # Shared depthwise causal conv over the fused q|k|v, then the sigmoid-
         # gated per-head output norm.
-        assert ops.count("mamba_conv1d") == 6
+        assert ops.count("glm_causal_conv1d") == 6
         assert ops.count("mamba_gated_rmsnorm") == 6
         assert '"gate_activation": "sigmoid"' in json.dumps(ir)
 
     def test_mla_graph_is_dense_and_nope(self, ir):
         ops = _ops(ir)
-        assert ops.count("flash_attention_qkv") == 2
+        assert ops.count("flash_attention") == 2
         # NoPE: nothing rotary anywhere in the text stack.
         assert "rope" not in ops
         assert "mrope" not in ops
@@ -219,6 +219,21 @@ class TestGraph:
         slots = {s["name"]: s for s in ir["activation_layout"]["slots"]}
         assert "residual0" in slots
         assert "hc_mult * d_model" in str(slots["residual0"]["shape"])
+        combines = [op for op in ir["forward"]["operations"] if op["kernel_type"] == "mhc_combine"]
+        for op in combines:
+            # Cross-layer residuals are materialized directly into their saved
+            # slots, rather than views over storage reused during recompute.
+            assert op["outputs"][0].endswith("combine_res")
+        final_alias = next(op for op in ir["forward"]["operations"] if op["name"] == "alias_final_7_hc_ffn_combine_res")
+        assert final_alias["attrs"]["shape"][-1] == 256
+
+    def test_router_precision_and_frozen_correction_bias(self, ir):
+        slots = {s["name"]: s for s in ir["activation_layout"]["slots"]}
+        for name in ("router_logits", "router_probs", "routing_weights"):
+            assert slots[name]["dtype"] == "fp32"
+        for name, param in ir["forward"]["params"].items():
+            if name.endswith("e_score_correction_bias"):
+                assert param["frozen"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -332,9 +347,7 @@ class TestHfMapping:
         assert gate_up["type"] == "stack_experts"
         assert gate_up["pattern"] == f"{mlp3}.experts.{{expert}}.gate_proj.weight"
         assert gate_up["fuse_gate_up"] is True
-        assert mapping["blocks[3].experts_down"]["pattern"] == (
-            f"{mlp3}.experts.{{expert}}.down_proj.weight"
-        )
+        assert mapping["blocks[3].experts_down"]["pattern"] == (f"{mlp3}.experts.{{expert}}.down_proj.weight")
         assert mapping["blocks[3].router_weight"] == f"{mlp3}.gate.weight"
         assert mapping["blocks[3].e_score_correction_bias"] == f"{mlp3}.gate.e_score_correction_bias"
         # Shared expert is plural on disk and has no gate row.
@@ -419,15 +432,11 @@ class TestRejections:
         assert not result.get("success")
 
     def test_rejects_unknown_layer_type(self):
-        result = _raw_compile(
-            _full_config(_mini_text_config(num_hidden_layers=2, layer_types=["conv", "conv"]))
-        )
+        result = _raw_compile(_full_config(_mini_text_config(num_hidden_layers=2, layer_types=["conv", "conv"])))
         assert not result.get("success")
 
     def test_rejects_layer_types_length_mismatch(self):
-        result = _raw_compile(
-            _full_config(_mini_text_config(layer_types=["linear_attention"] * 3))
-        )
+        result = _raw_compile(_full_config(_mini_text_config(layer_types=["linear_attention"] * 3)))
         assert not result.get("success")
 
     def test_rejects_index_topk_not_divisible_by_kpool(self):

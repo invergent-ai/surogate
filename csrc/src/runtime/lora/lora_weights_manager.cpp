@@ -142,7 +142,19 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
     const bool has_attention = (bt == BlockType::Dense || bt == BlockType::Attention ||
                                 ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
-    if (has_attention) {
+    if (static_cast<std::size_t>(layer_idx) < mConfig.attention_shapes.size()) {
+        const auto& shapes = mConfig.attention_shapes[layer_idx];
+        auto allocate = [&](int i, bool enabled, auto& master_proj, auto& work_proj, const char* name) {
+            if (!enabled || shapes[i].input == 0 || shapes[i].output == 0) return;
+            master_proj.emplace();
+            work_proj.emplace();
+            allocate_layer_weights(*master_proj, *work_proj, shapes[i].input, shapes[i].output, prefix + name);
+        };
+        allocate(0, mConfig.lora_config.applies_to_q(), master.attention.q, work.attention.q, "_q");
+        allocate(1, mConfig.lora_config.applies_to_k(), master.attention.k, work.attention.k, "_k");
+        allocate(2, mConfig.lora_config.applies_to_v(), master.attention.v, work.attention.v, "_v");
+        allocate(3, mConfig.lora_config.applies_to_o(), master.attention.o, work.attention.o, "_o");
+    } else if (has_attention) {
         if (mConfig.lora_config.applies_to_q()) {
             master.attention.q.emplace();
             work.attention.q.emplace();
@@ -824,24 +836,30 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
     if (!enabled()) return;
 
     for (int l = 0; l < (int)mMaster.blocks.size(); ++l) {
-        std::string prefix = fmt::format("base_model.model.model.layers.{}", l);
+        std::string prefix = fmt::format("{}.{}", mConfig.tensor_prefix, l);
+        const auto names = static_cast<std::size_t>(l) < mConfig.attention_names.size()
+                               ? mConfig.attention_names[l]
+                               : std::array<std::string, 4>{mConfig.lora_config.q_proj_name,
+                                                            "k_proj",
+                                                            "v_proj",
+                                                            mConfig.lora_config.o_proj_name};
         auto& block = mMaster.blocks[l];
 
         if (block.attention.q.has_value()) {
-            callback(prefix + ".self_attn." + mConfig.lora_config.q_proj_name + ".lora_A.weight", block.attention.q->A);
-            callback(prefix + ".self_attn." + mConfig.lora_config.q_proj_name + ".lora_B.weight", block.attention.q->B);
+            callback(prefix + ".self_attn." + names[0] + ".lora_A.weight", block.attention.q->A);
+            callback(prefix + ".self_attn." + names[0] + ".lora_B.weight", block.attention.q->B);
         }
         if (block.attention.k.has_value()) {
-            callback(prefix + ".self_attn.k_proj.lora_A.weight", block.attention.k->A);
-            callback(prefix + ".self_attn.k_proj.lora_B.weight", block.attention.k->B);
+            callback(prefix + ".self_attn." + names[1] + ".lora_A.weight", block.attention.k->A);
+            callback(prefix + ".self_attn." + names[1] + ".lora_B.weight", block.attention.k->B);
         }
         if (block.attention.v.has_value()) {
-            callback(prefix + ".self_attn.v_proj.lora_A.weight", block.attention.v->A);
-            callback(prefix + ".self_attn.v_proj.lora_B.weight", block.attention.v->B);
+            callback(prefix + ".self_attn." + names[2] + ".lora_A.weight", block.attention.v->A);
+            callback(prefix + ".self_attn." + names[2] + ".lora_B.weight", block.attention.v->B);
         }
         if (block.attention.o.has_value()) {
-            callback(prefix + ".self_attn." + mConfig.lora_config.o_proj_name + ".lora_A.weight", block.attention.o->A);
-            callback(prefix + ".self_attn." + mConfig.lora_config.o_proj_name + ".lora_B.weight", block.attention.o->B);
+            callback(prefix + ".self_attn." + names[3] + ".lora_A.weight", block.attention.o->A);
+            callback(prefix + ".self_attn." + names[3] + ".lora_B.weight", block.attention.o->B);
         }
 
         // Dense MLP LoRA

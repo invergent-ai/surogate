@@ -94,6 +94,9 @@ inline void apply_lora_slices_forward(const std::vector<dsl::LoRASlice>& slices,
         const int size = resolve_and_validate_slice_size(slice, total_out, layer_idx, "apply_lora_slices_forward");
         auto* lora = get_layer_weight_by_target(block, slice.id);
         if (!lora || !lora->has_value()) continue;
+        if (lora->A.Sizes[1] != in_features || lora->B.Sizes[0] != size)
+            throw std::invalid_argument("LoRA projection shape mismatch at layer " + std::to_string(layer_idx) + ": " +
+                                        slice_label(slice));
 
         const unsigned seed = compute_dropout_seed(*run_state, layer_idx, slice);
         apply_lora_contribution(output_2d,
@@ -154,6 +157,9 @@ inline void apply_lora_slices_backward(const std::vector<dsl::LoRASlice>& slices
         const int size = resolve_and_validate_slice_size(slice, total_out, layer_idx, "apply_lora_slices_backward");
         auto* lora = get_layer_weight_by_target(block, slice.id);
         if (!lora || !lora->has_value()) continue;
+        if (lora->A.Sizes[1] != in_features || lora->B.Sizes[0] != size)
+            throw std::invalid_argument("LoRA projection shape mismatch at layer " + std::to_string(layer_idx) + ": " +
+                                        slice_label(slice));
         auto* lora_grad = get_layer_weight_by_target(grad_block, slice.id);
         if (!lora_grad || !lora_grad->has_value()) continue;
 

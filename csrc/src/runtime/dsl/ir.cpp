@@ -131,6 +131,7 @@ TensorInfo parse_tensor_info(const nlohmann::json& obj) {
     info.is_input = obj.value("is_input", false);
     info.is_output = obj.value("is_output", false);
     info.quantizable = obj.value("quantizable", true);
+    info.frozen = obj.value("frozen", false);
     info.offload_group = obj.value("offload_group", -1);
     if (obj.contains("lora_targets") && obj["lora_targets"].is_array()) {
         info.lora_targets.reserve(obj["lora_targets"].size());

@@ -484,6 +484,18 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"mamba_out_proj", CompiledOpType::MambaOutProj},
         // Qwen3.5 gated delta rule forward operations
         {"chunk_gated_delta_rule", CompiledOpType::ChunkGatedDeltaRule},
+        {"mhc_mix", CompiledOpType::MhcMix},
+        {"mhc_mix_backward", CompiledOpType::MhcMixBackward},
+        {"mhc_combine", CompiledOpType::MhcCombine},
+        {"mhc_combine_backward", CompiledOpType::MhcCombineBackward},
+        {"kda_decay", CompiledOpType::KdaDecay},
+        {"kda_decay_backward", CompiledOpType::KdaDecayBackward},
+        {"chunk_kimi_delta_rule", CompiledOpType::KimiDeltaRule},
+        {"chunk_kimi_delta_rule_backward", CompiledOpType::KimiDeltaRuleBackward},
+        {"clamp", CompiledOpType::Clamp},
+        {"clamp_backward", CompiledOpType::ClampBackward},
+        {"glm_causal_conv1d", CompiledOpType::GlmCausalConv1d},
+        {"glm_causal_conv1d_backward", CompiledOpType::GlmCausalConv1dBackward},
         {"qwen3_5_decay", CompiledOpType::Qwen3_5Decay},
         {"repeat_interleave_heads", CompiledOpType::RepeatInterleaveHeads},
         // Qwen3.5 gated delta rule backward operations
@@ -1176,10 +1188,13 @@ GraphCompiler::resolve_tensor_ref(const std::string& name, bool is_output, const
                 ref.dtype = *slot_entry->dtype;
             }
         }
-        // Override with infer_known_tensor_shape when available.
+        // Block aliases such as *_flat need their reshaped compatibility
+        // shape. Model-scope tensors retain their declared DSL shape (e.g.
+        // GLM's residual0 is hc_mult times wider than HiddenSize).
         {
             std::vector<long> known_shape;
-            if (infer_known_tensor_shape(stripped, mConfig, mB, mT, known_shape)) {
+            if ((layer_idx >= 0 || ref.shape.empty()) &&
+                infer_known_tensor_shape(stripped, mConfig, mB, mT, known_shape)) {
                 ref.shape = known_shape;
             }
         }
@@ -1562,6 +1577,17 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
     } else {
         attrs.eps = static_cast<float>(mConfig.RmsNormEps);
     }
+
+    if (auto* v = find_attr(op.attrs, "hc_mult")) attrs.hc_mult = static_cast<int>(attr_int(*v).value());
+    if (auto* v = find_attr(op.attrs, "hc_sinkhorn_iters"))
+        attrs.hc_sinkhorn_iters = static_cast<int>(attr_int(*v).value());
+    if (auto* v = find_attr(op.attrs, "hc_eps")) attrs.hc_eps = static_cast<float>(attr_double(*v).value());
+    if (auto* v = find_attr(op.attrs, "lower_bound"))
+        attrs.kda_lower_bound = static_cast<float>(attr_double(*v).value());
+    if (auto* v = find_attr(op.attrs, "min")) attrs.clamp_min = static_cast<float>(attr_double(*v).value());
+    if (auto* v = find_attr(op.attrs, "max")) attrs.clamp_max = static_cast<float>(attr_double(*v).value());
+
+    if (auto* v = find_attr(op.attrs, "fused_gate_up")) attrs.clamp_fused_gate_up = attr_bool(*v).value();
 
     // Transpose mode for matmul ops
     attrs.transpose = parse_transpose(op.attrs);
@@ -4268,6 +4294,16 @@ bool GraphCompiler::resolve_tensor_shape(const std::string& name, std::vector<lo
     if (check_tensor_info(mModule.forward->params, "fwd.params")) return true;
     if (check_tensor_info(mModule.forward->intermediates, "fwd.intermediates")) return true;
 
+    // The model's declared globals take precedence over legacy name-based
+    // guesses. Wide residual streams need this shape during forward replay,
+    // when the arena bindings are reconstructed without executing producers.
+    if (auto entry = mSlotRegistry.lookup(name);
+        entry && entry->scope == ActivationScope::Global && !entry->shape.empty()) {
+        shape = resolve_shape(entry->shape, mShapeEnv);
+        mTensorShapes[name] = TensorShape{shape, false};
+        return true;
+    }
+
     // Try pattern-based inference for known tensor names
     if (infer_known_tensor_shape(name, mConfig, mB, mT, shape)) {
         maybe_override_for_block_scope(shape);
@@ -4795,6 +4831,36 @@ void GraphCompiler::infer_output_shapes(const Operation& op,
                 }
                 output_shapes.push_back(out_shape);
             }
+            break;
+        }
+
+        case CompiledOpType::MhcMix: {
+            if (input_shapes.size() >= 4 && input_shapes[0].size() == 3) {
+                auto s = input_shapes[0];
+                auto* hc = find_attr(op.attrs, "hc_mult");
+                const long H = hc ? attr_int(*hc).value_or(4) : 4;
+                if (H <= 0) throw std::runtime_error("mHC stream count must be positive");
+                s[2] /= H;
+                output_shapes = {s, {s[0] * s[1], H}, {s[0] * s[1], H, H}};
+            }
+            break;
+        }
+        case CompiledOpType::MhcCombine:
+        case CompiledOpType::KimiDeltaRule:
+        case CompiledOpType::KdaDecay:
+        case CompiledOpType::GlmCausalConv1d:
+        case CompiledOpType::Clamp:
+            if (!input_shapes.empty()) output_shapes.push_back(input_shapes[0]);
+            break;
+        case CompiledOpType::MhcMixBackward:
+        case CompiledOpType::MhcCombineBackward:
+        case CompiledOpType::KimiDeltaRuleBackward:
+        case CompiledOpType::KdaDecayBackward:
+        case CompiledOpType::GlmCausalConv1dBackward:
+        case CompiledOpType::ClampBackward: {
+            size_t offset = type == CompiledOpType::MhcMixBackward ? 3 : 1;
+            for (size_t i = 0; i < op.outputs.size(); ++i)
+                output_shapes.push_back(input_shapes.at(offset + i));
             break;
         }
 
@@ -6456,7 +6522,10 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                            compiled.type == CompiledOpType::MoEGroupedGemmDownBackward) {
                     // inputs: d_out, saved.inp, weights, saved.scatter_indices
                     // output: d_inp (same shape/dtype as saved.inp, input[1])
-                    if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
+                    if (i == 1 && compiled.inputs.size() > 2) {
+                        ref.dtype = compiled.inputs[2].dtype;
+                        ref.shape = compiled.inputs[2].shape;
+                    } else if (compiled.inputs.size() > 1 && !compiled.inputs[1].shape.empty()) {
                         ref.dtype = compiled.inputs[1].dtype;
                         ref.shape = compiled.inputs[1].shape;
                     } else if (compiled.inputs.size() > 3 && !compiled.inputs[3].shape.empty()) {
@@ -6508,6 +6577,23 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                             ref.shape = {x_shape[0], x_shape[1], x_shape[2] * repeats, x_shape[3]};
                         }
                     }
+                } else if (compiled.type == CompiledOpType::MhcMix) {
+                    ref.dtype = i == 0 ? compiled.inputs[0].dtype : ETensorDType::FP32;
+                } else if (compiled.type == CompiledOpType::KdaDecay) {
+                    ref.dtype = ETensorDType::FP32;
+                } else if (compiled.type == CompiledOpType::MhcCombine ||
+                           compiled.type == CompiledOpType::KimiDeltaRule || compiled.type == CompiledOpType::Clamp ||
+                           compiled.type == CompiledOpType::GlmCausalConv1d) {
+                    ref.dtype = compiled.inputs[0].dtype;
+                } else if (compiled.type == CompiledOpType::MhcMixBackward ||
+                           compiled.type == CompiledOpType::MhcCombineBackward ||
+                           compiled.type == CompiledOpType::KimiDeltaRuleBackward ||
+                           compiled.type == CompiledOpType::KdaDecayBackward ||
+                           compiled.type == CompiledOpType::ClampBackward ||
+                           compiled.type == CompiledOpType::GlmCausalConv1dBackward) {
+                    size_t source = i + (compiled.type == CompiledOpType::MhcMixBackward ? 3 : 1);
+                    ref.dtype = compiled.inputs.at(source).dtype;
+                    ref.shape = compiled.inputs.at(source).shape;
                 } else if (compiled.type == CompiledOpType::ChunkGatedDeltaRule) {
                     // output[0] = out [B, T, H, V] (match value dtype)
                     // output[1] = final_state [B, H, K, V] (kept in FP32 for cache stability)

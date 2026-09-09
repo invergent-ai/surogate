@@ -43,20 +43,16 @@ so a serve-spec generator can read them; the mechanism is not lowered):
   checkpoint's own speculative draft head.
 * **Vision tower** (``Glm5NextVisionModel``, ``model.visual.*``): text-only
   declaration, like ``qwen4_exp``'s. Its tensors are unused at import.
-* **``swiglu_limit``** (10.0): the reference clamps SwiGLU gate/up in every MLP.
-  The DSL's ``swiglu`` op takes no clamp, so the value is carried in the config
-  but not applied. See ``blocks/glm5_next.py``.
-
-Three graph ops are *named but unimplemented* — there is no kernel behind them
-yet, so this model compiles and its weights map, but it cannot train or serve
-until they land: ``mhc_gates`` (the sigmoid/softmax/Sinkhorn head of the mHC
-mix), ``kda_decay`` and ``chunk_kimi_delta_rule``. They are documented in
-``surogate/dsl/modules/glm5_next.py``.
+Native text training implements mHC, KDA forward/backward, packed convolution,
+FP32 routing and SwiGLU clipping. The runtime rejects sequences longer than
+``index_topk`` rather than silently replacing sparse DSA with dense attention.
+Vision/MTP/indexer weights remain outside the training parameter set.
 """
 
 from __future__ import annotations
 
 from .. import nn
+from ..block_schema import ServeObject, ServeSection
 from ..blocks.glm5_next import (
     GLM5_NEXT_MTP_LAYER_OBJECTS,
     Glm5NextKdaDenseBlock,
@@ -64,12 +60,10 @@ from ..blocks.glm5_next import (
     Glm5NextMlaDenseBlock,
     Glm5NextMlaMoEBlock,
 )
-from ..block_schema import ServeObject, ServeSection
 from ..hf import fuse, stack_experts
 from ..modules import Embedding, LMHead, RMSNorm, StreamBroadcast
 from ..modules.glm5_next import Glm5NextHyperHead
 from ..specs import ActivationScope
-
 
 #: The NextN draft head, `blk.N.nextn.*` of the GGUF and `layers.N.*` of the checkpoint for N
 #: the trunk's layer count. One latent-attention layer over the mixture on a single-stream
@@ -562,7 +556,7 @@ class Glm5NextConditionalModel(nn.Model):
         self.layer_types = layer_types
         self.mlp_layer_types = mlp_layer_types
         self.hybrid_pattern = "".join(
-            {"kda": "K", "kda_moe": "k", "mla": "M", "mla_moe": "m"}[t] for t in block_types
+            {"kda": "K", "kda_moe": "k", "mla": "A", "mla_moe": "m"}[t] for t in block_types
         )
 
         self.n_kda_blocks = sum(1 for t in block_types if t == "kda")
@@ -572,7 +566,7 @@ class Glm5NextConditionalModel(nn.Model):
         self.has_kda_blocks = (self.n_kda_blocks + self.n_kda_moe_blocks) > 0
         self.has_mla_blocks = (self.n_mla_blocks + self.n_mla_moe_blocks) > 0
 
-        hc_kwargs = dict(hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters)
+        hc_kwargs = dict(hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters, swiglu_limit=swiglu_limit)
         kda_kwargs = dict(
             linear_num_heads=linear_num_heads,
             linear_head_dim=linear_head_dim,
@@ -649,11 +643,10 @@ class Glm5NextConditionalModel(nn.Model):
     def forward(self, token_ids, position_ids, targets):
         G = ActivationScope.GLOBAL
 
-        # IO slots. There is no ``freq_cis``: GLM-5.3 is NoPE end to end, so
-        # ``position_ids`` reaches no operator — it is kept because the runtime
-        # model signature is fixed.
+        # No rotary table is needed. Position IDs mark packed sample boundaries
+        # for the convolution and KDA recurrence.
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
-        self._register_activation("position_ids", ("T",), dtype="int32", scope=G)
+        self._register_activation("position_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
 
         _h = ("B", "T", "d_model")

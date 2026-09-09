@@ -30,7 +30,7 @@ def shared_execution(config: dict, targets=()) -> str:
         raise ValueError("Nemotron is excluded from shared-model GRPO")
     # These definitions still contain deferred training operators. Registration
     # alone does not make them supported training models.
-    deferred = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text", "glm5_next"}
+    deferred = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text"}
     spec = next((s for name in list_registered_models() if (s := get_model_spec(name)).hf_config and
                  architecture in (s.hf_config.architecture, s.hf_config.model_type)), None)
     if spec is None or spec.hf_config.model_type in deferred:

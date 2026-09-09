@@ -45,6 +45,17 @@ def compile_jit_kernels(ir_json: str) -> dict[str, str]:
         gdr_manifests = _compile_gated_delta_rule(H, K, V)
         manifests.update(gdr_manifests)
 
+    if _ir_uses_op(ir, "chunk_kimi_delta_rule"):
+        config = next(
+            (m["config"] for m in ir.get("modules", []) if isinstance(m, dict) and m.get("config")),
+            ir.get("config", {}),
+        )
+        H, D = config.get("linear_num_heads", 0), config.get("linear_head_dim", 0)
+        if H <= 0 or D <= 0:
+            raise ValueError("KDA IR must specify linear_num_heads and linear_head_dim")
+        logger.info("Compiling vendored FLA KDA kernels (H=%d, D=%d)", H, D)
+        manifests.update(_compile_kimi_delta_rule(H, D))
+
     if manifests:
         logger.info("Compiled %d JIT kernels total.", len(manifests))
 
@@ -140,3 +151,24 @@ def _detect_sm() -> int:
     from surogate.kernels.compiler import _detect_sm
 
     return _detect_sm()
+
+
+def _compile_kimi_delta_rule(H: int, D: int) -> dict[str, str]:
+    import triton
+
+    from surogate.kernels.cache import KernelCache
+    from surogate.kernels.triton.kimi_delta_rule import compile_kimi_delta_rule
+
+    root = Path(__file__).parent
+    sm = _detect_sm()
+    return KernelCache().get_or_compile(
+        name="kimi_delta_rule",
+        src_files=[
+            root / "triton/kimi_delta_rule.py",
+            root / "compiler.py",
+            *sorted((root / "triton/fla_kda").glob("*.py")),
+        ],
+        dims={"H": H, "D": D, "triton": triton.__version__},
+        sm=sm,
+        compile_fn=lambda output_dir: compile_kimi_delta_rule(H, D, output_dir, sm),
+    )

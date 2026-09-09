@@ -941,6 +941,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
 
     const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() &&
                               mLoRAWeights->enabled() && layer_idx >= 0;
+    backward_moe_base_weights(op, d_gate_up, inp, host_offsets_ptr, num_experts);
     const bool skip_base_backward = lora_enabled && mRunState.is_lora_only_mode() && mRunState.is_prequantized() &&
                                     mConfig.Architecture == PretrainedConfig::GPT_OSS;
 
@@ -1520,7 +1521,7 @@ namespace {
 // MoE Grouped GEMM Gate+Up backward rule
 // Forward: out = moe_grouped_gemm_gate_up(inp, weights, scatter_indices)
 // Backward: d_inp = moe_grouped_gemm_gate_up_backward(d_out, inp, weights, scatter_indices)
-// Note: weights gradient is computed but not propagated (frozen expert weights)
+// The optional second output trains the base expert weights during full training.
 // -----------------------------------------------------------------------------
 std::vector<Operation> moe_grouped_gemm_gate_up_backward(const BackwardRuleContext& ctx) {
     std::vector<Operation> ops;
@@ -1540,7 +1541,7 @@ std::vector<Operation> moe_grouped_gemm_gate_up_backward(const BackwardRuleConte
                                      "moe_grouped_gemm_gate_up_backward",
                                      "moe_grouped_gemm_gate_up_backward",
                                      {ctx.d_output, inp_ref, weights_ref, scatter_ref},
-                                     {ctx.d_inputs[0]},
+                                     {ctx.d_inputs[0], ctx.needs_grad(1) ? ctx.d_inputs[1] : ""},
                                      attrs));
     }
 
@@ -1588,7 +1589,7 @@ const int _moe_grouped_gemm_gate_up_backward_shape_reg = [] {
     sig.min_inputs = 4;
     sig.max_inputs = 4;
     sig.min_outputs = 1;
-    sig.max_outputs = 1;
+    sig.max_outputs = 2;
     sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
         return std::optional<ShapeValidationError>();
     };

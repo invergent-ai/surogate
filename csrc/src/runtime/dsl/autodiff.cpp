@@ -190,6 +190,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         return stop_set.find(name) != stop_set.end();
     };
     auto is_differentiable = [&](const std::string& name) -> bool {
+        if (auto it = forward.params.find(name); it != forward.params.end() && it->second.frozen) return false;
         return !is_non_differentiable(forward, name) && !is_stopped(name);
     };
 

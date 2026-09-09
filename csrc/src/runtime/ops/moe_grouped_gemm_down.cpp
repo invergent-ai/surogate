@@ -801,6 +801,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
 
     const bool lora_enabled = mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() &&
                               mLoRAWeights->enabled() && layer_idx >= 0;
+    backward_moe_base_weights(op, d_output, inp, host_offsets_ptr, num_experts);
     const bool skip_base_backward = lora_enabled && mRunState.is_lora_only_mode() && mRunState.is_prequantized() &&
                                     mConfig.Architecture == PretrainedConfig::GPT_OSS;
 
@@ -1332,7 +1333,7 @@ std::vector<Operation> moe_grouped_gemm_down_backward(const BackwardRuleContext&
                                      "moe_grouped_gemm_down_backward",
                                      "moe_grouped_gemm_down_backward",
                                      {ctx.d_output, inp_ref, weights_ref, scatter_ref},
-                                     {ctx.d_inputs[0]}));
+                                     {ctx.d_inputs[0], ctx.needs_grad(1) ? ctx.d_inputs[1] : ""}));
     }
 
     return ops;
@@ -1379,7 +1380,7 @@ const int _moe_grouped_gemm_down_backward_shape_reg = [] {
     sig.min_inputs = 4;
     sig.max_inputs = 4;
     sig.min_outputs = 1;
-    sig.max_outputs = 1;
+    sig.max_outputs = 2;
     sig.validator = [](const auto&, const auto&, const AttrMap&, const ShapeEnv&) {
         return std::optional<ShapeValidationError>();
     };

@@ -60,7 +60,9 @@ def _detect_sm() -> int:
         major, minor = out.split("\n")[0].strip().split(".")
         return int(major) * 10 + int(minor)
     except Exception:
-        raise RuntimeError("Cannot detect GPU SM version. Pass sm= explicitly or ensure nvidia-smi is available.")
+        raise RuntimeError(
+            "Cannot detect GPU SM version. Pass sm= explicitly or ensure nvidia-smi is available."
+        ) from None
 
 
 def compile_triton_kernel(
@@ -72,6 +74,7 @@ def compile_triton_kernel(
     num_warps: int = 4,
     num_stages: int = 2,
     sm: int | None = None,
+    dot_input_precision: str | None = None,
 ) -> str:
     """Compile a Triton kernel to cubin + JSON manifest.
 
@@ -87,6 +90,7 @@ def compile_triton_kernel(
         num_warps: Number of warps per CTA (block_x = num_warps * 32).
         num_stages: Software pipelining stages.
         sm: Target SM version (e.g., 90 for H100). Auto-detected if None.
+        dot_input_precision: Optional precision for FP32 Triton dot products.
 
     Returns:
         Path to the generated JSON manifest file.
@@ -108,6 +112,8 @@ def compile_triton_kernel(
     src = ASTSource(fn=fn, signature=signature, constexprs=constants)
     target = GPUTarget("cuda", sm, 32)
     options = {"num_warps": num_warps, "num_stages": num_stages}
+    if dot_input_precision is not None:
+        options["default_dot_input_precision"] = dot_input_precision
 
     compiled = triton_compile(src, target=target, options=options)
 
@@ -121,6 +127,11 @@ def compile_triton_kernel(
         shared_mem = getattr(meta, "shared", shared_mem)
         global_scratch_size = getattr(meta, "global_scratch_size", 0)
         profile_scratch_size = getattr(meta, "profile_scratch_size", 0)
+
+    if global_scratch_size or profile_scratch_size:
+        raise RuntimeError(
+            f"{name} requires Triton scratch memory; the native launcher only supports kernels without scratch pointers"
+        )
 
     # The actual function name in the cubin (Triton mangles it)
     cubin_fn_name = compiled.name if hasattr(compiled, "name") else name
@@ -146,6 +157,7 @@ def compile_triton_kernel(
         "signature": signature,
         "constants": {str(k): v for k, v in constants.items()},
         "extra_null_params": extra_null_params,
+        "dot_input_precision": dot_input_precision,
     }
 
     manifest_path = output_dir / f"{name}.json"

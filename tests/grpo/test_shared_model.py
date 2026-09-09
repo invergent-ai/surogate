@@ -26,11 +26,17 @@ def test_nemotron_is_excluded(architecture):
         shared_execution(dict(architectures=[architecture]))
 
 
-@pytest.mark.parametrize("architecture", ["DeepseekV4ForCausalLM", "Glm5NextForConditionalGeneration",
+@pytest.mark.parametrize("architecture", ["DeepseekV4ForCausalLM",
                                          "Qwen4ExpForCausalLM", "MissingForCausalLM"])
 def test_incomplete_or_unknown_training_definitions_do_not_imply_support(architecture):
     with pytest.raises(ValueError, match="not a supported training"):
         shared_execution(dict(architectures=[architecture]))
+
+
+def test_glm_uses_the_training_model_for_shared_rollouts():
+    from examples.sft.glm.create_dummy import dummy_config
+
+    assert shared_execution(dummy_config(), ["all"]) == "training"
 
 
 def test_quantized_and_bidirectional_models_are_rejected():

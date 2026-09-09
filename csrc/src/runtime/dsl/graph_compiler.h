@@ -189,6 +189,18 @@ enum class CompiledOpType : std::uint8_t {
     MambaSsmScanBackward,
     MambaGatedRMSNormBackward,
     MambaOutProjBackward,
+    MhcMix,
+    MhcMixBackward,
+    MhcCombine,
+    MhcCombineBackward,
+    KdaDecay,
+    KdaDecayBackward,
+    KimiDeltaRule,
+    KimiDeltaRuleBackward,
+    Clamp,
+    ClampBackward,
+    GlmCausalConv1d,
+    GlmCausalConv1dBackward,
     // Sentinel
     Unknown
 };
@@ -215,6 +227,15 @@ struct TensorRef {
 // ============================================================================
 
 struct CompiledAttrs {
+    // GLM hyper-connections, decay and bounded activations
+    bool clamp_fused_gate_up = false;
+    int hc_mult = 4;
+    int hc_sinkhorn_iters = 20;
+    float hc_eps = 1e-6f;
+    float kda_lower_bound = -5.f;
+    float clamp_min = -std::numeric_limits<float>::infinity();
+    float clamp_max = std::numeric_limits<float>::infinity();
+
     // Common attributes
     float eps = 1e-6f;
     bool gelu_exact = false;

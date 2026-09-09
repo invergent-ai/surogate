@@ -58,6 +58,7 @@ class TensorRef:
     is_input: bool = False
     is_output: bool = False
     quantizable: bool = True
+    frozen: bool = False
     offload_group: int | str = -1
     # LoRA slice declarations attached to param tensors. Empty for
     # non-param tensors and for params that are not LoRA targets.
@@ -325,6 +326,7 @@ def _param_spec_to_ref(
         dtype=spec.dtype,
         is_param=True,
         quantizable=spec.quantizable,
+        frozen=spec.frozen,
         offload_group=spec.offload_group,
         lora_targets=list(spec.lora_targets),
     )
@@ -2063,6 +2065,8 @@ def _tensor_ref_to_dict(ref: TensorRef) -> dict[str, Any]:
         "is_output": ref.is_output,
     }
     if ref.is_param:
+        if ref.frozen:
+            result["frozen"] = True
         if not ref.quantizable:
             result["quantizable"] = False
         if ref.offload_group != -1:

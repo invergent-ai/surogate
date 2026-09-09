@@ -1,50 +1,11 @@
-"""GLM-5.3-Flash (``glm5_next``) mixers and residual plumbing.
+"""GLM-5.3-Flash text operators.
 
-Three mechanisms this architecture does not share with anything already in the
-DSL, transcribed from ``transformers/models/glm5_next/modular_glm5_next.py``
-(the reference implementation) and cross-checked against the released
-checkpoint's tensor contract (``study/colibri/c/tools/check_glm53_checkpoint.py``):
-
-``Glm5NextHyperConnection`` / ``Glm5NextHyperConnectionCombine``
-    Manifold-constrained hyper-connections (mHC, Xie et al. 2026), the
-    DeepSeek-V4 formulation GLM-5.3 inherits. The residual is ``hc_mult``
-    parallel streams; one *unweighted* RMSNorm over the flattened ``hc*d_model``
-    layout feeds a single projection ``fn`` whose ``(2+H)*H`` outputs split into
-    ``pre`` (stream collapse), ``post`` (block-output placement) and ``comb``
-    (an ``H x H`` matrix Sinkhorn-projected onto the doubly-stochastic manifold).
-    Unlike Qwen3.8-Flash-Next's hyper-connections these do **not** replace the
-    layer norms: GLM-5.3 keeps ``input_layernorm`` / ``post_attention_layernorm``
-    on the collapsed stream and a real ``model.norm`` after the head.
-
-``Glm5NextKimiDeltaMixer``
-    Kimi Delta Attention (KDA): a gated delta rule whose forget gate is
-    **per key channel**, not per head — ``g`` has shape ``[B, T, H, D]`` and
-    decays the recurrent state along the key axis. That is strictly more
-    fine-grained than the Qwen3.5 GDN this DSL already lowers, which is why it
-    cannot reuse ``chunk_gated_delta_rule``/``qwen3_5_decay`` (see below).
-
-``Glm5NextLatentAttention``
-    DeepSeek-style MLA with ``qk_rope_head_dim == 0`` — NoPE, so there is no
-    rotary anywhere in the text stack. Query and key/value both come through a
-    low-rank latent with its own RMSNorm; after ``kv_b_proj`` every head is
-    materialised, so the dense path is ordinary causal attention.
-
-DEFERRED, DELIBERATELY (no DSL primitive exists and no faithful lowering can be
-built out of the ones that do — a wrong lowering is worse than a named hole):
-
-* ``mhc_gates`` — the sigmoid/softmax/Sinkhorn head of the mHC mix. Sinkhorn
-  needs 20 alternating row/column *divisions*; the graph builder has no reduce
-  and no reciprocal, so this is emitted as one named custom op taking the mix
-  logits plus ``base``/``scale`` and returning ``(pre, post, comb)``. The norm
-  and the projection that feed it — the expensive parts — are real ops.
-  **There is no kernel behind this op name yet.**
-* ``kda_decay`` — ``lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))``.
-  Structurally the counterpart of the existing fused ``qwen3_5_decay`` op, but a
-  different formula on a different (per-channel) layout. **No kernel yet.**
-* ``chunk_kimi_delta_rule`` — the KDA core recurrence. Same signature as
-  ``chunk_gated_delta_rule`` except ``g`` is ``[B, T, H, D]``. **No kernel yet.**
-
-Everything else here is expressed in existing primitives.
+Native CUDA implements the manifold hyper-connections, bounded KDA decay and
+packed causal convolution. BF16 KDA training uses registered, vendored FLA
+Triton kernels; FP32 or disabled document masking uses the CUDA reference
+recurrence. MLA uses packed QKV with the existing attention dispatcher. Every SwiGLU applies GLM's
+asymmetric gate/up clamp. Sparse DSA selection remains outside the training graph;
+the runtime limits sequence length to ``index_topk``.
 """
 
 from __future__ import annotations
@@ -53,6 +14,65 @@ from typing import Any
 
 from ..dim import B, Dim, T
 from ..nn import Module, Proxy, Tracer
+from ..specs import LoRATarget
+from .moe import LagunaMoEExperts
+
+
+class Glm5NextMoEExperts(LagunaMoEExperts):
+    """Use concrete expert shapes to preserve GLM's dense/sparse width changes."""
+
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
+        result = super()._trace(tracer, *args, **kwargs)
+        dims = {"E": self.num_experts, "C": self.d_model, "M": self.d_ff, "MUp": 2 * self.d_ff}
+        for name in ("router_weight", "e_score_correction_bias", "experts_gate_up", "experts_down"):
+            param = tracer.params[tracer.prefixed(name)]
+            param.shape = tuple(dims.get(dim, dim) for dim in param.shape)
+        tracer.params[tracer.prefixed("router_weight")].lora_targets = []
+        tracer.params[tracer.prefixed("e_score_correction_bias")].frozen = True
+        # GLM routes in FP32. Rounding sigmoid scores to BF16 before top-k
+        # creates ties and can select entirely different experts.
+        router_slots = {tracer.prefixed(name) for name in ("router_logits", "router_probs", "routing_weights")}
+        for slot in tracer.forward_slots:
+            if slot.name in router_slots:
+                slot.dtype = "fp32"
+        return result
+
+
+class Glm5NextDenseMLP(Module):
+    """Dense SwiGLU with explicit dimensions beside the narrower MoE experts."""
+
+    def __init__(self, d_model: int, d_ff: int, limit: float) -> None:
+        super().__init__()
+        self.d_model, self.d_ff, self.limit = d_model, d_ff, limit
+
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
+        g = tracer.graph
+        (x,) = args
+        c, m = self.d_model, self.d_ff
+        up = tracer.register_param(
+            "up_weight",
+            (2 * m, c),
+            lora_targets=[
+                LoRATarget(name="up", size=m),
+                LoRATarget(name="gate", offset=m, size=m),
+            ],
+        )
+        down = tracer.register_param("down_weight", (c, m), lora_targets=[LoRATarget(name="down", size=c)])
+        up_slot = tracer.register_activation(
+            "up", ("B", "T", 2 * m), aliases=["up_flat"], share_policy="when_recomputed"
+        )
+        act_slot = tracer.register_activation(
+            "act", ("B", "T", m), aliases=["act_flat"], share_policy="when_recomputed"
+        )
+        out_slot = tracer.register_activation("down", ("B", "T", c), aliases=["down_flat"], share_policy="per_layer")
+        xf = g.view(x.ref, shape=[B * T, c], out_name=tracer.prefixed("x_flat"))
+        projected = g.matmul(xf, up, transpose="NT", out_name=tracer.prefixed("up_flat"))
+        projected = g.view(projected, shape=[B, T, 2 * m], out_name=up_slot)
+        act = g.swiglu(projected, limit=self.limit, out_name=act_slot)
+        act = g.view(act, shape=[B * T, m], out_name=tracer.prefixed("act_flat"))
+        result = g.matmul(act, down, transpose="NT", out_name=tracer.prefixed("down_flat"))
+        result = g.view(result, shape=[B, T, c], out_name=out_slot)
+        return Proxy(out_slot, result)
 
 
 class Glm5NextHyperConnection(Module):
@@ -96,79 +116,33 @@ class Glm5NextHyperConnection(Module):
     def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> tuple[Proxy, ...]:
         g = tracer.graph
         (residual,) = args
-
-        # -- params (tiny, never quantised) ---------------------------------
-        fn_w = tracer.register_param("fn", (self.MIX, self.SC), quantizable=False)
-        base_w = tracer.register_param("base", (self.MIX,), dtype="fp32", quantizable=False)
-        scale_w = tracer.register_param("scale", (3,), dtype="fp32", quantizable=False)
-
-        # -- activation slots ------------------------------------------------
-        tracer.register_activation("normed_rstd", ("B * T",), dtype="fp32", save=True)
-        logits_slot = tracer.register_activation(
-            "logits",
-            ("B * T", self.MIX),
-            save=True,
-            share_policy="per_layer",
-            description="mHC mix logits (pre | post | comb)",
+        fn = tracer.register_param("fn", (self.MIX, self.SC), quantizable=False)
+        base = tracer.register_param("base", (self.MIX,), dtype="fp32", quantizable=False)
+        scale = tracer.register_param("scale", (3,), dtype="fp32", quantizable=False)
+        mixed_slot = tracer.register_activation("mixed", ("B", "T", "C"), save=True, share_policy="per_layer")
+        post_slot = tracer.register_activation(
+            "post", ("B * T", self.S), dtype="fp32", save=True, share_policy="per_layer"
         )
-        pre_slot = tracer.register_activation("pre", ("B * T", self.S), save=True, share_policy="per_layer")
-        post_slot = tracer.register_activation("post", ("B * T", self.S), save=True, share_policy="per_layer")
         comb_slot = tracer.register_activation(
-            "comb",
-            ("B * T", self.S, self.S),
-            save=True,
-            share_policy="per_layer",
-            description="mHC doubly-stochastic stream mixer",
+            "comb", ("B * T", self.S, self.S), dtype="fp32", save=True, share_policy="per_layer"
         )
-        mixed_slot = tracer.register_activation(
-            "mixed",
-            ("B", "T", "C"),
-            share_policy="per_layer",
-            description="mHC collapsed stream (sublayer input)",
-        )
-
-        # -- graph -----------------------------------------------------------
-        res_flat = g.view(residual.ref, shape=[B * T, self.SC], out_name=tracer.prefixed("res_flat"))
-
-        # Unweighted RMSNorm over the whole hc*d_model layout: rmsnorm with a
-        # gamma of ones is exactly DeepseekV4UnweightedRMSNorm.
-        ones_ref = g.ones(shape=[self.SC], dtype="bf16")
-        normed, _rstd = g.rmsnorm(
-            res_flat,
-            ones_ref,
-            eps=self.eps,
-            y_name=tracer.prefixed("normed"),
-            rstd_name=tracer.prefixed("normed_rstd"),
-        )
-
-        logits = g.matmul(normed, fn_w, transpose="NT", out_name=logits_slot)
-
-        # DEFERRED: bias/scale + sigmoid/softmax + Sinkhorn projection. One
-        # named custom op; no kernel implements it yet (see module docstring).
-        pre, post, comb = g.custom(
-            "mhc_gates",
-            logits,
-            base_w,
-            scale_w,
+        # Norm, projection and stream collapse accumulate in FP32. Keeping them
+        # in one operator avoids rounding the mix logits or the pre gates to BF16.
+        mixed, post, comb = g.custom(
+            "mhc_mix",
+            residual.ref,
+            fn,
+            base,
+            scale,
             num_outputs=3,
             hc_mult=self.S,
             hc_eps=self.hc_eps,
             hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+            eps=self.eps,
         )
-        pre = g.view(pre, shape=[B * T, self.S], out_name=pre_slot)
+        mixed = g.view(mixed, shape=[B, T, self.C], out_name=mixed_slot)
         post = g.view(post, shape=[B * T, self.S], out_name=post_slot)
         comb = g.view(comb, shape=[B * T, self.S, self.S], out_name=comb_slot)
-
-        # Collapse: sum_s pre[s] * stream[s]. Real ops -- H is 4.
-        stream_sizes = [self.d_model] * self.S
-        streams = g.split(res_flat, split_size=stream_sizes, dim=1)
-        pre_cols = g.split(pre, split_size=[1] * self.S, dim=1)
-        acc = g.mul(streams[0], pre_cols[0], out_name=tracer.prefixed("collapse0"))
-        for i in range(1, self.S):
-            scaled = g.mul(streams[i], pre_cols[i], out_name=tracer.prefixed(f"collapse{i}"))
-            acc = g.add(acc, scaled)
-        mixed = g.view(acc, shape=[B, T, self.C], out_name=mixed_slot)
-
         return Proxy(mixed_slot, mixed), Proxy(post_slot, post), Proxy(comb_slot, comb)
 
 
@@ -176,13 +150,8 @@ class Glm5NextHyperConnectionCombine(Module):
     """mHC combine: place the sublayer output back on the residual streams.
 
     ``new[s] = post[s] * out + sum_j comb[j, s] * residual[j]`` — the transposed
-    ``comb`` matmul of the reference, unrolled over the (four) streams. No
+    ``comb`` matmul of the reference, fused over the (four) streams. No
     parameters of its own.
-
-    The unroll is exact but costs ``hc + hc^2`` elementwise ops per site (20 at
-    ``hc_mult=4``); a fused ``mhc_combine`` kernel is the obvious replacement
-    once one exists. It is written out rather than deferred because, unlike the
-    Sinkhorn head, it *can* be said in the primitives the DSL already has.
     """
 
     def __init__(self, d_model: int, hc_mult: int = 4) -> None:
@@ -195,34 +164,11 @@ class Glm5NextHyperConnectionCombine(Module):
     def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
         residual, out, post, comb = args
-
-        res_slot = tracer.register_activation(
-            "res",
-            ("B", "T", self.SC),
-            share_policy="per_layer",
-            description="Residual streams after the mHC combine",
-        )
-
-        res_flat = g.view(residual.ref, shape=[B * T, self.SC], out_name=tracer.prefixed("res_flat"))
-        out_flat = g.view(out.ref, shape=[B * T, self.C], out_name=tracer.prefixed("out_flat"))
-        comb_flat = g.view(comb.ref, shape=[B * T, self.S * self.S], out_name=tracer.prefixed("comb_flat"))
-
-        stream_sizes = [self.d_model] * self.S
-        res_parts = g.split(res_flat, split_size=stream_sizes, dim=1)
-        post_cols = g.split(post.ref, split_size=[1] * self.S, dim=1)
-        comb_cols = g.split(comb_flat, split_size=[1] * (self.S * self.S), dim=1)
-
-        combined = []
-        for s in range(self.S):
-            acc = g.mul(out_flat, post_cols[s], out_name=tracer.prefixed(f"place{s}"))
-            for j in range(self.S):
-                mixed_j = g.mul(res_parts[j], comb_cols[j * self.S + s])
-                acc = g.add(acc, mixed_j)
-            combined.append(acc)
-
-        cat = g.concat(*combined, dim=1, split_size=stream_sizes)
-        res_out = g.view(cat, shape=[B, T, self.SC], out_name=res_slot)
-        return Proxy(res_slot, res_out)
+        slot = tracer.register_activation("res", ("B", "T", self.SC), save=True, share_policy="per_layer")
+        # Write directly into the declared slot. A view would alias temporary
+        # storage, losing the cross-layer residual needed by backward replay.
+        combined = g.custom("mhc_combine", residual.ref, out.ref, post.ref, comb.ref, hc_mult=self.S, out_name=slot)
+        return Proxy(slot, combined)
 
 
 class Glm5NextHyperHead(Module):
@@ -275,8 +221,8 @@ class Glm5NextKimiDeltaMixer(Module):
     here on the dim-0 axis, which is exactly what the reference does at runtime
     (``torch.cat`` then one grouped conv).
 
-    ``kda_decay`` and ``chunk_kimi_delta_rule`` are declared-but-unimplemented
-    custom ops — see the module docstring.
+    ``kda_decay`` and ``chunk_kimi_delta_rule`` have native forward/backward
+    implementations. The latter uses vendored FLA for BF16 with document masking.
     """
 
     def __init__(
@@ -308,10 +254,17 @@ class Glm5NextKimiDeltaMixer(Module):
 
     def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
-        (x,) = args
+        x, position_ids = args
 
         # -- params ----------------------------------------------------------
-        qkv_w = tracer.register_param("qkv_weight", (self.ConvDim, "C"))
+        qkv_w = tracer.register_param(
+            "qkv_weight",
+            (self.ConvDim, "C"),
+            lora_targets=[
+                LoRATarget(name=name, offset=i * self.QKVDim, size=self.QKVDim)
+                for i, name in enumerate(("q", "k", "v"))
+            ],
+        )
         tracer.register_param("conv_weight", (self.ConvDim, 1, self.ConvK), quantizable=False)
         f_a_w = tracer.register_param("f_a_weight", (self.Dh, "C"), quantizable=False)
         f_b_w = tracer.register_param("f_b_weight", (self.QKVDim, self.Dh), quantizable=False)
@@ -321,7 +274,9 @@ class Glm5NextKimiDeltaMixer(Module):
         g_a_w = tracer.register_param("g_a_weight", (self.Dh, "C"), quantizable=False)
         g_b_w = tracer.register_param("g_b_weight", (self.QKVDim, self.Dh), quantizable=False)
         tracer.register_param("o_norm_weight", (self.Dh,), quantizable=False)
-        out_w = tracer.register_param("out_weight", ("C", self.QKVDim))
+        out_w = tracer.register_param(
+            "out_weight", ("C", self.QKVDim), lora_targets=[LoRATarget(name="o", size=self.d_model)]
+        )
 
         # -- activation slots ------------------------------------------------
         out_slot = tracer.register_activation(
@@ -334,30 +289,16 @@ class Glm5NextKimiDeltaMixer(Module):
         # -- graph -----------------------------------------------------------
         x_flat = g.view(x.ref, shape=[B * T, self.C], out_name=tracer.prefixed("x_flat"))
 
-        mixed_qkv_flat = g.matmul(
-            x_flat, qkv_w, transpose="NT", out_name=tracer.prefixed("mixed_qkv_flat")
-        )
-        mixed_qkv = g.view(
-            mixed_qkv_flat, shape=[B, T, self.ConvDim], out_name=tracer.prefixed("mixed_qkv")
-        )
-        mixed_qkv_cf = g.transpose(mixed_qkv, dim0=1, dim1=2)
-        conv_w2d = g.view(
+        mixed_qkv_flat = g.matmul(x_flat, qkv_w, transpose="NT", out_name=tracer.prefixed("mixed_qkv_flat"))
+        mixed_qkv = g.view(mixed_qkv_flat, shape=[B, T, self.ConvDim], out_name=tracer.prefixed("mixed_qkv"))
+        conv_out = g.custom(
+            "glm_causal_conv1d",
+            mixed_qkv,
             tracer.prefixed("conv_weight"),
-            shape=[self.ConvDim, self.ConvK],
-            out_name=tracer.prefixed("conv_w2d"),
+            position_ids.ref,
         )
-        conv_out_cf = g.mamba_conv1d(
-            mixed_qkv_cf,
-            conv_w2d,
-            None,
-            activation="silu",
-            out_name=tracer.prefixed("conv_out_cf"),
-        )
-        conv_out = g.transpose(conv_out_cf, dim0=1, dim1=2)
 
-        q_flat, k_flat, v_flat = g.split(
-            conv_out, split_size=[self.QKVDim, self.QKVDim, self.QKVDim], dim=2
-        )
+        q_flat, k_flat, v_flat = g.split(conv_out, split_size=[self.QKVDim, self.QKVDim, self.QKVDim], dim=2)
         query = g.view(q_flat, shape=[B, T, self.H, self.Dh], out_name=tracer.prefixed("query"))
         key = g.view(k_flat, shape=[B, T, self.H, self.Dh], out_name=tracer.prefixed("key"))
         value = g.view(v_flat, shape=[B, T, self.H, self.Dh], out_name=tracer.prefixed("value"))
@@ -366,7 +307,6 @@ class Glm5NextKimiDeltaMixer(Module):
         f_a = g.matmul(x_flat, f_a_w, transpose="NT", out_name=tracer.prefixed("f_a"))
         f_b = g.matmul(f_a, f_b_w, transpose="NT", out_name=tracer.prefixed("f_b"))
         f_b = g.view(f_b, shape=[B, T, self.H, self.Dh], out_name=tracer.prefixed("f_gate"))
-        # DEFERRED: no kernel implements `kda_decay` yet (module docstring).
         decay = g.custom(
             "kda_decay",
             f_b,
@@ -380,32 +320,23 @@ class Glm5NextKimiDeltaMixer(Module):
         b = g.view(b_flat, shape=[B, T, self.H], out_name=tracer.prefixed("b"))
         beta = g.sigmoid(b, out_name=tracer.prefixed("beta"))
 
-        # DEFERRED: no kernel implements `chunk_kimi_delta_rule` yet. It differs
-        # from `chunk_gated_delta_rule` only in that `decay` is per key channel.
-        core_attn_out, _state = g.custom(
+        # KDA decay is per key channel, unlike the scalar-head GDN gate.
+        core_attn_out = g.custom(
             "chunk_kimi_delta_rule",
             query,
             key,
             value,
             decay,
             beta,
-            num_outputs=2,
-            scale=0.0,
-            chunk_size=self.chunk_size,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
+            position_ids.ref,
         )
 
         # Output gate: low-rank, then the sigmoid-gated per-head RMSNorm.
         g_a = g.matmul(x_flat, g_a_w, transpose="NT", out_name=tracer.prefixed("g_a"))
         g_b = g.matmul(g_a, g_b_w, transpose="NT", out_name=tracer.prefixed("g_b"))
 
-        core_flat = g.view(
-            core_attn_out, shape=[B * T * self.H, self.Dh], out_name=tracer.prefixed("core_flat")
-        )
-        gate_flat = g.view(
-            g_b, shape=[B * T * self.H, self.Dh], out_name=tracer.prefixed("gate_flat")
-        )
+        core_flat = g.view(core_attn_out, shape=[B * T * self.H, self.Dh], out_name=tracer.prefixed("core_flat"))
+        gate_flat = g.view(g_b, shape=[B * T * self.H, self.Dh], out_name=tracer.prefixed("gate_flat"))
         gated_flat = g.mamba_gated_rmsnorm(
             core_flat,
             gate_flat,
@@ -416,9 +347,7 @@ class Glm5NextKimiDeltaMixer(Module):
             gate_activation="sigmoid",
             out_name=tracer.prefixed("gated_flat"),
         )
-        gated = g.view(
-            gated_flat, shape=[B * T, self.QKVDim], out_name=tracer.prefixed("gated")
-        )
+        gated = g.view(gated_flat, shape=[B * T, self.QKVDim], out_name=tracer.prefixed("gated"))
         out_flat = g.matmul(gated, out_w, transpose="NT", out_name=tracer.prefixed("out_flat"))
         out = g.view(out_flat, shape=[B, T, self.C], out_name=out_slot)
         return Proxy(out_slot, out)
@@ -438,7 +367,7 @@ class Glm5NextLatentAttention(Module):
     DEFERRED: the DSA indexer (``wq_b``/``wk``/``k_norm``/``weights_proj`` plus
     the k-pool compression tensors) and its top-k masking. Training runs dense
     causal attention, which is the exact semantics whenever the sequence fits
-    inside ``index_topk``; the reference model likewise trains dense. The
+    inside ``index_topk`` with tail selection enabled. The
     indexer tensors are simply not declared here, mirroring how ``qwen4_exp``
     treats its QSA indexer.
     """
@@ -457,8 +386,7 @@ class Glm5NextLatentAttention(Module):
         super().__init__()
         if qk_rope_head_dim != 0:
             raise ValueError(
-                "Glm5NextLatentAttention is the NoPE variant: qk_rope_head_dim must be 0, "
-                f"got {qk_rope_head_dim}"
+                f"Glm5NextLatentAttention is the NoPE variant: qk_rope_head_dim must be 0, got {qk_rope_head_dim}"
             )
         if q_lora_rank <= 0:
             raise ValueError("Glm5NextLatentAttention requires a positive q_lora_rank")
@@ -493,11 +421,17 @@ class Glm5NextLatentAttention(Module):
         # -- params ----------------------------------------------------------
         q_a_w = tracer.register_param("q_a_weight", (self.QRank, "C"))
         tracer.register_param("q_a_norm_weight", (self.QRank,), quantizable=False)
-        q_b_w = tracer.register_param("q_b_weight", (self.QDim, self.QRank))
+        q_b_w = tracer.register_param(
+            "q_b_weight", (self.QDim, self.QRank), lora_targets=[LoRATarget(name="q", size=self.QDim)]
+        )
         kv_a_w = tracer.register_param("kv_a_weight", (self.KVRank, "C"))
         tracer.register_param("kv_a_norm_weight", (self.KVRank,), quantizable=False)
-        kv_b_w = tracer.register_param("kv_b_weight", (self.KVBDim, self.KVRank))
-        out_w = tracer.register_param("out_weight", ("C", self.VDim))
+        kv_b_w = tracer.register_param(
+            "kv_b_weight", (self.KVBDim, self.KVRank), lora_targets=[LoRATarget(name="k", size=self.KVBDim)]
+        )
+        out_w = tracer.register_param(
+            "out_weight", ("C", self.VDim), lora_targets=[LoRATarget(name="o", size=self.d_model)]
+        )
 
         # -- activation slots ------------------------------------------------
         tracer.register_activation("q_a_rstd", ("B * T",), dtype="fp32", save=True)
@@ -509,12 +443,8 @@ class Glm5NextLatentAttention(Module):
             share_policy="per_layer",
             description="Query latent (also the DSA indexer's input, when it lands)",
         )
-        att_slot = tracer.register_activation(
-            "att", ("B", "T", self.VDim), save=True, share_policy="always_recompute"
-        )
-        tracer.register_activation(
-            "lse", ("B", self.Hq, "T"), dtype="fp32", save=True, share_policy="always_recompute"
-        )
+        att_slot = tracer.register_activation("att", ("B", "T", self.VDim), save=True, share_policy="always_recompute")
+        tracer.register_activation("lse", ("B", self.Hq, "T"), dtype="fp32", save=True, share_policy="always_recompute")
         out_slot = tracer.register_activation(
             "att_out", ("B", "T", "C"), share_policy="per_layer", description="MLA output"
         )
@@ -547,17 +477,11 @@ class Glm5NextLatentAttention(Module):
             shape=[B, T, self.Hq, self.qk_nope_head_dim + self.VHead],
             out_name=tracer.prefixed("kv"),
         )
-        key = g.narrow(kv, dim=3, start=0, length=self.qk_nope_head_dim, out_name=tracer.prefixed("key"))
-        key = g.contiguous(key)
-        value = g.narrow(
-            kv, dim=3, start=self.qk_nope_head_dim, length=self.VHead, out_name=tracer.prefixed("value")
-        )
-        value = g.contiguous(value)
+        key, value = g.split(kv, dim=3, split_size=[self.qk_nope_head_dim, self.VHead])
 
-        attn_out, _lse = g.flash_attention_qkv(
-            query,
-            key,
-            value,
+        qkv = g.concat(query, key, value, dim=2, split_size=[self.Hq] * 3, out_name=tracer.prefixed("qkv"))
+        attn_out, _lse = g.flash_attention(
+            qkv,
             causal=True,
             softmax_scale=self.softmax_scale,
             out_name=att_slot,

@@ -446,6 +446,9 @@ bool is_bias_param_name(const std::string& name) {
 }
 
 std::vector<long> infer_fuse_slices(const std::string& name, const PretrainedConfig& cfg, int num_sources) {
+    // KDA's Q/K/V widths are independent of the full-attention head geometry.
+    // Its three projections are equally sized; infer from the actual tensor.
+    if (name.ends_with(".kda_qkv_weight")) return {};
     if (tensor_role_is_fused_qkv_name(name)) {
         const long hs = cfg.head_size();
         const long q_rows = static_cast<long>(cfg.NumQueryHeads) * hs;

@@ -59,6 +59,7 @@ public:
         /// Per-layer attention dims for hybrid models. Must mirror the weights
         /// manager so gradient buffers line up with the LoRA weights.
         std::vector<dsl::BlockTypeDims> per_layer_dims;
+        std::vector<LoRAAttentionShapes> attention_shapes;
 
         /// Per-layer MLP structure — must mirror the weights manager (see
         /// ModularLoRAWeightsManager::Config).

@@ -207,9 +207,9 @@ DslParamStore::DslParamStore(const Module& module,
         } else {
             entry.tensor = mAllocator->allocate(dtype, name.c_str(), EAllocationType::ON_DEVICE, shape);
         }
-        entry.trainable = !is_rope_param(name);
+        entry.trainable = !info.frozen && !is_rope_param(name);
         if (freeze_base) {
-            entry.trainable = train_router && is_router_param(name);
+            entry.trainable = !info.frozen && train_router && is_router_param(name);
         }
 
         mParams.emplace(name, entry);

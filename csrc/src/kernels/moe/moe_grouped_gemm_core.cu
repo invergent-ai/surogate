@@ -351,10 +351,9 @@ void moe_grouped_gemm_weight_grad_impl(T* d_weight,
 
     CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
 
-    // dW(M, N) = grad_output^T(M, K) @ input(K, N)  where K = tokens_e
-    // In column-major: dW(M, N) = A @ B
-    // A is grad_output treated as (K, M) col-major => A^T is (M, K)
-    // B is input treated as (K, N) col-major => B is (K, N)
+    // Row-major dW[M,N] = grad_output[K,M]^T @ input[K,N].
+    // cuBLAS must write its column-major transpose [N,M], so compute
+    // input^T[N,K] @ grad_output[K,M] with OP_N and OP_T respectively.
 
     std::vector<int> m_vec, n_vec, k_vec;
     std::vector<int> lda_vec, ldb_vec, ldc_vec;
@@ -376,28 +375,17 @@ void moe_grouped_gemm_weight_grad_impl(T* d_weight,
         int tokens_e = h_offsets[global_idx + 1] - h_offsets[global_idx];
         if (tokens_e == 0) continue;
 
-        m_vec.push_back(M);
-        n_vec.push_back(N);
+        m_vec.push_back(N);
+        n_vec.push_back(M);
         k_vec.push_back(tokens_e);
 
-        lda_vec.push_back(M);
-        ldb_vec.push_back(N);
-        ldc_vec.push_back(M);
+        lda_vec.push_back(N);
+        ldb_vec.push_back(M);
+        ldc_vec.push_back(N);
 
-        // Row-major grad_output is (tokens, M). Treated as col-major it's (M, tokens).
-        // Transpose A (CUBLAS_OP_T) gives (M, tokens)? NO.
-        // If row-major (tokens, M) is treated as col-major (M, tokens),
-        // we want result (M, N).
-        // C(M, N) = A(M, K) @ B(K, N)
-        // A is grad_output(M, K) col-major. OP_N.
-        // B is input(K, N) col-major. OP_T?
-        // Row-major input is (K, N). Treated as col-major it's (N, K).
-        // OP_T on B gives (K, N).
-        // So: C(M, N) = A(M, K) @ B^T(K, N)
-
-        A_vec.push_back(grad_output + h_offsets[global_idx] * M);
-        B_vec.push_back(input + h_offsets[global_idx] * N);
-        C_vec.push_back(d_weight + (weight_is_compact ? e : global_idx) * M * N);
+        A_vec.push_back(input + static_cast<std::size_t>(h_offsets[global_idx]) * N);
+        B_vec.push_back(grad_output + static_cast<std::size_t>(h_offsets[global_idx]) * M);
+        C_vec.push_back(d_weight + static_cast<std::size_t>(weight_is_compact ? e : global_idx) * M * N);
     }
 
     if (m_vec.empty()) return;

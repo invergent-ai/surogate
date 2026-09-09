@@ -584,12 +584,19 @@ class Block(Module):
             input_specs.append(IOSpec(name=name, tensor_type=tt))
 
         output_specs = []
+
+        def output_type(name):
+            slot = _slot_map_model.get(name)
+            if slot and slot.shape:
+                return TensorAnnotation(dims=tuple(slot.shape), dtype=slot.dtype or "bf16")
+            return _generic_tensor
+
         if isinstance(result, tuple):
             for i, proxy in enumerate(result):
                 out_name = proxy.name if isinstance(proxy, Proxy) else f"out_{i}"
-                output_specs.append(IOSpec(name=out_name, tensor_type=_generic_tensor))
+                output_specs.append(IOSpec(name=out_name, tensor_type=output_type(out_name)))
         elif isinstance(result, Proxy):
-            output_specs.append(IOSpec(name=result.name, tensor_type=_generic_tensor))
+            output_specs.append(IOSpec(name=result.name, tensor_type=output_type(result.name)))
 
         forward_spec = ForwardSpec(
             inputs=input_specs,

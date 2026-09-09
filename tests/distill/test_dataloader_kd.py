@@ -104,11 +104,8 @@ class TestDataLoaderKd:
                     err_msg=f"KD logprobs mismatch at row {row}",
                 )
             checked += 1
-        # has_next(1) is conservative on the last file (strict `+ world_size`
-        # bound): the epoch's final chunk is withheld. Pre-existing loader
-        # behavior, independent of KD; with world_size=1 that is one chunk.
         total_chunks = (N_TOKENS - 1) // SEQ_LEN
-        assert checked == total_chunks - 1
+        assert checked == total_chunks
         assert checked > 0
 
     def test_enable_kd_rejects_wrong_k(self, kd_shard):

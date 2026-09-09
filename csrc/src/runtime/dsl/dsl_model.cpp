@@ -531,22 +531,29 @@ std::vector<modules::LayerOverride> parse_hybrid_pattern_to_overrides(const std:
     overrides.reserve(pattern.size());
     for (int i = 0; i < static_cast<int>(pattern.size()); ++i) {
         switch (pattern[i]) {
+            case 'K':  // Kimi Delta Attention uses the recurrent layer storage.
             case 'M': overrides.push_back(modules::LayerOverride::mamba(i)); break;
             case 'A': overrides.push_back(modules::LayerOverride::attention(i)); break;
             case 'P': overrides.push_back(modules::LayerOverride::mlp(i)); break;
             case 'E': overrides.push_back(modules::LayerOverride::moe(i)); break;
             case 'C': overrides.push_back(modules::LayerOverride::conv(i)); break;
+            case 'k': {
+                auto layer = modules::LayerOverride::mamba(i);
+                layer.is_moe = true;
+                overrides.push_back(layer);
+                break;
+            }
+            case 'm':  // GLM's sparse MLA block.
             case 'a':
             case 'c': {
-                auto layer = pattern[i] == 'a' ? modules::LayerOverride::attention(i)
-                                               : modules::LayerOverride::conv(i);
+                auto layer = pattern[i] != 'c' ? modules::LayerOverride::attention(i) : modules::LayerOverride::conv(i);
                 layer.is_moe = true;
                 overrides.push_back(layer);
                 break;
             }
             default:
                 throw std::runtime_error(fmt::format("Invalid character '{}' at index {} in hybrid_pattern. "
-                                                     "Expected 'M', 'A', 'P', 'E', 'C', 'a', or 'c'.",
+                                                     "Expected 'M', 'A', 'P', 'E', 'C', 'K', 'a', 'c', 'k', or 'm'.",
                                                      pattern[i],
                                                      i));
         }
@@ -1393,6 +1400,32 @@ DslModel::DslModel(const PretrainedConfig& config,
         wm.per_layer_dims = mRuntimeConfig.per_layer_dims;
         wm.layer_has_dense_mlp = mRuntimeConfig.layer_has_dense_mlp;
         wm.layer_has_moe = mRuntimeConfig.layer_has_moe;
+        if (mModelConfig.ModelTypeName == "glm5_next") {
+            wm.attention_shapes.resize(mModelConfig.NumLayers);
+            wm.tensor_prefix = "base_model.model.model.language_model.layers";
+            wm.attention_names.resize(mModelConfig.NumLayers);
+            ShapeEnv env = make_shape_env(*mModule, 1, 1);
+            augment_shape_env(env, mModule->config);
+            for (const auto& [name, info] : mModule->forward->params) {
+                int layer = -1;
+                std::string field;
+                if (!parse_block_param(name, layer, field) || info.shape.size() != 2 || layer < 0 ||
+                    layer >= mModelConfig.NumLayers)
+                    continue;
+                auto shape = resolve_shape(info.shape, env);
+                for (const auto& target : info.lora_targets) {
+                    const std::string names = "qkvo";
+                    const auto i = target.name.size() == 1 ? names.find(target.name) : std::string::npos;
+                    if (i == std::string::npos || target.grouped) continue;
+                    wm.attention_names[layer][i] =
+                        field.rfind("mla_", 0) == 0
+                            ? std::array<std::string, 4>{"q_b_proj", "kv_b_proj", "", "o_proj"}[i]
+                            : std::array<std::string, 4>{"q_proj", "k_proj", "v_proj", "o_proj"}[i];
+                    wm.attention_shapes[layer][i] = {static_cast<int>(shape[1]),
+                                                     target.size > 0 ? target.size : static_cast<int>(shape[0])};
+                }
+            }
+        }
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             wm.num_experts = mModelConfig.moe_config->num_experts;
             wm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0
@@ -1422,6 +1455,7 @@ DslModel::DslModel(const PretrainedConfig& config,
         gm.is_moe = mIsMoEModel;
         gm.model_config = &mModelConfig;
         gm.per_layer_dims = mRuntimeConfig.per_layer_dims;
+        gm.attention_shapes = wm.attention_shapes;
         gm.layer_has_dense_mlp = mRuntimeConfig.layer_has_dense_mlp;
         gm.layer_has_moe = mRuntimeConfig.layer_has_moe;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {

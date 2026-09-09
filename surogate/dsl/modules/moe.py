@@ -648,6 +648,10 @@ class MoESharedExpert(Module):
             transpose="NT",
             out_name=tracer.prefixed("up_out"),
         )
+        limit = getattr(self, "swiglu_limit", None)
+        if limit is not None:
+            shared_gate = g.clamp(shared_gate, max=limit)
+            shared_up = g.clamp(shared_up, min=-limit, max=limit)
         shared_gate_act = g.silu(shared_gate, out_name=tracer.prefixed("gate_act"))
         shared_hidden = g.mul(shared_gate_act, shared_up)
         shared_out = g.matmul(
@@ -1187,6 +1191,7 @@ class LagunaMoEExperts(Module):
         expert_act = g.swiglu(
             expert_gate_up,
             out_name=tracer.prefixed("expert_act"),
+            limit=getattr(self, "swiglu_limit", None),
         )
         expert_down = g.moe_grouped_gemm_down(
             expert_act,

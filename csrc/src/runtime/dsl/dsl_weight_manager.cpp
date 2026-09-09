@@ -305,9 +305,9 @@ void DslWeightManager::allocate_weights(const Module& module,
         std::vector<long> shape = resolve_shape(info.shape, env);
 
         DslWeightEntry entry;
-        entry.trainable = !is_rope_param(name);
+        entry.trainable = !info.frozen && !is_rope_param(name);
         if (freeze_base) {
-            entry.trainable = train_router && is_router_param(name);
+            entry.trainable = !info.frozen && train_router && is_router_param(name);
         }
 
         // Parse layer index for block weights

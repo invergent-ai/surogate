@@ -471,6 +471,8 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/mamba_out_proj.cpp
     src/runtime/ops/gated_delta_rule.cpp
     src/runtime/ops/qwen3_5_decay.cpp
+    src/runtime/ops/glm5.cpp
+    src/kernels/glm5.cu
     src/runtime/ops/repeat_interleave_heads.cpp
 
     src/config/pretrained_config.cpp
@@ -500,6 +502,7 @@ target_sources(surogate-common PRIVATE
     # JIT kernel loader (Triton, CuTe, etc.)
     src/runtime/jit/jit_kernel.cpp
     src/runtime/jit/gated_delta_rule_kernels.cpp
+    src/runtime/jit/kimi_delta_rule_kernels.cpp
 
     # Recipe system
     src/recipes/recipe.cpp

@@ -101,6 +101,7 @@ struct TensorInfo {
     bool is_input = false;
     bool is_output = false;
     bool quantizable = true;                 ///< Whether this param can be quantized (QLoRA)
+    bool frozen = false;                     ///< Checkpoint buffer excluded from gradients and optimizer updates
     int offload_group = -1;                  ///< Offload group ID (-1 = no offloading)
     std::vector<LoRATargetIR> lora_targets;  ///< LoRA slice declarations (param-only)
 };

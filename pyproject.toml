@@ -5,7 +5,7 @@ description = "Surogate LLMOps Toolkit"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "surogate/kernels/triton/fla_kda/LICENSE"]
 authors = [
     { name = "Flavius Burca", email = "flavius@invergent.ai" }
 ]
@@ -126,6 +126,7 @@ extend-exclude = [
     ".venv",
     "csrc/build",
     "csrc/third_party",
+    "surogate/kernels/triton/fla_kda",  # Vendored kernels retain upstream formatting.
 ]
 
 [tool.ruff.format]

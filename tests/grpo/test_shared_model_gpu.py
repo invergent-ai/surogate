@@ -50,7 +50,7 @@ def test_generation_scoring_and_training_share_the_policy(tmp_path, case):
         options.jit_kernel_manifests = manifests
     targets = ["all"]
     text_config = config.get("text_config", config)
-    dtype = "bf16" if text_config.get("num_experts", text_config.get("num_local_experts", 0)) else "fp32"
+    dtype = "bf16" if text_config.get("num_experts", text_config.get("num_local_experts", text_config.get("n_routed_experts", 0))) else "fp32"
     lora = ext.LoRAAdapterConfig(rank=8, alpha=16, dropout=0., dtype=dtype, target_modules=targets)
     batch_size = int(os.environ.get("SUROGATE_SHARED_BATCH", "1"))
     trainer = ext.SurogateTrainer(ngpu=1, config=ext.PretrainedConfig.from_pretrained(str(root), "bf16"),

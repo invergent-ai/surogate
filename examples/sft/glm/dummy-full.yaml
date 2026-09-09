@@ -1,0 +1,28 @@
+# Generate the local checkpoint with create_dummy.py first; see README.md.
+model: ./models/dummy-glm-5.3-flash
+output_dir: ./outputs/sft/glm/dummy-full
+resume_from_checkpoint: false
+gpus: 1
+recipe: bf16
+master_dtype: bf16
+gradient_dtype: bf16
+train_vision: false
+lora: false
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+sequence_len: 128
+sample_packing: true
+recompute: true
+max_steps: 10
+learning_rate: 1e-3
+lr_scheduler_type: constant
+warmup_ratio: 0
+optimizer: adamw
+save_steps: 0
+eval_steps: 0
+validation_split_ratio: 0
+dataloader_num_workers: 1
+datasets:
+  - path: ./examples/datasets/conversations.jsonl
+    type: conversation
+    messages_field: dialog

@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -59,6 +60,16 @@ void DslModel::export_adapter(const std::string& directory,
         adapter_config["bias"] = "none";
         adapter_config["use_rslora"] = mLoRAConfig->use_rs_lora;
         adapter_config["target_modules"] = modules::detail::targets_to_peft_names(*mLoRAConfig);
+        if (mModelConfig.ModelTypeName == "glm5_next") {
+            std::set<std::string> targets;
+            mLoRAWeights->iterate_tensors([&](const std::string& name, const TensorShard&) {
+                constexpr std::string_view prefix = "base_model.model.";
+                auto end = name.find(".lora_");
+                if (name.starts_with(prefix) && end != std::string::npos)
+                    targets.insert(name.substr(prefix.size(), end - prefix.size()));
+            });
+            adapter_config["target_modules"] = targets;
+        }
         std::ofstream config_file(dir / "adapter_config.json");
         config_file << adapter_config.dump(2);
     }

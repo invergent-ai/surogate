@@ -307,8 +307,23 @@ class GraphBuilder:
     # Activations
     # =========================================================================
 
-    def swiglu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
+    def clamp(
+        self,
+        x: str | GraphRef,
+        *,
+        min: float | None = None,
+        max: float | None = None,
+        fused_gate_up: bool = False,
+    ) -> GraphRef:
+        attrs = {k: v for k, v in {"min": min, "max": max}.items() if v is not None}
+        if fused_gate_up:
+            attrs["fused_gate_up"] = True
+        return self.custom("clamp", x, **attrs)
+
+    def swiglu(self, x: str | GraphRef, *, out_name: str | None = None, limit: float | None = None) -> GraphRef:
         """SwiGLU activation: silu(gate) * up"""
+        if limit is not None:
+            x = self.clamp(x, min=-limit, max=limit, fused_gate_up=True)
         out = out_name if out_name else self._fresh_name("swiglu")
         self._add_node(
             GraphNode(
@@ -1688,10 +1703,13 @@ class GraphBuilder:
         op_name: str,
         *inputs: str | GraphRef,
         num_outputs: int = 1,
+        out_name: str | None = None,
         **attrs: Any,
     ) -> GraphRef | tuple[GraphRef, ...]:
         """Call a custom/user-defined operation."""
-        outputs = [self._fresh_name(op_name) for _ in range(num_outputs)]
+        if out_name is not None and num_outputs != 1:
+            raise ValueError("custom out_name requires exactly one output")
+        outputs = [out_name] if out_name is not None else [self._fresh_name(op_name) for _ in range(num_outputs)]
         self._add_node(
             GraphNode(
                 op=op_name,

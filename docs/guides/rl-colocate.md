@@ -13,9 +13,11 @@ This mode supports the training families below, excluding **Nemotron**, using
 - Gemma 3 and Gemma 4, including E-series, unified, and MoE variants.
 - LFM2/LFM2.5, LFM2-MoE, Qwen3-VL, and LFM2-VL.
 - GPT-OSS and Laguna, when supplied as unquantized BF16 checkpoints.
+- GLM-5.3-Flash text, with context no longer than `index_topk`; see the
+  [tiny GLM fixture](../../examples/sft/glm/README.md) for tested settings and limitations.
 
 Multimodal checkpoints use **text prompts only**. Experimental training definitions
-such as DeepSeek-V4, Flash-Next, and GLM-5.3-Flash are not included.
+such as DeepSeek-V4 and Flash-Next are not included.
 
 Dense Qwen3 and Qwen3.5 use the optimized generation server. Other families generate
 through the same model instance that performs training. This general path processes
