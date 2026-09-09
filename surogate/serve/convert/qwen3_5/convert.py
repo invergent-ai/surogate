@@ -315,7 +315,7 @@ def convert(
     gguf_repack: str | Path | None = None,
     mtp: bool = True,
     vision: bool = True,
-    vision_storage: str = inventory.VISION_QUANTIZED,
+    vision_storage: str = inventory.VISION_BF16,
 ) -> Path:
     """Run the complete registered conversion and return the report path."""
 
@@ -582,10 +582,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="the quantised release, for the exports that publish the "
                              "unquantised objects separately")
     parser.add_argument("--vision-storage", choices=inventory.VISION_STORAGE,
-                        default=inventory.VISION_QUANTIZED,
-                        help="How to store the vision tower. `quantized` is what serving reads; "
-                             "`bf16` keeps the source checkpoint's weights, which is what a "
-                             "trainer extracting features needs.")
+                        default=inventory.VISION_BF16,
+                        help="How to store the vision tower. `bf16` is the weights the "
+                             "checkpoint ships, and the default. `quantized` is about a third "
+                             "of the size and measurably further from the source tower.")
     parser.add_argument("--no-vision", action="store_true",
                         help="convert without the vision tower (a text-only export)")
     parser.add_argument("--no-mtp", action="store_true",

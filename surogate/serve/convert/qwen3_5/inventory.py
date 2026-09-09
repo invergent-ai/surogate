@@ -402,7 +402,7 @@ def build_mtp_specs(g: Geometry) -> tuple[TensorSpec, ...]:
     )
 
 
-def build_vision_specs(g: Geometry, *, vision_storage: str = VISION_QUANTIZED) -> tuple[TensorSpec, ...]:
+def build_vision_specs(g: Geometry, *, vision_storage: str = VISION_BF16) -> tuple[TensorSpec, ...]:
     tower = vision_tower(g)
     return _family_vision_specs(g.hidden, storage=vision_storage, **tower) if tower else ()
 
@@ -410,7 +410,7 @@ def build_vision_specs(g: Geometry, *, vision_storage: str = VISION_QUANTIZED) -
 def build_tensor_specs(geometry: Geometry, *, profile: str = GROUPWISE_INT,
                        mtp: bool | None = None,
                        vision: bool | None = None,
-                       vision_storage: str = VISION_QUANTIZED) -> tuple[TensorSpec, ...]:
+                       vision_storage: str = VISION_BF16) -> tuple[TensorSpec, ...]:
     """The tensor list for one checkpoint and export, which a repack plan is made against."""
     export = export_for(profile, geometry)
     tensors = (build_text_core_specs(geometry, profile)
@@ -429,7 +429,7 @@ def build_tensor_specs(geometry: Geometry, *, profile: str = GROUPWISE_INT,
 def active_specs(*, mtp: bool | None = None, vision: bool | None = None,
                  geometry: Geometry,
                  profile: str = GROUPWISE_INT,
-                 vision_storage: str = VISION_QUANTIZED) -> tuple[tuple, tuple]:
+                 vision_storage: str = VISION_BF16) -> tuple[tuple, tuple]:
     """(tensor_specs, object_specs) for the requested artifact variant."""
     tensors = build_tensor_specs(geometry, profile=profile, mtp=mtp, vision=vision,
                                  vision_storage=vision_storage)

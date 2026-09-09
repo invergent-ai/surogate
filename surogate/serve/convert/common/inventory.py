@@ -135,21 +135,22 @@ RESOURCE_SPECS = tuple(
 )
 
 
-#: How a tower is stored.
+#: How a tower is stored. The default is the weights the checkpoint ships.
 #:
-#: `quantized` is what serving reads and what every artifact carried until now: six bits on
-#: the patch embedding, four on the projections that dominate it, five on the outputs, eight
-#: on the merger. It is the right trade for generation, where the tower runs once per image
-#: and the answer is a sampled token.
+#: Artifacts used to quantize the tower unconditionally -- six bits on the patch embedding,
+#: four on the projections that dominate it, five on the outputs, eight on the merger -- and
+#: offered no way to ask for anything else. On a Qwen3.5-2B that is 200 MiB against 632, so
+#: it buys real room. It also costs more than rounding: against the source tower on the same
+#: image, cosine 0.87 where the checkpoint's own weights give 0.98, and 0.84 against 0.98 on
+#: a larger grid.
 #:
-#: `bf16` exists because a trainer extracting features is not doing that. It feeds the tower's
-#: output into a loss, and four-bit weights compounding over twenty-four layers move that
-#: output far enough to matter -- measured against the source checkpoint on one image, cosine
-#: 0.74 at a 16x16 grid and 0.28 at 20x20. Training against features the source model would
-#: not produce is a change of behaviour, not a change of implementation.
-VISION_QUANTIZED = "quantized"
+#: A tower is a component its author trained and published; serving a four-bit approximation
+#: of it by default answers a question nobody asked. `bf16` is what the checkpoint ships and
+#: what both serving and a trainer reading features now get. `quantized` remains for someone
+#: who has measured the trade on their own model and wants the room back.
 VISION_BF16 = "bf16"
-VISION_STORAGE = (VISION_QUANTIZED, VISION_BF16)
+VISION_QUANTIZED = "quantized"
+VISION_STORAGE = (VISION_BF16, VISION_QUANTIZED)
 
 
 def build_vision_specs(
@@ -162,7 +163,7 @@ def build_vision_specs(
     patch_rows: int,
     position_embeddings: int,
     merger_hidden: int,
-    storage: str = VISION_QUANTIZED,
+    storage: str = VISION_BF16,
 ) -> tuple[TensorSpec, ...]:
     """Build the tower inventory from its resolved checkpoint dimensions."""
 
