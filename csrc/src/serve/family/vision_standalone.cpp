@@ -154,6 +154,15 @@ void StandaloneVisionTower::encode(std::span<const std::uint16_t> patches, const
         state_->workspace.emplace(needed);
     }
     state_->tower->encode(VisionItemView{patches, &control}, output, *state_->workspace);
+    // The tower is stream-ordered, and the buffer leaves here for a caller that has no idea
+    // which stream that was -- torch reads it on its own. Returning before the work lands
+    // hands back whatever the allocation happened to hold, which reads as a plausible
+    // tensor: finite, right shape, silently wrong. Wait for it.
+    if (const cudaError_t status = cudaStreamSynchronize(state_->device.stream);
+        status != cudaSuccess) {
+        throw std::runtime_error(std::string("vision encode failed: ") +
+                                 cudaGetErrorString(status));
+    }
 }
 
 } // namespace sinfer::family
