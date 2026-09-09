@@ -29,7 +29,7 @@ sampling:
   repetition_penalty: 1.05
   seed: 1234
   extra_body:
-    top_k: -1        # vLLM's spelling of "do not truncate"
+    top_k: -1        # -1 means "do not truncate"
     min_p: 0.02
     chat_template_kwargs:
       enable_thinking: true

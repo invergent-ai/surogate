@@ -15,7 +15,7 @@ from surogate.train.adapter_init import (
     import_initial_trainable_adapter,
 )
 from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
-from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_lora_compat
+from surogate.utils.lora_compat import ensure_surogate_lora_compat
 
 # Lazy import Ray to avoid dependency when not using distributed training
 _ray = None
@@ -1518,7 +1518,6 @@ class RayDistributedTrainer:
                                 f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed."
                             )
 
-                    ensure_vllm_lora_compat(adapter_dir, config.model_dir)
 
                     # Merge adapter into base model if requested (only on head node)
                     if config.merge_adapter:

@@ -1,4 +1,4 @@
-"""CLI entry point for GRPO RL Inference: `surogate grpo-infer config.yaml`"""
+"""CLI entry point for the GRPO rollout server: `surogate grpo-infer config.yaml`"""
 
 import argparse
 import sys
@@ -24,6 +24,5 @@ if __name__ == "__main__":
     from surogate.grpo.inference.grpo_infer import grpo_infer
 
     config = load_config(GRPOInferenceConfig, args.config)
-    config.__post_init__()
 
     grpo_infer(config)

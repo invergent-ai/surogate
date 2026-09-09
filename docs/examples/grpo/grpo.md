@@ -28,10 +28,10 @@ surogate grpo-colocate --train examples/grpo/train.yaml --infer examples/grpo/in
 
 After training is complete, the LoRA adapter will be saved in the `./outputs/final_adapter` folder. 
 
-You can now serve the model and trained adapter with vLLM:
+You can now serve the model with the trained adapter:
 
 ```shell
-vllm serve ./reverse-fft --enable-lora --lora-modules adapter=./outputs/final_adapter
+surogate serve ./reverse-fft --enable-lora --lora-modules adapter=./outputs/final_adapter
 ```
 
 And run the evaluation:

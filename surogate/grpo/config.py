@@ -74,8 +74,6 @@ class GRPOTrainConfig(SFTConfig):
 
     # Prime-RL integration
     transport_type: Literal["filesystem", "zmq"] = "filesystem"
-    # Weight broadcast backend: "filesystem" (disk), "nccl" (GPU broadcast), "colocate" (zero-copy shared memory)
-    weight_broadcast_type: Literal["filesystem", "nccl", "colocate"] = "filesystem"
     max_async_level: int = 1
     # Padding multiple for packed micro-batches.
     pad_to_multiple_of: int = 1
@@ -145,7 +143,6 @@ class GRPOTrainConfig(SFTConfig):
 
         self.transport_type = cfg.get("transport_type", self.transport_type)
         self.single_sample_bins = bool(cfg.get("single_sample_bins", self.single_sample_bins))
-        self.weight_broadcast_type = cfg.get("weight_broadcast_type", self.weight_broadcast_type)
         self.max_async_level = cfg.get("max_async_level", self.max_async_level)
         self.pad_to_multiple_of = cfg.get("pad_to_multiple_of", self.pad_to_multiple_of)
         self.doc_masking = cfg.get("doc_masking", self.doc_masking)

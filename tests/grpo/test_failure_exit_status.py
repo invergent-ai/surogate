@@ -1,6 +1,6 @@
 """A GRPO component failure must become a non-zero exit status.
 
-Two halves of one gap, in both GRPO runners.
+Two halves of one gap.
 
 The trainer's crash handler called `logger.exception`, which `LoggerWrapper`
 did not define, so the handler raised inside itself and the `error_event.set()`
@@ -16,17 +16,14 @@ swallowed the interrupt, returned normally, and the process exited 0 -- so ops
 finalized a crashed run as `completed` with a null error.
 """
 
-import asyncio
-import os
 import signal
 import sys
 import threading
-import time
 from unittest import mock
 
 import pytest
 
-# `split` and `colocate` reach the compiled extension through their config
+# `split` reaches the compiled extension through their config
 # import, which has nothing to do with the failure plumbing under test. Use the
 # real one where it is built (CI) and a stand-in where it is not, so these stay
 # runnable without a GPU toolchain.
@@ -39,7 +36,7 @@ except ImportError:  # pragma: no cover
     sys.modules["surogate._surogate"] = _stub
     surogate._surogate = _stub
 
-from surogate.grpo import colocate, split  # noqa: E402
+from surogate.grpo import split  # noqa: E402
 from surogate.grpo.abort import AbortReason  # noqa: E402
 from surogate.utils.logger import get_logger  # noqa: E402
 
@@ -111,20 +108,6 @@ def test_the_event_is_set_even_when_logging_fails():
     assert ev.is_set(), "a broken logger must not cost us the failure signal"
 
 
-def test_the_colocate_event_is_set_even_when_logging_fails():
-    """Same handler, same rule, the other runner."""
-    ev = threading.Event()
-    broken = mock.MagicMock()
-    broken.exception.side_effect = AttributeError("no such method")
-    with (
-        mock.patch.dict(sys.modules, {"surogate.grpo.trainer": _crashing_trainer_module()}),
-        mock.patch.object(colocate, "logger", broken),
-    ):
-        with pytest.raises(AttributeError):
-            colocate._run_trainer(mock.MagicMock(), None, ev)
-    assert ev.is_set()
-
-
 # ── an abort leaves a reason behind, a clean shutdown does not ───────
 
 
@@ -158,7 +141,7 @@ def test_a_trainer_import_failure_sets_the_failure_event():
 
 
 def test_a_planned_teardown_is_not_reported_as_a_crash():
-    """Teardown sets `shutdown_event` and then kills the vLLM subprocesses, so
+    """Teardown sets `shutdown_event` and then kills the server subprocesses, so
     their sentinels fire exactly like a crash. The loop's own post-wait check
     catches the ordinary case; this pins the window underneath it, where the
     scan has already run and teardown flips the flag before the abort. It used
@@ -179,7 +162,7 @@ def test_a_planned_teardown_is_not_reported_as_a_crash():
         mock.patch.object(split.multiprocessing.connection, "wait", return_value=["fd"]),
         mock.patch.object(split.os, "kill") as killed,
     ):
-        split._watch_components([(proc, "rollout vLLM")], threading.Event(), shutdown, abort)
+        split._watch_components([(proc, "rollout server")], threading.Event(), shutdown, abort)
 
     assert abort.reason is None, "a planned teardown must not be an abort"
     assert not killed.called
@@ -188,7 +171,7 @@ def test_a_planned_teardown_is_not_reported_as_a_crash():
 def test_a_late_trainer_crash_is_not_discarded_by_teardown():
     """The re-check added for planned teardown must not swallow a real crash.
 
-    Teardown kills the vLLM subprocesses, so their sentinels fire exactly like a
+    Teardown kills the server subprocesses, so their sentinels fire exactly like a
     crash and have to be re-checked against `shutdown_event`. The trainer is
     different: teardown only *joins* that thread, so `trainer_failed` is never a
     consequence of shutting down. Applying the re-check to it as well downgraded
@@ -213,251 +196,15 @@ def test_a_late_trainer_crash_is_not_discarded_by_teardown():
     assert killed.called
 
 
-def test_a_colocate_interrupt_marks_the_shutdown_planned():
-    """A terminal Ctrl-C also reaches vLLM's EngineCore children, which colocate
-    does not `setsid`. They die, the vLLM thread sets `error_event`, and the
-    watchdog would report a user stop as a component crash. The SIGINT handler
-    sets `shutdown_event` first so the watchdog returns quietly."""
-    error_event = threading.Event()
-    shutdown = threading.Event()
-    abort = AbortReason()
-
-    # What the handler does, then what the watchdog sees afterwards.
-    shutdown.set()
-    error_event.set()
-
-    with mock.patch.object(colocate.os, "kill") as killed:
-        colocate._watch_components(error_event, shutdown, abort)
-
-    assert abort.reason is None, "an interrupt is not a crash"
-    assert not killed.called
-
-
-def test_the_colocate_watchdog_records_why_it_aborted():
-    error_event = threading.Event()
-    error_event.set()
-    abort = AbortReason()
-
-    with mock.patch.object(colocate.os, "kill") as killed:
-        colocate._watch_components(error_event, threading.Event(), abort)
-
-    assert abort.reason, "both runners exit through the same ambiguity"
-    assert killed.called
-
-
-@pytest.mark.parametrize(
-    "runner,call",
-    [
-        ("split", lambda abort, shutdown: split._watch_components([], threading.Event(), shutdown, abort)),
-        ("colocate", lambda abort, shutdown: colocate._watch_components(threading.Event(), shutdown, abort)),
-    ],
-)
-def test_a_clean_shutdown_records_nothing(runner, call):
+def test_a_clean_shutdown_records_nothing():
     """A planned teardown must stay exit 0. Only a recorded reason is a failure,
     which is what keeps a user's Ctrl-C from being reported as a crash."""
     shutdown = threading.Event()
     shutdown.set()
     abort = AbortReason()
 
-    with (
-        mock.patch.object(split.os, "kill") as split_killed,
-        mock.patch.object(colocate.os, "kill") as colocate_killed,
-    ):
-        call(abort, shutdown)
+    with mock.patch.object(split.os, "kill") as killed:
+        split._watch_components([], threading.Event(), shutdown, abort)
 
     assert abort.reason is None
-    assert not split_killed.called and not colocate_killed.called
-
-
-# ── the co-locate contract, driven end to end ────────────────────────
-
-
-def _colocate_harness(monkeypatch, *, kill_mid_run, signal_during_teardown=False, user_interrupt=False):
-    """Run the real `grpo_colocate` with only its heavy edges substituted.
-
-    Everything the contract depends on stays real: both threads, the watchdog,
-    the SIGINT it sends, the KeyboardInterrupt handler, the teardown block and
-    the raise after it. Substituted are the parts that need a GPU -- the vLLM
-    server, the weight extraction, the trainer body and the orchestrator.
-
-    `order` records what actually happened, so the test can assert the raise
-    came *after* teardown rather than instead of it.
-    """
-    order: list[str] = []
-
-    def fake_setup_vllm_env(_cfg):
-        return None
-
-    error_box: list = []
-    shutdown_box: list = []
-
-    def fake_vllm_server(_infer, ready, error_event, engine_holder, loop_holder, shutdown):
-        error_box.append(error_event)
-        shutdown_box.append(shutdown)
-        engine_holder.append(mock.MagicMock())
-        loop = mock.MagicMock()
-        loop.is_closed.return_value = False
-        loop.call_soon_threadsafe.side_effect = lambda *_a, **_k: order.append("event-loop-stopped")
-        loop_holder.append(loop)
-        ready.set()
-        shutdown.wait(timeout=30.0)
-        if signal_during_teardown:
-            # `shutdown` is set at the top of the teardown block, so this lands
-            # squarely inside it -- exactly where the watchdog's own `os.kill`
-            # can arrive when it passed its shutdown check a moment earlier.
-            order.append("signal-during-teardown")
-            os.kill(os.getpid(), signal.SIGINT)
-
-    def fake_extract(_client, _loop, _gpus):
-        return [[{"name": "fake"}]]
-
-    def fake_trainer(_train, _weights, error_event):
-        order.append("trainer-started")
-        if kill_mid_run:
-            # A component dying while the orchestrator runs: the only path that
-            # reaches watchdog -> SIGINT -> the KeyboardInterrupt handler.
-            time.sleep(0.4)
-            order.append("component-died")
-            error_event.set()
-
-    async def fake_orchestrate(_cfg):
-        if user_interrupt:
-            # A terminal Ctrl-C: the signal reaches this process AND vLLM's
-            # EngineCore children, which colocate does not detach. They die a
-            # moment later, so `error_event` is set right behind the interrupt --
-            # which is exactly the race that decided whether a user stop was
-            # reported as a crash.
-            await asyncio.sleep(0.3)
-            order.append("user-pressed-ctrl-c")
-            threading.Timer(0.15, lambda: (order.append("vllm-children-died"), error_box[0].set())).start()
-            os.kill(os.getpid(), signal.SIGINT)
-        # Long enough that the watchdog's signal lands inside `asyncio.run`,
-        # which is where a real abort arrives.
-        await asyncio.sleep(5.0)
-        order.append("orchestrator-finished")
-
-    # Sizes vLLM's share against the trainer's estimate by asking torch about the
-    # device; nothing to do with the abort contract, and this venv's torch is
-    # CPU-only.
-    monkeypatch.setattr(colocate, "_compute_gpu_memory_utilization", lambda _c: 0.45)
-    monkeypatch.setattr(colocate, "setup_vllm_env", fake_setup_vllm_env)
-    monkeypatch.setattr(colocate, "_run_vllm_server", fake_vllm_server)
-    monkeypatch.setattr(colocate, "_extract_vllm_weights", fake_extract)
-    monkeypatch.setattr(colocate, "_run_trainer", fake_trainer)
-
-    orch_mod = mock.MagicMock()
-    orch_mod.orchestrate = fake_orchestrate
-    monkeypatch.setitem(sys.modules, "surogate.grpo.orchestrator.grpo_orch", orch_mod)
-
-    cfg = mock.MagicMock()
-    cfg.gpus = 1
-    cfg.gpu_memory_utilization = None
-    return cfg, order, shutdown_box
-
-
-def test_colocate_raises_after_teardown_when_a_component_dies(monkeypatch):
-    """The contract this branch rests on, on the runner with no live run.
-
-    A component dies mid-run, so the watchdog signals; the main thread must tear
-    down first and *then* raise. Exiting early would strand the vLLM engine, and
-    not raising at all is the bug being fixed.
-    """
-    cfg, order, shutdown_box = _colocate_harness(monkeypatch, kill_mid_run=True)
-    previous = signal.getsignal(signal.SIGINT)
-    try:
-        with pytest.raises(RuntimeError, match="GRPO pipeline aborted"):
-            colocate.grpo_colocate(cfg, cfg, cfg)
-    finally:
-        signal.signal(signal.SIGINT, previous)
-
-    assert "component-died" in order
-    assert "event-loop-stopped" in order, "teardown must have run"
-    assert order.index("event-loop-stopped") > order.index("component-died")
-    assert "orchestrator-finished" not in order, "the run was aborted, not completed"
-
-
-def test_colocate_exits_cleanly_when_nothing_dies(monkeypatch):
-    """The other half: no component failure means no raise, so a good run stays
-    a good run. A guard that fires on healthy runs is worse than none."""
-    cfg, order, shutdown_box = _colocate_harness(monkeypatch, kill_mid_run=False)
-    previous = signal.getsignal(signal.SIGINT)
-    try:
-        colocate.grpo_colocate(cfg, cfg, cfg)  # must not raise
-    finally:
-        signal.signal(signal.SIGINT, previous)
-
-    assert "orchestrator-finished" in order
-    assert "event-loop-stopped" in order
-
-
-def test_colocate_teardown_survives_a_signal_landing_inside_it(monkeypatch):
-    """Teardown must be signal-masked, or the raise never happens.
-
-    The watchdog can pass its own `shutdown_event` check and still be inside
-    `logger.error` when the main thread enters the `finally`. Its `os.kill` then
-    lands during the joins. Unmasked, that raises KeyboardInterrupt out of the
-    `finally`: the event loop is never stopped, the threads are never joined,
-    and the raise after the block never runs -- so a crashed run exits 0 with a
-    leaked engine. Split masked here all along; co-locate did not.
-    """
-    cfg, order, shutdown_box = _colocate_harness(monkeypatch, kill_mid_run=True, signal_during_teardown=True)
-    previous = signal.getsignal(signal.SIGINT)
-    raised: BaseException | None = None
-    try:
-        colocate.grpo_colocate(cfg, cfg, cfg)
-    except BaseException as exc:  # noqa: BLE001 - the type is the assertion
-        raised = exc
-    finally:
-        signal.signal(signal.SIGINT, previous)
-
-    # Catch BaseException rather than `pytest.raises(RuntimeError)`: unmasked,
-    # the escaping KeyboardInterrupt tears down the whole pytest session instead
-    # of failing this test, which makes a regression look like an aborted run.
-    assert "signal-during-teardown" in order, "the fixture must actually signal"
-    assert not isinstance(raised, KeyboardInterrupt), (
-        "the signal escaped the teardown block; the event loop was never stopped and the raise after it never ran"
-    )
-    assert isinstance(raised, RuntimeError), f"expected the abort, got {raised!r}"
-    assert "GRPO pipeline aborted" in str(raised)
-    assert "event-loop-stopped" in order, "teardown must complete despite the signal"
-
-
-def test_the_interrupt_handler_marks_the_shutdown_planned(monkeypatch):
-    """Ctrl-C must not be turned into a crash report.
-
-    Colocate does not `setsid` vLLM's EngineCore children, so a terminal
-    interrupt reaches them directly; they die, the vLLM thread flags an error,
-    and the watchdog would call that a component crash and exit non-zero. The
-    handler marks the shutdown planned first, so the watchdog returns quietly.
-
-    This asserts the mechanism, not the race. The race itself has no
-    deterministic test: whether the watchdog has already passed its
-    `shutdown_event` check when the children die is genuine timing, and the
-    handler narrows that window rather than closing it. A test that tried to
-    stage the race passed with the handler removed, so it was measuring nothing.
-    """
-    cfg, order, shutdown_box = _colocate_harness(monkeypatch, kill_mid_run=False)
-    captured: dict = {}
-
-    real_signal = signal.signal
-
-    def capture_handler(signum, handler):
-        if signum == signal.SIGINT and callable(handler):
-            captured.setdefault("handler", handler)
-        return real_signal(signum, handler)
-
-    monkeypatch.setattr(colocate.signal, "signal", capture_handler)
-
-    previous = signal.getsignal(signal.SIGINT)
-    try:
-        colocate.grpo_colocate(cfg, cfg, cfg)
-    finally:
-        real_signal(signal.SIGINT, previous)
-
-    assert "handler" in captured, "colocate must install a SIGINT handler"
-    assert shutdown_box, "the fake vLLM thread must have handed us the event"
-    shutdown = shutdown_box[0]
-    shutdown.clear()
-    with pytest.raises(KeyboardInterrupt):
-        captured["handler"](signal.SIGINT, None)
-    assert shutdown.is_set(), "the handler must mark the shutdown planned before interrupting"
+    assert not killed.called

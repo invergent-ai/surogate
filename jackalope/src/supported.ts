@@ -1,6 +1,6 @@
 // Which HuggingFace models surogate can train. Mirrors the framework's DSL model
 // registry (resolved from config.json `architectures` / `model_type`, exactly how
-// vLLM picks a model class). Source: surogate/dsl/models/* + docs/guides.
+// a serving engine picks a model class). Source: surogate/dsl/models/* + docs/guides.
 
 export interface Family {
   type: string; // HF model_type

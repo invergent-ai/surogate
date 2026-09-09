@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import { ConfirmInput, Select } from "@inkjs/ui";
 import fs from "node:fs";
@@ -14,8 +14,6 @@ import {
   ensureRlConfigs,
   fitOnGpu,
   gpuFreeGB,
-  grpoStackAvailable,
-  grpoStackInstallCommand,
   type GrpoOverlay,
   listExampleConfigs,
   loadGpuSelection,
@@ -37,7 +35,6 @@ import { loadProviders } from "../providers.ts";
 import { launchModalRun, MODAL_DEFAULT_IMAGE, MODAL_GPUS, modalReady } from "../modal.ts";
 import { Stepper } from "./Stepper.tsx";
 import { type SshTarget, detectRemoteGpus, launchRemoteRun, parseSshTarget, rememberSshHost } from "../ssh.ts";
-import { runShell } from "../setup.ts";
 import { StatusVerb } from "./StatusVerb.tsx";
 import { Spinner } from "./Spinner.tsx";
 import { C } from "./theme.ts";
@@ -113,7 +110,7 @@ function stepRail(compute: Compute, mode: Mode, source: Source): { phase: Phase;
     ...head,
     { phase: "mode", label: "Mode" },
     { phase: "tgpus", label: "Trainer" },
-    { phase: "vgpus", label: "vLLM" },
+    { phase: "vgpus", label: "Inference" },
   ];
   if (mode === "ruler") rail.push({ phase: "jgpus", label: "Judge" });
   rail.push({ phase: "gparams", label: "Params" }, { phase: "confirm", label: "Run" });
@@ -132,8 +129,8 @@ const PHASE_GUIDANCE: Record<Phase, string> = {
   gpus: "tick the GPUs to train on (⏎ uses the highlighted one if none ticked)",
   params: "tune the run, or just launch with the sensible defaults",
   tgpus: "GPUs for the trainer",
-  vgpus: "GPUs for inference (vLLM) — must be disjoint from the trainer",
-  jgpus: "GPUs for the LLM judge (vLLM) — disjoint from trainer + inference",
+  vgpus: "GPUs for the inference server — must be disjoint from the trainer",
+  jgpus: "GPUs for the LLM judge server — disjoint from trainer + inference",
   gparams: "tune the overlay params, or launch with the example defaults",
   confirm: "review the command and start the run",
   started: "launching…",
@@ -267,12 +264,6 @@ export function Launch({
   const FIELD_PHASES: Phase[] = ["dstackcfg", "params", "gparams"];
   useInput(
     (input, key) => {
-      // 'i' installs the vLLM stack when an RL mode needs it — but not during a
-      // field-editing phase, where 'i' is ordinary typed text.
-      if (input === "i" && mode !== "sft" && stackOk === false && !installing && !FIELD_PHASES.includes(phase)) {
-        installStack();
-        return;
-      }
       if (!key.leftArrow || FIELD_PHASES.includes(phase) || phase === "started") return;
       const rail = stepRail(compute, mode, source);
       const cur = rail.findIndex((s) => s.phase === phase);
@@ -284,7 +275,7 @@ export function Launch({
   // Seed from the GPUs tab's earmarked selection (local GPUs present here).
   const [selected, setSelected] = useState<number[]>(() => loadGpuSelection().filter((id) => gpus.some((g) => g.id === id)));
   const [trainerGpus, setTrainerGpus] = useState<number[]>([]);
-  const [vllmGpus, setVllmGpus] = useState<number[]>([]);
+  const [inferGpus, setInferGpus] = useState<number[]>([]);
   const [judgeGpus, setJudgeGpus] = useState<number[]>([]);
   // Every SFT knob lives here, editable in Parameters → buildConfigYaml.
   const [fields, setFields] = useState<LaunchFields>(() => ({
@@ -295,34 +286,6 @@ export function Launch({
   const [grpoFields, setGrpoFields] = useState<GrpoFields>({ ...GRPO_DEFAULTS });
   const [pid, setPid] = useState<number | null>(null);
   const [launchErr, setLaunchErr] = useState<string | null>(null);
-  // GRPO/RULER preflight: is the vLLM stack present in surogate's venv? Probed
-  // lazily (only when an RL mode is first chosen) so SFT-only users never pay for
-  // it; re-checked after an in-UI install.
-  const [stackOk, setStackOk] = useState<boolean | null>(null);
-  const [installing, setInstalling] = useState(false);
-  const [installLog, setInstallLog] = useState<string[]>([]);
-  const mounted = useRef(true);
-  const installBusy = useRef(false); // synchronous guard against double-trigger
-  useEffect(() => () => void (mounted.current = false), []);
-  const checkStack = () => {
-    void grpoStackAvailable(surogateBin).then((ok) => mounted.current && setStackOk(ok));
-  };
-  const installStack = () => {
-    if (installBusy.current) return;
-    installBusy.current = true;
-    setInstalling(true);
-    setInstallLog([]);
-    runShell(grpoStackInstallCommand(surogateBin), (line) => setInstallLog((l) => [...l.slice(-12), line]), repoRoot)
-      .done.then(() => grpoStackAvailable(surogateBin))
-      .then((ok) => {
-        installBusy.current = false;
-        if (!mounted.current) return; // navigated away mid-install — skip stale setState
-        setStackOk(ok);
-        setInstalling(false);
-        setInstallLog((l) => [...l.slice(-12), ok ? "✓ vLLM stack ready" : "✗ install failed — see output above"]);
-      });
-  };
-
   // keep model/dataset in sync when one is picked in the Models/Datasets tabs
   const pickedModel = picked?.model?.id;
   const pickedDataset = picked?.dataset;
@@ -458,20 +421,16 @@ export function Launch({
   };
 
   const doLaunchGrpo = () => {
-    if (stackOk === false) {
-      setLaunchErr("the vLLM stack is missing — press i to install it before launching");
-      return;
-    }
     const metricsPath = newRunFeedPath(mode, Date.now());
     writeRunMeta(metricsPath, {
       mode,
       recipe: grpoFields.recipe,
-      gpus: [...trainerGpus, ...vllmGpus, ...judgeGpus],
+      gpus: [...trainerGpus, ...inferGpus, ...judgeGpus],
       maxSteps: Number(grpoFields.maxSteps) || undefined,
       startedAt: Date.now(),
       label: mode,
     });
-    finishLaunch(spawnGrpo(rlConfigs, trainerGpus, vllmGpus, metricsPath, surogateBin, judgeGpus, grpoOverlay()), metricsPath);
+    finishLaunch(spawnGrpo(rlConfigs, trainerGpus, inferGpus, metricsPath, surogateBin, judgeGpus, grpoOverlay()), metricsPath);
   };
 
   const finishLaunch = (r: SpawnResult, metricsPath: string) => {
@@ -494,7 +453,7 @@ export function Launch({
         ? `ssh ${sshHost} -- ${buildCommand(selected, "config.yaml", surogateBin)}   (detached in tmux)`
         : mode === "sft"
           ? buildCommand(selected, "<run-folder>/config.yaml", surogateBin)
-          : buildGrpoCommand(trainerGpus, vllmGpus, rlConfigs, surogateBin, judgeGpus);
+          : buildGrpoCommand(trainerGpus, inferGpus, rlConfigs, surogateBin, judgeGpus);
 
   // ORDER-driven step state: `pastOrAt` decides if a step block is visible yet,
   // `done` (strictly past) gets a green ✓ wizard-style. Both replace verbose
@@ -769,7 +728,6 @@ export function Launch({
               const m = v as Mode;
               if (m !== "sft" && compute !== "local") return; // remote/cloud = SFT only for now
               setMode(m);
-              if (m !== "sft" && stackOk === null) checkStack(); // probe the vLLM stack on first RL pick
               if (m !== "sft") setPhase("tgpus");
               else if (isCloud(compute)) {
                 setSource("new");
@@ -784,36 +742,6 @@ export function Launch({
           <Text color={C.text}>{mode.toUpperCase()}</Text>
         )}
       </Box>
-
-      {/* GRPO/RULER preflight: the vLLM stack must be in surogate's venv */}
-      {mode !== "sft" && phase !== "mode" && (stackOk === false || installing) && (
-        <Box marginTop={1} flexDirection="column">
-          {installing ? (
-            <>
-              <Text color={C.accent}>
-                <Spinner /> installing the vLLM stack (vllm · msgspec · uvloop) into surogate's venv…
-              </Text>
-              {installLog.slice(-6).map((l, i) => (
-                <Text key={i} color={C.dim} wrap="truncate-end">
-                  {"  "}
-                  {l}
-                </Text>
-              ))}
-            </>
-          ) : (
-            <Text>
-              <Text color={C.warm} bold>
-                ⚠ vLLM stack missing
-              </Text>
-              <Text color={C.dim}> — GRPO/RULER need vllm · msgspec · uvloop. Press </Text>
-              <Text color={C.gold} bold>
-                i
-              </Text>
-              <Text color={C.dim}> to install into surogate's venv.</Text>
-            </Text>
-          )}
-        </Box>
-      )}
 
       {/* SFT 2 · config source (local only) */}
       {mode === "sft" && compute === "local" && phase !== "mode" && pastOrAt("source") && (
@@ -908,7 +836,7 @@ export function Launch({
         </Box>
       )}
 
-      {/* GRPO / RULER: trainer + vllm (+ judge) gpus */}
+      {/* GRPO / RULER: trainer + inference (+ judge) gpus */}
       {(mode === "grpo" || mode === "ruler") &&
         pastOrAt("tgpus") && (
         <Box marginTop={1} flexDirection="column">
@@ -930,7 +858,7 @@ export function Launch({
           {pastOrAt("vgpus") && (
             <Box flexDirection="column" marginTop={1}>
               <Text color={phase === "vgpus" ? C.accent : C.muted} bold>
-                {mark("vgpus")}3 · Inference (vLLM) GPUs — must be disjoint{" "}
+                {mark("vgpus")}3 · Inference GPUs — must be disjoint{" "}
                 <Text color={C.dim}>{phase === "vgpus" ? GPU_HINT : ""}</Text>
               </Text>
               {phase === "vgpus" ? (
@@ -940,26 +868,26 @@ export function Launch({
                     .filter((g) => !trainerGpus.includes(g.id))
                     .map((g) => ({ id: g.id, label: gpuLabel(g, null) }))}
                   onSubmit={(ids) => {
-                    setVllmGpus(ids);
+                    setInferGpus(ids);
                     setPhase(mode === "ruler" ? "jgpus" : "gparams");
                   }}
                 />
               ) : (
-                <Text color={C.text}>{vllmGpus.map((g) => `gpu${g}`).join(", ") || "—"}</Text>
+                <Text color={C.text}>{inferGpus.map((g) => `gpu${g}`).join(", ") || "—"}</Text>
               )}
             </Box>
           )}
           {mode === "ruler" && pastOrAt("jgpus") && (
             <Box flexDirection="column" marginTop={1}>
               <Text color={phase === "jgpus" ? C.accent : C.muted} bold>
-                {mark("jgpus")}4 · Judge GPUs — LLM-as-judge vLLM (disjoint){" "}
+                {mark("jgpus")}4 · Judge GPUs — LLM-as-judge server (disjoint){" "}
                 <Text color={C.dim}>{phase === "jgpus" ? GPU_HINT : ""}</Text>
               </Text>
               {phase === "jgpus" ? (
                 <GpuSelect
                   active={active}
                   options={gpus
-                    .filter((g) => !trainerGpus.includes(g.id) && !vllmGpus.includes(g.id))
+                    .filter((g) => !trainerGpus.includes(g.id) && !inferGpus.includes(g.id))
                     .map((g) => ({ id: g.id, label: gpuLabel(g, null) }))}
                   onSubmit={(ids) => {
                     setJudgeGpus(ids);

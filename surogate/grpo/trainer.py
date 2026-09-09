@@ -28,7 +28,6 @@ from surogate.train.lr_schedule import LRSchedule
 from surogate.train.metrics_writer import MetricsWriter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
-from surogate.utils.lora_compat import ensure_vllm_lora_compat
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
@@ -135,7 +134,7 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
 class GRPOTrainer:
     """GRPO RL trainer using Surogate's C++ engine."""
 
-    def __init__(self, config: GRPOTrainConfig, external_weights: list[list[dict]] | None = None):
+    def __init__(self, config: GRPOTrainConfig):
         self.phase_controller = None
         self.config = config
 
@@ -217,13 +216,8 @@ class GRPOTrainer:
         initial_adapter = configure_initial_adapter(
             config, self.trainer, fresh_run=fresh_run)
         model_weights_path = get_model_weights_path(config.model_dir)
-        if external_weights is not None:
-            # Zero-copy import from external GPU pointers (colocate mode with vLLM)
-            logger.info(f"Importing weights from external GPU pointers (non-quantized from {model_weights_path})")
-            self.trainer.import_weights_from_external(model_weights_path, external_weights)
-        else:
-            logger.info(f"Importing weights from {model_weights_path}")
-            self.trainer.import_weights(model_weights_path)
+        logger.info(f"Importing weights from {model_weights_path}")
+        self.trainer.import_weights(model_weights_path)
         if fresh_run:
             import_initial_trainable_adapter(self.trainer, initial_adapter)
         else:
@@ -259,25 +253,14 @@ class GRPOTrainer:
         )
 
         # Weight broadcast (with optional QeRL noise injection)
-        if config.weight_broadcast_type == "colocate":
-            from surogate.grpo.weight_broadcast import ColocateWeightBroadcast
-
-            self.broadcast = ColocateWeightBroadcast(
-                output_dir=config.output_dir,
-                max_async_level=config.max_async_level,
-                noise_config=config.noise_scheduler,
-                base_model_dir=config.model_dir,
-                max_steps=config.max_steps,
-            )
-        else:
-            self.broadcast = SurogateWeightBroadcast(
-                output_dir=config.output_dir,
-                adapter_only=config.lora,
-                max_async_level=config.max_async_level,
-                noise_config=config.noise_scheduler,
-                base_model_dir=config.model_dir,
-                max_steps=config.max_steps,
-            )
+        self.broadcast = SurogateWeightBroadcast(
+            output_dir=config.output_dir,
+            adapter_only=config.lora,
+            max_async_level=config.max_async_level,
+            noise_config=config.noise_scheduler,
+            base_model_dir=config.model_dir,
+            max_steps=config.max_steps,
+        )
 
         # Data loader setup is deferred to train() since packer must run first
         self.data_loader: GRPODataLoader | None = None
@@ -1004,7 +987,6 @@ class GRPOTrainer:
             adapter_dir = output_path / "final_adapter"
             adapter_dir.mkdir(parents=True, exist_ok=True)
             self.trainer.export_adapter(str(adapter_dir))
-            ensure_vllm_lora_compat(adapter_dir, config.model_dir)
             logger.info(f"Final LoRA adapter saved to {adapter_dir}")
 
             if config.merge_adapter:

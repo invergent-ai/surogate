@@ -300,7 +300,7 @@ export interface GrpoConfigs {
 // tries to `prime env install` it — it must be importable, which we guarantee by
 // pointing env.path at the repo dir (grpo_orch.py inserts it onto sys.path).
 const RL_ENV_ID = "markdown-table-qa";
-// Disjoint vLLM ports: the student rollout server and the RULER judge must not
+// Disjoint server ports: the student rollout server and the RULER judge must not
 // collide (surogate validates judge.port != rollout.port), and the orchestrator's
 // client/judge base_urls must point at the matching port (no auto-reconcile).
 const STUDENT_PORT = 8007;
@@ -343,7 +343,6 @@ function grpoInferYaml(port: number): string {
 enable_lora: true
 max_lora_rank: 32
 max_model_len: 2048
-gpu_memory_utilization: 0.3
 port: ${port}
 `;
 }
@@ -373,7 +372,7 @@ dump_metrics: true
 `;
 }
 
-// RULER: a frozen judge vLLM (Qwen3-1.7B at :8001) scores groups; mode=replace
+// RULER: a frozen judge server (Qwen3-1.7B at :8001) scores groups; mode=replace
 // uses the judge as the sole reward (needs rollouts_per_example >= 2).
 function rulerOrchYaml(envPath: string | null): string {
   return `${MANAGED_HEADER}model:
@@ -417,7 +416,6 @@ function judgeYaml(port: number): string {
   return `${MANAGED_HEADER}model: Qwen/Qwen3-1.7B
 enable_lora: false
 max_model_len: 4096
-gpu_memory_utilization: 0.3
 port: ${port}
 `;
 }
@@ -429,8 +427,8 @@ function writeManaged(p: string, content: string): void {
 
 /** Generate self-contained, runnable RL configs into ~/.surogate-watch/configs/
  *  <mode>/. Regenerated each call so port/env-path fixes always propagate (these
- *  are jackalope-managed scaffolds — markdown-table-qa reward env, disjoint vLLM
- *  ports, judge for RULER). The trainer/vLLM/judge GPU counts are injected later,
+ *  are jackalope-managed scaffolds — markdown-table-qa reward env, disjoint server
+ *  ports, judge for RULER). The trainer/inference/judge GPU counts are injected later,
  *  per-launch, by spawnGrpo (they depend on the user's GPU selection). */
 export function ensureRlConfigs(
   mode: "grpo" | "ruler",
@@ -452,92 +450,16 @@ export function ensureRlConfigs(
   return out;
 }
 
-// ---------------- GRPO preflight: the vLLM stack ----------------
-// GRPO/RULER run a vLLM rollout server + (for RULER) a judge vLLM, which the base
-// surogate install may omit. Missing it surfaces as a cryptic `ModuleNotFoundError:
-// No module named 'vllm'|'msgspec'|'uvloop'` deep in the run log, so we detect it
-// up front and offer a one-key install into surogate's own venv.
-const GRPO_STACK_PKGS = ["vllm", "msgspec", "uvloop"];
-
-/** Resolve the Python interpreter the `surogate` console-script runs under, so we
- *  probe/install in the SAME venv surogate uses (not the system python). */
-function resolveSurogatePython(surogateBin: string): string | null {
-  let scriptPath = surogateBin;
-  if (!surogateBin.includes("/")) {
-    // resolve on PATH ourselves rather than shelling out (no flag interpolated
-    // into bash → no injection from a hostile --surogate-bin value).
-    const hit = (process.env.PATH ?? "")
-      .split(path.delimiter)
-      .map((d) => path.join(d, surogateBin))
-      .find((p) => {
-        try {
-          return fs.statSync(p).isFile();
-        } catch {
-          return false;
-        }
-      });
-    if (!hit) return null;
-    scriptPath = hit;
-  }
-  // the console-script's shebang points straight at its venv interpreter
-  try {
-    const first = fs.readFileSync(scriptPath, "utf8").split("\n", 1)[0] ?? "";
-    const m = first.match(/^#!\s*(\S+)(?:\s+(\S+))?/);
-    if (m) {
-      // `#!/usr/bin/env python` → the real interpreter is the 2nd token; only an
-      // absolute path is usable directly (a bare name falls through to the sibling).
-      const interp = path.basename(m[1]!) === "env" && m[2] ? m[2] : m[1]!;
-      if (interp.includes("/") && fs.existsSync(interp)) return interp;
-    }
-  } catch {
-    /* not a readable text script (e.g. a compiled binary) — fall back below */
-  }
-  const sib = path.join(path.dirname(scriptPath), "python");
-  return fs.existsSync(sib) ? sib : null;
-}
-
-/** Is the vLLM stack importable in surogate's venv? Cheap metadata check (does not
- *  import vllm) run off the event loop. Resolves true if we can't resolve the
- *  interpreter (don't block on an unknown setup — e.g. a Docker/remote surogate). */
-export function grpoStackAvailable(surogateBin = "surogate"): Promise<boolean> {
-  const py = resolveSurogatePython(surogateBin);
-  if (!py) return Promise.resolve(true); // unknown interpreter → assume present rather than nag
-  const probe = `import importlib.metadata as m; [m.version(x) for x in ${JSON.stringify(GRPO_STACK_PKGS)}]`;
-  return new Promise((resolve) => {
-    const child = spawn(py, ["-c", probe], { stdio: "ignore" });
-    const timer = setTimeout(() => {
-      child.kill();
-      resolve(false);
-    }, 8000);
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve(false);
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve(code === 0);
-    });
-  });
-}
-
-/** Shell command to install the vLLM stack into surogate's venv (uv preferred,
- *  pip fallback). Run via runShell (bash -lc). */
-export function grpoStackInstallCommand(surogateBin = "surogate"): string {
-  const py = resolveSurogatePython(surogateBin) ?? "python3";
-  const pkgs = GRPO_STACK_PKGS.join(" ");
-  return `command -v uv >/dev/null 2>&1 && uv pip install --python "${py}" ${pkgs} || "${py}" -m pip install ${pkgs}`;
-}
-
 export function buildGrpoCommand(
   trainerGpus: number[],
-  vllmGpus: number[],
+  inferGpus: number[],
   c: GrpoConfigs,
   surogateBin = "surogate",
   judgeGpus: number[] = [],
 ): string {
   let cmd =
     `${surogateBin} grpo --train ${c.train} --infer ${c.infer} --orch ${c.orch} ` +
-    `--trainer-gpus ${trainerGpus.join(",")} --vllm-gpus ${vllmGpus.join(",")}`;
+    `--trainer-gpus ${trainerGpus.join(",")} --infer-gpus ${inferGpus.join(",")}`;
   if (c.judge && judgeGpus.length) cmd += ` --judge-infer ${c.judge} --judge-gpus ${judgeGpus.join(",")}`;
   return cmd;
 }
@@ -567,14 +489,14 @@ function writeOverlay(basePath: string, outPath: string, extra: string[]): strin
 export function spawnGrpo(
   c: GrpoConfigs,
   trainerGpus: number[],
-  vllmGpus: number[],
+  inferGpus: number[],
   metricsPath: string,
   surogateBin = "surogate",
   judgeGpus: number[] = [],
   overlay: GrpoOverlay = {},
 ): SpawnResult {
   const tag = path.basename(metricsPath);
-  // surogate validates trainer-GPU count == train.gpus and vLLM-GPU count == tp*dp,
+  // surogate validates trainer-GPU count == train.gpus and inference-GPU count == tp*dp,
   // so inject the per-role counts from the user's GPU selection (no auto-reconcile).
   const trainExtra = [
     "# --- jackalope overlay ---",
@@ -585,10 +507,10 @@ export function spawnGrpo(
   ];
   const trainOverlay = writeOverlay(c.train, path.join(RUNS_OVERLAY_DIR(), `grpo-train-${tag}.yaml`), trainExtra);
 
-  // vLLM tensor-parallelism = number of inference GPUs (judge likewise).
+  // tp = number of inference GPUs (judge likewise).
   const inferOverlay = writeOverlay(c.infer, path.join(RUNS_OVERLAY_DIR(), `grpo-infer-${tag}.yaml`), [
     "# --- jackalope overlay ---",
-    `tp: ${Math.max(1, vllmGpus.length)}`,
+    `tp: ${Math.max(1, inferGpus.length)}`,
   ]);
 
   let orchPath = c.orch;
@@ -608,8 +530,8 @@ export function spawnGrpo(
     orchPath,
     "--trainer-gpus",
     trainerGpus.join(","),
-    "--vllm-gpus",
-    vllmGpus.join(","),
+    "--infer-gpus",
+    inferGpus.join(","),
   ];
   if (c.judge && judgeGpus.length) {
     const judgeOverlay = writeOverlay(c.judge, path.join(RUNS_OVERLAY_DIR(), `grpo-judge-${tag}.yaml`), [

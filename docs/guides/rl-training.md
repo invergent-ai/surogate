@@ -1,12 +1,12 @@
 # RL Training (GRPO)
 
-Surogate supports reinforcement learning fine-tuning via GRPO (Group Relative Policy Optimization). The pipeline coordinates an inference server, a GRPO orchestrator, and the Surogate trainer. Native Surogate serving is the default; vLLM is also available.
+Surogate supports reinforcement learning fine-tuning via GRPO (Group Relative Policy Optimization). The pipeline coordinates Surogate's own inference server, a GRPO orchestrator, and the Surogate trainer.
 
 This gives you:
 
 - Surogate's near-SOL training throughput (LoRA, QLoRA, FP8)
 - Async RL pipeline (rollouts, reward computation, sample packing)
-- vLLM for fast inference and generation
+- Surogate's serving engine for rollouts, hot-loading the adapter between steps
 - Two single-command runners — split-GPU (`grpo`) and co-locate (`grpo-colocate`)
 - Training & Evaluation with [Environments](./rl-environments.md)
 
@@ -22,11 +22,11 @@ GRPO training supports three deployment modes:
 
 ### Split-GPU mode
 
-vLLM runs in a spawned subprocess with its own `CUDA_VISIBLE_DEVICES`; the trainer runs in the parent process on the remaining GPUs. Weight broadcasts go through the filesystem (no shared GPU memory):
+The inference server runs in a spawned subprocess with its own `CUDA_VISIBLE_DEVICES`; the trainer runs in the parent process on the remaining GPUs. Weight broadcasts go through the filesystem (no shared GPU memory):
 
 ```
 surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml \
-    --vllm-gpus 0,1,2,3 --trainer-gpus 4,5,6,7
+    --infer-gpus 0,1,2,3 --trainer-gpus 4,5,6,7
 ```
 
 ```
@@ -38,17 +38,17 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml \
 │   │   └─ Loads its own copy of base weights from disk     │
 │   └─ Orchestrator (main async event loop)                 │
 │                                                           │
-│  Spawned vLLM subprocess (CUDA_VISIBLE_DEVICES=<vllm ids>)│
-│   └─ vLLM serves /v1/chat/completions                     │
+│  Spawned server subprocess (CUDA_VISIBLE_DEVICES=<infer>) │
+│   └─ surogate serve /v1/chat/completions                  │
 │                                                           │
 │  Communication:                                           │
-│   - Rollouts:  Orchestrator → vLLM via HTTP               │
+│   - Rollouts:  Orchestrator → server via HTTP             │
 │   - Batches:   Orchestrator → Trainer via filesystem/zmq  │
-│   - Weights:   Trainer → vLLM via filesystem broadcast    │
+│   - Weights:   Trainer → server via filesystem broadcast  │
 └───────────────────────────────────────────────────────────┘
 ```
 
-The CLI is the source of truth for the trainer GPU count: `--trainer-gpus 4,5,6,7` automatically sets `train.gpus = 4`, and (for MoE models) `ep_size` is set to the same value. The YAML `gpus` field is ignored in this mode. The vLLM count must equal `infer.dp * infer.tp`.
+The CLI is the source of truth for the trainer GPU count: `--trainer-gpus 4,5,6,7` automatically sets `train.gpus = 4`, and (for MoE models) `ep_size` is set to the same value. The YAML `gpus` field is ignored in this mode. The inference GPU count must equal `infer.dp * infer.tp`.
 
 ### Co-locate mode
 
@@ -62,15 +62,10 @@ CUDA_VISIBLE_DEVICES=0 surogate grpo-colocate \
     --train train.yaml --infer infer.yaml --orch orch.yaml
 ```
 
-Use `backend: surogate` in `infer.yaml`, `gpus: 1`, `recipe: bf16`, and
+Use `gpus: 1`, `recipe: bf16`, and
 `lora: true` in `train.yaml`. Training and orchestrator `max_steps` must match.
 Start with a fresh output directory. See [Single-GPU GRPO](rl-colocate.md) for
 complete configuration and current limitations.
-
-The existing vLLM co-locate mode remains available with `backend: vllm`. It
-shares supported quantized base matrices; other tensors are loaded separately,
-and adapter updates use files. The vLLM-specific configuration is described
-[below](#vllm-co-locate-mode-details).
 
 ### Multi-process mode
 
@@ -78,21 +73,21 @@ The original three-process architecture, useful for multi-node setups or any cas
 
 ```
 ┌─────────────┐    rollouts    ┌──────────────┐    batches    ┌──────────────────┐
-│   vLLM      │ ─────────────> │ Orchestrator │ ────────────> │     Trainer      │
+│   Server    │ ─────────────> │ Orchestrator │ ────────────> │     Trainer      │
 └─────────────┘   new weights  └──────────────┘               └──────────────────┘
        ^                                                             │
        └─────────────── weight broadcast (filesystem) ───────────────┘
 ```
 
-1. **vLLM inference** (`surogate grpo-infer`) generates completions with log-probabilities
+1. **Inference server** (`surogate grpo-infer`) generates completions with log-probabilities
 2. **Orchestrator** (`surogate grpo-orch`) collects rollouts, computes rewards and advantages, packs samples into training batches
-3. **Surogate trainer** (`surogate grpo-train`) performs the policy gradient update and broadcasts updated weights back to vLLM
+3. **Surogate trainer** (`surogate grpo-train`) performs the policy gradient update and broadcasts updated weights back to the server
 
 The three processes communicate via a shared filesystem directory (`output_dir`).
 
 ## Quick Start (split-GPU mode)
 
-This walkthrough uses the **reverse-text** example. Split-GPU mode needs at least two GPUs (one for vLLM, one for the trainer). For a single-GPU setup, see [Co-locate mode](#quick-start-co-locate-mode) below.
+This walkthrough uses the **reverse-text** example. Split-GPU mode needs at least two GPUs (one for the server, one for the trainer). For a single-GPU setup, see [Co-locate mode](#quick-start-co-locate-mode) below.
 
 ### 1. Create the three config files
 
@@ -168,16 +163,16 @@ sampling:
 
 ```bash
 surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml \
-    --vllm-gpus 0 --trainer-gpus 1
+    --infer-gpus 0 --trainer-gpus 1
 ```
 
 That's it. The command:
 
-1. Spawns the vLLM inference server as a subprocess with `CUDA_VISIBLE_DEVICES=0`
-2. Polls `/health` until vLLM is ready
+1. Spawns the inference server as a subprocess with `CUDA_VISIBLE_DEVICES=0`
+2. Polls `/health` until it is ready
 3. Starts the Surogate trainer in a background thread, restricted to GPU 1
 4. Runs the orchestrator, which coordinates rollouts and training steps
-5. Shuts down vLLM and the trainer cleanly when `max_steps` is reached
+5. Shuts down the server and the trainer cleanly when `max_steps` is reached
 
 `--trainer-gpus` doubles as the trainer's GPU count, so the YAML `gpus` field is optional. For MoE models, `ep_size` is also auto-set to the same count.
 
@@ -189,14 +184,14 @@ For a single-GPU setup, run serving and training with `surogate grpo-colocate`:
 surogate grpo-colocate --train train.yaml --infer infer.yaml --orch orch.yaml
 ```
 
-For native co-locate mode, follow [Single-GPU GRPO](rl-colocate.md). With `backend: vllm`, `gpu_memory_utilization` is computed automatically based on the trainer's memory requirements.
+Follow [Single-GPU GRPO](rl-colocate.md) for the configuration and its current limits.
 
 ## Quick Start (multi-process mode)
 
 For multi-node setups, or any case where you want each component in its own process, use the three individual commands:
 
 ```bash
-# Terminal 1: Start vLLM inference server (GPU 0)
+# Terminal 1: Start the inference server (GPU 0)
 CUDA_VISIBLE_DEVICES=0 surogate grpo-infer infer.yaml
 
 # Terminal 2: Start orchestrator (CPU only)
@@ -212,7 +207,7 @@ The trainer blocks at startup until the orchestrator delivers the first batch. T
 
 Each training step performs:
 
-1. **Weight broadcast** (after step > 0): Saves LoRA adapter to `{output_dir}/broadcasts/step_{N}/` with a `STABLE` marker file. vLLM polls for this marker to hot-reload weights. If QeRL is enabled, noisy norm weights are saved alongside the adapter.
+1. **Weight broadcast** (after step > 0): Saves LoRA adapter to `{output_dir}/broadcasts/step_{N}/` with a `STABLE` marker file. The orchestrator watches for the marker and asks the server to hot-load the adapter. If QeRL is enabled, noisy norm weights are saved alongside the adapter.
 
 2. **Pack and receive batch**: The packer (on master) converts `TrainingBatch` from the orchestrator into packed `MicroBatch` sequences. The data loader delivers these as numpy arrays.
 
@@ -296,17 +291,17 @@ where $\mu$ is the rollout policy, $\pi_\theta$ is the current trainer policy, $
 
 ### GPU assignment
 
-The `--vllm-gpus` and `--trainer-gpus` CLI flags use **driver-level GPU indices** (the same values you would put in `CUDA_VISIBLE_DEVICES`). The two sets must be disjoint.
+The `--infer-gpus` and `--trainer-gpus` CLI flags use **driver-level GPU indices** (the same values you would put in `CUDA_VISIBLE_DEVICES`). The two sets must be disjoint.
 
-- `--vllm-gpus N0,N1,...` count must equal `infer.dp * infer.tp`.
+- `--infer-gpus N0,N1,...` count must equal `infer.dp * infer.tp`.
 - `--trainer-gpus M0,M1,...` count overrides `train.gpus`. The YAML field is ignored when present.
 - For MoE models, `ep_size` is set to the trainer GPU count automatically. The runner re-validates that `num_experts` is divisible by `ep_size`; if not, the run fails fast with a clear error.
 
-The CLI applies `CUDA_VISIBLE_DEVICES=<trainer ids>` to the parent process **before** any torch import, and `CUDA_VISIBLE_DEVICES=<vllm ids>` to the spawned vLLM child via its own environment. The two values are interpreted by the CUDA driver independently — the parent's mask does not propagate to the child.
+The CLI applies `CUDA_VISIBLE_DEVICES=<trainer ids>` to the parent process **before** any CUDA-touching import, and `CUDA_VISIBLE_DEVICES=<infer ids>` to the spawned server via its own environment. The two values are interpreted by the CUDA driver independently — the parent's mask does not propagate to the child.
 
 ### Weight broadcast
 
-In split mode, weight broadcasts use the filesystem backend regardless of what is configured in the YAML. Each broadcast writes the LoRA adapter (~10 MB) to `{output_dir}/broadcasts/step_N/`; vLLM polls for the `STABLE` marker file and hot-reloads the adapter.
+In split mode, weight broadcasts use the filesystem backend regardless of what is configured in the YAML. Each broadcast writes the LoRA adapter (~10 MB) to `{output_dir}/broadcasts/step_N/`; the orchestrator watches for the `STABLE` marker and asks the server to hot-load it.
 
 ### Long sequences: chunked GRPO
 
@@ -361,56 +356,7 @@ easy to scroll past in volume.
 
 ### Lifecycle
 
-The `surogate grpo` process owns the vLLM subprocess: it terminates and (if necessary) kills the child during shutdown. If the parent is `SIGKILL`ed, the vLLM subprocess and its engine workers can be left orphaned holding GPU memory — clean up with `nvidia-smi` if that happens.
-
-## vLLM Co-locate Mode Details
-
-This section applies to `backend: vllm`.
-
-### How weight sharing works
-
-In co-locate mode, the base model is loaded only once:
-
-1. vLLM starts first and loads the model (quantized weights go to GPU)
-2. The trainer receives GPU pointers to vLLM's quantized tensors via CUDA IPC
-3. Both vLLM and the trainer read from the same GPU memory — zero copy, zero duplication
-4. Only LoRA adapter updates (~10 MB) are written to disk and reloaded by vLLM
-
-This saves roughly 50% of GPU memory for the base model. For example, a Qwen3-8B model in NF4 takes ~4.5 GB — in co-locate mode this is shared instead of duplicated.
-
-### Automatic gpu_memory_utilization
-
-In co-locate mode, `gpu_memory_utilization` is computed automatically by estimating the trainer's GPU memory needs:
-
-| Component              | Estimate                                                        |
-| ---------------------- | --------------------------------------------------------------- |
-| LoRA parameters        | Weight + master copy + gradient + 8-bit optimizer (6 bytes/param) |
-| Activations            | Working set (6 BF16 tensors/layer) + logits + residual checkpoints |
-| Dequantization buffers | 3 concurrent BF16 buffers (max weight size)                     |
-| Embeddings + LM head   | vocab_size * hidden_size * 2 bytes (BF16, loaded from disk)     |
-| Fixed overhead         | 2.5 GB (CUDA context, cuDNN workspace, allocator fragmentation) |
-
-The remaining GPU memory (minus a 10% safety margin) is assigned to vLLM. You can override this by setting `gpu_memory_utilization` explicitly in `infer.yaml`.
-
-### Multi-GPU co-locate
-
-Both the trainer and vLLM use data parallelism (`tp=1, dp=N`). Each GPU has a full model replica, and weight sharing is 1:1 per GPU:
-
-```yaml
-# train.yaml
-gpus: 2
-
-# infer.yaml
-dp: 2
-```
-
-### Supported quantization formats
-
-Co-locate weight sharing works with all quantization formats since it operates on raw GPU pointers:
-
-- **BnB NF4** — Packed uint8 data + FP32 scales
-- **FP8** (E4M3) — FP8 data + FP32 block scales
-- **NVFP4** — Packed FP4 data + FP8 scales + FP32 global scale
+The `surogate grpo` process owns the server subprocess: it terminates and (if necessary) kills the child during shutdown. If the parent is `SIGKILL`ed, the server can be left orphaned holding GPU memory — clean up with `nvidia-smi` if that happens.
 
 ## QLoRA for RL Training
 
@@ -453,9 +399,8 @@ often reached for in the wrong order:
 
 - **`max_num_seqs`** caps concurrent sequences and therefore sizes the
   CUDA-graph and activation buffers. On a 27B model served TP2 with
-  `enable_lora: true`, the vLLM default OOMs at startup and a small value
-  (e.g. `16`) fits. Lowering `gpu_memory_utilization` does **not** help here —
-  it shrinks the very budget those buffers are allocated from.
+  `enable_lora: true`, the default OOMs at startup and a small value
+  (e.g. `16`) fits.
 - **`kv_cache_dtype: fp8`** halves KV bytes per token, which raises the
   concurrency a KV-bound server can sustain. It also perturbs sampled
   logprobs, and those feed GRPO's importance ratio — watch `mismatch_kl` for a
@@ -478,7 +423,7 @@ QeRL (Quantization-enhanced RL, [arXiv:2510.11696](https://arxiv.org/abs/2510.11
 1. At each training step, the noise scheduler computes a sigma value based on a geometric decay schedule
 2. All RMSNorm weights (input_layernorm, post_attention_layernorm, etc.) are read from the base model
 3. Gaussian noise N(0, sigma^2) is added to produce noisy copies
-4. The noisy norm weights are applied to vLLM's model before the next rollout batch
+4. The noisy norm weights travel with a full-model broadcast to the inference server
 5. The trainer always uses the clean (non-noisy) weights for gradient computation
 
 The sigma decays geometrically from `sigma_start` to `sigma_end` over `num_stages` intervals. The first interval uses sigma=0 (no noise) to establish a baseline.
@@ -508,7 +453,7 @@ noise_scheduler:
 - Tasks where reward signal diversity is low (many rollouts get the same reward)
 - Pre-quantized models (NVFP4, FP8) where quantization already introduces noise — QeRL amplifies this effect in a controlled way
 
-QeRL works in split, vLLM co-locate, and multi-process modes. Native co-locate does not yet support QeRL weight noise.
+QeRL needs the inference server to take the perturbed norms between steps, which the native engine does not do yet: both runners refuse `noise_scheduler.enabled` rather than compute a sigma that nothing applies.
 
 ### On-Policy Distillation
 
@@ -630,13 +575,13 @@ RULER requires `rollouts_per_example >= 2` (a single rollout has no peers to ran
 
 The judge runs as a *separate* OpenAI-compatible inference server — start it independently before launching `surogate grpo`:
 
-**Terminal 1** — judge vLLM:
+**Terminal 1** — judge server:
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 surogate grpo-infer judge.yaml
 ```
 
-where `judge.yaml` is a stock inference config (`enable_lora: false`, the model you want to judge with). Any OpenAI-compatible endpoint works — local vLLM, hosted API, or a LiteLLM proxy.
+where `judge.yaml` is a stock inference config (`enable_lora: false`, the model you want to judge with). Any OpenAI-compatible endpoint works — a local `surogate grpo-infer`, a hosted API, or a LiteLLM proxy.
 
 **Terminal 2** — `surogate grpo` with RULER enabled in `orch.yaml`:
 
@@ -827,22 +772,15 @@ Key inference options:
 | `model`                   | (required)     | HuggingFace model ID or local path                     |
 | `host`                    | `null`         | Bind address (null = all interfaces)                   |
 | `port`                    | `8000`         | Bind port                                              |
-| `dtype`                   | `"auto"`       | Data type (`float16`, `bfloat16`, `auto`)              |
 | `max_model_len`           | `null`         | Maximum context length                                 |
-| `max_num_seqs`            | `null`         | Max concurrent sequences (null = vLLM default)         |
-| `kv_cache_dtype`          | `null`         | KV cache dtype, e.g. `fp8` (null = vLLM default)       |
-| `enforce_eager`           | `false`        | Disable CUDA graphs (useful for debugging)             |
-| `trust_remote_code`       | `false`        | Allow custom HF model code                             |
-| `tp`                      | `1`            | Tensor parallelism degree                              |
-| `dp`                      | `1`            | Data parallelism degree                                |
-| `enable_lora`             | `true`         | Enable LoRA hot-reload                                 |
-| `max_lora_rank`           | `null`         | Maximum LoRA rank (auto-rounded to vLLM valid values)  |
+| `max_num_seqs`            | `null`         | Max concurrent sequences (null = engine default)       |
+| `kv_cache_dtype`          | `null`         | KV cache dtype, e.g. `fp8` (null = engine default)     |
+| `tp`                      | `1`            | GPUs per replica                                       |
+| `dp`                      | `1`            | Replicas                                               |
+| `enable_lora`             | `true`         | Enable LoRA hot-loading                                |
+| `max_lora_rank`           | `null`         | Largest adapter rank the server accepts                |
 | `max_loras`               | `8`            | Max simultaneously loaded LoRA adapters                |
-| `max_cpu_loras`           | `100`          | Max LoRA adapters cached on CPU                        |
-| `enable_prefix_caching`   | `null`         | Enable prefix caching (null = vLLM default)            |
-| `gpu_memory_utilization`  | `0.9`          | Fraction of GPU memory for KV cache (auto in co-locate mode) |
-| `weight_broadcast_type`   | `"filesystem"` | How to receive weight updates (`filesystem` or `nccl`) |
-| `reasoning_parser`        | `null`         | Parser for extracting reasoning content                |
+| `seed`                    | `0`            | Sampling seed                                          |
 | `enable_auto_tool_choice` | `false`        | Enable auto tool choice                                |
 | `rope_scaling`            | `null`         | RoPE scaling configuration dict                        |
 
@@ -891,7 +829,7 @@ Key orchestrator settings:
 | ------------------------------ | ------------------------------ | --------------------------------------- |
 | `client.base_url`              | `["http://localhost:8000/v1"]` | Inference server URL(s)                 |
 | `client.timeout`               | `1200`                         | Request timeout in seconds              |
-| `client.api_key_var`           | `"VLLM_API_KEY"`               | Env var name for the API key            |
+| `client.api_key_var`           | `"SUROGATE_API_KEY"`           | Env var name for the API key            |
 | `client.skip_model_check`      | `false`                        | Skip checking `/models` endpoint        |
 | `client.elastic.hostname`      | ---                            | DNS hostname for elastic pool discovery |
 | `client.elastic.port`          | `8000`                         | Port for elastic pool servers           |
@@ -978,7 +916,7 @@ Key orchestrator settings:
 | `ruler.mode`                            | `"replace"`             | `"replace"` (RULER alone), `"add"` (sum with env rubric), `"metric"` (observability only, weight 0)   |
 | `ruler.judge_model`                     | `null`                  | Judge model name (must be served by `judge.base_url`); required when `enabled: true`                  |
 | `ruler.judge.base_url`                  | `null`                  | List of OpenAI-compatible judge endpoints (round-robined); required when `enabled: true`              |
-| `ruler.judge.api_key_var`               | `"RULER_JUDGE_API_KEY"` | Env var holding the judge API key (use any string for unauthenticated local vLLM)                     |
+| `ruler.judge.api_key_var`               | `"RULER_JUDGE_API_KEY"` | Env var holding the judge API key (use any string for an unauthenticated local server)                     |
 | `ruler.judge.timeout`                   | `120.0`                 | Per-request timeout in seconds                                                                        |
 | `ruler.judge.connect_timeout`           | `5.0`                   | Per-request connect timeout in seconds                                                                |
 | `ruler.judge.max_connections`           | `256`                   | Max HTTP connections per endpoint                                                                     |
@@ -992,7 +930,7 @@ Key orchestrator settings:
 | `ruler.max_retries_on_parse_error`      | `2`                     | Retries when the judge returns malformed JSON                                                         |
 | `ruler.swallow_exceptions`              | `true`                  | When true, judge failures drop the group instead of crashing the orchestrator                         |
 | `ruler.debug`                           | `false`                 | Log per-group judge reasoning at INFO (otherwise DEBUG)                                               |
-| `ruler.extra_body`                      | `{}`                    | Extra request-body fields forwarded to the judge (e.g. vLLM `guided_json` knobs)                      |
+| `ruler.extra_body`                      | `{}`                    | Extra request-body fields forwarded to the judge (e.g. structured-output knobs)                      |
 | `ruler.sampling`                        | `{}`                    | Sampling overrides for the judge call (`temperature`, `max_completion_tokens`, `reasoning_effort`)    |
 | `ruler.cost.input_per_million`          | `null`                  | USD per 1M input tokens (drives `ruler/total_judge_cost_usd`)                                         |
 | `ruler.cost.output_per_million`         | `null`                  | USD per 1M output tokens                                                                              |

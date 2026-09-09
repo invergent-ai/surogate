@@ -81,7 +81,7 @@ From raw text to specialized models, with Python configuration and native C++/CU
 | **Pretraining & full fine-tuning** | Train from scratch, continue pretraining, or update the full model with SFT. |
 | **LoRA & QLoRA** | Adapter training with BF16 bases or FP8, NVFP4, and BnB/NF4 quantization; supported pre-quantized checkpoints and stacked LoRA adapters. |
 | **Native precision recipes** | BF16, hybrid FP8, and Blackwell NVFP4, with configurable model, gradient, and adapter precision. |
-| **GRPO reinforcement learning** | Reward environments, evaluation, and policy updates with native serving or vLLM; shared-weight single-GPU BF16 LoRA across supported training families except Nemotron. |
+| **GRPO reinforcement learning** | Reward environments, evaluation, and policy updates with native serving; shared-weight single-GPU BF16 LoRA across supported training families except Nemotron. |
 | **DPO preference training** | Learn from chosen/rejected pairs, with an inline frozen reference, optional length normalization, and differing-span masking. |
 | **Knowledge distillation** | Capture teacher top-K distributions, then train a student with KL divergence and optional cross-entropy. |
 | **Multi-GPU & multi-node** | Native threaded data parallelism, ZeRO sharding, communication overlap, and Ray for multi-node training. |
@@ -264,7 +264,7 @@ CUDA_VISIBLE_DEVICES=0 surogate grpo-colocate \
   --train train.yaml --infer infer.yaml --orch orch.yaml
 ```
 
-Training buffers remain reserved during generation, so choose a model and context length that fit your GPU. Quantized bases, multiple GPUs, and checkpoint resume are not yet supported in this native mode. See the [GRPO guide](docs/guides/rl-training.md) for separate-GPU and vLLM options.
+Training buffers remain reserved during generation, so choose a model and context length that fit your GPU. Quantized bases, multiple GPUs, and checkpoint resume are not yet supported in this native mode. See the [GRPO guide](docs/guides/rl-training.md) for the separate-GPU runner.
 
 <details>
 <summary><strong>Docker and source builds</strong></summary>

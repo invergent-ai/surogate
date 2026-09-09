@@ -228,9 +228,6 @@ async def check_health(
     await asyncio.gather(*[_check_health(admin_client) for admin_client in admin_clients])
 
 
-NCCL_READY_MARKER = "NCCL_READY"
-
-
 async def update_weights(
     admin_clients: list[AsyncClient],
     weight_dir: Path | None,
@@ -239,12 +236,9 @@ async def update_weights(
 ) -> None:
     """Update weights on static inference servers.
 
-    Creates a NCCL_READY marker file before calling the update endpoint to signal
-    to the trainer that inference workers are about to enter the receive path.
-    This marker is only used in NCCL broadcast mode but is harmless in filesystem mode.
-
-    Note: The server-side /update_weights endpoint automatically resets the prefix cache
-    to invalidate any cached KV states computed with the old weights.
+    With a LoRA adapter the server hot-loads it through /load_lora_adapter. A
+    full-model update posts /update_weights, which the engine does not serve
+    yet; the 404 is logged and the update skipped rather than failing the step.
     """
     weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
 
@@ -262,13 +256,6 @@ async def update_weights(
                     return
                 raise
 
-        # Create ready marker before servers enter receive path (used by NCCL broadcast)
-        if weight_dir is not None:
-            nccl_ready_file = weight_dir / NCCL_READY_MARKER
-            nccl_ready_file.parent.mkdir(parents=True, exist_ok=True)
-            nccl_ready_file.touch()
-            logger.debug(f"Created NCCL_READY marker at {nccl_ready_file}")
-
         await asyncio.gather(*[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients])
 
 
@@ -281,7 +268,7 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
 
 
 async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path) -> None:
-    """Make a HTTP post request to the vLLM server to load a LoRA adapter.
+    """Ask the inference server to load a LoRA adapter.
 
     Uses our wrapper endpoint that also resets the prefix cache to invalidate
     KV states computed with old weights.
@@ -309,7 +296,7 @@ async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lo
 
 
 async def unload_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) -> None:
-    """Make a HTTP post request to the vLLM server to unload a LoRA adapter."""
+    """Ask the inference server to unload a LoRA adapter."""
 
     async def _unload_lora_adapter(admin_client: AsyncClient) -> None:
         logger.debug(f"Sending request to unload LoRA adapter {lora_name}")
@@ -319,33 +306,3 @@ async def unload_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) 
 
     await asyncio.gather(*[_unload_lora_adapter(admin_client) for admin_client in admin_clients])
 
-
-async def init_nccl_broadcast(admin_clients: list[AsyncClient], host: str, port: int, timeout: int) -> None:
-    """Make a HTTP post request to the vLLM server to initialize the NCCL broadcast."""
-
-    async def _init_nccl_broadcast(
-        admin_client: AsyncClient, host: str, port: int, client_num: int, timeout: int
-    ) -> None:
-        try:
-            response = await admin_client.post(
-                "/init_broadcaster",
-                json={
-                    "host": host,
-                    "port": port,
-                    "server_rank": client_num,
-                    "num_inference_server": len(admin_clients),
-                    "timeout": timeout,
-                },
-            )
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                logger.warning("The route /init_broadcaster does not exist. Skipping NCCL broadcast initialization.")
-                return
-
-    await asyncio.gather(
-        *[
-            _init_nccl_broadcast(admin_client, host, port, client_num, timeout)
-            for client_num, admin_client in enumerate(admin_clients)
-        ]
-    )

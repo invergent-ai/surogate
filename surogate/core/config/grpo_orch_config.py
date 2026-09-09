@@ -12,9 +12,9 @@ class GRPOModelConfig:
 
     Args:
         name: Name or path of the HF model to use.
-        lora_adapter: Name of the LoRA adapter to register with vLLM. When set, weight broadcasts
-            are routed through vLLM's `/load_lora_adapter` endpoint and the served model name
-            switches to this adapter after the first update. Required when training with LoRA.
+        lora_adapter: Name of the LoRA adapter to register with the inference server. When set,
+            weight broadcasts are routed through its `/load_lora_adapter` endpoint and the served
+            model name switches to this adapter after the first update. Required when training with LoRA.
     """
 
     name: str | None = None
@@ -32,7 +32,7 @@ class GRPOClientConfig:
 
     Args:
         timeout: Timeout in seconds. Defaults to 1200 seconds.
-        base_url: Base URLs to use for the OpenAI API. By default, it is set to a single server on localhost at port 8000 which matches the default local vLLM server configuration. If you specify more than one URL, the client will round-robin (chat) completion requests across all servers.
+        base_url: Base URLs to use for the OpenAI API. By default, it is set to a single server on localhost at port 8000 which matches the rollout server's default port. If you specify more than one URL, the client will round-robin (chat) completion requests across all servers.
         api_key_var: Name of environment variable containing the API key to use for the inference API. Can be set to an arbitrary string if the inference server is not protected by an API key. If multiple URLs are specified, the same API key will be used for all servers.
         headers: Headers to use for the OpenAI API. By default, it is set to an empty dictionary.
         skip_model_check: Whether to skip checking if the model is available in the inference pool. Useful for external APIs or API Keys that don't support the /models endpoint.
@@ -40,14 +40,14 @@ class GRPOClientConfig:
 
     timeout: int | None = 1200
     base_url: list[str] | None = field(default_factory=lambda: ["http://localhost:8000/v1"])
-    api_key_var: str | None = "VLLM_API_KEY"
+    api_key_var: str | None = "SUROGATE_API_KEY"
     headers: dict[str, str] | None = field(default_factory=dict)
     skip_model_check: bool | None = False
 
     def __init__(self, cfg: DictDefault):
         self.timeout = cfg.get("timeout", 1200)
         self.base_url = cfg.get("base_url", ["http://localhost:8000/v1"])
-        self.api_key_var = cfg.get("api_key_var", "VLLM_API_KEY")
+        self.api_key_var = cfg.get("api_key_var", "SUROGATE_API_KEY")
         self.headers = cfg.get("headers", {})
         self.skip_model_check = cfg.get("skip_model_check", False)
 
@@ -138,7 +138,7 @@ class GRPOTemperatureSchedulerConfig:
 @dataclass
 class GRPOSamplingConfig:
     """
-    Configures how tokens are sampled from the model for training. Largely follows the vLLM sampling parameters.
+    Configures how tokens are sampled from the model for training. Largely follows the OpenAI sampling parameters.
 
     Args:
         temperature: Constant temperature for sampling. Defaults to 1.0 if neither this nor temp_scheduler is set. Cannot be set together with temp_scheduler.
@@ -244,7 +244,7 @@ class GRPOEvalEnvConfig(GRPOEnvConfig):
 @dataclass
 class GRPOEvalSamplingConfig:
     """
-    Configures how tokens are sampled from the model for evaluation. Largely follows the vLLM sampling parameters.
+    Configures how tokens are sampled from the model for evaluation. Largely follows the OpenAI sampling parameters.
 
     Args:
         temperature: Scales the output probability distribution. Lower values => more deterministic, higher values => more random. If 0, will sample greedily. Defaults to None, which means we fall back to the inference server's default value.
@@ -688,7 +688,7 @@ class GRPORulerConfig:
         max_retries_on_parse_error: Number of retries when the judge returns malformed JSON. Each retry re-issues the request.
         swallow_exceptions: When True, judge failures fail the group (rollouts dropped) instead of raising. Recommended in production.
         debug: When True, the judge's per-group reasoning is logged at INFO level. Otherwise it's DEBUG only.
-        extra_body: Extra body fields passed verbatim with every judge request (e.g. vLLM ``guided_json`` knobs).
+        extra_body: Extra body fields passed verbatim with every judge request (e.g. structured-output knobs).
         sampling: Sampling overrides applied to the judge call (temperature, max_completion_tokens, reasoning_effort, top_p).
         cost: Per-token cost rates. Used to surface USD figures in step metrics.
     """
@@ -872,32 +872,6 @@ class FileSystemWeightBroadcastConfig:
 
 
 @dataclass
-class NCCLWeightBroadcastConfig:
-    """Configures the NCCL weight broadcast."""
-
-    type: Literal["nccl"] | None = "nccl"
-    host: str | None = "localhost"
-    port: int | None = 29501
-    timeout: int | None = 1200
-
-    def __init__(self, cfg: DictDefault):
-        self.type = cfg.get("type", self.type)
-        self.host = cfg.get("host", self.host)
-        self.port = cfg.get("port", self.port)
-        self.timeout = cfg.get("timeout", self.timeout)
-
-
-@dataclass
-class ColocateWeightBroadcastConfig:
-    """Configures colocate weight broadcast (zero-copy shared GPU memory)."""
-
-    type: Literal["colocate"] | None = "colocate"
-
-    def __init__(self, cfg: DictDefault):
-        self.type = cfg.get("type", self.type)
-
-
-@dataclass
 class FileSystemTransportConfig:
     """Configures filesystem-based transport for training examples."""
 
@@ -982,9 +956,7 @@ class GRPOOrchestratorConfig:
     ckpt: GRPOCheckpointConfig | None = None
     val: GRPOValConfig | None = None
     ruler: GRPORulerConfig | None = None
-    weight_broadcast: (
-        FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | ColocateWeightBroadcastConfig | None
-    ) = None
+    weight_broadcast: FileSystemWeightBroadcastConfig | None = None
     rollout_transport: FileSystemTransportConfig | ZMQTransportConfig | None = None
     output_dir: str | None = "outputs/run_default"
     max_concurrent: int | None = None
@@ -1073,16 +1045,9 @@ class GRPOOrchestratorConfig:
 
         self.ruler = GRPORulerConfig(cfg.get("ruler", {}) or DictDefault({}))
 
-        if cfg.get("weight_broadcast") is not None:
-            wb_type = cfg.get("weight_broadcast").get("type")
-            if wb_type == "nccl":
-                self.weight_broadcast = NCCLWeightBroadcastConfig(cfg.get("weight_broadcast", {}))
-            elif wb_type == "colocate":
-                self.weight_broadcast = ColocateWeightBroadcastConfig(cfg.get("weight_broadcast", {}))
-            else:
-                self.weight_broadcast = FileSystemWeightBroadcastConfig(cfg.get("weight_broadcast", {}))
-        else:
-            self.weight_broadcast = FileSystemWeightBroadcastConfig({})
+        # Only the filesystem broadcast exists: the trainer writes each step's adapter
+        # to a directory and the server is asked to load it from there.
+        self.weight_broadcast = FileSystemWeightBroadcastConfig(cfg.get("weight_broadcast", {}) or DictDefault({}))
 
         if cfg.get("rollout_transport") is not None:
             if cfg.get("rollout_transport").get("type") == "zmq":
@@ -1139,10 +1104,6 @@ class GRPOOrchestratorConfig:
 
         if self.max_concurrent is not None and self.max_concurrent < self.rollouts_per_example:
             raise ValueError("max_concurrent must be at least the number of rollouts per example")
-
-        if self.weight_broadcast.type == "nccl":
-            if not self.max_async_level == 1:
-                raise ValueError("max_async_level must be 1 for NCCL broadcast")
 
         has_rollout_batch = self.batch_size is not None
         has_token_batch = self.token_batch_size is not None

@@ -88,7 +88,7 @@ test("buildGrpoCommand has split gpus + 3 configs", () => {
   const c = { train: "t.yaml", infer: "i.yaml", orch: "o.yaml" };
   const cmd = buildGrpoCommand([4, 5], [0, 1, 2, 3], c, "surogate");
   assert.match(cmd, /surogate grpo --train t\.yaml --infer i\.yaml --orch o\.yaml/);
-  assert.match(cmd, /--trainer-gpus 4,5 --vllm-gpus 0,1,2,3/);
+  assert.match(cmd, /--trainer-gpus 4,5 --infer-gpus 0,1,2,3/);
 });
 
 import { buildGrpoCommand as bgc, ensureRlConfigs } from "./launch.ts";
@@ -102,7 +102,7 @@ const TMP_CFG = fs.mkdtempSync(path.join(os.tmpdir(), "jk-rl-"));
 test("RULER command adds judge-infer + judge-gpus", () => {
   const c = { train: "t.yaml", infer: "i.yaml", orch: "o.yaml", judge: "j.yaml" };
   const cmd = bgc([4, 5], [0, 1], c, "surogate", [6, 7]);
-  assert.match(cmd, /--trainer-gpus 4,5 --vllm-gpus 0,1/);
+  assert.match(cmd, /--trainer-gpus 4,5 --infer-gpus 0,1/);
   assert.match(cmd, /--judge-infer j\.yaml --judge-gpus 6,7/);
 });
 
@@ -117,7 +117,7 @@ test("ensureRlConfigs(grpo) generates runnable configs with reconciled ports", (
   const infer = fs.readFileSync(c.infer, "utf8");
   const orch = fs.readFileSync(c.orch, "utf8");
   assert.match(infer, /port: 8007/);
-  assert.match(orch, /localhost:8007\/v1/); // orch client points at the student vLLM port
+  assert.match(orch, /localhost:8007\/v1/); // orch client points at the student server port
   assert.match(orch, /id: markdown-table-qa/); // a locally-importable env (no "/" → no hub install)
 });
 
@@ -126,7 +126,7 @@ test("ensureRlConfigs(ruler) reconciles disjoint student/judge ports", () => {
   assert.ok(c.judge);
   const judge = fs.readFileSync(c.judge!, "utf8");
   const orch = fs.readFileSync(c.orch, "utf8");
-  assert.match(judge, /port: 8001/); // judge vLLM binds 8001…
+  assert.match(judge, /port: 8001/); // judge server binds 8001…
   assert.match(orch, /localhost:8001\/v1/); // …and the RULER judge base_url matches
   assert.match(orch, /localhost:8007\/v1/); // student rollout still on 8007 (disjoint)
 });

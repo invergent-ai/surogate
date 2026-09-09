@@ -1,9 +1,9 @@
 """Tests for GRPO-shutdown subprocess reaping in `surogate.grpo.split`.
 
-The vLLM subprocess `setsid()`s so its immediate tree shares one process group,
-but some workers (the vLLM `EngineCore`, the `multiprocessing.resource_tracker`)
+The inference subprocess `setsid()`s so its immediate tree shares one process group,
+but some workers (a `multiprocessing.resource_tracker`, for one)
 end up outside that group, and when their parent dies mid-run they reparent to
-PID 1 — so a `killpg` on the vLLM group misses them and a plain child-tree walk
+PID 1 — so a `killpg` on the server's group misses them and a plain child-tree walk
 can no longer find them. Shutdown must still leave nothing behind, else those
 workers linger orphaned and strand the run.
 
@@ -24,7 +24,7 @@ import psutil
 from surogate.grpo.split import (
     _reap_survivors,
     _set_child_subreaper,
-    _terminate_vllm_tree,
+    _terminate_inference_tree,
 )
 
 if sys.platform != "linux":
@@ -45,7 +45,7 @@ def _escaped_stubborn(ready=None):
     """A session leader that ignores SIGTERM, signalling once its handler is set.
 
     Models both a real escaped orphan (own group, so `killpg` can't reach it)
-    and a hung vLLM leader that only SIGKILL can end. The readiness signal fires
+    and a hung server leader that only SIGKILL can end. The readiness signal fires
     *after* the SIG_IGN handler is installed, so a test never races SIGTERM
     against an un-armed handler (which would let the process die on the default
     disposition and pass without exercising the SIGKILL escalation).
@@ -57,7 +57,7 @@ def _escaped_stubborn(ready=None):
 
 
 def _responsive_leader(ready=None):
-    """A vLLM-leader stand-in that exits on the default SIGTERM (the clean case)."""
+    """A server-leader stand-in that exits on the default SIGTERM (the clean case)."""
     os.setsid()
     _signal_ready(ready)
     time.sleep(30)
@@ -126,13 +126,13 @@ def test_reap_survivors_is_a_noop_when_nothing_survives():
     _reap_survivors([], grace=0.5)  # must not raise
 
 
-def test_terminate_vllm_tree_sigterms_a_responsive_leader():
+def test_terminate_inference_tree_sigterms_a_responsive_leader():
     proc = _start_ready(_responsive_leader)
     try:
         pgid = proc.pid
         assert _group_alive(pgid), "precondition: the group should be alive"
 
-        _terminate_vllm_tree(proc, grace=0.5)  # SIGTERM alone should end a responsive leader
+        _terminate_inference_tree(proc, grace=0.5)  # SIGTERM alone should end a responsive leader
 
         assert not proc.is_alive()
         assert _wait_group_gone(pgid), "the group must empty on a clean SIGTERM exit"
@@ -140,13 +140,13 @@ def test_terminate_vllm_tree_sigterms_a_responsive_leader():
         _kill_tree(proc.pid)
 
 
-def test_terminate_vllm_tree_sigkills_a_stubborn_leader():
+def test_terminate_inference_tree_sigkills_a_stubborn_leader():
     proc = _start_ready(_escaped_stubborn)  # ignores SIGTERM
     try:
         pgid = proc.pid
         assert _group_alive(pgid), "precondition: the group should be alive"
 
-        _terminate_vllm_tree(proc, grace=0.5)  # SIGTERM ignored -> escalate to SIGKILL
+        _terminate_inference_tree(proc, grace=0.5)  # SIGTERM ignored -> escalate to SIGKILL
 
         assert not proc.is_alive(), "a leader that ignores SIGTERM must be SIGKILLed after the grace"
         assert _wait_group_gone(pgid)
@@ -154,9 +154,9 @@ def test_terminate_vllm_tree_sigkills_a_stubborn_leader():
         _kill_tree(proc.pid)
 
 
-def test_terminate_vllm_tree_is_a_noop_for_an_unstarted_process():
+def test_terminate_inference_tree_is_a_noop_for_an_unstarted_process():
     proc = mp.get_context("fork").Process(target=time.sleep, args=(0,))
-    _terminate_vllm_tree(proc, grace=0.5)  # never started: pid is None -> early return
+    _terminate_inference_tree(proc, grace=0.5)  # never started: pid is None -> early return
 
 
 def test_set_child_subreaper_is_best_effort_when_prctl_unavailable():

@@ -58,7 +58,7 @@ def get_eval_sampling_args(sampling_config: GRPOEvalSamplingConfig) -> dict[str,
     extra_body_cfg = sampling_config.extra_body or {}
     extra_body: dict[str, Any] = dict(extra_body_cfg)
 
-    # Apply vLLM-specific sampling arguments, if specified
+    # Server-side sampling extensions, if specified
     if sampling_config.top_k is not None:
         extra_body["top_k"] = sampling_config.top_k
     if sampling_config.min_p is not None:

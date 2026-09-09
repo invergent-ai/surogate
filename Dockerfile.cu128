@@ -57,7 +57,6 @@ ENV PATH="/root/.venv/bin:$PATH" \
 # ldconfig runs last: the cache built above was made before these libs existed, so without
 # refreshing it the loader cannot find libcudart and the entrypoint fails to import _surogate.
 RUN ~/.local/bin/uv pip install "torch==2.11.0+${CUDA_TAG}" "torchvision==0.26.0+${CUDA_TAG}" "torchaudio==2.11.0+${CUDA_TAG}" --index-url https://download.pytorch.org/whl/${CUDA_TAG} \
- && ~/.local/bin/uv pip install "vllm==0.25.1" \
  && ~/.local/bin/uv pip install ${WHEEL_URL} \
  && ~/.local/bin/uv pip install "nvidia-cuda-runtime-cu12==12.8.90" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.8.93" "nvidia-cudnn-cu12==9.19.0.56" \
  && ldconfig

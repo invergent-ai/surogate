@@ -537,12 +537,10 @@ Keys most often set; see the [RL Training guide](../guides/rl-training.md) for t
 | `model`                  | string | (required)     | HuggingFace model ID or local path. Must match `train.yaml` and `orch.yaml`.              |
 | `tp` / `dp`              | int    | `1` / `1`      | Tensor and data parallelism degrees.                                                      |
 | `max_model_len`          | int    | `null`         | Maximum context length.                                                                   |
-| `max_num_seqs`           | int    | `null`         | Cap on concurrent sequences. Sizes the CUDA-graph and activation buffers, so it — not `gpu_memory_utilization` — is the knob that decides whether a large model plus LoRA fits. `null` uses vLLM's default. |
-| `kv_cache_dtype`         | string | `null`         | KV cache dtype. `fp8` halves KV bytes per token and raises sustainable concurrency, at the cost of perturbing sampled logprobs — watch `mismatch_kl`. `null` uses vLLM's default. |
+| `max_num_seqs`           | int    | `null`         | Cap on concurrent sequences. Sizes the CUDA-graph and activation buffers, so it is the knob that decides whether a large model plus LoRA fits. `null` uses the engine's default. |
+| `kv_cache_dtype`         | string | `null`         | KV cache dtype. `fp8` halves KV bytes per token and raises sustainable concurrency, at the cost of perturbing sampled logprobs — watch `mismatch_kl`. `null` uses the engine's default. |
 | `enable_lora`            | bool   | `true`         | Enable LoRA hot-reload, which is how the trainer's adapter reaches the server.             |
-| `max_lora_rank`          | int    | `null`         | Maximum LoRA rank, auto-rounded up to a vLLM-valid value.                                 |
-| `gpu_memory_utilization` | float  | `0.9`          | Fraction of GPU memory for the KV cache. Computed automatically in co-locate mode.         |
-| `weight_broadcast_type`  | string | `"filesystem"` | Must match the trainer's setting.                                                          |
+| `max_lora_rank`          | int    | `null`         | Largest adapter rank the server accepts.                                                  |
 
 ### Checkpoint resume
 
