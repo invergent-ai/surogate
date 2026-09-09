@@ -203,6 +203,14 @@ void Binder::validate_only(ObjectHandle handle) {
     planned_[handle.index] = true;
 }
 
+void Binder::discard_unconsumed() {
+    for (std::size_t index = 0; index < consumed_.size(); ++index) {
+        if (consumed_[index]) { continue; }
+        consumed_[index] = true;
+        planned_[index]  = true; // validated, placed nowhere: it costs the device nothing
+    }
+}
+
 MaterializationPlan Binder::finish() {
     const auto it = std::find(consumed_.begin(), consumed_.end(), false);
     if (it != consumed_.end()) {

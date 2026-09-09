@@ -89,6 +89,14 @@ public:
     /// like any other object and costs the device nothing.
     void bank_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
+    /// Account for every object this caller did not bind, without placing any of them.
+    ///
+    /// `finish` insists that a target consume the whole artifact, which is what catches a
+    /// target that silently ignores an object a checkpoint ships. A caller that wants one
+    /// part of a checkpoint -- the vision tower on its own, with no text model -- has to say
+    /// so rather than be caught by that rule, and saying so is this call. Targets never make
+    /// it; the invariant they are held to is unchanged.
+    void discard_unconsumed();
     MaterializationPlan finish();
 
 private:

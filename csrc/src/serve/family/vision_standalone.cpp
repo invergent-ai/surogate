@@ -116,6 +116,9 @@ StandaloneVisionTower::StandaloneVisionTower(const std::filesystem::path& artifa
     }
     state_->geometry = VisionGeometry::resolved(state_->reader.vision_geometry());
     const TowerPlan plan = bind_tower(binder, state_->geometry);
+    // The text model, the frontend resources and everything else this checkpoint ships are
+    // deliberately not read: the caller asked for a tower.
+    binder.discard_unconsumed();
     state_->backing = artifact::materialize(state_->reader, binder.finish(), state_->device);
     state_->weights = take_tower(state_->backing, plan, state_->geometry);
 

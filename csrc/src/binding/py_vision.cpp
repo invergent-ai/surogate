@@ -73,7 +73,12 @@ public:
                                static_cast<std::int32_t>(planes)});
         const std::span<const std::uint16_t> values(
             static_cast<const std::uint16_t*>(patches.data()), patches.size());
-        tower_.encode(values, grid, modality_from(modality), output);
+        {
+            // Only the tower runs without the GIL. The capsule below is a Python object,
+            // and building one while another thread may be collecting is a crash.
+            nb::gil_scoped_release unlocked;
+            tower_.encode(values, grid, modality_from(modality), output);
+        }
 
         // The buffer outlives this call for exactly as long as the array does: the capsule
         // holds the only remaining reference and frees it when Python drops the view.
@@ -103,7 +108,6 @@ void bind_vision_encoder(nb::module_& m) {
                      "The tower's dimensions, as the artifact declares them.")
         .def("encode", &VisionEncoder::encode, nb::arg("patches"), nb::arg("temporal"),
              nb::arg("height"), nb::arg("width"), nb::arg("modality") = "image",
-             nb::call_guard<nb::gil_scoped_release>(),
              "Encode one image or video item into merged visual tokens.\n\n"
              "Parameters:\n"
              "- patches: host BF16 array, patch_count * patch_dim, patch-major.\n"
