@@ -16,30 +16,41 @@ jobs:
     strategy:
       matrix:
         include:
-          # `archs` is the *trainer's* architecture set (CUDAARCHS). The serve engine has its
-          # own, `SUROGATE_SERVE_CUDA_ARCHS`, defaulting to the RTX line it is built for --
-          # sm_89 and sm_120a, one binary for the 4090, the 5090 and the RTX PRO 6000. It is
+          # `archs` is the *trainer's* architecture set (CUDAARCHS), and it is the only place
+          # one exists: csrc/CMakeLists.txt declares a floor (SUROGATE_MIN_CUDA_ARCH 89) and,
+          # left alone, probes nvidia-smi and builds for the one card it finds. So this list is
+          # what the published wheels can run on, and nothing else has an opinion.
+          #
+          # Three architectures, each with a claim on it. sm_89 is Ada -- the 4090, L4, L40.
+          # sm_90a is Hopper, which the README's headline benchmark is measured on (53,900
+          # tok/s on one H100). sm_120a is the RTX 50 series and the RTX PRO 6000. Datacenter
+          # Blackwell -- sm_100a (B200) and sm_103a (B300) -- is not here: no code path, no
+          # benchmark and no config asks for it, and carrying it cost a whole third wheel,
+          # since sm_103a is the one thing CUDA 12.8 cannot compile.
+          #
+          # The serve engine keeps its own list, `SUROGATE_SERVE_CUDA_ARCHS`, narrower still at
+          # sm_89 and sm_120a -- one binary for the 4090, the 5090 and the RTX PRO 6000. It is
           # left at its default here and checked in the wheel afterwards; restating it in the
           # workflow would only be a second place to be wrong.
           #
           # `serve` says whether this toolkit can build the engine at all: it needs CUDA 13.1,
-          # so the two older wheels are trainer-only and say so rather than dropping the engine
+          # so the older wheel is trainer-only and says so rather than dropping the engine
           # quietly (SUROGATE_REQUIRE_SERVE turns a missing engine into a failed build).
+          #
+          # Two wheels, not three. A binary built against 12.8 runs on any 12.x runtime -- CUDA
+          # minor version compatibility -- and nothing here links torch, so there is no ABI
+          # tying a wheel to one toolkit. cu128 is what a CUDA 12.9 host installs. It also
+          # covers anyone whose driver predates CUDA 13, which is why it is not folded into
+          # cu130 as well.
           - cuda_version: "12.8"
             cuda_build_image: "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu128"
-            # sm_103 (Blackwell Ultra) needs CUDA 12.9+, so it is absent here.
-            archs: "89;90a;100a;120a"
-            serve: false
-          - cuda_version: "12.9"
-            cuda_build_image: "nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04"
-            wheel_tag: "cu129"
-            archs: "89;90a;100a;103a;120a"
+            archs: "89;90a;120a"
             serve: false
           - cuda_version: "13.1"
             cuda_build_image: "nvidia/cuda:13.1.1-cudnn-devel-ubuntu24.04"
             wheel_tag: "cu130"
-            archs: "89;90a;100a;103a;120a"
+            archs: "89;90a;120a"
             serve: true
     env:
       CMAKE_GENERATOR: Ninja

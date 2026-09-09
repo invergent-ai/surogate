@@ -34,7 +34,7 @@ ENV UV_HTTP_TIMEOUT=600
 # FFmpeg for the multimodal decode path (serve/media/decode) and libnuma for the host-offload
 # path (expert_cache, host_bank). Neither arrives with the wheel, so without them `surogate
 # serve` finds its binary and the binary refuses to start. Only this image needs them: the
-# engine requires CUDA 13.1, so the cu128 and cu129 wheels are built without one.
+# engine requires CUDA 13.1, so the cu128 wheel is built without one.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl libdw-dev python3-dev build-essential rsync wget netcat-openbsd gcc patch pciutils fuse3 openssh-server sudo openssh-server git \
        libavformat60 libavcodec60 libavutil58 libswscale7 libnuma1 \

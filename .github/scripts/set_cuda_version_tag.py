@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Add CUDA tag to wheel version
 #
-# PyPI/PEP 440 supports local version identifiers (e.g., 0.1.1+cu129)
+# PyPI/PEP 440 supports local version identifiers (e.g., 0.1.1+cu128)
 # This script modifies pyproject.toml to add the CUDA tag to the version
 # before building the wheel.
 import subprocess
@@ -12,10 +12,6 @@ CUDA_DEPS = {
     "cu128": [
         "torch==2.11.0+cu128",
         "torchvision==0.26.0+cu128",
-    ],
-    "cu129": [
-        "torch==2.11.0+cu129",
-        "torchvision==0.26.0+cu129",
     ],
     "cu130": [
         "torch==2.11.0+cu130",
