@@ -788,6 +788,10 @@ option(BUILD_TESTS_INTEGRATION "Build integration tests (training loops, distrib
 if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
     enable_testing()
 
+    add_executable(dsl-weight-loader-tests src/testing/runtime/test-dsl-weight-loader.cpp)
+    target_link_libraries(dsl-weight-loader-tests PRIVATE surogate-common Catch2::Catch2WithMain)
+    add_test(NAME dsl-weight-loader-tests COMMAND dsl-weight-loader-tests)
+
     add_executable(integration-tests
         src/testing/utilities/test_main.cpp
         src/testing/distributed/test-nccl.cpp

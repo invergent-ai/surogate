@@ -19,6 +19,7 @@
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/shared_master_store.h"
 #include "runtime/dsl/dsl_weight_manager.h"
+#include "runtime/dsl/dsl_weight_loader.h"
 #include "runtime/executor/graph_executor.h"
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/qlora/adapter_merger.h"
@@ -121,7 +122,6 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
     }
 
     SafeTensorsReader reader(file_name);
-    std::vector<std::pair<std::string, std::string>> tied_params;
 
     if (qlora_enabled()) {
         if (!mLoRAConfig) {
@@ -186,33 +186,18 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
     }
 
     const bool sharded_weights = mWeightManager && mOptions.ShardWeights && (mNumShards > 1);
-    auto shard_range = [&](long global_rows, bool param_sharded) -> std::pair<long, long> {
-        if (!param_sharded) {
-            return {0, global_rows};
-        }
-        if (global_rows % mNumShards != 0) {
-            throw std::runtime_error("DSL model: sharded load requires dim0 divisible by num_shards");
-        }
-        const long shard_rows = global_rows / mNumShards;
-        const long start = shard_rows * mShardIdx;
-        return {start, start + shard_rows};
-    };
-    auto row_stride = [](const std::vector<long>& shape) -> long {
-        long stride = 1;
-        for (std::size_t i = 1; i < shape.size(); ++i) {
-            stride *= shape[i];
-        }
-        return stride;
-    };
+    const ShardConfig shard_config{mShardIdx, mNumShards};
+    MoEWeightConfig moe_config;
+    moe_config.num_experts = mModelConfig.moe_config && mModelConfig.moe_config->num_experts > 0
+                                 ? mModelConfig.moe_config->num_experts
+                                 : mModelConfig.NumExperts;
+    DslWeightLoader loader(reader, mHfMapping, *mConfig, *mAllocator, shard_config, moe_config);
 
     // Adapter merge (stacked LoRA): merge previously-trained adapter into base weights.
     // This runs ONLY on the BF16 path; the QLoRA path handles merging in the pipeline.
     std::unique_ptr<qlora::AdapterMerger> adapter_merger;
     cudaStream_t adapter_stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
     if (!qlora_enabled() && !mAdapterPath.empty()) {
-        ShardConfig shard_config;
-        shard_config.shard_idx = mShardIdx;
-        shard_config.num_shards = mNumShards;
         adapter_merger = std::make_unique<qlora::AdapterMerger>(mAdapterPath, mHfMapping, reader, shard_config);
     }
 
@@ -278,486 +263,25 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         } finish_guard{name, shared_master};
 
         const bool param_sharded = sharded_weights && mWeightManager->is_sharded(name);
-        int layer_idx = -1;
-        const MappingSpec* spec = internal::find_mapping_spec(mHfMapping, name, layer_idx);
-        MappingSpec direct_fallback;
-        if (!spec) {
-            direct_fallback.kind = MappingSpec::Kind::Direct;
-            direct_fallback.source = name;
-            spec = &direct_fallback;
+        DslWeightLoader::ExpertLoadedCallback on_expert_loaded;
+        if (adapter_merger) {
+            on_expert_loaded = [&](int expert_idx, Tensor& expert) {
+                adapter_merger->apply_expert(name, expert_idx, expert, adapter_stream);
+            };
         }
-
-        if (spec->kind == MappingSpec::Kind::TiedTo) {
-            tied_params.emplace_back(name, spec->target);
-            continue;
+        const Tensor& global = mParams->template_tensor(name);
+        if (!loader.load_param(name, param, allow_cast, param_sharded, &global, adapter_stream,
+                               on_expert_loaded)) {
+            // Every allocated parameter must be populated, even when its mapping
+            // is optional for model variants that do not allocate that parameter.
+            throw std::runtime_error("DSL model: missing HF tensor for allocated param '" + name + "'");
         }
-
-        if (spec->kind == MappingSpec::Kind::Direct) {
-            const std::string hf_name = internal::format_hf_name(spec->source.empty() ? name : spec->source, layer_idx);
-
-            // Handle tied embeddings: if lm_head.weight is not found and embeddings are tied,
-            // fall back to model.embed_tokens.weight
-            const SafeTensorEntry* entry_ptr = nullptr;
-            try {
-                entry_ptr = &reader.find_entry(hf_name);
-            } catch (const std::out_of_range&) {
-                if (mConfig->TiedWordEmbeddings && hf_name == "lm_head.weight") {
-                    std::vector<std::string> candidates;
-                    int emb_layer_idx = -1;
-                    if (const auto* emb_spec = internal::find_mapping_spec(mHfMapping, "embedding", emb_layer_idx)) {
-                        if (emb_spec->kind == MappingSpec::Kind::Direct && !emb_spec->source.empty()) {
-                            candidates.push_back(internal::format_hf_name(emb_spec->source, emb_layer_idx));
-                        }
-                    }
-                    candidates.push_back("model.embed_tokens.weight");
-                    candidates.push_back("model.language_model.embed_tokens.weight");
-
-                    for (const auto& candidate : candidates) {
-                        if (candidate.empty()) {
-                            continue;
-                        }
-                        try {
-                            entry_ptr = &reader.find_entry(candidate);
-                            break;
-                        } catch (const std::out_of_range&) {
-                            continue;
-                        }
-                    }
-
-                    if (!entry_ptr) {
-                        throw std::runtime_error("DSL model: missing HF tensor '" + hf_name +
-                                                 "' (and tied fallback) for param '" + name + "'");
-                    }
-                } else {
-                    throw std::runtime_error("DSL model: missing HF tensor '" + hf_name + "' for param '" + name + "'");
-                }
-            }
-            const auto& entry = *entry_ptr;
-            const std::string entry_name = entry.name();
-            if (!param_sharded) {
-                const auto& file_shape = entry.shape();
-                if (static_cast<int>(file_shape.size()) != param.Rank) {
-                    // Allow squeezing size-1 dims (e.g., conv1d weight [D,1,K] -> [D,K]).
-                    std::vector<long> squeezed;
-                    squeezed.reserve(file_shape.size());
-                    for (long d : file_shape) {
-                        if (d != 1) squeezed.push_back(d);
-                    }
-                    bool match = (static_cast<int>(squeezed.size()) == param.Rank);
-                    for (int i = 0; match && i < param.Rank; ++i) {
-                        if (squeezed[i] != param.Sizes[i]) match = false;
-                    }
-                    if (!match) {
-                        throw std::runtime_error("DSL model: shape mismatch for '" + hf_name +
-                                                 "': file shape cannot be squeezed to target shape for param '" + name +
-                                                 "'");
-                    }
-                    entry.read_raw(param, 0, param.nelem(), allow_cast);
-                } else {
-                    entry.read_tensor(param, allow_cast);
-                }
-            } else {
-                const Tensor& global = mParams->template_tensor(name);
-                const long global_rows = global.Sizes[0];
-                auto [start, end] = shard_range(global_rows, param_sharded);
-                const long stride = row_stride(entry.shape());
-                (void)end;
-                entry.read_raw(param, static_cast<std::ptrdiff_t>(start) * stride, param.nelem(), allow_cast);
-            }
-            if (adapter_merger) {
-                adapter_merger->apply(name, param, adapter_stream);
-                CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
-            }
-            continue;
+        if (adapter_merger) {
+            // TiedTo is resolved from the merged source below; StackExperts has
+            // already been merged by the per-expert callback. apply skips both.
+            adapter_merger->apply(name, param, adapter_stream);
+            CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
         }
-
-        if (spec->kind == MappingSpec::Kind::Fuse) {
-            if (spec->dim != 0) {
-                throw std::runtime_error("DSL model: fuse mapping only supports dim=0 for " + name);
-            }
-            std::vector<long> slice_sizes =
-                internal::infer_fuse_slices(name, *mConfig, static_cast<int>(spec->sources.size()));
-
-            // Validate static slices against target. For hybrid models with
-            // per-block-type dimensions, the static inference may produce wrong
-            // sizes (uses global head_size which varies across block types).
-            const Tensor& global = mParams->template_tensor(name);
-            const long global_rows = global.Sizes[0];
-            if (!slice_sizes.empty()) {
-                long sum = 0;
-                for (long s : slice_sizes)
-                    sum += s;
-                if (sum != global_rows) {
-                    slice_sizes.clear();  // Invalidate — try file-based fallback
-                }
-            }
-
-            if (slice_sizes.empty()) {
-                // Infer slice sizes from the actual source file tensor shapes
-                std::vector<long> file_sizes;
-                file_sizes.reserve(spec->sources.size());
-                for (const auto& src : spec->sources) {
-                    const std::string hf_name = internal::format_hf_name(src, layer_idx);
-                    try {
-                        const auto& entry = reader.find_entry(hf_name);
-                        if (!entry.shape().empty()) {
-                            file_sizes.push_back(entry.shape()[0]);
-                        }
-                    } catch (...) {
-                        break;
-                    }
-                }
-                if (file_sizes.size() == spec->sources.size()) {
-                    slice_sizes = std::move(file_sizes);
-                } else if (global_rows % static_cast<long>(spec->sources.size()) == 0) {
-                    const long chunk = global_rows / static_cast<long>(spec->sources.size());
-                    slice_sizes.assign(spec->sources.size(), chunk);
-                } else {
-                    throw std::runtime_error("DSL model: cannot infer fuse slices for " + name);
-                }
-            } else if (slice_sizes.size() != spec->sources.size()) {
-                throw std::runtime_error("DSL model: fuse slice count mismatch for " + name);
-            }
-
-            auto [shard_start, shard_end] = shard_range(global_rows, param_sharded);
-
-            long offset = 0;
-            for (std::size_t i = 0; i < spec->sources.size(); ++i) {
-                const auto& src = spec->sources[i];
-                const std::string hf_name = internal::format_hf_name(src, layer_idx);
-                const auto& entry = reader.find_entry(hf_name);
-                if (entry.shape().empty()) {
-                    throw std::runtime_error("DSL model: empty shape for " + hf_name);
-                }
-                if (static_cast<int>(entry.shape().size()) != param.Rank) {
-                    throw std::runtime_error("DSL model: rank mismatch for " + hf_name);
-                }
-                for (int j = 1; j < param.Rank; ++j) {
-                    if (entry.shape().at(j) != global.Sizes[j]) {
-                        throw std::runtime_error("DSL model: shape mismatch for " + hf_name);
-                    }
-                }
-
-                const long slice_len = slice_sizes.at(i);
-                if (!param_sharded) {
-                    Tensor slice = internal::slice_dim0(param, offset, slice_len);
-                    entry.read_raw(slice, 0, slice.nelem(), allow_cast);
-                    offset += slice_len;
-                    continue;
-                }
-
-                const long src_begin = offset;
-                const long src_end = offset + slice_len;
-                const long overlap_begin = std::max(src_begin, shard_start);
-                const long overlap_end = std::min(src_end, shard_end);
-                if (overlap_begin < overlap_end) {
-                    const long rows = overlap_end - overlap_begin;
-                    const long dst_row_offset = overlap_begin - shard_start;
-                    const long src_row_offset = overlap_begin - src_begin;
-                    Tensor slice = internal::slice_dim0(param, dst_row_offset, rows);
-                    const long stride = row_stride(entry.shape());
-                    entry.read_raw(slice,
-                                   static_cast<std::ptrdiff_t>(src_row_offset) * stride,
-                                   slice.nelem(),
-                                   allow_cast);
-                }
-                offset += slice_len;
-            }
-            if (offset != global_rows) {
-                throw std::runtime_error("DSL model: fuse mapping size mismatch for " + name);
-            }
-            if (adapter_merger) {
-                adapter_merger->apply(name, param, adapter_stream);
-                CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
-            }
-            continue;
-        }
-
-        if (spec->kind == MappingSpec::Kind::Split) {
-            if (spec->dim != 0) {
-                throw std::runtime_error("DSL model: split mapping only supports dim=0 for " + name);
-            }
-            if (spec->ranges.empty()) {
-                throw std::runtime_error("DSL model: split mapping missing ranges for " + name);
-            }
-            auto [start, end] = spec->ranges.front();
-            if (start < 0 || end <= start) {
-                throw std::runtime_error("DSL model: unsupported split range for " + name);
-            }
-            const long expected = end - start;
-            const std::string hf_name = internal::format_hf_name(spec->source, layer_idx);
-            const auto& entry = reader.find_entry(hf_name);
-            if (!param_sharded) {
-                if (param.Sizes[0] != expected) {
-                    throw std::runtime_error("DSL model: split range size mismatch for " + name);
-                }
-                long stride = 1;
-                for (int i = 1; i < param.Rank; ++i) {
-                    stride *= param.Sizes[i];
-                }
-                const std::ptrdiff_t offset = static_cast<std::ptrdiff_t>(start) * stride;
-                entry.read_raw(param, offset, param.nelem(), allow_cast);
-            } else {
-                const long shard_rows = expected / mNumShards;
-                if (expected % mNumShards != 0 || param.Sizes[0] != shard_rows) {
-                    throw std::runtime_error("DSL model: split shard size mismatch for " + name);
-                }
-                const long local_start = start + shard_rows * mShardIdx;
-                const long stride = row_stride(entry.shape());
-                entry.read_raw(param, static_cast<std::ptrdiff_t>(local_start) * stride, param.nelem(), allow_cast);
-            }
-            if (adapter_merger) {
-                adapter_merger->apply(name, param, adapter_stream);
-                CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
-            }
-            continue;
-        }
-
-        if (spec->kind == MappingSpec::Kind::Transform) {
-            if (spec->fn != "transpose") {
-                throw std::runtime_error("DSL model: unsupported transform '" + spec->fn + "' for " + name);
-            }
-            const std::string hf_name = internal::format_hf_name(spec->source, layer_idx);
-            const auto& entry = reader.find_entry(hf_name);
-            cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
-            if (entry.shape().size() == 2 && param.Rank == 2) {
-                if (!param_sharded) {
-                    Tensor tmp = mAllocator->allocate(param.DType,
-                                                      ("hf_tmp_" + name).c_str(),
-                                                      EAllocationType::ON_DEVICE,
-                                                      {entry.shape().at(0), entry.shape().at(1)});
-                    entry.read_tensor(tmp, allow_cast);
-                    transpose(param,
-                              tmp,
-                              static_cast<int>(entry.shape().at(0)),
-                              static_cast<int>(entry.shape().at(1)),
-                              stream);
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                } else {
-                    const Tensor& global = mParams->template_tensor(name);
-                    const long global_rows = global.Sizes[0];
-                    auto [start, end] = shard_range(global_rows, param_sharded);
-                    if (param.Sizes[0] != (end - start)) {
-                        throw std::runtime_error("DSL model: transpose shard size mismatch for " + name);
-                    }
-                    Tensor tmp_src = mAllocator->allocate(param.DType,
-                                                          ("hf_tmp_src_" + name).c_str(),
-                                                          EAllocationType::ON_DEVICE,
-                                                          {entry.shape().at(0), entry.shape().at(1)});
-                    entry.read_tensor(tmp_src, allow_cast);
-                    Tensor tmp_full = mAllocator->allocate(param.DType,
-                                                           ("hf_tmp_full_" + name).c_str(),
-                                                           EAllocationType::ON_DEVICE,
-                                                           {global.Sizes[0], global.Sizes[1]});
-                    transpose(tmp_full,
-                              tmp_src,
-                              static_cast<int>(entry.shape().at(0)),
-                              static_cast<int>(entry.shape().at(1)),
-                              stream);
-                    Tensor slice = internal::slice_dim0(tmp_full, start, end - start);
-                    CUDA_CHECK(
-                        cudaMemcpyAsync(param.Data, slice.Data, param.bytes(), cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                }
-            } else if (entry.shape().size() == 3 && param.Rank == 3) {
-                const long E = static_cast<long>(entry.shape().at(0));
-                const long A = static_cast<long>(entry.shape().at(1));
-                const long B = static_cast<long>(entry.shape().at(2));
-                if (!param_sharded) {
-                    if (param.Sizes[0] != E || param.Sizes[1] != B || param.Sizes[2] != A) {
-                        throw std::runtime_error("DSL model: transpose (3D) shape mismatch for " + name);
-                    }
-                    Tensor tmp_src = mAllocator->allocate(param.DType,
-                                                          ("hf_tmp_" + name).c_str(),
-                                                          EAllocationType::ON_DEVICE,
-                                                          {E, A, B});
-                    entry.read_tensor(tmp_src, allow_cast);
-                    const std::size_t elem_size = get_dtype_size(param.DType);
-                    for (long e = 0; e < E; ++e) {
-                        Tensor src_view = tmp_src;
-                        src_view.Rank = 2;
-                        src_view.Sizes[0] = A;
-                        src_view.Sizes[1] = B;
-                        src_view.Data =
-                            static_cast<std::byte*>(tmp_src.Data) + static_cast<std::size_t>(e) * A * B * elem_size;
-
-                        Tensor dst_view = param;
-                        dst_view.Rank = 2;
-                        dst_view.Sizes[0] = B;
-                        dst_view.Sizes[1] = A;
-                        dst_view.Data =
-                            static_cast<std::byte*>(param.Data) + static_cast<std::size_t>(e) * B * A * elem_size;
-
-                        transpose(dst_view, src_view, static_cast<int>(A), static_cast<int>(B), stream);
-                    }
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                } else {
-                    const Tensor& global = mParams->template_tensor(name);
-                    const long global_rows = global.Sizes[0];
-                    auto [start, end] = shard_range(global_rows, param_sharded);
-                    if (param.Sizes[0] != (end - start) || global.Sizes[1] != B || global.Sizes[2] != A) {
-                        throw std::runtime_error("DSL model: transpose (3D) shard size mismatch for " + name);
-                    }
-                    Tensor tmp_src = mAllocator->allocate(param.DType,
-                                                          ("hf_tmp_src_" + name).c_str(),
-                                                          EAllocationType::ON_DEVICE,
-                                                          {E, A, B});
-                    entry.read_tensor(tmp_src, allow_cast);
-                    Tensor tmp_full = mAllocator->allocate(param.DType,
-                                                           ("hf_tmp_full_" + name).c_str(),
-                                                           EAllocationType::ON_DEVICE,
-                                                           {global.Sizes[0], global.Sizes[1], global.Sizes[2]});
-                    const std::size_t elem_size = get_dtype_size(param.DType);
-                    for (long e = 0; e < E; ++e) {
-                        Tensor src_view = tmp_src;
-                        src_view.Rank = 2;
-                        src_view.Sizes[0] = A;
-                        src_view.Sizes[1] = B;
-                        src_view.Data =
-                            static_cast<std::byte*>(tmp_src.Data) + static_cast<std::size_t>(e) * A * B * elem_size;
-
-                        Tensor dst_view = tmp_full;
-                        dst_view.Rank = 2;
-                        dst_view.Sizes[0] = B;
-                        dst_view.Sizes[1] = A;
-                        dst_view.Data =
-                            static_cast<std::byte*>(tmp_full.Data) + static_cast<std::size_t>(e) * B * A * elem_size;
-
-                        transpose(dst_view, src_view, static_cast<int>(A), static_cast<int>(B), stream);
-                    }
-                    Tensor slice = internal::slice_dim0(tmp_full, start, end - start);
-                    CUDA_CHECK(
-                        cudaMemcpyAsync(param.Data, slice.Data, param.bytes(), cudaMemcpyDeviceToDevice, stream));
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                }
-            } else {
-                throw std::runtime_error("DSL model: transpose expects 2D or 3D tensors for " + name);
-            }
-            if (adapter_merger) {
-                adapter_merger->apply(name, param, adapter_stream);
-                CUDA_CHECK(cudaStreamSynchronize(adapter_stream));
-            }
-            continue;
-        }
-
-        if (spec->kind == MappingSpec::Kind::StackExperts) {
-            // Stack per-expert HF tensors into batched format [num_experts, ...]
-            // The pattern has {expert} placeholder that we replace for each expert.
-            if (spec->source.empty()) {
-                throw std::runtime_error("DSL model: stack_experts missing pattern for " + name);
-            }
-
-            // Get number of experts from spec or config
-            int num_experts = spec->num_experts;
-            if (num_experts <= 0 && mModelConfig.moe_config.has_value()) {
-                num_experts = mModelConfig.moe_config->num_experts;
-            }
-            if (num_experts <= 0) {
-                num_experts = mModelConfig.NumExperts;
-            }
-            if (num_experts <= 0) {
-                throw std::runtime_error("DSL model: stack_experts cannot determine num_experts for " + name);
-            }
-
-            // param shape is [num_experts, ...] for batched format
-            // Each expert tensor has shape [...]
-            if (param.Rank < 1 || param.Sizes[0] < num_experts) {
-                throw std::runtime_error("DSL model: stack_experts param rank/size mismatch for " + name);
-            }
-
-            const long expert_size = param.nelem() / param.Sizes[0];  // Elements per expert
-            const std::size_t elem_size = get_dtype_size(param.DType);
-            cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
-
-            // Sharding: determine which experts this shard owns
-            const int experts_per_shard = param_sharded ? (num_experts / mNumShards) : num_experts;
-            const int expert_start = param_sharded ? (mShardIdx * experts_per_shard) : 0;
-            const int expert_end = param_sharded ? (expert_start + experts_per_shard) : num_experts;
-
-            if (spec->fuse_gate_up) {
-                // Load gate_proj and up_proj for each expert and fuse into gate_up format
-                // gate_up layout: [up; gate] per expert, so first D rows are up, next D rows are gate
-                const std::string gate_pattern = spec->source;
-                const std::string up_pattern =
-                    MappingSpec::derive_up_pattern(spec->source, spec->up_source);
-
-                // Expert tensor shape: [2*D, C] where D = intermediate_size
-                // Each sub-tensor (gate/up) has shape [D, C]
-                const long fused_rows = param.Rank >= 2 ? param.Sizes[1] : 1;  // Assuming [E, 2*D, C]
-                const long D = fused_rows / 2;
-                const long C = param.Rank >= 3 ? param.Sizes[2] : 1;
-                const long sub_expert_elems = D * C;
-
-                for (int e = expert_start; e < expert_end; ++e) {
-                    const int local_e = e - expert_start;
-                    const std::size_t base_offset = static_cast<std::size_t>(local_e) * fused_rows * C * elem_size;
-
-                    // Load up_proj into first D rows
-                    std::string up_hf = internal::format_hf_name(up_pattern, layer_idx, e);
-                    const auto& up_entry = reader.find_entry(up_hf);
-                    if (up_entry.shape().empty()) {
-                        throw std::runtime_error("DSL model: stack_experts missing up_proj " + up_hf);
-                    }
-                    Tensor up_slice = param;
-                    up_slice.Rank = 2;
-                    up_slice.Sizes[0] = D;
-                    up_slice.Sizes[1] = C;
-                    up_slice.Data = param.Data + base_offset;
-                    up_entry.read_tensor(up_slice, allow_cast);
-
-                    // Load gate_proj into second D rows
-                    std::string gate_hf = internal::format_hf_name(gate_pattern, layer_idx, e);
-                    const auto& gate_entry = reader.find_entry(gate_hf);
-                    if (gate_entry.shape().empty()) {
-                        throw std::runtime_error("DSL model: stack_experts missing gate_proj " + gate_hf);
-                    }
-                    Tensor gate_slice = param;
-                    gate_slice.Rank = 2;
-                    gate_slice.Sizes[0] = D;
-                    gate_slice.Sizes[1] = C;
-                    gate_slice.Data = param.Data + base_offset + sub_expert_elems * elem_size;
-                    gate_entry.read_tensor(gate_slice, allow_cast);
-
-                    // Merge adapter delta for this expert (stacked LoRA)
-                    if (adapter_merger) {
-                        Tensor expert_view = param;
-                        expert_view.Rank = 2;
-                        expert_view.Sizes[0] = fused_rows;
-                        expert_view.Sizes[1] = C;
-                        expert_view.Data = param.Data + base_offset;
-                        adapter_merger->apply_expert(name, e, expert_view, adapter_stream);
-                    }
-                }
-            } else {
-                // Load single tensor (e.g., down_proj) for each expert
-                for (int e = expert_start; e < expert_end; ++e) {
-                    const int local_e = e - expert_start;
-                    std::string hf_name = internal::format_hf_name(spec->source, layer_idx, e);
-                    const auto& entry = reader.find_entry(hf_name);
-                    if (entry.shape().empty()) {
-                        throw std::runtime_error("DSL model: stack_experts missing " + hf_name);
-                    }
-
-                    // Create slice for this expert
-                    Tensor slice = param;
-                    slice.Rank = param.Rank - 1;
-                    for (int d = 0; d < slice.Rank; ++d) {
-                        slice.Sizes[d] = param.Sizes[d + 1];
-                    }
-                    slice.Data = param.Data + static_cast<std::size_t>(local_e) * expert_size * elem_size;
-                    entry.read_tensor(slice, allow_cast);
-
-                    // Merge adapter delta for this expert (stacked LoRA)
-                    if (adapter_merger) {
-                        adapter_merger->apply_expert(name, e, slice, adapter_stream);
-                    }
-                }
-            }
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            continue;
-        }
-
-        throw std::runtime_error("DSL model: unsupported HF mapping for " + name);
     }
 
     // Completion pass: shared masters claimed by other ranks may still be mid-read
@@ -783,14 +307,11 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         fflush(stderr);
     }
 
-    for (const auto& tie : tied_params) {
-        if (mParams->is_external(tie.first) || mParams->is_external(tie.second)) {
-            continue;
-        }
-        Tensor& dst = mWeightManager ? mWeightManager->get_master(tie.first) : mParams->get(tie.first);
-        Tensor& src = mWeightManager ? mWeightManager->get_master(tie.second) : mParams->get(tie.second);
-        CUDA_CHECK(cudaMemcpy(dst.Data, src.Data, src.bytes(), cudaMemcpyDeviceToDevice));
-    }
+    loader.resolve_tied_params(
+        [&](const std::string& name) -> Tensor& {
+            return mWeightManager ? mWeightManager->get_master(name) : mParams->get(name);
+        },
+        [&](const std::string& name) { return mParams->is_external(name); });
 
     if (lora_enabled()) {
         mLoRAWeights->random_init(42, comm);

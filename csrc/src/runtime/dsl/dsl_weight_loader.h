@@ -14,7 +14,7 @@
 //   DslWeightLoader loader(reader, mapping, config, allocator, {shard_idx, num_shards});
 //   for (const auto& name : param_names) {
 //       Tensor& param = store.get(name);
-//       loader.load_param(name, param, is_sharded, &global_template, stream);
+//       loader.load_param(name, param, allow_cast, is_sharded, &global_template, stream);
 //   }
 //   loader.resolve_tied_params([&](const std::string& n) -> Tensor& { return store.get(n); });
 
@@ -57,6 +57,11 @@ struct MoEWeightConfig {
 /// Thread safety: NOT thread-safe. Use one loader per import operation.
 class DslWeightLoader {
 public:
+    /// Called after loading a StackExperts slice, with its global expert index.
+    /// The view is valid only during the callback. Any GPU work must use the
+    /// stream passed to load_param(), which is synchronized after the expert loop.
+    using ExpertLoadedCallback = std::function<void(int, Tensor&)>;
+
     /// Construct a weight loader.
     ///
     /// @param reader       SafeTensors reader (file already opened).
@@ -88,6 +93,7 @@ public:
     ///                         (provides global shape). nullptr if not sharded.
     /// @param stream        CUDA stream for async operations (Transform, StackExperts).
     ///                      nullptr uses the default stream.
+    /// @param on_expert_loaded  Optional post-load operation on each expert (e.g. adapter merge).
     ///
     /// @return true if the parameter was loaded (or deferred as TiedTo),
     ///         false if the mapping was optional and the HF tensor was not found.
@@ -98,7 +104,8 @@ public:
                     bool allow_cast,
                     bool param_sharded = false,
                     const Tensor* global_template = nullptr,
-                    cudaStream_t stream = nullptr);
+                    cudaStream_t stream = nullptr,
+                    const ExpertLoadedCallback& on_expert_loaded = {});
 
     /// Try loading a parameter from multiple mapping specs in order.
     ///
@@ -150,7 +157,10 @@ public:
     /// Copies data from source to destination for each TiedTo pair.
     ///
     /// @param get_tensor  Callback to retrieve a tensor by internal name.
-    void resolve_tied_params(const std::function<Tensor&(const std::string&)>& get_tensor);
+    /// @param skip_param  Optional predicate for parameters owned by another provider.
+    ///                    A pair is skipped if either its source or destination matches.
+    void resolve_tied_params(const std::function<Tensor&(const std::string&)>& get_tensor,
+                             const std::function<bool(const std::string&)>& skip_param = {});
 
     /// Get the list of deferred TiedTo pairs (dest, source).
     [[nodiscard]] const std::vector<std::pair<std::string, std::string>>& tied_params() const {
@@ -207,7 +217,8 @@ private:
                             int layer_idx,
                             bool allow_cast,
                             bool param_sharded,
-                            cudaStream_t stream);
+                            cudaStream_t stream,
+                            const ExpertLoadedCallback& on_expert_loaded = {});
 
     // ---- Private utilities ----
 
