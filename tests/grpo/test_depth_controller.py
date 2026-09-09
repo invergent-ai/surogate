@@ -160,7 +160,7 @@ class TestCapInjection:
         from surogate.grpo.orchestrator.scheduler import Scheduler
 
         stub = self._scheduler_stub(None)
-        example = {"task": "t", "info": {"a": 1}}
+        example = {"info": {"env_id": "t", "a": 1}}
         assert Scheduler._example_with_depth_cap(stub, example) is example
 
     def test_cap_lands_in_info_without_mutating_the_source(self):
@@ -168,7 +168,7 @@ class TestCapInjection:
         from surogate.grpo.orchestrator.scheduler import Scheduler
 
         stub = self._scheduler_stub(6)
-        example = {"task": "t", "info": {"a": 1}}
+        example = {"info": {"env_id": "t", "a": 1}}
         out = Scheduler._example_with_depth_cap(stub, example)
 
         assert out["info"][ROLLOUT_DEPTH_CAP_KEY] == 6
@@ -180,7 +180,7 @@ class TestCapInjection:
         from surogate.grpo.orchestrator.scheduler import Scheduler
 
         stub = self._scheduler_stub(3)
-        out = Scheduler._example_with_depth_cap(stub, {"task": "t"})
+        out = Scheduler._example_with_depth_cap(stub, {"prompt": "hi"})
         assert out["info"][ROLLOUT_DEPTH_CAP_KEY] == 3
 
 

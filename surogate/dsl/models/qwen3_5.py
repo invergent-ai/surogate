@@ -95,14 +95,20 @@ def capture_vision_geometry(vision_config: dict | bool | None) -> dict[str, int]
 #: embedding, a position table, `vision_layers` encoder blocks and a merger that
 #: projects into the text width. Formats are left to the export profile except the
 #: norms and biases, which are never quantised.
+#:
+#: The weights are `profiled` rather than `quantised` because the profile may leave
+#: them whole: the tower's default is the checkpoint's own BF16, and `--vision-storage
+#: quantized` is the narrowing. A tower is a small part of a VL model's bytes and the
+#: whole of what it sees, so the width it is stored at is the export's decision to
+#: make, not one the model settles in advance.
 QWEN3_5_VISION_SERVE_SECTION_OBJECTS: tuple[ServeObject, ...] = (
-    ServeObject("attention/qkv", "quantised", ("VisionQkvRows", "VisionHidden")),
+    ServeObject("attention/qkv", "profiled", ("VisionQkvRows", "VisionHidden")),
     ServeObject("attention/qkv_bias", "bf16", ("VisionQkvRows",)),
-    ServeObject("attention/output", "quantised", ("VisionHidden", "VisionHidden")),
+    ServeObject("attention/output", "profiled", ("VisionHidden", "VisionHidden")),
     ServeObject("attention/output_bias", "bf16", ("VisionHidden",)),
-    ServeObject("mlp/fc1", "quantised", ("VisionIntermediate", "VisionHidden")),
+    ServeObject("mlp/fc1", "profiled", ("VisionIntermediate", "VisionHidden")),
     ServeObject("mlp/fc1_bias", "bf16", ("VisionIntermediate",)),
-    ServeObject("mlp/fc2", "quantised", ("VisionHidden", "VisionIntermediate")),
+    ServeObject("mlp/fc2", "profiled", ("VisionHidden", "VisionIntermediate")),
     ServeObject("mlp/fc2_bias", "bf16", ("VisionHidden",)),
     ServeObject("norm1/weight", "bf16", ("VisionHidden",)),
     ServeObject("norm1/bias", "bf16", ("VisionHidden",)),
@@ -111,7 +117,7 @@ QWEN3_5_VISION_SERVE_SECTION_OBJECTS: tuple[ServeObject, ...] = (
 )
 
 QWEN3_5_VISION_HEAD_OBJECTS: tuple[ServeObject, ...] = (
-    ServeObject("vision/patch_embedding", "quantised", ("VisionHidden", "VisionPatchRows"),
+    ServeObject("vision/patch_embedding", "profiled", ("VisionHidden", "VisionPatchRows"),
                 scope="model", capability="vision"),
     ServeObject("vision/patch_embedding_bias", "bf16", ("VisionHidden",), scope="model",
                 capability="vision"),
@@ -121,11 +127,11 @@ QWEN3_5_VISION_HEAD_OBJECTS: tuple[ServeObject, ...] = (
 )
 
 QWEN3_5_VISION_MERGER_OBJECTS: tuple[ServeObject, ...] = (
-    ServeObject("vision/merger/fc1", "quantised", ("VisionMergerHidden", "VisionMergerHidden"),
+    ServeObject("vision/merger/fc1", "profiled", ("VisionMergerHidden", "VisionMergerHidden"),
                 scope="model", capability="vision"),
     ServeObject("vision/merger/fc1_bias", "bf16", ("VisionMergerHidden",), scope="model",
                 capability="vision"),
-    ServeObject("vision/merger/fc2", "quantised", ("C", "VisionMergerHidden"),
+    ServeObject("vision/merger/fc2", "profiled", ("C", "VisionMergerHidden"),
                 scope="model", capability="vision"),
     ServeObject("vision/merger/fc2_bias", "bf16", ("C",), scope="model", capability="vision"),
     ServeObject("vision/merger/norm/weight", "bf16", ("VisionHidden",), scope="model",

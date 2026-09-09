@@ -82,10 +82,16 @@ def _format_name(fmt: str, module) -> str:
 def formats_agree(declared: str, committed: str, module) -> bool:
     """A declared `quantised` accepts whatever width the export profile picked —
     the 35B stores routed experts Q4 and their down projections Q5 where the 0.8B
-    stores both W8. What the declaration pins is that a norm is *never* quantised."""
+    stores both W8. What the declaration pins is that a norm is *never* quantised.
+
+    `profiled` widens that to include BF16, and pins only that the object is a weight:
+    the vision tower's default profile stores it whole, and `--vision-storage quantized`
+    narrows it, so neither width is the declaration's to fix."""
 
     if declared == "quantised":
         return committed not in (module.BF16, module.FP32, module.I32)
+    if declared == "profiled":
+        return committed not in (module.FP32, module.I32)
     return _format_name(declared, module) == committed
 
 

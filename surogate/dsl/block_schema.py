@@ -31,7 +31,11 @@ RoutingKind = Literal[
 #: stores all three W8. The declaration fixes only what the *model* fixes: a norm
 #: is never quantised, a weight may be. This is the same distinction `quantizable`
 #: already draws on parameters.
-ServeFormat = Literal["quantised", "w8", "bf16", "fp32", "i32", "raw"]
+#: `profiled` is the same deferral one step wider: the profile chooses, and storing
+#: the weight whole is among its choices. The vision tower is the case — it ships as
+#: the checkpoint holds it and narrows only when asked — so `quantised`, which
+#: promises the width is *below* BF16, would be a promise the model does not make.
+ServeFormat = Literal["quantised", "profiled", "w8", "bf16", "fp32", "i32", "raw"]
 
 
 @dataclass(frozen=True)
