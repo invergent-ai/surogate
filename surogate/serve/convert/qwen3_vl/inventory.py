@@ -8,6 +8,7 @@ from surogate.serve.convert.common import declaration
 from surogate.serve.convert.common.checkpoint import positive_int, dense_geometry
 from surogate.serve.convert.common.inventory import (
     RESOURCE_SPECS, BF16, W8, tensor_spec, build_vision_specs,
+    VISION_BF16, VISION_STORAGE,
 )
 from surogate.serve.convert.common.qwen3_5 import vision_geometry_block, vision_tower
 from surogate.serve.convert.qwen3.inventory import Geometry as TextGeometry
@@ -95,15 +96,18 @@ def merger_tensors(g):
                    f"model.visual.deepstack_merger_list.{index}.{source}", shape, fmt)
 
 
-def build_tensor_specs(g):
+def build_tensor_specs(g, *, vision_storage: str = VISION_BF16):
     text = tuple(tensor_spec(o.name, o.shape, {"quantised": W8, "bf16": BF16}[o.format])
                  for o in g.declared.objects(capabilities={"text"}))
-    # Keep intermediate visual features at the same weight precision as the text stack.
+    # The tower as the checkpoint ships it by default. Asked for the smaller one, this family
+    # takes eight bits across the whole tower rather than the shared four/five/six -- it keeps
+    # intermediate visual features at the text stack's precision, which is why the remap is
+    # here and not in the shared inventory.
     vision = tuple(tensor_spec(s.name, s.shape, BF16 if s.format == BF16 else W8)
-                   for s in build_vision_specs(g.hidden, **vision_tower(g)))
+                   for s in build_vision_specs(g.hidden, storage=vision_storage, **vision_tower(g)))
     return (*text, *vision,
             *(tensor_spec(name, shape, fmt) for name, _, shape, fmt in merger_tensors(g)))
 
 
-def build_object_specs(g):
-    return (*build_tensor_specs(g), *RESOURCE_SPECS)
+def build_object_specs(g, *, vision_storage: str = VISION_BF16):
+    return (*build_tensor_specs(g, vision_storage=vision_storage), *RESOURCE_SPECS)

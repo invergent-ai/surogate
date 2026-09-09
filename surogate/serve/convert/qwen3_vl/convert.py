@@ -16,14 +16,14 @@ from . import inventory, recipe
 validate_config = inventory.geometry_from_config
 
 
-def convert(model_dir, out_path, *, device="cuda"):
+def convert(model_dir, out_path, *, device="cuda", vision_storage=inventory.VISION_BF16):
     started = time.perf_counter()
     model, output = Path(model_dir), Path(out_path)
     device = pick_device(device)
     config = conversion.load_json(model / "config.json")
     geometry = validate_config(config)
     conversion.honour_declared_scope(config, geometry, model, what=conversion.checkpoint_label(model))
-    tensors = inventory.build_tensor_specs(geometry)
+    tensors = inventory.build_tensor_specs(geometry, vision_storage=vision_storage)
     recipes = recipe.build_recipes(geometry)
     validate_recipe_coverage(recipes, tensors)
     source = recipe.preflight_sources(model, recipes)
@@ -36,7 +36,8 @@ def convert(model_dir, out_path, *, device="cuda"):
     if "frontend/preprocessor_config.json" not in resources:
         raise ValueError("Qwen3-VL requires preprocessor_config.json for its image processor")
     resources = {s.name: resources[s.name] for s in inventory.RESOURCE_SPECS if s.name in resources}
-    plan = conversion.build_object_plan(inventory.build_object_specs(geometry), resources)
+    plan = conversion.build_object_plan(
+        inventory.build_object_specs(geometry, vision_storage=vision_storage), resources)
     recipes = {r.object_name: r for r in recipes}
     identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture=inventory.TARGET_KEY)
     print(f"preflight complete: {len(plan.objects)} objects, {source.source_tensor_count} source tensors", flush=True)
@@ -74,8 +75,14 @@ def main(argv=None):
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--vision-storage", choices=inventory.VISION_STORAGE,
+                        default=inventory.VISION_BF16,
+                        help="How to store the vision tower. `bf16` is the weights the "
+                             "checkpoint ships, and the default. `quantized` is smaller and "
+                             "measurably further from the source tower.")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device)
+    convert(args.model, args.out, device=args.device,
+            vision_storage=args.vision_storage)
 
 
 if __name__ == "__main__":

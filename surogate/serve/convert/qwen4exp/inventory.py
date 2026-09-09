@@ -4,6 +4,8 @@ from surogate.serve.convert.common.inventory import (
     BF16, CONTIGUOUS_LAYOUT, FP32, GGML_BLOCKS_LAYOUT, I32, RESOURCE_SPECS,
     ROW_SPLIT_LAYOUT, ResourceSpec, StoredObjectSpec, TensorSpec, W8,
     build_vision_specs as _vision_specs,
+    VISION_BF16,
+    VISION_STORAGE,
 )
 from surogate.serve.convert.common.qwen3_5 import vision_tower
 from surogate.serve.convert.common.qwen4exp import Geometry, geometry_from_config, geometry_from_gguf
@@ -156,17 +158,18 @@ def ple_table_spec(g: Geometry) -> TensorSpec:
                       PLE_TABLE_FORMAT, GGML_BLOCKS_LAYOUT)
 
 
-def build_vision_specs(g: Geometry) -> tuple[TensorSpec, ...]:
+def build_vision_specs(g: Geometry, *, vision_storage: str = VISION_BF16) -> tuple[TensorSpec, ...]:
     tower = vision_tower(g)
-    return _vision_specs(g.hidden, **tower) if tower else ()
+    return _vision_specs(g.hidden, storage=vision_storage, **tower) if tower else ()
 
 
 def active_specs(*, geometry: Geometry, vision: bool | None = None,
-                 mtp: bool | None = None) -> tuple[tuple, tuple]:
+                 mtp: bool | None = None,
+                 vision_storage: str = VISION_BF16) -> tuple[tuple, tuple]:
     g = geometry
     tensors = build_text_core_specs(g)
     if vision is not False:
-        tensors += build_vision_specs(g)
+        tensors += build_vision_specs(g, vision_storage=vision_storage)
     if mtp is not False and g.mtp_layers:
         tensors += build_mtp_specs(g)
     leading = (ple_table_spec(g),) if g.ple_ngram else ()
