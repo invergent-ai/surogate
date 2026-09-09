@@ -28,6 +28,7 @@
 namespace nb = nanobind;
 void bind_shared_server(nb::module_& m);
 
+void bind_vision_encoder(nb::module_& m);
 namespace {
 
 const char* finish_reason_name(sinfer::FinishReason reason) {
@@ -150,6 +151,7 @@ private:
 
 NB_MODULE(_surogate_serve, m) {
     bind_shared_server(m);
+    bind_vision_encoder(m);
     m.doc() = "surogate serve engine (RTX inference; see csrc/src/serve)";
 
     nb::class_<PyEngine>(m, "Engine")

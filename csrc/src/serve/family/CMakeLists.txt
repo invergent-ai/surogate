@@ -18,7 +18,8 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/visual_scatter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/bindings.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/control.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/vision_tower.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/vision_tower.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/vision_standalone.cpp)
 
 target_include_directories(sinfer_engine PRIVATE
   ${SERVE_ROOT})
