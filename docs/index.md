@@ -1,129 +1,70 @@
-<div align="center" style="padding: 2rem">
-<p align="center">
-  <a href="https://surogate.ai/#gh-dark-mode-only">
-    <img
-      alt="Surogate"
-      width="40%"
-      src="https://github.com/invergent-ai/surogate/raw/main/assets/logo-white.svg#gh-dark-mode-only"
-    />
-  </a>
+# Table of Contents
 
-  <a href="https://surogate.ai/#gh-light-mode-only">
-    <img
-      alt="Surogate"
-      width="40%"
-      src="https://github.com/invergent-ai/surogate/raw/main/assets/logo-black.svg#gh-light-mode-only"
-    />
-  </a>
-</p>
-<h2>FP8/FP4 Training, Fine-tuning and RL at the speed of light</h2>
-<br/>
-<iframe src="https://ghbtns.com/github-btn.html?user=invergent-ai&repo=surogate&type=star&count=true&size=large" frameborder="0" scrolling="0" width="170" height="30" title="GitHub"></iframe>
-</div>
-
-## What is Surogate?
-
-Surogate is an extremely fast **production-grade LLM training framework** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and predictable multi-GPU/multi-Node scaling at scale.
-
-By combining a native **C++/CUDA execution engine**, a low-overhead [Python DSL](./about/dsl), an AOT-based [Auto Differentiantion engine](./about/automatic-differentiation.md) and a highly optimized **multi-threaded scheduler**, Surogate achieves industry-leading Speed-Of-Light (SOL) utilization on NVIDIA GPUs — **outperforming existing training toolkits by a wide margin**.
-
-
-## ✨ Highlights
-Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
-
-- **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
-- [**🎓 Knowledge Distillation**](./guides/distillation.md): offline top-K logit distillation — capture teacher logprobs once, then train the student with a fused CE + KL loss
-- [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning**](./guides/rl-training.md): advanced GRPO training and evaluation with custom, deterministic environments
-- [**🔧 RL Environments**](./guides/rl-environments.md): predictable environments for RL training
-- [**🖥️...🖥️ Native multi-GPU**](./guides/multi-gpu.md) training with the multi-threaded backend
-- [**🖥️...🖥️ Native multi-Node**](./guides/multi-node.md) DDP training with Ray
-- [**🧩 Dispatch Pipeline Parallelism**](./guides/dispatch-pp.md): train models whose weights don't fit on a single GPU on PCIe-only boxes (no NVLink/P2P) — streams the frozen base from CPU per stage, with FP8 weight streaming
-- **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
-- [**🔥 Python DSL**](./about/dsl.md) with AOT auto-differentiation for adding new model architectures
-- [**⚖️ Smart CPU Offloading**](./guides/offloading.md) for weights, gradients, activations, quants
-- **📜 Pre-built training recipes**:
-  - [**💎 BF16**](./guides/precision-and-recipes.md#bf16): Baseline recipe using `bfloat16` for all GEMMs, designed for maximum numerical accuracy. No quantization is applied.
-  - [**🔥 FP8**](./guides/precision-and-recipes.md#fp8-hybrid): Native `FP8` training delivering extreme performance with `E4M3` used for activations and weights and `E5M2` for gradients. Uses per-tensor delayed scaling to provide stable training.
-  - [**🔥 NVFP4**](./guides/precision-and-recipes.md#fp4-nvfp4): Native CUTLASS `FP4 E2M1` training with two-level block scaling for extreme performance and memory efficiency on Blackwell GPUs (**SM100+**: B200, B300, RTX 50xx series). Uses stochastic rounding and random Hadamard Transforms for numerical stability. **Supports NVIDIA B200, B300, RTX 5070, 5080, 5090 !!**
-- [**⚡ BnB/FP8/NVFP4 QLoRA**](./guides/qlora.md) Support for a variety of QLoRA configurations, including online quantization (FP8, NVFP4, BnB) or loading pre-quantized weights (FP8, NVFP4)
-- [**👌 Optimizers**](./guides/optimizers.md): AdamW 8bit, !! NorMuon !!
-- **🖥️ Runs on all NVIDIA GPUs**: sm80, sm86, sm89, sm90, sm100, sm103, sm120, sm121
-- [**🧪 Mixed-precision training**](./guides/precision-and-recipes.md#mixed-precision-training): Mix different dtypes for GEMMs, model, gradients and LoRA recipes to create your own flavor.
-- [**🧬 Adaptive Training**](./about/adaptive-training.md): built-in automated training monitoring with automatic phase detection, multi-criteria early stopping (convergence, compute-efficiency, divergence, plateau), auto LR management, MoE imbalance detection, Chinchilla token budgeting and dynamic epoch adjustment
-- [**🎨 Dedicated MoE Features**](./guides/moe.md): Expert Parallelism, Least-Loaded EP load-balancing, MoE training metrics, Imbalance detection
-- **🥞 Stacked LoRA training**: Train a LoRA adapter on top of another LoRA adapter to skip offline merging into base model.
-- **🛡️ Designed for reliability**: deterministic configs, explicit recipes, and a clear C++ core
-
-
-## 🧠 Supported Models:
-We support the following models. Please create a PR if you need a specific model
-
-| Model              | Architecture                                            | Model Sizes                   |
-| ------------------ | ------------------------------------------------------- | ----------------------------- |
-| Qwen3              | Qwen3ForCausalLM                                        | 0.6B, 1.7B, 4B, 8B, 14B, 35B  |
-| Qwen3VL            | Qwen3VLForConditionalGeneration                         | 2B, 4B, 8B, 32B               |
-| Qwen3 MoE          | Qwen3MoeForCausalLM                                     | 30B-A3B, 235B-A22B            |
-| Qwen3.5            | Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration     | 0.8B, 2B 4B, 9B, 27B          |
-| Qwen3.5 Moe        | Qwen3MoeForCausalLM, Qwen3_5MoeForConditionalGeneration | 35B-A3B, 122B-A10B, 397B-A17B |
-| Nemotron Nano v3   | NemotronHForCausalLM                                    | 30B-A3B                       |
-| Nemotron Super v3  | NemotronHForCausalLM                                    | 120B-A12B                     |
-| Nemotron Cascade 2 | NemotronHForCausalLM                                    | 30B-A3B                       |
-| GPT-OSS            | GptOssForCausalLM                                       | 20B, 120B                     |
-| Llama 3.1          | LlamaForCausalLM                                        | 8B, 70B, 405B                     |
-| Llama 3.2          | LlamaForCausalLM                                        | 1B, 3B                      |
-| MiniCPM5           | LlamaForCausalLM                                        | 1B, 2B                      |
-| Spark-X2.5         | Spark2_5ForCausalLM                                     | 1.7B, 4B                    |
-
-
-## Quickstart
-
-### Option A: Run using Docker (recommended)
-Surogate provides 3 docker images for various CUDA versions. Currently only the `x86-64` architecture is supported.
-
-| CUDA   | Image                                        | Recommended NVIDIA Driver | Minimum NVIDIA Driver |
-| ------ | -------------------------------------------- | ------------------------- | --------------------- |
-| 12.8.1 | `ghcr.io/invergent-ai/surogate:latest-cu128` | `>= 570.124.06`           | `>= 525`              |
-| 12.9.1 | `ghcr.io/invergent-ai/surogate:latest-cu129` | `>= 575.57.08`            | `>= 525`              |
-| 13.1   | `ghcr.io/invergent-ai/surogate:latest-cu130` | `>= 590.48.01`            | `>= 580`              |
-
-```bash
-docker run --gpus=all -v /my/local/config.yaml:/home/surogate/config.yaml -v /my/local/output_dir:<OUTPUT_DIR_FROM_CONFIG_YAML> <IMAGE> sft config.yaml
-```
-
-### Option B: Install via script
-```bash
-curl -LsSf https://surogate.ai/install.sh | sh
-```
-
-Follow these guides to run your first training:
+## Getting Started
 
 - [Installation](getting-started/installation.md)
-- [Training modes: Pretraining vs Full Fine-Tuning vs LoRA](getting-started/training-modes.md)
-- [Quickstart: SFT](getting-started/quickstart-sft.md)
-- [Quickstart: Pre-training](getting-started/quickstart-pretraining.md)
-- [Quickstart: GRPO](getting-started/quickstart-grpo.md)
-- [Quickstart: DPO](getting-started/quickstart-dpo.md)
+- [Training Modes](getting-started/training-modes.md)
+- [Quickstart: Supervised Fine-Tuning (SFT)](getting-started/quickstart-sft.md)
+- [Quickstart: Pretraining (PT)](getting-started/quickstart-pretraining.md)
+- [Quickstart: RL Training (GRPO)](getting-started/quickstart-grpo.md)
+- [Quickstart: Preference Fine-Tuning (DPO)](getting-started/quickstart-dpo.md)
 
-## Hardware / Requirements
+## User Guides
 
-- NVIDIA GPU + recent driver
-- CUDA **12.8, 12.9, 13**, NCCL, cuDNN
-- Linux x86_64
+- [Configuration](guides/configuration.md)
+- [Datasets](guides/datasets.md)
+- [Precision & Recipes](guides/precision-and-recipes.md)
+- [Quantized LoRA (QLoRA)](guides/qlora.md)
+- [Optimizers](guides/optimizers.md)
+- [Memory](guides/memory.md)
+- [Offloading](guides/offloading.md)
+- [Performance](guides/performance.md)
+- [Multi-GPU Training](guides/multi-gpu.md)
+- [Multi-Node Training](guides/multi-node.md)
+- [Dispatch Pipeline Parallelism](guides/dispatch-pp.md)
+- [Long Context Training](guides/long-context.md)
+- [Mixture-of-Experts (MoE) Models](guides/moe.md)
+- [Fine-tuning MiniCPM5 and Spark-X2.5](guides/minicpm5-spark.md)
+- [Knowledge Distillation](guides/distillation.md)
+- [RL Training (GRPO)](guides/rl-training.md)
+- [RL Environments](guides/rl-environments.md)
+- [Single-GPU GRPO](guides/rl-colocate.md)
+- [Training Metrics & Monitoring](guides/metrics.md)
+- [Debugging Training Issues](guides/debugging.md)
 
-### Supported NVIDIA GPUs:
-- `SM80`: A100, A30
-- `SM86`: A2, A16, A10, A40, RTX3050, RTX3060, RTX 3070, RTX 3080, RTX 3090, A2000, A3000, A4000, A5000, A6000
-- `SM89`: L4, L40, L40S, RTX 4050, RTX 4060, RTX 4070, RTX 4080, RTX 4090, RTX 2000 Ada, RTX 4000 SFF Ada, RTX 4000 Ada, RTX 4500 Ada, RTX 5000 Ada, RTX 6000 Ada
-- `SM90`: H100, H200, GH200
-- `SM100`: B200, GB200
-- `SM103`: B300, GB300
-- `SM120`: RTX PRO 6000/5000/4000/2500/2000 Blackwell,  RTX 5050,  RTX 5060,  RTX 5070,  RTX 5080,  RTX 5090
-- `SM121`: DGX Spark
+## Inference & Serving
 
-## Learn More
+- [Overview](inference/index.md)
+- [Serving Models](inference/serving-models.md)
+- [Inference CLI](inference/cli.md)
+- [OpenAI-compatible API](inference/api.md)
 
-- **[How Surogate Works](about/how-it-works.md)**: Deep dive into the C++/CUDA engine and multi-threaded scheduler.
-- **[Inference & Serving](inference/index.md)**: The serving engine, supported quantizations, and the OpenAI-compatible API.
-- **[Examples Library](examples/index.md)**: Pre-built configurations for Qwen, Llama, and MoE models.
-- **[User Guides](guides/configuration.md)**: Advanced documentation on precision, memory, scaling, and more.
-- **[Technical Reference](reference/config.md)**: Comprehensive CLI and API reference.
+## Examples
+
+- [Examples Library](examples/index.md)
+- [Qwen 3 Pre-training (PT)](examples/pt/qwen3.md)
+- [Qwen 3 LoRA Fine-Tuning (SFT)](examples/sft/qwen3-lora.md)
+- [Qwen 3 QLoRA Fine-Tuning](examples/sft/qwen3-qlora.md)
+- [Qwen 3 MoE Fine-Tuning](examples/sft/qwen3moe-lora.md)
+- [GRPO: Teach a Model to Reverse the Prompt](examples/grpo/grpo.md)
+
+## Technical Reference
+
+- [Configuration Reference](reference/config.md)
+- [CLI Reference](reference/cli.md)
+- [Python API](reference/python-api.md)
+- [Benchmarks](reference/benchmarks.md)
+
+## About
+
+- [How Surogate Works](about/how-it-works.md)
+- [Python DSL](about/dsl.md)
+- [Automatic Differentiation](about/automatic-differentiation.md)
+- [Adaptive Training](about/adaptive-training.md)
+
+## Appendix
+
+- [Compatibility](appendix/compatibility.md)
+- [FAQ](appendix/faq.md)
+- [Glossary](appendix/glossary.md)
+- [Release Notes](appendix/release-notes.md)
