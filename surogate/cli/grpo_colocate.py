@@ -1,8 +1,7 @@
 """CLI entry point for co-locate GRPO: `surogate grpo-colocate --train t.yaml --infer i.yaml --orch o.yaml`
 
-Native serving and training alternate on one GPU with shared BF16 Qwen3 weights.
-Select backend: vllm in the inference config for the CUDA IPC quantized path.
-For disjoint-GPU mode, see `surogate grpo`.
+Native serving and training alternate on one GPU with one resident copy of the base
+weights, shared between the two. For disjoint-GPU mode, see `surogate grpo`.
 """
 
 import argparse
@@ -27,17 +26,13 @@ if __name__ == "__main__":
     args = prepare_command_parser().parse_args(sys.argv[1:])
 
     from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
-    from surogate.core.config.grpo_orch_config import ColocateWeightBroadcastConfig, GRPOOrchestratorConfig
+    from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
     from surogate.core.config.loader import load_config
     from surogate.grpo.config import GRPOTrainConfig
-    from surogate.grpo.colocate import grpo_colocate
+    from surogate.grpo.native_colocate import grpo_native_colocate
 
     train_config = load_config(GRPOTrainConfig, args.train)
     infer_config = load_config(GRPOInferenceConfig, args.infer)
     orch_config = load_config(GRPOOrchestratorConfig, args.orch)
 
-    train_config.weight_broadcast_type = "colocate"
-    infer_config.weight_broadcast_type = "colocate"
-    orch_config.weight_broadcast = ColocateWeightBroadcastConfig({"type": "colocate"})
-
-    grpo_colocate(train_config, infer_config, orch_config)
+    grpo_native_colocate(train_config, infer_config, orch_config)

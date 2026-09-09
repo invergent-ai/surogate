@@ -79,12 +79,12 @@ export const TIPS: Tip[] = [
   { t: "omit router_*_loss_coef to keep the model's tuned defaults", tags: ["moe"] },
   { t: "MoE needs varied data to keep all experts active — avoid narrow corpora", tags: ["moe"] },
   // ---- grpo / rl ----
-  { t: "GRPO split-GPU: trainer + vLLM on disjoint GPUs (must not overlap)", tags: ["grpo"] },
-  { t: "co-locate mode shares GPUs via CUDA IPC when you can't split them", tags: ["grpo"] },
-  { t: "vLLM hot-reloads LoRA from broadcasts/step_N once the STABLE marker lands", tags: ["grpo"] },
+  { t: "GRPO split-GPU: trainer + inference server on disjoint GPUs (must not overlap)", tags: ["grpo"] },
+  { t: "co-locate mode shares one resident copy of the base weights when you can't split GPUs", tags: ["grpo"] },
+  { t: "the server hot-loads LoRA from broadcasts/step_N once the STABLE marker lands", tags: ["grpo"] },
   { t: "raise max_async_level to 2 when weight broadcast latency is high (network)", tags: ["grpo"] },
   { t: "GRPO reward stuck? check the environment + that rollouts vary", tags: ["grpo", "plateau"] },
-  { t: "RULER judge runs a 2nd vLLM — give it its own --judge-gpus", tags: ["grpo"] },
+  { t: "RULER judge runs a 2nd server — give it its own --judge-gpus", tags: ["grpo"] },
   // ---- long context ----
   { t: "seq ≥ 8K? enable long_context (tiled MLP) — trades ~5–10% speed for memory", tags: ["longseq"] },
   { t: "long_context disables CUDA graphs (varying seq len) — works with packing", tags: ["longseq"] },

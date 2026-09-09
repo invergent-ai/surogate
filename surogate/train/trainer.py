@@ -30,7 +30,7 @@ from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, lo
 from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
-from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_lora_compat
+from surogate.utils.lora_compat import ensure_surogate_lora_compat
 from surogate.utils.model import estimate_model_parameters
 from surogate.utils.tensor import to_surogate_dtype
 
@@ -815,7 +815,6 @@ class SurogateTrainerWrapper:
                 logger.info(f"Saving LoRA adapter to {adapter_dir}...")
                 adapter_dir.mkdir(parents=True, exist_ok=True)
                 self.trainer.export_adapter(str(adapter_dir))
-                ensure_vllm_lora_compat(adapter_dir, self.config.model_dir)
                 logger.info("done")
                 logger.info(f"LoRA adapter saved to {adapter_dir}")
 

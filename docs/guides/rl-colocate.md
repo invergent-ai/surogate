@@ -120,5 +120,4 @@ contain readiness markers only.
 
 Quantized checkpoints, QLoRA, full fine-tuning, image/video prompts,
 Nemotron, multiple GPUs, CPU weight offload, QeRL weight noise, and
-checkpoint resume are not yet supported by native co-locate mode. Use the existing split-GPU runner or
-`backend: vllm` where appropriate.
+checkpoint resume are not yet supported by native co-locate mode. Use the split-GPU runner for those.

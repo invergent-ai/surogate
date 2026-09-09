@@ -113,11 +113,7 @@ cache-keys = [
 override-dependencies = [
     "triton",
     "torch",
-    "vllm",
 ]
-
-[project.entry-points."vllm.general_plugins"]
-surogate = "surogate.grpo.inference.patches:transformers_v5_compat"
 
 # ────────── Python formatter / linter ──────────
 # Aligned with .clang-format for LLM/agent ergonomics: stable line boundaries,

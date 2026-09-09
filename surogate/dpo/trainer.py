@@ -42,7 +42,7 @@ from surogate.dpo.data import tokenize_preference_pairs
 from surogate.train.lr_schedule import LRSchedule
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
-from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_lora_compat
+from surogate.utils.lora_compat import ensure_surogate_lora_compat
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
@@ -395,6 +395,5 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
         adapter_dir = out / "final_adapter"
         adapter_dir.mkdir(parents=True, exist_ok=True)
         trainer.export_adapter(str(adapter_dir))
-        ensure_vllm_lora_compat(adapter_dir, config.model_dir)
         logger.info(f"Final LoRA adapter saved to {adapter_dir}")
     logger.info("DPO training complete.")

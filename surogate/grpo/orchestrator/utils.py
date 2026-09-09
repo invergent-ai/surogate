@@ -38,8 +38,7 @@ async def get_semaphore() -> AsyncContextManager:
 
 
 def get_sampling_args(sampling_config: GRPOSamplingConfig, temperature: float) -> dict:
-    # Convert SamplingConfig to vLLM OAI sampling args
-    # https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#extra-parameters_2
+    # Convert SamplingConfig to the OpenAI-compatible sampling args the server accepts
     sampling_args = dict(sampling_config.__dict__)
     sampling_args.pop("temp_scheduler", None)
     sampling_args["temperature"] = temperature
@@ -190,8 +189,7 @@ def get_weight_dir(output_dir: Path, step: int, check_exists: bool = True, wait_
         output_dir: The output directory for the run.
         step: The checkpoint step.
         check_exists: If True, raises FileNotFoundError if no weight directory exists.
-            If False, returns the broadcast directory path without checking existence
-            (useful for NCCL mode where weights are broadcasted, not stored on disk).
+            If False, returns the broadcast directory path without checking existence.
         wait_timeout: Maximum time in seconds to wait for a stable directory to appear.
             If None, no waiting is performed.
     """

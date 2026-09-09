@@ -21,7 +21,7 @@ export const STATUS_VERBS = [
   "Wiring up the feed",
   "Stretching the adapters",
   "Allocating VRAM",
-  "Booting vLLM",
+  "Booting the server",
   "Building the KV cache",
   "Casting to NVFP4",
   "Pinning host memory",

@@ -159,7 +159,6 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
     orch_config.strict_async_level = True
     # The native runner owns publication; the trainer's default broadcaster is
     # replaced before train() and never exports step adapters.
-    train_config.weight_broadcast_type = "filesystem"
     Path(orch_config.output_dir).mkdir(parents=True, exist_ok=True)
     context = infer_config.max_model_len or train_config.sequence_len
     concurrency = infer_config.max_num_seqs or min(16, orch_config.batch_size or 16)

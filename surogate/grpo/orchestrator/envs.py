@@ -7,22 +7,16 @@ if TYPE_CHECKING:
     # ruff: noqa
     from surogate.grpo.utils.envs import *
 
-    # vLLM
-    VLLM_CONFIGURE_LOGGING: int
-
     # tqdm
     TQDM_DISABLE: int
 
 
 _ORCHESTRATOR_ENV_PARSERS = {
-    "VLLM_CONFIGURE_LOGGING": int,
     "TQDM_DISABLE": int,
     **_BASE_ENV_PARSERS,
 }
 
-_ORCHESTRATOR_ENV_DEFAULTS = {
-    "VLLM_CONFIGURE_LOGGING": "0",
-}
+_ORCHESTRATOR_ENV_DEFAULTS: dict[str, str] = {}
 
 set_defaults(_ORCHESTRATOR_ENV_DEFAULTS)
 

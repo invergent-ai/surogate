@@ -68,7 +68,7 @@ export function runControllable(feedPath: string): boolean {
 }
 
 /** Signal a launched run's whole process group (it was spawned `detached`, so
- *  children — vLLM, workers — get the signal too). Falls back to the single pid. */
+ *  children — the server, workers — get the signal too). Falls back to the single pid. */
 export function signalRun(feedPath: string, signal: NodeJS.Signals): boolean {
   const p = readRunPid(feedPath);
   if (p === null || !isOurRun(p)) return false; // never signal a stale/recycled PID

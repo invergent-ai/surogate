@@ -131,10 +131,10 @@ in a single command. On two or more GPUs, assign each side its own:
 
 ```bash
 surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml \
-    --vllm-gpus 0 --trainer-gpus 1
+    --infer-gpus 0 --trainer-gpus 1
 ```
 
-On a single GPU, co-locate them instead (they share base weights via CUDA IPC):
+On a single GPU, co-locate them instead (they share one resident copy of the base weights):
 
 ```bash
 surogate grpo-colocate --train train.yaml --infer infer.yaml --orch orch.yaml

@@ -12,7 +12,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
@@ -31,10 +30,6 @@ _NORM_WEIGHT_RE = re.compile(
     r"|backbone\.norm_f)"
     r"\.weight$"
 )
-
-# Sigma file written alongside LoRA adapter for vLLM worker to read.
-NOISE_SIGMA_FILENAME = "qerl_sigma.json"
-
 
 def compute_sigma(step: int, total_steps: int, config: NoiseSchedulerConfig) -> float:
     """Compute the noise sigma for the current step.
@@ -103,17 +98,6 @@ def inject_noise_into_safetensors(
         save_file(tensors, str(safetensors_path))
 
     return modified
-
-
-def write_noise_sigma(adapter_dir: Path, sigma: float) -> None:
-    """Write the noise sigma to a JSON file alongside the LoRA adapter.
-
-    The vLLM worker reads this file and applies noise in-place to the base
-    model's RMSNorm weights on GPU, matching the QeRL reference implementation.
-    """
-    sigma_file = adapter_dir / NOISE_SIGMA_FILENAME
-    with open(sigma_file, "w") as f:
-        json.dump({"sigma": sigma}, f)
 
 
 def inject_noise_model(model_dir: Path, sigma: float) -> int:

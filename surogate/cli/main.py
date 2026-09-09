@@ -105,13 +105,13 @@ def parse_args():
     # grpo command (split-GPU mode)
     from surogate.cli.grpo import prepare_command_parser as grpo_prepare_command_parser
 
-    grpo_prepare_command_parser(subparsers.add_parser("grpo", help="GRPO RL (vLLM and trainer on disjoint GPU sets)"))
+    grpo_prepare_command_parser(subparsers.add_parser("grpo", help="GRPO RL (inference server and trainer on disjoint GPU sets)"))
 
     # grpo-colocate command (shared-GPU mode)
     from surogate.cli.grpo_colocate import prepare_command_parser as grpo_colocate_prepare_command_parser
 
     grpo_colocate_prepare_command_parser(
-        subparsers.add_parser("grpo-colocate", help="GRPO RL (vLLM and trainer share GPUs via CUDA IPC)")
+        subparsers.add_parser("grpo-colocate", help="GRPO RL (serving and training share one GPU and one copy of the base weights)")
     )
 
     # grpo-infer command

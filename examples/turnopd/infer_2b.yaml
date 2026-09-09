@@ -3,5 +3,4 @@ model: "Qwen/Qwen3.5-2B"
 enable_lora: true
 max_lora_rank: 32
 max_model_len: 4096
-gpu_memory_utilization: 0.6
 port: 8009

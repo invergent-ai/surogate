@@ -1,8 +1,5 @@
-# Rollout server for the GRPO example.
-#
-# `backend` selects the engine. It defaults to "surogate" -- this repository's own
-# serving engine -- and "vllm" remains available for comparison. The engine reads a
-# HuggingFace directory or a GGUF and builds its artifact on first use, cached.
+# Rollout server for the GRPO example: this repository's own serving engine. It reads
+# a HuggingFace directory or a GGUF and builds its artifact on first use, cached.
 model: "Qwen/Qwen3-0.6B"
 enable_lora: true
 max_lora_rank: 32

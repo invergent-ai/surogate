@@ -82,7 +82,7 @@ def test_grpo_run_completes_and_trains(tmp_path):
     train, infer, orch = _write_configs(tmp_path)
     completed = subprocess.run(
         [str(_CLI), "grpo", "--train", str(train), "--infer", str(infer), "--orch", str(orch),
-         "--vllm-gpus", _GPUS[0], "--trainer-gpus", _GPUS[1]],
+         "--infer-gpus", _GPUS[0], "--trainer-gpus", _GPUS[1]],
         cwd=str(_ROOT), capture_output=True, text=True, timeout=2400,
     )
     log = completed.stdout + completed.stderr

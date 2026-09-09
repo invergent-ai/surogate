@@ -1,12 +1,13 @@
 """CLI entry point for split-GPU GRPO: `surogate grpo --train t.yaml --infer i.yaml --orch o.yaml \\
-       --vllm-gpus 0,1,2,3 --trainer-gpus 4,5,6,7`
+       --infer-gpus 0,1,2,3 --trainer-gpus 4,5,6,7`
 
-vLLM and the trainer occupy disjoint sets of GPUs. We set ``CUDA_VISIBLE_DEVICES`` for
-the trainer side BEFORE any torch import (in this module's ``__main__`` block) and
-launch vLLM as a subprocess with its own ``CUDA_VISIBLE_DEVICES``.
+The inference server and the trainer occupy disjoint sets of GPUs. We set
+``CUDA_VISIBLE_DEVICES`` for the trainer side BEFORE any CUDA-touching import (in this
+module's ``__main__`` block) and launch the server as a subprocess with its own
+``CUDA_VISIBLE_DEVICES``.
 
 For RULER training, also pass ``--judge-infer judge.yaml --judge-gpus 6,7`` to spawn
-a second vLLM serving the judge model alongside the rollout vLLM. The judge
+a second server serving the judge model alongside the rollout server. The judge
 runs in its own subprocess on its own GPU set; the orchestrator hits it over HTTP
 at the URL configured under ``orch.yaml`` ``ruler.judge.base_url``.
 
@@ -46,10 +47,10 @@ def prepare_command_parser(parser=None):
     parser.add_argument("--infer", type=str, required=True, help="Path to GRPO inference config YAML file")
     parser.add_argument("--orch", type=str, required=True, help="Path to GRPO orchestrator config YAML file")
     parser.add_argument(
-        "--vllm-gpus",
+        "--infer-gpus",
         type=_gpu_list,
         required=True,
-        help="Comma-separated GPU ids for vLLM (e.g. '0,1,2,3'). Count must equal infer.dp * infer.tp.",
+        help="Comma-separated GPU ids for the inference server (e.g. '0,1,2,3'). Count must equal infer.dp * infer.tp.",
     )
     parser.add_argument(
         "--trainer-gpus",
@@ -64,7 +65,7 @@ def prepare_command_parser(parser=None):
         help=(
             "Path to a GRPO inference config YAML for the RULER judge. When set together "
             "with --judge-gpus AND orch.yaml has ruler.enabled=true, surogate grpo spawns "
-            "a second vLLM subprocess serving the judge. Omit to point at an externally-running judge."
+            "a second server subprocess serving the judge. Omit to point at an externally-running judge."
         ),
     )
     parser.add_argument(
@@ -72,8 +73,8 @@ def prepare_command_parser(parser=None):
         type=_gpu_list,
         default=None,
         help=(
-            "Comma-separated GPU ids for the judge vLLM (e.g. '6,7'). Must be disjoint from "
-            "--vllm-gpus and --trainer-gpus. Count must equal judge_infer.dp * judge_infer.tp."
+            "Comma-separated GPU ids for the judge server (e.g. '6,7'). Must be disjoint from "
+            "--infer-gpus and --trainer-gpus. Count must equal judge_infer.dp * judge_infer.tp."
         ),
     )
     return parser
@@ -82,9 +83,9 @@ def prepare_command_parser(parser=None):
 if __name__ == "__main__":
     args = prepare_command_parser().parse_args(sys.argv[1:])
 
-    overlap = sorted(set(args.vllm_gpus) & set(args.trainer_gpus))
+    overlap = sorted(set(args.infer_gpus) & set(args.trainer_gpus))
     if overlap:
-        logger.error(f"--vllm-gpus and --trainer-gpus overlap on {overlap}")
+        logger.error(f"--infer-gpus and --trainer-gpus overlap on {overlap}")
         sys.exit(1)
 
     # --judge-infer and --judge-gpus are paired: both or neither. Catching here
@@ -97,16 +98,16 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    # Mask the parent process to the trainer GPUs BEFORE any torch import below.
-    # vLLM runs in a spawned subprocess that overrides CUDA_VISIBLE_DEVICES on its
-    # own; values are interpreted as driver-level GPU indices in both processes,
-    # so the parent's mask does not propagate to the child.
+    # Mask the parent process to the trainer GPUs BEFORE any CUDA-touching import
+    # below. The server runs in a spawned subprocess that overrides
+    # CUDA_VISIBLE_DEVICES on its own; values are interpreted as driver-level GPU
+    # indices in both processes, so the parent's mask does not propagate to the child.
     import os
 
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in args.trainer_gpus)
 
     from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
-    from surogate.core.config.grpo_orch_config import FileSystemWeightBroadcastConfig, GRPOOrchestratorConfig
+    from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
     from surogate.core.config.loader import load_config
     from surogate.grpo.config import GRPOTrainConfig
     from surogate.grpo.split import grpo_split
@@ -124,15 +125,11 @@ if __name__ == "__main__":
         train_config.ep_size = train_config.gpus
         train_config._validate_ep_config()
 
-    train_config.weight_broadcast_type = "filesystem"
-    infer_config.weight_broadcast_type = "filesystem"
-    orch_config.weight_broadcast = FileSystemWeightBroadcastConfig({"type": "filesystem"})
-
     grpo_split(
         train_config,
         infer_config,
         orch_config,
-        vllm_gpu_ids=args.vllm_gpus,
+        infer_gpu_ids=args.infer_gpus,
         trainer_gpu_ids=args.trainer_gpus,
         judge_infer_config=judge_infer_config,
         judge_gpu_ids=args.judge_gpus,

@@ -69,10 +69,7 @@ from surogate.grpo.orchestrator.vf_utils import (
     task_uses_group_scoring,
     wait_for_env_servers,
 )
-from surogate.grpo.utils.client import (
-    init_nccl_broadcast,
-    setup_inference_pool,
-)
+from surogate.grpo.utils.client import setup_inference_pool
 from surogate.rewards.ruler import JudgeClientPool, build_ruler_rubric
 from surogate.grpo.utils.logger import setup_logger
 from surogate.grpo.utils.monitor import setup_monitor
@@ -431,15 +428,7 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
         if ruler_judge_pool is not None:
             await ruler_judge_pool.wait_for_ready()
 
-        # Set up weight broadcast backend
-        logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
-        if config.weight_broadcast.type == "nccl":
-            await init_nccl_broadcast(
-                inference_pool.admin_clients,
-                config.weight_broadcast.host,
-                config.weight_broadcast.port,
-                config.weight_broadcast.timeout,
-            )
+        logger.info(f"Weight broadcast: {config.weight_broadcast}")
 
         # Setup training batch sender for sending training examples to trainer
         logger.info(f"Initializing training batch sender ({config.rollout_transport})")
@@ -466,8 +455,7 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
                 # Allow eval at resumed step by setting prev_ckpt_step one behind
                 prev_ckpt_step = scheduler.ckpt_step - 1
 
-            # In NCCL mode, skip existence check - weights are broadcasted, not stored on disk
-            check_exists = config.weight_broadcast.type != "nccl"
+            check_exists = True
             wait_timeout = config.ckpt.wait_for_weights_timeout if config.ckpt else None
             weights_path = get_weight_dir(
                 Path(config.output_dir), scheduler.ckpt_step, check_exists=check_exists, wait_timeout=wait_timeout

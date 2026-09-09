@@ -13,17 +13,17 @@ small env is enough to see every code path execute and to catch regressions.
 
 | File | Purpose |
 |---|---|
-| [`infer.yaml`](infer.yaml) | vLLM serving the *student* (Qwen3-0.6B) the trainer is updating. LoRA enabled. |
-| [`judge.yaml`](judge.yaml) | vLLM serving the *judge* (Qwen3-1.7B). Frozen weights, no LoRA, must support OpenAI structured outputs. |
+| [`infer.yaml`](infer.yaml) | The inference server for the *student* (Qwen3-0.6B) the trainer is updating. LoRA enabled. |
+| [`judge.yaml`](judge.yaml) | The inference server for the *judge* (Qwen3-1.7B). Frozen weights, no LoRA, must support OpenAI structured outputs. |
 | [`train.yaml`](train.yaml) | GRPO trainer config — LoRA + AdamW + bf16. |
 | [`orch.yaml`](orch.yaml) | Orchestrator config with `ruler.enabled: true`. |
 
 ## Prerequisites
 
 1. **4-GPU node** (RTX 5090 32GB or equivalent). The layout is:
-   - GPU 0 — rollout vLLM (student)
+   - GPU 0 — rollout server (student)
    - GPU 1 — trainer
-   - GPU 2 — judge vLLM
+   - GPU 2 — judge server
    - GPU 3 — spare
 2. **Environment installed**: `markdown-table-qa` is referenced in `orch.yaml`. If
    it isn't pip-installed yet:
@@ -36,7 +36,7 @@ small env is enough to see every code path execute and to catch regressions.
 
 ## Step 1 — start the entire pipeline with one command
 
-`surogate grpo` can spawn the rollout vLLM, the judge vLLM, and the trainer
+`surogate grpo` can spawn the rollout server, the judge server, and the trainer
 together when you pass `--judge-infer` and `--judge-gpus`. This is the
 production path — one process tree, single shutdown signal, watchdog watches
 all four components for unexpected death.
@@ -47,21 +47,21 @@ RULER_JUDGE_API_KEY=EMPTY surogate grpo \
     --infer       examples/ruler/infer.yaml \
     --orch        examples/ruler/orch.yaml \
     --judge-infer examples/ruler/judge.yaml \
-    --vllm-gpus   0 \
+    --infer-gpus  0 \
     --trainer-gpus 1 \
     --judge-gpus  2
 ```
 
 The runner enforces:
 
-- `--vllm-gpus`, `--trainer-gpus`, `--judge-gpus` are all pairwise disjoint.
+- `--infer-gpus`, `--trainer-gpus`, `--judge-gpus` are all pairwise disjoint.
 - Each GPU count matches the corresponding inference config's `dp * tp` (or `train.gpus`).
 - The judge port (in `judge.yaml`) differs from the rollout port (in `infer.yaml`).
 - `orch.yaml` has `ruler.enabled: true` (otherwise the judge would never be called).
 
 The `RULER_JUDGE_API_KEY` env var name is set in `orch.yaml`
 (`ruler.judge.api_key_var`); the value `EMPTY` is fine for an unauthenticated
-local vLLM. Use a real API key here if pointing the judge at a hosted endpoint.
+local server. Use a real API key here if pointing the judge at a hosted endpoint.
 
 ### Alternative: judge in a separate terminal
 
@@ -70,16 +70,16 @@ restart independently, or pointing at a hosted endpoint), omit the `--judge-*`
 flags and start the judge as a free-standing `grpo-infer`:
 
 ```bash
-# Terminal A — judge vLLM
+# Terminal A — judge server
 CUDA_VISIBLE_DEVICES=2 RULER_JUDGE_API_KEY=EMPTY \
     surogate grpo-infer examples/ruler/judge.yaml
 
-# Terminal B — rollout vLLM + trainer + orchestrator
+# Terminal B — rollout server + trainer + orchestrator
 RULER_JUDGE_API_KEY=EMPTY surogate grpo \
     --train examples/ruler/train.yaml \
     --infer examples/ruler/infer.yaml \
     --orch  examples/ruler/orch.yaml \
-    --vllm-gpus 0 --trainer-gpus 1
+    --infer-gpus 0 --trainer-gpus 1
 ```
 
 Sanity-check the standalone judge from another shell:
@@ -203,7 +203,7 @@ triggers two evaluations against the env's native rubric:
 2. **End-of-training final eval** — the trained adapter evaluated on the
    same 50 examples after the loop ends.
 
-Both share the same examples, the same sampling args, the same vLLM, and
+Both share the same examples, the same sampling args, the same server, and
 the same env. RULER does **not** participate in either — `task_uses_group_scoring`
 auto-detection only wraps train envs, not eval envs (see [grpo_orch.py:184-201](https://github.com/invergent-ai/surogate/blob/main/surogate/grpo/orchestrator/grpo_orch.py#L184-L201)).
 
@@ -308,7 +308,7 @@ eval:
   rollouts_per_example: 4
   interval: 25             # ~8 mid-training evals at ~10% wall-clock overhead
   eval_base_model: true
-  # cancel_inflight_rollouts_on_eval: true   # only if eval saturates the rollout vLLM
+  # cancel_inflight_rollouts_on_eval: true   # only if eval saturates the rollout server
 ```
 
 Cost guidance:
@@ -363,13 +363,11 @@ deferred-group-scoring path which is gated on it.
 RULER is fundamentally relative; a single rollout has no peers to compare
 against. Default `rollouts_per_example` in `orch.yaml` is 4.
 
-**Judge errors with `"json_schema is not supported"`** — your vLLM is too old
-for OpenAI structured outputs. Upgrade to ≥0.5.5 or pass
-`--guided-decoding-backend xgrammar` when starting the judge manually.
+**Judge errors with `"json_schema is not supported"`** — the judge endpoint does not
+implement OpenAI structured outputs; point `ruler.judge.base_url` at one that does.
 
-**Judge OOM** — Qwen3-1.7B at `max_model_len: 16384` and `gpu_memory_utilization:
-0.85` fits comfortably on a 32 GB card. On a 24 GB card, drop
-`max_model_len` to 8192 and `gpu_memory_utilization` to 0.7.
+**Judge OOM** — Qwen3-1.7B at `max_model_len: 16384` needs its KV cache to fit beside the
+weights. Lower `max_model_len` in `judge.yaml`, or give the judge a GPU of its own.
 
 **`ruler/judge_failure_rate > 0`** — judge is producing malformed JSON or
 timing out. Increase `ruler.request_timeout` and `ruler.max_retries_on_parse_error`,
@@ -388,7 +386,7 @@ the warning log it means the first attempt was wasted. Two ways to avoid it:
 `Application startup complete.` line in Terminal A before launching Terminal B.
 
 **Trainer hangs at "Waiting for inference pool to be ready"** — the rollout
-vLLM (port 8007) didn't come up. Check `outputs/ruler/logs/` for vLLM errors,
+The rollout server (port 8007) didn't come up. Check `outputs/ruler/logs/` for its errors,
 typically OOM or HF download failure.
 
 **Trainer keeps logging `Run run_default: No orchestrator config found at

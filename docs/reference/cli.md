@@ -38,43 +38,42 @@ Options:
 
 ### `grpo`
 
-GRPO RL training with vLLM and the trainer on **disjoint** GPU sets, communicating
+GRPO RL training with the inference server and the trainer on **disjoint** GPU sets, communicating
 over the filesystem.
 
 ```bash
 surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml \
-    --vllm-gpus 0,1 --trainer-gpus 2,3
+    --infer-gpus 0,1 --trainer-gpus 2,3
 ```
 
 Options:
 
 - `--train <path>`: required, trainer config YAML
-- `--infer <path>`: required, vLLM inference config YAML
+- `--infer <path>`: required, inference server config YAML
 - `--orch <path>`: required, orchestrator config YAML
-- `--vllm-gpus <ids>`: required, comma-separated GPU ids for vLLM. Count must equal `infer.dp * infer.tp`
+- `--infer-gpus <ids>`: required, comma-separated GPU ids for the inference server. Count must equal `infer.dp * infer.tp`
 - `--trainer-gpus <ids>`: required, comma-separated GPU ids for the trainer. Count must equal `train.gpus`, which
   therefore becomes optional in the YAML
 - `--judge-infer <path>`: optional, inference config for a RULER judge server. With `--judge-gpus` and
-  `ruler.enabled: true` in `orch.yaml`, a second vLLM subprocess is spawned for the judge
-- `--judge-gpus <ids>`: optional, GPU ids for the judge. Must be disjoint from `--vllm-gpus` and `--trainer-gpus`
+  `ruler.enabled: true` in `orch.yaml`, a second server subprocess is spawned for the judge
+- `--judge-gpus <ids>`: optional, GPU ids for the judge. Must be disjoint from `--infer-gpus` and `--trainer-gpus`
 
 ### `grpo-colocate`
 
-Same three configs, but vLLM and the trainer **share** GPUs and exchange base weights
-via zero-copy CUDA IPC. `gpu_memory_utilization` is computed automatically.
+Same three configs, but serving and training alternate on one GPU with a single
+resident copy of the base weights, shared between them.
 
 ```bash
 surogate grpo-colocate --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
 ```
 
 Options: `--train`, `--infer`, `--orch` (all required). No GPU-assignment flags — the
-components share every visible GPU.
+components share the visible GPU.
 
 ### `grpo-infer`
 
 Runs only the inference server. Use it for multi-node setups, or any case where each
-component should own its process. This is the server that exposes the weight-update and
-LoRA hot-load admin routes the trainer broadcasts into — a stock `vllm serve` does not.
+component should own its process. This is `surogate serve` with the LoRA hot-load admin routes the trainer broadcasts into.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 surogate grpo-infer infer.yaml

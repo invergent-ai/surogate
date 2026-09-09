@@ -1,9 +1,9 @@
 # GRPO orchestrator with RULER (LLM-as-judge) reward.
 #
 # Topology (4-GPU node):
-#   GPU 0 — rollout vLLM (Qwen3-0.6B, the student) at :8007  [examples/ruler/infer.yaml]
+#   GPU 0 — rollout server (Qwen3-0.6B, the student) at :8007  [examples/ruler/infer.yaml]
 #   GPU 1 — trainer (Qwen3-0.6B + LoRA + AdamW)              [examples/ruler/train.yaml]
-#   GPU 2 — judge vLLM (Qwen3-1.7B, frozen) at :8001         [examples/ruler/judge.yaml]
+#   GPU 2 — judge server (Qwen3-1.7B, frozen) at :8001         [examples/ruler/judge.yaml]
 #
 # The orchestrator wraps every train env's rubric in a vf.RubricGroup that adds
 # a group-level RULER reward; under mode=replace it bypasses the env's existing
@@ -22,7 +22,7 @@ model:
 env:
   - id: markdown-table-qa
 
-# Rollout sampling client: the *student* vLLM
+# Rollout sampling client: the *student* server
 client:
   base_url:
     - http://localhost:8007/v1

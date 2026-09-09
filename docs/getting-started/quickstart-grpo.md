@@ -1,13 +1,13 @@
 # Quickstart: RL Training (GRPO)
 
-This runs a GRPO reinforcement learning example. GRPO coordinates three components — an inference server (vLLM), an orchestrator (rollouts + rewards), and a Surogate trainer (policy gradient updates) — via a single command.
+This runs a GRPO reinforcement learning example. GRPO coordinates three components — Surogate's inference server, an orchestrator (rollouts + rewards), and a Surogate trainer (policy gradient updates) — via a single command.
 
 ## 1) Pick example configs
 
 Example configs are in `examples/grpo/`. GRPO uses three config files:
 
 - **`train.yaml`** — Trainer settings (model, LoRA, precision, loss function)
-- **`infer.yaml`** — vLLM inference server settings
+- **`infer.yaml`** — inference server settings
 - **`orch.yaml`** — Orchestrator settings (environment, batch size, sampling)
 
 ## 2) Run
@@ -16,24 +16,24 @@ GRPO can run in two single-command modes depending on your GPU layout:
 
 ### Split-GPU mode — `surogate grpo` (recommended for ≥2 GPUs)
 
-vLLM and the trainer run on disjoint GPU sets, communicating via the filesystem. You explicitly assign GPU ids to each side:
+The inference server and the trainer run on disjoint GPU sets, communicating via the filesystem. You explicitly assign GPU ids to each side:
 
 ```bash
 surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml \
-    --vllm-gpus 0 --trainer-gpus 1
+    --infer-gpus 0 --trainer-gpus 1
 ```
 
 The trainer's GPU count is derived from `--trainer-gpus` automatically — the YAML `gpus` field becomes optional. For MoE models, `ep_size` is also auto-set to the trainer GPU count.
 
 ### Co-locate mode — `surogate grpo-colocate` (single-GPU or shared-GPU setups)
 
-vLLM and the trainer share the same GPUs and exchange base weights via zero-copy CUDA IPC:
+Serving and training alternate on one GPU with a single resident copy of the base weights:
 
 ```bash
 surogate grpo-colocate --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
 ```
 
-No manual memory tuning needed — `gpu_memory_utilization` is computed automatically.
+No GPU-assignment flags. See [Single-GPU GRPO](../guides/rl-colocate.md) for the current limits.
 
 If you use `uv`, prefix any of the above with `uv run`.
 
@@ -62,7 +62,7 @@ Set `resume_from_checkpoint: false` in `train.yaml` to force a fresh run.
 
 ## 4) Example Configuration
 
-A minimal setup using the **reverse-text** environment. With co-locate (`grpo-colocate`) this runs on a single GPU; with split (`grpo`) it runs on two GPUs (one for vLLM, one for the trainer):
+A minimal setup using the **reverse-text** environment. With co-locate (`grpo-colocate`) this runs on a single GPU; with split (`grpo`) it runs on two GPUs (one for the server, one for the trainer):
 
 **`train.yaml`**:
 
@@ -102,7 +102,7 @@ model: Qwen/Qwen3-0.6B
 enable_lora: true
 max_lora_rank: 32
 
-# Optional; omit to use vLLM's own defaults.
+# Optional; omit to use the engine's own defaults.
 # max_num_seqs: 16      # concurrency cap — see "Serving memory" below
 # kv_cache_dtype: fp8   # halves KV bytes/token
 ```
@@ -179,13 +179,12 @@ Two `infer.yaml` keys decide whether a large policy plus LoRA fits:
 
 - **`max_num_seqs`** caps concurrent sequences and so sizes the CUDA-graph and
   activation buffers. A 27B model served TP2 with `enable_lora: true` OOMs at
-  the vLLM default and fits at `16`. Lowering `gpu_memory_utilization` does
-  **not** help — it shrinks the budget those buffers draw from.
+  the default and fits at `16`.
 - **`kv_cache_dtype: fp8`** halves KV bytes per token, raising sustainable
   concurrency on a KV-bound server. It also perturbs sampled logprobs, which
   feed GRPO's importance ratio, so check `mismatch_kl` after enabling it.
 
-Both default to unset, in which case vLLM's own defaults apply.
+Both default to unset, in which case the engine's own defaults apply.
 
 ## 6) Advanced: Three-Process Mode
 
@@ -206,7 +205,6 @@ For single-host runs, prefer `surogate grpo` (split GPUs) or `surogate grpo-colo
 
 ## Notes
 
-- GRPO requires `vllm` to be installed for the inference server.
 - **Reading progress from a log file.** The orchestrator's rollout progress bar
   is rendered by `tqdm`, which needs a TTY — under `nohup` or any redirect it
   writes nothing useful. Alongside it, the orchestrator emits plain `[progress]`

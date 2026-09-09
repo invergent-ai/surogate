@@ -11,7 +11,7 @@ The convention both runners follow:
 
 1. The watchdog records the reason **before** signalling, so it is already
    visible by the time the interrupt lands.
-2. The main thread raises only **after** its teardown block has reaped the vLLM
+2. The main thread raises only **after** its teardown block has reaped the server
    process trees. Exiting early would strand them holding their GPUs.
 """
 

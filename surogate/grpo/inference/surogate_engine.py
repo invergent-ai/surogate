@@ -1,4 +1,4 @@
-"""Serve GRPO rollouts from this repository's own engine instead of vLLM.
+"""Serve GRPO rollouts from this repository's own engine.
 
 The orchestrator talks to an inference server over HTTP and nothing else: the
 OpenAI chat surface for the rollouts, `/tokenize` and `/v1/chat/completions/tokens`
