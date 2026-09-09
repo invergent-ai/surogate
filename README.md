@@ -3,17 +3,18 @@
 <a href="https://surogate.ai">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-white.svg">
-    <img src="assets/logo-black.svg" alt="Surogate" width="420">
+    <img src="assets/surogate-logo.png" alt="Surogate" width="150">
   </picture>
 </a>
 
-<h1>Train and serve LLMs at extreme speed and massive throughput.</h1>
+<h1>Surogate</h1>
 
-<p><strong>Native C++/CUDA engine for LLM training and serving.<br>Native GGUF, NVFP4, BF16, and FP8. From your first fine-tune to hundreds of concurrent requests.</strong></p>
+<p><strong>Native C++/CUDA LLM training and serving: GGUF, NVFP4, BF16, FP8. <br>
+From your first fine-tune to hundreds of concurrent requests.</strong></p>
 
 <p>
   <a href="https://surogate.ai">Website</a> ·
-  <a href="https://docs.surogate.ai">Documentation</a> ·
+  <a href="docs/index.md">Documentation</a> ·
   <a href="#speed-you-can-measure">Benchmarks</a> ·
   <a href="#quickstart">Quickstart</a> ·
   <a href="#supported-models">Models</a> ·
@@ -44,20 +45,6 @@ Speed drives the design: compiled training graphs, fused CUDA kernels, low-preci
 
 ## Speed you can measure
 
-### Training: more experiments per GPU-hour
-
-**53,900 training tokens/s on a single H100. 136,200 on four RTX 5090s.**
-
-| Model | Hardware | Surogate | Unsloth | Throughput gain |
-|---|---|---:|---:|---:|
-| Qwen3-0.6B | 1× H100 80 GB | **53,900 tok/s · BF16** | 21,300 tok/s · BF16 | **2.53×** |
-| Qwen3-0.6B | 1× RTX 5090 32 GB | **30,100 tok/s · BF16** | 22,100 tok/s · BF16 | **1.36×** |
-| Qwen3-8B | 1× RTX 5090 32 GB | **6,900 tok/s · FP4** | 3,500 tok/s · BF16 | **1.97×** |
-
-Need more throughput? Qwen3-0.6B FP4 LoRA scales from **36,400 tok/s on one RTX 5090 to 136,200 tok/s on four**: 3.74× aggregate throughput. Qwen3-8B reaches **27,100 tok/s** on the same four-card setup.
-
-These are total training tokens/s for packed 2,048-token sequences, batch size 2 per GPU, gradient accumulation 4, and LoRA rank 16 / alpha 32. The FP4 comparison uses different compute precision; recipe choice also affects accuracy. [Full results, configuration, and accuracy measurements →](docs/reference/benchmarks.md)
-
 ### Serving: fast for one user. Fast under load.
 
 **Native GGUF decoding at 802 tokens/s on one RTX 5090. A 200 GB MoE serving 16 users at 7× llama.cpp's aggregate decode throughput on eight cards.**
@@ -71,9 +58,17 @@ These are total training tokens/s for packed 2,048-token sequences, batch size 2
 
 Responsiveness matters, too. At 100 users, Qwen3.5-4B delivers **40 ms median time to first token**, versus 230 ms for vLLM. At 16 users, GLM-5.3-Flash delivers **1.59 seconds**, versus 55.13 seconds for llama.cpp.
 
-Selected measurements from August 30–September 7, 2026, using streaming HTTP clients, staggered requests, salted prompts, and a 512-input / 128-output token workload. Decode rates are generated tokens divided by wall time, summed across users. Model loading is excluded. The 0.8B runs use native Q4_K_M GGUF for Surogate and llama.cpp, and NVFP4 for vLLM; the 4B pair uses NVFP4; the GLM pair uses the same GGUF with resident weights. Baselines include vLLM 0.27.1 and CUDA llama.cpp builds.
+### Training: more experiments per GPU-hour
 
-**These wins describe the measured configurations.** Performance varies with model, precision, context, concurrency, and offload. The full benchmark record includes engine flags, correctness checks, and workloads where another engine leads. [Full serving results and methodology →](surogate/serve/BENCHMARKS.md)
+**53,900 training tokens/s on a single H100. 136,200 on four RTX 5090s.**
+
+| Model | Hardware | Surogate | Unsloth | Throughput gain |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B | 1× H100 80 GB | **53,900 tok/s · BF16** | 21,300 tok/s · BF16 | **2.53×** |
+| Qwen3-0.6B | 1× RTX 5090 32 GB | **30,100 tok/s · BF16** | 22,100 tok/s · BF16 | **1.36×** |
+| Qwen3-8B | 1× RTX 5090 32 GB | **6,900 tok/s · FP4** | 3,500 tok/s · BF16 | **1.97×** |
+
+Need more throughput? Qwen3-0.6B FP4 LoRA scales from **36,400 tok/s on one RTX 5090 to 136,200 tok/s on four**: 3.74× aggregate throughput. Qwen3-8B reaches **27,100 tok/s** on the same four-card setup.
 
 ## Two engines. One workflow.
 
