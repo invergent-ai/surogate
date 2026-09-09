@@ -36,6 +36,9 @@ from surogate.serve.convert.common.inventory import (
     ResourceSpec,
     StoredObjectSpec,
     TensorSpec,
+    VISION_BF16,
+    VISION_QUANTIZED,
+    VISION_STORAGE,
     W8,
     build_vision_specs as _family_vision_specs,
     tensor_spec as _family_tensor_spec,
@@ -399,14 +402,15 @@ def build_mtp_specs(g: Geometry) -> tuple[TensorSpec, ...]:
     )
 
 
-def build_vision_specs(g: Geometry) -> tuple[TensorSpec, ...]:
+def build_vision_specs(g: Geometry, *, vision_storage: str = VISION_QUANTIZED) -> tuple[TensorSpec, ...]:
     tower = vision_tower(g)
-    return _family_vision_specs(g.hidden, **tower) if tower else ()
+    return _family_vision_specs(g.hidden, storage=vision_storage, **tower) if tower else ()
 
 
 def build_tensor_specs(geometry: Geometry, *, profile: str = GROUPWISE_INT,
                        mtp: bool | None = None,
-                       vision: bool | None = None) -> tuple[TensorSpec, ...]:
+                       vision: bool | None = None,
+                       vision_storage: str = VISION_QUANTIZED) -> tuple[TensorSpec, ...]:
     """The tensor list for one checkpoint and export, which a repack plan is made against."""
     export = export_for(profile, geometry)
     tensors = (build_text_core_specs(geometry, profile)
@@ -414,7 +418,7 @@ def build_tensor_specs(geometry: Geometry, *, profile: str = GROUPWISE_INT,
     if (export.mtp if mtp is None else mtp) and geometry.mtp_layers:
         tensors += build_mtp_specs(geometry)
     if export.vision if vision is None else vision:
-        tensors += build_vision_specs(geometry)
+        tensors += build_vision_specs(geometry, vision_storage=vision_storage)
     return tensors
 
 
@@ -424,9 +428,11 @@ def build_tensor_specs(geometry: Geometry, *, profile: str = GROUPWISE_INT,
 # vision/* objects entirely.
 def active_specs(*, mtp: bool | None = None, vision: bool | None = None,
                  geometry: Geometry,
-                 profile: str = GROUPWISE_INT) -> tuple[tuple, tuple]:
+                 profile: str = GROUPWISE_INT,
+                 vision_storage: str = VISION_QUANTIZED) -> tuple[tuple, tuple]:
     """(tensor_specs, object_specs) for the requested artifact variant."""
-    tensors = build_tensor_specs(geometry, profile=profile, mtp=mtp, vision=vision)
+    tensors = build_tensor_specs(geometry, profile=profile, mtp=mtp, vision=vision,
+                                 vision_storage=vision_storage)
     return tensors, RESOURCE_SPECS + tensors
 
 

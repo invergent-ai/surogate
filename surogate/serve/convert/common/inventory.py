@@ -135,6 +135,23 @@ RESOURCE_SPECS = tuple(
 )
 
 
+#: How a tower is stored.
+#:
+#: `quantized` is what serving reads and what every artifact carried until now: six bits on
+#: the patch embedding, four on the projections that dominate it, five on the outputs, eight
+#: on the merger. It is the right trade for generation, where the tower runs once per image
+#: and the answer is a sampled token.
+#:
+#: `bf16` exists because a trainer extracting features is not doing that. It feeds the tower's
+#: output into a loss, and four-bit weights compounding over twenty-four layers move that
+#: output far enough to matter -- measured against the source checkpoint on one image, cosine
+#: 0.74 at a 16x16 grid and 0.28 at 20x20. Training against features the source model would
+#: not produce is a change of behaviour, not a change of implementation.
+VISION_QUANTIZED = "quantized"
+VISION_BF16 = "bf16"
+VISION_STORAGE = (VISION_QUANTIZED, VISION_BF16)
+
+
 def build_vision_specs(
     text_width: int,
     *,
@@ -145,11 +162,19 @@ def build_vision_specs(
     patch_rows: int,
     position_embeddings: int,
     merger_hidden: int,
+    storage: str = VISION_QUANTIZED,
 ) -> tuple[TensorSpec, ...]:
     """Build the tower inventory from its resolved checkpoint dimensions."""
 
+    if storage not in VISION_STORAGE:
+        raise ValueError(f"vision storage must be one of {VISION_STORAGE}, got {storage!r}")
+    # Every weight of the tower moves together: a half-quantized tower has the error of the
+    # quantized half and the size of the other.
+    plain = storage == VISION_BF16
+    q6, q4, q5, w8 = (BF16, BF16, BF16, BF16) if plain else (Q6, Q4, Q5, W8)
+
     specs: list[TensorSpec] = [
-        tensor_spec("vision/patch_embedding", (hidden, patch_rows), Q6),
+        tensor_spec("vision/patch_embedding", (hidden, patch_rows), q6),
         tensor_spec("vision/patch_embedding_bias", (hidden,), BF16),
         tensor_spec("vision/position_embedding", (position_embeddings, hidden), BF16),
     ]
@@ -158,13 +183,13 @@ def build_vision_specs(
         prefix = f"vision/layers/{layer}/"
         specs.extend(
             (
-                tensor_spec(prefix + "attention/qkv", (qkv_rows, hidden), Q4),
+                tensor_spec(prefix + "attention/qkv", (qkv_rows, hidden), q4),
                 tensor_spec(prefix + "attention/qkv_bias", (qkv_rows,), BF16),
-                tensor_spec(prefix + "attention/output", (hidden, hidden), Q5),
+                tensor_spec(prefix + "attention/output", (hidden, hidden), q5),
                 tensor_spec(prefix + "attention/output_bias", (hidden,), BF16),
-                tensor_spec(prefix + "mlp/fc1", (intermediate, hidden), Q4),
+                tensor_spec(prefix + "mlp/fc1", (intermediate, hidden), q4),
                 tensor_spec(prefix + "mlp/fc1_bias", (intermediate,), BF16),
-                tensor_spec(prefix + "mlp/fc2", (hidden, intermediate), Q5),
+                tensor_spec(prefix + "mlp/fc2", (hidden, intermediate), q5),
                 tensor_spec(prefix + "mlp/fc2_bias", (hidden,), BF16),
                 tensor_spec(prefix + "norm1/weight", (hidden,), BF16),
                 tensor_spec(prefix + "norm1/bias", (hidden,), BF16),
@@ -175,9 +200,9 @@ def build_vision_specs(
 
     specs.extend(
         (
-            tensor_spec("vision/merger/fc1", (merger_hidden, merger_hidden), W8),
+            tensor_spec("vision/merger/fc1", (merger_hidden, merger_hidden), w8),
             tensor_spec("vision/merger/fc1_bias", (merger_hidden,), BF16),
-            tensor_spec("vision/merger/fc2", (text_width, merger_hidden), W8),
+            tensor_spec("vision/merger/fc2", (text_width, merger_hidden), w8),
             tensor_spec("vision/merger/fc2_bias", (text_width,), BF16),
             tensor_spec("vision/merger/norm/weight", (hidden,), BF16),
             tensor_spec("vision/merger/norm/bias", (hidden,), BF16),

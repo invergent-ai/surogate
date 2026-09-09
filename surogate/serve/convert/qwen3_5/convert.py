@@ -315,6 +315,7 @@ def convert(
     gguf_repack: str | Path | None = None,
     mtp: bool = True,
     vision: bool = True,
+    vision_storage: str = inventory.VISION_QUANTIZED,
 ) -> Path:
     """Run the complete registered conversion and return the report path."""
 
@@ -332,7 +333,7 @@ def convert(
     geometry = replace(geometry, mtp_layers=geometry.mtp_layers if mtp else 0)
     recipes = active_recipes(mtp=mtp, vision=vision, geometry=geometry)
     active_tensor_specs, active_object_specs = inventory.active_specs(
-        mtp=mtp, vision=vision, geometry=geometry)
+        mtp=mtp, vision=vision, geometry=geometry, vision_storage=vision_storage)
     # A tied head duplicates the vocabulary table; drop the copy and let the loader point
     # both plans at the survivor.
     tied = set(inventory.tied_duplicate_objects(recipes, active_tensor_specs))
@@ -580,6 +581,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--quantized-model", type=Path, default=None,
                         help="the quantised release, for the exports that publish the "
                              "unquantised objects separately")
+    parser.add_argument("--vision-storage", choices=inventory.VISION_STORAGE,
+                        default=inventory.VISION_QUANTIZED,
+                        help="How to store the vision tower. `quantized` is what serving reads; "
+                             "`bf16` keeps the source checkpoint's weights, which is what a "
+                             "trainer extracting features needs.")
     parser.add_argument("--no-vision", action="store_true",
                         help="convert without the vision tower (a text-only export)")
     parser.add_argument("--no-mtp", action="store_true",
@@ -598,7 +604,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     profile = args.profile or profile_for_checkpoint(_config)
     if profile == inventory.GROUPWISE_INT:
         convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack,
-                mtp=not args.no_mtp, vision=not args.no_vision)
+                mtp=not args.no_mtp, vision=not args.no_vision,
+                vision_storage=args.vision_storage)
         return
     writer = _export_writer(profile)
     if profile in DUAL_SOURCE_PROFILES:
