@@ -334,9 +334,9 @@ def test_reward_ema_updates_and_persists(tmp_path):
 def _long_dataset():
     from datasets import Dataset
     return Dataset.from_list([
-        {"example_id": 0, "task": "env_a", "prompt": [{"role": "user", "content": "L" * 9000}]},
-        {"example_id": 1, "task": "env_a", "prompt": [{"role": "user", "content": "L" * 9000}]},
-        {"example_id": 2, "task": "env_a", "prompt": [{"role": "user", "content": "s" * 100}]},
+        {"example_id": 0, "info": {"env_id": "env_a"}, "prompt": [{"role": "user", "content": "L" * 9000}]},
+        {"example_id": 1, "info": {"env_id": "env_a"}, "prompt": [{"role": "user", "content": "L" * 9000}]},
+        {"example_id": 2, "info": {"env_id": "env_a"}, "prompt": [{"role": "user", "content": "s" * 100}]},
     ])
 
 
@@ -415,10 +415,10 @@ def test_vtc_rescue_batch_draw_still_rescues_immediately(monkeypatch):
 def _two_env_buffer(**config_overrides) -> Buffer:
     dataset = Dataset.from_list(
         [
-            {"example_id": 0, "task": "env_full", "prompt": [{"role": "user", "content": "a"}]},
-            {"example_id": 1, "task": "env_full", "prompt": [{"role": "user", "content": "b"}]},
-            {"example_id": 2, "task": "env_full", "prompt": [{"role": "user", "content": "c"}]},
-            {"example_id": 3, "task": "env_starved", "prompt": [{"role": "user", "content": "d"}]},
+            {"example_id": 0, "info": {"env_id": "env_full"}, "prompt": [{"role": "user", "content": "a"}]},
+            {"example_id": 1, "info": {"env_id": "env_full"}, "prompt": [{"role": "user", "content": "b"}]},
+            {"example_id": 2, "info": {"env_id": "env_full"}, "prompt": [{"role": "user", "content": "c"}]},
+            {"example_id": 3, "info": {"env_id": "env_starved"}, "prompt": [{"role": "user", "content": "d"}]},
         ]
     )
     config = GRPOBufferConfig(
@@ -445,7 +445,7 @@ def test_starved_env_recycles_its_own_pool_even_when_global_floor_never_trips():
 
     starved_rollout = {
         "example_id": 3,
-        "task": "env_starved",
+        "info": {"env_id": "env_starved"},
         "reward": 0.0,
         "trajectory": [{"role": "assistant", "content": "{}"}],
         "error": None,
