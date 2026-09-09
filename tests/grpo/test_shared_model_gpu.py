@@ -13,6 +13,9 @@ import torch
 from surogate.grpo.shared_model import SharedModelServer
 from tests.grpo.shared_model_configs import configurations
 
+# Real checkpoint, real cards: minutes, not milliseconds. Runs under `--slow`.
+pytestmark = [pytest.mark.gpu, pytest.mark.slow]
+
 CASES = configurations()
 SELECTED = os.environ.get("SUROGATE_SHARED_CASES", "").split(",")
 REAL = os.environ.get("SUROGATE_SHARED_MODEL", "")

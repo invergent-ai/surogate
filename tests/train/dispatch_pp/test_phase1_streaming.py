@@ -27,9 +27,10 @@ from tests.test_onboarding_qwen3 import (
     resolve_model_path,
 )
 
-pytestmark = pytest.mark.skipif(
+# Real checkpoint, real cards: minutes, not milliseconds. Runs under `--slow`.
+pytestmark = [pytest.mark.gpu, pytest.mark.slow, pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Phase-1 weight-streaming parity needs a GPU"
-)
+)]
 
 
 def _build_trainer(model_dir, *, offload_master):

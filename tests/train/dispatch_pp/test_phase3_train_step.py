@@ -39,9 +39,10 @@ def _enough_free_gpu():
     return free >= _MIN_FREE_BYTES
 
 
-pytestmark = pytest.mark.skipif(
+# Real checkpoint, real cards: minutes, not milliseconds. Runs under `--slow`.
+pytestmark = [pytest.mark.gpu, pytest.mark.slow, pytest.mark.skipif(
     not _enough_free_gpu(), reason=f"needs 1 GPU with >= {_MIN_FREE_BYTES // 1024**3} GiB free"
-)
+)]
 
 
 def _build_trainer():

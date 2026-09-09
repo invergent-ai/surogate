@@ -142,11 +142,22 @@ grpo-test:
 	SUROGATE_TEST_GRPO_GPUS="$(SUROGATE_TEST_GRPO_GPUS)" \
 	$(PYTEST) -q tests/serve/test_grpo_rollout_contract.py tests/grpo/test_grpo_run_smoke.py
 
+# The Python suite as a bare `pytest tests/` runs it: everything except the tests marked
+# slow, which want real checkpoints on real cards. About a minute.
+test-py:
+	$(PYTEST) -q tests/
+
+# The same suite including those: the onboarding gates, the dispatch-PP stages, the
+# distillation capture. Tens of minutes, and several want two free GPUs -- each skips
+# itself when the hardware or the checkpoint is missing rather than failing.
+test-py-slow:
+	$(PYTEST) -q tests/ --slow
+
 # Everything the serving engine has. This is the command a change to `csrc/src/serve` or
 # `surogate/serve` has to pass.
 serve-check: serve-test-py serve-test
 
-.PHONY: grpo-test serve-configure serve-build serve-test-build serve-test serve-test-py serve-check quantizer
+.PHONY: test-py test-py-slow grpo-test serve-configure serve-build serve-test-build serve-test serve-test-py serve-check quantizer
 
 # Internal helper: build + repair wheel for a given CUDA tag
 # Usage: $(call build_wheel,cu128)

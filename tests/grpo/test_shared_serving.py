@@ -13,6 +13,9 @@ import torch
 
 from surogate.grpo.shared_weights import adapter_modules, borrow_weights, write_shared_artifact
 
+# Real checkpoint, real cards: minutes, not milliseconds. Runs under `--slow`.
+pytestmark = [pytest.mark.gpu, pytest.mark.slow]
+
 MODEL = os.environ.get("SUROGATE_SHARED_MODEL", "")
 
 
