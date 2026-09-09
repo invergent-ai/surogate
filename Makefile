@@ -27,7 +27,7 @@ ifneq ($(wildcard $(PIP_NCCL)/lib/libnccl.so.2),)
 NCCL_CMAKE_FLAGS := -DNCCL_INCLUDE_DIR=$(PIP_NCCL)/include -DNCCL_LIB_DIR=$(PIP_NCCL)/lib
 endif
 
-.PHONY: all build build-all export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all regression-smoke regression-update-baseline regression-gpu help info format format-check format-cpp format-py lint-py
+.PHONY: all build build-all export-checkpoint wheel wheel-cu128 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all regression-smoke regression-update-baseline regression-gpu help info format format-check format-cpp format-py lint-py
 
 # Default target
 all: build
@@ -176,9 +176,6 @@ endef
 
 wheel-cu128:
 	$(call build_wheel,cu128)
-
-wheel-cu129:
-	$(call build_wheel,cu129)
 
 wheel-cu130:
 	$(call build_wheel,cu130)

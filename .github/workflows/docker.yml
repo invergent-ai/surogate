@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       cuda_versions:
-        description: 'CUDA versions to build (comma-separated: cu128,cu129,cu130, or "all")'
+        description: 'CUDA versions to build (comma-separated: cu128,cu130, or "all")'
         required: true
         default: 'all'
         type: string
@@ -36,9 +36,6 @@ jobs:
           # has one, and only it is worth asking whether `surogate serve` can find its binary.
           - wheel_tag: "cu128"
             dockerfile: "Dockerfile.cu128"
-            serve: false
-          - wheel_tag: "cu129"
-            dockerfile: "Dockerfile.cu129"
             serve: false
           - wheel_tag: "cu130"
             dockerfile: "Dockerfile.cu130"

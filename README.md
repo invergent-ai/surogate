@@ -269,13 +269,13 @@ Training buffers remain reserved during generation, so choose a model and contex
 <details>
 <summary><strong>Docker and source builds</strong></summary>
 
-CUDA-specific containers are available as `ghcr.io/invergent-ai/surogate:latest-cu128`, `latest-cu129`, and `latest-cu130`.
+CUDA-specific containers are available as `ghcr.io/invergent-ai/surogate:latest-cu128` and `latest-cu130`. A CUDA 12.9 host uses the cu128 image.
 
 ```bash
 # From the directory containing train.yaml; output stays in ./output on the host.
 docker run --gpus all --rm \
   -v "$PWD:/workspace" -w /workspace \
-  ghcr.io/invergent-ai/surogate:latest-cu129 sft train.yaml
+  ghcr.io/invergent-ai/surogate:latest-cu130 sft train.yaml
 ```
 
 For development, clone the repository and install with a CUDA toolkit, NCCL development libraries, and FFmpeg/libcurl development packages for serving. See [CMake](csrc/CMakeLists.txt) for the full build configuration:
