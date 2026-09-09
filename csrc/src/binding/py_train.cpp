@@ -1878,9 +1878,13 @@ void MultiGPUPyTrainer::dispatch_async(std::function<void(sThreadContext& ctx)> 
 }
 
 // Block until GPU `gpu`'s outstanding async work has finished (Done caught up to
-// Pending). Propagates worker exceptions like run_work.
+// Pending). Propagates worker exceptions like run_work, and watches for a stalled
+// worker the same way.
 void MultiGPUPyTrainer::wait_gpu(int gpu) {
     const auto g = static_cast<std::size_t>(gpu);
+    auto last_progress = std::chrono::steady_clock::now();
+    std::size_t last_done = static_cast<std::size_t>(mCtxDone[g].load(std::memory_order_acquire)) +
+                            ::surogate::watchdog_heartbeat();
     while (mCtxDone[g].load(std::memory_order_acquire) < mCtxPending[g].load(std::memory_order_acquire)) {
         if (mThreads->has_exception()) {
             stop();
@@ -1897,6 +1901,25 @@ void MultiGPUPyTrainer::wait_gpu(int gpu) {
                 fflush(stderr);
                 mThreads->rethrow_exception();  // will throw, ending the loop
             }
+        }
+        // The same lost-wakeup watchdog `run_work` carries, for the same reason: a worker
+        // can miss a driver/futex wakeup under heavy multi-threaded CUDA load and wait
+        // forever on a condition that has already been met. Without it this loop is a
+        // silent spin -- one core at 100%, the GPUs idle, and nothing on stderr to say so,
+        // which is how a wedged run reads as a slow one for as long as anyone will wait.
+        const std::size_t done_now = static_cast<std::size_t>(mCtxDone[g].load(std::memory_order_acquire)) +
+                                     ::surogate::watchdog_heartbeat();
+        if (done_now != last_done) {
+            last_done = done_now;
+            last_progress = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - last_progress > std::chrono::seconds(45)) {
+            fprintf(stderr,
+                    "MultiGPUPyTrainer: no progress on GPU %d for 45s; poking workers "
+                    "(lost-wakeup recovery)\n",
+                    gpu);
+            fflush(stderr);
+            mThreads->poke_workers();
+            last_progress = std::chrono::steady_clock::now();
         }
         std::this_thread::yield();
     }
