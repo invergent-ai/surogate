@@ -62,14 +62,15 @@ def check(inputs, dy, out, grads, lengths):
     "batch,length,dim,gate_scale",
     [(2, 1, 8, 5), (2, 17, 16, 5), (2, 65, 32, 5), (1, 129, 64, 0.01), (1, 257, 128, 0.01)],
 )
-def test_native_fla_forward_backward(batch, length, dim, gate_scale):
+@pytest.mark.parametrize("recurrent_forward", [False, True], ids=["chunk", "rollout"])
+def test_native_fla_forward_backward(batch, length, dim, gate_scale, recurrent_forward):
     inputs, dy = make_case(batch, length, dim, gate_scale)
     runner = kernels(2, dim)
     work = torch.empty(runner.workspace_bytes(batch, length, 2, dim, 0, True), dtype=torch.uint8, device="cuda")
     out = torch.empty_like(inputs[0])
     grads = [torch.empty_like(x, dtype=torch.float32) for x in inputs]
     stream = torch.cuda.current_stream().cuda_stream
-    runner.run(False, inputs, [out], None, work, stream)
+    runner.run(False, inputs, [out], None, work, stream, recurrent_forward=recurrent_forward)
     runner.run(True, [dy, *inputs], grads, None, work, stream)
     check(inputs, dy, out, grads, [length] * batch)
 
@@ -84,7 +85,8 @@ def test_native_fla_forward_backward(batch, length, dim, gate_scale):
     ],
     ids=["chunk_boundaries", "many_documents"],
 )
-def test_packed_cuda_graph_replay_changes_chunk_count(layouts):
+@pytest.mark.parametrize("recurrent_forward", [False, True], ids=["chunk", "rollout"])
+def test_packed_cuda_graph_replay_changes_chunk_count(layouts, recurrent_forward):
     # Same N and total tokens, but different numbers of real 64-token chunks,
     # an empty document, and resets on both sides of chunk boundaries.
     length, num_docs = sum(layouts[0]), len(layouts[0])
@@ -97,7 +99,7 @@ def test_packed_cuda_graph_replay_changes_chunk_count(layouts):
 
     def step():
         stream = torch.cuda.current_stream().cuda_stream
-        runner.run(False, inputs, [out], cu, work, stream)
+        runner.run(False, inputs, [out], cu, work, stream, recurrent_forward=recurrent_forward)
         runner.run(True, [dy, *inputs], grads, cu, work, stream)
 
     step()
@@ -117,7 +119,7 @@ def test_compile_without_external_fla(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "fla", None)
     sm = torch.cuda.get_device_capability()
     manifests = compile_kimi_delta_rule(2, 32, tmp_path, sm[0] * 10 + sm[1])
-    assert len(manifests) == 16
+    assert len(manifests) == 19
     from surogate import _surogate as ext
 
     runner = ext._KdaKernels()
@@ -129,3 +131,23 @@ def test_compile_without_external_fla(monkeypatch, tmp_path):
     runner.run(False, inputs, [out], None, work, torch.cuda.current_stream().cuda_stream)
     runner.run(True, [dy, *inputs], grads, None, work, torch.cuda.current_stream().cuda_stream)
     check(inputs, dy, out, grads, [17])
+
+
+@pytest.mark.parametrize("dim", [8, 32, 128])
+def test_recurrent_state_survives_prefill_and_decode(dim):
+    inputs, _ = make_case(1, 65, dim, 0.01)
+    runner = kernels(2, dim)
+    carry = torch.empty((1, 2, dim, dim), dtype=torch.float32, device="cuda")
+    output = torch.empty_like(inputs[0])
+    start = 0
+    for length in (17, 1, 1, 45, 1):
+        chunk = [x[:, start : start + length].contiguous() for x in inputs]
+        result = torch.empty_like(chunk[0])
+        runner.recurrent(chunk, result, carry, start == 0, torch.cuda.current_stream().cuda_stream)
+        output[:, start : start + length] = result
+        start += length
+    expected, _ = reference(inputs, [65])
+    torch.testing.assert_close(output.float(), expected, atol=0.002, rtol=0.02)
+    # Starting another request must ignore the previous request's state.
+    runner.recurrent(inputs, output, carry, True, torch.cuda.current_stream().cuda_stream)
+    torch.testing.assert_close(output.float(), expected, atol=0.002, rtol=0.02)

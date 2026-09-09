@@ -217,6 +217,22 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);
+    } else if (mOptions.GlmRolloutParity && mGlmMatmulKernels.is_ready() && !weight_is_compact && !is_llep_active &&
+               mOptions.EPSize == 1) {
+        if (inp.DType != weights.DType || out.DType != inp.DType)
+            throw std::runtime_error("GLM rollout parity requires matching expert activation and weight dtypes");
+        mGlmMatmulKernels.grouped(out.Data,
+                                  inp.Data,
+                                  weights.Data,
+                                  expert_offsets.get<int>(),
+                                  inp.DType,
+                                  num_experts,
+                                  total_tokens,
+                                  hidden_size,
+                                  intermediate_size,
+                                  1.0f,
+                                  0.0f,
+                                  mRunState.MainStream);
     } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact && !is_llep_active) {
         // Recipe-driven MoE GEMM via cuDNN FE (skip when LLEP active — cuDNN
         // crashes with variable merged expert counts; cuBLAS per-expert is safe)
@@ -366,6 +382,22 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                 }
             }
             const bool lora_weight_is_compact = (weight_rows != num_experts);
+            if (mOptions.GlmRolloutParity && mGlmMatmulKernels.is_ready() && !lora_weight_is_compact &&
+                mOptions.EPSize == 1 && mode == EMMTranspose::TN) {
+                mGlmMatmulKernels.grouped(out_t.Data,
+                                          in_t.Data,
+                                          weight_view.Data,
+                                          expert_offsets.get<int>(),
+                                          in_t.DType,
+                                          num_experts,
+                                          in_t.Sizes[0],
+                                          M,
+                                          K,
+                                          alpha,
+                                          beta,
+                                          mRunState.MainStream);
+                return;
+            }
             const int* lora_active_ptr = active_ptr;
             int lora_num_active = num_active;
             std::vector<int> fallback_active;
@@ -421,7 +453,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                 lora_dropout_scale(t, dropout, seed, mRunState.MainStream);
             }
             if (scaling != 1.0f) {
-                vector_add_sr(t, t, t, 0.5f * scaling, t.nelem(), /*seed=*/0, mRunState.MainStream);
+                vector_add(t, t, t, 0.5f * scaling, t.nelem(), mRunState.MainStream);
             }
         };
 
@@ -973,7 +1005,21 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                             lora_host_offsets_ptr = lora_host_offsets_sanitized.data();
                         }
                     }
-                    if (in_t.DType == ETensorDType::BF16) {
+                    if (mOptions.GlmRolloutParity && !lora_weight_is_compact && mode == EMMTranspose::TN) {
+                        // Recomputed LoRA activations use the forward reduction order.
+                        mGlmMatmulKernels.grouped(out_t.Data,
+                                                  in_t.Data,
+                                                  weight_view.Data,
+                                                  expert_offsets_ptr,
+                                                  in_t.DType,
+                                                  num_experts,
+                                                  in_t.Sizes[0],
+                                                  M,
+                                                  K,
+                                                  alpha,
+                                                  beta,
+                                                  mRunState.MainStream);
+                    } else if (in_t.DType == ETensorDType::BF16) {
                         moe_grouped_gemm(out_t.get<nv_bfloat16>(),
                                          in_t.get<nv_bfloat16>(),
                                          weight_view.get<nv_bfloat16>(),
@@ -1132,7 +1178,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                         lora_dropout_scale(t, dropout, seed, mRunState.MainStream);
                     }
                     if (scaling != 1.0f) {
-                        vector_add_sr(t, t, t, 0.5f * scaling, t.nelem(), /*seed=*/0, mRunState.MainStream);
+                        vector_add(t, t, t, 0.5f * scaling, t.nelem(), mRunState.MainStream);
                     }
                 };
 

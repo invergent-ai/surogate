@@ -1478,7 +1478,12 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             base = &rs.rope_freqs(ref.name);
         }
         if (base && base->Data) {
-            Tensor view = view_for_shape(*base, ref.shape, ref.name);
+            // Decode runs one shorter sequence inside the trainer's activation
+            // capacity. Keep the owner's geometry intact for captured training
+            // graphs, and bind only a prefix view in the dedicated executor.
+            const bool decode_prefix = mExecutionRequest && mExecutionRequest->glm_decode_state &&
+                                       mB == 1 && shape_nelem(ref.shape) <= base->nelem();
+            Tensor view = decode_prefix ? view_tensor(*base, ref.shape) : view_for_shape(*base, ref.shape, ref.name);
             if (tid >= 0) {
                 mTensors[static_cast<std::size_t>(tid)] = view;
                 return mTensors[static_cast<std::size_t>(tid)];
@@ -1868,7 +1873,9 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
         if (t.Data) {
             Tensor resolved = t;
             if (!ref.shape.empty()) {
-                resolved = view_for_shape(t, ref.shape, ref.name);
+                const bool decode_prefix = mExecutionRequest && mExecutionRequest->glm_decode_state &&
+                                           mB == 1 && shape_nelem(ref.shape) <= t.nelem();
+                resolved = decode_prefix ? view_tensor(t, ref.shape) : view_for_shape(t, ref.shape, ref.name);
             }
             if (tid >= 0) {
                 mTensors[static_cast<std::size_t>(tid)] = resolved;

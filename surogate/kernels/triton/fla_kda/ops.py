@@ -12,3 +12,13 @@ def exp2(x):
 
 
 gather = tl.gather
+
+
+@triton.jit
+def exp(x):
+    return tl.exp(x.to(tl.float32))
+
+
+@triton.jit
+def softplus(x):
+    return tl.where(x < 20.0, tl.math.log(1 + tl.math.exp(x)), x)

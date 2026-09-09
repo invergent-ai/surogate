@@ -496,6 +496,9 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"clamp_backward", CompiledOpType::ClampBackward},
         {"glm_causal_conv1d", CompiledOpType::GlmCausalConv1d},
         {"glm_causal_conv1d_backward", CompiledOpType::GlmCausalConv1dBackward},
+        {"glm_dsa_indexer", CompiledOpType::GlmDsaIndexer},
+        {"glm_dsa_attention", CompiledOpType::GlmDsaAttention},
+        {"glm_dsa_attention_backward", CompiledOpType::GlmDsaAttentionBackward},
         {"qwen3_5_decay", CompiledOpType::Qwen3_5Decay},
         {"repeat_interleave_heads", CompiledOpType::RepeatInterleaveHeads},
         // Qwen3.5 gated delta rule backward operations
@@ -3036,7 +3039,9 @@ color_frame(const std::vector<int>& tids, const std::vector<LayoutInfo>& info, s
         std::size_t off = 0;
         for (const auto& s : live) {
             if (off + ti.bytes <= s.off) break;
-            off = std::max(off, s.off + s.size);
+            // Odd token counts produce small index/statistic tensors whose
+            // byte sizes are not multiples of cuBLASLt's 16-byte alignment.
+            off = (std::max(off, s.off + s.size) + 15) & ~std::size_t(15);
         }
 
         offsets[idx] = off;
@@ -3044,7 +3049,8 @@ color_frame(const std::vector<int>& tids, const std::vector<LayoutInfo>& info, s
         peak = std::max(peak, off + ti.bytes);
     }
 
-    peak_out = peak;
+    // Per-layer sections use this peak as their stride.
+    peak_out = (peak + 15) & ~std::size_t(15);
     return offsets;
 }
 
@@ -4834,6 +4840,25 @@ void GraphCompiler::infer_output_shapes(const Operation& op,
             break;
         }
 
+        case CompiledOpType::GlmDsaIndexer: {
+            const auto& s = input_shapes.at(0);
+            const auto* width_attr = find_attr(op.attrs, "index_size");
+            const long width = width_attr ? attr_int(*width_attr).value_or(0) : 0;
+            if (s.size() != 4 || width <= 0)
+                throw std::runtime_error("GLM DSA indexer requires [B,T,H,D] queries and positive index_size");
+            output_shapes.push_back({s[0], s[1], width});
+            break;
+        }
+        case CompiledOpType::GlmDsaAttention: {
+            const auto& s = input_shapes.at(0);
+            if (s.size() != 4 || s[2] % 3 != 0)
+                throw std::runtime_error("GLM DSA attention requires [B,T,3H,D] QKV");
+            output_shapes.push_back({s[0], s[1], s[2] / 3 * s[3]});
+            break;
+        }
+        case CompiledOpType::GlmDsaAttentionBackward:
+            output_shapes.push_back(input_shapes.at(1));
+            break;
         case CompiledOpType::MhcMix: {
             if (input_shapes.size() >= 4 && input_shapes[0].size() == 3) {
                 auto s = input_shapes[0];
@@ -6577,6 +6602,13 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                             ref.shape = {x_shape[0], x_shape[1], x_shape[2] * repeats, x_shape[3]};
                         }
                     }
+                } else if (compiled.type == CompiledOpType::GlmDsaIndexer) {
+                    ref.dtype = ETensorDType::INT32;
+                } else if (compiled.type == CompiledOpType::GlmDsaAttention) {
+                    ref.dtype = compiled.inputs[0].dtype;
+                } else if (compiled.type == CompiledOpType::GlmDsaAttentionBackward) {
+                    ref.dtype = compiled.inputs[1].dtype;
+                    ref.shape = compiled.inputs[1].shape;
                 } else if (compiled.type == CompiledOpType::MhcMix) {
                     ref.dtype = i == 0 ? compiled.inputs[0].dtype : ETensorDType::FP32;
                 } else if (compiled.type == CompiledOpType::KdaDecay) {

@@ -658,6 +658,21 @@ int test_tool_response_serialization() {
     failures +=
         check(with_content.at("choices").at(0).at("message").at("content") == "Calling weather.",
               "tool content prefix carried");
+    TokenDetail detail;
+    detail.include_token_ids = detail.include_logprobs = true;
+    detail.prompt_token_ids = {4, 5};
+    detail.completion_token_ids = {6, 7};
+    detail.logprobs = {-0.25f, -0.5f};
+    detail.texts = {"<tool_call>", "</tool_call>"};
+    const Json training = Json::parse(make_chat_completion_tool_response(
+        "id-train", "m", 224, "", "", calls, usage, detail));
+    failures += check(training["prompt_token_ids"] == Json::array({4, 5}), "tool prompt IDs retained");
+    failures += check(training["choices"][0]["token_ids"] == Json::array({6, 7}), "tool completion IDs retained");
+    failures += check(training["choices"][0]["logprobs"]["content"].size() == 2, "tool policy logprobs retained");
+    const Json chunk = parse_sse(make_chat_chunk_token_detail("id-train", "m", 224, detail, false));
+    failures += check(chunk["choices"][0]["token_ids"] == Json::array({6, 7}), "stream token IDs retained");
+    failures += check(chunk["choices"][0]["logprobs"] == training["choices"][0]["logprobs"], "stream policy scores retained");
+    failures += check(chunk["choices"][0]["delta"].empty() && chunk["choices"][0]["finish_reason"].is_null(), "detail chunk has no text or terminal reason");
     return failures;
 }
 

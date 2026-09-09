@@ -360,6 +360,9 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::KimiDeltaRuleBackward: return "chunk_kimi_delta_rule_backward";
         case CompiledOpType::GlmCausalConv1d: return "glm_causal_conv1d";
         case CompiledOpType::GlmCausalConv1dBackward: return "glm_causal_conv1d_backward";
+        case CompiledOpType::GlmDsaIndexer: return "glm_dsa_indexer";
+        case CompiledOpType::GlmDsaAttention: return "glm_dsa_attention";
+        case CompiledOpType::GlmDsaAttentionBackward: return "glm_dsa_attention_backward";
         case CompiledOpType::Clamp: return "clamp";
         case CompiledOpType::ClampBackward: return "clamp_backward";
         case CompiledOpType::Qwen3_5Decay: return "qwen3_5_decay";
@@ -402,6 +405,14 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
     if (!options.JitKernelManifests.empty()) {
         mGdrKernels.load(options.JitKernelManifests);
         mKdaKernels.load(options.JitKernelManifests);
+        mDsaKernels.load(options.JitKernelManifests);
+        mGlmMatmulKernels.load(options.JitKernelManifests);
+    }
+    if (options.GlmRolloutParity &&
+        (!options.DocMasking || options.EPSize != 1 || options.matmul_dtype() != ETensorDType::BF16 ||
+         !mKdaKernels.is_ready() || !mGlmMatmulKernels.is_ready())) {
+        throw std::runtime_error(
+            "GLM rollout parity requires BF16, doc_masking=true, ep_size=1 and compiled KDA/matmul kernels");
     }
 }
 

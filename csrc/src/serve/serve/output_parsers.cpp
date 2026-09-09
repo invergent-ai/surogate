@@ -73,7 +73,7 @@ std::string rtrim(std::string text) {
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
     for (const unsigned char c : name) {
-        if (std::isalnum(c) == 0 && c != '_' && c != '-') { return false; }
+        if (std::isalnum(c) == 0 && c != '_' && c != '-' && c != '.') { return false; }
     }
     return true;
 }
@@ -243,7 +243,7 @@ ReasoningSplit split_reasoning(ReasoningFormat format, std::string reasoning,
 }
 
 ParsedToolCalls parse_tool_calls(ToolCallFormat format, const std::string& text,
-                                 std::size_t max_tool_name_length) {
+                                 std::size_t max_tool_name_length, const std::vector<ToolDefinition>& tools) {
     ParsedToolCalls out;
     switch (format) {
     case ToolCallFormat::None:
@@ -252,8 +252,8 @@ ParsedToolCalls parse_tool_calls(ToolCallFormat format, const std::string& text,
     case ToolCallFormat::QwenXml:
     case ToolCallFormat::Spark25: {
         ParsedToolCallOutput parsed = format == ToolCallFormat::Spark25
-            ? parse_spark_tool_call_output(text, max_tool_name_length)
-            : parse_qwen_tool_call_output(text, max_tool_name_length);
+            ? parse_spark_tool_call_output(text, max_tool_name_length, tools)
+            : parse_qwen_tool_call_output(text, max_tool_name_length, tools);
         out.is_tool_call_response   = parsed.is_tool_call_response;
         out.content                 = std::move(parsed.content);
         out.tool_calls              = std::move(parsed.tool_calls);

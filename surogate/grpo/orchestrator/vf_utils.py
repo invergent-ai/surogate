@@ -77,6 +77,9 @@ def _run_env_server_with_path(
     *args,
     **kwargs,
 ):
+    from surogate.grpo.tool_client import install_tool_token_client
+
+    install_tool_token_client()
     if env_path:
         import sys
 

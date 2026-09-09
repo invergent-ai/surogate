@@ -39,6 +39,7 @@
 #include "runtime/attention/mem_eff/mem_eff_dispatch.h"
 #include "kernels/glm5.h"
 #include "runtime/jit/kimi_delta_rule_kernels.h"
+#include "runtime/jit/glm_dsa_kernels.h"
 
 namespace nb = nanobind;
 
@@ -591,6 +592,8 @@ NB_MODULE(_surogate, m) {
         .def_rw("doc_masking",
                 &RuntimeOptions::DocMasking,
                 "Enable document-level attention masking for packed sequences.")
+        .def_rw("glm_rollout_parity", &RuntimeOptions::GlmRolloutParity,
+                "Use recurrent KDA forward and fixed-reduction GEMMs for GLM GRPO.")
         .def_rw("use_dsl_ir", &RuntimeOptions::UseDslIr, "Deprecated (DSL backend is always enabled).")
         .def_rw("dsl_ir_json", &RuntimeOptions::DslIrJson, "DSL IR JSON payload (generated at compile time).")
         .def_rw("jit_kernel_manifests",
@@ -2418,6 +2421,21 @@ NB_MODULE(_surogate, m) {
             "                Provide position_ids for packed sequences where positions reset.\n\n"
             "Returns: float32 log-probabilities shaped [B, T].\n"
             "         Masked positions (target==-100) receive 0.")
+        .def("reset_decode_state", &MultiGPUPyTrainer::reset_decode_state, nb::call_guard<nb::gil_scoped_release>())
+        .def("decode_logits", [](MultiGPUPyTrainer* trainer,
+                                  nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> ids,
+                                  bool reset) {
+            std::vector<float> logits;
+            {
+                nb::gil_scoped_release release;
+                logits = trainer->decode_logits(ids.data(), static_cast<int>(ids.size()), reset);
+            }
+            auto* data = new float[logits.size()];
+            std::copy(logits.begin(), logits.end(), data);
+            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            return nb::ndarray<nb::numpy, float, nb::ndim<1>>(data, {logits.size()}, owner);
+        }, nb::arg("input_ids"), nb::arg("reset") = false,
+        "Prefill with reset=true, then append tokens using persistent GLM state; return the last next-token logits.")
         .def("next_token_logits", [](MultiGPUPyTrainer* trainer,
                                      nb::ndarray<const int32_t, nb::numpy, nb::ndim<2>, nb::c_contig, nb::device::cpu> ids,
                                      nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> positions) {
@@ -3645,24 +3663,59 @@ NB_MODULE(_surogate, m) {
             "- batch: List of conversations, each a list of message dicts.\n"
             "- strategy: 'default', 'last_round', 'thinking_only', 'final_only', or 'all'.");
 
+    nb::class_<dsl::GlmDecodeState>(m, "_GlmDecodeState")
+        .def(nb::init<>())
+        .def_rw("length", &dsl::GlmDecodeState::length)
+        .def_rw("capacity", &dsl::GlmDecodeState::capacity)
+        .def_prop_ro("bytes", [](const dsl::GlmDecodeState& state) { return state.allocator.total_allocation(); });
+    nb::class_<GlmDsaKernels>(m, "_DsaKernels")
+        .def(nb::init<>())
+        .def("load", &GlmDsaKernels::load)
+        .def("workspace_bytes", &GlmDsaKernels::workspace_bytes, nb::arg("batch"), nb::arg("length"), nb::arg("offset") = 0)
+        .def("run", [](const GlmDsaKernels& kernels, int kind,
+                       const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+                       const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results,
+                       nb::ndarray<nb::device::cuda, nb::c_contig> workspace, std::uintptr_t stream,
+                       dsl::GlmDecodeState* cache) {
+            std::vector<Tensor> in, out;
+            for (const auto& a : arrays) in.push_back(glm_kernel_tensor(a));
+            for (const auto& a : results) out.push_back(glm_kernel_tensor(a));
+            auto s = reinterpret_cast<cudaStream_t>(stream);
+            if (kind == 0) kernels.indexer(in, out.at(0), glm_kernel_tensor(workspace), s, cache);
+            else if (kind == 1) kernels.attention(in.at(0), in.at(1), out.at(0), out.at(1), s, cache);
+            else if (kind == 2) kernels.backward(in.at(0), in.at(1), in.at(2), in.at(3), in.at(4), out.at(0), s);
+            else throw std::invalid_argument("Invalid DSA operation");
+        }, nb::arg("kind"), nb::arg("inputs"), nb::arg("outputs"), nb::arg("workspace"), nb::arg("stream"),
+           nb::arg("cache").none() = nullptr);
+
     nb::class_<KimiDeltaRuleKernels>(m, "_KdaKernels")
         .def(nb::init<>())
         .def("load", &KimiDeltaRuleKernels::load)
         .def_static("workspace_bytes", &KimiDeltaRuleKernels::workspace_bytes)
+        .def("recurrent", [](const KimiDeltaRuleKernels& kernels,
+                             const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+                             nb::ndarray<nb::device::cuda, nb::c_contig> output,
+                             nb::ndarray<nb::device::cuda, nb::c_contig> state, bool initial, std::uintptr_t stream) {
+            std::vector<Tensor> inputs;
+            for (const auto& a : arrays) inputs.push_back(glm_kernel_tensor(a));
+            kernels.recurrent(inputs, glm_kernel_tensor(output), glm_kernel_tensor(state), initial,
+                               reinterpret_cast<cudaStream_t>(stream));
+        }, nb::arg("inputs"), nb::arg("output"), nb::arg("state"), nb::arg("initial"), nb::arg("stream"))
         .def("run", [](const KimiDeltaRuleKernels& kernels, bool backward,
                        const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
                        const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results,
                        std::optional<nb::ndarray<std::int32_t, nb::ndim<1>, nb::device::cuda, nb::c_contig>> cu,
                        nb::ndarray<nb::device::cuda, nb::c_contig> workspace,
-                       std::uintptr_t stream) {
+                       std::uintptr_t stream, bool recurrent_forward) {
             std::vector<Tensor> in, out;
             for (const auto& a : arrays) in.push_back(glm_kernel_tensor(a));
             for (const auto& a : results) out.push_back(glm_kernel_tensor(a));
             if (cu && cu->size() < 2) throw std::runtime_error("KDA cu_seqlens needs at least two entries");
             kernels.run(backward, in, out, cu ? cu->data() : nullptr, cu ? cu->size() - 1 : 0,
-                        glm_kernel_tensor(workspace), reinterpret_cast<cudaStream_t>(stream));
+                        glm_kernel_tensor(workspace), reinterpret_cast<cudaStream_t>(stream), recurrent_forward);
         }, nb::arg("backward"), nb::arg("inputs"), nb::arg("outputs"),
-           nb::arg("cu_seqlens").none(), nb::arg("workspace"), nb::arg("stream"));
+           nb::arg("cu_seqlens").none(), nb::arg("workspace"), nb::arg("stream"),
+           nb::arg("recurrent_forward") = false);
 
     // Standalone native kernels for numerical forward/backward regression tests.
     m.def(

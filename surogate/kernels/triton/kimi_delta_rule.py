@@ -12,7 +12,7 @@ import triton.language as tl
 
 from surogate.kernels.compiler import compile_triton_kernel
 
-from .fla_kda import backward, cumsum, intra, norm, output, state, wy
+from .fla_kda import backward, cumsum, intra, norm, output, recurrent, state, wy
 
 
 @triton.jit
@@ -60,7 +60,12 @@ def reduce_beta(partials, base, out, T, H: tl.constexpr, NK: tl.constexpr, BLOCK
 
 
 def compile_kimi_delta_rule(H: int, D: int, output_dir: str | Path, sm: int) -> dict[str, str]:
-    """Compile BF16 KDA, with FP32 decay and gradients and 64-token chunks."""
+    """Compile BF16 KDA with FP32 intermediates and 64-token chunks.
+
+    Normalized q/k, triangular solves, WY values and state stay in FP32 so
+    chunked training agrees with recurrent decoding near hard routing ties.
+    TF32x3 dot products retain tensor-core execution for these intermediates.
+    """
     if H <= 0 or D not in (8, 16, 32, 64, 128):
         raise ValueError(f"Unsupported KDA geometry: H={H}, D={D}")
     if sm < 80:
@@ -98,7 +103,7 @@ def compile_kimi_delta_rule(H: int, D: int, output_dir: str | Path, sm: int) -> 
     )
     manifests = {}
 
-    def add(name, fn, fp32="", integers="cu_seqlens chunk_indices chunk_offsets", *, tiles=None, warps=4):
+    def add(name, fn, fp32="", integers="cu_seqlens chunk_indices chunk_offsets", *, tiles=None, warps=4, stages=2):
         constants = common | (tiles or {})
         constants = {key: constants[key] for i, key in enumerate(fn.arg_names) if i in fn.constexprs}
         signature = {}
@@ -123,7 +128,7 @@ def compile_kimi_delta_rule(H: int, D: int, output_dir: str | Path, sm: int) -> 
             output_dir,
             name,
             num_warps=warps,
-            num_stages=2,
+            num_stages=stages,
             sm=sm,
             # FP32 intra-chunk products enter differences of nearly equal
             # terms in dg. TF32 rounding there can dominate small gate grads.
@@ -132,19 +137,80 @@ def compile_kimi_delta_rule(H: int, D: int, output_dir: str | Path, sm: int) -> 
 
     add("kda_metadata", prepare_metadata, integers="cu_in cu offsets", tiles={"BLOCK": 256})
     add("kda_indices", prepare_indices, integers="offsets indices", tiles={"BLOCK": 128})
-    add("kda_norm_fwd", norm.l2norm_fwd_kernel, "rstd", tiles={"BT": 32})
-    add("kda_norm_bwd", norm.l2norm_bwd_kernel, "rstd dy dx", tiles={"BT": 32})
+    add("kda_norm_fwd_fp32", norm.l2norm_fwd_kernel, "y rstd", tiles={"BT": 32})
+    add("kda_norm_bwd", norm.l2norm_bwd_kernel, "y rstd dy dx", tiles={"BT": 32})
     add("kda_cumsum_fwd", cumsum.chunk_local_cumsum_vector_kernel, "s o", tiles={"REVERSE": False, "HAS_SCALE": True})
     add("kda_cumsum_rev", cumsum.chunk_local_cumsum_vector_kernel, "s o", tiles={"REVERSE": True, "HAS_SCALE": False})
-    add("kda_intra_fwd", intra.chunk_kda_fwd_kernel_intra_sub_chunk, "g Akk", tiles={"BK": max(16, D)})
-    add("kda_solve", intra.chunk_kda_fwd_kernel_inter_solve_fused, "g Akkd")
-    add("kda_wy_fwd", wy.recompute_w_u_fwd_kda_kernel, "gk", tiles={"BK": 64, "BV": 64})
+    add("kda_intra_fwd", intra.chunk_kda_fwd_kernel_intra_sub_chunk, "q k g Aqk Akk", tiles={"BK": max(16, D)})
+    add("kda_solve", intra.chunk_kda_fwd_kernel_inter_solve_fused, "q k g Aqk Akk Akkd")
+    add("kda_wy_fwd", wy.recompute_w_u_fwd_kda_kernel, "q k qg kg w u A gk", tiles={"BK": 64, "BV": 64})
     # Upstream restricts this kernel to two warps on Blackwell for correctness.
-    add("kda_state_fwd", state.chunk_gated_delta_rule_fwd_kernel_h_blockdim64, "g gk h0 ht", warps=2)
-    add("kda_output", output.chunk_gla_fwd_kernel_o, "g")
-    add("kda_dav", backward.chunk_kda_bwd_kernel_dAv, "dA")
-    add("kda_state_bwd", state.chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64, "g gk dht dh0", warps=2)
-    add("kda_wy_bwd", backward.chunk_kda_bwd_kernel_wy_dqkg_fused, "g dq dk dg db dA dv2", tiles={"BV": 64})
-    add("kda_intra_bwd", intra.chunk_kda_bwd_kernel_intra, "g dAqk dAkk dq dq2 dk dk2 dg dg2 db")
+    add("kda_state_fwd", state.chunk_gated_delta_rule_fwd_kernel_h_blockdim64, "k v w v_new g gk h h0 ht", warps=2)
+    add("kda_output", output.chunk_gla_fwd_kernel_o, "q v g h A")
+    add("kda_dav", backward.chunk_kda_bwd_kernel_dAv, "q k v A dv dA")
+    # At D=128 the two-warp FP32 lowering exceeds the 99-KiB shared-memory
+    # budget on consumer GPUs. Four warps with one stage fit without reducing
+    # precision. The upstream two-warp restriction applies to forward only.
+    add(
+        "kda_state_bwd",
+        state.chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64,
+        "q k w g gk dh dv dv2 dht dh0",
+        warps=4 if D == 128 else 2,
+        stages=1 if D == 128 else 2,
+    )
+    add(
+        "kda_wy_bwd",
+        backward.chunk_kda_bwd_kernel_wy_dqkg_fused,
+        "q k v_new g A h dh dq dk dv dg db dA dv2",
+        tiles={"BV": 64},
+    )
+    add("kda_intra_bwd", intra.chunk_kda_bwd_kernel_intra, "q k g dAqk dAkk dq dq2 dk dk2 dg dg2 db")
     add("kda_beta_bwd", reduce_beta, "partials base out", integers="", tiles={"NK": triton.cdiv(D, 32), "BLOCK": 256})
+    # Persistent inference carries one FP32 [H,K,V] state per sequence. It
+    # accepts a complete prefill chunk or one subsequent token, in-place.
+    for mode in ("init", "continue", "train"):
+        fn = recurrent.fused_recurrent_kda_fwd_kernel
+        options = common | dict(
+            BK=D,
+            BV=32,
+            IS_VARLEN=mode == "train",
+            USE_INITIAL_STATE=mode == "continue",
+            STORE_FINAL_STATE=mode != "train",
+            INPLACE_FINAL_STATE=True,
+            IS_BETA_HEADWISE=False,
+            USE_QK_L2NORM_IN_KERNEL=True,
+            IS_CONTINUOUS_BATCHING=False,
+            IS_SPEC_DECODING=False,
+            HAS_DT_BIAS=False,
+            USE_GATE_IN_KERNEL=False,
+            USE_LOWER_BOUND=False,
+            APPLY_BETA_SIGMOID=False,
+            ALLOW_NEG_EIGVAL=False,
+            stride_init_state_token=H * D * D,
+            stride_final_state_token=H * D * D,
+            stride_indices_seq=1,
+            stride_indices_tok=1,
+            scale=D**-0.5,
+            num_stages=1,
+        )
+        constants = {key: options[key] for i, key in enumerate(fn.arg_names) if i in fn.constexprs}
+        signature = {
+            key: (
+                "i64"
+                if key in ("N", "T")
+                else "fp32"
+                if key == "lower_bound"
+                else "*i32"
+                if key in ("cu_seqlens", "ssm_state_indices", "num_accepted_tokens")
+                else "*fp32"
+                if key in ("g", "h0", "ht", "A_log", "dt_bias")
+                else "*bf16"
+            )
+            for key in fn.arg_names
+            if key not in constants
+        }
+        name = "kda_recurrent" if mode == "continue" else f"kda_recurrent_{mode}"
+        manifests[name] = compile_triton_kernel(
+            fn, signature, constants, output_dir, name, num_warps=4, num_stages=1, sm=sm
+        )
     return manifests

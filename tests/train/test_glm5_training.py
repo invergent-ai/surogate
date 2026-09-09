@@ -168,10 +168,8 @@ def checkpoint(tmp_path_factory):
 @pytest.mark.parametrize(
     "field,value,message",
     [
-        ("index_topk", 16, "sequence_len <= index_topk"),
         ("n_group", 2, "n_group=topk_group=1"),
         ("norm_topk_prob", False, "norm_topk_prob=true"),
-        ("index_kpool_always_select_tail", False, "index_kpool_always_select_tail=true"),
     ],
 )
 def test_unsupported_attention_and_routing_are_rejected(checkpoint, tmp_path, capfd, field, value, message):
@@ -200,26 +198,51 @@ def test_unsupported_attention_and_routing_are_rejected(checkpoint, tmp_path, ca
 
 
 @pytest.mark.parametrize(
-    "lora,graphs,packed,grad_accum,doc_masking",
+    "lora,graphs,packed,grad_accum,doc_masking,topk,rollout_parity",
     [
-        (False, False, False, 1, True),
-        (True, False, False, 1, True),
-        (False, True, True, 1, True),
-        (True, True, True, 1, True),
-        (False, True, True, 2, True),
-        (True, True, True, 2, True),
-        (False, False, False, 1, False),
+        (False, False, False, 1, True, 256, False),
+        (True, False, False, 1, True, 256, False),
+        (False, True, True, 1, True, 256, False),
+        (True, True, True, 1, True, 256, False),
+        (False, True, True, 2, True, 256, False),
+        (True, True, True, 2, True, 256, False),
+        (False, False, False, 1, False, 256, False),
+        (False, True, True, 1, True, 8, False),
+        (True, True, True, 1, True, 8, False),
+        (False, True, True, 1, True, 8, True),
+        (True, True, True, 1, True, 8, True),
     ],
-    ids=["full", "lora", "full-packed", "lora-packed", "full-accum", "lora-accum", "reference-fallback"],
+    ids=[
+        "full",
+        "lora",
+        "full-packed",
+        "lora-packed",
+        "full-accum",
+        "lora-accum",
+        "reference-fallback",
+        "full-sparse",
+        "lora-sparse",
+        "full-rollout-parity",
+        "lora-rollout-parity",
+    ],
 )
 def test_dummy_checkpoint_forward_backward_and_update(
-    checkpoint, tmp_path, monkeypatch, lora, graphs, packed, grad_accum, doc_masking
+    checkpoint, tmp_path, monkeypatch, lora, graphs, packed, grad_accum, doc_masking, topk, rollout_parity
 ):
     from transformers import Glm5NextForConditionalGeneration
     from transformers.models.glm5_next import modeling_glm5_next as glm
 
     from surogate import _surogate as ext
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
+
+    if topk != 256:
+        sparse_checkpoint = tmp_path / "sparse"
+        sparse_checkpoint.mkdir()
+        config = json.loads((checkpoint / "config.json").read_text())
+        config["text_config"]["index_topk"] = topk
+        (sparse_checkpoint / "config.json").write_text(json.dumps(config))
+        (sparse_checkpoint / "model.safetensors").symlink_to(checkpoint / "model.safetensors")
+        checkpoint = sparse_checkpoint
 
     # Transformers otherwise silently selects an installed FLA package. Keep
     # this reference independent of both the vendored and external kernels.
@@ -236,9 +259,10 @@ def test_dummy_checkpoint_forward_backward_and_update(
         doc_masking=doc_masking,
     )
     options.dsl_ir_json = build_dsl_ir_for_model(str(checkpoint))
+    options.glm_rollout_parity = rollout_parity
     from surogate.kernels.jit_compile import compile_jit_kernels
 
-    options.jit_kernel_manifests = compile_jit_kernels(options.dsl_ir_json) if doc_masking else {}
+    options.jit_kernel_manifests = compile_jit_kernels(options.dsl_ir_json)
     adapter = (
         ext.LoRAAdapterConfig(rank=8, alpha=16, dropout=0.0, dtype="bf16", target_modules=["all"]) if lora else None
     )
@@ -389,6 +413,7 @@ def test_dummy_checkpoint_forward_backward_and_update(
         np.testing.assert_allclose(
             trainer.compute_logprobs(ids, targets, position_ids=positions), after, atol=1e-5, rtol=0
         )
+
     else:
         model_path = tmp_path / "trained"
         trainer.export_model(str(model_path))
@@ -396,3 +421,97 @@ def test_dummy_checkpoint_forward_backward_and_update(
         np.testing.assert_allclose(
             trainer.compute_logprobs(ids, targets, position_ids=positions), after, atol=1e-5, rtol=0
         )
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_persistent_decode_matches_prefix_and_invalidates_on_updates(checkpoint, tmp_path, batch_size):
+    from surogate import _surogate as ext
+    from surogate.dsl.ir_builder import build_dsl_ir_for_model
+    from surogate.kernels.jit_compile import compile_jit_kernels
+
+    config = json.loads((checkpoint / "config.json").read_text())
+    config["text_config"]["index_topk"] = 8
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    options = ext.RuntimeOptions(
+        recompute="true",
+        use_cuda_graphs=True,
+        master_dtype="bf16",
+        offload_master=False,
+        offload_grads=False,
+        offload_optimizer=False,
+    )
+    options.dsl_ir_json = build_dsl_ir_for_model(str(tmp_path))
+    options.jit_kernel_manifests = compile_jit_kernels(options.dsl_ir_json)
+    trainer = ext.SurogateTrainer(
+        ngpu=1,
+        config=ext.PretrainedConfig.from_pretrained(str(tmp_path), "bf16"),
+        options=options,
+        batch_size=batch_size,
+        seq_len=64,
+        grad_accum=1,
+        lora_config=ext.LoRAAdapterConfig(rank=8, alpha=16, dropout=0.0, dtype="bf16", target_modules=["all"]),
+    )
+    trainer.import_weights(str(checkpoint / "model.safetensors"))
+    base = {n: torch.from_dlpack(t).data_ptr() for n, t in trainer.get_shared_base_weights().items()}
+    tokens = np.random.default_rng(79).integers(3, 259, size=32, dtype=np.int32)
+    padded = np.zeros((batch_size, 64), dtype=np.int32)
+    padded[0, : len(tokens)] = tokens
+    positions = np.zeros(batch_size, dtype=np.int32)
+
+    def compare_chunks():
+        end = 0
+        outputs = {}
+        for count in (5, 1, 11, 1, 14):
+            actual = trainer.decode_logits(tokens[end : end + count], reset=end == 0)
+            end += count
+            outputs[end] = actual
+        for end, actual in outputs.items():
+            # A fresh prefill uses the same recurrence but none of the carried
+            # convolution, recurrent, pooled-indexer or KV history under test.
+            expected = trainer.decode_logits(tokens[:end], reset=True)
+            np.testing.assert_allclose(actual, expected, atol=0.015, rtol=0, err_msg=f"prefix length {end}")
+            if end <= 8:
+                # Before sparse selection, also compare to the training graph.
+                # Beyond top-k, BF16 chunk/recurrent rounding can change which
+                # pools the hard indexer selects; kernel tests check each path
+                # independently against its mathematical reference.
+                positions[0] = end - 1
+                expected = trainer.next_token_logits(padded, positions)[0]
+                np.testing.assert_allclose(actual, expected, atol=0.035, rtol=0)
+
+    compare_chunks()
+    # A new prompt reuses allocations but starts clean, including an incomplete pool.
+    restarted = trainer.decode_logits(tokens[:3], reset=True)
+    positions[0] = 2
+    np.testing.assert_allclose(restarted, trainer.next_token_logits(padded, positions)[0], atol=0.035, rtol=0)
+    trainer.reset_decode_state()
+    with pytest.raises(RuntimeError, match="prefill"):
+        trainer.decode_logits(tokens[:1])
+    with pytest.raises(ValueError, match="vocabulary"):
+        trainer.decode_logits(np.array([-1], dtype=np.int32), reset=True)
+    compare_chunks()
+    with pytest.raises(ValueError, match="maximum context"):
+        trainer.decode_logits(np.zeros(33, dtype=np.int32))
+
+    adapter = tmp_path / "adapter"
+    trainer.export_adapter(str(adapter), str(checkpoint))
+    trainer.import_adapter(str(adapter / "adapter_model.safetensors"))
+    with pytest.raises(RuntimeError, match="prefill"):
+        trainer.decode_logits(tokens[:1])
+
+    targets = np.roll(padded, -1, axis=1)
+    targets[:, 31:] = -100
+    for step in (1, 2):
+        trainer.step_with_custom_loss(padded, targets, (targets != -100).astype(np.float32))
+        trainer.update_with_config(ext.OptimizerConfig(learning_rate=1e-3), step)
+        with pytest.raises(RuntimeError, match="prefill"):
+            trainer.decode_logits(tokens[:1])
+        compare_chunks()
+    # The second full-step call replays captured optimizer kernels without
+    # entering the model's host-side update method. It must invalidate too.
+    for step in (3, 4):
+        trainer.train_step_graphed(padded, targets, ext.OptimizerConfig(learning_rate=1e-4), step)
+        with pytest.raises(RuntimeError, match="prefill"):
+            trainer.decode_logits(tokens[:1])
+        compare_chunks()
+    assert base == {n: torch.from_dlpack(t).data_ptr() for n, t in trainer.get_shared_base_weights().items()}

@@ -58,6 +58,7 @@ public:
         options.use_cuda_graph = nb::cast<bool>(settings["use_cuda_graph"]);
         options.enable_sleep_mode = true;
         options.enable_lora = true;
+        options.enable_auto_tool_choice = true;
         options.max_loras = 1;
         options.max_lora_rank = nb::cast<std::uint32_t>(settings["rank"]);
         options.log_stats_interval_ms = 0;

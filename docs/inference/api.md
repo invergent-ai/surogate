@@ -75,7 +75,7 @@ management requests to select the model.
 | `min_tokens` | Suppress stop tokens until this many tokens have been generated; stop strings remain active |
 | `tokens` | Nonempty array of exact prompt token ids to use instead of the formatted messages; `messages` is still required |
 | `add_generation_prompt` | Whether the template appends the assistant-generation prefix; defaults to `true` |
-| `logprobs`, `return_token_ids` | Token details in non-streaming text Chat Completion responses; see below |
+| `logprobs`, `return_token_ids` | Raw token details for text and tool-call Chat Completion responses, including SSE; see below |
 
 If the server was started with `--greedy`, temperature is always zero even when a request
 specifies another value.
@@ -92,8 +92,10 @@ arguments before use: the server does not guarantee that they match the tool's s
 
 `logprobs: true` returns each generated token's log-probability and text in `choices[].logprobs.content`;
 `top_logprobs` entries are empty. `return_token_ids: true` adds the exact prompt and completion
-ids. These details are available only for non-streaming text responses; use `stream: false`.
-They are omitted from tool-call responses. Unavailable log-probabilities are returned as `null`.
+ids. These details cover the raw generated sequence, including reasoning and tool-call syntax,
+for both text and tool-call responses. With `stream: true`, the server sends the token details
+together in a chunk with an empty `delta` after generation and before the finish chunk.
+Unavailable log-probabilities are returned as `null`.
 
 ### Reasoning models
 

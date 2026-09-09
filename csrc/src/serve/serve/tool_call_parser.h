@@ -16,10 +16,12 @@ struct ParsedToolCallOutput {
 };
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length);
+                                                 std::size_t max_tool_name_length,
+                                                 const std::vector<ToolDefinition>& tools = {});
 
 ParsedToolCallOutput parse_spark_tool_call_output(const std::string& text,
-                                                  std::size_t max_tool_name_length);
+                                                  std::size_t max_tool_name_length,
+                                                  const std::vector<ToolDefinition>& tools = {});
 
 // Incrementally publishes text that is provably outside a possible Qwen
 // <tool_call> suffix. At terminal time, a valid tool response discards the

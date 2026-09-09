@@ -34,9 +34,9 @@ every released config, so the group-restricted selection degenerates to a plain
 top-k and is not modelled.
 
 The training graph includes the asymmetric SwiGLU clamp and resets recurrent
-state and convolution history at packed sequence boundaries. Sparse DSA
-selection, vision and MTP are serving-only declarations; text training currently
-requires sequences no longer than ``index_topk``.
+state, convolution history and DSA pooling at packed sequence boundaries. The
+frozen indexer selects sparse keys for differentiable attention. Vision and MTP
+remain outside the text training graph.
 """
 
 from __future__ import annotations
@@ -102,6 +102,7 @@ GLM5_NEXT_MOE_BLOCK_REMAP: dict[str, str] = {**_GLM5_NORM_REMAP, **_GLM5_MOE_REM
 # Schemas
 # ---------------------------------------------------------------------------
 
+
 #: The mHC pair, identical on every layer and both sublayer sites.
 def _hc_slots(site: str) -> tuple[SlotDecl, ...]:
     return (
@@ -135,6 +136,13 @@ _MLA_SLOTS: tuple[SlotDecl, ...] = (
     SlotDecl("mla_kv_a_norm_weight", kind="param", shape=("KVRank",)),
     SlotDecl("mla_kv_b_weight", kind="param", shape=("KVBDim", "KVRank"), residency="auto"),
     SlotDecl("mla_out_weight", kind="param", shape=("C", "VDim"), residency="auto"),
+    SlotDecl("mla_index_q_weight", kind="param", shape=("index_n_heads * index_head_dim", "QRank")),
+    SlotDecl("mla_index_k_weight", kind="param", shape=("index_head_dim", "C")),
+    SlotDecl("mla_index_head_weight", kind="param", shape=("index_n_heads", "C")),
+    SlotDecl("mla_index_compress_weight", kind="param", shape=("index_head_dim", "C")),
+    SlotDecl("mla_index_norm_weight", kind="param", shape=("index_head_dim",)),
+    SlotDecl("mla_index_norm_bias", kind="param", shape=("index_head_dim",)),
+    SlotDecl("mla_index_ape", kind="param", shape=("index_kpool", "index_head_dim")),
     SlotDecl("mla_att_out", shape=("B", "T", "C")),
 )
 
@@ -212,8 +220,9 @@ _KDA_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("kda/query_key_value", "quantised", ("KdaConvDim", "C"), ("kda_qkv_weight",)),
     # Stored [K, channels] like the linear-attention convolution's taps, which is the layout its
     # kernel reads; the checkpoint holds them [channels, 1, K].
-    ServeObject("kda/convolution", "bf16", ("KdaConvK", "KdaConvDim"), ("kda_conv_weight",),
-                transform="transpose_taps"),
+    ServeObject(
+        "kda/convolution", "bf16", ("KdaConvK", "KdaConvDim"), ("kda_conv_weight",), transform="transpose_taps"
+    ),
     ServeObject("kda/decay_a", "quantised", ("KdaHeadDim", "C"), ("kda_f_a_weight",)),
     ServeObject("kda/decay_b", "quantised", ("KdaDim", "KdaHeadDim"), ("kda_f_b_weight",)),
     ServeObject("kda/decay_bias", "fp32", ("KdaDim",), ("kda_dt_bias",)),
@@ -247,8 +256,7 @@ _MLA_SERVE_OBJECTS: tuple[ServeObject, ...] = (
 #: The dense feed-forward of the leading layers, at `intermediate_size` rather than the
 #: mixture's width.
 _GLM5_DENSE_FFN_OBJECTS: tuple[ServeObject, ...] = (
-    ServeObject("mlp/gate_up", "quantised", ("TwoM", "C"),
-                ("mlp_up_weight.gate", "mlp_up_weight.up")),
+    ServeObject("mlp/gate_up", "quantised", ("TwoM", "C"), ("mlp_up_weight.gate", "mlp_up_weight.up")),
     ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
 )
 
@@ -259,12 +267,25 @@ _GLM5_MOE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("moe/router", "bf16", ("E", "C"), ("router_weight",)),
     # Selection is on the score plus this bias; the weight is the score without it.
     ServeObject("moe/router_bias", "fp32", ("E",), ("e_score_correction_bias",)),
-    ServeObject("moe/routed_gate_up", "quantised", ("RoutedGateUpRows", "C"),
-                ("experts_gate_up",), transform="flatten_experts", residency="auto"),
-    ServeObject("moe/routed_down", "quantised", ("RoutedDownRows", "MoeM"),
-                ("experts_down",), transform="flatten_experts", residency="auto"),
-    ServeObject("moe/shared_gate_up", "quantised", ("SharedGateUpRows", "C"),
-                ("shared_expert_gate", "shared_expert_up")),
+    ServeObject(
+        "moe/routed_gate_up",
+        "quantised",
+        ("RoutedGateUpRows", "C"),
+        ("experts_gate_up",),
+        transform="flatten_experts",
+        residency="auto",
+    ),
+    ServeObject(
+        "moe/routed_down",
+        "quantised",
+        ("RoutedDownRows", "MoeM"),
+        ("experts_down",),
+        transform="flatten_experts",
+        residency="auto",
+    ),
+    ServeObject(
+        "moe/shared_gate_up", "quantised", ("SharedGateUpRows", "C"), ("shared_expert_gate", "shared_expert_up")
+    ),
     ServeObject("moe/shared_down", "quantised", ("C", "SharedM"), ("shared_expert_down",)),
 )
 
@@ -386,6 +407,11 @@ class _Glm5NextBlockBase(nn.Block):
         v_head_dim: int,
         qk_rope_head_dim: int,
         eps: float,
+        index_n_heads: int,
+        index_head_dim: int,
+        index_kpool: int,
+        index_topk: int,
+        index_kpool_always_select_tail: bool,
     ) -> None:
         self.Hq = num_attention_heads
         self.QRank = q_lora_rank
@@ -404,6 +430,11 @@ class _Glm5NextBlockBase(nn.Block):
             v_head_dim=v_head_dim,
             qk_rope_head_dim=qk_rope_head_dim,
             eps=eps,
+            index_n_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            index_kpool=index_kpool,
+            index_topk=index_topk,
+            index_kpool_always_select_tail=index_kpool_always_select_tail,
         )
 
     def _init_dense_ffn(self, *, d_model: int, intermediate_size: int) -> None:
@@ -509,7 +540,11 @@ class Glm5NextKdaDenseBlock(_Glm5NextBlockBase):
     ):
         super().__init__()
         self._init_common(
-            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters,
+            d_model=d_model,
+            eps=eps,
+            hc_mult=hc_mult,
+            hc_eps=hc_eps,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
             swiglu_limit=swiglu_limit,
         )
         self._init_kda(
@@ -558,7 +593,11 @@ class Glm5NextKdaMoEBlock(_Glm5NextBlockBase):
     ):
         super().__init__()
         self._init_common(
-            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters,
+            d_model=d_model,
+            eps=eps,
+            hc_mult=hc_mult,
+            hc_eps=hc_eps,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
             swiglu_limit=swiglu_limit,
         )
         self._init_kda(
@@ -612,10 +651,19 @@ class Glm5NextMlaDenseBlock(_Glm5NextBlockBase):
         hc_sinkhorn_iters: int = 20,
         swiglu_limit: float = 10.0,
         eps: float = 1e-5,
+        index_n_heads: int = 32,
+        index_head_dim: int = 128,
+        index_kpool: int = 16,
+        index_topk: int = 2048,
+        index_kpool_always_select_tail: bool = True,
     ):
         super().__init__()
         self._init_common(
-            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters,
+            d_model=d_model,
+            eps=eps,
+            hc_mult=hc_mult,
+            hc_eps=hc_eps,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
             swiglu_limit=swiglu_limit,
         )
         self._init_mla(
@@ -627,11 +675,16 @@ class Glm5NextMlaDenseBlock(_Glm5NextBlockBase):
             v_head_dim=v_head_dim,
             qk_rope_head_dim=qk_rope_head_dim,
             eps=eps,
+            index_n_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            index_kpool=index_kpool,
+            index_topk=index_topk,
+            index_kpool_always_select_tail=index_kpool_always_select_tail,
         )
         self._init_dense_ffn(d_model=d_model, intermediate_size=intermediate_size)
 
     def _mixer_out(self, h, position_ids):
-        return self.mla(h)
+        return self.mla(h, position_ids)
 
     def _ffn_out(self, h):
         return self._dense_ffn(h)
@@ -663,10 +716,19 @@ class Glm5NextMlaMoEBlock(_Glm5NextBlockBase):
         swiglu_limit: float = 10.0,
         eps: float = 1e-5,
         ep_size: int = 1,
+        index_n_heads: int = 32,
+        index_head_dim: int = 128,
+        index_kpool: int = 16,
+        index_topk: int = 2048,
+        index_kpool_always_select_tail: bool = True,
     ):
         super().__init__()
         self._init_common(
-            d_model=d_model, eps=eps, hc_mult=hc_mult, hc_eps=hc_eps, hc_sinkhorn_iters=hc_sinkhorn_iters,
+            d_model=d_model,
+            eps=eps,
+            hc_mult=hc_mult,
+            hc_eps=hc_eps,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
             swiglu_limit=swiglu_limit,
         )
         self._init_mla(
@@ -678,6 +740,11 @@ class Glm5NextMlaMoEBlock(_Glm5NextBlockBase):
             v_head_dim=v_head_dim,
             qk_rope_head_dim=qk_rope_head_dim,
             eps=eps,
+            index_n_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            index_kpool=index_kpool,
+            index_topk=index_topk,
+            index_kpool_always_select_tail=index_kpool_always_select_tail,
         )
         self._init_moe_ffn(
             d_model=d_model,
@@ -690,7 +757,7 @@ class Glm5NextMlaMoEBlock(_Glm5NextBlockBase):
         )
 
     def _mixer_out(self, h, position_ids):
-        return self.mla(h)
+        return self.mla(h, position_ids)
 
     def _ffn_out(self, h):
         return self._moe_ffn(h)

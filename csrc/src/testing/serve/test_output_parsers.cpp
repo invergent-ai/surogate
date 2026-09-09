@@ -165,7 +165,7 @@ void test_spark_tool_calls() {
         check(content == parsed.content, "Spark split-stream content");
     }
     for (const auto malformed : {
-        "<tool_call>bad.name</tool_call>", "<tool_call>weather<arg_key>city</arg_key></tool_call>",
+        "<tool_call>bad/name</tool_call>", "<tool_call>weather<arg_key>city</arg_key></tool_call>",
         "<tool_call>weather<arg_key>x</arg_key><arg_value>1</arg_value><arg_key>x</arg_key><arg_value>2</arg_value></tool_call>",
         "<tool_call>weather", "<tool_call>weather</tool_call>trailing"}) {
         const auto result = parse_tool_calls(ToolCallFormat::Spark25, malformed, 64);

@@ -605,6 +605,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
                                        const modules::ForwardHook* hook) {
+    ScopedGlmMatmul matmul_scope(mGlmMatmulKernels, mOptions.GlmRolloutParity);
     // dispatch-PP: a resumed sub-range segment shares the prior segment's
     // executor state, so skip the (re)initialization that would clear
     // mTensors/mNamedTensors and the cross-block residual.

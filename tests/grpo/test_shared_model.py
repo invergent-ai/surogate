@@ -39,6 +39,13 @@ def test_glm_uses_the_training_model_for_shared_rollouts():
     assert shared_execution(dummy_config(), ["all"]) == "training"
 
 
+def test_custom_or_missing_qwen_tool_template_uses_shared_training():
+    config = configurations()["qwen3"]
+    assert shared_execution(config, tokenizer=SimpleNamespace(chat_template=None)) == "training"
+    assert shared_execution(config, tokenizer=SimpleNamespace(chat_template="<tool_call>")) == "serve"
+    assert shared_execution(config, tokenizer=SimpleNamespace(chat_template="<arg_key>")) == "training"
+
+
 def test_quantized_and_bidirectional_models_are_rejected():
     config = configurations()["llama"]
     for change, message in ((dict(quantization_config={"quant_method": "mxfp4"}), "unquantized"),
@@ -105,6 +112,34 @@ def test_http_tokens_sampling_and_publication(service):
     server.begin_training()
     with pytest.raises(ValueError, match="live adapter"):
         server.publish("policy", [object()], 2)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_persistent_decode_prefills_once_and_resets_between_requests(service, fail):
+    server, trainer, url = service
+    server.persistent_decode = True
+    calls, resets = [], []
+
+    def decode(ids, reset=False):
+        calls.append((ids.tolist(), reset))
+        if fail and not reset:
+            raise RuntimeError("decode failed")
+        return np.array([0., -2., 2., 1., -1.], dtype=np.float32)
+
+    trainer.decode_logits = decode
+    trainer.reset_decode_state = lambda: resets.append(True)
+    trainer.next_token_logits = lambda *args: pytest.fail("GLM generation must use the persistent cache")
+    server.publish("policy", [], 0)
+    body = dict(model="policy", tokens=[0, 2], temperature=0, max_tokens=3)
+    for _ in range(2):
+        response = requests.post(url + "/v1/chat/completions/tokens", json=body, timeout=10)
+        assert response.status_code == (500 if fail else 200), response.text
+    per_request = [([0, 2], True), ([2], False)] + ([] if fail else [([2], False)])
+    assert calls == per_request * 2
+    assert len(resets) == 2
+    server.begin_training()
+    assert len(resets) == 3
+    assert server.summary()["persistent_decode"]
 
 
 def test_pause_drains_streams_and_rejects_new_requests(service):

@@ -8,8 +8,8 @@ import tempfile
 import threading
 from pathlib import Path
 
-from surogate.grpo.shared_weights import adapter_modules, borrow_weights, write_shared_artifact
 from surogate.grpo.shared_model import SharedModelServer, shared_execution
+from surogate.grpo.shared_weights import adapter_modules, borrow_weights, write_shared_artifact
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -63,7 +63,7 @@ def validate_configs(train, infer, orch):
     config = json.loads((Path(train.model_dir) / "config.json").read_text())
     shared_execution(config, train.lora_target_modules)
     text = config.get("text_config", config)
-    if (text.get("num_experts", text.get("num_local_experts", 0)) and
+    if (text.get("num_experts", text.get("num_local_experts", text.get("n_routed_experts", 0))) and
             getattr(train, "lora_dtype", "fp32") != "bf16"):
         raise ValueError("MoE shared-model GRPO requires lora_dtype: bf16 for expert adapter training")
 
@@ -171,12 +171,16 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
     orch_config.client.base_url = [f"http://127.0.0.1:{settings['port']}/v1"]
     trainer, server = None, None
     config = json.loads((Path(train_config.model_dir) / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    if config.get("model_type") == "glm5_next" or text_config.get("model_type") in ("glm5_next", "glm5_next_text"):
+        train_config.runtime_config.glm_rollout_parity = True
+        logger.info("GLM policy scoring uses recurrent FLA KDA and fixed-reduction GEMMs.")
     generation_config = Path(train_config.model_dir) / "generation_config.json"
     if generation_config.is_file():
         eos = json.loads(generation_config.read_text()).get("eos_token_id")
         if eos is not None:
             settings["eos_token_id"] = eos
-    execution = shared_execution(config, train_config.lora_target_modules)
+    execution = shared_execution(config, train_config.lora_target_modules, getattr(train_config, "tokenizer", None))
     with tempfile.TemporaryDirectory(prefix="surogate-shared-grpo-") as temporary:
         artifact = Path(temporary) / "model.sinfer"
         bindings = write_shared_artifact(train_config.model_dir, artifact) if execution == "serve" else None
@@ -187,8 +191,7 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
                 weights = borrow_weights(trainer.trainer, bindings)
                 server = _surogate_serve.SharedServer(str(artifact), weights, settings)
             else:
-                logger.info("Shared-model rollouts use the training runtime and recompute the prefix for each token. "
-                            "Start with short contexts and a small rollout batch.")
+                logger.info("Shared-model rollouts use the resident training model.")
                 server = SharedModelServer(trainer.trainer, train_config.tokenizer, config, settings)
             policy = SharedPolicy(server, train_config, orch_config)
             trainer.phase_controller = policy

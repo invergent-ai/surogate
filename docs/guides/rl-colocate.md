@@ -13,7 +13,7 @@ This mode supports the training families below, excluding **Nemotron**, using
 - Gemma 3 and Gemma 4, including E-series, unified, and MoE variants.
 - LFM2/LFM2.5, LFM2-MoE, Qwen3-VL, and LFM2-VL.
 - GPT-OSS and Laguna, when supplied as unquantized BF16 checkpoints.
-- GLM-5.3-Flash text, with context no longer than `index_topk`; see the
+- GLM-5.3-Flash text, including sparse DSA and persistent decode state; see the
   [tiny GLM fixture](../../examples/sft/glm/README.md) for tested settings and limitations.
 
 Multimodal checkpoints use **text prompts only**. Experimental training definitions
@@ -21,11 +21,23 @@ such as DeepSeek-V4 and Flash-Next are not included.
 
 Dense Qwen3 and Qwen3.5 use the optimized generation server. Other families generate
 through the same model instance that performs training. This general path processes
-requests one at a time and recomputes the prefix for every generated token, so long
-prompts and completions are considerably slower. Start with short contexts and a
-small rollout batch. It supports text completions, streaming, and token-based
-multi-turn conversations; tool-call parsing and structured outputs are not available
-on this path.
+requests one at a time. GLM prefills once, then carries recurrent, convolution,
+indexer and attention history across tokens. Other families recompute the prefix
+for each token. GLM's cache uses expanded K/V and its pooled indexer still allocates
+scores over all pools, so context length remains limited by available memory.
+State resets between requests and after training updates. This path supports text
+completions, streaming, and token-based multi-turn conversations with function
+tools. Structured `response_format` decoding remains unsupported on this path.
+
+For GLM, native co-locate automatically enables consistent rollout/scoring
+arithmetic before allocating the trainer: recurrent FLA KDA forward, fixed-order
+dense and expert GEMMs, and deterministic BF16 forward additions. This avoids
+batch-size rounding differences changing nearly tied expert or sparse-attention
+selections during GRPO scoring. Backward uses the FLA chunk kernels with FP32
+intermediates. Training forward sacrifices token parallelism for agreement with
+decode; ordinary SFT keeps its parallel chunk forward. `doc_masking: true` is
+required. Low-level Python users can select this mode with
+`options.glm_rollout_parity = True` before constructing `SurogateTrainer`.
 
 Choose a model and sequence length that fit your GPU together with training
 activations and optimizer state. The entire base must fit on one GPU, including all
@@ -123,3 +135,51 @@ contain readiness markers only.
 Quantized checkpoints, QLoRA, full fine-tuning, image/video prompts,
 Nemotron, multiple GPUs, CPU weight offload, QeRL weight noise, and
 checkpoint resume are not yet supported by native co-locate mode. Use the split-GPU runner for those.
+
+## Agentic tool rollouts
+
+Every supported family above accepts OpenAI function tools. Use a Verifiers
+`ToolEnv` (or an environment providing tool schemas and executing tool calls) and
+set `use_token_client: true`. The server returns structured `tool_calls` with
+JSON argument strings and `finish_reason: tool_calls`. The environment executes
+the function and supplies the next tool message. A runnable local example is
+[`examples/grpo/tools-orch.yaml`](../../examples/grpo/tools-orch.yaml).
+
+The shared training server chooses the parser from the checkpoint's actual chat
+template, including custom and `tool_use` variants:
+
+| Checkpoint protocol | Families using it |
+|---|---|
+| JSON inside `<tool_call>` | Qwen3, Qwen3-MoE, Qwen3-VL |
+| Function/parameter XML | Qwen3.5 and its variants |
+| Function/param XML | MiniCPM5 (including checkpoints identifying as Llama) |
+| Argument-key/value XML | GLM-5.3-Flash, Spark-X2.5, Laguna |
+| JSON or Python function lists | Llama tool templates, Gemma 3 tool templates |
+| Python function lists with control tokens | LFM2/LFM2.5, MoE and VL text variants |
+| Gemma tool and channel tokens | Gemma 4 variants |
+| Harmony channels and tool handoff | GPT-OSS |
+
+Templates without tool support get a JSON tool prompt and adapted tool history;
+checkpoints without a chat template use a basic text template. This provides the
+interface for base models too; it does not supply learned tool-use capability.
+The optimized Qwen server enables automatic tool choice and accepts both Qwen
+JSON and function/parameter XML responses.
+
+Raw completion IDs and per-token policy log probabilities include reasoning,
+tool syntax and stop tokens. Parsing changes only the HTTP message fields.
+The token client appends tool results while retaining earlier generated IDs;
+tool results have a zero loss mask. Its template bridge retains function names
+for GPT-OSS/Gemma and a stable dummy reasoning span for Qwen. It is installed
+in the orchestrator and its environment workers.
+
+Tool calls are exposed only after a complete, normally terminated generation.
+Incomplete, malformed, unknown-function or length-truncated calls remain text.
+Parallel calls are supported by formats that allow them. On the shared training
+path, `parallel_tool_calls: false` prevents returning multiple executable calls.
+That path supports `tool_choice: auto` and `none`; required/named choices and
+schema-constrained decoding are unavailable. Function `strict` metadata is
+accepted for Verifiers compatibility, but does not enable constrained sampling;
+the environment handles argument validation and execution errors.
+Tool arguments are buffered until completion in streaming responses; Harmony
+chat fields are also buffered, while raw token/logprob events continue to stream.
+Multimodal tool results remain unsupported; use text or text-only content parts.

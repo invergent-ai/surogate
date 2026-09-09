@@ -452,6 +452,22 @@ __global__ void conv_bwd(Ptr dy, Ptr x, Ptr w, const int* pos, float* dx, float*
     }
 }
 
+__global__ void conv_state_fwd(Ptr x, Ptr w, Ptr history, Ptr out, int T, int C, int K, bool initial) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const long base = static_cast<long>(c) * (K - 1);
+    if (initial)
+        for (int j = 0; j < K - 1; ++j) history.set(base + j, 0.f);
+    for (int t = 0; t < T; ++t) {
+        float current = x.get(static_cast<long>(t) * C + c);
+        float z = current * w.get(c * K + K - 1);
+        for (int j = K - 2; j >= 0; --j) z += history.get(base + j) * w.get(c * K + j);
+        for (int j = 0; j < K - 2; ++j) history.set(base + j, history.get(base + j + 1));
+        if (K > 1) history.set(base + K - 2, current);
+        out.set(static_cast<long>(t) * C + c, z * sigmoid(z));
+    }
+}
+
 __global__ void clamp_fwd(Ptr x, Ptr y, long n, float lo, float hi, int width) {
     long i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -477,6 +493,17 @@ void validate_hc(const Glm5Options& o) {
         throw std::runtime_error("mHC requires 1..8 streams and 1..64 Sinkhorn iterations");
 }
 }  // namespace
+
+void glm5_convolution_state(const Tensor& x, const Tensor& weight, const Tensor& state,
+                            const Tensor& output, bool initial, cudaStream_t stream) {
+    if (x.Rank != 3 || x.Sizes[0] != 1 || weight.Rank != 3 || output.nelem() != x.nelem())
+        throw std::runtime_error("GLM convolution decode requires one [1,T,C] sequence");
+    int C = x.Sizes[2], K = weight.Sizes[2];
+    if (state.nelem() != static_cast<long>(C) * (K - 1))
+        throw std::runtime_error("Invalid GLM convolution history");
+    conv_state_fwd<<<(C + 255) / 256, 256, 0, stream>>>(ptr(x), ptr(weight), ptr(state), ptr(output), x.Sizes[1], C, K, initial);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void glm5_forward(Glm5Kernel kind,
                   const std::vector<Tensor>& x,

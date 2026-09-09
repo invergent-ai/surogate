@@ -23,7 +23,7 @@
  * @param[in] nelem Total number of elements to process
  * @param[in] seed Random seed for stochastic rounding
  */
-template <typename T>
+template <typename T, bool Stochastic = true>
 __global__ void vector_add_sr_kernel(T* dest, const T* left, const T* right, float scale, long nelem, unsigned seed) {
     using vec_t = GenericVector<T, 16 / sizeof(T)>;
     long idx = (blockIdx.x * blockDim.x + threadIdx.x) * vec_t::size;
@@ -34,19 +34,25 @@ __global__ void vector_add_sr_kernel(T* dest, const T* left, const T* right, flo
         vec_t c = vec_t::zeros();
         for (int j = 0; j < vec_t::size; ++j) {
             float sum = scale * ((float)a[j] + (float)b[j]);
-            stochastic_rounding(sum, &c[j], seed + idx + j);
+            if constexpr (Stochastic)
+                stochastic_rounding(sum, &c[j], seed + idx + j);
+            else
+                c[j] = T(sum);
         }
         c.store(dest + idx);
     } else if (idx < nelem) {
         // Scalar tail path: handle remaining elements one by one
         for (long j = idx; j < nelem; ++j) {
             float sum = scale * ((float)left[j] + (float)right[j]);
-            stochastic_rounding(sum, &dest[j], seed + j);
+            if constexpr (Stochastic)
+                stochastic_rounding(sum, &dest[j], seed + j);
+            else
+                dest[j] = T(sum);
         }
     }
 }
 
-template <typename T>
+template <typename T, bool Stochastic = true>
 __global__ void vector_add_same_sr_kernel(T* dest, const T* src, float scale, long nelem, unsigned seed) {
     using vec_t = GenericVector<T, 16 / sizeof(T)>;
     long idx = (blockIdx.x * blockDim.x + threadIdx.x) * vec_t::size;
@@ -55,14 +61,20 @@ __global__ void vector_add_same_sr_kernel(T* dest, const T* src, float scale, lo
         vec_t c = vec_t::zeros();
         for (int j = 0; j < vec_t::size; ++j) {
             float sum = scale * ((float)a[j] + (float)a[j]);
-            stochastic_rounding(sum, &c[j], seed + idx + j);
+            if constexpr (Stochastic)
+                stochastic_rounding(sum, &c[j], seed + idx + j);
+            else
+                c[j] = T(sum);
         }
         c.store(dest + idx);
     } else if (idx < nelem) {
         for (long j = idx; j < nelem; ++j) {
             float value = (float)src[j];
             float sum = scale * (value + value);
-            stochastic_rounding(sum, &dest[j], seed + j);
+            if constexpr (Stochastic)
+                stochastic_rounding(sum, &dest[j], seed + j);
+            else
+                dest[j] = T(sum);
         }
     }
 }
@@ -150,7 +162,7 @@ __global__ void vector_reduce_sr_kernel(T* dest,
  * @param[in] seed Random seed for stochastic rounding
  * @param[in] stream CUDA stream for asynchronous execution
  */
-template <typename T>
+template <typename T, bool Stochastic = true>
 void vector_add_sr_imp(T* dest,
                        const T* left,
                        const T* right,
@@ -183,13 +195,28 @@ void vector_add_sr_imp(T* dest,
         throw std::runtime_error("vector_add_sr_imp: grid_size too large");
     }
     if (left == right) {
-        vector_add_same_sr_kernel<T>
+        vector_add_same_sr_kernel<T, Stochastic>
             <<<(unsigned int)grid_size, (unsigned int)block_size, 0, stream>>>(dest, left, scale, nelem, seed);
     } else {
-        vector_add_sr_kernel<T>
+        vector_add_sr_kernel<T, Stochastic>
             <<<(unsigned int)grid_size, (unsigned int)block_size, 0, stream>>>(dest, left, right, scale, nelem, seed);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Forward activations must round independently of their position in a batch,
+// packed sequence or decode buffer. Keep stochastic rounding for accumulation.
+void vector_add(float* dest, const float* left, const float* right, float scale, long nelem, cudaStream_t stream) {
+    vector_add_sr_imp<float, false>(dest, left, right, scale, nelem, 0, stream);
+}
+
+void vector_add(nv_bfloat16* dest,
+                const nv_bfloat16* left,
+                const nv_bfloat16* right,
+                float scale,
+                long nelem,
+                cudaStream_t stream) {
+    vector_add_sr_imp<nv_bfloat16, false>(dest, left, right, scale, nelem, 0, stream);
 }
 
 /**

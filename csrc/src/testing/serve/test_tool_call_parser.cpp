@@ -151,6 +151,38 @@ int test_incremental_filter_fallback() {
     return failures;
 }
 
+int test_checkpoint_json_and_schema_strings() {
+    using sinfer::serve::parse_qwen_tool_call_output;
+    sinfer::serve::ToolDefinition tool;
+    tool.name = "files.write";
+    tool.parameters_json = R"({"type":"object","properties":{"text":{"$ref":"#/$defs/Text"},"count":{"type":"integer"}},"$defs":{"Text":{"type":"string"}}})";
+    const auto parsed = parse_qwen_tool_call_output(
+        "<tool_call><function=files.write><parameter=text>\n  007\n\n</parameter>"
+        "<parameter=count>\n3\n</parameter></function></tool_call>", 64, {tool});
+    int failures = check(parsed.tool_calls.size() == 1, "namespaced function parsed");
+    if (parsed.tool_calls.empty()) { return failures; }
+    auto args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args["text"] == "  007\n" && args["count"] == 3, "schema preserves string bytes and numeric types");
+    const auto json = parse_qwen_tool_call_output(
+        R"(<tool_call>{"name":"files.write","arguments":{"text":"007","count":3}}</tool_call>)", 64, {tool});
+    failures += check(json.tool_calls.size() == 1, "Qwen3/Hermes JSON accepted");
+    if (!json.tool_calls.empty()) {
+        args = Json::parse(json.tool_calls[0].arguments_json);
+        failures += check(args["text"] == "007" && args["count"] == 3, "JSON types preserved");
+    }
+    const std::string duplicate = "<tool_call><function=f><parameter=x>1</parameter>"
+                                  "<parameter=x>2</parameter></function></tool_call>";
+    failures += check(!parse_qwen_tool_call_output(duplicate, 64).is_tool_call_response,
+                      "duplicate parameters do not execute");
+    tool.parameters_json = R"({"properties":{"text":{"anyOf":[{"type":"string"},{"type":"null"}]}}})";
+    const auto nullable = parse_qwen_tool_call_output(
+        "<tool_call><function=files.write><parameter=text>123</parameter></function></tool_call>", 64, {tool});
+    failures += check(nullable.tool_calls.size() == 1 &&
+                      Json::parse(nullable.tool_calls[0].arguments_json)["text"] == "123",
+                      "nullable string does not become a number");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -162,6 +194,7 @@ int main() {
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
+    failures += test_checkpoint_json_and_schema_strings();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

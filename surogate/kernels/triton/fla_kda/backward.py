@@ -59,7 +59,7 @@ def chunk_kda_bwd_kernel_dAv(
     b_A = tl.load(p_A, mask=m_AT, other=0.0)
 
     m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
-    b_A = tl.where(m_A, b_A, 0).to(do.dtype.element_ty)
+    b_A = tl.where(m_A, b_A, 0)
 
     b_dA = tl.zeros([BT, BT], dtype=tl.float32)
     for i_v in range(tl.cdiv(V, BV)):
@@ -73,7 +73,8 @@ def chunk_kda_bwd_kernel_dAv(
         # [BV, BT]
         b_v = tl.load(p_v, mask=m_vT, other=0.0)
         # [BT, BV]
-        b_do = tl.load(p_do, mask=m_tv, other=0.0)
+        # Surogate: use the intermediate precision for gradient products.
+        b_do = tl.load(p_do, mask=m_tv, other=0.0).to(b_v.dtype)
         # [BT, BT]
         b_dA += tl.dot(b_do, b_v)
         # [BT, BV]
@@ -203,7 +204,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
             p_dv = dv + o_t[:, None] * (HV*V) + o_v[None, :]
             # [BT, BV]
             b_v_new = tl.load(p_v_new, mask=m_tv, other=0.0)
-            b_do = tl.load(p_do, mask=m_tv, other=0.0)
+            b_do = tl.load(p_do, mask=m_tv, other=0.0).to(b_v_new.dtype)
             # [BV, BK]
             b_h = tl.load(p_h, mask=m_h, other=0.0)
             b_dh = tl.load(p_dh, mask=m_h, other=0.0)
@@ -219,7 +220,7 @@ def chunk_kda_bwd_kernel_wy_dqkg_fused(
                 p_v = v + o_t[:, None] * (HV*V) + o_v[None, :]
                 p_dv2 = dv2 + o_t[:, None] * (HV*V) + o_v[None, :]
 
-                b_v = tl.load(p_v, mask=m_tv, other=0.0)
+                b_v = tl.load(p_v, mask=m_tv, other=0.0).to(b_dv.dtype)
 
                 b_dA += tl.dot(b_dv, tl.trans(b_v))
 

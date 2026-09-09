@@ -104,25 +104,10 @@ def checkpoint_weights(model):
             yield name, tensor.contiguous()
 
 
-def create_dummy(output: Path, seed: int = 42):
-    import torch
-    from safetensors.torch import save_file
+def dummy_tokenizer():
+    """Byte tokenizer with the released chat/tool protocol, within the 512 IDs."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-    from transformers import Glm5NextConfig, Glm5NextForConditionalGeneration, PreTrainedTokenizerFast
-
-    if output.exists() and any(output.iterdir()):
-        raise ValueError(f"Output directory must be empty: {output}")
-    output.mkdir(parents=True, exist_ok=True)
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(seed)
-        model = Glm5NextForConditionalGeneration(Glm5NextConfig(**dummy_config())).to(torch.bfloat16)
-    # These small parameters are retained in FP32 by the training graph.
-    for name, param in model.named_parameters():
-        if name.endswith((".base", ".scale", ".A_log", ".dt_bias", ".e_score_correction_bias")):
-            param.data = param.data.float()
-    model.config.architectures = ["Glm5NextForConditionalGeneration"]
-    model.config.save_pretrained(output)
-    save_file(dict(checkpoint_weights(model)), str(output / "model.safetensors"), metadata={"format": "pt"})
+    from transformers import PreTrainedTokenizerFast
 
     vocab = {
         token: i for i, token in enumerate(["<pad>", "<eos>", "<unk>"] + sorted(pre_tokenizers.ByteLevel.alphabet()))
@@ -133,8 +118,44 @@ def create_dummy(output: Path, seed: int = 42):
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=backend, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>"
     )
-    tokenizer.chat_template = "{% for message in messages %}{{ message['role'] + ': ' + message['content'] + '\n' }}{% endfor %}{% if add_generation_prompt %}{{ 'assistant: ' }}{% else %}{{ eos_token }}{% endif %}"
+    tokenizer.add_special_tokens(dict(additional_special_tokens=[
+        "[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>", "<|observation|>",
+        "<think>", "</think>", "<tool_call>", "</tool_call>",
+        "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
+    ]))
+    tokenizer.chat_template = Path(__file__).with_name("chat_template.jinja").read_text()
+    return tokenizer
+
+
+def create_dummy(output: Path, seed: int = 42, index_topk: int = 256, max_sequence_length: int = 256):
+    import torch
+    from safetensors.torch import save_file
+    from transformers import Glm5NextConfig, Glm5NextForConditionalGeneration
+
+    if output.exists() and any(output.iterdir()):
+        raise ValueError(f"Output directory must be empty: {output}")
+    if max_sequence_length <= 0:
+        raise ValueError("max_sequence_length must be positive")
+    output.mkdir(parents=True, exist_ok=True)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        config = dummy_config()
+        config["text_config"]["index_topk"] = index_topk
+        config["text_config"]["max_position_embeddings"] = max_sequence_length
+        model = Glm5NextForConditionalGeneration(Glm5NextConfig(**config)).to(torch.bfloat16)
+    # These small parameters are retained in FP32 by the training graph.
+    for name, param in model.named_parameters():
+        if name.endswith((".base", ".scale", ".A_log", ".dt_bias", ".e_score_correction_bias")):
+            param.data = param.data.float()
+    model.config.architectures = ["Glm5NextForConditionalGeneration"]
+    model.config.save_pretrained(output)
+    save_file(dict(checkpoint_weights(model)), str(output / "model.safetensors"), metadata={"format": "pt"})
+
+    tokenizer = dummy_tokenizer()
     tokenizer.save_pretrained(output)
+    (output / "generation_config.json").write_text(json.dumps(dict(
+        eos_token_id=[tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|observation|>"),
+                      tokenizer.convert_tokens_to_ids("<|user|>")], pad_token_id=tokenizer.pad_token_id)) + "\n")
     (output / "dummy_model.json").write_text(
         json.dumps(
             {
@@ -153,6 +174,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("models/dummy-glm-5.3-flash"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--index-topk",
+        type=int,
+        default=256,
+        help="Selected DSA tokens; use 32 to exercise sparsity with the 128-token examples",
+    )
+    parser.add_argument(
+        "--max-sequence-length", type=int, default=256, help="Model context limit; increase this for long-rollout tests"
+    )
     args = parser.parse_args()
-    model = create_dummy(args.output, args.seed)
+    model = create_dummy(args.output, args.seed, args.index_topk, args.max_sequence_length)
     print(f"Saved {sum(p.numel() for p in model.parameters()):,} parameters to {args.output}")

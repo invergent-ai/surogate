@@ -106,9 +106,8 @@ def _synthesize_generation_config(root: Path) -> bytes:
     Not every model in this family ships `generation_config.json` — `Qwen/Qwen3.5-0.8B`
     and `Qwen3.5-9B` do not, and the hub returns 404 for it — but the engine requires
     one and reads `eos_token_id` out of it to seed its default stop tokens. That field
-    is not missing information: it is in `config.json`, which every checkpoint has. So
-    the converter carries it across rather than refusing a checkpoint for a file the
-    publisher chose not to write.
+    lives in config.json, but chat checkpoints may also use a different tokenizer
+    EOS for end-of-turn. Retain both so tool calls terminate at the chat boundary.
     """
 
     config = json.loads((root / "config.json").read_text())
@@ -118,6 +117,29 @@ def _synthesize_generation_config(root: Path) -> bytes:
         value = text.get(key, config.get(key))
         if value is not None:
             generation[key] = value
+    tokenizer_config = root / "tokenizer_config.json"
+    if tokenizer_config.exists():
+        tokenizer = json.loads(tokenizer_config.read_text())
+        token = tokenizer.get("eos_token")
+        if isinstance(token, dict):
+            token = token.get("content")
+        if isinstance(token, str):
+            chat_eos = next((int(i) for i, added in tokenizer.get("added_tokens_decoder", {}).items()
+                             if added.get("content") == token), None)
+            if chat_eos is None and (root / "tokenizer.json").exists():
+                backend = json.loads((root / "tokenizer.json").read_text())
+                chat_eos = next((added["id"] for added in backend.get("added_tokens", [])
+                                 if added.get("content") == token), None)
+                if chat_eos is None:
+                    vocab = backend.get("model", {}).get("vocab", {})
+                    if isinstance(vocab, dict):
+                        chat_eos = vocab.get(token)
+            if chat_eos is not None:
+                current = generation.get("eos_token_id", [])
+                stops = list(current) if isinstance(current, list) else [current]
+                if chat_eos not in stops:
+                    stops.append(chat_eos)
+                generation["eos_token_id"] = stops[0] if len(stops) == 1 else stops
     if "eos_token_id" not in generation:
         raise ValueError(
             "cannot synthesize generation_config.json: config.json declares no eos_token_id, "

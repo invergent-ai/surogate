@@ -31,7 +31,7 @@ enum class ReasoningFormat {
 /// How a model emits a tool call.
 enum class ToolCallFormat {
     None,        ///< tool calls are not parsed out of the text
-    QwenXml,     ///< `<tool_call>{"name":..,"arguments":{..}}</tool_call>` (qwen3_xml, hermes)
+    QwenXml,     ///< JSON or function/parameter XML inside `<tool_call>` (qwen3_xml, hermes)
     Spark25,     ///< `<tool_call>name<arg_key>key</arg_key><arg_value>value</arg_value></tool_call>`
     Llama3Json,  ///< bare `{"name":..,"parameters":{..}}`, optionally after `<|python_tag|>`
 };
@@ -67,6 +67,7 @@ struct ParsedToolCalls {
     std::vector<ToolCall> tool_calls;
 };
 [[nodiscard]] ParsedToolCalls parse_tool_calls(ToolCallFormat format, const std::string& text,
-                                               std::size_t max_tool_name_length);
+                                               std::size_t max_tool_name_length,
+                                               const std::vector<ToolDefinition>& tools = {});
 
 } // namespace sinfer::serve

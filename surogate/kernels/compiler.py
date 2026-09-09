@@ -43,6 +43,7 @@ import json
 import logging
 import re
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -115,7 +116,17 @@ def compile_triton_kernel(
     if dot_input_precision is not None:
         options["default_dot_input_precision"] = dot_input_precision
 
-    compiled = triton_compile(src, target=target, options=options)
+    # Triton 3.7's tl.dot resolves its default from language knobs before the
+    # backend sees default_dot_input_precision. Set both, and restore the knob
+    # (and its environment variable) after compiling this kernel.
+    import triton
+
+    language = getattr(getattr(triton, "knobs", None), "language", None)
+    precision_scope = language.scope() if dot_input_precision is not None and language is not None else nullcontext()
+    with precision_scope:
+        if dot_input_precision is not None and language is not None:
+            language.fp32_default = dot_input_precision
+        compiled = triton_compile(src, target=target, options=options)
 
     # Extract cubin and metadata
     cubin = compiled.asm["cubin"]

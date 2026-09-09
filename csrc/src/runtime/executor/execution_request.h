@@ -50,7 +50,9 @@ struct ExecutionResult {
     std::optional<float> accuracy;
 };
 
+struct GlmDecodeState;
 struct ExecutionRequest {
+    GlmDecodeState* glm_decode_state = nullptr;
     long batch = 0;
     long sequence = 0;
     ExecutionMode mode = ExecutionMode::Forward;

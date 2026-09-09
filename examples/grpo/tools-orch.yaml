@@ -1,0 +1,22 @@
+# Use with the existing train.yaml and infer.yaml in a fresh outputs/grpo directory.
+model:
+  name: Qwen/Qwen3-0.6B
+  lora_adapter: default
+env:
+  - id: tool-env
+    path: ./examples/grpo
+batch_size: 8
+rollouts_per_example: 8
+sequence_len: 2048
+max_steps: 20
+use_token_client: true
+sampling:
+  temperature: 1.0
+  max_tokens: 512
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+client:
+  base_url:
+    - http://localhost:8007/v1
+output_dir: ./outputs/grpo/run_tools

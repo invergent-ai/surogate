@@ -201,6 +201,9 @@ enum class CompiledOpType : std::uint8_t {
     ClampBackward,
     GlmCausalConv1d,
     GlmCausalConv1dBackward,
+    GlmDsaIndexer,
+    GlmDsaAttention,
+    GlmDsaAttentionBackward,
     // Sentinel
     Unknown
 };

@@ -1398,6 +1398,8 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         if (!dsl_model) {
             throw std::runtime_error("train_step_graphed: only supported for DSL models");
         }
+        // Graph replay bypasses DslModel's host-side optimizer entry points.
+        dsl_model->reset_decode_state();
         if (config.type != optimizers::OptimizerType::ADAMW && config.type != optimizers::OptimizerType::ADAMW_8BIT &&
             config.type != optimizers::OptimizerType::NORMUON) {
             throw std::runtime_error("train_step_graphed: only supports AdamW, AdamW 8-bit or NorMuon optimizer");
@@ -3326,6 +3328,31 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_shared_base_w
         result = model->shared_base_weights();
     }, 0);
     return result;
+}
+
+std::vector<float> MultiGPUPyTrainer::decode_logits(const std::int32_t* input_ids, int T, bool reset) {
+    if (mContexts.size() != 1) throw std::invalid_argument("Persistent decode requires one GPU");
+    std::vector<float> result;
+    std::exception_ptr error;
+    run_work([&](sThreadContext& ctx) {
+        try {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model) throw std::runtime_error("Persistent decode requires a DSL model");
+            result = model->decode_logits(input_ids, T, reset, seq_length(), *ctx.Communicator);
+        } catch (...) {
+            // Request errors (missing prefill, context limit, invalid token)
+            // must not terminate the trainer's worker.
+            error = std::current_exception();
+        }
+    }, 0);
+    if (error) std::rethrow_exception(error);
+    return result;
+}
+
+void MultiGPUPyTrainer::reset_decode_state() {
+    run_work([](sThreadContext& ctx) {
+        if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) model->reset_decode_state();
+    });
 }
 
 std::vector<float> MultiGPUPyTrainer::next_token_logits(const std::int32_t* input_ids,

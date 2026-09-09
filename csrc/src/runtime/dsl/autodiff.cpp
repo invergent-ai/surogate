@@ -343,14 +343,17 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         BackwardRuleContext ctx{fwd_op, d_outputs, d_output, d_inputs, shape_env, op_counter, &forward};
         std::vector<Operation> bwd_ops = rule(ctx);
 
-        // Add generated operations to backward graph
+        // Rules may stop gradients for selected inputs (e.g. discrete DSA
+        // indices). Only publish gradients that the rule actually produces.
+        std::unordered_set<std::string> produced;
         for (auto& bwd_op : bwd_ops) {
+            produced.insert(bwd_op.outputs.begin(), bwd_op.outputs.end());
             backward.operations.push_back(std::move(bwd_op));
         }
 
         // Update gradient map with accumulation if needed
         for (size_t i = 0; i < fwd_op.inputs.size(); ++i) {
-            if (d_inputs[i].empty()) {
+            if (d_inputs[i].empty() || !produced.count(d_inputs[i])) {
                 continue;
             }
 

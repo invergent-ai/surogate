@@ -41,6 +41,8 @@
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/jit/gated_delta_rule_kernels.h"
 #include "runtime/jit/kimi_delta_rule_kernels.h"
+#include "runtime/jit/glm_dsa_kernels.h"
+#include "runtime/jit/glm_matmul_kernels.h"
 
 namespace ep {
 class EPStrategy;
@@ -648,6 +650,7 @@ public:
     void dispatch_chunk_gated_delta_rule_backward(const CompiledOp& op);
     void dispatch_glm5(const CompiledOp& op);
     void dispatch_glm5_backward(const CompiledOp& op);
+    void dispatch_glm_dsa(const CompiledOp& op);
     void backward_moe_base_weights(const CompiledOp& op,
                                    const Tensor& dout,
                                    const Tensor& input,
@@ -802,6 +805,8 @@ private:
     // JIT-compiled Triton kernels for gated delta rule (loaded once from manifests)
     GatedDeltaRuleKernels mGdrKernels;
     KimiDeltaRuleKernels mKdaKernels;
+    GlmMatmulKernels mGlmMatmulKernels;
+    GlmDsaKernels mDsaKernels;
 
     // Log-prob extraction context (null in training mode)
     float* mLogprobsGpu = nullptr;

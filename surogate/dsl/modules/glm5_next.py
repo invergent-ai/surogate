@@ -2,10 +2,10 @@
 
 Native CUDA implements the manifold hyper-connections, bounded KDA decay and
 packed causal convolution. BF16 KDA training uses registered, vendored FLA
-Triton kernels; FP32 or disabled document masking uses the CUDA reference
-recurrence. MLA uses packed QKV with the existing attention dispatcher. Every SwiGLU applies GLM's
-asymmetric gate/up clamp. Sparse DSA selection remains outside the training graph;
-the runtime limits sequence length to ``index_topk``.
+Triton kernels; standalone FP32 KDA or disabled document masking uses the CUDA
+reference recurrence. MLA uses frozen pooled DSA selection and differentiable
+sparse attention. Every SwiGLU applies GLM's asymmetric gate/up clamp. Decode
+carries convolution, recurrent, indexer and attention history between calls.
 """
 
 from __future__ import annotations
@@ -364,12 +364,9 @@ class Glm5NextLatentAttention(Module):
         k,v = split(kv_b( rmsnorm(kv_a(x)) ).view(B,T,H,-1), [qk_nope, v_head])
         out = o_proj( attention(q, k, v, causal, scale=qk_head_dim**-0.5) )
 
-    DEFERRED: the DSA indexer (``wq_b``/``wk``/``k_norm``/``weights_proj`` plus
-    the k-pool compression tensors) and its top-k masking. Training runs dense
-    causal attention, which is the exact semantics whenever the sequence fits
-    inside ``index_topk`` with tail selection enabled. The
-    indexer tensors are simply not declared here, mirroring how ``qwen4_exp``
-    treats its QSA indexer.
+    The frozen DSA indexer selects complete key pools plus the optional current
+    tail. Attention gathers only the selected keys; its Q/K/V backward remains
+    differentiable. Packed position IDs reset pooling at document boundaries.
     """
 
     def __init__(
@@ -382,6 +379,11 @@ class Glm5NextLatentAttention(Module):
         v_head_dim: int,
         qk_rope_head_dim: int = 0,
         eps: float = 1e-5,
+        index_n_heads: int = 32,
+        index_head_dim: int = 128,
+        index_kpool: int = 16,
+        index_topk: int = 2048,
+        index_kpool_always_select_tail: bool = True,
     ) -> None:
         super().__init__()
         if qk_rope_head_dim != 0:
@@ -413,10 +415,15 @@ class Glm5NextLatentAttention(Module):
         self.VDim = num_heads * v_head_dim
         self.qk_nope_head_dim = qk_nope_head_dim
         self.softmax_scale = float(self.QKHead) ** -0.5
+        self.index_n_heads = index_n_heads
+        self.index_head_dim = index_head_dim
+        self.index_kpool = index_kpool
+        self.index_topk = index_topk
+        self.index_tail = index_kpool_always_select_tail
 
     def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
-        (x,) = args
+        x, positions = args
 
         # -- params ----------------------------------------------------------
         q_a_w = tracer.register_param("q_a_weight", (self.QRank, "C"))
@@ -432,6 +439,25 @@ class Glm5NextLatentAttention(Module):
         out_w = tracer.register_param(
             "out_weight", ("C", self.VDim), lora_targets=[LoRATarget(name="o", size=self.d_model)]
         )
+        ih, idim, pool = self.index_n_heads, self.index_head_dim, self.index_kpool
+        index_weights = {
+            "index_q_weight": (ih * idim, self.QRank),
+            "index_k_weight": (idim, "C"),
+            "index_head_weight": (ih, "C"),
+            "index_compress_weight": (idim, "C"),
+            "index_norm_weight": (idim,),
+            "index_norm_bias": (idim,),
+            "index_ape": (pool, idim),
+        }
+        for name, shape in index_weights.items():
+            tracer.register_param(name, shape, frozen=True, quantizable=False)
+        index_slot = tracer.register_activation(
+            "indices",
+            ("B", "T", self.index_topk + (pool - 1 if self.index_tail else 0)),
+            dtype="int32",
+            save=True,
+            share_policy="per_layer",
+        )
 
         # -- activation slots ------------------------------------------------
         tracer.register_activation("q_a_rstd", ("B * T",), dtype="fp32", save=True)
@@ -441,10 +467,12 @@ class Glm5NextLatentAttention(Module):
             ("B * T", self.QRank),
             save=True,
             share_policy="per_layer",
-            description="Query latent (also the DSA indexer's input, when it lands)",
+            description="Normalized query latent, shared with the DSA indexer",
         )
         att_slot = tracer.register_activation("att", ("B", "T", self.VDim), save=True, share_policy="always_recompute")
-        tracer.register_activation("lse", ("B", self.Hq, "T"), dtype="fp32", save=True, share_policy="always_recompute")
+        qkv_slot = tracer.register_activation(
+            "qkv", ("B", "T", 3 * self.Hq, self.QKHead), save=True, share_policy="always_recompute"
+        )
         out_slot = tracer.register_activation(
             "att_out", ("B", "T", "C"), share_policy="per_layer", description="MLA output"
         )
@@ -479,14 +507,28 @@ class Glm5NextLatentAttention(Module):
         )
         key, value = g.split(kv, dim=3, split_size=[self.qk_nope_head_dim, self.VHead])
 
-        qkv = g.concat(query, key, value, dim=2, split_size=[self.Hq] * 3, out_name=tracer.prefixed("qkv"))
-        attn_out, _lse = g.flash_attention(
-            qkv,
-            causal=True,
-            softmax_scale=self.softmax_scale,
-            out_name=att_slot,
-            lse_name=tracer.prefixed("lse"),
+        qkv = g.concat(query, key, value, dim=2, split_size=[self.Hq] * 3, out_name=qkv_slot)
+        index_q = g.matmul(q_resid, tracer.prefixed("index_q_weight"), transpose="NT")
+        index_q = g.view(index_q, shape=[B, T, ih, idim])
+        index_k = g.view(g.matmul(x_flat, tracer.prefixed("index_k_weight"), transpose="NT"), shape=[B, T, idim])
+        index_gate = g.view(
+            g.matmul(x_flat, tracer.prefixed("index_compress_weight"), transpose="NT"), shape=[B, T, idim]
         )
+        index_head = g.view(g.matmul(x_flat, tracer.prefixed("index_head_weight"), transpose="NT"), shape=[B, T, ih])
+        indices = g.custom(
+            "glm_dsa_indexer",
+            index_q,
+            index_k,
+            index_gate,
+            index_head,
+            tracer.prefixed("index_norm_weight"),
+            tracer.prefixed("index_norm_bias"),
+            tracer.prefixed("index_ape"),
+            positions.ref,
+            out_name=index_slot,
+            index_size=self.index_topk + (pool - 1 if self.index_tail else 0),
+        )
+        attn_out = g.custom("glm_dsa_attention", qkv, indices, out_name=att_slot)
 
         att_flat = g.view(attn_out, shape=[B * T, self.VDim], out_name=tracer.prefixed("att_flat"))
         out_flat = g.matmul(att_flat, out_w, transpose="NT", out_name=tracer.prefixed("att_out_flat"))

@@ -1,23 +1,26 @@
 """Text rollouts through the same native DSL model used for training.
 
-This path recomputes the prefix and serializes generation on the trainer's
-workspace. It needs neither a second model nor serving-specific weight layouts.
+Generation is serialized on the trainer's workspace. GLM keeps recurrent and
+attention history across decode calls; other families recompute the prefix.
+Weights and adapters belong to the trainer throughout generation.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
+from surogate.grpo.tool_protocol import request_tools, select_protocol
 
-def shared_execution(config: dict, targets=()) -> str:
+
+def shared_execution(config: dict, targets=(), tokenizer=None) -> str:
     """Select the optimized server where available, otherwise the training model."""
     from surogate.dsl import models  # noqa: F401
     from surogate.dsl.ir_builder import resolve_architecture
@@ -41,6 +44,10 @@ def shared_execution(config: dict, targets=()) -> str:
         raise ValueError("shared-model GRPO requires a causal language model")
     standard = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "all"}
     if spec.hf_config.model_type in ("qwen3", "qwen3_5", "qwen3_5_text") and not set(targets or ()) - standard:
+        if tokenizer is not None:
+            protocol = select_protocol(tokenizer, config, [dict(type="function", function=dict(name="f"))])
+            if protocol.fallback or protocol.name not in ("json_xml", "qwen_coder"):
+                return "training"
         return "serve"
     return "training"
 
@@ -53,7 +60,7 @@ class SharedModelServer:
     def __init__(self, trainer, tokenizer, config: dict, settings: dict):
         import torch
 
-        self.trainer, self.tokenizer = trainer, tokenizer
+        self.trainer, self.tokenizer, self.config = trainer, tokenizer, config
         self.model = settings["model"]
         self.context = min(settings["max_context"], trainer.seq_length)
         self.capacity = settings["max_concurrency"]
@@ -69,9 +76,16 @@ class SharedModelServer:
         allocations = {(t.data_ptr(), t.numel() * t.element_size()) for t in base}
         self.base_bytes = sum(size for _, size in allocations)
         text = config.get("text_config", config)
+        self.persistent_decode = config.get("model_type") == "glm5_next" or text.get("model_type") in ("glm5_next", "glm5_next_text")
+        if self.persistent_decode and not hasattr(trainer, "decode_logits"):
+            raise ValueError("GLM persistent decode requires the current native training extension")
         self.vocab = text["vocab_size"]
         eos = settings.get("eos_token_id", text.get("eos_token_id", config.get("eos_token_id", tokenizer.eos_token_id)))
         self.eos = set(eos if isinstance(eos, list) else [eos]) - {None}
+        # Some chat checkpoints keep the base-model EOS in config.json while
+        # the tokenizer uses a different end-of-turn token (Qwen3.5-0.8B).
+        if tokenizer.eos_token_id is not None:
+            self.eos.add(tokenizer.eos_token_id)
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -168,6 +182,8 @@ class SharedModelServer:
             self.sleeping = True
             self.condition.notify_all()
             self.condition.wait_for(lambda: self.active == 0)
+        if self.persistent_decode:
+            self.trainer.reset_decode_state()
 
     def publish(self, name, modules, version):
         with self.condition:
@@ -181,7 +197,7 @@ class SharedModelServer:
         with self.condition:
             return dict(policy_version=self.version, shared_base_bytes=self.base_bytes,
                         serving_base_allocated_bytes=0, base_upload_bytes=0,
-                        sleeping=self.sleeping, execution="training")
+                        sleeping=self.sleeping, execution="training", persistent_decode=self.persistent_decode)
 
     def close(self):
         with self.condition:
@@ -195,17 +211,23 @@ class SharedModelServer:
         self.trainer = None
 
     def tokenize(self, body):
+        tools = request_tools(body)
         if "tokens" in body:
             tokens = body["tokens"]
         elif "messages" in body:
             messages = body["messages"]
             if not isinstance(messages, list) or not messages or any(not isinstance(m, dict) for m in messages):
                 raise ValueError("messages must be a nonempty list")
-            for message in messages:
-                if not isinstance(message.get("content", ""), str):
-                    raise ValueError("shared-model GRPO currently accepts text messages only")
             kwargs = dict(body.get("chat_template_kwargs") or {})
+            protocol = select_protocol(self.tokenizer, self.config, tools, kwargs)
+            messages = protocol.messages(messages, tools)
+            kwargs["chat_template"] = protocol.chat_template
             kwargs.update(tokenize=True, return_dict=False, add_generation_prompt=body.get("add_generation_prompt", True))
+            # Use the same schema and template arguments on generation and on
+            # Verifiers' /tokenize bridge calls between agent turns.
+            kwargs["tools"] = tools or None
+            if "reasoning_effort" in body:
+                kwargs["reasoning_effort"] = body["reasoning_effort"]
             tokens = self.tokenizer.apply_chat_template(messages, **kwargs)
         else:
             tokens = self.tokenizer.encode(body["prompt"], add_special_tokens=body.get("add_special_tokens", True))
@@ -214,8 +236,9 @@ class SharedModelServer:
         return tokens
 
     def prepare(self, body):
-        if body.get("n", 1) != 1 or body.get("tools") or body.get("response_format"):
-            raise ValueError("shared training execution supports one text completion per request")
+        if body.get("n", 1) != 1 or body.get("response_format"):
+            raise ValueError("shared training execution supports one completion per request, without response_format")
+        tools = request_tools(body)
         prompt = self.tokenize(body)
         maximum = int(body.get("max_completion_tokens", body.get("max_tokens", 128)))
         minimum = int(body.get("min_tokens", 0))
@@ -250,28 +273,41 @@ class SharedModelServer:
             stop = [stop]
         if not isinstance(stop, list) or any(not isinstance(s, str) or not s for s in stop):
             raise ValueError("stop must contain nonempty strings")
+        protocol = select_protocol(self.tokenizer, self.config, tools, body.get("chat_template_kwargs"))
+        tail = self.tokenizer.decode(prompt[-256:], skip_special_tokens=False)
         return body | dict(prompt_ids=prompt, maximum=min(maximum, self.context - len(prompt)),
-                           minimum=minimum, stop=stop)
+                           minimum=minimum, stop=stop, parsed_tools=tools, protocol=protocol, prompt_tail=tail)
 
     def generate(self, request, callback=None):
         # One workspace serves all admitted requests; begin_training waits for
         # both the running request and admitted requests waiting on this lock.
         with self.compute_lock:
-            return self._generate(request, callback)
+            try:
+                return self._generate(request, callback)
+            finally:
+                if self.persistent_decode:
+                    self.trainer.reset_decode_state()
 
     def _generate(self, request, callback):
         prompt = request["prompt_ids"]
-        inputs = np.zeros((self.trainer.batch_size, self.trainer.seq_length), dtype=np.int32)
-        inputs[0, :len(prompt)] = prompt
+        inputs = None if self.persistent_decode else np.zeros((self.trainer.batch_size, self.trainer.seq_length), dtype=np.int32)
+        if inputs is not None:
+            inputs[0, :len(prompt)] = prompt
         positions = np.zeros(self.trainer.batch_size, dtype=np.int32)
         rng = np.random.default_rng(request.get("seed"))
-        ids, scores, text, emitted = [], [], "", ""
+        ids, scores, text = [], [], ""
+        emitted_fields = dict(content="", reasoning_content="")
+        message = dict(role="assistant", content="")
         identifier, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
         finish = "length"
         eos = (set() if request.get("ignore_eos", False) else self.eos) | set(request.get("stop_token_ids") or [])
         for step in range(request["maximum"]):
             positions[0] = len(prompt) + step - 1
-            logits = self.trainer.next_token_logits(inputs, positions)[0].astype(np.float64)
+            if self.persistent_decode:
+                tokens = np.asarray(prompt if step == 0 else [ids[-1]], dtype=np.int32)
+                logits = self.trainer.decode_logits(tokens, reset=step == 0).astype(np.float64)
+            else:
+                logits = self.trainer.next_token_logits(inputs, positions)[0].astype(np.float64)
             if not np.isfinite(logits).all():
                 raise RuntimeError("model returned nonfinite logits")
             temperature = float(request.get("temperature", 1.))
@@ -301,7 +337,8 @@ class SharedModelServer:
                 raise ValueError("sampling constraints removed every token or model logits are nonfinite")
             token = int(np.argmax(sampling) if temperature == 0 else rng.choice(len(sampling), p=probabilities))
             ids.append(token)
-            inputs[0, len(prompt) + step] = token
+            if inputs is not None:
+                inputs[0, len(prompt) + step] = token
             piece = self.tokenizer.decode([token], skip_special_tokens=False)
             score = dict(token=piece, logprob=float(logprobs[token]), bytes=list(piece.encode()), top_logprobs=[])
             top_count = int(request.get("top_logprobs", 0) or 0)
@@ -310,8 +347,16 @@ class SharedModelServer:
                 token_text = self.tokenizer.decode([int(t)], skip_special_tokens=False)
                 score["top_logprobs"].append(dict(token=token_text, logprob=float(logprobs[t]), bytes=list(token_text.encode())))
             scores.append(score)
-            text = self.tokenizer.decode(ids, skip_special_tokens=True)
             stopped = token in eos
+            # Tool/think delimiters may themselves be special tokens. Preserve
+            # them for parsing, removing only a terminal model EOS from the
+            # text view. The training token/logprob arrays retain every token.
+            protocol = request["protocol"]
+            # Harmony's terminal token identifies tool handoff versus a final
+            # answer. LFM/Gemma may use their closing tool tag as EOS too.
+            keep_terminal = protocol.name == "harmony" or piece in ("<|tool_call_end|>", "<tool_call|>", "</tool_call>")
+            text_ids = ids[:-1] if stopped and token in self.eos and not keep_terminal else ids
+            text = self.tokenizer.decode(text_ids, skip_special_tokens=False)
             if step + 1 >= request["minimum"]:
                 matches = [text.index(stop) for stop in request["stop"] if stop in text]
                 if matches:
@@ -321,16 +366,35 @@ class SharedModelServer:
             stable = text if final else text[:len(text) - max((len(s) - 1 for s in request["stop"]), default=0)]
             if not final and "\ufffd" in stable:
                 stable = stable[:stable.index("\ufffd")]
-            delta, emitted = stable[len(emitted):], stable
+            parse_tools = request["parsed_tools"] if not final or stopped else []
+            fields = protocol.parse(stable, parse_tools, prefix=request["prompt_tail"], final=final)
+            if not request.get("parallel_tool_calls", True) and len(fields.get("tool_calls", [])) > 1:
+                fields = protocol.parse(stable, [], prefix=request["prompt_tail"], final=final)
+            delta = dict(role="assistant")
+            for key in ("content", "reasoning_content"):
+                value = fields[key]
+                if value != emitted_fields[key]:
+                    delta[key] = value[len(emitted_fields[key]):]
+                emitted_fields[key] = value
+            if fields.get("tool_calls"):
+                delta["tool_calls"] = [dict(index=i, **call) for i, call in enumerate(fields["tool_calls"])]
+            message = dict(role="assistant", content=fields["content"])
+            if fields["reasoning_content"]:
+                message["reasoning_content"] = fields["reasoning_content"]
+            if fields.get("tool_calls"):
+                message["tool_calls"] = fields["tool_calls"]
+                message["content"] = fields["content"] or None
             if callback:
                 callback(dict(id=identifier, created=created, object="chat.completion.chunk", model=self.adapter,
-                    choices=[dict(index=0, delta=dict(role="assistant", content=delta), token_ids=[token],
+                    choices=[dict(index=0, delta=delta, token_ids=[token],
                                   logprobs=dict(content=[score]) if request.get("logprobs") else None, finish_reason=None)]))
             if stopped:
                 finish = "stop"
                 break
+        if message.get("tool_calls"):
+            finish = "tool_calls"
         return dict(id=identifier, created=created, object="chat.completion", model=self.adapter,
-            prompt_token_ids=prompt, choices=[dict(index=0, message=dict(role="assistant", content=text),
+            prompt_token_ids=prompt, choices=[dict(index=0, message=message,
                 token_ids=ids, logprobs=dict(content=scores) if request.get("logprobs") else None, finish_reason=finish)],
             usage=dict(prompt_tokens=len(prompt), completion_tokens=len(ids), total_tokens=len(prompt) + len(ids)))
 

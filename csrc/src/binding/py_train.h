@@ -282,6 +282,8 @@ public:
     // use_lora=true applies LoRA (policy model); use_lora=false skips LoRA (reference model).
     // position_ids: optional [B, T] position IDs for packed sequences (nullptr = sequential).
     // Returns B*T float log-probs; masked positions (target==-100) receive 0.
+    std::vector<float> decode_logits(const std::int32_t* input_ids, int T, bool reset);
+    void reset_decode_state();
     std::vector<float> next_token_logits(const std::int32_t* input_ids,
                                          const std::int32_t* last_positions, int B, int T);
 

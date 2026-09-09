@@ -133,6 +133,9 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
         install_env(env_id)
 
     # Setup inference pool
+    from surogate.grpo.tool_client import install_tool_token_client
+
+    install_tool_token_client()
     client_type = "openai_chat_completions_token" if config.use_token_client else "openai_chat_completions"
     if config.use_token_client:
         logger.warning(

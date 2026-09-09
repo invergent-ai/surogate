@@ -1,12 +1,46 @@
 """Shared-policy publication and cancellation must unblock the next owner."""
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
 import pytest
 
 from surogate.grpo.native_colocate import SharedPolicy, _run
+
+
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ({"model_type": "glm5_next", "text_config": {}}, True),
+        ({"model_type": "glm5_next_text"}, True),
+        ({"model_type": "llama"}, False),
+    ],
+)
+def test_glm_parity_is_selected_before_allocating_the_trainer(tmp_path, monkeypatch, config, expected):
+    from surogate.grpo import native_colocate, trainer
+
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    train = SimpleNamespace(
+        model_dir=tmp_path,
+        sequence_len=512,
+        lora_rank=8,
+        lora_target_modules=["all"],
+        runtime_config=SimpleNamespace(glm_rollout_parity=False),
+    )
+    infer = SimpleNamespace(max_model_len=512, max_num_seqs=2, host="127.0.0.1", port=8000)
+    orch = SimpleNamespace(output_dir=tmp_path / "out", model=SimpleNamespace(name="glm"), client=SimpleNamespace())
+
+    def allocate(actual):
+        assert actual.runtime_config.glm_rollout_parity is expected
+        raise RuntimeError("allocation reached")
+
+    monkeypatch.setattr(native_colocate, "validate_configs", lambda *args: None)
+    monkeypatch.setattr(native_colocate, "shared_execution", lambda *args: "training")
+    monkeypatch.setattr(trainer, "GRPOTrainer", allocate)
+    with pytest.raises(RuntimeError, match="allocation reached"):
+        native_colocate.grpo_native_colocate(train, infer, orch)
 
 
 def test_publication_releases_the_batch_receiver_and_rejects_stale_versions(tmp_path, monkeypatch):
@@ -20,8 +54,9 @@ def test_publication_releases_the_batch_receiver_and_rejects_stale_versions(tmp_
             pass
 
         def summary(self):
-            return dict(policy_version=self.version, shared_base_bytes=1234,
-                        serving_base_allocated_bytes=0, base_upload_bytes=0)
+            return dict(
+                policy_version=self.version, shared_base_bytes=1234, serving_base_allocated_bytes=0, base_upload_bytes=0
+            )
 
     manager = SimpleNamespace(used_idxs={0}, ready_to_update=[True])
     monkeypatch.setattr("surogate.grpo.runs.get_multi_run_manager", lambda: manager)
@@ -69,7 +104,7 @@ def test_component_failure_stops_the_other_before_releasing_shared_storage(monke
 
     async def orchestrate(*args, **kwargs):
         while not started.is_set():
-            await asyncio.sleep(.001)
+            await asyncio.sleep(0.001)
         if failing_side == "orchestrator":
             raise RuntimeError("orchestration failed")
         await asyncio.Event().wait()

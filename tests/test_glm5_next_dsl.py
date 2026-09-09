@@ -63,7 +63,7 @@ def _mini_text_config(**overrides) -> dict:
         "hc_mult": 4,
         "hc_eps": 1e-6,
         "hc_sinkhorn_iters": 20,
-        # DSA indexer (declared, deferred)
+        # Pooled DSA indexer
         "index_topk": 64,
         "index_head_dim": 8,
         "index_n_heads": 2,
@@ -189,9 +189,11 @@ class TestGraph:
         assert ops.count("mamba_gated_rmsnorm") == 6
         assert '"gate_activation": "sigmoid"' in json.dumps(ir)
 
-    def test_mla_graph_is_dense_and_nope(self, ir):
+    def test_mla_graph_uses_sparse_dsa_and_nope(self, ir):
         ops = _ops(ir)
-        assert ops.count("flash_attention") == 2
+        assert ops.count("glm_dsa_attention") == 2
+        assert ops.count("glm_dsa_indexer") == 2
+        assert "flash_attention" not in ops
         # NoPE: nothing rotary anywhere in the text stack.
         assert "rope" not in ops
         assert "mrope" not in ops
@@ -361,16 +363,15 @@ class TestHfMapping:
 
 
 class TestConfig:
-    def test_deferred_subsystem_hyperparameters_reach_the_runtime_config(self, ir):
-        """The DSA indexer is not in the graph, but a serve-spec generator has
-        to be able to read its geometry off the compiled config."""
+    def test_indexer_hyperparameters_reach_the_runtime_config(self, ir):
+        """Native kernels and serving tooling share the indexer geometry."""
         config = ir["config"]
         assert config["index_topk"] == 64
         assert config["index_n_heads"] == 2
         assert config["index_head_dim"] == 8
         assert config["index_kpool"] == 4
         assert config["has_dsa_indexer"] is True
-        # Clamp limit is carried but deliberately not applied in the graph.
+        # The same clamp limit is used by every feed-forward block.
         assert config["swiglu_limit"] == pytest.approx(10.0)
 
     def test_shared_expert_width_is_moe_width_times_count(self, ir):
@@ -441,4 +442,22 @@ class TestRejections:
 
     def test_rejects_index_topk_not_divisible_by_kpool(self):
         result = _raw_compile(_full_config(_mini_text_config(index_topk=63, index_kpool=4)))
+        assert not result.get("success")
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            dict(index_kpool=0),
+            dict(index_kpool=3),
+            dict(index_n_heads=0),
+            dict(indexer_types=["full"]),
+            dict(indexer_types=[]),
+            dict(indexer_types=["shared"] * 8),
+            dict(index_topk_pattern="FFFSSSSS"),
+            dict(index_topk_pattern="invalid"),
+            dict(index_topk_freq=3),
+        ],
+    )
+    def test_rejects_unsupported_indexer_geometry(self, change):
+        result = _raw_compile(_full_config(_mini_text_config(**change)))
         assert not result.get("success")

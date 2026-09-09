@@ -2121,6 +2121,16 @@ void transpose(__nv_fp8_e5m2* dst, const __nv_fp8_e5m2* src, int rows, int cols,
 void transpose(nv_bfloat16* dst, const nv_bfloat16* src, int rows, int cols, cudaStream_t stream);
 void transpose(Tensor& dst, const Tensor& src, int rows, int cols, cudaStream_t stream);
 
+// Round-to-nearest addition for forward activations: dest = scale * (left + right).
+void vector_add(float* dest, const float* left, const float* right, float scale, long nelem, cudaStream_t stream);
+void vector_add(nv_bfloat16* dest,
+                const nv_bfloat16* left,
+                const nv_bfloat16* right,
+                float scale,
+                long nelem,
+                cudaStream_t stream);
+void vector_add(Tensor& dest, const Tensor& left, const Tensor& right, float scale, long nelem, cudaStream_t stream);
+
 void vector_add_sr(float* dest,
                    const float* left,
                    const float* right,

@@ -102,7 +102,7 @@ std::optional<std::uint64_t> get_u64(const Json& obj, const char* key) {
 bool is_valid_function_name(const std::string& name) {
     if (name.empty() || name.size() > 64) { return false; }
     for (const unsigned char c : name) {
-        if (std::isalnum(c) == 0 && c != '_' && c != '-') { return false; }
+        if (std::isalnum(c) == 0 && c != '_' && c != '-' && c != '.') { return false; }
     }
     return true;
 }
@@ -113,7 +113,7 @@ std::string require_function_name(const Json& obj, const char* param) {
     }
     std::string name = obj.at("name").get<std::string>();
     if (!is_valid_function_name(name)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
+        bad_request("function name must match [A-Za-z0-9_.-]{1,64}", param);
     }
     return name;
 }
@@ -698,7 +698,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     return out;
 }
 
-std::string make_chat_completion_response(const std::string& id, const std::string& model,
+static Json chat_completion_payload(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning, const char* finish_reason,
                                           const CompletionUsage& usage,
@@ -740,30 +740,39 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
     // The prompt's ids sit at the top level, where vLLM puts them, because they
     // belong to the request rather than to any one choice.
     if (detail.include_token_ids) { payload["prompt_token_ids"] = detail.prompt_token_ids; }
-    return dump_lossy(payload);
+    return payload;
+}
+
+std::string make_chat_completion_response(const std::string& id, const std::string& model,
+                                          std::int64_t created, const std::string& content,
+                                          const std::string& reasoning, const char* finish_reason,
+                                          const CompletionUsage& usage, const TokenDetail& detail) {
+    return dump_lossy(chat_completion_payload(id, model, created, content, reasoning, finish_reason, usage, detail));
 }
 
 std::string make_chat_completion_tool_response(const std::string& id, const std::string& model,
                                                std::int64_t created, const std::string& content,
                                                const std::string& reasoning,
                                                const std::vector<ToolCall>& tool_calls,
-                                               const CompletionUsage& usage) {
-    Json message = {{"role", "assistant"},
-                    {"content", content.empty() ? Json(nullptr) : Json(content)},
-                    {"tool_calls", tool_calls_json(tool_calls, false)}};
-    if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
-    const Json payload = {
-        {"id", id},
-        {"object", "chat.completion"},
-        {"created", created},
-        {"model", model},
-        {"choices",
-         Json::array({Json{
-             {"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}}})},
-        {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
-                       {"completion_tokens", usage.completion_tokens},
-                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+                                               const CompletionUsage& usage, const TokenDetail& detail) {
+    Json payload = chat_completion_payload(id, model, created, content, reasoning, "tool_calls", usage, detail);
+    Json& message = payload["choices"][0]["message"];
+    if (content.empty()) { message["content"] = nullptr; }
+    message["tool_calls"] = tool_calls_json(tool_calls, false);
     return dump_lossy(payload);
+}
+
+std::string make_chat_chunk_token_detail(const std::string& id, const std::string& model,
+                                         std::int64_t created, const TokenDetail& detail, bool include_usage) {
+    Json payload = chat_completion_payload(id, model, created, "", "", "", {}, detail);
+    payload["object"] = "chat.completion.chunk";
+    Json& choice = payload["choices"][0];
+    choice.erase("message");
+    choice["delta"] = Json::object();
+    choice["finish_reason"] = nullptr;
+    payload.erase("usage");
+    if (include_usage) { payload["usage"] = nullptr; }
+    return sse_event(payload);
 }
 
 std::string make_chat_chunk_role(const std::string& id, const std::string& model,

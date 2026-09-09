@@ -1299,6 +1299,10 @@ DslModel::DslModel(const PretrainedConfig& config,
     }
 
     const ETensorDType model_dtype = options.ModelType.value_or(mConfig->DType);
+    if (mModelConfig.ModelTypeName == "glm5_next" &&
+        (model_dtype != ETensorDType::BF16 || mConfig->DType != ETensorDType::BF16)) {
+        throw std::runtime_error("GLM-5.3-Flash native DSA currently requires BF16 model activations");
+    }
     const ETensorDType master_dtype = options.MasterDType.value_or(mConfig->DType);
     const bool need_master_work = master_dtype != model_dtype;
     const bool use_weight_manager =
@@ -1687,6 +1691,7 @@ void DslModel::update(NCCLCommunicator& comm,
 }
 
 void DslModel::update_with_config(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config, int step) {
+    reset_decode_state();
     ensure_optimizer(mOptimizer, config.type);
     mOptimizer->step(*this, comm, config, step);
 }
@@ -1695,6 +1700,7 @@ void DslModel::update_with_graph_params(NCCLCommunicator& comm,
                                         const optimizers::OptimizerConfig& config,
                                         const float* opt_params,
                                         const int* opt_step) {
+    reset_decode_state();
     if (!opt_params || !opt_step) {
         throw std::logic_error("DslModel::update_with_graph_params: missing optimizer parameter buffers");
     }

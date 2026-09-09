@@ -26,16 +26,14 @@ blocks, expert_weights_scale 2.5, hc count 4 / 20 Sinkhorn iterations,
 rope.dimension_count 0 (NoPE), kda head_dim 128 / conv kernel 4 /
 gate_lower_bound -5, indexer 32 heads x 128 dim / top-k 2048.
 
-DECLARED BUT NOT IN THE TRAINING GRAPH (hyperparameters reach the runtime config
-so a serve-spec generator can read them; the mechanism is not lowered):
+Native text training implements mHC, KDA forward/backward, packed convolution,
+FP32 routing, SwiGLU clipping and pooled sparse DSA. Indexer parameters are
+loaded and frozen, matching Transformers' no-grad indexer; Q/K/V attention
+projections remain differentiable. Each MLA layer currently runs a full indexer.
+Native-colocate keeps KDA, convolution, indexer and KV history during generation.
 
-* **DSA indexer** (``index_*``, ``indexer_types``, and the per-MLA-layer
-  ``self_attn.indexer.*`` tensors incl. the k-pool ``index_kpool_compress_ape``
-  / ``index_kpool_compress_gate``): inference-time sparse *selection*. Training
-  runs dense causal attention, which is the exact semantics whenever the
-  sequence fits inside ``index_topk`` (2048) — the same argument, and the same
-  treatment, as ``qwen4_exp``'s QSA indexer. The indexer tensors are not
-  declared, so they are simply unused at import.
+Outside the text training graph:
+
 * **MTP / next-token-prediction block** (layer 45, ``nextn_predict_layers``):
   transformers itself drops it (``_keys_to_ignore_on_load_unexpected`` skips
   ``layers.45.`` and ``shared_head.``), so it is not part of the training graph.
@@ -43,10 +41,6 @@ so a serve-spec generator can read them; the mechanism is not lowered):
   checkpoint's own speculative draft head.
 * **Vision tower** (``Glm5NextVisionModel``, ``model.visual.*``): text-only
   declaration, like ``qwen4_exp``'s. Its tensors are unused at import.
-Native text training implements mHC, KDA forward/backward, packed convolution,
-FP32 routing and SwiGLU clipping. The runtime rejects sequences longer than
-``index_topk`` rather than silently replacing sparse DSA with dense attention.
-Vision/MTP/indexer weights remain outside the training parameter set.
 """
 
 from __future__ import annotations
@@ -82,8 +76,9 @@ GLM5_NEXT_MTP_SERVE_SECTION = ServeSection(
         ServeObject("embedding_norm", "bf16", ("C",), source="enorm.weight"),
         ServeObject("hidden_norm", "bf16", ("C",), source="hnorm.weight"),
         *(
-            ServeObject("layer/" + o.name, o.format, o.shape, o.components,
-                        transform=o.transform, residency=o.residency)
+            ServeObject(
+                "layer/" + o.name, o.format, o.shape, o.components, transform=o.transform, residency=o.residency
+            )
             for o in GLM5_NEXT_MTP_LAYER_OBJECTS
         ),
         ServeObject("final_norm", "bf16", ("C",), source="shared_head.norm.weight"),
@@ -168,7 +163,7 @@ def _build_glm5_next_block_mappings(layer_prefix: str, model_prefix: str) -> dic
         "kda_g_b_weight": f"{attn}.g_b_proj.weight",
         "kda_o_norm_weight": f"{attn}.o_norm.weight",
         "kda_out_weight": f"{attn}.o_proj.weight",
-        # --- NoPE MLA (indexer tensors deliberately not declared) ---
+        # --- NoPE MLA and its frozen pooled DSA indexer ---
         "mla_q_a_weight": f"{attn}.q_a_proj.weight",
         "mla_q_a_norm_weight": f"{attn}.q_a_layernorm.weight",
         "mla_q_b_weight": f"{attn}.q_b_proj.weight",
@@ -176,6 +171,13 @@ def _build_glm5_next_block_mappings(layer_prefix: str, model_prefix: str) -> dic
         "mla_kv_a_norm_weight": f"{attn}.kv_a_layernorm.weight",
         "mla_kv_b_weight": f"{attn}.kv_b_proj.weight",
         "mla_out_weight": f"{attn}.o_proj.weight",
+        "mla_index_q_weight": f"{attn}.indexer.wq_b.weight",
+        "mla_index_k_weight": f"{attn}.indexer.wk.weight",
+        "mla_index_head_weight": f"{attn}.indexer.weights_proj.weight",
+        "mla_index_compress_weight": f"{attn}.indexer.index_kpool_compress_gate",
+        "mla_index_norm_weight": f"{attn}.indexer.k_norm.weight",
+        "mla_index_norm_bias": f"{attn}.indexer.k_norm.bias",
+        "mla_index_ape": f"{attn}.indexer.index_kpool_compress_ape",
         # --- dense feed-forward (the leading layers). Fused row order [up; gate] ---
         "mlp_up_weight": fuse(f"{mlp}.up_proj.weight", f"{mlp}.gate_proj.weight", dim=0),
         "mlp_down_weight": f"{mlp}.down_proj.weight",
@@ -281,12 +283,8 @@ def _resolve_glm5_next_block_types(
     """
 
     if layer_types is None:
-        layer_types = [
-            "linear_attention" if i % 4 != 3 else "deepseek_sparse_attention" for i in range(n_layers)
-        ]
-    layer_types = [
-        "deepseek_sparse_attention" if t == "full_attention" else t for t in layer_types
-    ]
+        layer_types = ["linear_attention" if i % 4 != 3 else "deepseek_sparse_attention" for i in range(n_layers)]
+    layer_types = ["deepseek_sparse_attention" if t == "full_attention" else t for t in layer_types]
     if len(layer_types) != n_layers:
         raise ValueError(f"layer_types length ({len(layer_types)}) must match n_layers ({n_layers})")
 
@@ -294,9 +292,7 @@ def _resolve_glm5_next_block_types(
         dense = max(0, min(first_k_dense_replace, n_layers))
         mlp_layer_types = ["dense"] * dense + ["sparse"] * (n_layers - dense)
     if len(mlp_layer_types) != n_layers:
-        raise ValueError(
-            f"mlp_layer_types length ({len(mlp_layer_types)}) must match n_layers ({n_layers})"
-        )
+        raise ValueError(f"mlp_layer_types length ({len(mlp_layer_types)}) must match n_layers ({n_layers})")
 
     block_types = []
     for index, (layer_type, mlp_type) in enumerate(zip(layer_types, mlp_layer_types)):
@@ -308,8 +304,7 @@ def _resolve_glm5_next_block_types(
             )
         if mlp_type not in ("dense", "sparse"):
             raise ValueError(
-                f"Unsupported glm5_next mlp layer type '{mlp_type}' at layer {index}. "
-                "Expected 'dense' or 'sparse'"
+                f"Unsupported glm5_next mlp layer type '{mlp_type}' at layer {index}. Expected 'dense' or 'sparse'"
             )
         block_types.append(mixer if mlp_type == "dense" else f"{mixer}_moe")
     return block_types, layer_types, mlp_layer_types
@@ -356,13 +351,16 @@ def _resolve_glm5_next_block_types(
     hc_sinkhorn_iters="text_config.hc_sinkhorn_iters",
     # The NextN draft head's depth: serving carries the head, training does not.
     nextn_predict_layers="text_config.nextn_predict_layers",
-    # Deferred subsystems: captured for the serve-spec generator (see docstring)
+    # Pooled DSA geometry and legacy indexer schedules.
     index_topk="text_config.index_topk",
     index_head_dim="text_config.index_head_dim",
     index_n_heads="text_config.index_n_heads",
     index_kpool="text_config.index_kpool",
     index_kpool_always_select_tail="text_config.index_kpool_always_select_tail",
     indexer_types="text_config.indexer_types",
+    index_topk_pattern="text_config.index_topk_pattern",
+    index_topk_freq="text_config.index_topk_freq",
+    index_skip_topk_offset="text_config.index_skip_topk_offset",
     tie_word_embeddings="tie_word_embeddings",
     use_visual_inputs="vision_config",
 )
@@ -372,8 +370,7 @@ class Glm5NextConditionalModel(nn.Model):
     #: The endpoints. Per-layer objects come from whichever of the four block schemas the
     #: schedule puts on that layer.
     _serve_objects_ = (
-        ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",),
-                    scope="model"),
+        ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",), scope="model"),
         ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model"),
         ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",), scope="model"),
     )
@@ -405,9 +402,7 @@ class Glm5NextConditionalModel(nn.Model):
         return block_types
 
     _name_remap_ = GLM5_NEXT_MODEL_NAME_REMAP
-    _hf_block_mappings_ = _build_glm5_next_block_mappings(
-        "model.language_model.layers.{layer}", "model.language_model"
-    )
+    _hf_block_mappings_ = _build_glm5_next_block_mappings("model.language_model.layers.{layer}", "model.language_model")
 
     def __init__(
         self,
@@ -453,6 +448,9 @@ class Glm5NextConditionalModel(nn.Model):
         index_kpool: int = 16,
         index_kpool_always_select_tail: bool = True,
         indexer_types: list[str] | None = None,
+        index_topk_pattern: str | list[str] | None = None,
+        index_topk_freq: int = 1,
+        index_skip_topk_offset: int = 2,
         tie_word_embeddings: bool = False,
         chunk_size: int = 64,
         ep_size: int = 1,
@@ -474,16 +472,15 @@ class Glm5NextConditionalModel(nn.Model):
         )
 
         if qk_rope_head_dim != 0:
-            raise ValueError(
-                "glm5_next is a NoPE architecture: qk_rope_head_dim must be 0, "
-                f"got {qk_rope_head_dim}"
-            )
+            raise ValueError(f"glm5_next is a NoPE architecture: qk_rope_head_dim must be 0, got {qk_rope_head_dim}")
         if q_lora_rank is None or q_lora_rank <= 0:
             raise ValueError("glm5_next requires a positive q_lora_rank for its MLA layers")
-        if index_kpool and index_topk % index_kpool != 0:
-            raise ValueError(
-                f"index_topk ({index_topk}) must be divisible by index_kpool ({index_kpool})"
-            )
+        if min(index_kpool, index_topk, index_n_heads, index_head_dim) <= 0:
+            raise ValueError("GLM DSA index dimensions, pool size and top-k must be positive")
+        if index_kpool & (index_kpool - 1):
+            raise ValueError("GLM DSA index_kpool must be a power of two")
+        if index_topk % index_kpool != 0:
+            raise ValueError(f"index_topk ({index_topk}) must be divisible by index_kpool ({index_kpool})")
 
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -532,13 +529,28 @@ class Glm5NextConditionalModel(nn.Model):
         # declaration, which emits the `mtp/` section that many times (0 or 1).
         self.nextn_predict_layers = nextn_predict_layers
 
-        # Deferred subsystems — config only (see module docstring).
+        # Pooled DSA geometry and per-layer indexer mode.
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
         self.index_kpool = index_kpool
         self.index_kpool_always_select_tail = bool(index_kpool_always_select_tail)
-        self.indexer_types = list(indexer_types) if indexer_types else None
+        if indexer_types is None:
+            if index_topk_pattern is not None:
+                try:
+                    indexer_types = (
+                        [{"F": "full", "S": "shared"}[c] for c in index_topk_pattern]
+                        if isinstance(index_topk_pattern, str)
+                        else list(index_topk_pattern)
+                    )
+                except KeyError as exc:
+                    raise ValueError("index_topk_pattern must contain only F or S") from exc
+            else:
+                freq = max(index_topk_freq, 1)
+                indexer_types = [
+                    "full" if max(i - index_skip_topk_offset + 1, 0) % freq == 0 else "shared" for i in range(n_layers)
+                ]
+        self.indexer_types = list(indexer_types)
         self.has_dsa_indexer = index_n_heads > 0
 
         self.tie_word_embeddings = tie_word_embeddings
@@ -555,9 +567,12 @@ class Glm5NextConditionalModel(nn.Model):
         self.block_types = block_types
         self.layer_types = layer_types
         self.mlp_layer_types = mlp_layer_types
-        self.hybrid_pattern = "".join(
-            {"kda": "K", "kda_moe": "k", "mla": "A", "mla_moe": "m"}[t] for t in block_types
-        )
+        if self.indexer_types is not None:
+            if len(self.indexer_types) != n_layers or any(t not in ("full", "shared") for t in self.indexer_types):
+                raise ValueError("indexer_types must contain one 'full' or 'shared' entry per layer")
+            if any(mode == "shared" and kind.startswith("mla") for mode, kind in zip(self.indexer_types, block_types)):
+                raise ValueError("GLM native training currently requires a full DSA indexer on each MLA layer")
+        self.hybrid_pattern = "".join({"kda": "K", "kda_moe": "k", "mla": "A", "mla_moe": "m"}[t] for t in block_types)
 
         self.n_kda_blocks = sum(1 for t in block_types if t == "kda")
         self.n_kda_moe_blocks = sum(1 for t in block_types if t == "kda_moe")
@@ -581,6 +596,11 @@ class Glm5NextConditionalModel(nn.Model):
             qk_nope_head_dim=qk_nope_head_dim,
             v_head_dim=v_head_dim,
             qk_rope_head_dim=qk_rope_head_dim,
+            index_n_heads=index_n_heads,
+            index_head_dim=index_head_dim,
+            index_kpool=index_kpool,
+            index_topk=index_topk,
+            index_kpool_always_select_tail=index_kpool_always_select_tail,
         )
         moe_kwargs = dict(
             moe_intermediate_size=moe_d_ff,

@@ -36,6 +36,7 @@ def main():
     runner.load(_compile_kimi_delta_rule(args.heads, args.dim))
     work = torch.empty(runner.workspace_bytes(*shape, 0, True), dtype=torch.uint8, device="cuda")
     chunk_out = torch.empty_like(out)
+    rollout_out = torch.empty_like(out)
     chunk_grads = [torch.empty_like(x) for x in grads]
 
     def native_forward():
@@ -50,12 +51,19 @@ def main():
     def chunk_backward():
         runner.run(True, [dy, *inputs], chunk_grads, None, work, torch.cuda.current_stream().cuda_stream)
 
+    def rollout_forward():
+        runner.run(
+            False, inputs, [rollout_out], None, work, torch.cuda.current_stream().cuda_stream, recurrent_forward=True
+        )
+
     native_forward()
     native_backward()
     chunk_forward()
     chunk_backward()
+    rollout_forward()
     errors = [float((a - b).square().mean().sqrt() / b.square().mean().sqrt()) for a, b in zip(chunk_grads, grads)]
     torch.testing.assert_close(chunk_out, out, atol=0.002, rtol=0.03)
+    torch.testing.assert_close(rollout_out, out, atol=0.002, rtol=0.03)
     assert max(errors) < 0.02, errors
     max_output_error = float((out - chunk_out).abs().max())
 
@@ -65,6 +73,10 @@ def main():
 
     def chunk_step():
         chunk_forward()
+        chunk_backward()
+
+    def rollout_step():
+        rollout_forward()
         chunk_backward()
 
     result = dict(
@@ -77,10 +89,12 @@ def main():
         forward_ms={
             "cuda_reference": do_bench_cudagraph(native_forward, rep=50),
             "vendored_fla": do_bench_cudagraph(chunk_forward, rep=50),
+            "rollout_parity": do_bench_cudagraph(rollout_forward, rep=50),
         },
         forward_backward_ms={
             "cuda_reference": do_bench_cudagraph(native_step, rep=50),
             "vendored_fla": do_bench_cudagraph(chunk_step, rep=50),
+            "rollout_parity": do_bench_cudagraph(rollout_step, rep=50),
         },
     )
     print(json.dumps(result, indent=2))

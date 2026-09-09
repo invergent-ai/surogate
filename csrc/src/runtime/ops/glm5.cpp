@@ -174,7 +174,17 @@ void CompiledExecutor::dispatch_glm5(const CompiledOp& op) {
         }
         outputs.push_back(out);
     }
-    if (k == Glm5Kernel::KdaRule && inputs[0].DType == ETensorDType::BF16 && mOptions.DocMasking) {
+    auto* decode = mExecutionRequest ? mExecutionRequest->glm_decode_state : nullptr;
+    if (decode && k == Glm5Kernel::KdaRule) {
+        const auto& q = inputs[0];
+        auto state = decode->get(op_layer_idx(op), "kda_state", ETensorDType::FP32,
+                                 {q.Sizes[0], q.Sizes[2], q.Sizes[3], q.Sizes[3]});
+        mKdaKernels.recurrent(inputs, outputs[0], state, decode->length == 0, mRunState.MainStream);
+    } else if (decode && k == Glm5Kernel::CausalConv1d) {
+        const auto& x = inputs[0];
+        auto history = decode->get(op_layer_idx(op), "convolution", x.DType, {x.Sizes[2], inputs[1].Sizes[2] - 1});
+        glm5_convolution_state(x, inputs[1], history, outputs[0], decode->length == 0, mRunState.MainStream);
+    } else if (k == Glm5Kernel::KdaRule && inputs[0].DType == ETensorDType::BF16 && mOptions.DocMasking) {
         const auto& q = inputs[0];
         if (mCuSeqlensGpu && mTotalDocTokens != q.Sizes[0] * q.Sizes[1])
             throw std::runtime_error("KDA document metadata must cover all batch tokens");
@@ -186,7 +196,8 @@ void CompiledExecutor::dispatch_glm5(const CompiledOp& op) {
                                                                                                          mNumDocs,
                                                                                                          false))},
                                                 "kda_workspace");
-        mKdaKernels.run(false, inputs, outputs, mCuSeqlensGpu, mNumDocs, workspace, mRunState.MainStream);
+        mKdaKernels.run(false, inputs, outputs, mCuSeqlensGpu, mNumDocs, workspace, mRunState.MainStream,
+                        mOptions.GlmRolloutParity);
         mRunState.Stack.free(workspace);
     } else {
         glm5_forward(k, inputs, outputs, opts, mRunState.MainStream);

@@ -478,6 +478,15 @@ private:
     // running one GPU on the full batch (it would deadlock waiting for idle GPUs).
     bool mSkipGradReduce = false;
     std::unique_ptr<CompiledExecutor> mCompiledExecutor;
+    // Decode compiles only forward ops and borrows the training workspace.
+    // Its own executor keeps training graphs and weight addresses intact.
+    std::unique_ptr<GraphCompiler> mDecodeCompiler;
+    std::unique_ptr<CompiledExecutor> mDecodeExecutor;
+    std::unique_ptr<CompiledGraph> mDecodePrefillGraph;
+    std::unique_ptr<CompiledGraph> mDecodeTokenGraph;
+    PhaseArenas mDecodePrefillArenas;
+    PhaseArenas mDecodeTokenArenas;
+    long mDecodePrefillT = 0;
     std::unique_ptr<CompiledGraph> mCompiledForward;
     std::unique_ptr<CompiledGraph> mCompiledBackward;
     long mCompiledB = 0;

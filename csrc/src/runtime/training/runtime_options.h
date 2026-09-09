@@ -122,6 +122,9 @@ struct RuntimeOptions {
     // Document-level attention masking for packed sequences.
     // When enabled, doc boundaries are inferred from position_id resets.
     bool DocMasking = true;
+    // Match GLM's rollout recurrence and GEMM reduction order during GRPO.
+    // Enabled by native-colocate before allocating the training model.
+    bool GlmRolloutParity = false;
 
     // DSL IR execution (deprecated flag; DSL backend is always used).
     bool UseDslIr = true;

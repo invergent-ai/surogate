@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "kernels.h"
+#include "runtime/jit/glm_matmul_kernels.h"
 #include "utilities/utils.h"
 #include "utilities/vec.cuh"
 
@@ -661,6 +662,34 @@ void matmul_cublaslt(FloatC* d,
                      int ldc_override = -1,
                      int lda_override = -1,
                      int ldb_override = -1) {
+    if constexpr ((std::is_same_v<FloatA, float> || std::is_same_v<FloatA, nv_bfloat16>) &&
+                  (std::is_same_v<FloatB, float> || std::is_same_v<FloatB, nv_bfloat16>) &&
+                  (std::is_same_v<FloatC, float> || std::is_same_v<FloatC, nv_bfloat16>)) {
+        if (auto* kernels = active_glm_matmul(); kernels && !bias && !scale_a && !scale_b) {
+            const bool ta = mode == EMMTranspose::TN || mode == EMMTranspose::TT;
+            const bool tb = mode == EMMTranspose::NT || mode == EMMTranspose::TT;
+            const int lda = lda_override > 0 ? lda_override : (ta ? k : m);
+            const int ldb = ldb_override > 0 ? ldb_override : (tb ? n : k);
+            kernels->matmul(d,
+                            a,
+                            b,
+                            std::is_same_v<FloatA, float> ? ETensorDType::FP32 : ETensorDType::BF16,
+                            std::is_same_v<FloatB, float> ? ETensorDType::FP32 : ETensorDType::BF16,
+                            std::is_same_v<FloatC, float> ? ETensorDType::FP32 : ETensorDType::BF16,
+                            m,
+                            n,
+                            k,
+                            ta ? lda : 1,
+                            ta ? 1 : lda,
+                            tb ? 1 : ldb,
+                            tb ? ldb : 1,
+                            ldc_override > 0 ? ldc_override : m,
+                            alpha_val,
+                            beta_val,
+                            stream);
+            return;
+        }
+    }
     static const bool debug_fallback = (std::getenv("SUROGATE_DEBUG_MATMUL_FALLBACK") != nullptr);
     static int fallback_log_count = 0;
 

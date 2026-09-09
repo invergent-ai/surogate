@@ -8,7 +8,9 @@ import triton.language as tl
 from .ops import exp2
 from .ops import gather
 
-SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
+# Surogate: the inverse feeds FP32 WY intermediates, so retain FP32 product
+# accuracy here too. Plain TF32 can still perturb hard routing decisions.
+SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32x3")
 
 
 @triton.jit(do_not_specialize=['T'])

@@ -47,6 +47,7 @@ void DslModel::set_rng_state(const std::vector<std::byte>& state) {
 }
 
 void DslModel::init_weights(NCCLCommunicator& comm) {
+    reset_decode_state();
     if (!mParams) {
         throw std::logic_error("DslModel::init_weights called before parameters are initialized");
     }
@@ -117,6 +118,7 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
 }
 
 void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) {
+    reset_decode_state();
     if (!mParams) {
         throw std::logic_error("DslModel::import_weights called before parameters are initialized");
     }
@@ -591,6 +593,7 @@ std::vector<std::pair<std::string, Tensor>> DslModel::shared_base_weights() {
 void DslModel::import_weights_from_external(const std::string& safetensors_path,
                                             const std::vector<qlora::ExternalWeight>& external_weights,
                                             NCCLCommunicator& comm) {
+    reset_decode_state();
     if (!mParams) {
         throw std::logic_error("DslModel::import_weights_from_external called before parameters are initialized");
     }

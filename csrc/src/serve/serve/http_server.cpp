@@ -802,23 +802,18 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             });
             log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            TokenDetail detail;
+            detail.include_token_ids = request.return_token_ids;
+            detail.include_logprobs = request.want_logprobs;
+            detail.prompt_token_ids = outcome.prompt_token_ids;
+            detail.completion_token_ids = outcome.completion_token_ids;
+            detail.logprobs = outcome.token_logprobs;
+            detail.texts = outcome.token_texts;
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
-                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage);
+                    id, model, created, outcome.text, outcome.reasoning, outcome.tool_calls, usage, detail);
             } else {
-                TokenDetail detail;
-                detail.include_token_ids = !outcome.completion_token_ids.empty() ||
-                                           !outcome.prompt_token_ids.empty();
-                detail.include_logprobs  = !outcome.token_logprobs.empty();
-                if (detail.include_token_ids) {
-                    detail.prompt_token_ids     = outcome.prompt_token_ids;
-                    detail.completion_token_ids = outcome.completion_token_ids;
-                }
-                if (detail.include_logprobs) {
-                    detail.logprobs = outcome.token_logprobs;
-                    detail.texts    = outcome.token_texts;
-                }
                 response_body = make_chat_completion_response(
                     id, model, created, outcome.text, outcome.reasoning,
                     finish_reason_wire(outcome.finish_reason), usage, detail);
@@ -884,6 +879,17 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
                 ensure_role();
+                if (stream->prepared.want_logprobs || stream->prepared.return_token_ids) {
+                    TokenDetail detail;
+                    detail.include_token_ids = stream->prepared.return_token_ids;
+                    detail.include_logprobs = stream->prepared.want_logprobs;
+                    detail.prompt_token_ids = outcome.prompt_token_ids;
+                    detail.completion_token_ids = outcome.completion_token_ids;
+                    detail.logprobs = outcome.token_logprobs;
+                    detail.texts = outcome.token_texts;
+                    write_stream_item(sink, *stream,
+                                      make_chat_chunk_token_detail(id, model, created, detail, include_usage));
+                }
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {

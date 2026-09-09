@@ -75,7 +75,8 @@ def recompute_w_u_fwd_kda_kernel(
         m_v = m_t[:, None] & (o_v[None, :] < V)
         p_v = v + o_t[:, None] * (HV*V) + o_v[None, :]
         p_u = u + o_t[:, None] * (HV*V) + o_v[None, :]
-        b_v = tl.load(p_v, mask=m_v, other=0.0)
+        # Surogate: preserve FP32 WY intermediates with BF16 model values.
+        b_v = tl.load(p_v, mask=m_v, other=0.0).to(b_A.dtype)
         b_vb = (b_v * b_b[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_A, b_vb)
         tl.store(p_u, b_u.to(p_u.dtype.element_ty), mask=m_v)

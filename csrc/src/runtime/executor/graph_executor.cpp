@@ -210,6 +210,10 @@ void debug_dump_tensor(const std::string& name, const Tensor& t, const std::stri
             std::memcpy(&h, &fp16_data[i], sizeof(__half));
             host_data[i] = __half2float(h);
         }
+    } else if (t.DType == ETensorDType::INT32) {
+        std::vector<int32_t> indices(nelem);
+        CUDA_CHECK(cudaMemcpy(indices.data(), t.Data, nelem * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        std::transform(indices.begin(), indices.end(), host_data.begin(), [](int32_t value) { return float(value); });
     } else {
         // Unsupported dtype for dump — skip silently
         return;
@@ -315,6 +319,8 @@ GraphExecutor::GraphExecutor(const Module& module,
 }
 
 GraphExecutor::~GraphExecutor() {
+    dsl::release_phase_arenas(mDecodePrefillArenas);
+    dsl::release_phase_arenas(mDecodeTokenArenas);
     // Stack arena (if rebased) is owned by DslRunState — adopted buffer
     // persists past this destructor and is cudaFree'd in ~DslRunState.
     // release_phase_arenas below skips unified_stack_ptr because ownership
@@ -1521,7 +1527,12 @@ std::vector<RuntimeBinding> materialize_runtime_bindings(const ExecutionRequest&
     std::vector<RuntimeBinding> bindings = request.bindings;
     bindings.reserve(bindings.size() + request.input_copies.size());
     for (const auto& copy : request.input_copies) {
-        bindings.push_back(RuntimeBinding{copy.name, copy.destination});
+        Tensor destination = copy.destination;
+        if (request.glm_decode_state) {
+            const std::vector<long> shape(copy.source.Sizes.begin(), copy.source.Sizes.begin() + copy.source.Rank);
+            destination = view_tensor(destination, shape);
+        }
+        bindings.push_back(RuntimeBinding{copy.name, destination});
     }
     return bindings;
 }
@@ -1583,6 +1594,86 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
     record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
 
     std::vector<RuntimeBinding> runtime_bindings = materialize_runtime_bindings(request);
+    if (request.glm_decode_state) {
+        if (request.batch != 1 || !request.disable_forward_saves || !request.generation_positions_cpu)
+            throw std::runtime_error("GLM decode requires one forward-only generation request");
+        if (!mDecodeCompiler) {
+            mDecodeCompiler = std::make_unique<GraphCompiler>(mModule, mConfig, mOptions, mWeights, mGrads);
+            mDecodeExecutor = std::make_unique<CompiledExecutor>(rs, mWeights, mGrads, mConfig, mOptions);
+            mDecodeExecutor->set_schema_hook_registry(mSchemaHookRegistry);
+            if (mOptions.TrainingRecipe) mDecodeExecutor->set_recipe(mOptions.TrainingRecipe.get());
+            auto dump_decode = [this](const std::vector<std::string>& names, int layer) {
+                const char* dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+                if (!dir || !*dir) return;
+                const std::string prefix = "blocks[" + std::to_string(layer) + "].";
+                for (const auto& name : names) {
+                    if (layer >= 0 && name.rfind(prefix, 0) != 0) continue;
+                    if (const Tensor* t = mDecodeExecutor->try_get_tensor(name); t && t->Data) {
+                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                        debug_dump_tensor("decode_" + name, *t, dir, mRunState.MainStream);
+                    }
+                }
+            };
+            mDecodeExecutor->set_debug_dump_fn(dump_decode);
+            mDecodeExecutor->set_debug_dump_layer_fn([dump_decode](int layer) {
+                dump_decode(debug_dump_tensor_list(), layer);
+            });
+        }
+        const bool token = request.sequence == 1;
+        auto& graph = token ? mDecodeTokenGraph : mDecodePrefillGraph;
+        auto& arenas = token ? mDecodeTokenArenas : mDecodePrefillArenas;
+        if (!graph || (!token && mDecodePrefillT != request.sequence)) {
+            mDecodeCompiler->reset_tid_namespace();
+            graph = std::make_unique<CompiledGraph>(mDecodeCompiler->compile(*mForward, 1, request.sequence, false));
+            // Slot aliases and LoRA hooks read activations outside the explicit
+            // op input list. Use the existing conservative per-block lifetimes;
+            // an empty backward graph allocates no backward saves.
+            CompiledGraph no_backward;
+            finalize_save_for_bwd(*graph, no_backward, std::unordered_set<std::string>{}, false);
+            graph->compute_layer_segments();
+            dsl::release_phase_arenas(arenas);
+            dsl::compute_arena_sizes(arenas, *graph, CompiledGraph{}, mConfig.NumLayers);
+            // Forward activation storage only. Resident base and adapter
+            // weights continue to resolve through their existing owners.
+            arenas.persistent_bytes = 0;
+            arenas.accumulator_bytes = 0;
+            try {
+                dsl::allocate_phase_arenas(arenas);
+            } catch (...) {
+                graph.reset();
+                dsl::release_phase_arenas(arenas);
+                throw;
+            }
+            if (!token) mDecodePrefillT = request.sequence;
+        }
+        // Avoid compile_graphs(): it reallocates phase arenas on shape changes,
+        // including storage referenced by captured training graphs. Decode uses
+        // its own forward activation arena and the resident weight owners.
+        static const std::vector<std::string> no_saves;
+        auto checkpoint = rs.Stack.checkpoint();
+        auto cleanup = [&]() {
+            mDecodeExecutor->set_execution_request_context(nullptr);
+            mDecodeExecutor->set_runtime_bindings(nullptr);
+            rs.set_active_executor(nullptr);
+            rs.Stack.restore(checkpoint);
+        };
+        mDecodeExecutor->set_lora_state(mLoRAConfig, mLoRAWeights, mLoRAGrads, mLoRARunState);
+        mDecodeExecutor->set_dimensions(1, request.sequence);
+        mDecodeExecutor->set_phase_arenas(&arenas);
+        mDecodeExecutor->set_forward_graph(graph.get());
+        mDecodeExecutor->set_save_list(&no_saves);
+        mDecodeExecutor->set_runtime_bindings(&runtime_bindings);
+        mDecodeExecutor->set_execution_request_context(&request);
+        try {
+            mDecodeExecutor->execute_forward(*graph, comm, false, nullptr);
+        } catch (...) {
+            cleanup();
+            throw;
+        }
+        cleanup();
+        record_event_if_not_capturing(rs.ForwardDone, rs.MainStream);
+        return {};
+    }
     mCompiledExecutor->set_runtime_bindings(&runtime_bindings);
     mCompiledExecutor->set_execution_request_context(&request);
     mActiveExecutionRequest = &request;
@@ -1591,12 +1682,16 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
     if (request.disable_forward_saves) {
         mCompiledExecutor->set_save_list(&empty_save_list);
     }
-    execute_forward(request.batch,
-                    request.sequence,
-                    comm,
-                    request.full_forward,
-                    request.forward_hook,
-                    request.micro_step);
+    try {
+        execute_forward(request.batch, request.sequence, comm, request.full_forward,
+                        request.forward_hook, request.micro_step);
+    } catch (...) {
+        if (request.disable_forward_saves) mCompiledExecutor->set_save_list(&mSaveList);
+        mCompiledExecutor->set_execution_request_context(nullptr);
+        mCompiledExecutor->set_runtime_bindings(nullptr);
+        mActiveExecutionRequest = nullptr;
+        throw;
+    }
     if (request.disable_forward_saves) {
         mCompiledExecutor->set_save_list(&mSaveList);
     }

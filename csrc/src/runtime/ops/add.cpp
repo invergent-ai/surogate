@@ -97,7 +97,14 @@ void CompiledExecutor::dispatch_add(const CompiledOp& op) {
         }
     }
 
-    vector_add_sr(out, a, b, 1.0f, static_cast<long>(a.nelem()), 0, mRunState.MainStream);
+    if (is_accum_output) {
+        vector_add_sr(out, a, b, 1.0f, static_cast<long>(a.nelem()), 0, mRunState.MainStream);
+    } else {
+        // Stochastic rounding hashes the flat buffer index, so the same token
+        // would change when decoded alone or moved within a packed batch.
+        // Forward recomputation must use this same deterministic addition.
+        vector_add(out, a, b, 1.0f, static_cast<long>(a.nelem()), mRunState.MainStream);
+    }
     store_tensor(op.outputs[0], out);
 }
 

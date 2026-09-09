@@ -55,6 +55,14 @@ def compile_jit_kernels(ir_json: str) -> dict[str, str]:
             raise ValueError("KDA IR must specify linear_num_heads and linear_head_dim")
         logger.info("Compiling vendored FLA KDA kernels (H=%d, D=%d)", H, D)
         manifests.update(_compile_kimi_delta_rule(H, D))
+        manifests.update(_compile_glm_matmul(config.get("n_routed_experts", config.get("num_experts", 1))))
+
+    if _ir_uses_op(ir, "glm_dsa_attention"):
+        config = next(
+            (m["config"] for m in ir.get("modules", []) if isinstance(m, dict) and m.get("config")),
+            ir.get("config", {}),
+        )
+        manifests.update(_compile_glm_dsa(config))
 
     if manifests:
         logger.info("Compiled %d JIT kernels total.", len(manifests))
@@ -171,4 +179,46 @@ def _compile_kimi_delta_rule(H: int, D: int) -> dict[str, str]:
         dims={"H": H, "D": D, "triton": triton.__version__},
         sm=sm,
         compile_fn=lambda output_dir: compile_kimi_delta_rule(H, D, output_dir, sm),
+    )
+
+
+def _compile_glm_matmul(experts: int) -> dict[str, str]:
+    import triton
+
+    from surogate.kernels.cache import KernelCache
+    from surogate.kernels.triton.glm_matmul import compile_glm_matmul
+
+    root = Path(__file__).parent
+    sm = _detect_sm()
+    return KernelCache().get_or_compile(
+        name="glm_matmul", src_files=[root / "triton/glm_matmul.py", root / "compiler.py"],
+        dims={"experts": experts, "triton": triton.__version__}, sm=sm,
+        compile_fn=lambda output_dir: compile_glm_matmul(experts, output_dir, sm),
+    )
+
+
+def _compile_glm_dsa(config: dict) -> dict[str, str]:
+    import triton
+
+    from surogate.kernels.cache import KernelCache
+    from surogate.kernels.triton.glm_dsa import compile_glm_dsa
+
+    geometry = dict(
+        H=config["num_attention_heads"],
+        D=config["qk_nope_head_dim"],
+        IH=config["index_n_heads"],
+        ID=config["index_head_dim"],
+        P=config["index_kpool"],
+        topk=config["index_topk"],
+        tail=config["index_kpool_always_select_tail"],
+        max_seq=config["max_seq"],
+    )
+    root = Path(__file__).parent
+    sm = _detect_sm()
+    return KernelCache().get_or_compile(
+        "glm_dsa",
+        [root / "triton/glm_dsa.py", root / "compiler.py"],
+        geometry | {"triton": triton.__version__},
+        sm,
+        lambda output_dir: compile_glm_dsa(**geometry, output_dir=output_dir, sm=sm),
     )

@@ -1528,6 +1528,19 @@ void transpose(Tensor& dst, const Tensor& src, int rows, int cols, cudaStream_t 
     }
 }
 
+// Forward residuals must round identically for a token alone or in a batch.
+void vector_add(Tensor& dest, const Tensor& left, const Tensor& right, float scale, long nelem, cudaStream_t stream) {
+    if (nelem < 0 || nelem > dest.nelem() || nelem > left.nelem() || nelem > right.nelem() ||
+        dest.DType != left.DType || dest.DType != right.DType)
+        throw std::runtime_error("vector_add: incompatible tensor sizes or dtypes");
+    if (dest.DType == ETensorDType::FP32)
+        vector_add(dest.get<float>(), left.get<float>(), right.get<float>(), scale, nelem, stream);
+    else if (dest.DType == ETensorDType::BF16)
+        vector_add(dest.get<nv_bfloat16>(), left.get<nv_bfloat16>(), right.get<nv_bfloat16>(), scale, nelem, stream);
+    else
+        throw std::logic_error("vector_add: unsupported dtype");
+}
+
 /**
  * @brief Performs a stochastic rounding vector addition of two tensors.
  *

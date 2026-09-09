@@ -13,7 +13,7 @@
 namespace {
 constexpr std::array Names = {"kda_metadata",
                               "kda_indices",
-                              "kda_norm_fwd",
+                              "kda_norm_fwd_fp32",
                               "kda_norm_bwd",
                               "kda_cumsum_fwd",
                               "kda_cumsum_rev",
@@ -26,7 +26,10 @@ constexpr std::array Names = {"kda_metadata",
                               "kda_state_bwd",
                               "kda_wy_bwd",
                               "kda_intra_bwd",
-                              "kda_beta_bwd"};
+                              "kda_beta_bwd",
+                              "kda_recurrent",
+                              "kda_recurrent_init",
+                              "kda_recurrent_train"};
 int ceildiv(int a, int b) {
     return (a + b - 1) / b;
 }
@@ -57,25 +60,25 @@ struct Workspace {
         cu = alloc(N + 1, 4);
         offsets = alloc(N + 1, 4);
         indices = alloc(2L * NT, 4);
-        qn = alloc(n, 2);
-        kn = alloc(n, 2);
+        qn = alloc(n, 4);
+        kn = alloc(n, 4);
         qr = alloc(rows, 4);
         kr = alloc(rows, 4);
         gc = alloc(n, 4);
-        Aqk = alloc(rows * 64, 2);
-        Akk = alloc(rows * 64, 2);
+        Aqk = alloc(rows * 64, 4);
+        Akk = alloc(rows * 64, 4);
         Akkd = alloc(rows * 16, 4);
-        w = alloc(n, 2);
-        u = alloc(n, 2);
-        qg = alloc(n, 2);
-        kg = alloc(n, 2);
-        h = alloc(static_cast<std::size_t>(NT) * H * D * D, 2);
-        vn = alloc(n, 2);
+        w = alloc(n, 4);
+        u = alloc(n, 4);
+        qg = alloc(n, 4);
+        kg = alloc(n, 4);
+        h = alloc(static_cast<std::size_t>(NT) * H * D * D, 4);
+        vn = alloc(n, 4);
         if (backward) {
             dout = alloc(n, 2);
-            dv = alloc(n, 2);
-            dvs = alloc(n, 2);
-            dh = alloc(static_cast<std::size_t>(NT) * H * D * D, 2);
+            dv = alloc(n, 4);
+            dvs = alloc(n, 4);
+            dh = alloc(static_cast<std::size_t>(NT) * H * D * D, 4);
             dq = alloc(n, 4);
             dk = alloc(n, 4);
             dg = alloc(n, 4);
@@ -106,13 +109,39 @@ std::size_t KimiDeltaRuleKernels::workspace_bytes(int B, int T, int H, int D, in
     return Workspace(nullptr, B, T, H, D, num_docs, backward).bytes;
 }
 
+void KimiDeltaRuleKernels::recurrent(const std::vector<Tensor>& inputs,
+                                     const Tensor& output,
+                                     const Tensor& state,
+                                     bool initial,
+                                     cudaStream_t stream) const {
+    if (!is_ready() || inputs.size() < 5 || inputs[0].Rank != 4)
+        throw std::runtime_error("Invalid KDA recurrent inputs or missing manifests");
+    const auto& q = inputs[0];
+    const int H = q.Sizes[2], D = q.Sizes[3];
+    if (q.DType != ETensorDType::BF16 || state.DType != ETensorDType::FP32 || state.nelem() != q.Sizes[0] * H * D * D ||
+        output.nelem() != q.nelem())
+        throw std::runtime_error("KDA decode requires BF16 activations and matching FP32 state");
+    auto& kernel = mKernels.at(initial ? "kda_recurrent_init" : "kda_recurrent");
+    if (kernel.meta().const_int("H", -1) != H || kernel.meta().const_int("K", -1) != D)
+        throw std::runtime_error("KDA recurrent manifest geometry mismatch");
+    std::int64_t B = q.Sizes[0], T = q.Sizes[1];
+    void* nil = nullptr;
+    float unused_bound = -5;
+    auto qptr = inputs[0].Data, k = inputs[1].Data, v = inputs[2].Data, g = inputs[3].Data, beta = inputs[4].Data,
+         out = output.Data, carry = state.Data;
+    void* params[] =
+        {&qptr, &k, &v, &g, &beta, &nil, &nil, &out, &carry, &carry, &nil, &nil, &nil, &unused_bound, &B, &T};
+    kernel.launch_triton(dim3(B * H * ((D + 31) / 32)), params, std::size(params), stream);
+}
+
 void KimiDeltaRuleKernels::run(bool backward,
                                const std::vector<Tensor>& inputs,
                                const std::vector<Tensor>& outputs,
                                const std::int32_t* cu_seqlens,
                                int num_docs,
                                const Tensor& workspace,
-                               cudaStream_t stream) const {
+                               cudaStream_t stream,
+                               bool recurrent_forward) const {
     if (!is_ready()) throw std::runtime_error("GLM KDA requires compile_jit_kernels() and JitKernelManifests");
     const int off = backward ? 1 : 0;
     if (inputs.size() < 5 + off || outputs.size() != (backward ? 5 : 1))
@@ -147,10 +176,35 @@ void KimiDeltaRuleKernels::run(bool backward,
         return mKernels.at(name).meta().const_int(key, -1);
     };
     launch("kda_metadata", dim3(1), cu_seqlens, s.cu, s.offsets, s.N, Trow, packed);
+    if (!backward && recurrent_forward) {
+        std::int64_t sequences = s.N, tokens = T;
+        float unused_bound = -5;
+        auto qptr = inputs[0].Data, kptr = inputs[1].Data, vptr = inputs[2].Data, gptr = inputs[3].Data,
+             betaptr = inputs[4].Data, out = outputs[0].Data;
+        void* args[] = {&qptr,
+                        &kptr,
+                        &vptr,
+                        &gptr,
+                        &betaptr,
+                        &nil,
+                        &nil,
+                        &out,
+                        &nil,
+                        &nil,
+                        &s.cu,
+                        &nil,
+                        &nil,
+                        &unused_bound,
+                        &sequences,
+                        &tokens};
+        mKernels.at("kda_recurrent_train")
+            .launch_triton(dim3(sequences * H * ceildiv(D, 32)), args, std::size(args), stream);
+        return;
+    }
     launch("kda_indices", dim3(s.N + 1), s.offsets, s.indices, s.N, s.NT);
-    const dim3 norm_grid(ceildiv(rows, tile("kda_norm_fwd", "BT")));
-    launch("kda_norm_fwd", norm_grid, q.Data, s.qn, s.qr, eps, rows);
-    launch("kda_norm_fwd", norm_grid, inputs[off + 1].Data, s.kn, s.kr, eps, rows);
+    const dim3 norm_grid(ceildiv(rows, tile("kda_norm_fwd_fp32", "BT")));
+    launch("kda_norm_fwd_fp32", norm_grid, q.Data, s.qn, s.qr, eps, rows);
+    launch("kda_norm_fwd_fp32", norm_grid, inputs[off + 1].Data, s.kn, s.kr, eps, rows);
     launch("kda_cumsum_fwd",
            dim3(ceildiv(D, tile("kda_cumsum_fwd", "BS")), s.NT, H),
            inputs[off + 3].Data,
@@ -161,7 +215,7 @@ void KimiDeltaRuleKernels::run(bool backward,
            T);
     auto v = inputs[off + 2].Data, beta = inputs[off + 4].Data;
     // The triangular solver writes only the lower triangle.
-    CUDA_CHECK(cudaMemsetAsync(s.Akk, 0, static_cast<std::size_t>(rows) * 64 * 2, stream));
+    CUDA_CHECK(cudaMemsetAsync(s.Akk, 0, static_cast<std::size_t>(rows) * 64 * 4, stream));
     launch("kda_intra_fwd", dim3(s.NT, 4, H), s.qn, s.kn, s.gc, beta, s.Aqk, s.Akkd, scale, s.cu, s.indices, T);
     launch("kda_solve", dim3(s.NT, H), s.qn, s.kn, s.gc, beta, s.Aqk, s.Akkd, s.Akk, scale, s.cu, s.indices, T);
     launch("kda_wy_fwd", dim3(s.NT, H), s.qn, s.kn, s.qg, s.kg, v, beta, s.w, s.u, s.Akk, s.gc, s.cu, s.indices, T);

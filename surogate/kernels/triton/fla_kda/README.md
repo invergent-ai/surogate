@@ -14,8 +14,9 @@ Copyright (c) 2023–2026 Songlin Yang, Yu Zhang, Zhiyuan Li;
 | `wy.py` | `fla/ops/kda/wy_fast.py` | `recompute_w_u_fwd_kda_kernel` |
 | `state.py` | `fla/ops/common/chunk_delta_h.py` | `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`, `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64` |
 | `output.py` | `fla/ops/gla/chunk.py` | `chunk_gla_fwd_kernel_o` |
+| `recurrent.py` | `fla/ops/kda/fused_recurrent.py` | `fused_recurrent_kda_fwd_kernel` |
 | `backward.py` | `fla/ops/kda/chunk_bwd.py` | `chunk_kda_bwd_kernel_dAv`, `chunk_kda_bwd_kernel_wy_dqkg_fused` |
-| `ops.py` | `fla/ops/utils/op.py` | Default `exp2` implementation and `tl.gather` alias |
+| `ops.py` | `fla/ops/utils/op.py`, `fla/ops/utils/softplus.py` | Default `exp2`, `exp`, portable `softplus_triton` and `tl.gather` alias |
 
 Local changes:
 
@@ -24,13 +25,18 @@ Local changes:
   tiles, signatures and manifests; no installed FLA package is required.
 - Kernels receiving `chunk_indices` return early for sequence index `-1`.
   Surogate fills spare entries with that sentinel to keep CUDA graph launch
-  dimensions stable when document lengths change. The numerical bodies are
-  otherwise unchanged.
-- Use `tf32x3` for default FP32 dot products to reduce rounding in gate
-  gradients; the triangular solver retains upstream's explicit TF32 setting.
+  dimensions stable when document lengths change.
+- Keep normalized Q/K, triangular/WY intermediates, chunk states and intermediate
+  value gradients in FP32. Local casts in `wy.py` and `backward.py` preserve that
+  precision when combining BF16 model activations with FP32 scratch tensors.
+- Use `tf32x3` for FP32 dot products, including the triangular solver. The AOT
+  compiler sets both the backend option and Triton's scoped language default;
+  recent Triton frontends resolve `tl.dot` precision before backend compilation.
   Use two warps for the forward state kernel, retaining upstream's Blackwell
   correctness restriction. Tile sizes are fixed and recorded in manifests;
   there is no runtime autotuning.
+- The 128-wide FP32 backward state kernel uses four warps and one pipeline stage
+  to fit the shared-memory limit on consumer GPUs.
 - `../kimi_delta_rule.py` adds Surogate metadata and beta-gradient reduction
   kernels plus AOT compilation. `csrc/src/runtime/jit/kimi_delta_rule_kernels.*`
   owns the native forward/backward launch order and scratch layout.
@@ -38,8 +44,14 @@ Local changes:
 The integrated path uses BF16 activations, FP32 decay and FP32 output gradients,
 Q/K L2 normalization, bounded-gate intra-chunk computation, 64-token chunks,
 equal Q/K/V head counts and dimensions, and zero initial state per document.
-It recomputes forward intermediates in backward. Context parallelism, persistent
-decode state and FLA's Python model/autograd APIs are outside this vendored subset.
+It recomputes forward intermediates in backward. Decode uses the fused recurrent
+kernel with FP32 state carried between chunks, plus persistent convolution history.
+The compiler registers 19 KDA manifests, including initial-state and continued-state
+decode variants and a packed recurrent training-forward variant. Native-colocate
+GRPO uses the recurrent forward to match rollout arithmetic; backward recomputes
+FP32 chunk intermediates and uses the chunk derivatives. Ordinary SFT retains the
+parallel chunk forward. Context parallelism and FLA's Python model/autograd APIs remain
+outside this vendored subset.
 
 When updating, diff these functions against the pinned source, retain licensing,
 and run `tests/train/test_kda_triton.py`, `tests/train/test_glm5_training.py`,

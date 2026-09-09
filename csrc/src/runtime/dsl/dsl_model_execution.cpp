@@ -280,16 +280,12 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     }
     if (const auto* type = internal::find_key(&mModule->hf_config, "model_type");
         type && internal::as_string(*type).value_or("") == "glm5_next") {
-        const auto* topk = internal::find_key(&mModule->config, "index_topk");
-        if (topk && T > internal::as_int(*topk).value_or(0))
-            throw std::runtime_error(
-                "GLM training currently requires sequence_len <= index_topk; sparse DSA selection is not implemented");
         for (const char* name : {"n_group", "topk_group"}) {
             const auto* value = internal::find_key(&mModule->config, name);
             if (value && internal::as_int(*value).value_or(1) != 1)
                 throw std::runtime_error("GLM training currently requires n_group=topk_group=1");
         }
-        for (const char* name : {"norm_topk_prob", "index_kpool_always_select_tail"}) {
+        for (const char* name : {"norm_topk_prob"}) {
             const auto* value = internal::find_key(&mModule->config, name);
             if (value && !internal::as_bool(*value).value_or(true))
                 throw std::runtime_error(std::string("GLM training currently requires ") + name + "=true");
@@ -704,7 +700,7 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
 
 std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
                                                const std::int32_t* last_positions,
-                                               int B, int T, NCCLCommunicator& comm) {
+                                               int B, int T, NCCLCommunicator& comm, GlmDecodeState* decode) {
     if (!mExecutor || !mRunState || !lora_enabled() || mWeightManager || qlora_enabled()) {
         throw std::runtime_error("next_token_logits requires initialized resident LoRA weights");
     }
@@ -727,23 +723,30 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
     std::vector<std::byte> raw(static_cast<std::size_t>(B) * V * get_dtype_size(dtype));
     std::vector<std::int32_t> positions(static_cast<std::size_t>(B) * T), targets(positions.size(), -100);
     for (int b = 0; b < B; ++b) {
-        std::iota(positions.begin() + b * T, positions.begin() + (b + 1) * T, 0);
+        std::iota(positions.begin() + b * T, positions.begin() + (b + 1) * T, decode ? decode->length : 0);
     }
     auto cpu_tokens = [B, T](const std::int32_t* data) {
         return Tensor::from_pointer(reinterpret_cast<std::byte*>(const_cast<std::int32_t*>(data)),
                                     -1, ETensorDType::INT32, std::vector<long>{B, T});
     };
     const auto inputs = cpu_tokens(input_ids), pos = cpu_tokens(positions.data());
-    ensure_lora_run_state(comm, B, T);
+    if (decode) {
+        // Reuse the trainer's capacity without replacing buffers referenced by
+        // its captured optimizer/backward graphs. LoRA forward derives active
+        // dimensions from the input tensors.
+        if (!mLoRARunState || B * T > mLoRARunState->B * mLoRARunState->T)
+            throw std::runtime_error("Decode exceeds the trainer's LoRA workspace capacity");
+    } else ensure_lora_run_state(comm, B, T);
     const bool was_training = mLoRARunState->is_training;
     mLoRARunState->is_training = false;
-    const bool masked = causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, pos);
+    const bool masked = !decode && causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, pos);
     auto request = causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, pos,
                                                          cpu_tokens(targets.data()), 0);
     request.mode = ExecutionMode::Forward;
     request.reduce_loss_on_completion = false;
     request.disable_forward_saves = true;
     request.generation_positions_cpu = last_positions;
+    request.glm_decode_state = decode;
     request.generation_logits_cpu = Tensor::from_pointer(raw.data(), -1, dtype, std::vector<long>{B, V});
     try {
         mExecutor->execute_forward(request, comm);
@@ -768,6 +771,41 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
         }
     }
     return result;
+}
+
+void DslModel::reset_decode_state() {
+    if (mGlmDecodeState) {
+        mGlmDecodeState->active = false;
+        mGlmDecodeState->length = 0;
+    }
+}
+
+std::vector<float> DslModel::decode_logits(const std::int32_t* input_ids, int T, bool reset,
+                                          int capacity, NCCLCommunicator& comm) {
+    const auto* type = internal::find_key(&mModule->hf_config, "model_type");
+    if (!type || internal::as_string(*type).value_or("") != "glm5_next")
+        throw std::runtime_error("Persistent training-model decode currently supports GLM-5.3-Flash");
+    if (T <= 0 || capacity <= 0) throw std::invalid_argument("Decode input must contain at least one token");
+    if (reset) {
+        if (!mGlmDecodeState || mGlmDecodeState->capacity != capacity) {
+            mGlmDecodeState = std::make_unique<GlmDecodeState>();
+            mGlmDecodeState->capacity = capacity;
+        }
+        mGlmDecodeState->length = 0;
+        mGlmDecodeState->active = true;
+    }
+    if (!mGlmDecodeState || !mGlmDecodeState->active)
+        throw std::runtime_error("Decode requires a prefill call with reset=true after reset or training");
+    if (T > capacity - mGlmDecodeState->length) throw std::invalid_argument("Decode exceeds maximum context length");
+    int position = T - 1;
+    try {
+        auto result = next_token_logits(input_ids, &position, 1, T, comm, mGlmDecodeState.get());
+        mGlmDecodeState->length += T;
+        return result;
+    } catch (...) {
+        reset_decode_state();
+        throw;
+    }
 }
 
 void DslModel::step_with_custom_loss(Tensor inputs,

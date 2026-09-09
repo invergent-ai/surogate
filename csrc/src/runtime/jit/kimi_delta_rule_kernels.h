@@ -20,6 +20,11 @@ public:
     void load(const std::unordered_map<std::string, std::string>& manifests);
     [[nodiscard]] bool is_ready() const;
     static std::size_t workspace_bytes(int B, int T, int H, int D, int num_docs, bool backward);
+    void recurrent(const std::vector<Tensor>& inputs,
+                   const Tensor& output,
+                   const Tensor& state,
+                   bool initial,
+                   cudaStream_t stream) const;
 
     /// Forward inputs: q/k/v (BF16), decay (FP32), beta (BF16).
     /// Backward prepends d_output and returns five FP32 gradients.
@@ -31,7 +36,8 @@ public:
              const std::int32_t* cu_seqlens,
              int num_docs,
              const Tensor& workspace,
-             cudaStream_t stream) const;
+             cudaStream_t stream,
+             bool recurrent_forward = false) const;
 
 private:
     std::unordered_map<std::string, JitKernel> mKernels;

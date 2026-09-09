@@ -40,6 +40,8 @@ void glm5_backward(Glm5Kernel kind,
                    Tensor checkpoints,
                    cudaStream_t stream);
 void glm5_copy_gradient(const Tensor& src, Tensor& dst, bool accumulate, cudaStream_t stream);
+void glm5_convolution_state(const Tensor& x, const Tensor& weight, const Tensor& state,
+                            const Tensor& output, bool initial, cudaStream_t stream);
 
 // Checkpointed recurrent backward recomputes at most 15 tokens per reverse step.
 // This bounds scratch by O(B * ceil(T/16) * H * K * V), not O(B*T*H*K*V).

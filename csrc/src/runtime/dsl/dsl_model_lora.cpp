@@ -76,6 +76,7 @@ void DslModel::export_adapter(const std::string& directory,
 }
 
 void DslModel::import_adapter(const std::string& file_name, NCCLCommunicator& comm) {
+    reset_decode_state();
     if (!lora_enabled()) return;
     mLoRAWeights->import_from_file(file_name, comm);
 }
@@ -127,6 +128,7 @@ void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
 }
 
 void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommunicator& comm) {
+    reset_decode_state();
     if (!lora_enabled()) return;
     namespace fs = std::filesystem;
 

@@ -23,6 +23,24 @@ unquantized BF16 safetensors, LoRA, one GPU, and a model supported by the shared
 runner (Nemotron is excluded). It does not support checkpoint resume, QLoRA, CPU
 weight offload, or QeRL noise. See [colocation limits](../../docs/guides/rl-colocate.md).
 
+For real function-tool rollouts, use [tools-orch.yaml](tools-orch.yaml) with the
+same training/inference files and a fresh output directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 surogate grpo-colocate \
+  --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml \
+  --orch examples/grpo/tools-orch.yaml
+```
+
+The local [tool environment](tool_env.py) exposes `add(a, b)`, executes the model's
+structured tool call, returns a tool message, and rewards the final answer.
+Schemas come from Verifiers' `ToolEnv`; custom environments can expose their own
+Python functions the same way. Tool results are context tokens with no GRPO loss.
+Every supported native-colocate model family can use tools. The shared training
+server selects the checkpoint protocol or adapts templates without tool support;
+base models still need training to learn reliable calls. See the
+[protocols and limits](../../docs/guides/rl-colocate.md#agentic-tool-rollouts).
+
 For independent processes, run these in three terminals:
 
 ```bash
@@ -49,9 +67,12 @@ Keep these values aligned when customizing:
 - `rollouts_per_example` must divide `batch_size`; inference needs room for prompt
   plus completion, and adapters must fit `max_lora_rank`.
 
-`use_token_client: true` requires the chat template to preserve conversation prefixes.
-Use `false` for templates that rewrite earlier turns; the [multi-turn OPD example](../turnopd/README.md)
-does so. Very short completion limits can truncate every answer and leave zero
+`use_token_client: true` preserves previously generated tokens and appends the
+environment's response using a template bridge. Surogate supplies a bridge that
+preserves real function names and handles Qwen's reasoning rules. Truncated
+turns or incompatible custom templates can still fall back to message rendering;
+the client logs this. The [multi-turn OPD example](../turnopd/README.md) uses
+message rendering explicitly. Very short completion limits can truncate every answer and leave zero
 reward; a small model may still need easier tasks or more steps to learn.
 
 For split-mode resume, set trainer `resume_from_checkpoint: true` and orchestrator

@@ -33,6 +33,7 @@
 #include "utilities/tensor_container.h"
 #include "runtime/core/qlora_provider.h"
 #include "runtime/dsl/mapping_spec.h"
+#include "runtime/executor/glm_decode_state.h"
 
 namespace modules {
 struct HfMapping;
@@ -383,7 +384,10 @@ public:
     /// Evaluate selected next-token logits using the resident policy, without saving backward activations.
     std::vector<float> next_token_logits(const std::int32_t* input_ids,
                                          const std::int32_t* last_positions,
-                                         int B, int T, NCCLCommunicator& comm);
+                                         int B, int T, NCCLCommunicator& comm, GlmDecodeState* decode = nullptr);
+    std::vector<float> decode_logits(const std::int32_t* input_ids, int T, bool reset,
+                                     int capacity, NCCLCommunicator& comm);
+    void reset_decode_state();
 
     /// Run one training micro-step with externally-computed per-token gradient multipliers.
     ///
@@ -663,6 +667,7 @@ private:
 
     // Adapter merge state (optional — stacked LoRA)
     std::string mAdapterPath;
+    std::unique_ptr<GlmDecodeState> mGlmDecodeState;
 
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;
