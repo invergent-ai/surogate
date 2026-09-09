@@ -8,14 +8,34 @@ import subprocess
 import sys
 import tomlkit
 
+# What a wheel declares, so that `pip install <wheel-url>` resolves from PyPI alone.
+#
+# cu130 asks for plain `torch==2.11.0`. The pin used to carry a local version --
+# `torch==2.11.0+cu130` -- which exists only on download.pytorch.org, so the install
+# died in resolution unless the caller passed --index-url. Nothing here links torch
+# (there is no find_package(Torch); the extensions pull libcudart, libcublasLt,
+# libcuda and libgomp only), so its CUDA variant is not our concern -- and PyPI's
+# torch 2.11.0 is itself a CUDA 13 build, which is the one that matches.
+#
+# The CUDA runtime *is* our concern, because our own binaries link it, so we name it
+# rather than hope torch's transitive set covers the right major. Bounds stay loose:
+# the cu13 packages pin each other through `cuda-toolkit`, and a tighter floor here
+# makes that graph unsatisfiable.
+#
+# cu128 keeps its local-version pin. PyPI publishes one Linux torch and it is CUDA 13,
+# so a CUDA 12 host needs the pytorch index either way -- which is what install.sh is
+# for. Its users are on drivers that predate CUDA 13 and cannot take the PyPI build.
 CUDA_DEPS = {
     "cu128": [
         "torch==2.11.0+cu128",
         "torchvision==0.26.0+cu128",
     ],
     "cu130": [
-        "torch==2.11.0+cu130",
-        "torchvision==0.26.0+cu130",
+        "torch==2.11.0",
+        "torchvision==0.26.0",
+        "nvidia-cuda-runtime>=13,<14",
+        "nvidia-cublas>=13,<14",
+        "nvidia-cufile>=1.15,<2",
     ],
 }
 

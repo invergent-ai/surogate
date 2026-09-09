@@ -172,6 +172,16 @@ source .venv/bin/activate
 
 The installer selects a CUDA-specific wheel and downloads the example configurations.
 
+On CUDA 13 the wheel is also installable on its own, with no index flags — every
+dependency resolves from PyPI:
+
+```bash
+pip install https://github.com/invergent-ai/surogate/releases/latest/download/surogate-<version>+cu130-cp312-abi3-manylinux_2_39_x86_64.whl
+```
+
+A CUDA 12 host needs the installer: PyPI publishes one Linux torch and it is a CUDA 13
+build, so a 12.x runtime has to take its torch from the PyTorch index.
+
 ### Serve a model
 
 ```bash

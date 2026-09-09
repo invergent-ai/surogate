@@ -746,9 +746,17 @@ if (PYTHON_BINDING)
     # doesn't pull the archive objects).
     target_link_libraries(_surogate PRIVATE mem_eff)
 
-    # pick up cuda libraries from within the current python env, if available
+    # Pick up CUDA libraries from within the current python env, if available.
+    #
+    # Two layouts, because the nvidia wheels changed shape at CUDA 13: the cu12
+    # packages install one directory per library (nvidia/cuda_runtime/lib,
+    # nvidia/cublas/lib), while the cu13 ones put everything in nvidia/cu13/lib.
+    # Both are listed -- a path that does not exist costs a stat at load time,
+    # and omitting the cu13 one left a pip-installed cu130 wheel unable to find
+    # libcudart.so.13 outside a container that had written its own ld.so.conf.
     set(RPATH_LIST
         "$ORIGIN"
+        "$ORIGIN/../nvidia/cu13/lib"
         "$ORIGIN/../nvidia/nccl/lib"
         "$ORIGIN/../nvidia/cudnn/lib"
         "$ORIGIN/../nvidia/cuda_runtime/lib"
@@ -1666,12 +1674,14 @@ set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
             set(SINFER_BIN_RPATH_LIST
                 "$ORIGIN"
                 "$ORIGIN/../.."
+                "$ORIGIN/../../../nvidia/cu13/lib"
                 "$ORIGIN/../../../nvidia/cuda_runtime/lib"
                 "$ORIGIN/../../../nvidia/cublas/lib"
                 "$ORIGIN/../../../nvidia/cudnn/lib")
             list(JOIN SINFER_BIN_RPATH_LIST ":" SINFER_BIN_RPATH)
             set(SINFER_LIB_RPATH_LIST
                 "$ORIGIN"
+                "$ORIGIN/../nvidia/cu13/lib"
                 "$ORIGIN/../nvidia/cuda_runtime/lib"
                 "$ORIGIN/../nvidia/cublas/lib"
                 "$ORIGIN/../nvidia/cudnn/lib")
