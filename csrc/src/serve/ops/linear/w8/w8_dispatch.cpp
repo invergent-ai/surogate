@@ -69,6 +69,22 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_w8_mma_r64_c128;
         }
         break;
+    // The 768-wide tower's merger (Qwen3.5 0.8B): fc1 is square at 4*768, fc2 projects to
+    // the text model's 1024. Measured with sinfer_vision_tower_tune_bench --hidden 768.
+    case 3072:
+        if (n == 3072) {  // merger fc1
+            if (t <= 44) { return launch_w8_simt_r8_c4; }
+            if (t <= 444) { return launch_w8_mma_r32_c128; }
+            if (t <= 764) { return launch_w8_mma_r64_c96; }
+            return launch_w8_mma_r64_c128;
+        }
+        if (n == 1024) {  // merger fc2
+            if (t <= 108) { return launch_w8_simt_r8_c4; }
+            if (t <= 1596) { return launch_w8_mma_r32_c128; }
+            if (t <= 2044) { return launch_w8_mma_r64_c96; }
+            return launch_w8_mma_r64_c128;
+        }
+        break;
     case 4096:
         if (n == 2048) {
             if (t <= 48) { return launch_w8_small_t; }

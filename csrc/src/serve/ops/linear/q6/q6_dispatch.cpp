@@ -52,6 +52,14 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         // ran the SIMT path to t=96 where it stops winning at 64. Boundaries sit on
         // the stable regions; the harness resolves ~2 us, so adjacent tiles within
         // that of each other are interchangeable.
+        // Measured with sinfer_vision_tower_tune_bench --hidden 768.
+        if (n == 768) {
+            if (t < 4 || t > 131072 || (t % 4) != 0) { break; }
+            if (t <= 44) { return launch_q6_simt_r8_c4; }
+            if (t <= 124) { return launch_q6_simt_r8_c8; }
+            if (t <= 1024) { return launch_q6_mma_r64_c96; }
+            return launch_q6_mma_r64_c128;
+        }
         if (n == 1024) {
             if (t < 4 || t > 131072 || (t % 4) != 0) { break; }
             if (t <= 32) { return launch_q6_simt_r8_c4; }

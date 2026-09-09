@@ -70,6 +70,26 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     // Flash-Next. Measured with sinfer_vision_tower_tune_bench --hidden 1024: c96 wins
     // across the useful range on both shapes and c64 never does, which is what
     // mirroring the 1152 schedule had picked.
+    // The 768-wide vision tower (Qwen3.5 0.8B). Nothing dispatched for it before, so the
+    // tower threw on its first projection and the checkpoint could not serve an image.
+    // Measured with sinfer_vision_tower_tune_bench --hidden 768. The harness resolves
+    // ~2 us, so tiles within that of each other are interchangeable and the boundaries
+    // sit on the stable regions rather than on every flip.
+    case 768:
+        if (t < 4 || t > 131072 || (t % 4) != 0) { break; }
+        switch (n) {
+        case 2304:  // qkv
+            if (t <= 44) { return launch_q4_simt_r8_c4; }
+            if (t <= 2048) { return launch_q4_mma_r64_c96; }
+            return launch_q4_mma_r64_c128;
+        case 3072:  // mlp fc1
+            if (t <= 28) { return launch_q4_simt_r8_c4; }
+            if (t <= 1536) { return launch_q4_mma_r64_c96; }
+            return launch_q4_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
     case 1024:
         if (t < 4 || t > 131072 || (t % 4) != 0) { break; }
         switch (n) {

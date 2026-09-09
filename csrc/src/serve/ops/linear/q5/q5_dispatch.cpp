@@ -45,6 +45,22 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q5_mma_r64_c128;
         }
         break;
+    // Vision tower, 768-wide (Qwen3.5 0.8B): attention output is n = k = hidden, mlp fc2
+    // is k = intermediate. Measured with sinfer_vision_tower_tune_bench --hidden 768; the
+    // flips between c64 and c128 in the middle of both ranges are inside the harness's ~2 us,
+    // so each takes the tile that holds across its region.
+    case 768:
+        if (n == 768 && t >= 4 && t <= 131072 && (t % 4) == 0) {
+            if (t <= 1020) { return launch_q5_mma_r64_c64; }
+            return launch_q5_mma_r64_c128;
+        }
+        break;
+    case 3072:
+        if (n == 768 && t >= 4 && t <= 131072 && (t % 4) == 0) {
+            if (t <= 252) { return launch_q5_simt_r8_c4; }
+            return launch_q5_mma_r64_c128;
+        }
+        break;
     // Vision tower, 1024-wide (Qwen3.5 2B/4B): attention output is n = k = hidden,
     // mlp fc2 is k = intermediate below. Measured with sinfer_vision_tower_tune_bench
     // --hidden 1024. Mirroring 1152 had fc2 on c64 out to t=1148, where c128 in fact

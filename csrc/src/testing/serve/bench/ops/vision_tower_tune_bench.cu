@@ -15,8 +15,13 @@
 //   mlp fc1          q4  n=I          k=H
 //   mlp fc2          q5  n=H          k=I
 //   merger fc1       w8  n=4H         k=4H
+//   merger fc2       w8  n=text width k=4H
 //
-//   sinfer_vision_tower_tune_bench [--hidden 1024|1152] [--t-sweep 196,256,...]
+// The merger's output is the text model's width, which does not follow the tower's:
+// the 0.8B pairs a 768 tower with a 1024 text model, the 2B a 1024 tower with 2048.
+//
+//   sinfer_vision_tower_tune_bench [--hidden 768|1024|1152] [--text-width 2048]
+//                                  [--t-sweep 196,256,...]
 
 #include "core/device.h"
 #include "sinfer_bench_common.h"
@@ -103,6 +108,7 @@ std::vector<std::int32_t> parse_list(std::string_view raw) {
 int main(int argc, char** argv) {
     try {
         std::int32_t hidden = 1024;
+        std::int32_t text_width = 0;   // defaults below, from the tower
         // A 224x224 image is 196 patches; larger inputs and batches run longer.
         std::vector<std::int32_t> sweep{64, 128, 196, 256, 512, 1024, 2048};
         int warmup = 3, repeat = 20;
@@ -114,6 +120,8 @@ int main(int argc, char** argv) {
             };
             if (a == "--hidden") {
                 hidden = std::stoi(std::string(next("--hidden")));
+            } else if (a == "--text-width") {
+                text_width = std::stoi(std::string(next("--text-width")));
             } else if (a == "--t-sweep") {
                 sweep = parse_list(next("--t-sweep"));
             } else if (a == "--warmup") {
@@ -126,6 +134,10 @@ int main(int argc, char** argv) {
         }
         // 16 heads either way; the intermediate follows the tower.
         const std::int32_t intermediate = hidden == 1152 ? 4304 : 4 * hidden;
+        // The pairings shipped so far; anything else has to say.
+        if (text_width == 0) {
+            text_width = hidden == 768 ? 1024 : hidden == 1024 ? 2048 : 4096;
+        }
 
         const Shape shapes[] = {
             {"patch_embedding", QType::Q6G64_F16S, hidden, 1536, kQ6, std::size(kQ6)},
@@ -134,6 +146,7 @@ int main(int argc, char** argv) {
             {"mlp/fc1", QType::Q4G64_F16S, intermediate, hidden, kQ4, std::size(kQ4)},
             {"mlp/fc2", QType::Q5G64_F16S, hidden, intermediate, kQ5, std::size(kQ5)},
             {"merger/fc1", QType::W8G32_F16S, 4 * hidden, 4 * hidden, kW8, std::size(kW8)},
+            {"merger/fc2", QType::W8G32_F16S, text_width, 4 * hidden, kW8, std::size(kW8)},
         };
 
         cudaStream_t stream = nullptr;
@@ -142,7 +155,8 @@ int main(int argc, char** argv) {
         std::int32_t max_t = 0;
         for (const std::int32_t t : sweep) { max_t = std::max(max_t, t); }
 
-        std::printf("vision tower tuning, hidden=%d intermediate=%d\n", hidden, intermediate);
+        std::printf("vision tower tuning, hidden=%d intermediate=%d text_width=%d\n", hidden,
+                    intermediate, text_width);
         for (const Shape& shape : shapes) {
             bench::PackedQuantizedWeight packed =
                 bench::make_row_split_weight(shape.qtype, shape.n, shape.k, shape.k);
