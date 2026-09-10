@@ -19,7 +19,7 @@ CASES = configurations()
 SELECTED = os.environ.get("SUROGATE_SHARED_CASES", "all").split(",")
 
 
-def make_trainer(root, case, *, graphs=False, sequence=256, config=None):
+def make_trainer(root, case, *, graphs=False, sequence=256, config=None, rollout_parity=None):
     from surogate import _surogate as ext
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
     from surogate.kernels.jit_compile import compile_jit_kernels
@@ -30,6 +30,11 @@ def make_trainer(root, case, *, graphs=False, sequence=256, config=None):
         create_dummy(root, index_topk=32, max_sequence_length=sequence)
     else:
         (root / "config.json").write_text(json.dumps(CASES[case] if config is None else config))
+    config = json.loads((root / "config.json").read_text())
+    text = config.get("text_config", config)
+    moe = text.get("num_experts", text.get("num_local_experts", text.get("n_routed_experts", 0)))
+    if rollout_parity is None:
+        rollout_parity = bool(moe)
     options = ext.RuntimeOptions(
         recompute="true",
         use_cuda_graphs=graphs,
@@ -40,11 +45,9 @@ def make_trainer(root, case, *, graphs=False, sequence=256, config=None):
         doc_masking=True,
     )
     options.glm_rollout_parity = case == "glm"
+    options.moe_rollout_parity = rollout_parity
     options.dsl_ir_json = build_dsl_ir_for_model(str(root))
-    options.jit_kernel_manifests = compile_jit_kernels(options.dsl_ir_json)
-    config = json.loads((root / "config.json").read_text())
-    text = config.get("text_config", config)
-    moe = text.get("num_experts", text.get("num_local_experts", text.get("n_routed_experts", 0)))
+    options.jit_kernel_manifests = compile_jit_kernels(options.dsl_ir_json, rollout_parity=rollout_parity)
     trainer = ext.SurogateTrainer(
         ngpu=1,
         config=ext.PretrainedConfig.from_pretrained(str(root), "bf16"),

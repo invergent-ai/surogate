@@ -24,10 +24,12 @@ requests are generating. Active generation has priority, while waiting prompts
 continue to make progress. Long prompts are processed in smaller chunks to keep
 the server responsive.
 
-Prompt caching reuses previously processed text, which can reduce work when GRPO
-requests several completions for the same prompt or continues a conversation.
-Each request keeps its own sampling settings and seed. Cached prompts are cleared
-before training updates so subsequent rollouts use the updated policy.
+Prompt and completed-turn caching reuse previously processed text. This reduces
+work when GRPO requests several completions for the same prompt or continues a
+conversation. Follow-up requests can reuse the earlier prompt and generated
+response when their token history matches. Each request keeps its own sampling
+settings and seed. Caches are cleared before training updates so subsequent
+rollouts use the updated policy.
 For models with sliding-window attention, older history is released as the window
 advances. Full-attention models still need their complete history.
 
@@ -41,7 +43,7 @@ Dense Qwen3 and Qwen3.5 normally use the optimized generation server. The follow
 | Setting | Default | When to change it |
 |---|---|---|
 | `decode_prefill_chunk` | `256` | Lower the maximum prompt tokens processed per round to improve responsiveness during long prompts. The server also reduces chunks automatically when busy or short of memory. |
-| `decode_prefix_entries` | `32` | Increase the number of cached prompt prefixes for more reuse, at the cost of memory. Set `0` to disable prompt caching. |
+| `decode_prefix_entries` | `32` | Increase the number of cached prompt and completed-turn prefixes for more reuse, at the cost of memory. Set `0` to disable both. |
 | `decode_cache_bytes` | `0` | Cap generation cache memory in bytes. `0` selects 25% of free GPU memory after the trainer is loaded. |
 | `decode_memory_bytes` | `0` | Cap total generation memory in bytes. `0` selects 80% of free GPU memory after the trainer is loaded. |
 
@@ -59,9 +61,10 @@ completion length. Returned log-probabilities describe the temperature-scaled
 policy before penalties and filtering, as required by GRPO. Structured
 `response_format` decoding remains unsupported on this path.
 
-For GLM, native co-locate automatically keeps rollout and scoring log-probabilities
-consistent. This can make training slower than ordinary SFT. Set
-`doc_masking: true` in the training config.
+For MoE models and GLM, native co-locate automatically keeps rollout and scoring
+log-probabilities consistent, including packed conversations. This can make
+training slower than ordinary SFT. Use `doc_masking: true` and
+`sequence_chunks: 1` in the training config.
 
 Set `long_context: true` and `lora_dropout: 0` to reduce memory use during scoring
 and training with long sequences. See [long-context memory](long-context.md).
@@ -79,6 +82,7 @@ gpus: 1
 per_device_train_batch_size: 1
 sequence_len: 2048
 max_steps: 20
+save_steps: 5
 learning_rate: 1e-4
 lr_scheduler_type: constant
 recipe: bf16
@@ -144,8 +148,8 @@ exported as BF16; their quantized formats cannot be used in this mode.
 
 Use the same model in all three files, matching `max_steps` in training and
 orchestration, and an orchestrator output directory directly inside the training
-output directory. Start each run in a fresh directory. The runner connects the
-orchestrator to the local server and sets synchronous generation automatically.
+output directory. Start each new run in a fresh directory. The runner connects
+the orchestrator to the local server and sets synchronous generation automatically.
 
 Reduce `max_num_seqs` to lower serving concurrency and memory use. On the shared
 training path, `decode_cache_bytes` also caps persistent request cache storage.
@@ -156,13 +160,38 @@ to finish its answer and receive a useful reward.
 
 The run writes `shared_weights.jsonl` in the training output directory. It reports
 the shared base size and policy version at each phase. Base
-upload bytes and serving base allocation bytes should both be zero. Normal final
-adapter saving and training checkpoints still work; per-step broadcast folders
-contain readiness markers only.
+upload bytes and serving base allocation bytes should both be zero. Final adapters are saved normally. Set `save_steps` in `train.yaml` to save
+resumable checkpoints every few updates and at the end of the run. Set it to `0`
+to disable checkpoint saving.
 
 Quantized checkpoints, QLoRA, full fine-tuning, image/video prompts,
-Nemotron, multiple GPUs, CPU weight offload, QeRL weight noise, and
-checkpoint resume are not yet supported by native co-locate mode. Use the split-GPU runner for those.
+Nemotron, multiple GPUs, CPU weight offload, and QeRL weight noise are not yet
+supported by native co-locate mode. Use the split-GPU runner for those.
+
+## Resume a run
+
+Run the same command with the same output directories. With
+`resume_from_checkpoint: true` in `train.yaml` (the default), native co-locate
+restores the latest complete checkpoint, including the adapter, optimizer, and
+rollout progress. Incomplete checkpoint saves are skipped. To extend a finished
+run, increase `max_steps` in both `train.yaml` and `orch.yaml` before restarting.
+Keep the model, adapter, optimizer type, and sequence length unchanged.
+
+To resume an earlier saved update, set `ckpt.resume_step` in `orch.yaml`:
+
+```yaml
+ckpt:
+  resume_step: 10
+```
+
+The number is the count of completed training updates. Set `resume_step: -1`
+(or omit it) to select the latest complete checkpoint. Later rollout work is
+preserved separately and regenerated from the restored policy. Generation caches
+rebuild after restart; new rollouts may differ from an uninterrupted run.
+
+Resume requires checkpoints saved by this native runner with both training and
+rollout progress. An adapter export alone cannot resume a run. For a fresh run,
+choose a new output directory and set `resume_from_checkpoint: false` if desired.
 
 ## Agentic tool rollouts
 

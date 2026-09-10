@@ -125,6 +125,10 @@ struct RuntimeOptions {
     // Match GLM's rollout recurrence and GEMM reduction order during GRPO.
     // Enabled by native-colocate before allocating the training model.
     bool GlmRolloutParity = false;
+    bool MoeRolloutParity = false;
+    bool rollout_parity() const {
+        return GlmRolloutParity || MoeRolloutParity;
+    }
 
     // DSL IR execution (deprecated flag; DSL backend is always used).
     bool UseDslIr = true;

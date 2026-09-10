@@ -201,3 +201,37 @@ def test_failed_optional_snapshot_does_not_leak_page_references(tmp_path, case):
     trainer.reset_decode_state()
     del trainer
     gc.collect()
+
+
+@pytest.mark.parametrize("case", ["llama", "qwen3_5_moe", "lfm2_moe", "glm"])
+def test_completed_conversation_turns_reuse_generated_state(tmp_path, case):
+    trainer = make_trainer(tmp_path, case, graphs=True)
+    scheduler = DecodeScheduler(trainer, max_batch=4, prefill_chunk=64, token_budget=1024, prefix_entries=8)
+    prompt = [7, 9, 13] * 39
+    generated_inputs = [17, 19, 23] * 5
+    history = prompt + generated_inputs
+    try:
+        session = scheduler.new_session()
+        scheduler.step(session, prompt, True)
+        for token in generated_inputs:
+            scheduler.step(session, [token])
+        scheduler.release(session, cache=True)
+        assert trainer.get_decode_batch_stats()["sessions"] == 0
+        before = scheduler.summary()["prefill_tokens"]
+        for tail in ([29, 31], [43, 37, 41]):
+            session = scheduler.new_session()
+            actual = scheduler.step(session, history + tail, True)
+            expected = trainer.decode_logits(np.array(history + tail, dtype=np.int32), reset=True)
+            assert_policy(actual, expected, case)
+            scheduler.release(session)
+        summary = scheduler.summary()
+        assert summary["completed_turn_cache_hits"] == 2
+        assert summary["prefill_tokens"] - before == 5
+        trainer.reset_decode_state()
+        scheduler.invalidate_prefixes()
+        assert trainer.get_decode_batch_stats()["prefix_entries"] == 0
+        assert not scheduler.completed_prefixes
+    finally:
+        scheduler.close()
+    del trainer
+    gc.collect()

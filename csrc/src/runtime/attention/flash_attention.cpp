@@ -485,7 +485,9 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     params.max_doc_seqlen = mMaxDocSeqlen;
     params.total_doc_tokens = mTotalDocTokens;
     params.stream = mRunState.MainStream;
-    params.cudnn_handle = mRunState.CudnnHandle;
+    // cuDNN's wrapper fixes the softmax scale; the parity forward honors the
+    // model's explicit scale and therefore needs a backward that honors it too.
+    params.cudnn_handle = mOptions.MoeRolloutParity ? nullptr : mRunState.CudnnHandle;
     params.cublas_handle = mRunState.cublas_handle();
     params.cudnn_workspace = mRunState.scratch().cudnn_workspace;
     params.run_state = &mRunState;
@@ -510,6 +512,31 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         params.chunk_append_pos = mChunkIdx * static_cast<int>(mT);
     }
 
+    auto consistent_forward = [&](bool decoding) {
+        long pages = (mT + DecodePageRows - 1) / DecodePageRows;
+        if (window_size > 0) pages = std::min<long>(pages, (window_size + 2 * DecodePageRows - 2) / DecodePageRows);
+        const long per_query = mB * Hq * pages * (Hs + 2L) * sizeof(float);
+        const long tile = std::max<long>(
+            1,
+            std::min<long>({64, mT, static_cast<long>(mRunState.Stack.unused_capacity() / per_query) - 1}));
+        auto scratch = mRunState.temp_alloc(ETensorDType::FP32, {mB, tile, Hq, pages, Hs + 2L}, "rollout_attention");
+        rollout_consistent_attention(qkv,
+                                     out,
+                                     lse,
+                                     scratch,
+                                     decoding ? nullptr : mCuSeqlensGpu,
+                                     decoding ? 0 : mNumDocs,
+                                     mB,
+                                     mT,
+                                     Hq,
+                                     Hkv,
+                                     Hs,
+                                     window_size,
+                                     params.softmax_scale,
+                                     tile,
+                                     params.stream);
+        mRunState.Stack.free(scratch);
+    };
     if (mExecutionRequest && mExecutionRequest->decoding()) {
         const auto& bindings = mExecutionRequest->decode_binding(layer_idx, "attention_kv");
         bool prefill = true;
@@ -521,7 +548,10 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         }
         decode_append_kv_batch(qkv, bindings, mB, mT, Hq, Hkv, Hs, params.stream);
         if (prefill) {
-            AttentionBackendRegistry::instance().select(params).forward(params);
+            if (mOptions.MoeRolloutParity)
+                consistent_forward(true);
+            else
+                AttentionBackendRegistry::instance().select(params).forward(params);
         } else {
             if (window_size > 0) pages = std::min<long>(pages, (window_size + 2 * DecodePageRows - 2) / DecodePageRows);
             auto scratch = mRunState.temp_alloc(ETensorDType::FP32, {mB, mT, Hq, pages, Hs + 2L}, "decode_attention");
@@ -579,7 +609,10 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                   << " out_shape=" << tensor_shape_debug(out) << " lse_shape=" << tensor_shape_debug(lse)
                   << " packed=" << (mCuSeqlensGpu ? 1 : 0) << std::endl;
     }
-    backend.forward(params);
+    if (mOptions.MoeRolloutParity)
+        consistent_forward(false);
+    else
+        backend.forward(params);
     if (should_dump_attention_layer(layer_idx)) {
         const char* dump_dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
         debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.qkv", layer_idx), qkv, dump_dir);
@@ -660,7 +693,9 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     params.max_doc_seqlen = mMaxDocSeqlen;
     params.total_doc_tokens = mTotalDocTokens;
     params.stream = mRunState.MainStream;
-    params.cudnn_handle = mRunState.CudnnHandle;
+    // cuDNN's wrapper fixes the softmax scale; the parity forward honors the
+    // model's explicit scale and therefore needs a backward that honors it too.
+    params.cudnn_handle = mOptions.MoeRolloutParity ? nullptr : mRunState.CudnnHandle;
     params.cublas_handle = mRunState.cublas_handle();
     params.cudnn_workspace = mRunState.scratch().cudnn_workspace;
     params.run_state = &mRunState;
@@ -735,6 +770,22 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.out_bwd", layer_idx), out, dump_dir);
         debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.lse_bwd", layer_idx), lse, dump_dir);
         debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.qkv_bwd", layer_idx), qkv, dump_dir);
+    }
+    if (mOptions.MoeRolloutParity && std::string_view(backend.name()) == "flash_varlen" && mB > 1) {
+        // The rollout kernels and sinks use [B,H,T]; Flash varlen consumes
+        // [H,B*T], including when it synthesizes documents for a dense batch.
+        auto packed_lse = mRunState.temp_alloc(ETensorDType::FP32, {Hq, mB * mT}, "rollout_lse_varlen");
+        mTemps.push_back(packed_lse);
+        for (long b = 0; b < mB; ++b)
+            CUDA_CHECK(cudaMemcpy2DAsync(packed_lse.get<float>() + b * mT,
+                                         mB * mT * sizeof(float),
+                                         lse.get<float>() + b * Hq * mT,
+                                         mT * sizeof(float),
+                                         mT * sizeof(float),
+                                         Hq,
+                                         cudaMemcpyDeviceToDevice,
+                                         params.stream));
+        params.lse = packed_lse;
     }
     backend.backward(params);
 

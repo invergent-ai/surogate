@@ -255,6 +255,29 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
         return;
     }
 
+    if (mOptions.MoeRolloutParity) {
+        if (sequence_chunk_active() || initial_state)
+            throw std::runtime_error("MoE rollout parity requires unchunked gated delta rule sequences");
+        Tensor query = q, key = k;
+        query.Data = static_cast<std::byte*>(q_eff);
+        key.Data = static_cast<std::byte*>(k_eff);
+        rollout_delta_rule(query,
+                           key,
+                           v,
+                           g_input,
+                           beta,
+                           out_val,
+                           state_val,
+                           {},
+                           mCuSeqlensGpu,
+                           mNumDocs,
+                           scale,
+                           stream);
+        store_tensor(op.outputs[0], out_val);
+        if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], state_val);
+        return;
+    }
+
     // Allocate intermediates
     Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
     mTemps.push_back(g_cum);
@@ -566,241 +589,289 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm path complete\n");
     }
 
-    // ---- Recompute forward intermediates ----
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] recomputing forward intermediates...\n");
-    // g_cum
-    Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
-    mTemps.push_back(g_cum);
-    {
-        void* g_in = g_input.Data;
-        void* g_out = g_cum.Data;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&g_in, &g_out, &Tv};
-        mGdrKernels.cumsum_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
-    }
-    // A, Ai
-    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT}, "gated_delta_rule_A");
-    mTemps.push_back(A);
-    {
-        void* gp = g_cum.Data;
-        void* bp = beta.Data;
-        void* ap = A.Data;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&k_eff, &gp, &bp, &ap, &Tv};
-        mGdrKernels.kkt_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 5, stream);
-    }
-    Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT}, "gated_delta_rule_Ai");
-    mTemps.push_back(Ai);
-    CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
-    {
-        void* ap = A.Data;
-        void* aip = Ai.Data;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&ap, &aip, &Tv};
-        mGdrKernels.solve_tril({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
-    }
-    // w, u
-    Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_w");
-    mTemps.push_back(w);
-    Tensor u_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_u_buf");
-    mTemps.push_back(u_buf);
-    {
-        void* vp = v.Data;
-        void* bp = beta.Data;
-        void* wp = w.Data;
-        void* up = u_buf.Data;
-        void* aip = Ai.Data;
-        void* gp = g_cum.Data;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&k_eff, &vp, &bp, &wp, &up, &aip, &gp, &Tv};
-        mGdrKernels.wy_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 8, stream);
-    }
-    // h, v_new
-    Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V}, "gated_delta_rule_h");
-    mTemps.push_back(h);
-    Tensor ht_dummy = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_ht_dummy");
-    mTemps.push_back(ht_dummy);
-    Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_v_new");
-    mTemps.push_back(v_new);
-
-    void* h0_ptr;
-    Tensor h0_buf;
-    ChunkGdnState* chunk_gdn = nullptr;
-    if (sequence_chunk_active()) {
-        chunk_gdn = &chunk_gdn_state(static_cast<long>(B) * H * K * V, op_layer_idx(op));
-        h0_ptr = chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx()) * chunk_gdn->elems;
-    } else if (initial_state) {
-        h0_ptr = initial_state->Data;
+    if (mOptions.MoeRolloutParity) {
+        if (sequence_chunk_active() || initial_state || (d_final_state && d_final_state->Data))
+            throw std::runtime_error("MoE rollout parity requires unchunked gated delta rule sequences");
+        Tensor query = q, key = k, dq_target = *d_q, dk_target = *d_k;
+        query.Data = static_cast<std::byte*>(q_eff);
+        key.Data = static_cast<std::byte*>(k_eff);
+        dq_target.Data = static_cast<std::byte*>(dq_data);
+        dk_target.Data = static_cast<std::byte*>(dk_data);
+        auto checkpoints = mRunState.temp_alloc(ETensorDType::FP32,
+                                                {B, (T + DELTA_RULE_CHECKPOINT - 1) / DELTA_RULE_CHECKPOINT, H, K, V},
+                                                "delta_checkpoints");
+        // Reuse gradient output buffers for the disposable forward output/state.
+        rollout_delta_rule(query,
+                           key,
+                           v,
+                           g_input,
+                           beta,
+                           *d_v,
+                           *d_initial,
+                           checkpoints,
+                           mCuSeqlensGpu,
+                           mNumDocs,
+                           scale,
+                           stream);
+        rollout_delta_rule_backward(query,
+                                    key,
+                                    v,
+                                    g_input,
+                                    beta,
+                                    d_out,
+                                    dq_target,
+                                    dk_target,
+                                    *d_v,
+                                    *d_g,
+                                    *d_beta,
+                                    checkpoints,
+                                    mCuSeqlensGpu,
+                                    mNumDocs,
+                                    scale,
+                                    stream);
+        mRunState.Stack.free(checkpoints);
+        fill_zero(*d_initial, stream);
     } else {
-        h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_buf");
-        mTemps.push_back(h0_buf);
-        CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
-        h0_ptr = h0_buf.Data;
-    }
-    {
-        void* up = u_buf.Data;
-        void* wp = w.Data;
-        void* vnp = v_new.Data;
-        void* gp = g_cum.Data;
-        void* hp = h.Data;
-        void* htp = ht_dummy.Data;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&k_eff, &up, &wp, &vnp, &gp, &hp, &h0_ptr, &htp, &Tv};
-        mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)), static_cast<unsigned>(BH), 1},
-                          args,
-                          9,
-                          stream);
-    }
-
-    // ---- Backward pipeline ----
-    if (debug_replay) fprintf(stderr, "[GDR_BWD] starting backward pipeline...\n");
-
-    // bwd_dv_local
-    {
-        void* gp = g_cum.Data;
-        void* dop = d_out.Data;
-        void* dvp = d_v->Data;
-        float sv = scale;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&q_eff, &k_eff, &gp, &dop, &dvp, &sv, &Tv};
-        mGdrKernels.bwd_dv_local({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 7, stream);
-    }
-
-    // bwd_dhu
-    Tensor dh = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V}, "gated_delta_rule_dh");
-    mTemps.push_back(dh);
-    Tensor dv2 = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_dv2");
-    mTemps.push_back(dv2);
-    {
-        void* wp = w.Data;
-        void* gp = g_cum.Data;
-        void* dhtp = d_final_state ? d_final_state->Data : nullptr;
-        if (chunk_gdn) {
-            // Reverse carry: d(final state of this chunk) = d(initial state)
-            // emitted by the NEXT chunk's backward (zeroed at sweep start for
-            // the last chunk, whose final state is unused).
-            dhtp = chunk_gdn->d_state;
+        // ---- Recompute forward intermediates ----
+        if (debug_replay) fprintf(stderr, "[GDR_BWD] recomputing forward intermediates...\n");
+        // g_cum
+        Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
+        mTemps.push_back(g_cum);
+        {
+            void* g_in = g_input.Data;
+            void* g_out = g_cum.Data;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&g_in, &g_out, &Tv};
+            mGdrKernels.cumsum_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
         }
-        Tensor dht_zero;
-        if (!dhtp) {
-            dht_zero = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_dht_zero");
-            mTemps.push_back(dht_zero);
-            CUDA_CHECK(cudaMemsetAsync(dht_zero.Data, 0, dht_zero.nelem() * sizeof(float), stream));
-            dhtp = dht_zero.Data;
+        // A, Ai
+        Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT}, "gated_delta_rule_A");
+        mTemps.push_back(A);
+        {
+            void* gp = g_cum.Data;
+            void* bp = beta.Data;
+            void* ap = A.Data;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&k_eff, &gp, &bp, &ap, &Tv};
+            mGdrKernels.kkt_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 5, stream);
         }
-        void* dh0p = d_initial->Data;
-        void* dop = d_out.Data;
-        void* dhp = dh.Data;
-        void* dvp = d_v->Data;
-        void* dv2p = dv2.Data;
-        float sv = scale;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&q_eff, &k_eff, &wp, &gp, &dhtp, &dh0p, &dop, &dhp, &dvp, &dv2p, &sv, &Tv};
-        mGdrKernels.bwd_dhu({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_dhu)), static_cast<unsigned>(BH), 1},
-                            args,
-                            12,
-                            stream);
-    }
+        Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT}, "gated_delta_rule_Ai");
+        mTemps.push_back(Ai);
+        CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
+        {
+            void* ap = A.Data;
+            void* aip = Ai.Data;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&ap, &aip, &Tv};
+            mGdrKernels.solve_tril({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
+        }
+        // w, u
+        Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_w");
+        mTemps.push_back(w);
+        Tensor u_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_u_buf");
+        mTemps.push_back(u_buf);
+        {
+            void* vp = v.Data;
+            void* bp = beta.Data;
+            void* wp = w.Data;
+            void* up = u_buf.Data;
+            void* aip = Ai.Data;
+            void* gp = g_cum.Data;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&k_eff, &vp, &bp, &wp, &up, &aip, &gp, &Tv};
+            mGdrKernels.wy_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 8, stream);
+        }
+        // h, v_new
+        Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V}, "gated_delta_rule_h");
+        mTemps.push_back(h);
+        Tensor ht_dummy = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_ht_dummy");
+        mTemps.push_back(ht_dummy);
+        Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_v_new");
+        mTemps.push_back(v_new);
 
-    if (chunk_gdn) {
-        // Hand this chunk's d_initial to the previous chunk's backward. The
-        // kernel above consumed the old carry (dht) before this copy, and
-        // both run on the same stream — no hazard.
-        CUDA_CHECK(cudaMemcpyAsync(chunk_gdn->d_state,
-                                   d_initial->Data,
-                                   chunk_gdn->elems * sizeof(float),
-                                   cudaMemcpyDeviceToDevice,
-                                   stream));
-    }
-
-    // bwd_dqkwg
-    Tensor dw = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_dw");
-    mTemps.push_back(dw);
-    Tensor dg_nk = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(NK), B, T, H}, "gated_delta_rule_dg_nk");
-    mTemps.push_back(dg_nk);
-    {
-        void* vnp = v_new.Data;
-        void* gp = g_cum.Data;
-        void* hp = h.Data;
-        void* dop = d_out.Data;
-        void* dhp = dh.Data;
-        void* dwp = dw.Data;
-        void* dv2p = dv2.Data;
-        void* dgnkp = dg_nk.Data;
-        float sv = scale;
-        int32_t Bv = static_cast<int32_t>(B);
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] =
-            {&q_eff, &k_eff, &vnp, &gp, &hp, &dop, &dhp, &dq_data, &dk_data, &dwp, &dv2p, &dgnkp, &sv, &Bv, &Tv};
-        mGdrKernels.bwd_dqkwg({static_cast<unsigned>(NK), static_cast<unsigned>(NT), static_cast<unsigned>(BH)},
+        void* h0_ptr;
+        Tensor h0_buf;
+        ChunkGdnState* chunk_gdn = nullptr;
+        if (sequence_chunk_active()) {
+            chunk_gdn = &chunk_gdn_state(static_cast<long>(B) * H * K * V, op_layer_idx(op));
+            h0_ptr = chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx()) * chunk_gdn->elems;
+        } else if (initial_state) {
+            h0_ptr = initial_state->Data;
+        } else {
+            h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_buf");
+            mTemps.push_back(h0_buf);
+            CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
+            h0_ptr = h0_buf.Data;
+        }
+        {
+            void* up = u_buf.Data;
+            void* wp = w.Data;
+            void* vnp = v_new.Data;
+            void* gp = g_cum.Data;
+            void* hp = h.Data;
+            void* htp = ht_dummy.Data;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&k_eff, &up, &wp, &vnp, &gp, &hp, &h0_ptr, &htp, &Tv};
+            mGdrKernels.fwd_h({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)), static_cast<unsigned>(BH), 1},
                               args,
-                              15,
+                              9,
                               stream);
-    }
-    const long dg_bth = B * T * H;
+        }
 
-    // TODO: dg_nk reduction across NK dimension needs a small kernel or cumsum approach.
-    // For now, the dg reduction is deferred to the cumsum_rev step below, which
-    // expects a pre-reduced dg tensor. We handle the NK reduction via a simple
-    // device-side sum using the host-side temp approach.
-    // Sum dg_nk[NK, B, T, H] -> dg[B, T, H]
-    // dg is d_g output. We sum in-place.
-    {
-        // Simple approach: use first slice as accumulator, add remaining slices.
-        // For NK=2 (typical), this is just one addition.
-        float* dg_base = dg_nk.get<float>();
-        float* dg_out_ptr = d_g->get<float>();
-        // Copy first slice
-        CUDA_CHECK(cudaMemcpyAsync(dg_out_ptr, dg_base, dg_bth * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-        for (int nk = 1; nk < NK; ++nk) {
-            // dg_out += dg_nk[nk]
-            // Use a simple element-wise add via cublas or a tiny kernel.
-            // For correctness, use cuBLAS saxpy: y = alpha*x + y
+        // ---- Backward pipeline ----
+        if (debug_replay) fprintf(stderr, "[GDR_BWD] starting backward pipeline...\n");
+
+        // bwd_dv_local
+        {
+            void* gp = g_cum.Data;
+            void* dop = d_out.Data;
+            void* dvp = d_v->Data;
+            float sv = scale;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&q_eff, &k_eff, &gp, &dop, &dvp, &sv, &Tv};
+            mGdrKernels.bwd_dv_local({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 7, stream);
+        }
+
+        // bwd_dhu
+        Tensor dh =
+            mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V}, "gated_delta_rule_dh");
+        mTemps.push_back(dh);
+        Tensor dv2 = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_dv2");
+        mTemps.push_back(dv2);
+        {
+            void* wp = w.Data;
+            void* gp = g_cum.Data;
+            void* dhtp = d_final_state ? d_final_state->Data : nullptr;
+            if (chunk_gdn) {
+                // Reverse carry: d(final state of this chunk) = d(initial state)
+                // emitted by the NEXT chunk's backward (zeroed at sweep start for
+                // the last chunk, whose final state is unused).
+                dhtp = chunk_gdn->d_state;
+            }
+            Tensor dht_zero;
+            if (!dhtp) {
+                dht_zero = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_dht_zero");
+                mTemps.push_back(dht_zero);
+                CUDA_CHECK(cudaMemsetAsync(dht_zero.Data, 0, dht_zero.nelem() * sizeof(float), stream));
+                dhtp = dht_zero.Data;
+            }
+            void* dh0p = d_initial->Data;
+            void* dop = d_out.Data;
+            void* dhp = dh.Data;
+            void* dvp = d_v->Data;
+            void* dv2p = dv2.Data;
+            float sv = scale;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&q_eff, &k_eff, &wp, &gp, &dhtp, &dh0p, &dop, &dhp, &dvp, &dv2p, &sv, &Tv};
+            mGdrKernels.bwd_dhu(
+                {static_cast<unsigned>(cdiv(static_cast<int>(V), BV_dhu)), static_cast<unsigned>(BH), 1},
+                args,
+                12,
+                stream);
+        }
+
+        if (chunk_gdn) {
+            // Hand this chunk's d_initial to the previous chunk's backward. The
+            // kernel above consumed the old carry (dht) before this copy, and
+            // both run on the same stream — no hazard.
+            CUDA_CHECK(cudaMemcpyAsync(chunk_gdn->d_state,
+                                       d_initial->Data,
+                                       chunk_gdn->elems * sizeof(float),
+                                       cudaMemcpyDeviceToDevice,
+                                       stream));
+        }
+
+        // bwd_dqkwg
+        Tensor dw = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_dw");
+        mTemps.push_back(dw);
+        Tensor dg_nk =
+            mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(NK), B, T, H}, "gated_delta_rule_dg_nk");
+        mTemps.push_back(dg_nk);
+        {
+            void* vnp = v_new.Data;
+            void* gp = g_cum.Data;
+            void* hp = h.Data;
+            void* dop = d_out.Data;
+            void* dhp = dh.Data;
+            void* dwp = dw.Data;
+            void* dv2p = dv2.Data;
+            void* dgnkp = dg_nk.Data;
+            float sv = scale;
+            int32_t Bv = static_cast<int32_t>(B);
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] =
+                {&q_eff, &k_eff, &vnp, &gp, &hp, &dop, &dhp, &dq_data, &dk_data, &dwp, &dv2p, &dgnkp, &sv, &Bv, &Tv};
+            mGdrKernels.bwd_dqkwg({static_cast<unsigned>(NK), static_cast<unsigned>(NT), static_cast<unsigned>(BH)},
+                                  args,
+                                  15,
+                                  stream);
+        }
+        const long dg_bth = B * T * H;
+
+        // TODO: dg_nk reduction across NK dimension needs a small kernel or cumsum approach.
+        // For now, the dg reduction is deferred to the cumsum_rev step below, which
+        // expects a pre-reduced dg tensor. We handle the NK reduction via a simple
+        // device-side sum using the host-side temp approach.
+        // Sum dg_nk[NK, B, T, H] -> dg[B, T, H]
+        // dg is d_g output. We sum in-place.
+        {
+            // Simple approach: use first slice as accumulator, add remaining slices.
+            // For NK=2 (typical), this is just one addition.
+            float* dg_base = dg_nk.get<float>();
+            float* dg_out_ptr = d_g->get<float>();
+            // Copy first slice
+            CUDA_CHECK(cudaMemcpyAsync(dg_out_ptr, dg_base, dg_bth * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            for (int nk = 1; nk < NK; ++nk) {
+                // dg_out += dg_nk[nk]
+                // Use a simple element-wise add via cublas or a tiny kernel.
+                // For correctness, use cuBLAS saxpy: y = alpha*x + y
+                float alpha = 1.0f;
+                cublasHandle_t handle = mRunState.cublas_handle();
+                cublasSetStream(handle, stream);
+                cublasSaxpy(handle, static_cast<int>(dg_bth), &alpha, dg_base + nk * dg_bth, 1, dg_out_ptr, 1);
+            }
+        }
+
+        // bwd_wy: (k, v, beta, g, Ai, dw, dv2, dk, dv, db, dg_wy, T)
+        Tensor dg_wy = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_dg_wy");
+        mTemps.push_back(dg_wy);
+        {
+            void* vp = v.Data;
+            void* bp = beta.Data;
+            void* gp = g_cum.Data;
+            void* aip = Ai.Data;
+            void* dwp = dw.Data;
+            void* dv2p = dv2.Data;
+            void* dvp = d_v->Data;
+            void* dbp = d_beta->Data;
+            void* dgwyp = dg_wy.Data;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&k_eff, &vp, &bp, &gp, &aip, &dwp, &dv2p, &dk_data, &dvp, &dbp, &dgwyp, &Tv};
+            mGdrKernels.bwd_wy({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 12, stream);
+        }
+
+        // dg += dg_wy
+        {
             float alpha = 1.0f;
             cublasHandle_t handle = mRunState.cublas_handle();
             cublasSetStream(handle, stream);
-            cublasSaxpy(handle, static_cast<int>(dg_bth), &alpha, dg_base + nk * dg_bth, 1, dg_out_ptr, 1);
+            cublasSaxpy(handle, static_cast<int>(B * T * H), &alpha, dg_wy.get<float>(), 1, d_g->get<float>(), 1);
         }
-    }
 
-    // bwd_wy: (k, v, beta, g, Ai, dw, dv2, dk, dv, db, dg_wy, T)
-    Tensor dg_wy = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_dg_wy");
-    mTemps.push_back(dg_wy);
-    {
-        void* vp = v.Data;
-        void* bp = beta.Data;
-        void* gp = g_cum.Data;
-        void* aip = Ai.Data;
-        void* dwp = dw.Data;
-        void* dv2p = dv2.Data;
-        void* dvp = d_v->Data;
-        void* dbp = d_beta->Data;
-        void* dgwyp = dg_wy.Data;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&k_eff, &vp, &bp, &gp, &aip, &dwp, &dv2p, &dk_data, &dvp, &dbp, &dgwyp, &Tv};
-        mGdrKernels.bwd_wy({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 12, stream);
+        // cumsum_rev: reverse cumulative sum for dg
+        Tensor dg_out = mRunState.temp_alloc(d_g->DType, {B, T, H}, "gated_delta_rule_dg_out");
+        mTemps.push_back(dg_out);
+        {
+            void* dg_in = d_g->Data;
+            void* dg_outp = dg_out.Data;
+            int32_t Tv = static_cast<int32_t>(T);
+            void* args[] = {&dg_in, &dg_outp, &Tv};
+            mGdrKernels.cumsum_rev({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
+        }
+        // Copy result back to d_g output
+        CUDA_CHECK(
+            cudaMemcpyAsync(d_g->Data, dg_out.Data, d_g->nelem() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
     }
-
-    // dg += dg_wy
-    {
-        float alpha = 1.0f;
-        cublasHandle_t handle = mRunState.cublas_handle();
-        cublasSetStream(handle, stream);
-        cublasSaxpy(handle, static_cast<int>(B * T * H), &alpha, dg_wy.get<float>(), 1, d_g->get<float>(), 1);
-    }
-
-    // cumsum_rev: reverse cumulative sum for dg
-    Tensor dg_out = mRunState.temp_alloc(d_g->DType, {B, T, H}, "gated_delta_rule_dg_out");
-    mTemps.push_back(dg_out);
-    {
-        void* dg_in = d_g->Data;
-        void* dg_outp = dg_out.Data;
-        int32_t Tv = static_cast<int32_t>(T);
-        void* args[] = {&dg_in, &dg_outp, &Tv};
-        mGdrKernels.cumsum_rev({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
-    }
-    // Copy result back to d_g output
-    CUDA_CHECK(cudaMemcpyAsync(d_g->Data, dg_out.Data, d_g->nelem() * sizeof(float), cudaMemcpyDeviceToDevice, stream));
 
     // L2 norm backward: map dq_norm/dk_norm -> dq/dk
     if (use_l2norm) {

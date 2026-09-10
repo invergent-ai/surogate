@@ -89,7 +89,16 @@ void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
 
     export_adapter(checkpoint_dir, comm);
 
-    if (mLoRAAdamW8BitState && mLoRAAdamW8BitState->initialized) {
+    if (mLoRAAdamWState && (mLoRAAdamWState->initialized || mLoRAAdamWState->values_restored)) {
+        internal::LoRAAdamWStateContainer container(mLoRAAdamWState.get());
+        write_safetensors((fs::path(checkpoint_dir) / "lora_optimizer.safetensors").string(), container, comm);
+        if (comm.rank() == 0) {
+            nlohmann::json meta = {{"optimizer_type", "adamw"},
+                                   {"total_params", mLoRAAdamWState->total_params},
+                                   {"num_tensors", mLoRAAdamWState->num_tensors}};
+            std::ofstream(fs::path(checkpoint_dir) / "lora_optimizer.json") << meta.dump(2);
+        }
+    } else if (mLoRAAdamW8BitState && (mLoRAAdamW8BitState->initialized || mLoRAAdamW8BitState->values_restored)) {
         internal::LoRAAdamW8BitStateContainer container(mLoRAAdamW8BitState.get());
         fs::path opt_file = fs::path(checkpoint_dir) / "lora_optimizer.safetensors";
         write_safetensors(opt_file.string(), container, comm);
@@ -103,7 +112,7 @@ void DslModel::save_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
             std::ofstream meta_file(fs::path(checkpoint_dir) / "lora_optimizer.json");
             meta_file << opt_meta.dump(2);
         }
-    } else if (mLoRANorMuonState && mLoRANorMuonState->initialized) {
+    } else if (mLoRANorMuonState && (mLoRANorMuonState->initialized || mLoRANorMuonState->values_restored)) {
         internal::LoRANorMuonStateContainer container(mLoRANorMuonState.get());
         fs::path opt_file = fs::path(checkpoint_dir) / "lora_optimizer.safetensors";
         write_safetensors(opt_file.string(), container, comm);
@@ -159,7 +168,25 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
     nlohmann::json opt_meta = nlohmann::json::parse(meta_stream);
     std::string optimizer_type = opt_meta["optimizer_type"].get<std::string>();
 
-    if (optimizer_type == "adamw_8bit") {
+    if (optimizer_type == "adamw") {
+        if (!mLoRAAdamWState) mLoRAAdamWState = std::make_unique<modules::LoRAAdamWState>();
+        auto& state = *mLoRAAdamWState;
+        const auto total_params = opt_meta.at("total_params").get<size_t>();
+        const auto num_tensors = opt_meta.at("num_tensors").get<int>();
+        if (state.initialized && (state.total_params != total_params || state.num_tensors != num_tensors))
+            throw std::runtime_error("LoRA AdamW checkpoint geometry does not match the adapter");
+        state.total_params = total_params;
+        state.num_tensors = num_tensors;
+        if (!state.state1.Data) {
+            state.state1 =
+                mAllocator->allocate(ETensorDType::FP32, "lora_adamw_state1", {static_cast<long>(total_params)});
+            state.state2 =
+                mAllocator->allocate(ETensorDType::FP32, "lora_adamw_state2", {static_cast<long>(total_params)});
+        }
+        internal::LoRAAdamWStateContainer container(&state);
+        load_safetensors(opt_file.string(), container, /*allow_cast=*/false);
+        state.values_restored = true;
+    } else if (optimizer_type == "adamw_8bit") {
         if (!mLoRAAdamW8BitState) {
             mLoRAAdamW8BitState = std::make_unique<modules::LoRAAdamW8BitState>();
         }
@@ -612,6 +639,9 @@ void DslModel::initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t 
         });
     }
 
+    if (state.values_restored &&
+        (state.total_params != total_params || state.num_tensors != static_cast<int>(h_param_ptrs.size())))
+        throw std::runtime_error("LoRA AdamW checkpoint geometry does not match the adapter");
     state.num_tensors = static_cast<int>(h_param_ptrs.size());
     state.total_params = total_params;
 

@@ -200,3 +200,48 @@ def test_prefix_hits_cannot_bypass_logical_token_budget():
         assert scheduler.step(healthy, [7]).tolist() == [97, 31]
     finally:
         scheduler.close()
+
+
+@pytest.mark.parametrize("cache", [False, True])
+def test_completed_turn_reuses_only_tokens_executed_and_survives_branching(cache):
+    trainer = PrefixTrainer()
+    scheduler = DecodeScheduler(trainer, max_batch=4, prefill_chunk=8, token_budget=512, prefix_entries=8)
+    history = [3, 5, 7, 11, 13]
+    try:
+        session = scheduler.new_session()
+        scheduler.step(session, history[:3], True)
+        for token in history[3:]:
+            scheduler.step(session, [token])
+        scheduler.release(session, cache=cache)
+        assert not trainer.states and not scheduler.histories
+        assert scheduler.summary()["completed_turn_cache_saves"] == int(cache)
+        before = scheduler.summary()["prefill_tokens"]
+        # The last sampled token (17) is not in the cache: it is executed once
+        # together with the next user turn. Two users then take different paths.
+        for tail in ([17, 19], [29, 23]):
+            session = scheduler.new_session()
+            expected = history + tail
+            assert scheduler.step(session, expected, True).tolist() == [sum(expected), len(expected)]
+            scheduler.release(session)
+        assert scheduler.summary()["completed_turn_cache_hits"] == 2 * int(cache)
+        if cache:
+            assert scheduler.summary()["prefill_tokens"] - before == 4
+        trainer.prefixes.clear()
+        scheduler.invalidate_prefixes()
+        assert not scheduler.completed_prefixes and not trainer.prefixes
+    finally:
+        scheduler.close()
+
+
+def test_completed_turn_snapshot_failure_releases_live_request():
+    trainer = PrefixTrainer()
+    scheduler = DecodeScheduler(trainer, max_batch=1, prefill_chunk=8, token_budget=128)
+    try:
+        session = scheduler.new_session()
+        scheduler.step(session, [3, 5], True)
+        trainer.cache_decode_prefix = lambda *args: False
+        scheduler.release(session, cache=True)
+        assert not trainer.states and not scheduler.histories
+        assert scheduler.summary()["completed_turn_cache_saves"] == 0
+    finally:
+        scheduler.close()

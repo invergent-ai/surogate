@@ -85,6 +85,14 @@ def test_glm_long_rollout_matches_packed_scoring_after_updates(
     )
 
 
+@pytest.mark.parametrize("case", ["qwen3_moe", "qwen3_5_moe", "gemma4_moe", "lfm2_moe", "laguna", "gpt_oss"])
+@pytest.mark.parametrize("long_context", [False, True])
+def test_moe_packed_scoring_matches_rollouts_after_updates(tmp_path, case, long_context):
+    (tmp_path / "config.json").write_text(json.dumps(CASES[case]))
+    _check_policy(tmp_path, load_weights=False, batch_size=2, seq_len=256,
+                  rollout_tokens=70, graphs=True, packed=True, temperature=1.0, alpha=13, long_context=long_context)
+
+
 def test_glm_latent_cache_grows_and_preserves_chunked_decode(glm_checkpoint, tmp_path):
     from surogate import _surogate as ext
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
@@ -159,6 +167,8 @@ def _check_policy(
     from surogate.utils.hf import get_model_weights_path
 
     config = json.loads((root / "config.json").read_text())
+    text_config = config.get("text_config", config)
+    moe = bool(text_config.get("num_experts", text_config.get("num_local_experts", text_config.get("n_routed_experts", 0))))
     options = ext.RuntimeOptions(
         recompute=recompute,
         use_cuda_graphs=graphs,
@@ -169,7 +179,8 @@ def _check_policy(
         long_context=long_context,
     )
     options.dsl_ir_json = build_dsl_ir_for_model(str(root))
-    manifests = compile_jit_kernels(options.dsl_ir_json)
+    options.moe_rollout_parity = moe
+    manifests = compile_jit_kernels(options.dsl_ir_json, rollout_parity=moe)
     if manifests:
         options.jit_kernel_manifests = manifests
     targets = ["all"]
@@ -258,7 +269,7 @@ def _check_policy(
         print(f"rollout tokens={len(scores)} max_logprob_error={np.max(np.abs(scores - teacher)):.6g}")
         # GLM uses the same recurrence and fixed GEMM reduction at every batch
         # size. Only the CPU/GPU log-softmax calculation should differ.
-        np.testing.assert_allclose(scores, teacher, atol=1e-5 if glm else 0.08, rtol=0)
+        np.testing.assert_allclose(scores, teacher, atol=1e-5 if glm or moe else 0.08, rtol=0)
         if packed:
             # Shift identical rollouts around a packed batch, keeping document
             # count fixed so the second call can replay captured CUDA graphs.

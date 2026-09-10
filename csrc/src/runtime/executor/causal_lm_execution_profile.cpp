@@ -214,7 +214,14 @@ bool CausalLMExecutionProfile::apply_doc_masking(IGraphExecutor& executor,
     const auto* pos_ptr = reinterpret_cast<const std::int32_t*>(position_ids.Data);
     const int B = static_cast<int>(inputs.Sizes[0]);
     const int T = static_cast<int>(inputs.Sizes[1]);
-    auto doc_info = compute_doc_masking(pos_ptr, B, T, config.Rope.is_multimodal());
+    // Text callers supply one plane even for multimodal-capable checkpoints.
+    // A repeated zero separates one-token documents in that representation.
+    bool mrope = config.Rope.is_multimodal() && position_ids.nelem() > static_cast<long>(B) * T;
+    if (mrope && position_ids.nelem() == 3L * B * T) {
+        mrope = !std::equal(pos_ptr, pos_ptr + B * T, pos_ptr + B * T) ||
+                !std::equal(pos_ptr, pos_ptr + B * T, pos_ptr + 2L * B * T);
+    }
+    auto doc_info = compute_doc_masking(pos_ptr, B, T, mrope);
     if (!doc_info) {
         executor.clear_doc_masking();
         return false;

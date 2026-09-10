@@ -25,7 +25,9 @@ public:
                 int oc,
                 float alpha,
                 float beta,
-                cudaStream_t stream) const;
+                cudaStream_t stream,
+                const void* bias_bf16 = nullptr,
+                const void* bias_fp32 = nullptr) const;
     void grouped(void* out,
                  const void* input,
                  const void* weights,

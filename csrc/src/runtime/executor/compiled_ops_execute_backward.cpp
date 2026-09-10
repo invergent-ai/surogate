@@ -592,7 +592,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         int micro_step,
                                         const modules::BackwardHook* hook,
                                         bool skip_zeroing) {
-    ScopedGlmMatmul matmul_scope(mGlmMatmulKernels, mOptions.GlmRolloutParity);
+    ScopedGlmMatmul matmul_scope(mGlmMatmulKernels, mOptions.rollout_parity());
     struct BackwardPassGuard {
         bool& flag;
         explicit BackwardPassGuard(bool& f) : flag(f) {

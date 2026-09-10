@@ -58,6 +58,16 @@ void record_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
     }
 }
 
+LoRAAdamWStateContainer::LoRAAdamWStateContainer(modules::LoRAAdamWState* state)
+    : mState(state) {
+}
+
+void LoRAAdamWStateContainer::iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) {
+    if (!mState || !mState->state1.Data) return;
+    callback("lora_adamw.state1", TensorShard(mState->state1));
+    callback("lora_adamw.state2", TensorShard(mState->state2));
+}
+
 LoRAAdamW8BitStateContainer::LoRAAdamW8BitStateContainer(modules::LoRAAdamW8BitState* state)
     : mState(state) {
 }

@@ -42,6 +42,15 @@ struct HfValue {
 };
 
 // Tensor container for LoRA optimizer states
+class LoRAAdamWStateContainer final : public ITensorContainer {
+public:
+    explicit LoRAAdamWStateContainer(modules::LoRAAdamWState* state);
+    void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
+
+private:
+    modules::LoRAAdamWState* mState;
+};
+
 class LoRAAdamW8BitStateContainer final : public ITensorContainer {
 public:
     explicit LoRAAdamW8BitStateContainer(modules::LoRAAdamW8BitState* state);

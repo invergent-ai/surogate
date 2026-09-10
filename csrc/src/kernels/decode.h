@@ -11,6 +11,22 @@ struct DecodeCacheBinding {
 #include "utilities/tensor.h"
 #include <cuda_runtime.h>
 
+void rollout_consistent_attention(const Tensor& qkv,
+                                  const Tensor& out,
+                                  const Tensor& lse,
+                                  const Tensor& scratch,
+                                  const int* cu_seqlens,
+                                  int num_docs,
+                                  int B,
+                                  int T,
+                                  int Hq,
+                                  int Hkv,
+                                  int D,
+                                  int window,
+                                  float scale,
+                                  int query_tile,
+                                  cudaStream_t stream);
+
 void decode_paged_attention(const Tensor& qkv,
                             const Tensor& out,
                             const Tensor& lse,
@@ -41,6 +57,36 @@ void decode_delta_rule(const Tensor& q,
                        const Tensor& final_state,
                        float scale,
                        cudaStream_t stream);
+
+constexpr int DELTA_RULE_CHECKPOINT = 32;
+void rollout_delta_rule(const Tensor& q,
+                        const Tensor& k,
+                        const Tensor& v,
+                        const Tensor& g,
+                        const Tensor& beta,
+                        const Tensor& out,
+                        const Tensor& state,
+                        const Tensor& checkpoints,
+                        const int* cu_seqlens,
+                        int num_docs,
+                        float scale,
+                        cudaStream_t stream);
+void rollout_delta_rule_backward(const Tensor& q,
+                                 const Tensor& k,
+                                 const Tensor& v,
+                                 const Tensor& g,
+                                 const Tensor& beta,
+                                 const Tensor& dout,
+                                 const Tensor& dq,
+                                 const Tensor& dk,
+                                 const Tensor& dv,
+                                 const Tensor& dg,
+                                 const Tensor& dbeta,
+                                 const Tensor& checkpoints,
+                                 const int* cu_seqlens,
+                                 int num_docs,
+                                 float scale,
+                                 cudaStream_t stream);
 
 // Pack request-owned recurrent state into a contiguous batch (zero new rows),
 // or scatter a completed batch back to those same request buffers.

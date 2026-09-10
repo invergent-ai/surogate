@@ -674,8 +674,12 @@ NB_MODULE(_surogate, m) {
         .def_rw("doc_masking",
                 &RuntimeOptions::DocMasking,
                 "Enable document-level attention masking for packed sequences.")
-        .def_rw("glm_rollout_parity", &RuntimeOptions::GlmRolloutParity,
+        .def_rw("glm_rollout_parity",
+                &RuntimeOptions::GlmRolloutParity,
                 "Use recurrent KDA forward and fixed-reduction GEMMs for GLM GRPO.")
+        .def_rw("moe_rollout_parity",
+                &RuntimeOptions::MoeRolloutParity,
+                "Keep BF16 MoE rollout/scoring arithmetic consistent across batch shapes.")
         .def_rw("use_dsl_ir", &RuntimeOptions::UseDslIr, "Deprecated (DSL backend is always enabled).")
         .def_rw("dsl_ir_json", &RuntimeOptions::DslIrJson, "DSL IR JSON payload (generated at compile time).")
         .def_rw("jit_kernel_manifests",
@@ -693,7 +697,8 @@ NB_MODULE(_surogate, m) {
                 "LLEP adaptive threshold: LPT activates when max/mean GPU load exceeds this (default 1.3).")
         .def_rw("ep_plan_refresh_interval",
                 &RuntimeOptions::EPPlanRefreshInterval,
-                "LLEP sticky plans: recompute the LPT plan every N forward dispatches per layer (default 16, 1 = every step).")
+                "LLEP sticky plans: recompute the LPT plan every N forward dispatches per layer (default 16, 1 = every "
+                "step).")
         .def_rw("sequence_chunks",
                 &RuntimeOptions::SequenceChunks,
                 "Chunked-sequence training: process the sequence as N KV-checkpointed chunks (1 = off).")
@@ -3940,6 +3945,60 @@ NB_MODULE(_surogate, m) {
         .def_rw("length", &dsl::GlmDecodeState::length)
         .def_rw("capacity", &dsl::GlmDecodeState::capacity)
         .def_prop_ro("bytes", [](const dsl::GlmDecodeState& state) { return state.allocator.total_allocation(); });
+
+    m.def("_rollout_delta_rule",
+          [](const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& arrays,
+             const std::vector<nb::ndarray<nb::device::cuda, nb::c_contig>>& results,
+             nb::ndarray<int, nb::ndim<1>, nb::device::cuda, nb::c_contig> cu,
+             std::uintptr_t stream_ptr) {
+              if (arrays.size() != 6 || results.size() != 6 || cu.size() < 2)
+                  throw std::invalid_argument(
+                      "Delta rule fixture expects q,k,v,g,beta,dout and output plus five gradients");
+              std::vector<Tensor> in, out;
+              for (const auto& a : arrays)
+                  in.push_back(glm_kernel_tensor(a));
+              for (const auto& a : results)
+                  out.push_back(glm_kernel_tensor(a));
+              const auto& q = in[0];
+              const long B = q.Sizes[0], T = q.Sizes[1], H = q.Sizes[2], K = q.Sizes[3], V = in[2].Sizes[3];
+              TensorAllocator allocator;
+              auto state = allocator.allocate(ETensorDType::FP32, "delta_fixture_state", {B, H, K, V});
+              auto checkpoints =
+                  allocator.allocate(ETensorDType::FP32,
+                                     "delta_fixture_checkpoints",
+                                     {B, (T + DELTA_RULE_CHECKPOINT - 1) / DELTA_RULE_CHECKPOINT, H, K, V});
+              const auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+              const float scale = 1.f / std::sqrt(static_cast<float>(K));
+              rollout_delta_rule(q,
+                                 in[1],
+                                 in[2],
+                                 in[3],
+                                 in[4],
+                                 out[0],
+                                 state,
+                                 checkpoints,
+                                 cu.data(),
+                                 cu.size() - 1,
+                                 scale,
+                                 stream);
+              rollout_delta_rule_backward(q,
+                                          in[1],
+                                          in[2],
+                                          in[3],
+                                          in[4],
+                                          in[5],
+                                          out[1],
+                                          out[2],
+                                          out[3],
+                                          out[4],
+                                          out[5],
+                                          checkpoints,
+                                          cu.data(),
+                                          cu.size() - 1,
+                                          scale,
+                                          stream);
+              CUDA_CHECK(cudaStreamSynchronize(stream));
+          });
     nb::class_<GlmDsaKernels>(m, "_DsaKernels")
         .def(nb::init<>())
         .def("load", &GlmDsaKernels::load)

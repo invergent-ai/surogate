@@ -665,7 +665,9 @@ void matmul_cublaslt(FloatC* d,
     if constexpr ((std::is_same_v<FloatA, float> || std::is_same_v<FloatA, nv_bfloat16>) &&
                   (std::is_same_v<FloatB, float> || std::is_same_v<FloatB, nv_bfloat16>) &&
                   (std::is_same_v<FloatC, float> || std::is_same_v<FloatC, nv_bfloat16>)) {
-        if (auto* kernels = active_glm_matmul(); kernels && !bias && !scale_a && !scale_b) {
+        if (auto* kernels = active_glm_matmul();
+            kernels && !scale_a && !scale_b &&
+            (!bias || std::is_same_v<FloatBias, float> || std::is_same_v<FloatBias, nv_bfloat16>)) {
             const bool ta = mode == EMMTranspose::TN || mode == EMMTranspose::TT;
             const bool tb = mode == EMMTranspose::NT || mode == EMMTranspose::TT;
             const int lda = lda_override > 0 ? lda_override : (ta ? k : m);
@@ -686,7 +688,9 @@ void matmul_cublaslt(FloatC* d,
                             ldc_override > 0 ? ldc_override : m,
                             alpha_val,
                             beta_val,
-                            stream);
+                            stream,
+                            std::is_same_v<FloatBias, nv_bfloat16> ? bias : nullptr,
+                            std::is_same_v<FloatBias, float> ? bias : nullptr);
             return;
         }
     }

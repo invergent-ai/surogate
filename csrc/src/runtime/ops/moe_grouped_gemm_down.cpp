@@ -218,7 +218,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);
-    } else if (mOptions.GlmRolloutParity && mGlmMatmulKernels.is_ready() && !weight_is_compact && !is_llep_active &&
+    } else if (mOptions.rollout_parity() && mGlmMatmulKernels.is_ready() && !weight_is_compact && !is_llep_active &&
                mOptions.EPSize == 1) {
         if (inp.DType != weights.DType || out.DType != inp.DType)
             throw std::runtime_error("GLM rollout parity requires matching expert activation and weight dtypes");
@@ -383,7 +383,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                 }
             }
             const bool lora_weight_is_compact = (weight_rows != num_experts);
-            if (mOptions.GlmRolloutParity && mGlmMatmulKernels.is_ready() && !lora_weight_is_compact &&
+            if (mOptions.rollout_parity() && mGlmMatmulKernels.is_ready() && !lora_weight_is_compact &&
                 mOptions.EPSize == 1 && mode == EMMTranspose::TN) {
                 mGlmMatmulKernels.grouped(out_t.Data,
                                           in_t.Data,
@@ -1007,7 +1007,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                             lora_host_offsets_ptr = lora_host_offsets_sanitized.data();
                         }
                     }
-                    if (mOptions.GlmRolloutParity && !lora_weight_is_compact && mode == EMMTranspose::TN) {
+                    if (mOptions.rollout_parity() && !lora_weight_is_compact && mode == EMMTranspose::TN) {
                         // Recomputed LoRA activations use the forward reduction order.
                         mGlmMatmulKernels.grouped(out_t.Data,
                                                   in_t.Data,

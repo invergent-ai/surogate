@@ -61,10 +61,12 @@ void GlmMatmulKernels::matmul(void* out,
                               int oc,
                               float alpha,
                               float beta,
-                              cudaStream_t stream) const {
+                              cudaStream_t stream,
+                              const void* bias_bf16,
+                              const void* bias_fp32) const {
     const auto name = std::string("glm_matmul_") + dtype_name(da) + "_" + dtype_name(db) + "_" + dtype_name(dc);
     const auto& kernel = mKernels.at(name);
-    void* args[] = {&a, &b, &out, &m, &n, &k, &am, &ak, &bn, &bk, &oc, &alpha, &beta};
+    void* args[] = {&a, &b, &out, &m, &n, &k, &am, &ak, &bn, &bk, &oc, &alpha, &beta, &bias_bf16, &bias_fp32};
     kernel.launch_triton(dim3((n + 15) / 16, (m + 63) / 64), args, std::size(args), stream);
 }
 

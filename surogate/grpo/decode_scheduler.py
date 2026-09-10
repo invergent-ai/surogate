@@ -39,6 +39,8 @@ class DecodeScheduler:
             raise ValueError("decode scheduler capacities must be positive (prefix_entries may be zero)")
         self.prefix_entries = prefix_entries if hasattr(trainer, "cache_decode_prefix") else 0
         self.prefixes = OrderedDict()
+        self.completed_prefixes = set()
+        self.histories = {}
         self.prefill_owners = {}
         self.condition = threading.Condition()
         self.pending = deque()
@@ -50,6 +52,7 @@ class DecodeScheduler:
         self.decode_streak = 0
         self.rounds = self.batched_rounds = self.max_observed_batch = 0
         self.prefill_tokens = self.prefix_hits = self.prefix_tokens = self.prefill_splits = 0
+        self.completed_saves = self.completed_hits = 0
         self.thread = threading.Thread(target=self._run, name="shared-model-decode", daemon=True)
         self.thread.start()
 
@@ -73,12 +76,12 @@ class DecodeScheduler:
             self.condition.notify()
         return future.result()
 
-    def release(self, session):
+    def release(self, session, *, cache=False):
         future = Future()
         with self.condition:
             if self.closed:
                 return
-            self.releases.append((session, future))
+            self.releases.append((session, future, cache))
             self.condition.notify()
         future.result()
 
@@ -94,6 +97,8 @@ class DecodeScheduler:
             if self.lengths or self.pending:
                 raise RuntimeError("prefix invalidation requires drained decode requests")
             self.prefixes.clear()
+            self.completed_prefixes.clear()
+            self.histories.clear()
             self.prefill_owners.clear()
             self.decoding.clear()
 
@@ -102,6 +107,7 @@ class DecodeScheduler:
             return dict(decode_rounds=self.rounds, batched_decode_rounds=self.batched_rounds,
                         max_decode_batch=self.max_observed_batch, prefill_tokens=self.prefill_tokens,
                         prefix_cache_hits=self.prefix_hits, prefix_cached_tokens=self.prefix_tokens,
+                        completed_turn_cache_saves=self.completed_saves, completed_turn_cache_hits=self.completed_hits,
                         prefill_chunk_splits=self.prefill_splits)
 
     def _take_batch(self):
@@ -152,6 +158,8 @@ class DecodeScheduler:
             self.trainer.release_decode_sessions([item.session])
             self.lengths.pop(item.session)
             self.decoding.discard(item.session)
+        if item.reset and self.prefix_entries:
+            self.histories[item.session] = bytearray()
         if not item.key:
             return
         # Execute the final prompt token with this request's parameters and RNG;
@@ -166,25 +174,40 @@ class DecodeScheduler:
             if self.trainer.restore_decode_prefix(prefix, item.session):
                 item.offset, item.reset = length, False
                 self.lengths[item.session] = length
+                self.histories[item.session] = bytearray(key)
                 self.prefixes.move_to_end(key)
                 self.prefix_hits += 1
+                self.completed_hits += key in self.completed_prefixes
                 self.prefix_tokens += length
                 return
             self.prefixes.pop(key)
+            self.completed_prefixes.discard(key)
             self.trainer.release_decode_prefixes([prefix])
 
     def _cache(self, item):
         if not item.key or item.offset == len(item.tokens):
             return
         key = item.key[:item.offset * 4]
+        self._cache_prefix(item.session, key)
+
+    def _cache_prefix(self, session, key, *, completed=False):
+        if not self.prefix_entries or not key:
+            return
         if key in self.prefixes:
+            self.prefixes.move_to_end(key)
+            if completed:
+                self.completed_prefixes.add(key)
             return
         while len(self.prefixes) >= self.prefix_entries:
-            _, prefix = self.prefixes.popitem(last=False)
+            old_key, prefix = self.prefixes.popitem(last=False)
+            self.completed_prefixes.discard(old_key)
             self.trainer.release_decode_prefixes([prefix])
         prefix = next(self.ids)
-        if self.trainer.cache_decode_prefix(item.session, prefix):
+        if self.trainer.cache_decode_prefix(session, prefix):
             self.prefixes[key] = prefix
+            if completed:
+                self.completed_prefixes.add(key)
+                self.completed_saves += 1
 
     def _forget(self, item):
         if item.key and self.prefill_owners.get(item.key) == item.session:
@@ -193,6 +216,7 @@ class DecodeScheduler:
     def _fail(self, item, error):
         self.trainer.release_decode_sessions([item.session])
         self.lengths.pop(item.session, None)
+        self.histories.pop(item.session, None)
         self.decoding.discard(item.session)
         self._forget(item)
         if not item.future.done():
@@ -257,6 +281,8 @@ class DecodeScheduler:
             self.max_observed_batch = max(self.max_observed_batch, len(batch))
             for item, n in batch:
                 self.lengths[item.session] = self.lengths.get(item.session, 0) + n
+                if self.prefix_entries:
+                    self.histories[item.session].extend(item.tokens[item.offset:item.offset + n].tobytes())
                 item.offset += n
                 self.prefill_tokens += n if item.prefill else 0
                 self._cache(item)
@@ -304,18 +330,34 @@ class DecodeScheduler:
                     batch = self._take_batch()
             if releases or stopping:
                 try:
-                    ids = list(self.lengths) if stopping else [session for session, _ in releases]
+                    ids = list(self.lengths) if stopping else [session for session, _, _ in releases]
+                    if not stopping:
+                        for session, _, cache in releases:
+                            if cache and session in self.histories:
+                                self._cache_prefix(session, bytes(self.histories[session]), completed=True)
                     self.trainer.release_decode_sessions(ids)
                     for session in ids:
                         self.lengths.pop(session, None)
+                        self.histories.pop(session, None)
                         self.decoding.discard(session)
                     if stopping and self.prefix_entries:
                         self.trainer.release_decode_prefixes(list(self.prefixes.values()))
                         self.prefixes.clear()
-                    for _, future in releases:
+                        self.completed_prefixes.clear()
+                    for _, future, _ in releases:
                         future.set_result(None)
                 except Exception as exc:
-                    for _, future in releases:
+                    # Release remains mandatory if optional caching failed.
+                    try:
+                        self.trainer.release_decode_sessions(ids)
+                    except Exception:
+                        pass
+                    finally:
+                        for session in ids:
+                            self.lengths.pop(session, None)
+                            self.histories.pop(session, None)
+                            self.decoding.discard(session)
+                    for _, future, _ in releases:
                         future.set_exception(exc)
             if stopping:
                 return

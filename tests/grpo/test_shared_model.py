@@ -242,3 +242,46 @@ def test_ignoring_model_eos_preserves_explicit_stop_tokens(service):
         stop_token_ids=[2])).json()
     assert result["choices"][0]["token_ids"] == [2]
     assert result["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_successful_turns_are_cached_and_failed_generations_are_not(stream):
+    from tests.grpo.test_decode_scheduling import PrefixTrainer
+
+    class CachedTrainer(PrefixTrainer):
+        def get_shared_base_weights(self):
+            return dict(weight=torch.zeros(8, dtype=torch.bfloat16))
+
+        def decode_batch_logits(self, ids, tokens, offsets, resets):
+            super().decode_batch_logits(ids, tokens, offsets, resets)
+            return np.tile(np.array([0., -2., 2., 1., -1.], dtype=np.float32), (len(ids), 1))
+
+        def reset_decode_state(self):
+            self.states.clear()
+            self.prefixes.clear()
+
+    trainer = CachedTrainer()
+    tokenizer = SimpleNamespace(eos_token_id=1, decode=lambda ids, **kwargs: "x" * len(ids))
+    server = SharedModelServer(trainer, tokenizer, dict(vocab_size=5),
+                               dict(host="127.0.0.1", port=0, model="base", max_context=32, max_concurrency=2))
+    url = f"http://127.0.0.1:{server.http.server_port}/v1/chat/completions/tokens"
+    body = dict(model="policy", tokens=[0, 2], temperature=0, max_tokens=3, stream=stream)
+    try:
+        server.publish("policy", [], 0)
+        response = requests.post(url, json=body, timeout=10)
+        assert response.ok and "error" not in response.text
+        assert server.summary()["completed_turn_cache_saves"] == 1
+        # Raw generated IDs survive even when decoding does not preserve text.
+        continuation = body | dict(tokens=[0, 2, 2, 2, 2, 3])
+        assert requests.post(url, json=continuation, timeout=10).ok
+        assert server.summary()["completed_turn_cache_hits"] == 1
+        saves = server.summary()["completed_turn_cache_saves"]
+        trainer.fail = True
+        response = requests.post(url, json=body, timeout=10)
+        assert "error" in response.text
+        assert server.summary()["completed_turn_cache_saves"] == saves
+        assert not trainer.states and not server.scheduler.histories
+        server.begin_training()
+        assert not trainer.prefixes and not server.scheduler.completed_prefixes
+    finally:
+        server.close()

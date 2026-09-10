@@ -112,7 +112,18 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
     }
 
     // Call kernel
-    mamba_causal_conv1d_forward(out_val, x, weight, bias, B, T, conv_dim, kernel, silu, mRunState.MainStream);
+    mamba_causal_conv1d_forward(out_val,
+                                x,
+                                weight,
+                                bias,
+                                B,
+                                T,
+                                conv_dim,
+                                kernel,
+                                silu,
+                                mRunState.MainStream,
+                                mOptions.MoeRolloutParity ? mCuSeqlensGpu : nullptr,
+                                mNumDocs);
 
     store_tensor(op.outputs[0], out_val);
 }
@@ -222,7 +233,9 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
                                  conv_dim,
                                  kernel,
                                  silu,
-                                 mRunState.MainStream);
+                                 mRunState.MainStream,
+                                 mOptions.MoeRolloutParity ? mCuSeqlensGpu : nullptr,
+                                 mNumDocs);
 
     store_tensor(op.outputs[0], dx);
     store_tensor(op.outputs[1], dweight_fp32);

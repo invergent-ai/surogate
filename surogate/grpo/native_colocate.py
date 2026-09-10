@@ -46,24 +46,21 @@ def validate_configs(train, infer, orch):
         raise ValueError("train, infer and orch must name the same model")
     if not infer.enable_lora or not orch.model.lora_adapter:
         raise ValueError("set infer.enable_lora: true and orch.model.lora_adapter")
-    checkpoint = getattr(train, "checkpoint_dir", None)
-    if (getattr(train, "resume_from_checkpoint", False) and checkpoint and
-            Path(checkpoint).exists() and any(Path(checkpoint).iterdir())):
-        raise ValueError("native GRPO colocate checkpoint resume is not supported yet")
-    if getattr(orch, "ckpt", None) is not None and orch.ckpt.resume_step is not None:
-        raise ValueError("native GRPO colocate orchestrator resume is not supported yet")
     run = Path(orch.output_dir)
     output = Path(train.output_dir)
-    if (output / "rollouts").exists() or any(p.resolve() != run.resolve() for p in output.glob("run_*")):
-        raise ValueError("native GRPO colocate requires a fresh training output directory")
-    if any((run / name).exists() for name in ("broadcasts", "rollouts", "checkpoints", "control")):
-        raise ValueError("native GRPO colocate requires a fresh output directory")
+    if any(p.resolve() != run.resolve() for p in output.glob("run_*")):
+        raise ValueError("native GRPO colocate requires one orchestrator run directory")
     if getattr(train, "lora_dropout", 0):
         raise ValueError("native GRPO colocate requires lora_dropout: 0 for policy scoring")
     config = json.loads((Path(train.model_dir) / "config.json").read_text())
     shared_execution(config, train.lora_target_modules)
     text = config.get("text_config", config)
-    if (text.get("num_experts", text.get("num_local_experts", text.get("n_routed_experts", 0))) and
+    moe = text.get("num_experts", text.get("num_local_experts", text.get("n_routed_experts", 0)))
+    if moe and getattr(train, "sequence_chunks", 1) > 1:
+        raise ValueError("native MoE policy scoring requires sequence_chunks: 1; use long_context to reduce memory")
+    if moe and not getattr(train, "doc_masking", True):
+        raise ValueError("native MoE policy scoring requires doc_masking: true")
+    if (moe and
             getattr(train, "lora_dtype", "fp32") != "bf16"):
         raise ValueError("MoE shared-model GRPO requires lora_dtype: bf16 for expert adapter training")
 
@@ -71,13 +68,15 @@ def validate_configs(train, infer, orch):
 class SharedPolicy:
     """One phase owner, with an explicit version for every completed update."""
 
-    def __init__(self, server, train, orch):
+    def __init__(self, server, train, orch, *, start_step=0, checkpoints=None):
         self.server = server
         self.name = orch.model.lora_adapter
         self.scale = train.lora_alpha / train.lora_rank
         self.directory = Path(orch.output_dir) / "broadcasts"
         self.stop_event = threading.Event()
-        self.version = -1
+        self.start_step = start_step
+        self.version = start_step - 1
+        self.checkpoints = checkpoints
         self.training = True
         self.lock = threading.Lock()
         self.report_path = Path(train.output_dir) / "shared_weights.jsonl"
@@ -120,7 +119,7 @@ class SharedPolicy:
             directory.mkdir(parents=True, exist_ok=True)
             # Coordination only. No model or adapter files are written per step.
             (directory / "STABLE").touch()
-            if step > 0:
+            if step > self.start_step:
                 from surogate.grpo.runs import get_multi_run_manager
 
                 manager = get_multi_run_manager()
@@ -129,6 +128,10 @@ class SharedPolicy:
 
     def cleanup(self, step):
         pass
+
+    def save_checkpoint(self, trainer, next_step):
+        if self.checkpoints is not None:
+            self.checkpoints.save_training(trainer, next_step)
 
     async def acknowledge(self, weight_dir, lora_name=None, step=0):
         with self.lock:
@@ -151,7 +154,11 @@ class SharedInferencePool:
 
 def grpo_native_colocate(train_config, infer_config, orch_config):
     validate_configs(train_config, infer_config, orch_config)
+    from surogate.grpo.native_checkpoint import NativeCheckpointCoordinator
     from surogate.grpo.trainer import GRPOTrainer
+
+    checkpoints = NativeCheckpointCoordinator(train_config, orch_config)
+    checkpoints.prepare_resume()
 
     # Interleaving requires a complete batch from one policy before its update.
     train_config.max_async_level = 0
@@ -169,12 +176,15 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
                     decode_cache_bytes=getattr(infer_config, "decode_cache_bytes", 0),
                     decode_prefix_entries=getattr(infer_config, "decode_prefix_entries", 32),
                     decode_memory_bytes=getattr(infer_config, "decode_memory_bytes", 0),
+                    initial_policy_version=checkpoints.resume_step - 1,
                     rank=train_config.lora_rank)
     # Enforce the local server address; both components live in this process.
     orch_config.client.base_url = [f"http://127.0.0.1:{settings['port']}/v1"]
     trainer, server = None, None
     config = json.loads((Path(train_config.model_dir) / "config.json").read_text())
     text_config = config.get("text_config", config)
+    if text_config.get("num_experts", text_config.get("num_local_experts", text_config.get("n_routed_experts", 0))):
+        train_config.runtime_config.moe_rollout_parity = True
     if config.get("model_type") == "glm5_next" or text_config.get("model_type") in ("glm5_next", "glm5_next_text"):
         train_config.runtime_config.glm_rollout_parity = True
         logger.info("GLM policy scoring uses recurrent FLA KDA and fixed-reduction GEMMs.")
@@ -188,7 +198,7 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
         artifact = Path(temporary) / "model.sinfer"
         bindings = write_shared_artifact(train_config.model_dir, artifact) if execution == "serve" else None
         try:
-            trainer = GRPOTrainer(train_config)
+            trainer = GRPOTrainer(train_config, resume_checkpoint=checkpoints.trainer_resume)
             if execution == "serve":
                 from surogate import _surogate_serve
                 weights = borrow_weights(trainer.trainer, bindings)
@@ -196,10 +206,10 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
             else:
                 logger.info("Shared-model rollouts use the resident training model.")
                 server = SharedModelServer(trainer.trainer, train_config.tokenizer, config, settings)
-            policy = SharedPolicy(server, train_config, orch_config)
+            policy = SharedPolicy(server, train_config, orch_config, start_step=checkpoints.resume_step, checkpoints=checkpoints)
             trainer.phase_controller = policy
             trainer.broadcast = policy
-            policy.broadcast(trainer.trainer, 0)
+            policy.broadcast(trainer.trainer, checkpoints.resume_step)
             asyncio.run(_run(trainer, policy, orch_config))
         finally:
             if server is not None:
@@ -216,7 +226,8 @@ async def _run(trainer, policy, config):
     pool = await setup_inference_pool(config.client, model_name=config.model.name, client_type=client_type)
     training = asyncio.create_task(asyncio.to_thread(trainer.train))
     orchestrator = asyncio.create_task(orchestrate(config, inference_pool=SharedInferencePool(pool, policy),
-                                                  initial_policy_name=policy.name, prefetch_batches=False))
+                                                  initial_policy_name=policy.name, prefetch_batches=False,
+                                                  checkpoint_coordinator=getattr(policy, "checkpoints", None)))
     try:
         await asyncio.gather(asyncio.shield(training), orchestrator)
     finally:

@@ -9,7 +9,8 @@ from surogate.kernels.compiler import compile_triton_kernel
 
 
 @triton.jit
-def matmul(a, b, out, M, N, K, AM, AK, BN, BK, OC, alpha, beta, TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr):
+def matmul(a, b, out, M, N, K, AM, AK, BN, BK, OC, alpha, beta, bias_bf16, bias_fp32,
+           TM: tl.constexpr, TN: tl.constexpr, TK: tl.constexpr):
     # C[M,N] is column-major, as in the native cuBLAS interface. Computing
     # its transpose makes tokens the short tile dimension for forward GEMMs.
     rows = tl.program_id(0) * TN + tl.arange(0, TN)
@@ -29,6 +30,10 @@ def matmul(a, b, out, M, N, K, AM, AK, BN, BK, OC, alpha, beta, TM: tl.constexpr
     value = acc * alpha
     if beta != 0:
         value += beta * tl.load(ptr, mask, 0).to(tl.float32)
+    if bias_bf16.to(tl.int64) != 0:
+        value += tl.load(bias_bf16 + cols, cols < M, 0).to(tl.float32)[None, :]
+    if bias_fp32.to(tl.int64) != 0:
+        value += tl.load(bias_fp32 + cols, cols < M, 0)[None, :]
     tl.store(ptr, value, mask)
 
 
@@ -89,6 +94,7 @@ def compile_glm_matmul(experts, output_dir, sm):
         signature = dict(a=f"*{a}", b=f"*{b}", out=f"*{c}")
         signature.update({p: "i32" for p in ("M", "N", "K", "AM", "AK", "BN", "BK", "OC")})
         signature.update(alpha="fp32", beta="fp32")
+        signature.update(bias_bf16="*bf16", bias_fp32="*fp32")
         manifests[name] = compile_triton_kernel(matmul, signature, tiles, output_dir, name, sm=sm)
     for dtype in ("bf16", "fp32"):
         name = f"glm_grouped_matmul_{dtype}"

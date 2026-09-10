@@ -16,9 +16,12 @@ from surogate.grpo.native_colocate import SharedPolicy, _run
         ({"model_type": "glm5_next", "text_config": {}}, True),
         ({"model_type": "glm5_next_text"}, True),
         ({"model_type": "llama"}, False),
+        ({"model_type": "qwen3_5_moe_text", "num_experts": 4}, False),
+        ({"model_type": "gpt_oss", "num_local_experts": 4}, False),
+        ({"model_type": "laguna", "n_routed_experts": 4}, False),
     ],
 )
-def test_glm_parity_is_selected_before_allocating_the_trainer(tmp_path, monkeypatch, config, expected):
+def test_policy_parity_is_selected_before_allocating_the_trainer(tmp_path, monkeypatch, config, expected):
     from surogate.grpo import native_colocate, trainer
 
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -28,12 +31,17 @@ def test_glm_parity_is_selected_before_allocating_the_trainer(tmp_path, monkeypa
         lora_rank=8,
         lora_target_modules=["all"],
         runtime_config=SimpleNamespace(glm_rollout_parity=False),
+        output_dir=tmp_path / "out", checkpoint_dir=tmp_path / "out", save_steps=1, max_steps=2,
+        model="fixture", lora_alpha=16, lora_dtype="bf16", resume_from_checkpoint=True,
     )
     infer = SimpleNamespace(max_model_len=512, max_num_seqs=2, host="127.0.0.1", port=8000)
-    orch = SimpleNamespace(output_dir=tmp_path / "out", model=SimpleNamespace(name="glm"), client=SimpleNamespace())
+    orch = SimpleNamespace(output_dir=tmp_path / "out/run_default", model=SimpleNamespace(name="glm"), client=SimpleNamespace(), ckpt=None)
 
-    def allocate(actual):
+    def allocate(actual, **kwargs):
         assert actual.runtime_config.glm_rollout_parity is expected
+        text = config.get("text_config", config)
+        moe = bool(text.get("num_experts", text.get("num_local_experts", text.get("n_routed_experts", 0))))
+        assert getattr(actual.runtime_config, "moe_rollout_parity", False) is moe
         raise RuntimeError("allocation reached")
 
     monkeypatch.setattr(native_colocate, "validate_configs", lambda *args: None)

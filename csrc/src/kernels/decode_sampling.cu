@@ -76,53 +76,106 @@ __global__ void apply_bias(double* values, const DecodeLogitBias* bias, int coun
     if (i < count) values[bias[i].row * V + bias[i].token] += bias[i].value;
 }
 
-__global__ void filter(const double* values,
-                       const int* indices,
-                       double* probabilities,
-                       const DecodeSamplingParams* params,
-                       int V,
-                       bool sorted) {
-    const int row = blockIdx.x, tid = threadIdx.x;
+struct TileStatistics {
+    double maximum, raw_maximum, mass, raw_mass, prefix;
+};
+struct RowStatistics {
+    double maximum, raw_maximum, total, normalizer;
+};
+
+template <class Float>
+__global__ void maxima_tiles(const Float* logits, const double* values, const DecodeSamplingParams* params,
+                             TileStatistics* tiles, int V, int count) {
+    const int row = blockIdx.y, tile = blockIdx.x, i = tile * Threads + threadIdx.x;
+    const double temperature = params[row].temperature > 0 ? params[row].temperature : 1;
+    __shared__ Sum::TempStorage storage;
+    double maximum = Sum(storage).Reduce(i < V ? values[row * V + i] : -INFINITY, Maximum{});
+    if (!threadIdx.x) tiles[row * count + tile].maximum = maximum;
+    __syncthreads();
+    maximum = Sum(storage).Reduce(i < V ? static_cast<float>(logits[row * V + i]) / temperature : -INFINITY, Maximum{});
+    if (!threadIdx.x) tiles[row * count + tile].raw_maximum = maximum;
+}
+
+__global__ void maxima_rows(const TileStatistics* tiles, RowStatistics* rows, int count) {
+    const int row = blockIdx.x;
+    __shared__ Sum::TempStorage storage;
+    double maximum = -INFINITY, raw_maximum = -INFINITY;
+    for (int i = threadIdx.x; i < count; i += Threads) {
+        maximum = fmax(maximum, tiles[row * count + i].maximum);
+        raw_maximum = fmax(raw_maximum, tiles[row * count + i].raw_maximum);
+    }
+    const double reduced = Sum(storage).Reduce(maximum, Maximum{});
+    if (!threadIdx.x) rows[row].maximum = reduced;
+    __syncthreads();
+    const double raw_reduced = Sum(storage).Reduce(raw_maximum, Maximum{});
+    if (!threadIdx.x) rows[row].raw_maximum = raw_reduced;
+}
+
+template <class Float>
+__global__ void weights_tiles(const Float* logits, const double* values, double* weights,
+                              const DecodeSamplingParams* params, TileStatistics* tiles,
+                              const RowStatistics* rows, int V, int count) {
+    const int row = blockIdx.y, tile = blockIdx.x, i = tile * Threads + threadIdx.x;
     const auto p = params[row];
-    values += row * V;
-    indices += row * V;
-    probabilities += row * V;
-    __shared__ union {
-        Sum::TempStorage reduce;
-        Scan::TempStorage scan;
-    } storage;
-    __shared__ double maximum, total, prefix;
-    double local = -INFINITY;
-    for (int i = tid; i < V; i += Threads)
-        local = fmax(local, values[i]);
-    const double m = Sum(storage.reduce).Reduce(local, Maximum{});
-    if (tid == 0) maximum = m;
-    __syncthreads();
+    const double temperature = p.temperature > 0 ? p.temperature : 1;
     const int k = p.top_k > 0 ? min(p.top_k, V) : V;
-    local = 0;
-    for (int i = tid; i < k; i += Threads)
-        local += isfinite(values[i]) ? exp(values[i] - maximum) : 0;
-    const double sum = Sum(storage.reduce).Sum(local);
-    if (tid == 0) {
-        total = sum;
-        prefix = 0;
-    }
+    const double weight = i < k && isfinite(values[row * V + i]) ? exp(values[row * V + i] - rows[row].maximum) : 0;
+    if (i < V) weights[row * V + i] = weight;
+    __shared__ Sum::TempStorage storage;
+    const double mass = Sum(storage).Sum(weight);
+    if (!threadIdx.x) tiles[row * count + tile].mass = mass;
     __syncthreads();
-    for (int start = 0; start < V; start += Threads) {
-        const int i = start + tid;
-        double weight = i < k && isfinite(values[i]) ? exp(values[i] - maximum) : 0;
-        if (sorted) {
-            double before, tile;
-            Scan(storage.scan).ExclusiveSum(weight, before, tile);
-            __syncthreads();
-            if (prefix + before >= p.top_p * total) weight = 0;
-            __syncthreads();
-            if (tid == 0) prefix += tile;
-            __syncthreads();
-        }
-        if (weight < p.min_p) weight = 0;  // maximum unnormalized weight is 1
-        if (i < V) probabilities[sorted ? indices[i] : i] = weight;
+    const double raw = i < V ? exp(static_cast<float>(logits[row * V + i]) / temperature - rows[row].raw_maximum) : 0;
+    const double raw_mass = Sum(storage).Sum(raw);
+    if (!threadIdx.x) tiles[row * count + tile].raw_mass = raw_mass;
+}
+
+__global__ void prefix_rows(TileStatistics* tiles, RowStatistics* rows, int count, bool normalize) {
+    const int row = blockIdx.x, tid = threadIdx.x;
+    tiles += row * count;
+    __shared__ union { Sum::TempStorage reduce; Scan::TempStorage scan; } storage;
+    __shared__ double prefix;
+    if (normalize) {
+        double raw = 0;
+        for (int i = tid; i < count; i += Threads) raw += tiles[i].raw_mass;
+        const double raw_mass = Sum(storage.reduce).Sum(raw);
+        if (!tid) rows[row].normalizer = rows[row].raw_maximum + log(raw_mass);
+        __syncthreads();
     }
+    if (!tid) prefix = 0;
+    __syncthreads();
+    for (int start = 0; start < count; start += Threads) {
+        const int i = start + tid;
+        double before, mass;
+        Scan(storage.scan).ExclusiveSum(i < count ? tiles[i].mass : 0, before, mass);
+        if (i < count) tiles[i].prefix = prefix + before;
+        __syncthreads();
+        if (!tid) prefix += mass;
+        __syncthreads();
+    }
+    if (!tid) rows[row].total = prefix;
+}
+
+__global__ void filter_tiles(const double* weights, const int* indices, double* probabilities,
+                             const DecodeSamplingParams* params, const TileStatistics* tiles,
+                             const RowStatistics* rows, int V, int count, bool sorted) {
+    const int row = blockIdx.y, tile = blockIdx.x, i = tile * Threads + threadIdx.x;
+    double weight = i < V ? weights[row * V + i] : 0;
+    if (sorted) {
+        __shared__ Scan::TempStorage storage;
+        double before;
+        Scan(storage).ExclusiveSum(weight, before);
+        if (tiles[row * count + tile].prefix + before >= params[row].top_p * rows[row].total) weight = 0;
+    }
+    if (weight < params[row].min_p) weight = 0;
+    if (i < V) probabilities[row * V + (sorted ? indices[row * V + i] : i)] = weight;
+}
+
+__global__ void sample_masses(const double* probabilities, TileStatistics* tiles, int V, int count) {
+    const int row = blockIdx.y, tile = blockIdx.x, i = tile * Threads + threadIdx.x;
+    __shared__ Sum::TempStorage storage;
+    const double mass = Sum(storage).Sum(i < V ? probabilities[row * V + i] : 0);
+    if (!threadIdx.x) tiles[row * count + tile].mass = mass;
 }
 
 template <class Float>
@@ -130,7 +183,7 @@ __global__ void sample(const Float* logits,
                        const double* probabilities,
                        const DecodeSamplingParams* params,
                        DecodeSampleResult* results,
-                       int V) {
+                       const TileStatistics* tiles, const RowStatistics* rows, int count, int V) {
     const int row = blockIdx.x, tid = threadIdx.x;
     const auto p = params[row];
     auto& result = results[row];
@@ -145,58 +198,40 @@ __global__ void sample(const Float* logits,
         Select::TempStorage select;
         Scan::TempStorage scan;
     } storage;
-    __shared__ double maximum, normalizer, total, prefix;
     __shared__ Best previous;
+    __shared__ int selected_tile;
     const double temperature = p.temperature > 0 ? p.temperature : 1;
-    double local_max = -INFINITY, local_sum = 0;
-    for (int i = tid; i < V; i += Threads) {
-        local_max = fmax(local_max, static_cast<float>(logits[i]) / temperature);
-        local_sum += probabilities[i];
-    }
-    const double m = Sum(storage.reduce).Reduce(local_max, Maximum{});
-    if (!tid) maximum = m;
-    __syncthreads();
-    const double mass = Sum(storage.reduce).Sum(local_sum);
-    if (!tid) {
-        total = mass;
-        prefix = 0;
-    }
-    __syncthreads();
+    const double normalizer = rows[row].normalizer, total = rows[row].total;
     if (!(total > 0) || !isfinite(total)) {
-        if (!tid) {
-            result.token = -1;
-            result.status = 2;
-        }
+        if (!tid) { result.token = -1; result.status = 2; }
         return;
     }
-    local_sum = 0;
-    for (int i = tid; i < V; i += Threads)
-        local_sum += exp(static_cast<float>(logits[i]) / temperature - maximum);
-    const double partition = Sum(storage.reduce).Sum(local_sum);
-    if (!tid) normalizer = maximum + log(partition);
-    __syncthreads();
     Best best{-INFINITY, V};
     if (p.temperature == 0) {
         for (int i = tid; i < V; i += Threads)
             best = Better{}(best, {probabilities[i], i});
     } else {
-        // Token-ID order matches inverse-CDF sampling on the host. The host
-        // supplies one draw from each request's RNG, independent of batching.
-        int selected = V, last = -1;
-        for (int start = 0; start < V; start += Threads) {
-            const int i = start + tid;
-            const double weight = i < V ? probabilities[i] : 0;
-            double before, tile;
-            Scan(storage.scan).ExclusiveSum(weight, before, tile);
-            __syncthreads();
-            if (weight > 0) {
-                last = i;
-                if (prefix + before + weight > p.uniform * total) selected = min(selected, i);
+        // Locate the containing tile in token-ID order, then scan only that
+        // tile. The request's host RNG draw remains independent of batching.
+        Best candidate{-INFINITY, count};
+        for (int i = tid; i < count; i += Threads) {
+            const auto tile = tiles[row * count + i];
+            if (tile.mass > 0) {
+                const bool contains = tile.prefix + tile.mass > p.uniform * total;
+                candidate = Better{}(candidate, contains ? Best{1, i} : Best{0, -i});
             }
-            __syncthreads();
-            if (!tid) prefix += tile;
-            __syncthreads();
         }
+        const Best chosen_tile = Select(storage.select).Reduce(candidate, Better{});
+        if (!tid) selected_tile = chosen_tile.value == 1 ? chosen_tile.token : -chosen_tile.token;
+        __syncthreads();
+        const int i = selected_tile * Threads + tid;
+        const double weight = i < V ? probabilities[i] : 0;
+        double before;
+        Scan(storage.scan).ExclusiveSum(weight, before);
+        const double prefix = tiles[row * count + selected_tile].prefix;
+        const int selected = weight > 0 && prefix + before + weight > p.uniform * total ? i : V;
+        const int last = weight > 0 ? i : -1;
+        __syncthreads();
         // A final positive token also covers roundoff at the very end of CDF.
         best = selected < V ? Best{1, selected} : Best{0, -last};
     }
@@ -251,7 +286,7 @@ void DecodeSampler::reserve(Tensor& tensor, ETensorDType dtype, long elements, c
 
 void DecodeSampler::release_workspace() {
     for (auto* tensor : {&mLogits, &mValues, &mSorted, &mProbabilities, &mIndices, &mSortedIndices,
-                         &mOffsets, &mParams, &mBias, &mResults, &mSort})
+                         &mOffsets, &mParams, &mBias, &mResults, &mSort, &mTileStats, &mRowStats})
         mAllocator.free(*tensor);
 }
 
@@ -305,6 +340,8 @@ void DecodeSampler::prepare(const DecodeSamplingRequest* requests,
                                    cudaMemcpyHostToDevice,
                                    stream));
     mBiasPassSize = biased;
+    reserve(mTileStats, ETensorDType::BYTE, static_cast<long>(B) * ((V + Threads - 1) / Threads) * sizeof(TileStatistics), "decode_sample_tiles");
+    reserve(mRowStats, ETensorDType::BYTE, static_cast<long>(B) * sizeof(RowStatistics), "decode_sample_rows");
     if (mNeedsSort) {
         reserve(mSorted, ETensorDType::BYTE, mValues.nelem(), "decode_sample_sorted");
         reserve(mSortedIndices, ETensorDType::INT32, static_cast<long>(B) * V, "decode_sample_sorted_indices");
@@ -377,11 +414,28 @@ void DecodeSampler::run(const Tensor& counts, cudaStream_t stream) {
         values = reinterpret_cast<double*>(mSorted.Data);
         indices = mSortedIndices.get<int>();
     }
-    filter<<<mB, Threads, 0, stream>>>(values, indices, probabilities, params, mV, mNeedsSort);
-    if (mLogits.DType == ETensorDType::BF16)
-        sample<<<mB, Threads, 0, stream>>>(mLogits.get<nv_bfloat16>(), probabilities, params, results, mV);
-    else
-        sample<<<mB, Threads, 0, stream>>>(mLogits.get<float>(), probabilities, params, results, mV);
+    auto* tile_stats = reinterpret_cast<TileStatistics*>(mTileStats.Data);
+    auto* row_stats = reinterpret_cast<RowStatistics*>(mRowStats.Data);
+    const int tiles = (mV + Threads - 1) / Threads;
+    const dim3 grid(tiles, mB);
+    auto finish = [&]<class Float>() {
+        maxima_tiles<<<grid, Threads, 0, stream>>>(mLogits.get<Float>(), values, params, tile_stats, mV, tiles);
+        maxima_rows<<<mB, Threads, 0, stream>>>(tile_stats, row_stats, tiles);
+        weights_tiles<<<grid, Threads, 0, stream>>>(mLogits.get<Float>(), values, probabilities, params,
+                                                   tile_stats, row_stats, mV, tiles);
+        prefix_rows<<<mB, Threads, 0, stream>>>(tile_stats, row_stats, tiles, true);
+        // Values are no longer needed after weight construction; reuse their
+        // buffer for probabilities scattered back into token-ID order.
+        auto* filtered = reinterpret_cast<double*>(mValues.Data);
+        filter_tiles<<<grid, Threads, 0, stream>>>(probabilities, indices, filtered, params,
+                                                  tile_stats, row_stats, mV, tiles, mNeedsSort);
+        sample_masses<<<grid, Threads, 0, stream>>>(filtered, tile_stats, mV, tiles);
+        prefix_rows<<<mB, Threads, 0, stream>>>(tile_stats, row_stats, tiles, false);
+        sample<<<mB, Threads, 0, stream>>>(mLogits.get<Float>(), filtered, params, results,
+                                          tile_stats, row_stats, tiles, mV);
+    };
+    if (mLogits.DType == ETensorDType::BF16) finish.operator()<nv_bfloat16>();
+    else finish.operator()<float>();
     CUDA_CHECK(cudaGetLastError());
 }
 

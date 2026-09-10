@@ -415,6 +415,14 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
         throw std::runtime_error(
             "GLM rollout parity requires BF16, doc_masking=true, ep_size=1 and compiled KDA/matmul kernels");
     }
+    if (options.MoeRolloutParity && (!options.DocMasking || options.EPSize != 1 ||
+                                     options.matmul_dtype() != ETensorDType::BF16 || !mGlmMatmulKernels.is_ready())) {
+        throw std::runtime_error(
+            "MoE rollout parity requires BF16, doc_masking=true, ep_size=1 and compiled matmul kernels");
+    }
+    if (options.rollout_parity() && options.SequenceChunks > 1)
+        throw std::runtime_error(
+            "Rollout scoring parity requires sequence_chunks=1; use long_context to reduce training memory");
 }
 
 CompiledExecutor::~CompiledExecutor() {

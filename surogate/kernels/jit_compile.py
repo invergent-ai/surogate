@@ -16,7 +16,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def compile_jit_kernels(ir_json: str) -> dict[str, str]:
+def compile_jit_kernels(ir_json: str, *, rollout_parity: bool = False) -> dict[str, str]:
     """Compile all JIT kernels required by the model.
 
     Inspects the DSL IR JSON to determine which kernel families are needed,
@@ -32,6 +32,11 @@ def compile_jit_kernels(ir_json: str) -> dict[str, str]:
     manifests: dict[str, str] = {}
 
     ir = json.loads(ir_json)
+    if rollout_parity:
+        config = next((m["config"] for m in ir.get("modules", []) if isinstance(m, dict) and m.get("config")),
+                      ir.get("config", {}))
+        experts = config.get("n_routed_experts", config.get("num_experts", config.get("num_local_experts", 1)))
+        manifests.update(_compile_glm_matmul(experts))
 
     # Check if the model uses gated delta rule
     if _ir_uses_op(ir, "chunk_gated_delta_rule"):

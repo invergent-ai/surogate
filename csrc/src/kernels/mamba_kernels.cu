@@ -56,6 +56,66 @@ inline int div_up(long n, int d) {
     return static_cast<int>((n + d - 1) / d);
 }
 
+__device__ int convolution_document_start(const int* cu_seqlens, int num_docs, int token) {
+    int lo = 0, hi = num_docs;
+    while (lo + 1 < hi) {
+        int mid = (lo + hi) / 2;
+        if (cu_seqlens[mid] <= token) lo = mid;
+        else hi = mid;
+    }
+    return cu_seqlens[lo];
+}
+
+template <typename T>
+__device__ float packed_conv_value(const T* x, const T* w, int t, int start, int kernel, float bias) {
+    float result = bias;
+    for (int j = 0; j < kernel; ++j) {
+        int source = t - kernel + 1 + j;
+        result += to_float(w[j]) * (source >= start ? to_float(x[source]) : 0.f);
+    }
+    return result;
+}
+
+template <typename T, bool Backward>
+__global__ void packed_convolution(T* out, const T* x, const T* weight, const T* bias, const T* dout,
+                                  float* dw, float* db, int Tlen, int channels, int kernel, bool silu,
+                                  const int* cu_seqlens, int num_docs) {
+    const int row = blockIdx.y, channel = blockIdx.z, t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= Tlen) return;
+    const int start = convolution_document_start(cu_seqlens, num_docs, row * Tlen + t) - row * Tlen;
+    x += (row * channels + channel) * Tlen;
+    out += (row * channels + channel) * Tlen;
+    weight += channel * kernel;
+    const float b = bias ? to_float(bias[channel]) : 0.f;
+    if constexpr (!Backward) {
+        float value = packed_conv_value(x, weight, t, start, kernel, b);
+        if (silu) value *= 1.f / (1.f + expf(-value));
+        out[t] = from_float<T>(value);
+    } else {
+        dout += (row * channels + channel) * Tlen;
+        auto grad = [&](int r) {
+            float value = to_float(dout[r]);
+            if (silu) {
+                float y = packed_conv_value(x, weight, r, start, kernel, b);
+                float sigmoid = 1.f / (1.f + expf(-y));
+                value *= sigmoid * (1.f + y * (1.f - sigmoid));
+            }
+            return value;
+        };
+        const float dy = grad(t);
+        if (db) atomicAdd(db + channel, dy);
+        float dx = 0.f;
+        for (int j = 0; j < kernel; ++j) {
+            const int source = t - kernel + 1 + j;
+            if (source >= start) atomicAdd(dw + channel * kernel + j, to_float(x[source]) * dy);
+            const int dest = t + kernel - 1 - j;
+            if (dest < Tlen && convolution_document_start(cu_seqlens, num_docs, row * Tlen + dest) == row * Tlen + start)
+                dx += to_float(weight[j]) * grad(dest);
+        }
+        out[t] = from_float<T>(dx);
+    }
+}
+
 template <typename T>
 __global__ void mamba_copy_gate_kernel(T* gate, const T* proj, long total, int D, int proj_size) {
     long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -815,7 +875,21 @@ void mamba_causal_conv1d_forward(Tensor& out,
                                  int conv_dim,
                                  int kernel,
                                  bool silu,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, const int* cu_seqlens, int num_docs) {
+    if (cu_seqlens) {
+        auto launch = [&]<typename D>() {
+            packed_convolution<D, false><<<dim3(div_up(Tlen, 256), B, conv_dim), 256, 0, stream>>>(
+                reinterpret_cast<D*>(out.Data), reinterpret_cast<const D*>(x.Data),
+                reinterpret_cast<const D*>(weight.Data), bias ? reinterpret_cast<const D*>(bias->Data) : nullptr,
+                static_cast<const D*>(nullptr), nullptr, nullptr,
+                Tlen, conv_dim, kernel, silu, cu_seqlens, num_docs);
+        };
+        if (x.DType == ETensorDType::BF16) launch.template operator()<nv_bfloat16>();
+        else if (x.DType == ETensorDType::FP16) launch.template operator()<half>();
+        else launch.template operator()<float>();
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     ConvParamsBase params{};
     params.batch = B;
     params.dim = conv_dim;
@@ -867,7 +941,21 @@ void mamba_causal_conv1d_backward(Tensor& dx,
                                   int conv_dim,
                                   int kernel,
                                   bool silu,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const int* cu_seqlens, int num_docs) {
+    if (cu_seqlens) {
+        auto launch = [&]<typename D>() {
+            packed_convolution<D, true><<<dim3(div_up(Tlen, 256), B, conv_dim), 256, 0, stream>>>(
+                reinterpret_cast<D*>(dx.Data), reinterpret_cast<const D*>(x.Data),
+                reinterpret_cast<const D*>(weight.Data), nullptr,
+                reinterpret_cast<const D*>(dout.Data), reinterpret_cast<float*>(dweight_fp32.Data), dbias_fp32 ? reinterpret_cast<float*>(dbias_fp32->Data) : nullptr,
+                Tlen, conv_dim, kernel, silu, cu_seqlens, num_docs);
+        };
+        if (x.DType == ETensorDType::BF16) launch.template operator()<nv_bfloat16>();
+        else if (x.DType == ETensorDType::FP16) launch.template operator()<half>();
+        else launch.template operator()<float>();
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     ConvParamsBwd params{};
     params.batch = B;
     params.dim = conv_dim;

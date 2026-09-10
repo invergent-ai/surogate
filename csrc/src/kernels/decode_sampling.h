@@ -54,7 +54,7 @@ public:
 private:
     dsl::DecodeWorkspaceAllocator mAllocator;
     Tensor mLogits, mValues, mSorted, mProbabilities, mIndices, mSortedIndices, mOffsets;
-    Tensor mParams, mBias, mResults, mSort;
+    Tensor mParams, mBias, mResults, mSort, mTileStats, mRowStats;
     std::vector<DecodeSamplingParams> mHostParams;
     std::vector<DecodeLogitBias> mHostBias;
     int mB = 0, mV = 0;

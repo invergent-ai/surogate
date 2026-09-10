@@ -134,7 +134,7 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
 class GRPOTrainer:
     """GRPO RL trainer using Surogate's C++ engine."""
 
-    def __init__(self, config: GRPOTrainConfig):
+    def __init__(self, config: GRPOTrainConfig, *, resume_checkpoint=None):
         self.phase_controller = None
         self.config = config
 
@@ -150,7 +150,7 @@ class GRPOTrainer:
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
 
-        jit_manifests = compile_jit_kernels(ir_json)
+        jit_manifests = compile_jit_kernels(ir_json, rollout_parity=getattr(config.runtime_config, "moe_rollout_parity", False))
         if jit_manifests:
             config.runtime_config.jit_kernel_manifests = jit_manifests
 
@@ -208,7 +208,10 @@ class GRPOTrainer:
         # ``self.start_step`` is the NEXT batch to train: checkpoint at step
         # S = trained through batch S, so resume trains S+1.
         resume_step = -1
-        if getattr(config, "resume_from_checkpoint", False) and config.checkpoint_dir:
+        resume_source = config.checkpoint_dir
+        if resume_checkpoint is not None:
+            resume_source, resume_step = resume_checkpoint
+        elif getattr(config, "resume_from_checkpoint", False) and config.checkpoint_dir:
             resume_step = _surogate.find_latest_checkpoint(str(config.checkpoint_dir))
         self.start_step = 0
         fresh_run = resume_step < 0
@@ -225,12 +228,12 @@ class GRPOTrainer:
 
             if config.lora:
                 ensure_surogate_lora_compat(
-                    Path(config.checkpoint_dir) / f"step_{resume_step:08d}",
+                    Path(resume_source) / f"step_{resume_step:08d}",
                     config.model_dir,
                 )
             logger.info(f"Resuming from checkpoint step {resume_step} "
                         f"(next batch: {resume_step + 1})")
-            self.trainer.load_checkpoint(str(config.checkpoint_dir), resume_step)
+            self.trainer.load_checkpoint(str(resume_source), resume_step)
             self.start_step = resume_step + 1
 
         # loss_scale is computed dynamically per pack — see train() loop
@@ -970,7 +973,9 @@ class GRPOTrainer:
             )
 
             # 7. Checkpointing
-            if config.save_steps > 0 and step > 0 and step % config.save_steps == 0 and config.checkpoint_dir:
+            if self.phase_controller is not None:
+                self.phase_controller.save_checkpoint(self.trainer, orch_step + 1)
+            elif config.save_steps > 0 and step > 0 and step % config.save_steps == 0 and config.checkpoint_dir:
                 logger.info(f"Saving checkpoint at step {step}...")
                 self.trainer.save_checkpoint(config.checkpoint_dir, step)
 

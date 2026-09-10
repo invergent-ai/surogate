@@ -87,7 +87,7 @@ from surogate.grpo.utils.vlm import is_vlm_model
 
 @clean_exit
 async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, initial_policy_name=None,
-                      prefetch_batches=True):
+                      prefetch_batches=True, checkpoint_coordinator=None):
     # Initialize the logger
     logger = setup_logger(
         config.log.level,
@@ -358,9 +358,11 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
 
         # Get checkpoint manager
         logger.info(f"Initializing checkpoint manager ({config.ckpt})")
-        ckpt_manager = setup_ckpt_manager(Path(config.output_dir), config.ckpt)
+        ckpt_manager = None if checkpoint_coordinator is not None else setup_ckpt_manager(Path(config.output_dir), config.ckpt)
 
         checkpoint_step = None
+        if checkpoint_coordinator is not None and checkpoint_coordinator.resume_step:
+            checkpoint_step = checkpoint_coordinator.resume_step
         if config.ckpt and config.ckpt.resume_step is not None and ckpt_manager is not None:
             if config.ckpt.resume_step == -1:
                 checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
@@ -445,9 +447,17 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
         # Reset weights to base model if starting from scratch
         progress = Progress()
 
-        if checkpoint_step is not None and ckpt_manager is not None:
-            ckpt_manager.load(progress, buffer, step=checkpoint_step)
-            buffer.replay_wal()
+        if checkpoint_step is not None and (ckpt_manager is not None or checkpoint_coordinator is not None):
+            if checkpoint_coordinator is not None:
+                runtime = checkpoint_coordinator.load_orchestrator(progress, buffer)
+                scheduler.step = progress.step
+                scheduler.next_group_id = runtime["next_group_id"]
+                for name, value in runtime["depth_state"].items():
+                    if name.startswith("_"):
+                        setattr(depth_controller, name, value)
+            else:
+                ckpt_manager.load(progress, buffer, step=checkpoint_step)
+                buffer.replay_wal()
             logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
             scheduler.ckpt_step = progress.step  # Always resume from the latest checkpoint
             if config.eval and config.eval.skip_eval_on_resume:
@@ -936,6 +946,9 @@ async def orchestrate(config: GRPOOrchestratorConfig, *, inference_pool=None, in
 
             # Increment step
             progress.step += 1
+            if checkpoint_coordinator is not None:
+                checkpoint_coordinator.save_orchestrator(progress, buffer, next_group_id=scheduler.next_group_id,
+                                                         depth_state=vars(depth_controller).copy())
             is_first_step = False
 
             event_loop_lag_monitor.reset()

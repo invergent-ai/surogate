@@ -21,7 +21,7 @@ DEFAULTS = dict(
 )
 
 
-@pytest.mark.parametrize("vocabulary", [7, 257, 32771])
+@pytest.mark.parametrize("vocabulary", [7, 257, 32771, 131075])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_gpu_sampling_matches_cpu_constraints_and_unfiltered_policy_scores(vocabulary, dtype):
     from surogate import _surogate as ext
@@ -125,3 +125,19 @@ def test_invalid_sampling_parameters_are_rejected(invalid):
         ext._decode_sample(
             torch.zeros((1, 7), device="cuda"), torch.zeros((1, 7), device="cuda", dtype=torch.int32), [invalid]
         )
+
+
+@pytest.mark.parametrize("top_k,top_p", [(-1, 1.0), (-1, 0.5), (17, 0.75)])
+def test_large_uniform_vocabulary_preserves_ties_and_cdf_endpoints(top_k, top_p):
+    from surogate import _surogate as ext
+
+    vocabulary = 131075
+    logits = torch.zeros(3, vocabulary, device="cuda", dtype=torch.bfloat16)
+    counts = torch.zeros_like(logits, dtype=torch.int32)
+    uniforms = [0.0, 0.37, np.nextafter(1.0, 0.0)]
+    requests = [dict(top_k=top_k, top_p=top_p, uniform=u) for u in uniforms]
+    results = ext._decode_sample(logits, counts, requests)
+    kept = int(np.ceil((vocabulary if top_k < 0 else top_k) * top_p))
+    assert [r["token"] for r in results] == [0, int(0.37 * kept), kept - 1]
+    assert all(r["status"] == 0 for r in results)
+    np.testing.assert_allclose([r["logprob"] for r in results], -np.log(vocabulary), atol=1e-10, rtol=0)

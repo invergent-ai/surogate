@@ -4535,7 +4535,9 @@ void mamba_causal_conv1d_forward(Tensor& out,
                                  int conv_dim,
                                  int kernel,
                                  bool silu,
-                                 cudaStream_t stream);
+                                 cudaStream_t stream,
+                                 const int* cu_seqlens = nullptr,
+                                 int num_docs = 0);
 void mamba_causal_conv1d_backward(Tensor& dx,
                                   Tensor& dweight_fp32,
                                   Tensor* dbias_fp32,
@@ -4547,7 +4549,9 @@ void mamba_causal_conv1d_backward(Tensor& dx,
                                   int conv_dim,
                                   int kernel,
                                   bool silu,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream,
+                                  const int* cu_seqlens = nullptr,
+                                  int num_docs = 0);
 
 // Selective scan wrappers (Mamba2).
 void mamba_selective_scan_forward(Tensor& out,

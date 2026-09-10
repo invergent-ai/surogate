@@ -70,7 +70,9 @@ class SharedModelServer:
         self.condition = threading.Condition()
         self.compute_lock = threading.Lock()
         self.sleeping, self.closed, self.active = True, False, 0
-        self.version, self.adapter = -1, None
+        self.version, self.adapter = int(settings.get("initial_policy_version", -1)), None
+        if self.version < -1:
+            raise ValueError("initial_policy_version must be at least -1")
         # Check residency once and count unique underlying allocations, including
         # tied embedding/head aliases. The trainer owns every allocation.
         base = [torch.from_dlpack(t) for t in trainer.get_shared_base_weights().values()]
@@ -311,11 +313,14 @@ class SharedModelServer:
     def generate(self, request, callback=None):
         if self.scheduler:
             session = self.scheduler.new_session()
+            completed = False
             try:
-                return self._generate(request, callback,
+                result = self._generate(request, callback,
                     lambda tokens, reset, sampling=None: self.scheduler.step(session, tokens, reset, sampling))
+                completed = True
+                return result
             finally:
-                self.scheduler.release(session)
+                self.scheduler.release(session, cache=completed)
         # One workspace serves all admitted requests; begin_training waits for
         # both the running request and admitted requests waiting on this lock.
         with self.compute_lock:
