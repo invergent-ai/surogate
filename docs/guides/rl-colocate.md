@@ -39,17 +39,28 @@ The shared training executor also bounds context by the trainer's sequence lengt
 On the shared training path, `decode_cache_bytes` in `infer.yaml` sets a hard byte
 budget for cache pages, page tables, recurrent/convolution states, and sampling
 token counts. The default `0` chooses 25% of free VRAM after the trainer is
-allocated. Model weights, activation arenas and sampling scratch are outside this
-cache budget. Admission checks each request before advancing its history; a
-request that cannot fit receives a capacity error while other requests continue.
-Non-streaming HTTP requests receive status 429. Release or retry the rejected
-request after capacity becomes available. There is no cache eviction, preemption,
+allocated. `decode_memory_bytes` separately bounds cache storage plus decode
+activation arenas, extra temporary stacks, sampler scratch, and batch metadata.
+Its default `0` selects 80% of free VRAM after trainer allocation. The trainer's
+resident weights and existing execution buffers are outside this incremental
+budget. It includes 64 MiB of reserved headroom for CUDA graph executables and
+library allocations whose exact size cannot be queried in advance.
+
+Admission reserves execution workspaces before advancing request histories. It
+evicts unused decode shapes under memory pressure and splits execution into
+smaller batches when a larger shape cannot fit. A request that cannot fit receives
+a capacity error while other requests continue.
+Non-streaming HTTP requests receive status 429. A stream that has already started
+receives a JSON `error` event with a status code, followed by `[DONE]`.
+Release or retry the rejected request after capacity becomes available.
+There is no cache eviction, preemption,
 CPU spill, prefix sharing, or sliding-window page recycling.
 
 `trainer.get_decode_batch_stats()` reports active sessions, cached tokens, pages,
-allocated/in-use pool bytes, auxiliary bytes, the cache budget, page reuse, and
-decode shape compilation/capture/replay counts. The server summary reports batch sizes
-and decode rounds. Low-level callers use `decode_batch_logits(session_ids,
+allocated/in-use pool bytes, auxiliary bytes, both budgets, workspace and headroom
+reservations, page reuse, batch splits, and decode shape eviction/compilation/capture/replay
+counts. The server summary reports batch sizes and decode rounds.
+Low-level callers use `decode_batch_logits(session_ids,
 input_ids, offsets, reset)` with flattened token chunks and one reset flag per
 session, then `release_decode_sessions(session_ids)` when requests finish.
 `decode_logits` and `get_decode_cache_stats` remain available for single-session
@@ -59,6 +70,10 @@ batch/chunk shapes in an LRU cache with separate activation arenas. With
 `use_cuda_graphs: true`, one-token shapes warm up, then capture and replay stateless
 segments. Attention, recurrent state updates, dynamic MoE operations and the final
 generation head run eagerly. Training's captured graphs retain their buffers.
+Convolution, recurrent state updates, the GLM indexer and the vocabulary projection
+process batches together. GLM reconstructs selected latents in tiles of up to
+eight queries, preserving its BF16/LoRA arithmetic and attention reduction order.
+Decode does not allocate the training-only 256 MiB backward replay arena per shape.
 
 The HTTP server samples on GPU and transfers only selected tokens and requested
 log-probabilities. Temperature, top-k/top-p/min-p, repetition/presence/frequency
@@ -171,6 +186,7 @@ orchestrator to the local server and sets synchronous generation automatically.
 
 Reduce `max_num_seqs` to lower serving concurrency and memory use. On the shared
 training path, `decode_cache_bytes` also caps persistent request cache storage.
+Use `decode_memory_bytes` to cap that storage together with decode workspaces.
 Reduce `sequence_len` and `max_model_len` together to lower memory use. Set `sequence_len` in both the
 training and orchestrator configs. Keep enough generation tokens for the model
 to finish its answer and receive a useful reward.

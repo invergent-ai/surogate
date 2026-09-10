@@ -10,6 +10,7 @@ import pytest
 import requests
 import torch
 
+from surogate.grpo.decode_scheduler import DecodeCapacityError
 from surogate.grpo.shared_model import SharedModelServer, shared_execution
 from tests.grpo.shared_model_configs import configurations
 
@@ -78,6 +79,45 @@ def service():
     url = f"http://127.0.0.1:{server.http.server_port}"
     yield server, trainer, url
     server.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("fail_after", [0, 1])
+@pytest.mark.parametrize("error,status,error_type", [
+    (DecodeCapacityError("decode workspace is full"), 429, "capacity_error"),
+    (RuntimeError("execution failed"), 500, "server_error"),
+])
+def test_generation_errors_are_reported_and_release_admission(service, stream, fail_after, error, status, error_type):
+    server, trainer, url = service
+    server.publish("policy", [], 0)
+    original = trainer.next_token_logits
+    calls = 0
+
+    def fail(*args):
+        nonlocal calls
+        calls += 1
+        if calls > fail_after:
+            raise error
+        return original(*args)
+
+    trainer.next_token_logits = fail
+    body = dict(model="policy", tokens=[0, 2], temperature=0, max_tokens=3, stream=stream)
+    endpoint = url + "/v1/chat/completions/tokens"
+    response = requests.post(endpoint, json=body, timeout=10)
+    if stream:
+        assert response.status_code == 200
+        events = [line[6:] for line in response.text.splitlines() if line.startswith("data: ")]
+        assert events[-1] == "[DONE]"
+        payload = json.loads(events[-2])
+        assert all(choice.get("finish_reason") is None
+                   for event in events[:-2] for choice in json.loads(event).get("choices", []))
+    else:
+        assert response.status_code == status
+        payload = response.json()
+    assert payload == {"error": {"message": str(error), "type": error_type, "code": status}}
+    assert server.active == 0
+    trainer.next_token_logits = original
+    assert requests.post(endpoint, json=body | dict(stream=False), timeout=10).status_code == 200
 
 
 def test_http_tokens_sampling_and_publication(service):

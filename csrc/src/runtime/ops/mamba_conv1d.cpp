@@ -65,49 +65,13 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
 
     if (mExecutionRequest && mExecutionRequest->decoding() && kernel > 1) {
         const int tail = kernel - 1;
-        const auto es = get_dtype_size(x.DType);
         const auto stream = mRunState.MainStream;
-        auto extended = mRunState.temp_alloc(x.DType, {1, conv_dim, T + tail}, "decode_conv_input");
-        auto computed = mRunState.temp_alloc(x.DType, {1, conv_dim, T + tail}, "decode_conv_output");
-        for (int row = 0; row < B; ++row) {
-            auto* state = mExecutionRequest->decode_state(row);
-            auto history = state->get(op_layer_idx(op), "convolution", x.DType, {conv_dim, tail});
-            if (!state->length) fill_zero(history, stream);
-            auto input = decode_batch_row(x, row), output = decode_batch_row(out_val, row);
-            CUDA_CHECK(cudaMemcpy2DAsync(extended.Data,
-                                         (T + tail) * es,
-                                         history.Data,
-                                         tail * es,
-                                         tail * es,
-                                         conv_dim,
-                                         cudaMemcpyDeviceToDevice,
-                                         stream));
-            CUDA_CHECK(cudaMemcpy2DAsync(extended.Data + tail * es,
-                                         (T + tail) * es,
-                                         input.Data,
-                                         T * es,
-                                         T * es,
-                                         conv_dim,
-                                         cudaMemcpyDeviceToDevice,
-                                         stream));
-            mamba_causal_conv1d_forward(computed, extended, weight, bias, 1, T + tail, conv_dim, kernel, silu, stream);
-            CUDA_CHECK(cudaMemcpy2DAsync(output.Data,
-                                         T * es,
-                                         computed.Data + tail * es,
-                                         (T + tail) * es,
-                                         T * es,
-                                         conv_dim,
-                                         cudaMemcpyDeviceToDevice,
-                                         stream));
-            CUDA_CHECK(cudaMemcpy2DAsync(history.Data,
-                                         tail * es,
-                                         extended.Data + T * es,
-                                         (T + tail) * es,
-                                         tail * es,
-                                         conv_dim,
-                                         cudaMemcpyDeviceToDevice,
-                                         stream));
-        }
+        const auto& bindings = mExecutionRequest->decode_binding(op_layer_idx(op), "convolution");
+        auto extended = mRunState.temp_alloc(x.DType, {B, conv_dim, T + tail}, "decode_conv_input");
+        auto computed = mRunState.temp_alloc(x.DType, {B, conv_dim, T + tail}, "decode_conv_output");
+        decode_conv_input(x, bindings, extended, tail, stream);
+        mamba_causal_conv1d_forward(computed, extended, weight, bias, B, T + tail, conv_dim, kernel, silu, stream);
+        decode_conv_output(computed, extended, bindings, out_val, tail, stream);
         mRunState.Stack.free(computed);
         mRunState.Stack.free(extended);
         store_tensor(op.outputs[0], out_val);

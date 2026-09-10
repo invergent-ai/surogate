@@ -3890,7 +3890,7 @@ void cuda_malloc_or_die(std::byte** out, std::size_t bytes, const char* label) {
         std::ostringstream oss;
         oss << "allocate_phase_arenas: cudaMalloc(" << bytes << ") for " << label
             << " failed: " << cudaGetErrorString(err);
-        throw std::runtime_error(oss.str());
+        throw cuda_error(err, oss.str());
     }
 }
 
@@ -3898,19 +3898,28 @@ void cuda_malloc_or_die(std::byte** out, std::size_t bytes, const char* label) {
 
 void allocate_phase_arenas(PhaseArenas& arenas) {
     if (arenas.allocated) return;
-    cuda_malloc_or_die(&arenas.persistent_ptr, arenas.persistent_bytes, "persistent");
-    cuda_malloc_or_die(&arenas.persistent_activation_ptr, arenas.persistent_activation_bytes, "persistent_activation");
-    cuda_malloc_or_die(&arenas.model_scope_persistent_ptr,
-                       arenas.model_scope_persistent_bytes,
-                       "model_scope_persistent");
-    cuda_malloc_or_die(&arenas.accumulator_ptr, arenas.accumulator_bytes, "accumulator");
-    cuda_malloc_or_die(&arenas.fwd_stack_ptr, arenas.fwd_stack_bytes, "fwd_stack");
-    cuda_malloc_or_die(&arenas.bwd_stack_ptr, arenas.bwd_stack_bytes, "bwd_stack");
-    cuda_malloc_or_die(&arenas.save_for_bwd_ptr, arenas.save_for_bwd_bytes, "save_for_bwd");
-    cuda_malloc_or_die(&arenas.unified_stack_ptr, arenas.unified_stack_bytes, "unified_stack");
-    cuda_malloc_or_die(&arenas.bwd_cross_layer_ptr, arenas.bwd_cross_layer_bytes, "bwd_cross_layer");
-    cuda_malloc_or_die(&arenas.moe_saved_ptr, arenas.moe_saved_bytes, "moe_saved");
+    // Mark partial ownership too: an OOM must release every earlier allocation.
     arenas.allocated = true;
+    try {
+        cuda_malloc_or_die(&arenas.persistent_ptr, arenas.persistent_bytes, "persistent");
+        cuda_malloc_or_die(&arenas.persistent_activation_ptr,
+                           arenas.persistent_activation_bytes,
+                           "persistent_activation");
+        cuda_malloc_or_die(&arenas.model_scope_persistent_ptr,
+                           arenas.model_scope_persistent_bytes,
+                           "model_scope_persistent");
+        cuda_malloc_or_die(&arenas.accumulator_ptr, arenas.accumulator_bytes, "accumulator");
+        cuda_malloc_or_die(&arenas.fwd_stack_ptr, arenas.fwd_stack_bytes, "fwd_stack");
+        cuda_malloc_or_die(&arenas.bwd_stack_ptr, arenas.bwd_stack_bytes, "bwd_stack");
+        cuda_malloc_or_die(&arenas.save_for_bwd_ptr, arenas.save_for_bwd_bytes, "save_for_bwd");
+        cuda_malloc_or_die(&arenas.unified_stack_ptr, arenas.unified_stack_bytes, "unified_stack");
+        cuda_malloc_or_die(&arenas.bwd_cross_layer_ptr, arenas.bwd_cross_layer_bytes, "bwd_cross_layer");
+        cuda_malloc_or_die(&arenas.moe_saved_ptr, arenas.moe_saved_bytes, "moe_saved");
+        arenas.allocated = true;
+    } catch (...) {
+        release_phase_arenas(arenas);
+        throw;
+    }
 
     if (const char* env = std::getenv("SUROGATE_DEBUG_LAYOUT")) {
         if (std::string(env) == "1") {

@@ -8,6 +8,7 @@
 #include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/compiled_ops.h"
 #include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/op_registry.h"
 #include "runtime/executor/glm_decode_state.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
@@ -395,18 +396,191 @@ std::vector<DecodeCacheSpec> GraphExecutor::decode_cache_specs() const {
 struct GraphExecutor::DecodeVariant {
     long batch = 0, sequence = 0;
     std::uint64_t last_use = 0, calls = 0;
+    std::shared_ptr<DecodePagePool> pool;
+    std::size_t reserved_bytes = 0;
     PhaseArenas arenas;
     std::unique_ptr<CompiledGraph> graph;
     std::unique_ptr<CompiledExecutor> executor;
     ~DecodeVariant() {
         executor.reset();  // Destroy captures before their storage.
         dsl::release_phase_arenas(arenas);
+        if (pool) pool->workspace_bytes -= reserved_bytes;
     }
 };
+
+void GraphExecutor::prepare_decode(long B, long T, int capacity, const std::shared_ptr<DecodePagePool>& pool) {
+    mDecodeBudget = pool;
+    prepare_decode_variant(B, T, capacity);
+}
+
+bool GraphExecutor::evict_decode_workspace() {
+    if (mDecodeVariants.empty()) return false;
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+    auto oldest = std::min_element(mDecodeVariants.begin(), mDecodeVariants.end(), [](const auto& a, const auto& b) {
+        return a->last_use < b->last_use;
+    });
+    mDecodeVariants.erase(oldest);
+    ++mDecodeEvictions;
+    return true;
+}
+
+GraphExecutor::DecodeVariant& GraphExecutor::prepare_decode_variant(long B, long T, int capacity) {
+    auto& rs = mRunState;
+    if (!mDecodeCompiler)
+        mDecodeCompiler = std::make_unique<GraphCompiler>(mModule, mConfig, mOptions, mWeights, mGrads);
+    DecodeVariant* variant = nullptr;
+    for (auto& entry : mDecodeVariants)
+        if (entry->batch == B && entry->sequence == T) variant = entry.get();
+    if (!variant) {
+        // Bound activation/capture memory even when prompts use many shapes.
+        constexpr std::size_t max_variants = 8;
+        if (mDecodeVariants.size() == max_variants) {
+            evict_decode_workspace();
+        }
+        auto entry = std::make_unique<DecodeVariant>();
+        entry->batch = B;
+        entry->sequence = T;
+        mDecodeCompiler->reset_tid_namespace();
+        entry->graph = std::make_unique<CompiledGraph>(mDecodeCompiler->compile(*mForward, B, T, false));
+        auto& graph = *entry->graph;
+        CompiledGraph no_backward;
+        finalize_save_for_bwd(graph, no_backward, std::unordered_set<std::string>{}, false);
+        graph.compute_layer_segments(true);
+        dsl::compute_arena_sizes(entry->arenas, graph, no_backward, mConfig.NumLayers);
+        entry->arenas.persistent_bytes = entry->arenas.accumulator_bytes = 0;
+        // The trainer already owns its temporary stack. Reuse it when it
+        // covers this shape; otherwise allocate a decode-owned stack before
+        // any request executes. Size history-dependent work at full capacity
+        // so captured stack addresses never need to change as pages grow.
+        // Forward groups have different operand layouts from backward groups.
+        // Conservatively sum their live outputs and registered operator scratch
+        // per layer; clamp private MLP intermediates to their actual tile rows.
+        long peak = 0, live = 0;
+        for (std::size_t index = 0; index < graph.ops.size(); ++index) {
+            const auto& op = graph.ops[index];
+            const MlpTileGroup* tile = nullptr;
+            for (const auto& group : graph.mlp_tile_groups)
+                if (index >= group.start_op_idx && index <= group.end_op_idx) tile = &group;
+            for (const auto& ref : op.outputs) {
+                if (ref.shape.empty()) continue;
+                long elements = 1;
+                for (long d : ref.shape)
+                    elements *= d;
+                if (tile && graph.mlp_tile_internal_tids.count(ref.tensor_id)) {
+                    const long rows =
+                        std::min(B * T * (tile->grouped_experts ? rs.buffer_plan().TopK : 1), rs.buffer_plan().C);
+                    elements = std::min(elements, rows * ref.shape.back());
+                }
+                // Tiled expert dispatch also uses conversion/LoRA temporaries.
+                live += align_stack_bytes(elements * get_dtype_size(ref.dtype)) * (tile ? 4 : 1);
+            }
+            if (!tile)
+                if (const auto* desc = OpRegistry::instance().find(op.type); desc && desc->stack_bound_fn)
+                    live += desc->stack_bound_fn(op, rs.buffer_plan());
+            peak = std::max(peak, live);
+            if (op.layer_end >= 0) live = 0;
+        }
+        long scratch = 0;
+        for (const auto& op : graph.ops) {
+            auto aligned = [](long n) {
+                return align_stack_bytes(n);
+            };
+            if (op.type == CompiledOpType::FlashAttention) {
+                auto qkv = Tensor::from_pointer(nullptr, 0, ETensorDType::BF16, op.inputs[0].shape);
+                int hq = mConfig.NumQueryHeads, hk = mConfig.NumKeyValHeads;
+                int d = derive_head_size(qkv, hq, hk, mConfig.head_size());
+                resolve_attn_head_dims(rs.runtime_config(), op_layer_idx(op), qkv, hq, hk, d);
+                scratch =
+                    std::max(scratch,
+                             aligned(B * T * hq * ((capacity + DecodePageRows - 1) / DecodePageRows) * (d + 2) * 4));
+            } else if (op.type == CompiledOpType::GlmDsaIndexer) {
+                const auto& shape = op.inputs[0].shape;
+                long p = op.inputs[6].shape[0];
+                scratch = std::max(scratch,
+                                   aligned(GlmDsaKernels::indexer_workspace_bytes(B,
+                                                                                  T,
+                                                                                  capacity,
+                                                                                  shape[3],
+                                                                                  p,
+                                                                                  op.outputs[0].shape[2] / p)));
+            } else if (op.type == CompiledOpType::GlmDsaAttention) {
+                const auto& shape = op.inputs[0].shape;
+                const long hd = shape[2] / 3 * shape[3], rank = op.inputs[3].shape[1];
+                const long slots =
+                    std::min<long>(B * T, GlmDsaKernels::DecodeQueryTile) * std::max<long>(1, op.inputs[1].shape[2]);
+                scratch = std::max(scratch,
+                                   aligned(slots * rank * 2) + aligned(slots * 2 * hd * 2) + aligned(128 * 2 * hd * 2) +
+                                       aligned(slots * 4) + aligned(B * T * shape[2] / 3 * 4));
+            } else if (op.type == CompiledOpType::KimiDeltaRule) {
+                const auto& shape = op.inputs[0].shape;
+                scratch = std::max(scratch, aligned(B * shape[2] * shape[3] * shape[3] * 4));
+            } else if (op.type == CompiledOpType::MambaConv1d) {
+                const auto& shape = op.inputs[0].shape;
+                scratch = std::max(scratch, 2 * aligned(B * shape[1] * (T + op.inputs[1].shape[1] - 1) * 2));
+            } else if (op.type == CompiledOpType::FusedLMHeadLoss) {
+                scratch = std::max(scratch,
+                                   aligned(B * mConfig.VocabSize * 4) + aligned(B * op.inputs[1].shape[1] * 4) +
+                                       aligned(B * 4));
+            }
+        }
+        peak += scratch + (1 << 20);
+        if (peak > rs.Stack.capacity()) entry->arenas.unified_stack_bytes = peak;
+        auto& arenas = entry->arenas;
+        const auto bytes = arenas.persistent_activation_bytes + arenas.model_scope_persistent_bytes +
+                           arenas.fwd_stack_bytes + arenas.bwd_stack_bytes + arenas.save_for_bwd_bytes +
+                           arenas.unified_stack_bytes + arenas.bwd_cross_layer_bytes + arenas.moe_saved_bytes;
+        entry->pool = mDecodeBudget;
+        if (entry->pool) {
+            while (true) {
+                try {
+                    entry->pool->charge_workspace(bytes);
+                    break;
+                } catch (const DecodeCapacityError&) {
+                    if (!evict_decode_workspace()) throw;
+                }
+            }
+            entry->reserved_bytes = bytes;
+        }
+        while (true) {
+            try {
+                dsl::allocate_phase_arenas(arenas);
+                break;
+            } catch (const cuda_error& error) {
+                if (error.code != cudaErrorMemoryAllocation || !evict_decode_workspace()) throw;
+                cudaGetLastError();
+            }
+        }
+        entry->executor = std::make_unique<CompiledExecutor>(rs, mWeights, mGrads, mConfig, mOptions);
+        auto* executor = entry->executor.get();
+        executor->set_schema_hook_registry(mSchemaHookRegistry);
+        if (mOptions.TrainingRecipe) executor->set_recipe(mOptions.TrainingRecipe.get());
+        executor->resize_segment_graphs(graph, no_backward);
+        auto dump_decode = [this, executor](const std::vector<std::string>& names, int layer) {
+            const char* dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+            if (!dir || !*dir) return;
+            const std::string prefix = "blocks[" + std::to_string(layer) + "].";
+            for (const auto& name : names) {
+                if (layer >= 0 && name.rfind(prefix, 0) != 0) continue;
+                if (const Tensor* t = executor->try_get_tensor(name); t && t->Data) {
+                    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                    debug_dump_tensor("decode_" + name, *t, dir, mRunState.MainStream);
+                }
+            }
+        };
+        executor->set_debug_dump_fn(dump_decode);
+        executor->set_debug_dump_layer_fn([dump_decode](int layer) { dump_decode(debug_dump_tensor_list(), layer); });
+        variant = entry.get();
+        mDecodeVariants.push_back(std::move(entry));
+        ++mDecodeCompilations;
+    }
+    variant->last_use = ++mDecodeClock;
+    return *variant;
+}
 
 std::unordered_map<std::string, std::int64_t> GraphExecutor::decode_execution_stats() const {
     std::unordered_map<std::string, std::int64_t> stats{{"compiled_decode_shapes", mDecodeCompilations},
                                                         {"resident_decode_shapes", mDecodeVariants.size()},
+                                                        {"decode_shape_evictions", mDecodeEvictions},
                                                         {"decode_graph_captures", 0},
                                                         {"decode_graph_replays", 0}};
     for (const auto& variant : mDecodeVariants) {
@@ -1721,58 +1895,7 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
                              rs.MainStream);
         if (!request.disable_forward_saves || !request.generation_positions_cpu)
             throw std::runtime_error("Decode requires forward-only generation requests");
-        if (!mDecodeCompiler)
-            mDecodeCompiler = std::make_unique<GraphCompiler>(mModule, mConfig, mOptions, mWeights, mGrads);
-        DecodeVariant* variant = nullptr;
-        for (auto& entry : mDecodeVariants)
-            if (entry->batch == request.batch && entry->sequence == request.sequence) variant = entry.get();
-        if (!variant) {
-            // Bound activation/capture memory even when prompts use many shapes.
-            constexpr std::size_t max_variants = 8;
-            if (mDecodeVariants.size() == max_variants) {
-                CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-                auto oldest = std::min_element(mDecodeVariants.begin(),
-                                               mDecodeVariants.end(),
-                                               [](const auto& a, const auto& b) { return a->last_use < b->last_use; });
-                mDecodeVariants.erase(oldest);
-            }
-            auto entry = std::make_unique<DecodeVariant>();
-            entry->batch = request.batch;
-            entry->sequence = request.sequence;
-            mDecodeCompiler->reset_tid_namespace();
-            entry->graph = std::make_unique<CompiledGraph>(
-                mDecodeCompiler->compile(*mForward, request.batch, request.sequence, false));
-            auto& graph = *entry->graph;
-            CompiledGraph no_backward;
-            finalize_save_for_bwd(graph, no_backward, std::unordered_set<std::string>{}, false);
-            graph.compute_layer_segments(true);
-            dsl::compute_arena_sizes(entry->arenas, graph, no_backward, mConfig.NumLayers);
-            entry->arenas.persistent_bytes = entry->arenas.accumulator_bytes = 0;
-            dsl::allocate_phase_arenas(entry->arenas);
-            entry->executor = std::make_unique<CompiledExecutor>(rs, mWeights, mGrads, mConfig, mOptions);
-            auto* executor = entry->executor.get();
-            executor->set_schema_hook_registry(mSchemaHookRegistry);
-            if (mOptions.TrainingRecipe) executor->set_recipe(mOptions.TrainingRecipe.get());
-            executor->resize_segment_graphs(graph, no_backward);
-            auto dump_decode = [this, executor](const std::vector<std::string>& names, int layer) {
-                const char* dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
-                if (!dir || !*dir) return;
-                const std::string prefix = "blocks[" + std::to_string(layer) + "].";
-                for (const auto& name : names) {
-                    if (layer >= 0 && name.rfind(prefix, 0) != 0) continue;
-                    if (const Tensor* t = executor->try_get_tensor(name); t && t->Data) {
-                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                        debug_dump_tensor("decode_" + name, *t, dir, mRunState.MainStream);
-                    }
-                }
-            };
-            executor->set_debug_dump_fn(dump_decode);
-            executor->set_debug_dump_layer_fn(
-                [dump_decode](int layer) { dump_decode(debug_dump_tensor_list(), layer); });
-            variant = entry.get();
-            mDecodeVariants.push_back(std::move(entry));
-            ++mDecodeCompilations;
-        }
+        auto* variant = &prepare_decode_variant(request.batch, request.sequence, request.decode_state(0)->limit);
         variant->last_use = ++mDecodeClock;
         auto& graph = variant->graph;
         auto& arenas = variant->arenas;
@@ -1788,12 +1911,19 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
         // including storage referenced by captured training graphs. Decode uses
         // its own forward activation arena and the resident weight owners.
         static const std::vector<std::string> no_saves;
+        std::optional<DeviceMemoryStack> training_stack;
+        if (arenas.unified_stack_ptr) {
+            training_stack.emplace(std::move(rs.Stack));
+            rs.Stack =
+                DeviceMemoryStack(arenas.unified_stack_ptr, arenas.unified_stack_bytes, training_stack->device_id());
+        }
         auto checkpoint = rs.Stack.checkpoint();
         auto cleanup = [&]() {
             executor->set_execution_request_context(nullptr);
             executor->set_runtime_bindings(nullptr);
             rs.set_active_executor(nullptr);
             rs.Stack.restore(checkpoint);
+            if (training_stack) rs.Stack = std::move(*training_stack);
         };
         executor->set_lora_state(mLoRAConfig, mLoRAWeights, mLoRAGrads, mLoRARunState);
         executor->set_dimensions(request.batch, request.sequence);

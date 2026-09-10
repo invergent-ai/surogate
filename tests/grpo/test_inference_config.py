@@ -55,3 +55,10 @@ def test_shared_decode_cache_budget_defaults_and_validation():
     assert GRPOInferenceConfig(DictDefault({"model": "m", "decode_cache_bytes": 1 << 30})).decode_cache_bytes == 1 << 30
     with pytest.raises(ValueError, match="nonnegative"):
         GRPOInferenceConfig(DictDefault({"model": "m", "decode_cache_bytes": -1}))
+
+
+def test_shared_decode_memory_budget_defaults_and_validation():
+    assert GRPOInferenceConfig(DictDefault({"model": "m"})).decode_memory_bytes == 0
+    assert GRPOInferenceConfig(DictDefault({"model": "m", "decode_memory_bytes": 1 << 30})).decode_memory_bytes == 1 << 30
+    with pytest.raises(ValueError, match="nonnegative"):
+        GRPOInferenceConfig(DictDefault({"model": "m", "decode_memory_bytes": -1}))

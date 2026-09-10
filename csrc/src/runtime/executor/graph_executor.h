@@ -79,6 +79,12 @@ public:
     virtual std::unordered_map<std::string, std::int64_t> decode_execution_stats() const {
         return {};
     }
+    virtual void prepare_decode(long B, long T, int capacity, const std::shared_ptr<DecodePagePool>& pool) {
+        throw std::runtime_error("This execution topology does not support decode workspace admission");
+    }
+    virtual bool evict_decode_workspace() {
+        return false;
+    }
 
     virtual ExecutionResult execute_forward(const ExecutionRequest& request, NCCLCommunicator& comm) = 0;
     virtual ExecutionResult execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) = 0;
@@ -205,6 +211,8 @@ public:
     ~GraphExecutor() override;
     std::vector<DecodeCacheSpec> decode_cache_specs() const override;
     std::unordered_map<std::string, std::int64_t> decode_execution_stats() const override;
+    void prepare_decode(long B, long T, int capacity, const std::shared_ptr<DecodePagePool>& pool) override;
+    bool evict_decode_workspace() override;
 
     void set_lora_state(const modules::ModularLoRAConfig* config,
                         modules::ModularLoRAWeightsManager* weights,
@@ -491,10 +499,13 @@ private:
     // Bounded shape cache: each variant owns its executor, captures and arenas.
     // No decode compilation can replace storage held by training graphs.
     struct DecodeVariant;
+    DecodeVariant& prepare_decode_variant(long B, long T, int capacity);
+    std::shared_ptr<DecodePagePool> mDecodeBudget;
     std::unique_ptr<GraphCompiler> mDecodeCompiler;
     std::vector<std::unique_ptr<DecodeVariant>> mDecodeVariants;
     std::uint64_t mDecodeClock = 0;
     std::int64_t mDecodeCompilations = 0;
+    std::int64_t mDecodeEvictions = 0;
     std::unique_ptr<CompiledGraph> mCompiledForward;
     std::unique_ptr<CompiledGraph> mCompiledBackward;
     long mCompiledB = 0;

@@ -86,6 +86,8 @@ class SharedModelServer:
         self.scheduler = None
         if hasattr(trainer, "set_decode_cache_budget"):
             trainer.set_decode_cache_budget(settings.get("decode_cache_bytes", 0))
+        if hasattr(trainer, "set_decode_memory_budget"):
+            trainer.set_decode_memory_budget(settings.get("decode_memory_bytes", 0))
         if hasattr(trainer, "decode_batch_logits"):
             self.scheduler = DecodeScheduler(
                 trainer, max_batch=self.capacity,
@@ -165,9 +167,18 @@ class SharedModelServer:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 except Exception as exc:
-                    if not started:
-                        status = 429 if isinstance(exc, (Busy, DecodeCapacityError)) else 400 if isinstance(exc, (ValueError, TypeError, KeyError)) else 500
-                        self.send_json(status, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+                    status = 429 if isinstance(exc, (Busy, DecodeCapacityError)) else 400 if isinstance(exc, (ValueError, TypeError, KeyError)) else 500
+                    error_type = {429: "capacity_error", 400: "invalid_request_error", 500: "server_error"}[status]
+                    error = {"error": {"message": str(exc), "type": error_type, "code": status}}
+                    try:
+                        if started:
+                            callback(error)
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                        else:
+                            self.send_json(status, error)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
 
         self.http = ThreadingHTTPServer((settings["host"], settings["port"]), Handler)
         self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)

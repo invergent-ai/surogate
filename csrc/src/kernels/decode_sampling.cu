@@ -249,11 +249,18 @@ void DecodeSampler::reserve(Tensor& tensor, ETensorDType dtype, long elements, c
     tensor = mAllocator.allocate(dtype, name, EAllocationType::ON_DEVICE, {elements});
 }
 
+void DecodeSampler::release_workspace() {
+    for (auto* tensor : {&mLogits, &mValues, &mSorted, &mProbabilities, &mIndices, &mSortedIndices,
+                         &mOffsets, &mParams, &mBias, &mResults, &mSort})
+        mAllocator.free(*tensor);
+}
+
 void DecodeSampler::prepare(const DecodeSamplingRequest* requests,
                             int B,
                             int V,
                             ETensorDType dtype,
-                            cudaStream_t stream) {
+                            cudaStream_t stream,
+                            bool upload) {
     if (B <= 0 || V <= 0 || static_cast<long>(B) * V > std::numeric_limits<int>::max())
         throw std::invalid_argument("Invalid GPU sampling dimensions");
     mB = B;
@@ -286,12 +293,12 @@ void DecodeSampler::prepare(const DecodeSamplingRequest* requests,
             std::max<std::size_t>(1, mHostBias.size()) * sizeof(DecodeLogitBias),
             "decode_sample_bias");
     reserve(mResults, ETensorDType::BYTE, B * sizeof(DecodeSampleResult), "decode_sample_results");
-    CUDA_CHECK(cudaMemcpyAsync(mParams.Data,
+    if (upload) CUDA_CHECK(cudaMemcpyAsync(mParams.Data,
                                mHostParams.data(),
                                B * sizeof(DecodeSamplingParams),
                                cudaMemcpyHostToDevice,
                                stream));
-    if (!mHostBias.empty())
+    if (upload && !mHostBias.empty())
         CUDA_CHECK(cudaMemcpyAsync(mBias.Data,
                                    mHostBias.data(),
                                    mHostBias.size() * sizeof(DecodeLogitBias),

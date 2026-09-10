@@ -25,12 +25,41 @@ struct DecodePagePool {
     std::unordered_map<std::size_t, std::vector<Tensor>> free;
     std::int64_t allocated_bytes = 0, used_bytes = 0, reused_pages = 0;
     std::int64_t auxiliary_bytes = 0, limit_bytes = 0;
+    std::int64_t workspace_bytes = 0, memory_limit_bytes = 0;
+    std::int64_t execution_headroom_bytes = 0;
+
+    std::int64_t memory_bytes() const {
+        return allocated_bytes + auxiliary_bytes + workspace_bytes + execution_headroom_bytes;
+    }
+    void set_memory_limit(std::int64_t bytes) {
+        if (bytes < 0 || (bytes && bytes < used_bytes + auxiliary_bytes + workspace_bytes + execution_headroom_bytes))
+            throw std::invalid_argument("Decode memory budget is below live cache and workspace storage");
+        trim();
+        memory_limit_bytes = bytes;
+    }
+    void make_memory_room(std::size_t bytes) {
+        if (memory_limit_bytes && memory_bytes() + bytes > memory_limit_bytes) trim();
+        if (memory_limit_bytes && memory_bytes() + bytes > memory_limit_bytes)
+            throw DecodeCapacityError("Decode cache and workspace VRAM budget exhausted");
+        std::size_t available = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&available, &total));
+        if (available < bytes + execution_headroom_bytes) {
+            trim();
+            CUDA_CHECK(cudaMemGetInfo(&available, &total));
+            if (available < bytes + execution_headroom_bytes)
+                throw DecodeCapacityError("Insufficient free VRAM for decode execution workspace");
+        }
+    }
+    void charge_workspace(std::size_t bytes) {
+        make_memory_room(bytes);
+        workspace_bytes += bytes;
+    }
 
     void make_room(std::size_t bytes) {
-        if (!limit_bytes || allocated_bytes + auxiliary_bytes + bytes <= limit_bytes) return;
-        trim();
-        if (allocated_bytes + auxiliary_bytes + bytes > limit_bytes)
+        if (limit_bytes && allocated_bytes + auxiliary_bytes + bytes > limit_bytes) trim();
+        if (limit_bytes && allocated_bytes + auxiliary_bytes + bytes > limit_bytes)
             throw DecodeCapacityError("Decode cache VRAM budget exhausted");
+        make_memory_room(bytes);
     }
     void charge_auxiliary(std::size_t bytes) {
         make_room(bytes);
@@ -73,6 +102,37 @@ struct DecodePagePool {
                 allocated_bytes -= bytes;
             }
         free.clear();
+    }
+};
+
+// Allocation accounting shared by metadata and the reusable sampler. Failed
+// allocations return their reservation before admission considers another row.
+struct DecodeWorkspaceAllocator {
+    TensorAllocator allocator;
+    std::shared_ptr<DecodePagePool> pool;
+    ~DecodeWorkspaceAllocator() {
+        if (pool) pool->workspace_bytes -= allocator.total_allocation();
+    }
+    Tensor allocate(ETensorDType dtype, const char* name, EAllocationType kind, const std::vector<long>& shape) {
+        long bytes = get_dtype_size(dtype);
+        for (long d : shape)
+            bytes *= d;
+        if (pool) pool->charge_workspace(bytes);
+        try {
+            return allocator.allocate(dtype, name, kind, shape);
+        } catch (...) {
+            if (pool) pool->workspace_bytes -= bytes;
+            throw;
+        }
+    }
+    void free(Tensor& tensor) {
+        if (!tensor.Data) return;
+        const auto bytes = tensor.bytes();
+        allocator.free(tensor);
+        if (pool) pool->workspace_bytes -= bytes;
+    }
+    std::size_t total_allocation() const {
+        return allocator.total_allocation();
     }
 };
 

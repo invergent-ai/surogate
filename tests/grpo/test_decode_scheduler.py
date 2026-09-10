@@ -147,6 +147,14 @@ def test_gpu_sampling_only_selects_at_the_end_of_chunked_prefill(scheduler):
         return [dict(token=13 if p.get("enabled", True) else -1) for p in parameters]
 
     trainer.decode_batch_sample = sample
+    admissions = []
+
+    def admit(ids, counts, resets, *, sampling):
+        admissions.extend(sampling)
+        return [True] * len(ids)
+
+    trainer.admit_decode_sessions = admit
     params = dict(temperature=0.7, uniform=0.45)
     assert scheduler.step(scheduler.new_session(), [7] * 19, True, params) == dict(token=13)
     assert calls == [dict(enabled=False), dict(enabled=False), params]
+    assert admissions == calls

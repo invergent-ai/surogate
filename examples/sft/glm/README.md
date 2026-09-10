@@ -132,7 +132,10 @@ Current limits:
   BF16 LoRA adapters. Its MLA cache stores latents and reconstructs selected K/V
   with the original BF16/LoRA arithmetic, adding projection work during decode.
   Cache histories grow in 128-token pages, and token steps use continuous batching.
-  Decode graphs are not captured; the training graph's buffers remain stable.
+  Stateless token-step segments use CUDA graphs with separate activation arenas.
+  KDA, convolution, the paged indexer and vocabulary projection batch requests;
+  latent reconstruction batches bounded tiles of queries while preserving the
+  original attention reduction order. Stateful operations execute outside capture.
   Prefill uses the recurrent FLA kernel, without the training chunk kernel's
   parallelism across tokens.
 - Native-colocate automatically uses the same recurrent KDA forward for rollout

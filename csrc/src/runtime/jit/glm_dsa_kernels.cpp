@@ -1,6 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 #include "runtime/jit/glm_dsa_kernels.h"
+#include "kernels/decode.h"
 
 #include "utilities/utils.h"
 
@@ -17,7 +18,11 @@ constexpr std::array Names = {"dsa_norm",
                               "dsa_repack_kv",
                               "dsa_pool_paged",
                               "dsa_score_paged",
-                              "dsa_select_paged"};
+                              "dsa_select_paged",
+                              "dsa_pool_batch",
+                              "dsa_score_batch",
+                              "dsa_select_batch",
+                              "dsa_indices_batch"};
 struct Workspace {
     std::size_t bytes = 0;
     void *keys, *pooled, *ends, *scores, *selected;
@@ -74,11 +79,18 @@ void GlmDsaKernels::indexer(const std::vector<Tensor>& x,
                             const Tensor& workspace,
                             cudaStream_t stream,
                             dsl::GlmDecodeState* cache,
-                            int layer) const {
+                            int layer,
+                            const dsl::ExecutionRequest* request) const {
     require(x.size() == 8 && x[0].Rank == 4, "Invalid DSA indexer inputs");
     int B = x[0].Sizes[0], T = x[0].Sizes[1], H = constant("dsa_score", "H"), D = constant("dsa_pool", "D");
     int P = constant("dsa_pool", "P"), select = constant("dsa_select", "SELECT");
     int offset = cache ? cache->length : 0, TK = T + offset, NP = (TK + P - 1) / P;
+    if (request) {
+        for (int row = 0; row < B; ++row)
+            offset = std::max(offset, request->decode_state(row)->length);
+        TK = T + offset;
+        NP = (TK + P - 1) / P;
+    }
     int capacity = cache ? cache->capacity : T, pcap = cache ? (capacity + P - 1) / P : NP;
     require(x[0].Sizes[2] == H && x[0].Sizes[3] == D && NP <= constant("dsa_select", "BLOCK"),
             "DSA geometry exceeds compiled manifests");
@@ -98,7 +110,21 @@ void GlmDsaKernels::indexer(const std::vector<Tensor>& x,
     void *keys = s.keys, *gate = x[2].Data, *pos = x[7].Data, *pooled = s.pooled, *ends = s.ends;
     int start = 0;
     const bool paged = cache && cache->limit > 0;
-    if (paged) {
+    if (request) {
+        const auto& kb = request->decode_binding(layer, "index_keys");
+        auto normalized = Tensor::from_pointer(static_cast<std::byte*>(keys),
+                                               x[1].Device,
+                                               ETensorDType::BF16,
+                                               std::vector<long>{B, T, D});
+        decode_append_pages_batch(normalized, kb, B, T, D, stream);
+        decode_append_pages_batch(x[2], request->decode_binding(layer, "index_gate"), B, T, D, stream);
+        decode_append_pages_batch(x[7], request->decode_binding(layer, "index_positions"), B, T, 1, stream);
+        keys = kb.Data;
+        gate = request->decode_binding(layer, "index_gate").Data;
+        pos = request->decode_binding(layer, "index_positions").Data;
+        pooled = request->decode_binding(layer, "index_pooled").Data;
+        ends = request->decode_binding(layer, "index_ends").Data;
+    } else if (paged) {
         auto& k = cache->pages(layer, "index_keys", ETensorDType::BF16, D);
         auto& g = cache->pages(layer, "index_gate", ETensorDType::BF16, D);
         auto& p = cache->pages(layer, "index_positions", ETensorDType::INT32, 1);
@@ -143,8 +169,10 @@ void GlmDsaKernels::indexer(const std::vector<Tensor>& x,
         ends = pe.Data;
         start = offset / P;
     }
-    launch(paged ? "dsa_pool_paged" : "dsa_pool",
-           dim3(NP - start, B),
+    launch(request ? "dsa_pool_batch"
+           : paged ? "dsa_pool_paged"
+                   : "dsa_pool",
+           dim3(request ? (T + 2 * P - 2) / P : NP - start, B),
            stream,
            keys,
            gate,
@@ -152,7 +180,7 @@ void GlmDsaKernels::indexer(const std::vector<Tensor>& x,
            pos,
            pooled,
            ends,
-           TK,
+           request ? T : TK,
            capacity,
            pcap,
            start);
@@ -164,7 +192,9 @@ void GlmDsaKernels::indexer(const std::vector<Tensor>& x,
     const int selected = select;
     for (int query_start = 0; query_start < T; query_start += IndexerQueryTile) {
         const int query_count = std::min(IndexerQueryTile, T - query_start);
-        launch(paged ? "dsa_score_paged" : "dsa_score",
+        launch(request ? "dsa_score_batch"
+               : paged ? "dsa_score_paged"
+                       : "dsa_score",
                dim3(query_count, (NP + 31) / 32, B),
                stream,
                x[0].Data,
@@ -180,7 +210,9 @@ void GlmDsaKernels::indexer(const std::vector<Tensor>& x,
                offset,
                query_start,
                query_count);
-        launch(paged ? "dsa_select_paged" : "dsa_select",
+        launch(request ? "dsa_select_batch"
+               : paged ? "dsa_select_paged"
+                       : "dsa_select",
                dim3(query_count, B),
                stream,
                s.scores,
@@ -189,17 +221,30 @@ void GlmDsaKernels::indexer(const std::vector<Tensor>& x,
                query_count,
                NP,
                pcap);
-        launch("dsa_indices",
-               dim3(query_count, B),
-               stream,
-               s.selected,
-               x[7].Data,
-               indices.Data,
-               T,
-               offset,
-               selected,
-               query_start,
-               query_count);
+        if (request)
+            launch("dsa_indices_batch",
+                   dim3(query_count, B),
+                   stream,
+                   s.selected,
+                   x[7].Data,
+                   indices.Data,
+                   T,
+                   keys,
+                   selected,
+                   query_start,
+                   query_count);
+        else
+            launch("dsa_indices",
+                   dim3(query_count, B),
+                   stream,
+                   s.selected,
+                   x[7].Data,
+                   indices.Data,
+                   T,
+                   offset,
+                   selected,
+                   query_start,
+                   query_count);
     }
 }
 
@@ -242,7 +287,7 @@ void GlmDsaKernels::attention_selected(const Tensor& qkv,
                                        int slots,
                                        cudaStream_t stream) const {
     launch("dsa_attn_decode",
-           dim3(1, constant("dsa_attn_fwd", "H")),
+           dim3(1, constant("dsa_attn_fwd", "H"), qkv.Sizes[0]),
            stream,
            qkv.Data,
            kv.Data,

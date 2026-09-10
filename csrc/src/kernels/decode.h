@@ -36,11 +36,45 @@ void decode_delta_rule(const Tensor& q,
                        const Tensor& v,
                        const Tensor& g,
                        const Tensor& beta,
-                       const Tensor& state,
+                       const Tensor& bindings,
                        const Tensor& out,
-                       bool initial,
+                       const Tensor& final_state,
                        float scale,
                        cudaStream_t stream);
+
+// Pack request-owned recurrent state into a contiguous batch (zero new rows),
+// or scatter a completed batch back to those same request buffers.
+void decode_copy_state(const Tensor& bindings, const Tensor& state, int B, bool scatter, cudaStream_t stream);
+void decode_conv_input(const Tensor& x, const Tensor& bindings, const Tensor& extended, int tail, cudaStream_t stream);
+void decode_conv_output(const Tensor& computed,
+                        const Tensor& extended,
+                        const Tensor& bindings,
+                        const Tensor& output,
+                        int tail,
+                        cudaStream_t stream);
+void decode_gather_rows(const Tensor& input,
+                        const Tensor& positions,
+                        const Tensor& output,
+                        int B,
+                        int T,
+                        int C,
+                        cudaStream_t stream);
+void decode_append_pages_batch(const Tensor& input,
+                               const Tensor& bindings,
+                               int B,
+                               int T,
+                               int width,
+                               cudaStream_t stream);
+void decode_gather_pages_batch(const Tensor& bindings,
+                               const Tensor& indices,
+                               const Tensor& out,
+                               const Tensor& slots,
+                               int T,
+                               int query_start,
+                               int queries,
+                               int count,
+                               int width,
+                               cudaStream_t stream);
 
 void decode_append_kv_batch(const Tensor& qkv,
                             const Tensor& bindings,

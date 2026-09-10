@@ -149,10 +149,12 @@ class DecodeScheduler:
                     lengths[session] = after
                     accepted.append(item)
                 if accepted and hasattr(self.trainer, "admit_decode_sessions"):
+                    kwargs = {"sampling": [item[4] for item in accepted]} if accepted[0][4] is not None else {}
                     admitted = self.trainer.admit_decode_sessions(
                         np.asarray([item[0] for item in accepted], dtype=np.int64),
                         np.asarray([len(item[1]) for item in accepted], dtype=np.int32),
                         np.asarray([item[2] for item in accepted], dtype=np.int32),
+                        **kwargs,
                     )
                     rejected.extend(item for item, fits in zip(accepted, admitted, strict=True) if not fits)
                     accepted = [item for item, fits in zip(accepted, admitted, strict=True) if fits]

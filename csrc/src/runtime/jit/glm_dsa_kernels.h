@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <vector>
 #include "runtime/executor/glm_decode_state.h"
+#include "runtime/executor/execution_request.h"
 #include "runtime/jit/jit_kernel.h"
 
 class GlmDsaKernels {
@@ -17,11 +18,12 @@ public:
     GlmDsaKernels& operator=(GlmDsaKernels&&) = default;
     void load(const std::unordered_map<std::string, std::string>& manifests);
     [[nodiscard]] bool is_ready() const {
-        return mKernels.size() == 13;
+        return mKernels.size() == 17;
     }
     [[nodiscard]] std::size_t workspace_bytes(int B, int T, int length = 0) const;
     // Bound live score storage independently of the query sequence length.
     static constexpr int IndexerQueryTile = 128;
+    static constexpr int DecodeQueryTile = 8;
     [[nodiscard]] static std::size_t indexer_workspace_bytes(int B, int T, int TK, int D, int P, int select);
     [[nodiscard]] int selection_slots() const;
     void gather_latents(const Tensor& latent,
@@ -43,7 +45,8 @@ public:
                  const Tensor& workspace,
                  cudaStream_t stream,
                  dsl::GlmDecodeState* cache = nullptr,
-                 int layer = 0) const;
+                 int layer = 0,
+                 const dsl::ExecutionRequest* request = nullptr) const;
     void attention(const Tensor& qkv,
                    const Tensor& indices,
                    const Tensor& out,

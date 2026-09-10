@@ -406,11 +406,14 @@ public:
                                            DecodeSampleResult* samples = nullptr);
     void release_decode_sessions(const std::vector<std::int64_t>& sessions);
     void set_decode_cache_budget(std::int64_t bytes);
+    void set_decode_memory_budget(std::int64_t bytes);
+    void prepare_decode_workspace(int B, int T, int capacity, const DecodeSamplingRequest* sampling);
     std::vector<bool> admit_decode_sessions(const std::int64_t* sessions,
                                             const std::int32_t* counts,
                                             const std::int32_t* resets,
                                             int count,
-                                            int capacity);
+                                            int capacity,
+                                            const DecodeSamplingRequest* sampling = nullptr);
     std::unordered_map<std::string, std::int64_t> decode_batch_stats() const;
     std::unordered_map<std::string, std::int64_t> decode_cache_stats() const {
         return mGlmDecodeState ? mGlmDecodeState->stats() : std::unordered_map<std::string, std::int64_t>{};
@@ -698,9 +701,10 @@ private:
     std::shared_ptr<DecodePagePool> mDecodePagePool = std::make_shared<DecodePagePool>();
     std::unordered_map<std::int64_t, std::unique_ptr<GlmDecodeState>> mDecodeSessions;
     std::vector<DecodeCacheSpec> mDecodeCacheSpecs;
-    TensorAllocator mDecodeMetadataAllocator;
+    DecodeWorkspaceAllocator mDecodeMetadataAllocator;
     Tensor mDecodeMetadata;
     DecodeSampler mDecodeSampler;
+    std::int64_t mDecodeBatchSplits = 0;
 
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;

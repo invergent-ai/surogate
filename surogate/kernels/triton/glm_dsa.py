@@ -29,8 +29,28 @@ def page_pointer(table, row, col, width: tl.constexpr, dtype: tl.constexpr, vali
 
 
 @triton.jit
-def pool_keys(K, Gate, Ape, Pos, Pooled, Ends, T, CAP, NP, START, D: tl.constexpr, P: tl.constexpr, BD: tl.constexpr, PAGED: tl.constexpr):
-    slot, batch = tl.program_id(0) + START, tl.program_id(1)
+def batch_pages(bindings, batch):
+    # DecodeCacheBinding is {pointer, int32 length, int32 pages}.
+    return tl.load(bindings + batch * 2).to(tl.pointer_type(tl.int64))
+
+
+@triton.jit
+def batch_length(bindings, batch):
+    return (tl.load(bindings + batch * 2 + 1).to(tl.uint64) & 0xFFFFFFFF).to(tl.int32)
+
+
+@triton.jit
+def pool_keys(K, Gate, Ape, Pos, Pooled, Ends, T, CAP, NP, START, D: tl.constexpr, P: tl.constexpr, BD: tl.constexpr, PAGED: tl.constexpr, BATCHED: tl.constexpr):
+    batch = tl.program_id(1)
+    if BATCHED:
+        offset = batch_length(K, batch)
+        T += offset
+        START = offset // P
+        K, Gate, Pos = batch_pages(K, batch), batch_pages(Gate, batch), batch_pages(Pos, batch)
+        Pooled, Ends = batch_pages(Pooled, batch), batch_pages(Ends, batch)
+    slot = tl.program_id(0) + START
+    if slot >= tl.cdiv(T, P):
+        return
     p, d = tl.arange(0, P), tl.arange(0, BD)
     # Complete pools are at least P tokens apart, even across packed documents.
     # Their final tokens therefore occupy distinct P-wide slots in the row.
@@ -85,24 +105,31 @@ def score_pools(
     BD: tl.constexpr,
     BP: tl.constexpr,
     PAGED: tl.constexpr,
+    BATCHED: tl.constexpr,
+    P: tl.constexpr,
 ):
     local_row, tile, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    row_np = NP
+    if BATCHED:
+        OFFSET = batch_length(Pooled, batch)
+        row_np = tl.cdiv(OFFSET + TQ, P)
+        Pooled, Ends = batch_pages(Pooled, batch), batch_pages(Ends, batch)
     row = QSTART + local_row
     h, d, p = tl.arange(0, BH), tl.arange(0, BD), tile * BP + tl.arange(0, BP)
     q = tl.load(Q + ((batch * TQ + row) * H + h[:, None]) * D + d[None, :], (h[:, None] < H) & (d[None, :] < D), 0).to(
         tl.float32
     )
-    mask = (p[None, :] < NP) & (d[:, None] < D)
+    mask = (p[None, :] < row_np) & (d[:, None] < D)
     pooled_ptr = Pooled + (batch * PCAP + p[None, :]) * D + d[:, None]
     ends_ptr = Ends + batch * PCAP + p
     if PAGED:
         pooled_ptr = page_pointer(Pooled, p[None, :], d[:, None], D, tl.bfloat16, mask)
-        ends_ptr = page_pointer(Ends, p, 0, 1, tl.int32, p < NP)
+        ends_ptr = page_pointer(Ends, p, 0, 1, tl.int32, p < row_np)
     k = tl.load(pooled_ptr, mask, 0).to(tl.float32)
     scores = tl.maximum(tl.dot(q, k) * (D**-0.5), 0)
     weight = tl.load(Weights + (batch * TQ + row) * H + h, h < H, 0).to(tl.float32) * (H**-0.5)
     score = tl.sum(scores * weight[:, None], 0)
-    end = tl.load(ends_ptr, p < NP, -1)
+    end = tl.load(ends_ptr, p < row_np, -1)
     position = tl.load(Pos + batch * TQ + row)
     absolute = OFFSET + row
     visible = (end >= absolute - position) & (end <= absolute) & (end >= 0)
@@ -110,8 +137,10 @@ def score_pools(
 
 
 @triton.jit
-def select_pools(Scores, Ends, Selected, TQ, NP, PCAP, SELECT: tl.constexpr, BLOCK: tl.constexpr, PAGED: tl.constexpr):
+def select_pools(Scores, Ends, Selected, TQ, NP, PCAP, SELECT: tl.constexpr, BLOCK: tl.constexpr, PAGED: tl.constexpr, BATCHED: tl.constexpr):
     row, batch = tl.program_id(0), tl.program_id(1)
+    if BATCHED:
+        Ends = batch_pages(Ends, batch)
     p = tl.arange(0, BLOCK)
     scores = tl.load(Scores + (batch * TQ + row) * NP + p, p < NP, -float("inf"))
     # Sort an order-preserving float key together with its pool index. Keep
@@ -144,8 +173,11 @@ def expand_indices(
     TAIL: tl.constexpr,
     STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
+    BATCHED: tl.constexpr,
 ):
     local_row, batch = tl.program_id(0), tl.program_id(1)
+    if BATCHED:
+        OFFSET = batch_length(OFFSET, batch)
     row = QSTART + local_row
     i = tl.arange(0, BLOCK)
     end = tl.load(Selected + (batch * QCOUNT + local_row) * SELECT + i // P, i < KSEL * P, -1)
@@ -285,6 +317,7 @@ def compile_glm_dsa(
         STRIDE=stride,
         TAIL=tail,
         PAGED=False,
+        BATCHED=False,
     )
     manifests = {}
 
@@ -292,6 +325,9 @@ def compile_glm_dsa(
         constants = {key: constants[key] for i, key in enumerate(fn.arg_names) if i in fn.constexprs}
         signature = {
             key: (
+                "*i64"
+                if key in tables
+                else
                 "i32"
                 if key
                 in (
@@ -310,8 +346,6 @@ def compile_glm_dsa(
                     "QCOUNT",
                     "R",
                 )
-                else "*i64"
-                if key in tables
                 else "*i32"
                 if key in integers
                 else "*fp32"
@@ -353,4 +387,12 @@ def compile_glm_dsa(
     add("dsa_select_paged", select_pools,
         common | dict(PAGED=True, BLOCK=triton.next_power_of_2(max(topk // P, triton.cdiv(max_seq, P)))),
         fp32=("Scores",), integers=("Selected",), tables=("Ends",), warps=8)
+    batched = common | dict(PAGED=True, BATCHED=True)
+    add("dsa_pool_batch", pool_keys, batched, tables=("K", "Gate", "Pos", "Pooled", "Ends"))
+    add("dsa_score_batch", score_pools, batched, fp32=("Scores",), integers=("Pos",), tables=("Pooled", "Ends"))
+    add("dsa_select_batch", select_pools,
+        batched | dict(BLOCK=triton.next_power_of_2(max(topk // P, triton.cdiv(max_seq, P)))),
+        fp32=("Scores",), integers=("Selected",), tables=("Ends",), warps=8)
+    add("dsa_indices_batch", expand_indices, batched | dict(BLOCK=triton.next_power_of_2(stride)),
+        integers=("Selected", "Pos", "Indices"), tables=("OFFSET",))
     return manifests

@@ -151,7 +151,11 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
         }
     }
     if (!out_is_ref) {
-        out_val = make_persistent_tensor(mRunState, mSavedCache, op.op_id + ".out_fallback", v.DType, {B, T, H, V});
+        if (mExecutionRequest && mExecutionRequest->decoding()) {
+            out_val = mRunState.temp_alloc(v.DType, {B, T, H, V}, "decode_delta_output");
+            mTemps.push_back(out_val);
+        } else
+            out_val = make_persistent_tensor(mRunState, mSavedCache, op.op_id + ".out_fallback", v.DType, {B, T, H, V});
     }
 
     Tensor state_val;
@@ -164,11 +168,17 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
         }
     }
     if (!state_is_ref) {
-        state_val = make_persistent_tensor(mRunState,
-                                           mSavedCache,
-                                           op.op_id + ".state_fallback",
-                                           ETensorDType::FP32,
-                                           {B, H, K, V});
+        if (mExecutionRequest && mExecutionRequest->decoding()) {
+            if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+                state_val = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "decode_delta_final_state");
+                mTemps.push_back(state_val);
+            }
+        } else
+            state_val = make_persistent_tensor(mRunState,
+                                               mSavedCache,
+                                               op.op_id + ".state_fallback",
+                                               ETensorDType::FP32,
+                                               {B, H, K, V});
     }
     Tensor* out_ptr = &out_val;
     Tensor* final_state_ptr = &state_val;
@@ -230,22 +240,16 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
         Tensor query = q, key = k;
         query.Data = static_cast<std::byte*>(q_eff);
         key.Data = static_cast<std::byte*>(k_eff);
-        for (int row = 0; row < B; ++row) {
-            auto* state = mExecutionRequest->decode_state(row);
-            auto history = state->get(op_layer_idx(op), "delta_state", ETensorDType::FP32, {1, H, K, V});
-            decode_delta_rule(decode_batch_row(query, row),
-                              decode_batch_row(key, row),
-                              decode_batch_row(v, row),
-                              decode_batch_row(g_input, row),
-                              decode_batch_row(beta, row),
-                              history,
-                              decode_batch_row(out_val, row),
-                              state->length == 0,
-                              scale,
-                              stream);
-            auto target = decode_batch_row(state_val, row);
-            CUDA_CHECK(cudaMemcpyAsync(target.Data, history.Data, history.bytes(), cudaMemcpyDeviceToDevice, stream));
-        }
+        decode_delta_rule(query,
+                          key,
+                          v,
+                          g_input,
+                          beta,
+                          mExecutionRequest->decode_binding(op_layer_idx(op), "delta_state"),
+                          out_val,
+                          state_val,
+                          scale,
+                          stream);
         store_tensor(op.outputs[0], out_val);
         if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], state_val);
         return;

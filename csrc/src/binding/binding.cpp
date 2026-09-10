@@ -2523,16 +2523,37 @@ NB_MODULE(_surogate, m) {
              &MultiGPUPyTrainer::set_decode_cache_budget,
              nb::arg("bytes") = 0,
              nb::call_guard<nb::gil_scoped_release>())
-        .def("admit_decode_sessions",
-             [](MultiGPUPyTrainer* trainer,
-                nb::ndarray<std::int64_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> sessions,
-                nb::ndarray<std::int32_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> counts,
-                nb::ndarray<std::int32_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> resets) {
-                 if (sessions.size() == 0 || sessions.size() != counts.size() || sessions.size() != resets.size())
-                     throw std::invalid_argument("Decode admission arrays must have the same nonzero length");
-                 nb::gil_scoped_release release;
-                 return trainer->admit_decode_sessions(sessions.data(), counts.data(), resets.data(), sessions.size());
-             })
+        .def("set_decode_memory_budget",
+             &MultiGPUPyTrainer::set_decode_memory_budget,
+             nb::arg("bytes") = 0,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "admit_decode_sessions",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<std::int64_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> sessions,
+               nb::ndarray<std::int32_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> counts,
+               nb::ndarray<std::int32_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> resets,
+               nb::object sampling) {
+                if (sessions.size() == 0 || sessions.size() != counts.size() || sessions.size() != resets.size())
+                    throw std::invalid_argument("Decode admission arrays must have the same nonzero length");
+                std::vector<DecodeSamplingRequest> requests;
+                if (!sampling.is_none()) {
+                    auto values = nb::cast<nb::list>(sampling);
+                    if (nb::len(values) != sessions.size())
+                        throw std::invalid_argument("Decode admission sampling length mismatch");
+                    requests = decode_sampling_requests(values);
+                }
+                nb::gil_scoped_release release;
+                return trainer->admit_decode_sessions(sessions.data(),
+                                                      counts.data(),
+                                                      resets.data(),
+                                                      sessions.size(),
+                                                      requests.empty() ? nullptr : requests.data());
+            },
+            nb::arg("session_ids"),
+            nb::arg("counts"),
+            nb::arg("reset"),
+            nb::arg("sampling") = nb::none())
         .def("get_decode_batch_stats",
              &MultiGPUPyTrainer::get_decode_batch_stats,
              nb::call_guard<nb::gil_scoped_release>())

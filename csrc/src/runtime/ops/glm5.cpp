@@ -178,33 +178,23 @@ void CompiledExecutor::dispatch_glm5(const CompiledOp& op) {
     }
     if (mExecutionRequest && mExecutionRequest->decoding() &&
         (k == Glm5Kernel::KdaRule || k == Glm5Kernel::CausalConv1d)) {
-        for (int row = 0; row < inputs[0].Sizes[0]; ++row) {
-            auto* decode = mExecutionRequest->decode_state(row);
-            auto sliced = inputs;
-            if (k == Glm5Kernel::KdaRule) {
-                for (auto& tensor : sliced)
-                    tensor = decode_batch_row(tensor, row);
-                const auto& q = sliced[0];
-                auto state = decode->get(op_layer_idx(op),
-                                         "kda_state",
-                                         ETensorDType::FP32,
-                                         {1, q.Sizes[2], q.Sizes[3], q.Sizes[3]});
-                mKdaKernels.recurrent(sliced,
-                                      decode_batch_row(outputs[0], row),
-                                      state,
-                                      decode->length == 0,
-                                      mRunState.MainStream);
-            } else {
-                auto x = decode_batch_row(inputs[0], row);
-                auto history =
-                    decode->get(op_layer_idx(op), "convolution", x.DType, {x.Sizes[2], inputs[1].Sizes[2] - 1});
-                glm5_convolution_state(x,
-                                       inputs[1],
-                                       history,
-                                       decode_batch_row(outputs[0], row),
-                                       decode->length == 0,
-                                       mRunState.MainStream);
-            }
+        const auto& q = inputs[0];
+        const auto stream = mRunState.MainStream;
+        if (k == Glm5Kernel::KdaRule) {
+            const auto& bindings = mExecutionRequest->decode_binding(op_layer_idx(op), "kda_state");
+            auto state = mRunState.temp_alloc(ETensorDType::FP32,
+                                              {q.Sizes[0], q.Sizes[2], q.Sizes[3], q.Sizes[3]},
+                                              "decode_kda_state");
+            decode_copy_state(bindings, state, q.Sizes[0], false, stream);
+            mKdaKernels.recurrent(inputs, outputs[0], state, false, stream);
+            decode_copy_state(bindings, state, q.Sizes[0], true, stream);
+            mRunState.Stack.free(state);
+        } else {
+            glm5_convolution_state(q,
+                                   inputs[1],
+                                   mExecutionRequest->decode_binding(op_layer_idx(op), "convolution"),
+                                   outputs[0],
+                                   stream);
         }
     } else if (k == Glm5Kernel::KdaRule && inputs[0].DType == ETensorDType::BF16 && mOptions.DocMasking) {
         const auto& q = inputs[0];

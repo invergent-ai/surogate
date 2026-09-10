@@ -123,7 +123,11 @@ def test_paged_decode_membership_growth_reuse_and_invalidation(tmp_path, case):
     assert stats["sessions"] == 3 and stats["pages"] > 0 and stats["pool_used_bytes"] > 0
     assert stats["length"] == sum(map(len, history.values()))
     trainer.release_decode_sessions([11, 22, 33])
-    assert trainer.get_decode_batch_stats()["pool_used_bytes"] == 0
+    released = trainer.get_decode_batch_stats()
+    assert released["pages"] == 0
+    # The legacy reference above retains its own history in the same budget.
+    assert released["pool_used_bytes"] > 0
+    assert released["cache_allocated_bytes"] >= trainer.get_decode_cache_stats()["bytes"]
     with pytest.raises(RuntimeError, match="prefill"):
         decode(trainer, [11], [np.array([7])], [0])
     decode(trainer, [44], [history[22]], [1])
@@ -140,6 +144,7 @@ def test_paged_decode_membership_growth_reuse_and_invalidation(tmp_path, case):
     trainer.step_with_custom_loss(ids, targets, scales)
     trainer.update_with_config(ext.OptimizerConfig(learning_rate=1e-4), 1)
     assert trainer.get_decode_batch_stats()["sessions"] == 0
+    assert trainer.get_decode_batch_stats()["pool_used_bytes"] == 0
     assert base_ptrs == {n: torch.from_dlpack(t).data_ptr() for n, t in trainer.get_shared_base_weights().items()}
     with pytest.raises(RuntimeError, match="prefill"):
         decode(trainer, [44], [np.array([7])], [0])
@@ -303,5 +308,120 @@ def test_decode_shape_cache_is_bounded_and_reuses_recent_shapes(tmp_path):
     assert trainer.get_decode_batch_stats()["compiled_decode_shapes"] == 10
     decode(trainer, [1], [[13] * 2], [1])
     assert trainer.get_decode_batch_stats()["compiled_decode_shapes"] == 11
+    del trainer
+    gc.collect()
+
+
+@pytest.mark.parametrize("case", ["llama", "qwen3_5", "glm"])
+def test_workspace_admission_rejects_without_advancing_healthy_history(tmp_path, case):
+    trainer = make_trainer(tmp_path, case, graphs=True)
+
+    def admit(ids, counts, resets, sampling=None):
+        return trainer.admit_decode_sessions(np.asarray(ids, dtype=np.int64), np.asarray(counts, dtype=np.int32),
+                                            np.asarray(resets, dtype=np.int32), sampling)
+
+    trainer.set_decode_memory_budget(1)
+    assert admit([1], [1], [1]) == [False]
+    assert trainer.get_decode_batch_stats()["sessions"] == 0
+    trainer.set_decode_memory_budget(0)
+    decode(trainer, [1], [[7]], [1])
+    before = trainer.get_decode_batch_stats()
+    assert before["decode_workspace_bytes"] > 0
+    assert before["decode_execution_headroom_bytes"] == 64 << 20
+    budget = before["decode_memory_reserved_bytes"]
+    trainer.set_decode_memory_budget(budget)
+    assert admit([2, 1], [129, 1], [1, 0]) == [False, True]
+    assert trainer.get_decode_batch_stats()["length"] == 1
+    assert trainer.get_decode_batch_stats()["decode_memory_reserved_bytes"] <= budget
+    # Sampling scratch is also reserved during admission, before history writes.
+    assert admit([1], [1], [0], [dict(top_p=0.8, logit_bias={i: 1.0 for i in range(512)})]) == [False]
+    assert trainer.get_decode_batch_stats()["length"] == 1
+    assert admit([1], [1], [0]) == [True]
+    trainer.set_decode_memory_budget(0)
+    actual = decode(trainer, [1], [[13]], [0])
+    reference = decode(trainer, [3], [[7, 13]], [1])
+    actual -= np.logaddexp.reduce(actual, axis=-1, keepdims=True)
+    reference -= np.logaddexp.reduce(reference, axis=-1, keepdims=True)
+    np.testing.assert_allclose(actual, reference, atol=1e-5 if case == "glm" else 0.1, rtol=0)
+    trainer = None
+    gc.collect()
+
+
+def test_workspace_pressure_splits_batches_without_losing_rows(tmp_path):
+    trainer = make_trainer(tmp_path, "llama", graphs=True)
+    sessions = np.arange(1, 5, dtype=np.int64)
+    ones = np.ones(4, dtype=np.int32)
+    assert trainer.admit_decode_sessions(sessions, ones, ones) == [True] * 4
+    before = trainer.get_decode_batch_stats()
+    budget = before["decode_memory_reserved_bytes"] + 4096
+    trainer.set_decode_memory_budget(budget)
+    actual = decode(trainer, sessions, [[7], [13], [19], [23]], ones)
+    stats = trainer.get_decode_batch_stats()
+    assert stats["decode_batch_splits"] > 0
+    assert stats["length"] == 4 and stats["sessions"] == 4
+    assert stats["decode_memory_reserved_bytes"] <= budget
+    assert stats["decode_shape_evictions"] > 0
+    trainer.set_decode_memory_budget(0)
+    reference = decode(trainer, sessions + 10, [[7], [13], [19], [23]], ones)
+    np.testing.assert_array_equal(actual, reference)
+    del trainer
+    gc.collect()
+
+
+@pytest.mark.parametrize("case", ["qwen3_5", "lfm2", "glm"])
+def test_recurrent_and_sparse_batches_cross_query_tile_boundaries(tmp_path, case):
+    trainer = make_trainer(tmp_path, case, graphs=True)
+    sessions = list(range(1, 11))
+    prefixes = [[7 + row] * (row % 3 + 1) for row in range(10)]
+    decode(trainer, sessions, prefixes, [1] * 10)
+    # Ragged histories, a fresh row, and >8 queries exercise tiled MLA gathers,
+    # batched convolution, and recurrent-state resets together.
+    order = [10, 2, 9, 4, 8, 6, 7, 5, 3, 11]
+    chunks = [[31 + row, 47 + row] for row in range(10)]
+    resets = [int(session == 11) for session in order]
+    actual = decode(trainer, order, chunks, resets)
+    references = []
+    for row, session in enumerate(order):
+        prefix = prefixes[session - 1] if session != 11 else []
+        references.append(decode(trainer, [100 + row], [prefix + chunks[row]], [1])[0])
+    reference = np.asarray(references)
+    actual -= np.logaddexp.reduce(actual, axis=-1, keepdims=True)
+    reference -= np.logaddexp.reduce(reference, axis=-1, keepdims=True)
+    np.testing.assert_allclose(actual, reference, atol=1e-5 if case == "glm" else 0.1, rtol=0)
+    del trainer
+    gc.collect()
+
+
+def test_workspace_admission_recovers_after_physical_vram_pressure(tmp_path):
+    trainer = make_trainer(tmp_path, "llama", graphs=True)
+    decode(trainer, [1], [[7]], [1])
+    torch.cuda.empty_cache()
+    available, _ = torch.cuda.mem_get_info()
+    pressure = torch.empty(available - (32 << 20), dtype=torch.uint8, device="cuda")
+    try:
+        admitted = trainer.admit_decode_sessions(np.array([1], dtype=np.int64),
+                                                np.array([3], dtype=np.int32), np.array([0], dtype=np.int32))
+        assert admitted == [False]
+        assert trainer.get_decode_batch_stats()["length"] == 1
+    finally:
+        del pressure
+        torch.cuda.empty_cache()
+    actual = decode(trainer, [1], [[13, 19, 23]], [0])
+    reference = decode(trainer, [2], [[7, 13, 19, 23]], [1])
+    np.testing.assert_allclose(actual, reference, atol=0.1, rtol=0)
+    del trainer
+    gc.collect()
+
+
+@pytest.mark.parametrize("case", ["llama", "glm"])
+def test_batched_vocabulary_projection_selects_independent_positions(tmp_path, case):
+    trainer = make_trainer(tmp_path, case)
+    tokens = np.random.default_rng(87).integers(3, 97, size=(2, 256), dtype=np.int32)
+    actual = trainer.next_token_logits(tokens, np.array([0, 3], dtype=np.int32))
+    # The legacy API requires the trainer's full input shape. Compare selected
+    # positions against fresh cached prefixes from the same policy.
+    reference = np.concatenate([decode(trainer, [row + 1], [tokens[row, :pos + 1]], [1])
+                                for row, pos in enumerate([0, 3])])
+    np.testing.assert_allclose(actual, reference, atol=1e-5 if case == "glm" else 0.1, rtol=0)
     del trainer
     gc.collect()

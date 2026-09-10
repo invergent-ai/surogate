@@ -751,6 +751,7 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
         // dimensions from the input tensors.
         if (!mLoRARunState || B * T > mLoRARunState->B * mLoRARunState->T)
             throw std::runtime_error("Decode exceeds the trainer's LoRA workspace capacity");
+        prepare_decode_workspace(B, T, decode ? decode->limit : decode_states.at(0)->limit, sampling);
     } else
         ensure_lora_run_state(comm, B, T);
     const bool was_training = mLoRARunState->is_training;
@@ -770,13 +771,6 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
         if (decode) decode->prepare(mDecodeCacheSpecs, decode->length + T, rs.MainStream);
         metadata.reserve(mDecodeCacheSpecs.size() * B);
         const long bytes = mDecodeCacheSpecs.size() * B * sizeof(DecodeCacheBinding);
-        if (!mDecodeMetadata.Data || mDecodeMetadata.bytes() < bytes) {
-            mDecodeMetadataAllocator.free(mDecodeMetadata);
-            mDecodeMetadata = mDecodeMetadataAllocator.allocate(ETensorDType::BYTE,
-                                                                "decode_metadata",
-                                                                EAllocationType::ON_DEVICE,
-                                                                {bytes * 2});
-        }
         for (const auto& spec : mDecodeCacheSpecs) {
             const auto key = std::to_string(spec.layer) + "/" + spec.name;
             auto view = Tensor::from_pointer(mDecodeMetadata.Data + metadata.size() * sizeof(DecodeCacheBinding),
@@ -837,16 +831,77 @@ void DslModel::set_decode_cache_budget(std::int64_t bytes) {
     mDecodePagePool->set_limit(bytes);
 }
 
+void DslModel::set_decode_memory_budget(std::int64_t bytes) {
+    mDecodePagePool->set_memory_limit(bytes);
+}
+
+void DslModel::prepare_decode_workspace(int B, int T, int capacity, const DecodeSamplingRequest* sampling) {
+    if (mDecodeCacheSpecs.empty()) mDecodeCacheSpecs = mExecutor->decode_cache_specs();
+    auto& pool = *mDecodePagePool;
+    mDecodeMetadataAllocator.pool = mDecodePagePool;
+    mDecodeSampler.set_budget(mDecodePagePool);
+    bool trimmed_sampler = false;
+    auto reclaim = [&]() {
+        if (mExecutor->evict_decode_workspace()) return true;
+        if (!trimmed_sampler && mDecodeSampler.workspace_bytes()) {
+            mDecodeSampler.release_workspace();
+            trimmed_sampler = true;
+            return true;
+        }
+        mDecodeSampler.release_workspace();
+        return false;
+    };
+    for (;;) {
+        try {
+            if (!pool.execution_headroom_bytes) {
+                // CUDA graph executables and library-internal allocations have
+                // no exact size query. Keep explicit headroom in both budgets.
+                constexpr long headroom = 64L << 20;
+                pool.make_memory_room(headroom);
+                pool.execution_headroom_bytes = headroom;
+            }
+            const long bytes = mDecodeCacheSpecs.size() * B * sizeof(DecodeCacheBinding);
+            if (!mDecodeMetadata.Data || mDecodeMetadata.bytes() < bytes) {
+                mDecodeMetadataAllocator.free(mDecodeMetadata);
+                mDecodeMetadata = mDecodeMetadataAllocator.allocate(ETensorDType::BYTE,
+                                                                    "decode_metadata",
+                                                                    EAllocationType::ON_DEVICE,
+                                                                    {bytes});
+            }
+            if (sampling)
+                mDecodeSampler.prepare(sampling,
+                                       B,
+                                       mModelConfig.VocabSize,
+                                       mRunState->non_block_activations().output.DType,
+                                       mRunState->MainStream,
+                                       false);
+            mExecutor->prepare_decode(B, T, capacity, mDecodePagePool);
+            return;
+        } catch (const DecodeCapacityError&) {
+            CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+            if (!reclaim()) throw;
+        } catch (const cuda_error& error) {
+            if (error.code != cudaErrorMemoryAllocation) throw;
+            cudaGetLastError();
+            CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+            pool.trim();
+            if (!reclaim()) throw DecodeCapacityError("Insufficient free VRAM for decode execution workspace");
+        }
+    }
+}
+
 std::vector<bool> DslModel::admit_decode_sessions(const std::int64_t* sessions,
                                                   const std::int32_t* counts,
                                                   const std::int32_t* resets,
                                                   int count,
-                                                  int capacity) {
+                                                  int capacity,
+                                                  const DecodeSamplingRequest* sampling) {
     if (!mExecutor || !mRunState || count <= 0 || capacity <= 0)
         throw std::invalid_argument("Decode admission requires an initialized trainer and positive capacities");
     if (mDecodeCacheSpecs.empty()) mDecodeCacheSpecs = mExecutor->decode_cache_specs();
     std::unordered_set<std::int64_t> unique;
     for (int i = 0; i < count; ++i) {
+        if (sampling) sampling[i].validate(mModelConfig.VocabSize);
         if (sessions[i] < 0 || !unique.insert(sessions[i]).second || counts[i] <= 0 || counts[i] > capacity ||
             (resets[i] != 0 && resets[i] != 1))
             throw std::invalid_argument("Invalid decode admission request");
@@ -870,6 +925,11 @@ std::vector<bool> DslModel::admit_decode_sessions(const std::int64_t* sessions,
             required += spec.bytes(length + counts[i], capacity);
         auto& pool = *mDecodePagePool;
         if (pool.limit_bytes && pool.used_bytes + pool.auxiliary_bytes + required - before > pool.limit_bytes) continue;
+        try {
+            prepare_decode_workspace(1, counts[i], capacity, sampling ? sampling + i : nullptr);
+        } catch (const DecodeCapacityError&) {
+            continue;
+        }
         const bool fresh = it == mDecodeSessions.end();
         auto& state = mDecodeSessions[sessions[i]];
         if (fresh) {
@@ -944,9 +1004,9 @@ std::vector<float> DslModel::decode_batch_logits(const std::int64_t* sessions,
     std::vector<std::int32_t> counts(count);
     for (int i = 0; i < count; ++i)
         counts[i] = offsets[i + 1] - offsets[i];
-    const auto admitted = admit_decode_sessions(sessions, counts.data(), resets, count, capacity);
+    const auto admitted = admit_decode_sessions(sessions, counts.data(), resets, count, capacity, sampling);
     if (std::find(admitted.begin(), admitted.end(), false) != admitted.end())
-        throw DecodeCapacityError("Decode cache VRAM budget exhausted; use per-request admission");
+        throw DecodeCapacityError("Decode cache or workspace VRAM budget exhausted; use per-request admission");
     std::vector<float> result(sampling ? 0 : static_cast<std::size_t>(count) * mModelConfig.VocabSize);
     try {
         // Equal-size chunks share a graph invocation; all active one-token
@@ -954,8 +1014,22 @@ std::vector<float> DslModel::decode_batch_logits(const std::int64_t* sessions,
         // are bounded by the trainer's existing activation/LoRA input capacity.
         for (const auto& [T, members] : groups) {
             const int max_batch = std::max<long>(1, workspace_rows / T);
-            for (std::size_t start = 0; start < members.size(); start += max_batch) {
-                const int B = std::min<std::size_t>(max_batch, members.size() - start);
+            for (std::size_t start = 0; start < members.size();) {
+                int B = std::min<std::size_t>(max_batch, members.size() - start);
+                for (;;) {
+                    std::vector<DecodeSamplingRequest> preview;
+                    if (sampling)
+                        for (int row = 0; row < B; ++row)
+                            preview.push_back(sampling[members[start + row]]);
+                    try {
+                        prepare_decode_workspace(B, T, capacity, sampling ? preview.data() : nullptr);
+                        break;
+                    } catch (const DecodeCapacityError&) {
+                        if (B == 1) throw;
+                        B = std::max(1, B / 2);
+                        ++mDecodeBatchSplits;
+                    }
+                }
                 std::vector<int> tokens(B * T), positions(B, T - 1);
                 std::vector<GlmDecodeState*> states;
                 std::vector<DecodeSamplingRequest> params;
@@ -985,6 +1059,7 @@ std::vector<float> DslModel::decode_batch_logits(const std::int64_t* sessions,
                                     result.data() + member * mModelConfig.VocabSize);
                     states[row]->length += T;
                 }
+                start += B;
             }
         }
     } catch (...) {
@@ -1013,6 +1088,13 @@ std::unordered_map<std::string, std::int64_t> DslModel::decode_batch_stats() con
         {"reused_pages", mDecodePagePool->reused_pages},
         {"cache_budget_bytes", mDecodePagePool->limit_bytes},
         {"auxiliary_bytes", mDecodePagePool->auxiliary_bytes},
+        {"decode_workspace_bytes", mDecodePagePool->workspace_bytes},
+        {"decode_memory_budget_bytes", mDecodePagePool->memory_limit_bytes},
+        {"decode_memory_reserved_bytes", mDecodePagePool->memory_bytes()},
+        {"decode_execution_headroom_bytes", mDecodePagePool->execution_headroom_bytes},
+        {"decode_sampler_bytes", mDecodeSampler.workspace_bytes()},
+        {"decode_metadata_bytes", mDecodeMetadataAllocator.total_allocation()},
+        {"decode_batch_splits", mDecodeBatchSplits},
         {"cache_allocated_bytes", mDecodePagePool->allocated_bytes + mDecodePagePool->auxiliary_bytes}};
     if (mExecutor)
         for (const auto& [name, value] : mExecutor->decode_execution_stats())
@@ -1026,11 +1108,10 @@ std::unordered_map<std::string, std::int64_t> DslModel::decode_batch_stats() con
 
 void DslModel::reset_decode_state() {
     mDecodeSessions.clear();
-    mDecodePagePool->trim();
     if (mGlmDecodeState) {
-        mGlmDecodeState->active = false;
-        mGlmDecodeState->length = 0;
+        mGlmDecodeState.reset();
     }
+    mDecodePagePool->trim();
 }
 
 std::vector<float> DslModel::decode_logits(const std::int32_t* input_ids, int T, bool reset,
@@ -1039,6 +1120,7 @@ std::vector<float> DslModel::decode_logits(const std::int32_t* input_ids, int T,
     if (reset) {
         if (!mGlmDecodeState || mGlmDecodeState->limit != capacity) {
             mGlmDecodeState = std::make_unique<GlmDecodeState>();
+            mGlmDecodeState->page_pool = mDecodePagePool;
             mGlmDecodeState->limit = capacity;
         }
         mGlmDecodeState->length = 0;

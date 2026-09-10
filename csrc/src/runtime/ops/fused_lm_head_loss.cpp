@@ -20,6 +20,7 @@
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
+#include "kernels/decode.h"
 #include "recipes/recipe.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
@@ -266,33 +267,42 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
             throw std::logic_error(
                 "Generation logits must execute outside capture: result addresses are request-local");
         const bool on_gpu = request.generation_logits_gpu.Data != nullptr;
-        Tensor logits = on_gpu ? request.generation_logits_gpu : mRunState.non_block_activations().output;
-        if (!on_gpu && request.generation_logits_cpu.DType != logits.DType) {
+        const auto stream = mRunState.MainStream;
+        const long B = request.batch;
+        const auto dtype = mRunState.non_block_activations().output.DType;
+        if (!on_gpu && request.generation_logits_cpu.DType != dtype)
             throw std::runtime_error("generation logits dtype does not match the output buffer");
-        }
+        Tensor logits = on_gpu ? request.generation_logits_gpu : mRunState.temp_alloc(dtype, {B, V}, "decode_logits");
         logits.Rank = 2;
-        logits.Sizes[0] = 1;
+        logits.Sizes[0] = B;
         logits.Sizes[1] = V;
-        const auto row_bytes = static_cast<std::size_t>(V) * get_dtype_size(logits.DType);
-        for (long b = 0; b < request.batch; ++b) {
-            if (on_gpu) logits.Data = request.generation_logits_gpu.Data + b * row_bytes;
-            const long row = b * request.sequence + request.generation_positions_cpu[b];
-            Tensor x = xF_flat;
-            x.Data += row * C * get_dtype_size(x.DType);
-            x.Rank = 2;
-            x.Sizes[0] = 1;
-            x.Sizes[1] = C;
-            lm_head_logits_matmul(logits, weight, x, op.inputs[1].name, V, C, 1);
-            if (op.attrs.softcap > 0.0f) {
-                softcap_logits(logits, op.attrs.softcap, 1, V, mRunState.MainStream);
-            }
-            if (!on_gpu)
-                CUDA_CHECK(cudaMemcpyAsync(request.generation_logits_cpu.Data + b * row_bytes,
-                                           logits.Data,
-                                           row_bytes,
-                                           cudaMemcpyDeviceToHost,
-                                           mRunState.MainStream));
+        Tensor x = xF_flat;
+        Tensor selected, positions;
+        if (request.sequence != 1) {
+            selected = mRunState.temp_alloc(x.DType, {B, C}, "decode_head_rows");
+            positions = mRunState.temp_alloc(ETensorDType::INT32, {B}, "decode_head_positions");
+            CUDA_CHECK(cudaMemcpyAsync(positions.Data,
+                                       request.generation_positions_cpu,
+                                       B * sizeof(int),
+                                       cudaMemcpyHostToDevice,
+                                       stream));
+            decode_gather_rows(xF_flat, positions, selected, B, request.sequence, C, stream);
+            x = selected;
         }
+        x.Rank = 2;
+        x.Sizes[0] = B;
+        x.Sizes[1] = C;
+        lm_head_logits_matmul(logits, weight, x, op.inputs[1].name, V, C, B);
+        if (op.attrs.softcap > 0.0f) softcap_logits(logits, op.attrs.softcap, B, V, stream);
+        if (!on_gpu)
+            CUDA_CHECK(cudaMemcpyAsync(request.generation_logits_cpu.Data,
+                                       logits.Data,
+                                       logits.bytes(),
+                                       cudaMemcpyDeviceToHost,
+                                       stream));
+        if (positions.Data) mRunState.Stack.free(positions);
+        if (selected.Data) mRunState.Stack.free(selected);
+        if (!on_gpu) mRunState.Stack.free(logits);
         return;
     }
 

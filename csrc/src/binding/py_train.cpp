@@ -3418,6 +3418,28 @@ void MultiGPUPyTrainer::set_decode_cache_budget(std::int64_t bytes) {
     if (error) std::rethrow_exception(error);
 }
 
+void MultiGPUPyTrainer::set_decode_memory_budget(std::int64_t bytes) {
+    if (mContexts.size() != 1 || bytes < 0) throw std::invalid_argument("Invalid decode memory budget");
+    std::exception_ptr error;
+    run_work(
+        [&](sThreadContext& ctx) {
+            try {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model) throw std::runtime_error("Decode requires a DSL model");
+                if (!bytes) {
+                    std::size_t available = 0, total = 0;
+                    CUDA_CHECK(cudaMemGetInfo(&available, &total));
+                    bytes = available / 5 * 4 + model->decode_batch_stats().at("decode_memory_reserved_bytes");
+                }
+                model->set_decode_memory_budget(bytes);
+            } catch (...) {
+                error = std::current_exception();
+            }
+        },
+        0);
+    if (error) std::rethrow_exception(error);
+}
+
 std::vector<DecodeSampleResult> MultiGPUPyTrainer::decode_batch_sample(const std::int64_t* sessions,
                                                                        const std::int32_t* ids,
                                                                        const std::int32_t* offsets,
@@ -3453,7 +3475,8 @@ std::vector<DecodeSampleResult> MultiGPUPyTrainer::decode_batch_sample(const std
 std::vector<bool> MultiGPUPyTrainer::admit_decode_sessions(const std::int64_t* sessions,
                                                            const std::int32_t* counts,
                                                            const std::int32_t* resets,
-                                                           int count) {
+                                                           int count,
+                                                           const DecodeSamplingRequest* sampling) {
     if (mContexts.size() != 1) throw std::invalid_argument("Decode admission requires one GPU");
     std::vector<bool> result;
     std::exception_ptr error;
@@ -3462,7 +3485,7 @@ std::vector<bool> MultiGPUPyTrainer::admit_decode_sessions(const std::int64_t* s
             try {
                 auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                 if (!model) throw std::runtime_error("Decode requires a DSL model");
-                result = model->admit_decode_sessions(sessions, counts, resets, count, seq_length());
+                result = model->admit_decode_sessions(sessions, counts, resets, count, seq_length(), sampling);
             } catch (...) {
                 error = std::current_exception();
             }

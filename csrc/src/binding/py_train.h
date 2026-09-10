@@ -299,10 +299,12 @@ public:
                                                         const DecodeSamplingRequest* sampling);
     std::unordered_map<std::string, std::int64_t> get_decode_batch_stats();
     void set_decode_cache_budget(std::int64_t bytes);
+    void set_decode_memory_budget(std::int64_t bytes);
     std::vector<bool> admit_decode_sessions(const std::int64_t* sessions,
                                             const std::int32_t* counts,
                                             const std::int32_t* resets,
-                                            int count);
+                                            int count,
+                                            const DecodeSamplingRequest* sampling = nullptr);
     std::unordered_map<std::string, std::int64_t> get_decode_cache_stats();
     std::vector<float> next_token_logits(const std::int32_t* input_ids,
                                          const std::int32_t* last_positions, int B, int T);

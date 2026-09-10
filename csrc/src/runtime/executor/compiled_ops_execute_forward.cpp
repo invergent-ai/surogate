@@ -155,7 +155,9 @@ void CompiledExecutor::initialize_forward_execution(const CompiledGraph& graph, 
     // stream capture doesn't allow synchronous host allocations, and the
     // captured graph ends up with a stale pointer. Allocating here (outside
     // any capture) gives a stable base pointer for all subsequent captures.
-    ensure_replay_persist_arena();
+    // Decode never replays backward. Reserving the training-only 256 MiB
+    // arena here would bypass admission for every cached decode shape.
+    if (!mExecutionRequest || !mExecutionRequest->decoding()) ensure_replay_persist_arena();
     mCurrentLayer = -1;
     mSegmentDispatchedUntil = 0;
 

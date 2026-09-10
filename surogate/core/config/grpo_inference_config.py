@@ -20,6 +20,8 @@ class GRPOInferenceConfig:
         max_num_seqs: Concurrency cap (`--max-num-seqs`).
         decode_cache_bytes: Persistent cache byte budget on the shared training path;
             0 selects 25% of free VRAM after trainer allocation.
+        decode_memory_bytes: Combined decode cache/workspace budget on the shared
+            training path; 0 selects 80% of free VRAM after trainer allocation.
         kv_cache_dtype: KV cache dtype, e.g. `fp8` (`--kv-dtype`).
         tp: GPUs per replica. With `dp`, the number of GPUs a split run hands the server.
         dp: Replicas.
@@ -41,6 +43,8 @@ class GRPOInferenceConfig:
     # Native shared-model cache storage, including recurrent state and tables.
     # Zero selects 25% of free VRAM after allocating the resident trainer.
     decode_cache_bytes: int = 0
+    # Incremental decode cache + workspace budget; 0 chooses 80% of free VRAM.
+    decode_memory_bytes: int = 0
     # fp8 KV halves cache bytes/token, ~doubling concurrency on a KV-bound server. It
     # also perturbs sampled logprobs, which feed GRPO's importance ratio -- measure
     # mismatch_kl before adopting.
@@ -61,6 +65,9 @@ class GRPOInferenceConfig:
         self.decode_cache_bytes = int(cfg.get("decode_cache_bytes", self.decode_cache_bytes))
         if self.decode_cache_bytes < 0:
             raise ValueError("decode_cache_bytes must be nonnegative")
+        self.decode_memory_bytes = int(cfg.get("decode_memory_bytes", self.decode_memory_bytes))
+        if self.decode_memory_bytes < 0:
+            raise ValueError("decode_memory_bytes must be nonnegative")
         self.kv_cache_dtype = cfg.get("kv_cache_dtype", self.kv_cache_dtype)
         self.tp = cfg.get("tp", self.tp)
         self.dp = cfg.get("dp", self.dp)
