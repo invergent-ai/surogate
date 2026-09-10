@@ -89,6 +89,11 @@ public:
     /// like any other object and costs the device nothing.
     void bank_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
+    /// Validate all layers, but materialize only this pipeline stage's range.
+    void set_layer_range(int first, int last);
+    [[nodiscard]] bool contains_layer(int layer) const noexcept {
+        return stage_last_ == 0 || (layer >= stage_first_ && layer < stage_last_);
+    }
     /// Account for every object this caller did not bind, without placing any of them.
     ///
     /// `finish` insists that a target consume the whole artifact, which is what catches a
@@ -108,6 +113,8 @@ private:
     MaterializationPlan materialization_;
     std::optional<std::uint32_t> gpu_layers_;
     std::vector<std::uint32_t> host_moe_layers_;
+    int stage_first_ = 0;
+    int stage_last_ = 0;
 };
 
 } // namespace sinfer::artifact

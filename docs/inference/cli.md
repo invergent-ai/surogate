@@ -77,12 +77,25 @@ enough for one full-context request per model. See [Serving models](serving-mode
 With one GPU, preparation follows `--device`. `SUROGATE_CONVERT_DEVICE` overrides the preparation
 device when needed. GPU indices follow `CUDA_VISIBLE_DEVICES`.
 
-Multiple GPUs are supported for GLM-5.3-Flash, Qwen3.8 Flash-Next, Qwen3.5/3.6/3.8 dense
-models, and Qwen3.5/3.6 MoE models. MTP can be used with these models when their checkpoint
-includes compatible MTP weights.
+All supported text-generation families can use `--devices`. MTP is available when the
+checkpoint includes compatible MTP weights. DFlash still requires one GPU. The maximum
+number of GPUs depends on the checkpoint; if the requested split is rejected, use fewer GPUs.
 
-DFlash, additional models through `--model`, and sleep mode currently require a single GPU.
-To run independent replicas, start separate servers on different devices and ports.
+Additional models can share a GPU, use different GPUs, or use their own GPU groups. They
+inherit the primary model's placement unless you override it:
+
+```bash
+surogate serve /path/to/primary.sinfer --devices 0,1 --enable-sleep-mode \
+  --model second=/path/to/second.sinfer,devices=2:3 \
+  --model small=/path/to/small.sinfer,device=4
+```
+
+Within `--model`, separate GPU indices with colons. Sleep and wake apply to every GPU used
+by the selected model. The scheduler accounts for available memory on each GPU.
+
+For independent replicas in one server, add the same artifact under different model names
+with `--model replica=/path/to/primary.sinfer,device=2`. Select the replica with the request's
+`model` field; each replica has its own request capacity and cache.
 
 ### Host offload
 
@@ -172,6 +185,8 @@ The first, positional model still accepts a repo id, safetensors directory, or G
 | `--model name=path` | Add a model; clients select it with `model: "name"` |
 | `kv-tokens=N` | Override this model's cache budget; required with `--no-elastic-kv` |
 | `max-num-seqs=N` | Override its maximum simultaneous requests |
+| `device=N` | Place this model on one GPU |
+| `devices=A:B:...` | Split this model across these GPUs |
 | `max-model-len=N` | Override its context limit |
 | `spec=mtp\|dflash` | Enable speculation for this model; defaults its draft token count to 3 |
 | `draft-tokens=N`, `spec-max-lanes=N\|all` | Override this model's speculation settings |
@@ -196,7 +211,7 @@ advance. Management endpoints accept `?model=NAME` to select a particular model.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--enable-sleep-mode` | off | Enable `/sleep` and `/wake_up` to release and restore GPU memory while preserving model state; one GPU only |
+| `--enable-sleep-mode` | off | Enable `/sleep` and `/wake_up` to release and restore GPU memory while preserving model state across its GPUs |
 
 See the [API guide](api.md#sleep-mode) for commands and behavior while asleep.
 

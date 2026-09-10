@@ -69,6 +69,7 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    binder.set_layer_range(options.pipeline_stage_first, options.pipeline_stage_last);
     binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
                        static_cast<std::uint32_t>(options.pipeline_stage_first));
     auto plan = detail::bind_artifact(binder, family::startup_features(options), weights_profile,

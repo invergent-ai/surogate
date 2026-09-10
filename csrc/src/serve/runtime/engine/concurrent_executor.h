@@ -84,8 +84,13 @@ public:
         {
             std::lock_guard lock(queue_mutex_);
             asleep_ = asleep;
+            accepting_ = !asleep;
         }
         queue_cv_.notify_all();
+    }
+    void begin_sleep() {
+        std::lock_guard lock(queue_mutex_);
+        accepting_ = false;
     }
     [[nodiscard]] bool asleep() const {
         std::lock_guard lock(queue_mutex_);
@@ -189,7 +194,7 @@ public:
         std::uint64_t request_id = 0;
         {
             std::lock_guard lock(queue_mutex_);
-            if (asleep_) {
+            if (!accepting_) {
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "the model is asleep; wake it with POST /wake_up");
             }
@@ -1816,6 +1821,7 @@ private:
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
     bool asleep_ = false; ///< guarded by queue_mutex_; set by sleep(), cleared by wake()
+    bool accepting_ = true; ///< close admission while draining, before parking the worker
     std::deque<std::shared_ptr<Request>> pending_;
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;

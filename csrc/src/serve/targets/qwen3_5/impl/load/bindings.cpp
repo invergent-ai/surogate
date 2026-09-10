@@ -287,6 +287,7 @@ void bind_text_layers(artifact::Binder& binder, BindingPlan& out) {
     out.text_layers.resize(static_cast<std::size_t>(g.layers));
     for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
+        target.resident = binder.contains_layer(static_cast<int>(layer));
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
         target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
                                                                 NumericFormat::BF16, {g.hidden});
@@ -445,7 +446,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             "artifact has no MTP block (the source checkpoint was "
             "exported without nextn); run without --spec mtp");
     }
-    const artifact::TensorPlacement mtp_placement = features.mtp()
+    out.resident_mtp = features.mtp() && binder.contains_layer(g.layers - 1);
+    const artifact::TensorPlacement mtp_placement = out.resident_mtp
                                                         ? artifact::TensorPlacement::Device
                                                         : artifact::TensorPlacement::ValidateOnly;
     const auto bind_mtp                           = [&](std::string_view name, NumericFormat format,
@@ -552,6 +554,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         const TextLayerPlan& source = plan.text_layers[layer];
+        if (!source.resident) {
+            if (source.is_full_attention) { ++full_index; } else { ++gdn_index; }
+            continue;
+        }
         if (source.is_full_attention) {
             FullAttentionWeights& target = full_layers.at(full_index++);
             target.input_norm            = artifact::materialized_tensor(backing, source.input_norm,
@@ -602,7 +608,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                            NumericFormat::I32, {g.draft_vocab});
     }
 
-    if (plan.features.mtp() && plan.has_mtp) {
+    if (plan.resident_mtp && plan.has_mtp) {
         auto& mtp            = runtime.mtp.emplace();
         // The draft block projects [embedding ; hidden] -- two hidden widths -- not a query
         // plane. The binder above already says `mtp_input_rows()`; this said `query_size()`,

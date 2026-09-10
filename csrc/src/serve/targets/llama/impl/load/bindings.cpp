@@ -81,6 +81,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
     const NumericFormat weights = endpoint_format(weights_profile);
     for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
+        target.resident = binder.contains_layer(static_cast<int>(layer));
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
         target.input_norm        = artifact::bind_device_tensor(
             binder, prefix + "input_norm", NumericFormat::BF16, {g.hidden});
@@ -165,6 +166,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                   g.output_rows, g.hidden);
     for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
         const TextLayerPlan& source  = plan.text_layers[layer];
+        if (!source.resident) { continue; }
         FullAttentionWeights& target = runtime.full_layers.at(layer);
         target.input_norm            = artifact::materialized_tensor(
             backing, source.input_norm, NumericFormat::BF16, {g.hidden});

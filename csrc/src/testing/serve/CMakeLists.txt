@@ -128,6 +128,14 @@ sinfer_add_test(sinfer_tensor_test       SOURCES test_tensor.cpp)
 sinfer_add_test(sinfer_arena_test        SOURCES test_arena.cpp)
 sinfer_add_test(sinfer_request_memory_test SOURCES test_request_memory.cpp)
 sinfer_add_test(sinfer_admission_policy_test SOURCES test_admission_policy.cpp)
+sinfer_add_test(sinfer_model_device_budget_test SOURCES test_model_device_budget.cpp)
+target_compile_options(sinfer_model_device_budget_test PRIVATE -UNDEBUG)
+sinfer_add_test(sinfer_pipeline_partition_test SOURCES test_pipeline_partition.cpp)
+target_compile_options(sinfer_pipeline_partition_test PRIVATE -UNDEBUG)
+sinfer_add_test(sinfer_multi_device_test SOURCES test_multi_device.cpp LIBRARIES sinfer_serve)
+target_compile_options(sinfer_multi_device_test PRIVATE -UNDEBUG)
+set_tests_properties(sinfer_multi_device_test PROPERTIES SKIP_RETURN_CODE 77)
+
 sinfer_add_test(sinfer_high_concurrency_test
   SOURCES test_high_concurrency.cpp
   LIBRARIES sinfer_serve)

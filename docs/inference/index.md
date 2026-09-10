@@ -15,7 +15,7 @@ surogate serve Qwen/Qwen3.6-27B --port 8080
 - **Speculative decoding** — speed up supported models with MTP or DFlash (`--spec`).
 - **Models larger than GPU memory** — use system RAM for part of a model, or spread supported
   models across several GPUs.
-- **Several models on one GPU**, with optional sleep mode to free memory when a model is idle.
+- **Several models across GPUs**, with per-model placement and optional sleep mode to free memory when a model is idle.
 - **Images and video** for supported vision models (`--vision`).
 - **Embeddings** on GPU or CPU through `surogate serve --embed`.
 

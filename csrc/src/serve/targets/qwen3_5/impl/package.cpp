@@ -80,6 +80,7 @@ std::string_view Package::target_key_for(std::string_view model) noexcept {
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    binder.set_layer_range(options.pipeline_stage_first, options.pipeline_stage_last);
     binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
                        static_cast<std::uint32_t>(options.pipeline_stage_first));
     return LoadPlan(std::make_unique<LoadPlan::Impl>(

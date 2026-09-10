@@ -101,23 +101,7 @@ int main(int argc, char** argv) {
         scheduled.push_back(
             {server.public_model_id(), &service, priority_of(options.model_priority)});
         for (const auto& extra : options.extra_models) {
-            sinfer::serve::ServeOptions extra_options = options;
-            extra_options.artifact_path             = extra.artifact_path;
-            extra_options.model_id_override         = extra.name;
-            extra_options.kv_capacity =
-                extra.kv_tokens != 0 ? sinfer::KvCapacityPolicy::explicit_capacity(extra.kv_tokens)
-                                     : options.kv_capacity; // elastic: automatic against the ledger
-            if (extra.max_num_seqs != 0) { extra_options.max_concurrency = extra.max_num_seqs; }
-            if (extra.max_context != 0) { extra_options.max_context = extra.max_context; }
-            extra_options.extra_models.clear();
-            // Each extra brings its own adapters (lora=name:path keys); capacity
-            // knobs (--max-loras/--max-lora-rank) are shared with the primary.
-            extra_options.enable_lora  = !extra.lora.empty();
-            extra_options.lora_modules = extra.lora;
-            // Speculative backends are artifact-specific, so extras never
-            // inherit the primary's flag -- they opt in per model via
-            // spec=mtp|dflash[,draft-tokens=N].
-            extra_options.speculative = extra.speculative;
+            const auto extra_options = sinfer::serve::extra_model_options(options, extra);
             const auto extra_start = Clock::now();
             try {
                 extra_services.push_back(std::make_unique<sinfer::serve::GenerationService>(
@@ -129,10 +113,17 @@ int main(int argc, char** argv) {
                     sinfer::serve::ConsoleLogLevel::Info,
                     std::string("model '") + extra.name + "' did not fit awake (" +
                         first_error.what() + "); sleeping idle models and retrying");
-                service.sleep();
-                for (auto& built : extra_services) {
-                    if (built->active_requests() == 0) { built->sleep(); }
-                }
+                const auto selected = extra_options.devices.empty()
+                    ? std::vector<int>{extra_options.device} : extra_options.devices;
+                const auto park = [&](sinfer::serve::GenerationService& built) {
+                    const auto devices = built.devices();
+                    const bool overlaps = std::any_of(devices.begin(), devices.end(), [&](int device) {
+                        return std::find(selected.begin(), selected.end(), device) != selected.end();
+                    });
+                    if (overlaps && built.active_requests() == 0) { built.sleep(); }
+                };
+                park(service);
+                for (auto& built : extra_services) { park(*built); }
                 extra_services.push_back(std::make_unique<sinfer::serve::GenerationService>(
                     extra_options, load_progress.callback()));
             }
@@ -185,25 +176,29 @@ int main(int argc, char** argv) {
         if (options.enable_sleep_mode && !options.extra_models.empty()) {
             // Budget = what the awake models occupy plus what is still free,
             // minus headroom for transient allocations outside the arenas.
-            std::size_t awake_bytes = 0;
+            std::map<int, std::size_t> budgets;
             for (const auto& entry : scheduled) {
-                if (!entry.service->is_sleeping()) {
-                    awake_bytes += entry.service->resident_bytes();
+                for (int device : entry.service->devices()) {
+                    budgets.try_emplace(device, 0);
+                    if (!entry.service->is_sleeping()) {
+                        budgets[device] += entry.service->resident_bytes(device);
+                    }
                 }
             }
-            const std::size_t free_bytes = sinfer::device_free_bytes(options.devices.empty()
-                                                                          ? options.device
-                                                                          : options.devices.front());
-            const std::size_t headroom = 1ULL << 30;
-            const std::size_t budget =
-                awake_bytes + (free_bytes > headroom ? free_bytes - headroom : 0);
-            scheduler = std::make_unique<sinfer::serve::ModelScheduler>(std::move(scheduled),
-                                                                        budget);
+            constexpr std::size_t headroom = 1ULL << 30;
+            for (auto& [device, budget] : budgets) {
+                const auto free = sinfer::device_free_bytes(device);
+                budget += free > headroom ? free - headroom : 0;
+            }
+            scheduler = std::make_unique<sinfer::serve::ModelScheduler>(std::move(scheduled), budgets);
             server.attach_scheduler(*scheduler);
             std::ostringstream plan;
-            plan << "multi-model scheduler: budget "
-                 << static_cast<double>(budget) / (1024.0 * 1024.0 * 1024.0) << " GiB across "
-                 << (options.extra_models.size() + 1) << " models";
+            plan << "multi-model scheduler:";
+            for (const auto& [device, budget] : budgets) {
+                plan << " GPU " << device << " budget "
+                     << static_cast<double>(budget) / (1024.0 * 1024.0 * 1024.0) << " GiB;";
+            }
+            plan << ' ' << (options.extra_models.size() + 1) << " models";
             sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, plan.str());
         }
 

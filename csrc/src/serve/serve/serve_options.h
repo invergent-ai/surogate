@@ -44,6 +44,8 @@ struct ServeOptions {
     struct ExtraModel {
         std::string name;          ///< served model id; requests route by it
         std::string artifact_path;
+        std::optional<int> device;
+        std::vector<int> devices; ///< devices=A:B:C; empty inherits the primary placement
         std::uint32_t kv_tokens    = 0; ///< required: extras size their KV explicitly
         std::uint32_t max_num_seqs = 0; ///< 0 = inherit the primary's
         std::uint32_t max_context  = 0; ///< 0 = inherit the primary's
@@ -143,6 +145,7 @@ struct ServeOptions {
 };
 
 ServeOptions parse_serve_options(int argc, char** argv);
+ServeOptions extra_model_options(const ServeOptions& primary, const ServeOptions::ExtraModel& extra);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_id);
 std::string serve_usage_text(const char* argv0);

@@ -38,6 +38,8 @@ public:
 
     template <class T> T& slot();
 
+    std::atomic<bool> sleepable_allocations{false};
+
 private:
     struct Slot {
         std::atomic<void*> value{nullptr};

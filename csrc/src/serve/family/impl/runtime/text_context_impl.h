@@ -1747,8 +1747,14 @@ void TextContext::capture_per_layer_source(const Tensor& x, cudaStream_t stream)
         // Allocated from the round's arena, beside `x` itself, so it lives as long as the
         // layer loop that reads it.
         active_embedded_ = work_.alloc(DType::BF16, {x.ne[0], x.ne[1]});
-        CUDA_CHECK(cudaMemcpyAsync(active_embedded_.data, x.data, x.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
+        if (stage_embeds()) {
+            CUDA_CHECK(cudaMemcpyAsync(active_embedded_.data, x.data, x.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        } else {
+            // Per-layer inputs use the original token embedding, not the residual received
+            // from the preceding stage. Every stage keeps the embedding table for this.
+            Hooks::embed(weights_, active_ids_, active_embedded_, work_, stream);
+        }
     } else {
         (void)x;
         (void)stream;

@@ -60,6 +60,7 @@ struct AttentionPlan {
 };
 
 struct TextLayerPlan {
+    bool resident = true;
     artifact::ObjectHandle input_norm;
     AttentionPlan attention;
     artifact::ObjectHandle post_attention_norm;

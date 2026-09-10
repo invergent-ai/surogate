@@ -20,8 +20,6 @@
 namespace sinfer {
 namespace {
 
-std::atomic<bool> g_sleepable{false};
-
 void driver_check(CUresult result, const char* what) {
     if (result == CUDA_SUCCESS) { return; }
     const char* text = nullptr;
@@ -44,6 +42,7 @@ struct Region {
 struct SparseEntry {
     SparseRegionHooks hooks;
     bool asleep = false;
+    std::size_t parked_bytes = 0;
 };
 
 struct Registry {
@@ -91,8 +90,12 @@ void unmap_region(Region& region) {
 
 } // namespace
 
-bool sleepable_allocations_enabled() noexcept { return g_sleepable.load(); }
-void set_sleepable_allocations(bool enabled) noexcept { g_sleepable.store(enabled); }
+bool sleepable_allocations_enabled() noexcept {
+    return ops::current_ops_context().sleepable_allocations.load();
+}
+void set_sleepable_allocations(bool enabled) noexcept {
+    ops::current_ops_context().sleepable_allocations.store(enabled);
+}
 
 void* sleep_alloc(std::size_t bytes, int device) {
     // The driver API needs an initialized context; the runtime call ensures one.
@@ -130,7 +133,13 @@ bool sleep_free(void* base) noexcept {
         registry().regions.erase(found);
     }
     try {
-        if (!region.asleep) { unmap_region(region); }
+        ScopedDevice selected(region.device);
+        if (!region.asleep) {
+            // Preserve cudaFree's lifetime guarantee for arenas used by asynchronous
+            // kernels. VMM unmapping alone does not wait for those consumers.
+            CUDA_CHECK(cudaDeviceSynchronize());
+            unmap_region(region);
+        }
         driver_check(cuMemAddressFree(region.va, region.bytes), "cuMemAddressFree");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "sleep_free: %s\n", error.what());
@@ -168,7 +177,8 @@ std::size_t sleep_device(int device, const void* owner) {
     for (auto& [key, entry] : registry().sparse) {
         if (entry.hooks.device != device || entry.asleep) { continue; }
         if (owner != nullptr && entry.hooks.owner != owner) { continue; }
-        released += entry.hooks.sleep_fn();
+        entry.parked_bytes = entry.hooks.sleep_fn();
+        released += entry.parked_bytes;
         entry.asleep = true;
     }
     double pin_ms = 0, copy_ms = 0, unmap_ms = 0;
@@ -230,14 +240,18 @@ std::size_t wake_device(int device, const void* owner) {
     return mapped;
 }
 
-std::size_t sleep_owned_bytes(const void* owner) noexcept {
+std::size_t sleep_owned_bytes(const void* owner, int device) noexcept {
     const std::lock_guard<std::mutex> lock(registry().mutex);
     std::size_t bytes = 0;
     for (const auto& [base, region] : registry().regions) {
+        if (device >= 0 && region.device != device) { continue; }
         if (owner == nullptr || region.owner == owner) { bytes += region.bytes; }
     }
     for (const auto& [key, entry] : registry().sparse) {
-        if (owner == nullptr || entry.hooks.owner == owner) { bytes += entry.hooks.mapped_bytes(); }
+        if (device >= 0 && entry.hooks.device != device) { continue; }
+        if (owner == nullptr || entry.hooks.owner == owner) {
+            bytes += entry.asleep ? entry.parked_bytes : entry.hooks.mapped_bytes();
+        }
     }
     return bytes;
 }

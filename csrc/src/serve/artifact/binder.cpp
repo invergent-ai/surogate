@@ -144,10 +144,22 @@ std::span<const std::byte> Binder::run_span(const PayloadRun& run) const {
     return reader_.run_span(run);
 }
 
+void Binder::set_layer_range(int first, int last) {
+    if (first < 0 || last < 0 || (last == 0 ? first != 0 : first >= last)) {
+        throw ArtifactError("invalid pipeline layer range");
+    }
+    stage_first_ = first;
+    stage_last_ = last;
+}
+
 void Binder::materialize_on_device(ObjectHandle handle) {
     const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr) {
         throw ArtifactError("resource cannot be materialized as a device tensor");
+    }
+    if (const auto layer = decoder_layer(tensor->name); layer && !contains_layer(*layer)) {
+        validate_only(handle);
+        return;
     }
     if (offloads(tensor->name)) {
         bank_on_host(handle);
@@ -185,6 +197,10 @@ void Binder::bank_on_host(ObjectHandle handle) {
     const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr) {
         throw ArtifactError("a resource cannot be banked in device-mapped host memory");
+    }
+    if (const auto layer = decoder_layer(tensor->name); layer && !contains_layer(*layer)) {
+        validate_only(handle);
+        return;
     }
     if (planned_[handle.index]) {
         throw ArtifactError("artifact object has more than one materialization placement: " +

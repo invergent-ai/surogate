@@ -100,6 +100,27 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    const auto placed = parse({"sinfer-serve", "model.sinfer", "--devices", "2,3",
+                               "--enable-sleep-mode", "--model", "other=other.sinfer,devices=5:6",
+                               "--model", "replica=model.sinfer,device=7"});
+    const auto other = sinfer::serve::extra_model_options(placed, placed.extra_models[0]);
+    const auto replica = sinfer::serve::extra_model_options(placed, placed.extra_models[1]);
+    failures += check(other.devices == std::vector<int>({5, 6}) && other.device == 5 &&
+                          other.enable_sleep_mode && other.extra_models.empty() &&
+                          replica.devices.empty() && replica.device == 7,
+                      "extra model placement did not override the primary pipeline");
+    const auto inherited_placement = parse({"sinfer-serve", "model.sinfer", "--devices", "2,3",
+                                   "--model", "other=other.sinfer"});
+    failures += check(sinfer::serve::extra_model_options(inherited_placement, inherited_placement.extra_models[0]).devices ==
+                          inherited_placement.devices, "extra model did not inherit device placement");
+    for (const auto* invalid : {"x=m.sinfer,devices=1:1", "x=m.sinfer,devices=1:",
+                               "x=m.sinfer,device=-1", "x=m.sinfer,device=0,devices=1:2"}) {
+        bool rejected = false;
+        try { (void)parse({"sinfer-serve", "model.sinfer", "--model", invalid}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid extra-model GPU placement was accepted");
+    }
+
     const auto wide = parse({"sinfer-serve", "model.sinfer", "--max-num-seqs", "513",
                              "--model", "extra=other.sinfer,max-num-seqs=257"});
     failures += check(wide.max_concurrency == 513 && wide.extra_models.size() == 1 &&

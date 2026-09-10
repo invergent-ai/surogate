@@ -176,7 +176,10 @@ public:
     /// Publish a complete adapter from GPU tensors, then reopen generation.
     void publish_shared_adapter(const std::string& name, const std::vector<DeviceAdapterModule>& modules);
     /// This model's VRAM footprint while awake (sleepable regions).
-    [[nodiscard]] std::size_t resident_bytes() const { return engine_->sleepable_bytes(); }
+    [[nodiscard]] std::size_t resident_bytes(int device = -1) const {
+        return engine_->sleepable_bytes(device);
+    }
+    [[nodiscard]] std::vector<int> devices() const { return engine_->devices(); }
 
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;

@@ -138,8 +138,12 @@ HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
-    const std::size_t queued_requests =
+    std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
+    for (const auto& extra : options_.extra_models) {
+        queued_requests += (extra.max_num_seqs != 0 ? extra.max_num_seqs : options_.max_concurrency)
+                           + static_cast<std::size_t>(options_.max_pending_requests);
+    }
     const std::size_t worker_count = queued_requests + 1;
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, queued_requests);

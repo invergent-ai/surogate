@@ -90,6 +90,7 @@ struct AttentionPlan {
 /// The two named after the family's slots are the two the family already knows
 /// how to apply; the other two ride in the payloads above.
 struct TextLayerPlan {
+    bool resident = true;
     artifact::ObjectHandle input_norm;
     AttentionPlan attention;
     artifact::ObjectHandle pre_feedforward_norm;

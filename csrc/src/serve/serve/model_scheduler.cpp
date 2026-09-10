@@ -1,4 +1,5 @@
 #include "serve/model_scheduler.h"
+#include "serve/model_device_budget.h"
 
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
@@ -19,8 +20,8 @@ std::chrono::milliseconds env_ms(const char* name, std::chrono::milliseconds fal
 }
 } // namespace
 
-ModelScheduler::ModelScheduler(std::vector<Entry> entries, std::size_t budget_bytes)
-    : budget_bytes_(budget_bytes) {
+ModelScheduler::ModelScheduler(std::vector<Entry> entries, std::map<int, std::size_t> device_budgets)
+    : device_budgets_(std::move(device_budgets)) {
     keep_warm_     = env_ms("SUROGATE_MM_KEEPWARM_MS", keep_warm_);
     preempt_after_ = env_ms("SUROGATE_MM_PREEMPT_AFTER_MS", preempt_after_);
     min_dwell_     = env_ms("SUROGATE_MM_MIN_DWELL_MS", min_dwell_);
@@ -80,35 +81,43 @@ void ModelScheduler::ensure_awake(GenerationService* service) {
 }
 
 bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt) {
-    const std::size_t needed = target.entry.service->resident_bytes();
-    auto awake_bytes         = [&] {
-        std::size_t total = 0;
-        for (const auto& state : models_) {
-            if (!state.entry.service->is_sleeping()) {
-                total += state.entry.service->resident_bytes();
+    const auto target_devices = target.entry.service->devices();
+    const auto short_devices = [&] {
+        DeviceBytes needed, resident;
+        for (int device : target_devices) {
+            needed[device] = target.entry.service->resident_bytes(device);
+            for (const auto& state : models_) {
+                if (!state.entry.service->is_sleeping() && state.entry.service != target.entry.service) {
+                    resident[device] += state.entry.service->resident_bytes(device);
+                }
             }
         }
-        return total;
+        return model_memory_shortfall(needed, resident, device_budgets_);
+    };
+    const auto occupies = [](const State& state, const std::vector<int>& devices) {
+        return std::any_of(devices.begin(), devices.end(), [&](int device) {
+            return state.entry.service->resident_bytes(device) != 0;
+        });
     };
     // The cheap move first: an idle awake model's KV is mostly prefix cache, and an elastic
     // pool gives those granules back without the model leaving the device. Shrink every idle
     // neighbour once and re-check before any model is put to sleep.
-    if (awake_bytes() + needed > budget_bytes_) {
+    if (const auto shortfall = short_devices(); !shortfall.empty()) {
         for (auto& state : models_) {
             if (state.entry.service == target.entry.service || state.entry.service->is_sleeping() ||
-                state.entry.service->active_requests() != 0) {
+                state.entry.service->active_requests() != 0 || !occupies(state, shortfall)) {
                 continue;
             }
             state.entry.service->shrink_kv();
         }
     }
-    while (awake_bytes() + needed > budget_bytes_) {
+    for (auto shortfall = short_devices(); !shortfall.empty(); shortfall = short_devices()) {
         State* victim  = nullptr;
         bool busy_pick = false;
         const auto now = Clock::now();
         for (auto& state : models_) {
             if (state.entry.service == target.entry.service) { continue; }
-            if (state.entry.service->is_sleeping()) { continue; }
+            if (state.entry.service->is_sleeping() || !occupies(state, shortfall)) { continue; }
             const bool busy = state.entry.service->active_requests() != 0;
             if (busy && !allow_preempt) { continue; }
             // The preemption fence: a busy model yields only to an equal or
@@ -158,13 +167,20 @@ void ModelScheduler::tick_loop() {
         for (auto& state : models_) {
             GenerationService* service = state.entry.service;
             if (!service->is_sleeping() || service->active_requests() == 0) { continue; }
-            if (try_make_room_locked(state, /*allow_preempt=*/false)) {
-                write_console_log(ConsoleLogLevel::Info,
-                                  "scheduler: re-waking '" + state.entry.name +
-                                      "' to finish its parked generations");
-                service->wake_up();
-                state.woke_at = Clock::now();
-                cv_.notify_all();
+            try {
+                if (try_make_room_locked(state, /*allow_preempt=*/false)) {
+                    write_console_log(ConsoleLogLevel::Info,
+                                      "scheduler: re-waking '" + state.entry.name +
+                                          "' to finish its parked generations");
+                    service->wake_up();
+                    state.woke_at = Clock::now();
+                    cv_.notify_all();
+                }
+            } catch (const std::exception& error) {
+                // A GPU's free memory can change after the budget check. Keep the worker
+                // parked and allow a later tick to retry the remaining device mappings.
+                write_console_log(ConsoleLogLevel::Error,
+                    "scheduler: could not wake '" + state.entry.name + "': " + error.what());
             }
         }
     }

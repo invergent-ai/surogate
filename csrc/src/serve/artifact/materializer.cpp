@@ -39,7 +39,10 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
 
 class Slot {
 public:
-    explicit Slot(std::size_t bytes) : buffer(bytes) {
+    explicit Slot(std::size_t bytes) : buffer(bytes + Reader::direct_io_alignment - 1) {
+        const auto address = reinterpret_cast<std::uintptr_t>(buffer.data());
+        data = reinterpret_cast<std::byte*>(
+            align_up(address, Reader::direct_io_alignment, "read buffer alignment overflows"));
         CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
 
@@ -56,6 +59,7 @@ public:
     }
 
     PinnedHostBuffer buffer;
+    std::byte* data = nullptr;
     cudaEvent_t event = nullptr;
     bool pending      = false;
 };
@@ -465,7 +469,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     std::uint64_t peak_staging = 0;
     for (const Pass& pass : passes) { peak_staging = std::max(peak_staging, pass.staging_bytes); }
     out.stats_.peak_staging_bytes =
-        static_cast<std::uint64_t>(slot_bytes) * slot_count + peak_staging;
+        static_cast<std::uint64_t>(slot_bytes + alignment - 1) * slot_count + peak_staging;
 
     const auto start_time = std::chrono::steady_clock::now();
     if (progress != nullptr && progress->callback) { progress->callback("weights", 0, total); }
@@ -495,7 +499,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                     slot_bytes,
                     align_up(remaining, alignment, "artifact direct I/O request overflows u64")));
                 auto destination =
-                    std::span<std::byte>(static_cast<std::byte*>(slot.buffer.data()), request);
+                    std::span<std::byte>(slot.data, request);
                 const std::size_t bytes_read = reader.read_direct(span.source, source, destination);
                 const std::uint64_t required = std::min<std::uint64_t>(request, remaining);
                 if (bytes_read < required) {
@@ -527,7 +531,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                         CUDA_CHECK(cudaMemcpyAsync(
                             range.destination +
                                 static_cast<std::size_t>(copy_begin - range.source_begin),
-                            static_cast<std::byte*>(slot.buffer.data()) +
+                            slot.data +
                                 static_cast<std::size_t>(copy_begin - source),
                             amount, cudaMemcpyHostToDevice, device.load_stream));
                         copied =

@@ -428,7 +428,9 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     act += token * kDecodeScratch;
     if (adapter_slot) { adapter_slot += token * slot_stride; }
     if (lora_low) { lora_low += token * 2 * kPaths * kMoeLoraMaxRank; }
-    if (adapters) { pdl::wait_for_dependencies(); }
+    // The input can be produced by preparation kernels in the routing chain too.
+    // Wait before staging it, not only before reading the selected expert indices.
+    pdl::wait_for_dependencies();
     __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -443,7 +445,6 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     float gate  = 0.0f;
     float up    = 0.0f;
     if (warp < kTopK) {
-        pdl::wait_for_dependencies();
         const int expert   = ids[warp];
         const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
         const int row_base = block * (2 * kIntermediate);
@@ -496,6 +497,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
+    if constexpr (!Adaptive) { pdl::wait_for_dependencies(); }
     if constexpr (Adaptive) {
         if (*adaptive_route_jobs >= 0) { return; }
     }
@@ -516,15 +518,6 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
         }
         __syncthreads();
 
-        constexpr int kRouterPartitions = 4;
-        const int activation_begin      = (token * kPaths + path) * kIntermediate;
-        // Routed paths need S2's ids. A shared path is independent only when its output lies
-        // beyond the partial-score prefix that S2 may still read from the lifetime-unioned scratch.
-        const bool must_wait_for_s2 =
-            path < kTopK || activation_begin < tokens * kRouterRows * kRouterPartitions;
-        if constexpr (!Adaptive) {
-            if (must_wait_for_s2) { pdl::wait_for_dependencies(); }
-        }
         float gate = 0.0f;
         float up   = 0.0f;
         if (path < kTopK) {
@@ -1183,4 +1176,3 @@ void decode_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeigh
     }
     launch_d4_dependent(weights, destination, workspace, stream, adapters, adapter_slot);
 }
-

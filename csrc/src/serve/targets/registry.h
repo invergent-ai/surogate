@@ -121,6 +121,16 @@ using LoadedQwen38FlashNext = LoadedTarget<Qwen38FlashNext>;
 using Qwen38FlashNextInstance = TargetInstance<Qwen38FlashNext>;
 
 
+using Gemma3Pipeline = runtime::PipelineInstance<Gemma3Instance>;
+using Gemma4Pipeline = runtime::PipelineInstance<Gemma4Instance>;
+using Gemma4EPipeline = runtime::PipelineInstance<Gemma4EInstance>;
+using Gemma4MoePipeline = runtime::PipelineInstance<Gemma4MoeInstance>;
+using Lfm2Pipeline = runtime::PipelineInstance<Lfm2Instance>;
+using LlamaPipeline = runtime::PipelineInstance<LlamaInstance>;
+using SparkPipeline = runtime::PipelineInstance<SparkInstance>;
+using Qwen3DensePipeline = runtime::PipelineInstance<Qwen3DenseInstance>;
+using Qwen3MoePipeline = runtime::PipelineInstance<Qwen3MoeInstance>;
+
 using Glm5NextPipeline   = runtime::PipelineInstance<Glm5NextInstance>;
 using Qwen38FlashNextPipeline = runtime::PipelineInstance<Qwen38FlashNextInstance>;
 using Qwen3_5Pipeline    = runtime::PipelineInstance<Qwen3_5Instance>;
@@ -137,6 +147,15 @@ using ActiveTarget =
                  std::unique_ptr<Qwen3_5Instance>,
                  std::unique_ptr<Qwen3_5MoeInstance>,
                  std::unique_ptr<Qwen38FlashNextInstance>,
+                 std::unique_ptr<Gemma3Pipeline>,
+                 std::unique_ptr<Gemma4Pipeline>,
+                 std::unique_ptr<Gemma4EPipeline>,
+                 std::unique_ptr<Gemma4MoePipeline>,
+                 std::unique_ptr<Lfm2Pipeline>,
+                 std::unique_ptr<LlamaPipeline>,
+                 std::unique_ptr<SparkPipeline>,
+                 std::unique_ptr<Qwen3DensePipeline>,
+                 std::unique_ptr<Qwen3MoePipeline>,
                  std::unique_ptr<Glm5NextPipeline>,
                  std::unique_ptr<Qwen38FlashNextPipeline>, std::unique_ptr<Qwen3_5Pipeline>,
                  std::unique_ptr<Qwen3_5MoePipeline>>;

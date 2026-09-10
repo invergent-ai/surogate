@@ -104,6 +104,7 @@ struct AttentionPlan {
 /// Gemma 3 applies `normed * (1 + w)`. The declaration therefore carries no
 /// `unfold_unit_offset` on any of them and `Variant::norm_unit_offset` is false.
 struct TextLayerPlan {
+    bool resident = true;
     artifact::ObjectHandle input_norm;
     AttentionPlan attention;
     artifact::ObjectHandle pre_feedforward_norm;

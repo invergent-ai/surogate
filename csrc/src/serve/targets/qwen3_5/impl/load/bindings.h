@@ -112,6 +112,7 @@ struct GdnPlan {
 };
 
 struct TextLayerPlan {
+    bool resident = true;
     artifact::ObjectHandle input_norm;
     FullAttentionPlan attention{};
     GdnPlan gdn{};
@@ -161,6 +162,7 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head_token_ids;
     /// An MTP-less GGUF export omits the mtp/* objects; speculation needs them.
     bool has_mtp = false;
+    bool resident_mtp = false;
     MtpPlan mtp;
 
     /// The tower the vision objects were bound against: the compiled tower with the

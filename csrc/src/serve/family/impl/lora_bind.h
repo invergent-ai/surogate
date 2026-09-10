@@ -189,11 +189,13 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
     for (int layer = 0; layer < g.layers; ++layer) {
         if (g.attention_schedule_declared ? g.layer_attends(layer) : is_full(layer)) {
             const auto& full = runtime.full_layers.at(full_index++);
+            if (full.input_norm.data == nullptr) { continue; }
             bind_lora_gated_attention(store, layer, full.projection, g);
             store.register_module(layer, "o_proj", {full.output.qdata, kOutputPort, g.query_size(), g.hidden});
             bind_lora_dense_mlp(store, layer, full.post_mixer, g.hidden, g.intermediate);
         } else {
             const auto& linear = runtime.gdn_layers.at(linear_index++);
+            if (linear.input_norm.data == nullptr) { continue; }
             bind_lora_gdn(store, layer, linear, g);
             bind_lora_dense_mlp(store, layer, linear.post_mixer, g.hidden, g.intermediate);
         }
@@ -214,6 +216,7 @@ void bind_lora_moe_hybrid(const Runtime& runtime, const EngineOptions& options, 
     for (int layer = 0; layer < g.layers; ++layer) {
         if (g.attention_schedule_declared ? g.layer_attends(layer) : is_full(layer)) {
             const auto& full = runtime.full_layers.at(full_index++);
+            if (full.input_norm.data == nullptr) { continue; }
             bind_lora_gated_attention(store, layer, full.projection, g);
             store.register_module(layer, "o_proj", {full.output.qdata, kOutputPort, g.query_size(), g.hidden});
             bind_lora_moe(store, layer, [&]() -> const ops::SparseMoeWeights& {
@@ -222,6 +225,7 @@ void bind_lora_moe_hybrid(const Runtime& runtime, const EngineOptions& options, 
             }());
         } else {
             const auto& linear = runtime.gdn_layers.at(linear_index++);
+            if (linear.input_norm.data == nullptr) { continue; }
             bind_lora_gdn(store, layer, linear, g);
             bind_lora_moe(store, layer, [&]() -> const ops::SparseMoeWeights& {
                 if constexpr (requires { linear.post_mixer.op; }) { return linear.post_mixer.op; }

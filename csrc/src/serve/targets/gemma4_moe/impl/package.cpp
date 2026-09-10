@@ -81,6 +81,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
     using Binding = ops::LoraStore::ModuleBinding;
     const family::TextGeometry& g = runtime.geometry;
     for (std::size_t layer = 0; layer < runtime.full_layers.size(); ++layer) {
+        if (runtime.full_layers[layer].input_norm.data == nullptr) { continue; }
         const auto index      = static_cast<std::int32_t>(layer);
         const auto& attention = runtime.full_layers.at(layer);
         // Ports are the ones `variant.cpp` passes to `apply_lora`; with distinct
@@ -142,6 +143,7 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    binder.set_layer_range(options.pipeline_stage_first, options.pipeline_stage_last);
     binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
                        static_cast<std::uint32_t>(options.pipeline_stage_first));
     auto plan = detail::bind_artifact(binder, weights_profile, family::startup_features(options),

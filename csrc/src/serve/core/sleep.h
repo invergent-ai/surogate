@@ -81,7 +81,7 @@ std::size_t wake_device(int device, const void* owner = nullptr);
 
 /// Mapped bytes of the regions owned by `owner` (their VRAM footprint while
 /// awake). The scheduler sizes resident sets with this.
-[[nodiscard]] std::size_t sleep_owned_bytes(const void* owner) noexcept;
+[[nodiscard]] std::size_t sleep_owned_bytes(const void* owner, int device = -1) noexcept;
 
 /// Allocate the pinned host backups for `owner`'s Offload regions without
 /// sleeping anything. First-time pinning runs at ~2 GiB/s, so a model's first

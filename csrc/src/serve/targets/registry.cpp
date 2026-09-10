@@ -1,3 +1,4 @@
+#include "runtime/engine/pipeline_partition.h"
 #include <algorithm>
 #include <optional>
 #include <api/family/text_geometry.h>
@@ -501,63 +502,23 @@ std::vector<int> balanced_stage_bounds(const EngineOptions& options, artifact::R
         marginal[static_cast<std::size_t>(l)] = through > previous ? through - previous : 0;
         previous                              = through;
     }
-    if (std::all_of(marginal.begin(), marginal.end(), [](std::uint64_t b) { return b == 0; })) {
-        std::vector<int> even(static_cast<std::size_t>(stage_count) + 1, 0);
-        for (int s = 0; s <= stage_count; ++s) {
-            even[static_cast<std::size_t>(s)] = layers * s / stage_count;
-        }
-        return even;
-    }
-
-    // Minimise the heaviest stage: the smallest ceiling for which a left-to-right greedy fit
-    // uses no more than `stage_count` stages, binary-searched over the byte range. Every stage
-    // takes at least one layer, which the feasibility test enforces by construction.
-    const std::uint64_t heaviest = *std::max_element(marginal.begin(), marginal.end());
-    std::uint64_t total          = 0;
-    for (const std::uint64_t bytes : marginal) { total += bytes; }
-    const auto stages_needed = [&](std::uint64_t ceiling) {
-        int used             = 1;
-        std::uint64_t filled = 0;
-        for (const std::uint64_t bytes : marginal) {
-            if (filled + bytes > ceiling && filled > 0) {
-                ++used;
-                filled = 0;
+    const auto geometry = Target::declared_geometry(reader);
+    std::vector<int> sources(static_cast<std::size_t>(layers));
+    for (int layer = 0; layer < layers; ++layer) {
+        sources[layer] = layer;
+        if (!geometry.layer_attends(layer) || geometry.layer_owns_kv(layer)) { continue; }
+        for (int earlier = layer - 1; earlier >= 0; --earlier) {
+            if (geometry.layer_attends(earlier) && geometry.layer_owns_kv(earlier) &&
+                geometry.layer_is_windowed(earlier) == geometry.layer_is_windowed(layer)) {
+                sources[layer] = earlier;
+                break;
             }
-            filled += bytes;
         }
-        return used;
-    };
-    std::uint64_t low  = heaviest;
-    std::uint64_t high = total;
-    while (low < high) {
-        const std::uint64_t mid = low + (high - low) / 2;
-        if (stages_needed(mid) <= stage_count) {
-            high = mid;
-        } else {
-            low = mid + 1;
+        if (sources[layer] == layer) {
+            throw std::invalid_argument("shared-KV layer has no preceding source");
         }
     }
-
-    // Lay the layers out under that ceiling, leaving every remaining stage at least one layer.
-    std::vector<int> bounds(static_cast<std::size_t>(stage_count) + 1, 0);
-    int stage            = 0;
-    std::uint64_t filled = 0;
-    for (int l = 0; l < layers; ++l) {
-        const int remaining_stages = stage_count - stage - 1;
-        const int remaining_layers = layers - l;
-        const bool must_close      = remaining_layers <= remaining_stages;
-        if (stage + 1 < stage_count && filled > 0 &&
-            (must_close || filled + marginal[static_cast<std::size_t>(l)] > low)) {
-            ++stage;
-            bounds[static_cast<std::size_t>(stage)] = l;
-            filled                                  = 0;
-        }
-        filled += marginal[static_cast<std::size_t>(l)];
-    }
-    for (int s = stage + 1; s <= stage_count; ++s) {
-        bounds[static_cast<std::size_t>(s)] = layers;
-    }
-    return bounds;
+    return runtime::pipeline_partition(marginal, sources, stage_count);
 }
 
 template <class Target>
@@ -851,13 +812,25 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
     }
     const auto dispatch = [&]<class Target, class Loaded, class Instance>(
                               std::optional<ConstructedTarget>& out) {
-        if (out.has_value() || identity.architecture != Target::target_key) { return; }
+        if (out.has_value()) { return; }
+        if constexpr (requires { Target::accepts_architecture(identity.architecture); }) {
+            if (!Target::accepts_architecture(identity.architecture)) { return; }
+        } else if (identity.architecture != Target::target_key) { return; }
         out = construct_pipeline<Target, Loaded, Instance>(
             options, reader, load_start,
             Target::target_key,
             Target::declared_geometry(reader).layers);
     };
     std::optional<ConstructedTarget> constructed;
+    dispatch.template operator()<Gemma3, LoadedGemma3, Gemma3Instance>(constructed);
+    dispatch.template operator()<Gemma4, LoadedGemma4, Gemma4Instance>(constructed);
+    dispatch.template operator()<Gemma4E, LoadedGemma4E, Gemma4EInstance>(constructed);
+    dispatch.template operator()<Gemma4Moe, LoadedGemma4Moe, Gemma4MoeInstance>(constructed);
+    dispatch.template operator()<Lfm2, LoadedLfm2, Lfm2Instance>(constructed);
+    dispatch.template operator()<Llama, LoadedLlama, LlamaInstance>(constructed);
+    dispatch.template operator()<Spark, LoadedSpark, SparkInstance>(constructed);
+    dispatch.template operator()<Qwen3Dense, LoadedQwen3Dense, Qwen3DenseInstance>(constructed);
+    dispatch.template operator()<Qwen3Moe, LoadedQwen3Moe, Qwen3MoeInstance>(constructed);
     dispatch.template operator()<Glm5Next, LoadedGlm5Next, Glm5NextInstance>(constructed);
     dispatch.template operator()<Qwen38FlashNext, LoadedQwen38FlashNext,
                                  Qwen38FlashNextInstance>(constructed);

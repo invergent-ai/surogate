@@ -150,7 +150,8 @@ public:
 
     /// VRAM this engine's sleepable regions occupy while awake -- its cost in
     /// a resident set. Zero when built without sleep_enable.
-    [[nodiscard]] std::size_t sleepable_bytes() const;
+    [[nodiscard]] std::size_t sleepable_bytes(int device = -1) const;
+    [[nodiscard]] std::vector<int> devices() const;
 
     /// This engine's adapter store (runtime load/unload operates on it).
     /// The CUDA device this engine's memory lives on. A thread that touches that

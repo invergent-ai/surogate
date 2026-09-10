@@ -174,8 +174,9 @@ std::string serve_usage_text(const char* argv0) {
            "         command-line compatibility, and --no-enable-prefix-caching turns it off.\n"
            "       --gpu-layers N (aliases -ngl, --n-gpu-layers) keeps the first N decoder layers\n"
            "         on the GPU; 0 offloads them all, all keeps them resident.\n"
-           "       --model adds a prepared model with optional kv-tokens, max-num-seqs,\n"
-           "         max-model-len, spec, draft-tokens, spec-max-lanes, priority and lora overrides.\n"
+           "       --model adds a prepared model with optional device=N or devices=A:B:C,\n"
+           "         kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, spec-max-lanes,\n"
+           "         priority and lora overrides.\n"
            "       --enable-lora enables adapters; --lora-modules loads named adapters at startup.\n"
            "         --max-loras defaults to 1 and --max-lora-rank to 32 per model.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -448,6 +449,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     extra.name          = key;
                     extra.artifact_path = val;
                     first               = false;
+                } else if (key == "device") {
+                    if (extra.device || !extra.devices.empty()) {
+                        throw std::invalid_argument("--model: specify device or devices only once");
+                    }
+                    extra.device = parse_nonnegative_int(val.c_str(), "model device");
+                } else if (key == "devices") {
+                    if (extra.device || !extra.devices.empty()) {
+                        throw std::invalid_argument("--model: specify device or devices only once");
+                    }
+                    std::size_t begin = 0;
+                    while (begin <= val.size()) {
+                        const auto end = val.find(':', begin);
+                        const auto item = val.substr(begin, end == std::string::npos ? end : end - begin);
+                        const int device = parse_nonnegative_int(item.c_str(), "model devices");
+                        if (std::find(extra.devices.begin(), extra.devices.end(), device) != extra.devices.end()) {
+                            throw std::invalid_argument("--model: devices must contain distinct GPUs");
+                        }
+                        extra.devices.push_back(device);
+                        if (end == std::string::npos) { break; }
+                        begin = end + 1;
+                    }
                 } else if (key == "kv-tokens") {
                     extra.kv_tokens = parse_model_count(val, "kv-tokens");
                 } else if (key == "max-num-seqs") {
@@ -488,7 +510,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 } else {
                     throw std::invalid_argument(
                         "--model: unknown key '" + key +
-                        "' (kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, "
+                        "' (device, devices, kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, "
                         "spec-max-lanes, priority, lora)");
                 }
                 if (comma == std::string::npos) { break; }
@@ -651,11 +673,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             names.push_back(extra.name);
         }
-        if (options.devices.size() > 1) {
-            throw std::invalid_argument(
-                "--model extras support single-device serving today (the primary may still "
-                "pipeline; run extras on their own devices via their own flags later)");
-        }
         // One flat namespace: a request selects by the single `model` string, so
         // every served id and every adapter name -- the primary's and each
         // extra's -- must be distinct. Served-id-vs-adapter collisions that
@@ -676,11 +693,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     "because a request selects by the single `model` field");
             }
         }
-    }
-    if (options.enable_sleep_mode && options.devices.size() > 1) {
-        throw std::invalid_argument(
-            "--enable-sleep-mode supports single-device serving today; pipeline stages would "
-            "each need their own sleep transition");
     }
     if (options.enable_lora) {
         // Zero modules is a valid start: adapters can arrive later through
@@ -763,6 +775,28 @@ std::string resolve_public_model_id(const ServeOptions& options,
         throw std::logic_error("loaded artifact model_id must not be empty");
     }
     return std::string(artifact_model_id);
+}
+
+ServeOptions extra_model_options(const ServeOptions& primary, const ServeOptions::ExtraModel& extra) {
+    ServeOptions out = primary;
+    out.artifact_path = extra.artifact_path;
+    out.model_id_override = extra.name;
+    out.extra_models.clear();
+    if (extra.device) {
+        out.device = *extra.device;
+        out.devices.clear();
+    } else if (!extra.devices.empty()) {
+        out.devices = extra.devices;
+        out.device = extra.devices.front();
+    }
+    if (extra.kv_tokens != 0) { out.kv_capacity = KvCapacityPolicy::explicit_capacity(extra.kv_tokens); }
+    if (extra.max_num_seqs != 0) { out.max_concurrency = extra.max_num_seqs; }
+    if (extra.max_context != 0) { out.max_context = extra.max_context; }
+    out.enable_lora = !extra.lora.empty();
+    out.lora_modules = extra.lora;
+    out.speculative = extra.speculative;
+    out.model_priority = extra.priority;
+    return out;
 }
 
 } // namespace sinfer::serve

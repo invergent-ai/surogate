@@ -8,8 +8,8 @@ GGUF file. The first start prepares the model and saves the result under
 surogate serve Qwen/Qwen3.6-27B --port 8080
 ```
 
-The examples below cover quantized models, models larger than GPU memory, several models on
-one GPU, and embeddings. See the [CLI reference](cli.md) for all options.
+The examples below cover quantized models, models larger than GPU memory, several models across
+GPUs, and embeddings. See the [CLI reference](cli.md) for all options.
 
 ## NVFP4 model
 
@@ -230,6 +230,11 @@ surogate serve nvidia/Qwen3.6-27B-NVFP4 --served-model-name big \
 
 The first model accepts a repo id, local safetensors directory, or GGUF as usual. Additional
 models use cache paths. Check `/v1/models` for all available names.
+
+To place an additional model on another GPU, append `,device=1` to its `--model` value.
+For a separate GPU group, use `,devices=2:3`. Without a placement override, it uses the
+primary model's GPUs. You can load the same artifact under different names to serve
+independent replicas from this one server. See [Devices](cli.md#devices) for examples.
 
 ### Cache memory grows with demand
 

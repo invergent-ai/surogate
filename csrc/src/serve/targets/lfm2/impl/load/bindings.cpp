@@ -91,6 +91,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
     out.text_layers.resize(static_cast<std::size_t>(g.layers));
     for (std::size_t layer = 0; layer < out.text_layers.size(); ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
+        target.resident = binder.contains_layer(static_cast<int>(layer));
         const std::string prefix = layer_prefix(layer);
         target.attends           = g.layer_attends(static_cast<std::int32_t>(layer));
         // Both kinds carry these three: the mixer's input norm, the FFN's, and the FFN.
@@ -234,6 +235,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     std::size_t conv_index = 0;
     for (std::size_t layer = 0; layer < plan.text_layers.size(); ++layer) {
         const TextLayerPlan& source = plan.text_layers[layer];
+        if (!source.resident) {
+            if (source.attends) { ++full_index; } else { ++conv_index; }
+            continue;
+        }
         const Tensor input_norm = artifact::materialized_tensor(backing, source.input_norm,
                                                                 NumericFormat::BF16, {g.hidden});
         const Tensor post_norm  = artifact::materialized_tensor(

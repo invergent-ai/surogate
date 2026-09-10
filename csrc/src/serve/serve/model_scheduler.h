@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,12 +39,12 @@ public:
         int priority               = 1; ///< 0 low, 1 normal, 2 high
     };
 
-    /// `budget_bytes` is the VRAM the resident set may use (measured free at
+    /// `device_budgets` records the VRAM on each GPU the resident set may use (measured free at
     /// startup plus what the already-awake models occupy). The constructor also
     /// pre-pins every model's host backup -- first-time pinning runs at
     /// ~2 GiB/s and must never land on some other model's requester -- and
     /// starts the re-wake tick that resumes preempted in-flight work.
-    ModelScheduler(std::vector<Entry> entries, std::size_t budget_bytes);
+    ModelScheduler(std::vector<Entry> entries, std::map<int, std::size_t> device_budgets);
     ~ModelScheduler();
 
     /// Blocks until `service` is awake and fits, waking and evicting as
@@ -67,7 +68,7 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::vector<State> models_;
-    std::size_t budget_bytes_;
+    std::map<int, std::size_t> device_budgets_;
     std::chrono::milliseconds keep_warm_{3000};
     std::chrono::milliseconds preempt_after_{5000};
     std::chrono::milliseconds min_dwell_{2000};

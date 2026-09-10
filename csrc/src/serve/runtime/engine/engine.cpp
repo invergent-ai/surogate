@@ -167,13 +167,16 @@ public:
         // engine's context; the executor's worker thread binds the same object,
         // so addresses captured into graphs now and used by rounds later agree.
         options.ops_context = &ops_context;
+        auto* previous_context = const_cast<ops::EngineOpsContext*>(
+            static_cast<const ops::EngineOpsContext*>(ops::current_ops_owner()));
         ops::bind_ops_context(&ops_context);
         struct ConstructionContextGuard {
+            ops::EngineOpsContext* previous;
             ~ConstructionContextGuard() {
                 set_sleepable_allocations(false);
-                ops::bind_ops_context(nullptr);
+                ops::bind_ops_context(previous);
             }
-        } construction_context_guard;
+        } construction_context_guard{previous_context};
         // surogate vendor patch (PATCHES.md #20): the engine opts into the
         // derived FP8 prefill plane (op tests stay int8-exact by default;
         // SUROGATE_SERVE_FP8_PREFILL=0 vetoes).
@@ -223,8 +226,6 @@ public:
                                                                               options);
             },
             active);
-        set_sleepable_allocations(false);
-        ops::bind_ops_context(nullptr);
     }
 
     ~Impl() noexcept {
@@ -252,6 +253,7 @@ public:
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
     Executor executor;
+    bool memory_asleep = false;
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
@@ -457,7 +459,7 @@ void Engine::sleep_begin() {
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                executor->set_asleep(true);
+                executor->begin_sleep();
             }
         },
         impl.executor);
@@ -474,9 +476,9 @@ void Engine::sleep(bool allow_active) {
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                if (device_asleep(impl.device.device, &impl.ops_context)) { return; } // idempotent
                 executor->set_asleep(true);
-                if (!allow_active && executor->any_active_lane()) {
+                auto paused = executor->pause_execution();
+                if (!allow_active && !impl.memory_asleep && executor->any_active_lane()) {
                     executor->set_asleep(false);
                     throw std::logic_error(
                         "sleep requires a drained engine; requests are still in flight");
@@ -484,9 +486,18 @@ void Engine::sleep(bool allow_active) {
                 // With submissions refused and no active lanes, the worker loop
                 // is parked on its queue wait; holding the execution mutex makes
                 // that certain before touching memory.
-                auto paused = executor->pause_execution();
-                impl.device.synchronize();
-                const std::size_t released = sleep_device(impl.device.device, &impl.ops_context);
+                const auto participating = devices();
+                // A pipeline may have several groups in flight when preempted. Quiesce every
+                // stage before unmapping any stage's memory; its pinned handoff stays intact.
+                for (int device : participating) {
+                    CUDA_CHECK(cudaSetDevice(device));
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
+                std::size_t released = 0;
+                for (int device : participating) {
+                    released += sleep_device(device, &impl.ops_context);
+                }
+                impl.memory_asleep = true;
                 std::fprintf(stderr, "engine: asleep, released %.2f GiB of device memory\n",
                              static_cast<double>(released) / (1024.0 * 1024.0 * 1024.0));
             }
@@ -502,13 +513,20 @@ void Engine::wake() {
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                if (device_asleep(impl.device.device, &impl.ops_context)) {
-                    auto paused = executor->pause_execution();
-                    const std::size_t mapped = wake_device(impl.device.device, &impl.ops_context);
-                    impl.device.synchronize();
-                    std::fprintf(stderr, "engine: awake, restored %.2f GiB of device memory\n",
-                                 static_cast<double>(mapped) / (1024.0 * 1024.0 * 1024.0));
+                if (!executor->asleep()) {
+                    executor->set_asleep(false); // reopen admission after an abandoned drain
+                    return;
                 }
+                auto paused = executor->pause_execution();
+                executor->set_asleep(true);
+                std::size_t mapped = 0;
+                for (int device : devices()) {
+                    mapped += wake_device(device, &impl.ops_context);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
+                std::fprintf(stderr, "engine: awake, restored %.2f GiB of device memory\n",
+                             static_cast<double>(mapped) / (1024.0 * 1024.0 * 1024.0));
+                impl.memory_asleep = false;
                 executor->set_asleep(false);
             }
         },
@@ -519,7 +537,17 @@ void Engine::prepare_sleep_backup() {
     if (impl_->options.sleep_enable) { sleep_prepare_backups(&impl_->ops_context); }
 }
 
-std::size_t Engine::sleepable_bytes() const { return sleep_owned_bytes(&impl_->ops_context); }
+std::size_t Engine::sleepable_bytes(int device) const {
+    return sleep_owned_bytes(&impl_->ops_context, device);
+}
+
+std::vector<int> Engine::devices() const {
+    auto out = impl_->options.devices;
+    if (out.empty()) { out.push_back(impl_->device.device); }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
 
 ops::LoraStoreSet& Engine::lora_stores() { return impl_->ops_context.slot<ops::LoraStoreSet>(); }
 

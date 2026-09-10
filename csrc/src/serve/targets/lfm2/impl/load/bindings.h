@@ -59,6 +59,7 @@ struct ConvPlan {
 /// and a flag, rather than two vectors whose correspondence to layer numbers would have to be
 /// reconstructed by whoever reads them.
 struct TextLayerPlan {
+    bool resident = true;
     bool attends = false;
     artifact::ObjectHandle input_norm;
     AttentionPlan attention;

@@ -85,6 +85,7 @@ struct GdnPlan {
 };
 
 struct TextLayerPlan {
+    bool resident = true;
     artifact::ObjectHandle input_norm;
     FullAttentionPlan attention{};
     GdnPlan gdn{};
@@ -139,6 +140,7 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
     bool has_mtp = false;
+    bool resident_mtp = false;
     family::VisionGeometry vision_geometry;
     family::VisionBackbonePlan vision_backbone;
     bool has_vision = false;
