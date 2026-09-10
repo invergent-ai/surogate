@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .dflash import DFLASH_SERVE_SECTION, DFLASH_HEAD_OBJECTS, DFLASH_TAIL_OBJECTS
 from .. import nn
 from ..blocks.qwen3_5 import (
     Qwen3_5AttentionBlock,
@@ -274,8 +275,9 @@ class Qwen3_5CausalModel(nn.Model):
     #: the block schemas, these are the rest. `draft_head_vocab` is the size of the
     #: vocabulary subset the speculative head predicts over — a property of the
     #: served model, so it is declared rather than hardcoded in a converter.
-    _serve_objects_ = QWEN3_5_MODEL_SERVE_OBJECTS
-    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION, QWEN3_5_VISION_SERVE_SECTION)
+    _serve_objects_ = (*QWEN3_5_MODEL_SERVE_OBJECTS, *DFLASH_HEAD_OBJECTS, *DFLASH_TAIL_OBJECTS)
+    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION, QWEN3_5_VISION_SERVE_SECTION, DFLASH_SERVE_SECTION)
+    dflash_layers = 0
     _serve_blocks_ = {
         "attention": Qwen3_5AttentionBlock,
         "mamba": Qwen3_5LinearBlock,
@@ -469,8 +471,9 @@ class Qwen3_5ConditionalModel(nn.Model):
     #: the block schemas, these are the rest. `draft_head_vocab` is the size of the
     #: vocabulary subset the speculative head predicts over — a property of the
     #: served model, so it is declared rather than hardcoded in a converter.
-    _serve_objects_ = QWEN3_5_MODEL_SERVE_OBJECTS
-    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION, QWEN3_5_VISION_SERVE_SECTION)
+    _serve_objects_ = (*QWEN3_5_MODEL_SERVE_OBJECTS, *DFLASH_HEAD_OBJECTS, *DFLASH_TAIL_OBJECTS)
+    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION, QWEN3_5_VISION_SERVE_SECTION, DFLASH_SERVE_SECTION)
+    dflash_layers = 0
     _serve_blocks_ = {
         "attention": Qwen3_5AttentionBlock,
         "mamba": Qwen3_5LinearBlock,

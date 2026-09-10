@@ -10,6 +10,7 @@ Canonical invocation::
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
@@ -33,6 +34,7 @@ from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.safetensors import ShardReader
 from surogate.serve.convert.common import conversion as family_conversion
 from surogate.serve.convert.common import qwen3_5 as checkpoint
+from surogate.serve.convert.common import dflash as dflash_checkpoint
 
 from . import draft_head, inventory, recipe
 
@@ -314,6 +316,7 @@ def convert(
     mtp: bool = True,
     vision: bool = True,
     vision_storage: str = inventory.VISION_BF16,
+    dflash_model_dir: str | Path | None = None,
 ) -> Path:
     """Run the complete registered conversion and return the report path."""
 
@@ -397,6 +400,15 @@ def convert(
         if not native_runs:
             print(f"native K-quants: {len(native)} objects served as the GGUF stores them",
                   flush=True)
+    dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
+    dflash_geometry = None
+    if dflash_model is not None:
+        dflash_geometry = dflash_checkpoint.geometry_from_config(_load_config(dflash_model), geometry)
+        dflash_specs, dflash_recipes = dflash_checkpoint.conversion_plan(dflash_geometry, geometry)
+        recipe.preflight_sources(dflash_model, dflash_recipes)
+        active_tensor_specs += dflash_specs
+        active_object_specs += dflash_specs
+        recipes.update((r.object_name, r) for r in dflash_recipes)
     preflight = preflight_conversion(
         model, repack, planned + tuple(native) + tuple(sorted(tied)) + tuple(halves) + tuple(in_place),
         mtp=mtp, vision=vision, native=native, object_specs=active_object_specs, geometry=geometry
@@ -418,12 +430,16 @@ def convert(
             half_lookup[name] = (parent, slice(first, first + rows))
             first += rows
 
-    with ShardReader.for_directory(model) as reader:
+    with ExitStack() as stack:
+        reader = stack.enter_context(ShardReader.for_directory(model))
+        dflash_reader = stack.enter_context(ShardReader.for_directory(dflash_model)) if dflash_model else None
         with ArtifactWriter(
             output,
             ArtifactIdentity(inventory.model_id_for(geometry), inventory.WEIGHTS_ID, architecture="qwen3_5"),
             preflight.object_plan.specs,
             geometry=geometry_block(geometry),
+            dflash_geometry=dflash_checkpoint.geometry_block(dflash_geometry) if dflash_geometry else None,
+            dflash_target_layers=dflash_geometry.target_feature_layers if dflash_geometry else None,
             layer_types=geometry.layer_types,
             vision_geometry=(vision_geometry_block(preflight.config)
                              if carries_vision(preflight.object_plan.specs) else None),
@@ -468,7 +484,8 @@ def convert(
                     payload = repack.payload_for(spec, recipes[spec.name], token_ids)
                     repacked = True
                 else:
-                    tensor = materialize_tensor(spec, reader, preflight.draft, recipes)
+                    source_reader = dflash_reader if spec.name.startswith("dflash/") else reader
+                    tensor = materialize_tensor(spec, source_reader, preflight.draft, recipes)
                     payload = encode_tensor_payload(tensor, spec, resolved_device)
                     del tensor
                 writer.write(spec.name, payload)
@@ -489,6 +506,7 @@ def convert(
         "gguf_repack": str(gguf_repack) if gguf_repack else None,
         "repacked_objects": len(repacked_names),
         "mtp": mtp,
+        "dflash_model": str(dflash_model) if dflash_model else None,
     }
     report = build_conversion_report(
         geometry=geometry,
@@ -573,6 +591,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gguf-repack", type=Path, default=None)
+    parser.add_argument("--dflash-model", type=Path, help="matching DFlash drafter checkpoint")
     parser.add_argument("--profile", choices=inventory.PROFILES, default=None,
                         help="which export this checkpoint is; read from its "
                              "quantization_config when not given")
@@ -603,8 +622,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     if profile == inventory.GROUPWISE_INT:
         convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack,
                 mtp=not args.no_mtp, vision=not args.no_vision,
-                vision_storage=args.vision_storage)
+                vision_storage=args.vision_storage, dflash_model_dir=args.dflash_model)
         return
+    if args.dflash_model is not None:
+        raise ValueError("--dflash-model currently requires the groupwise-int conversion profile")
     writer = _export_writer(profile)
     if profile in DUAL_SOURCE_PROFILES:
         if args.quantized_model is None:

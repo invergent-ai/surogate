@@ -192,6 +192,7 @@ public:
         }
         // A prompt that completed inside its first chunk sampled its token on the last stage
         // only; the others recorded placeholders (and, under a draft head, proposed nothing).
+        propagate_prefill_features(lane, result);
         if (result.complete) { propagate_prefill_token(lane, result); }
         return result;
     }
@@ -206,6 +207,7 @@ public:
             trace("advance_prefill_lane", s, 1);
             result = stages_[s]->program->advance_prefill_lane(lane);
         }
+        propagate_prefill_features(lane, result);
         if (result.complete) { propagate_prefill_token(lane, result); }
         return result;
     }
@@ -533,6 +535,7 @@ private:
         // token the caller will read is copied into the flight first — the program's egress
         // buffers belong to the next round on that stage.
         if (f.kind == FlightKind::Prefill) {
+            propagate_prefill_features(f.prefill_lane, f.result.prefill);
             if (f.result.prefill.complete) {
                 store_prefill_token(f.result.prefill, f.lone_prefill_token);
                 propagate_prefill_token(f.prefill_lane, f.result.prefill);
@@ -749,9 +752,26 @@ private:
     // The stages without the head recorded placeholder tokens this round: overwrite them with
     // the tokens the last stage sampled (one per lane; stages run single rounds). Under
     // speculation they recorded nothing and adopt the last stage's decision instead.
+    void propagate_prefill_features(std::uint32_t lane, const PrefillStepResult& result) {
+        if (result.processed_prompt_tokens == 0) { return; }
+        const auto* packet = stages_.back()->program->stage_export_buffer();
+        if (!packet) { return; }
+        for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
+            select(s);
+            stages_[s]->program->adopt_pipeline_prefill_features(lane,
+                {static_cast<const std::byte*>(packet), boundary_bytes_}, result.processed_prompt_tokens);
+        }
+    }
     void propagate_round_tokens(std::span<const std::uint32_t> lanes, const BatchedGeneratedRound& round,
                                 const std::vector<std::byte>& outcome) {
         if (stages_.size() < 2 || lanes.empty()) { return; }
+        if (const auto* packet = stages_.back()->program->stage_export_buffer()) {
+            for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
+                select(s);
+                stages_[s]->program->adopt_pipeline_decode_features(lanes,
+                    {static_cast<const std::byte*>(packet), boundary_bytes_});
+            }
+        }
         if (width_ > 1) {
             const std::span<const std::byte> bytes(outcome.data(), outcome.size());
             for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {

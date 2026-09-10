@@ -77,8 +77,8 @@ enough for one full-context request per model. See [Serving models](serving-mode
 With one GPU, preparation follows `--device`. `SUROGATE_CONVERT_DEVICE` overrides the preparation
 device when needed. GPU indices follow `CUDA_VISIBLE_DEVICES`.
 
-All supported text-generation families can use `--devices`. MTP is available when the
-checkpoint includes compatible MTP weights. DFlash still requires one GPU. The maximum
+All supported text-generation families can use `--devices`. MTP and DFlash can also use
+multiple GPUs when the prepared model includes compatible draft weights. The maximum
 number of GPUs depends on the checkpoint; if the requested split is rejected, use fewer GPUs.
 
 Additional models can share a GPU, use different GPUs, or use their own GPU groups. They
@@ -164,14 +164,14 @@ workload: more simultaneous requests or heavy CPU offload can reduce the benefit
 | Flag | Meaning |
 |---|---|
 | `--spec mtp` | Enable MTP on a supported model; supports one or multiple GPUs |
-| `--spec dflash` | Use a compatible separate drafter; requires one GPU, `--kv-cache-dtype bf16`, and no `--vision` |
+| `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; requires `--kv-cache-dtype bf16` and no `--vision` |
 | `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec` |
 | `--spec-max-lanes N\|all` | MTP checks drafts only while at most N requests are decoding. Default (or `0`) is 1; `all` keeps checking at every concurrency level. Does not affect DFlash |
 | `--lm-head-draft` | Use a smaller draft vocabulary when the checkpoint provides one |
 
 MTP needs the checkpoint's MTP weights, which some community exports omit. DFlash
 needs a compatible drafter included during model preparation. Missing draft weights produce
-a startup error.
+a startup error. See [Preparing a DFlash pair](serving-models.md#preparing-a-dflash-pair).
 
 ### Serving several models from one process
 

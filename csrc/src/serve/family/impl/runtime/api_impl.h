@@ -330,6 +330,18 @@ bool Program<Variant>::speculative_round_is_narrow(std::size_t lanes) const noex
 }
 
 template <>
+void Program<Variant>::adopt_pipeline_prefill_features(std::uint32_t lane,
+    std::span<const std::byte> packet, std::uint32_t tokens) {
+    impl_->adopt_pipeline_prefill_features(lane, packet, tokens);
+}
+
+template <>
+void Program<Variant>::adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
+    std::span<const std::byte> packet) {
+    impl_->adopt_pipeline_decode_features(lanes, packet);
+}
+
+template <>
 std::span<const std::byte> Program<Variant>::speculative_outcome() const noexcept {
     return impl_->speculative_outcome();
 }

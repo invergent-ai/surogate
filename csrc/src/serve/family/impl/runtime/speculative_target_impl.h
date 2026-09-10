@@ -23,6 +23,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  frame.valid_columns, frame.kv_table_rows, frame.lanes, envelope,
                                  frame.target_hidden, frame.target_logits, frame.target_tokens);
     }
+    if (execution.stage.last >= 0 && execution.stage.last < execution.model.geometry.layers) { return; }
     ops::speculative_accept_greedy_drafts(frame.target_tokens, frame.target_logits, frame.drafts,
                                           frame.current_extents, frame.frontiers, frame.anchors,
                                           frame.licensed_tokens, frame.licensed_counts,

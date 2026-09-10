@@ -85,25 +85,6 @@ void require_identity_divisor(const artifact::Binder& binder, artifact::ObjectHa
     }
 }
 
-Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
-    if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n ||
-        block.qtype != QType::W8G32_F16S || block.layout != QuantLayout::RowSplit ||
-        block.group != 32) {
-        throw std::logic_error("invalid DFlash W8 row view");
-    }
-    const std::uint64_t code_row = static_cast<std::uint64_t>(block.padded_shape[1]);
-    const std::uint64_t scale_row =
-        static_cast<std::uint64_t>(block.padded_shape[1] / block.group) * sizeof(std::uint16_t);
-    Weight out = block;
-    out.qdata  = static_cast<const std::byte*>(block.qdata) +
-                static_cast<std::uint64_t>(row_begin) * code_row;
-    out.scales = static_cast<const std::byte*>(block.scales) +
-                 static_cast<std::uint64_t>(row_begin) * scale_row;
-    out.n               = row_count;
-    out.shape[0]        = row_count;
-    out.padded_shape[0] = row_count;
-    return out;
-}
 
 MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, artifact::TensorPlacement placement,
                  const family::TextGeometry& g,
@@ -402,56 +383,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures
     out.vision_merger_norm = family::bind_vision_merger_norm(binder, vision_placement, vg);
     }
 
-    // The DFlash drafter is a separate checkpoint the converter may not have
-    // had; such artifacts omit every dflash/* object. Probe the family once
-    // and turn a missing drafter into a startup error only when DFlash was
-    // actually requested, rather than a missing-object failure on load.
     out.has_dflash = g.dflash.layers > 0;
-    if (out.has_dflash != binder.has("dflash/feature_projection")) {
-        throw artifact::ArtifactError("DFlash metadata disagrees with stored objects");
-    }
-    if (!out.has_dflash && features.dflash()) {
-        throw std::runtime_error(
-            "qwen3_5_moe artifact has no DFlash drafter (converted without "
-            "--dflash-model); run without --spec dflash");
-    }
-    const artifact::TensorPlacement dflash_placement =
-        features.dflash() ? artifact::TensorPlacement::Device
-                          : artifact::TensorPlacement::ValidateOnly;
-    const auto bind_dflash = [&](std::string_view name, NumericFormat format,
-                                 std::initializer_list<std::uint64_t> shape) {
-        return artifact::bind_tensor(binder, name, format, shape, dflash_placement);
-    };
-    if (out.has_dflash) {
-    const auto& d = g.dflash;
-    out.dflash.layers.resize(d.layers);
-    out.dflash.feature_projection =
-        bind_dflash("dflash/feature_projection", NumericFormat::W8G32_F16S,
-                    {d.hidden, d.feature_rows});
-    out.dflash.context_norm = bind_dflash("dflash/context_norm", NumericFormat::BF16, {g.hidden});
-    for (std::size_t layer = 0; layer < d.layers; ++layer) {
-        DFlashLayerPlan& target  = out.dflash.layers[layer];
-        const std::string prefix = "dflash/layers/" + std::to_string(layer) + "/";
-        target.input_norm        = bind_dflash(prefix + "input_norm", NumericFormat::BF16, {g.hidden});
-        target.query_key_value   = bind_dflash(prefix + "attention/query_key_value",
-                                               NumericFormat::W8G32_F16S, {d.query_size() + 2 * d.kv_size(), g.hidden});
-        target.query_norm =
-            bind_dflash(prefix + "attention/query_norm", NumericFormat::BF16,
-                        {d.head_dim});
-        target.key_norm = bind_dflash(prefix + "attention/key_norm", NumericFormat::BF16,
-                                      {d.head_dim});
-        target.attention_output =
-            bind_dflash(prefix + "attention/output", NumericFormat::W8G32_F16S, {g.hidden, d.query_size()});
-        target.post_attention_norm =
-            bind_dflash(prefix + "post_attention_norm", NumericFormat::BF16, {g.hidden});
-        target.gate_up =
-            bind_dflash(prefix + "mlp/gate_up", NumericFormat::W8G32_F16S,
-                        {2 * d.intermediate, d.hidden});
-        target.down = bind_dflash(prefix + "mlp/down", NumericFormat::W8G32_F16S,
-                                  {d.hidden, d.intermediate});
-    }
-    out.dflash.final_norm = bind_dflash("dflash/final_norm", NumericFormat::BF16, {d.hidden});
-    }
+    out.dflash = family::bind_dflash(binder, g, features);
 
     load_plan.materialization = binder.finish();
     out.host_bank = family::collect_host_bank(binder, load_plan.materialization,
@@ -610,43 +543,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 
     if (plan.features.dflash()) {
-        const auto& d = g.dflash;
-        DFlashWeights& target     = runtime.dflash.emplace();
-        target.layers.resize(d.layers);
-        target.feature_projection = artifact::materialized_weight(
-            backing, plan.dflash.feature_projection, NumericFormat::W8G32_F16S, d.hidden,
-        d.feature_rows);
-        target.context_norm = artifact::materialized_tensor(backing, plan.dflash.context_norm,
-                                                            NumericFormat::BF16, {g.hidden});
-        for (std::size_t layer = 0; layer < d.layers; ++layer) {
-            const DFlashLayerPlan& source = plan.dflash.layers[layer];
-            DFlashLayerWeights& weights   = target.layers[layer];
-            weights.input_norm      = artifact::materialized_tensor(backing, source.input_norm,
-                                                                    NumericFormat::BF16, {g.hidden});
-            weights.query_key_value = artifact::materialized_weight(
-                backing, source.query_key_value, NumericFormat::W8G32_F16S,
-            d.query_size() + 2 * d.kv_size(), d.hidden);
-            weights.context_key   = row_view(weights.query_key_value, d.query_size(), d.kv_size());
-            weights.context_value = row_view(weights.query_key_value, d.query_size() + d.kv_size(),
-                     d.kv_size());
-            weights.query_norm    = artifact::materialized_tensor(backing, source.query_norm,
-                                                                  NumericFormat::BF16, {d.head_dim});
-            weights.key_norm =
-                artifact::materialized_tensor(backing, source.key_norm, NumericFormat::BF16, {d.head_dim});
-            weights.attention_output = artifact::materialized_weight(
-                backing, source.attention_output, NumericFormat::W8G32_F16S, d.hidden,
-            d.query_size());
-            weights.post_attention_norm = artifact::materialized_tensor(
-                backing, source.post_attention_norm, NumericFormat::BF16, {g.hidden});
-            weights.gate_up = artifact::materialized_weight(backing, source.gate_up,
-                                                            NumericFormat::W8G32_F16S, 2 * d.intermediate,
-                                                        d.hidden);
-            weights.down    = artifact::materialized_weight(backing, source.down,
-                                                            NumericFormat::W8G32_F16S, d.hidden,
-                                                     d.intermediate);
-        }
-        target.final_norm = artifact::materialized_tensor(backing, plan.dflash.final_norm,
-                                                          NumericFormat::BF16, {g.hidden});
+        runtime.dflash = family::materialize_dflash(plan.dflash, backing, g);
     }
 }
 

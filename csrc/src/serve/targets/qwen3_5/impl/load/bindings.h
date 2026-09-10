@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/load/dflash.h"
+
 #include "family/impl/load/host_bank.h"
 
 #include <api/targets/qwen3_5/package.h>
@@ -164,6 +166,7 @@ struct BindingPlan {
     bool has_mtp = false;
     bool resident_mtp = false;
     MtpPlan mtp;
+    family::DFlashPlan dflash;
 
     /// The tower the vision objects were bound against: the compiled tower with the
     /// artifact's `vision_geometry` laid over it, projecting into the text width above.

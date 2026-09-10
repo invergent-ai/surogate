@@ -250,8 +250,13 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     stage.first   = plan.pipeline_stage_first;
     stage.last    = plan.pipeline_stage_last;
     stage.columns = static_cast<std::int32_t>(plan.pipeline_boundary_columns);
-    stage_boundary_bytes_ = static_cast<std::size_t>(cfg.residual) *
-                            plan.pipeline_boundary_columns * dtype_size(plan.geometry.residual_dtype());
+    stage.residual_bytes = static_cast<std::size_t>(cfg.residual) * dtype_size(plan.geometry.residual_dtype());
+    stage.column_bytes = stage.residual_bytes;
+    if (plan.features.dflash()) {
+        stage.column_bytes += static_cast<std::size_t>(plan.geometry.dflash.feature_rows) * sizeof(std::uint16_t)
+                              + 2 * sizeof(std::int32_t);
+    }
+    stage_boundary_bytes_ = stage.column_bytes * plan.pipeline_boundary_columns;
     if (stage.first > 0) {
         // The stage owns its import buffer (the driver copies the previous stage's export
         // into it), so stages can run different micro-batches at the same time.
@@ -262,10 +267,12 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
             stage.import_pinned = stage_import.data;
         }
     }
-    if (stage.last < layers) {
+    if (stage.last < layers || plan.features.dflash()) {
         CUDA_CHECK(cudaHostAlloc(&stage_export.data, stage_boundary_bytes_, cudaHostAllocPortable));
         stage.export_pinned = stage_export.data;
     }
+    if (stage_import.data) { std::memset(stage_import.data, 0, stage_boundary_bytes_); }
+    if (stage_export.data) { std::memset(stage_export.data, 0, stage_boundary_bytes_); }
     std::fprintf(stderr, "pipeline stage: layers [%d, %d) of %d, boundary %u columns%s%s\n", stage.first,
                  stage.last, layers, plan.pipeline_boundary_columns, stage.first > 0 ? ", imports" : "",
                  stage.last < layers ? ", exports" : "");
@@ -360,7 +367,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
-    if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
+    if (plan.persistent.dflash) {
+        dflash.emplace(backing, *plan.persistent.dflash);
+        if (pipeline_stage()) { stage.features = &dflash->prefill_features; }
+    }
     if (dflash.has_value() != plan.features.dflash()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
@@ -779,17 +789,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         sequence.prefix_identity.assign(prompt, request_plan.lora_slot);
 
-        if (speculative_backend == SpeculativeBackend::DFlash) {
-            if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
-                throw std::logic_error("DFlash prefill state is incomplete");
-            }
-            *dflash_host_ingress                         = {};
-            dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(family::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
-        }
+
 
         if (request_plan.vision) {
             std::vector<bool> used(prompt.media_payloads.size(), false);
@@ -841,9 +841,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         // is the one that respects stage ownership, and a first chunk run at
         // admission shares a stage's boundary buffers with whatever round is in
         // flight there. Vision prompts and bridged reuse keep the classic order.
-        if (defer_first_chunk && speculative_backend != SpeculativeBackend::DFlash &&
-            !staged.vision && staged.mtp_bridge == MtpBridgeMode::None &&
-            staged.cursor < staged.prompt_tokens) {
+        if (defer_first_chunk &&
+            ((pipeline_stage() && speculative_backend == SpeculativeBackend::DFlash) ||
+             (speculative_backend != SpeculativeBackend::DFlash && !staged.vision &&
+              staged.mtp_bridge == MtpBridgeMode::None && staged.cursor < staged.prompt_tokens))) {
             return runtime::PrefillStepResult{
                 .summary = runtime::BeginSummary{.prompt_tokens        = staged.prompt_tokens,
                                                  .reused_prompt_tokens = staged.base,
@@ -1045,7 +1046,6 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
-    const std::uint32_t width = draft_window + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = sequences[lanes[row]];
@@ -1057,12 +1057,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
-            // MTP reads the lane's own copy of the decision (SpeculativeOutcome), never the
-            // shared egress: another round may already be copying into that.
-            const TokenId* token_base =
-                speculative_backend == SpeculativeBackend::Mtp
-                    ? request.outcome.licensed_tokens.data()
-                    : dflash_host_egress->licensed_tokens.data() + row * width;
+            // Each lane keeps its decision; another round may already be copying into
+            // the shared egress.
+            const TokenId* token_base = request.outcome.licensed_tokens.data();
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
             sequence.prefix_identity.append_generated(committed, sequence.rope_delta);
             sequence.execution_frontier = pending.base_E + committed;
@@ -1230,6 +1227,19 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
         set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
         set_device_i32(io.backend_kv_table_row,
                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+
+        // Stage the controls at execution, after this pipeline stage becomes free.
+        if (speculative_backend == SpeculativeBackend::DFlash) {
+            if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
+                throw std::logic_error("DFlash prefill state is incomplete");
+            }
+            *dflash_host_ingress                         = {};
+            dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
+            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                                       sizeof(family::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                                       device.stream));
+        }
     } catch (...) {
         if (sequence.kv->backend && sequence.kv->backend->bound_row() >= 0) {
             sequence.kv->backend->unbind_row();
@@ -3430,8 +3440,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
 void ProgramImplCore::adopt_speculative_outcome(std::span<const std::uint32_t> lanes,
                                                 std::span<const std::byte> outcome) {
-    if (speculative_backend != SpeculativeBackend::Mtp) {
-        throw std::logic_error("adopting a speculative outcome requires the MTP backend");
+    if (speculative_backend == SpeculativeBackend::None) {
+        throw std::logic_error("adopting a speculative outcome requires a speculative backend");
     }
     if (stage_holds_head()) {
         throw std::logic_error("the stage with the head decides its own speculative rounds");
@@ -3470,6 +3480,71 @@ void ProgramImplCore::adopt_speculative_outcome(std::span<const std::uint32_t> l
     }
 }
 
+void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
+    std::span<const std::byte> packet, std::uint32_t tokens) {
+    if (!stage.features || tokens == 0) { return; }
+    if (lane >= max_concurrency || tokens > static_cast<std::uint32_t>(dflash->prefill_positions.ne[0]) ||
+        packet.size() < static_cast<std::size_t>(tokens) * stage.column_bytes) {
+        throw std::invalid_argument("DFlash prefill feature transfer is out of bounds");
+    }
+    const auto feature_bytes = static_cast<std::size_t>(model.geometry.dflash.feature_rows) * sizeof(std::uint16_t);
+    CUDA_CHECK(cudaMemcpy2DAsync(dflash->prefill_features.data, dflash->prefill_features.nb[1],
+        packet.data() + stage.residual_bytes, stage.column_bytes, feature_bytes, tokens,
+        cudaMemcpyHostToDevice, device.stream));
+    CUDA_CHECK(cudaMemcpy2DAsync(dflash->prefill_positions.data, sizeof(std::int32_t),
+        packet.data() + stage.residual_bytes + feature_bytes + sizeof(std::int32_t), stage.column_bytes,
+        sizeof(std::int32_t), tokens, cudaMemcpyHostToDevice, device.stream));
+    auto& frame = *io.dflash_decode;
+    auto& sequence = sequences[lane];
+    Tensor count = frame.append_counts.slice(0, 0, 1);
+    Tensor lane_tensor = frame.lanes.slice(0, 0, 1);
+    Tensor row = frame.dflash_kv_table_rows.slice(0, 0, 1);
+    set_device_i32(count, static_cast<std::int32_t>(tokens));
+    set_device_i32(lane_tensor, static_cast<std::int32_t>(lane));
+    set_device_i32(row, sequence.kv->backend->bound_row());
+    schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
+        replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+        proposal_head, &decoder->ple, stage}, *dflash};
+    work.reset();
+    Tensor features = dflash->prefill_features.slice(1, 0, tokens).view(
+        {model.geometry.dflash.feature_rows, static_cast<std::int32_t>(tokens), 1});
+    Tensor positions = dflash->prefill_positions.slice(0, 0, tokens).view({static_cast<std::int32_t>(tokens), 1});
+    schedule::dflash_append_context(state, features, positions, count, lane_tensor, row, {tokens, tokens});
+    std::int32_t checkpoint = 0;
+    std::memcpy(&checkpoint, packet.data() + stage.residual_bytes + feature_bytes, sizeof(checkpoint));
+    if (checkpoint) { dflash->save_rewrite_checkpoint(static_cast<std::int32_t>(lane), device.stream); }
+    device.synchronize();
+    work.reset();
+}
+
+void ProgramImplCore::adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
+    std::span<const std::byte> packet) {
+    if (!stage.features || lanes.empty()) { return; }
+    const auto width = draft_window + 1U;
+    const auto columns = width * lanes.size();
+    if (lanes.size() > batch_capacity || columns > static_cast<std::size_t>(dflash->prefill_features.ne[1]) ||
+        packet.size() < columns * stage.column_bytes) {
+        throw std::invalid_argument("DFlash decode feature transfer is out of bounds");
+    }
+    const auto bytes = static_cast<std::size_t>(model.geometry.dflash.feature_rows) * sizeof(std::uint16_t);
+    CUDA_CHECK(cudaMemcpy2DAsync(dflash->prefill_features.data, dflash->prefill_features.nb[1],
+        packet.data() + stage.residual_bytes, stage.column_bytes, bytes, columns,
+        cudaMemcpyHostToDevice, device.stream));
+    std::vector<std::int32_t> selected(lanes.begin(), lanes.end());
+    std::vector<std::int32_t> counts(lanes.size(), static_cast<std::int32_t>(width));
+    auto& frame = *io.dflash_decode;
+    Tensor lane_tensor = frame.lanes.slice(0, 0, lanes.size());
+    Tensor valid = frame.target_valid_columns.slice(0, 0, lanes.size());
+    CUDA_CHECK(cudaMemcpyAsync(lane_tensor.data, selected.data(), selected.size() * sizeof(std::int32_t),
+        cudaMemcpyHostToDevice, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(valid.data, counts.data(), counts.size() * sizeof(std::int32_t),
+        cudaMemcpyHostToDevice, device.stream));
+    Tensor compact = dflash->prefill_features.slice(1, 0, columns).view(
+        {model.geometry.dflash.feature_rows, static_cast<std::int32_t>(width), static_cast<std::int32_t>(lanes.size())});
+    ops::scatter_bf16_batch(compact, lane_tensor, valid, dflash->pending_features, device.stream);
+    device.synchronize();
+}
+
 std::span<const std::byte> ProgramImplCore::lane_draft_state(std::uint32_t lane) const {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const SequenceState& sequence = sequences[lane];
@@ -3494,8 +3569,8 @@ void ProgramImplCore::adopt_lane_draft_state(std::uint32_t lane, std::span<const
     sequence.mtp_drafts      = adopted.drafts;
 }
 
-runtime::BatchedGeneratedRound
-ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
+runtime::RoundHandle
+ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets) {
     if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
@@ -3593,8 +3668,46 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                       draft_window, envelopes, target_envelope, executable);
-        device.synchronize();
+        in_flight_ = InFlightRound{.id = ++in_flight_counter_,
+                                    .rows = static_cast<std::uint32_t>(lanes.size()),
+                                    .start = started};
+        std::copy(lanes.begin(), lanes.end(), in_flight_.lanes.begin());
+        std::copy(budgets.begin(), budgets.end(), in_flight_.budgets.begin());
+        return runtime::RoundHandle{.id = in_flight_.id, .rows = in_flight_.rows};
+    } catch (...) {
+        try { device.synchronize(); } catch (...) {}
+        for (const auto lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
+    }
+}
 
+runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::RoundHandle handle) {
+    if (!handle.valid() || handle.id != in_flight_.id) {
+        throw std::logic_error("consuming a DFlash round that is not in flight");
+    }
+    const std::span<const std::uint32_t> lanes(in_flight_.lanes.data(), in_flight_.rows);
+    const std::span<const runtime::RoundBudget> budgets(in_flight_.budgets.data(), in_flight_.rows);
+    const auto started = in_flight_.start;
+    const std::uint32_t width = draft_window + 1U;
+    try {
+        device.synchronize();
+        if (!stage_holds_head()) {
+            outcome_export_.clear();
+            for (const auto lane : lanes) {
+                auto& sequence = sequences[lane];
+                auto& request = requests[lane];
+                sequence.dflash_context_frontier = sequence.execution_frontier;
+                request.pending = PendingCandidate{.kind = PendingKind::Speculative,
+                    .base_E = sequence.execution_frontier, .base_S = sequence.ledger_frontier};
+                request.lifecycle = Lifecycle::Pending;
+                request.timings.decode_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+            }
+            return runtime::BatchedGeneratedRound{.row_counts = std::span<const std::int32_t>(
+                headless_counts_.data(), lanes.size()), .row_stride = width};
+        }
+        outcome_export_.resize(lanes.size() * sizeof(SpeculativeOutcome));
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
@@ -3603,19 +3716,25 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t base_S    = sequence.ledger_frontier;
             const std::int32_t count_i    = dflash_host_egress->licensed_counts[row];
             const std::int32_t accepted_i = dflash_host_egress->accepted_drafts[row];
-            const std::uint32_t extent =
-                static_cast<std::uint32_t>(dflash_host_ingress->proposal_extents[row]);
+            const std::uint32_t extent = std::min({draft_window,
+                budgets[row].generated_tokens_remaining - 1U, capacity - base_E - 1U});
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || accepted_i > static_cast<std::int32_t>(extent) ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
                 static_cast<std::uint64_t>(base_E) + static_cast<std::uint32_t>(count_i) >
                     capacity) {
-                throw std::runtime_error("DFlash batch returned invalid row metadata");
+                throw std::runtime_error("DFlash batch returned invalid row metadata: row=" +
+                    std::to_string(row) + " count=" + std::to_string(count_i) +
+                    " accepted=" + std::to_string(accepted_i) + " extent=" + std::to_string(extent));
             }
             const std::span<const TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() +
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            request.outcome = SpeculativeOutcome{.licensed_count = count_i, .accepted_drafts = accepted_i};
+            std::copy(row_tokens.begin(), row_tokens.end(), request.outcome.licensed_tokens.begin());
+            std::memcpy(outcome_export_.data() + row * sizeof(SpeculativeOutcome),
+                        &request.outcome, sizeof(SpeculativeOutcome));
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
@@ -3653,6 +3772,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         }
         throw;
     }
+}
+
+runtime::BatchedGeneratedRound
+ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
+                                      std::span<const runtime::RoundBudget> budgets) {
+    return consume_dflash_round(launch_dflash_round(lanes, budgets));
 }
 
 runtime::BatchedGeneratedRound

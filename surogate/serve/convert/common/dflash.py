@@ -104,3 +104,17 @@ def geometry_block(g: Geometry):
                 block_size=g.block_size, max_context=g.max_context, rms_epsilon=g.rms_epsilon,
                 rope_theta=g.rope_theta, attention_scale=g.head_dim ** -.5,
                 feature_layers=len(g.target_feature_layers), feature_rows=g.feature_rows)
+
+
+def conversion_plan(g: Geometry, target):
+    """Resolve only the auxiliary checkpoint's objects and source recipes."""
+    from .declaration import derive_recipes
+    from .inventory import tensor_spec, W8
+    declared = g.declaration(target)
+    specs = tuple(tensor_spec(obj.name, obj.shape,
+                              W8 if obj.format == "quantised" else obj.format.upper())
+                  for obj in declared.objects(capabilities={"text", "dflash"})
+                  if obj.name.startswith("dflash/"))
+    recipes = tuple(r for r in derive_recipes(declared, capabilities={"text", "dflash"})
+                    if r.object_name.startswith("dflash/"))
+    return specs, recipes

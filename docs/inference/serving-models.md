@@ -204,7 +204,27 @@ surogate serve ~/models/Qwen3.8-Flash-Next-00001-of-00004.gguf \
 Memory requirements depend on the model, context length, and concurrency. Add
 `--host-moe-layers auto` when the model needs additional system RAM. Supported models can
 also use MTP across multiple GPUs if their checkpoints include the required draft weights.
-See [Devices](cli.md#devices) for the supported families. DFlash currently requires one GPU.
+See [Devices](cli.md#devices) for the supported families. DFlash also supports pipeline serving.
+
+### Preparing a DFlash pair
+
+Use a drafter trained for the exact target checkpoint. For example,
+[Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) has a matching
+[z-lab/Qwen3.5-4B-DFlash](https://huggingface.co/z-lab/Qwen3.5-4B-DFlash) drafter.
+Download both checkpoints, then prepare them together:
+
+```bash
+python -m surogate.serve.convert.qwen3_5.convert \
+  --model /path/to/Qwen3.5-4B \
+  --dflash-model /path/to/Qwen3.5-4B-DFlash \
+  --out /path/to/qwen35-4b-dflash.sinfer --no-vision
+
+surogate serve /path/to/qwen35-4b-dflash.sinfer \
+  --devices 0,1 --spec dflash --draft-tokens 3 --kv-cache-dtype bf16
+```
+
+Use `--device 0` for a single GPU. Each pipeline GPU needs room for its share of the target,
+the drafter, and cache. Sleep/wake and completed-turn cache reuse remain available.
 
 ## Several models on one GPU
 

@@ -21,7 +21,11 @@ int main() {
         return 77;
     }
     setenv("SUROGATE_SERVE_PIPELINE_SERIAL_CONSTRUCT", "1", 1);
-    setenv("SUROGATE_SERVE_PIPELINE_GROUPS", "1", 1);
+    const auto* groups = std::getenv("SUROGATE_MULTI_DEVICE_TEST_GROUPS");
+    setenv("SUROGATE_SERVE_PIPELINE_GROUPS", groups ? groups : "1", 1);
+    if (groups) {
+        setenv("SUROGATE_SERVE_PIPELINE_MIN_LANES", "1", 1);
+    }
     ServeOptions options;
     options.artifact_path = artifact;
     options.max_context = 512;
@@ -37,6 +41,19 @@ int main() {
         options.speculative.backend = sinfer::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 3;
     }
+    if (std::getenv("SUROGATE_MULTI_DEVICE_TEST_DFLASH")) {
+        options.speculative.backend = sinfer::SpeculativeBackend::DFlash;
+        options.speculative.draft_tokens = 3;
+        options.kv_cache = sinfer::KvCacheStorage::BFloat16;
+    }
+    if (const auto* count = std::getenv("SUROGATE_MULTI_DEVICE_TEST_DRAFT_TOKENS")) {
+        options.speculative.draft_tokens = std::stoul(count);
+    }
+    const bool cache_turn = std::getenv("SUROGATE_MULTI_DEVICE_TEST_CACHE") != nullptr;
+    options.rewrite_checkpoints = cache_turn;
+    if (std::getenv("SUROGATE_MULTI_DEVICE_TEST_LONG_PROMPT")) {
+        options.prefill_chunk = 128;
+    }
     std::istringstream selected(
         std::getenv("SUROGATE_MULTI_DEVICE_TEST_DEVICES") ? std::getenv("SUROGATE_MULTI_DEVICE_TEST_DEVICES") : "0:0");
     std::vector<int> devices;
@@ -50,24 +67,57 @@ int main() {
         request.lora_adapter = "test-adapter";
     }
     request.raw_prompt = "Continue: 1, 2, 3, 4,";
+    if (std::getenv("SUROGATE_MULTI_DEVICE_TEST_LONG_PROMPT")) {
+        for (int i = 0; i < 200; ++i) {
+            *request.raw_prompt += " sample";
+        }
+        *request.raw_prompt += "\nContinue: 1, 2, 3, 4,";
+    }
     request.max_tokens = 128;
     request.max_tokens_set = true;
     request.ignore_eos = true;
     request.sampling.temperature = 0;
     request.return_token_ids = true;
+    std::string completed_text;
     const auto generate = [&](GenerationService& service) {
         auto prepared = service.prepare(request);
-        return service.run(prepared, nullptr).completion_token_ids;
+        auto result = service.run(prepared, nullptr);
+        if (options.speculative.backend == sinfer::SpeculativeBackend::DFlash) {
+            std::cout << "DFlash rounds=" << result.metrics.speculative_rounds
+                      << " accepted=" << result.metrics.speculative_accepted_tokens << '\n';
+            assert(result.metrics.speculative_rounds > 0);
+        }
+        completed_text = result.text;
+        return result.completion_token_ids;
     };
-    std::vector<sinfer::TokenId> expected;
+    GenerationRequest continued = request;
+    std::vector<sinfer::TokenId> expected, expected_turn;
+    const auto continue_turn = [&](GenerationService& service) {
+        auto prepared = service.prepare(continued);
+        auto result = service.run(prepared, nullptr);
+        std::cout << "continued turn cached tokens=" << result.metrics.prefix_cache_hit_tokens << '\n';
+        assert(result.metrics.prefix_cache_hit_tokens > 0);
+        assert(result.completion_token_ids.size() == 128);
+        return result.completion_token_ids;
+    };
     {
         GenerationService baseline(options);
         expected = generate(baseline);
         assert(expected.size() == 128);
+        if (cache_turn) {
+            continued.raw_prompt = *request.raw_prompt + completed_text + "\nContinue.";
+            expected_turn = continue_turn(baseline);
+        }
+    }
+    if (std::getenv("SUROGATE_MULTI_DEVICE_TEST_SINGLE_ONLY")) {
+        return 0;
     }
     options.devices = devices;
     GenerationService pipeline(options);
     assert(generate(pipeline) == expected);
+    if (cache_turn) {
+        assert(continue_turn(pipeline) == expected_turn);
+    }
     const auto footprint = pipeline.resident_bytes();
     std::size_t sum = 0;
     for (int device : pipeline.devices()) {

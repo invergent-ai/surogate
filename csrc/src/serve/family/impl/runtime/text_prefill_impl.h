@@ -46,6 +46,13 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
     }
     return dflash_feature_sink(
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
+            const auto& stage = state.execution.stage;
+            if (stage.features) {
+                const auto offset = stage.residual_bytes + static_cast<std::size_t>(features.ne[0]) * sizeof(std::uint16_t);
+                *reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(stage.export_pinned) + offset) =
+                    rewrite_checkpoint ? 1 : 0;
+                if (stage.last < state.execution.model.geometry.layers) { return; }
+            }
             auto& frame  = *state.execution.io.dflash_decode;
             Tensor count = frame.append_counts.slice(0, 0, 1);
             Tensor lane  = frame.lanes.slice(0, 0, 1);

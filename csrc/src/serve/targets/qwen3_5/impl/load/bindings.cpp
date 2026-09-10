@@ -25,6 +25,10 @@ namespace sinfer::targets::qwen3_5::detail {
 
 family::TextGeometry resolved_geometry(const artifact::Reader& reader) {
     auto geometry = family::TextGeometry::resolved_hybrid(reader.geometry(), reader.layer_types());
+    if (!reader.dflash_geometry().empty()) {
+        geometry.dflash = family::DFlashGeometry::resolved(reader.dflash_geometry(),
+            reader.dflash_target_layers(), geometry.hidden, geometry.layers, geometry.output_rows);
+    }
     artifact::resolve_linear_storage(reader, geometry);
     return geometry;
 }
@@ -519,6 +523,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.vision_merger_norm = family::bind_vision_merger_norm(binder, vision_placement, vg);
     }
 
+    out.dflash = family::bind_dflash(binder, g, features);
     load_plan.materialization = binder.finish();
     out.host_bank = family::collect_host_bank(binder, load_plan.materialization);
     return load_plan;
@@ -659,6 +664,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         vision.merger_fc2_bias = artifact::materialized_tensor(
             backing, plan.vision_merger_fc2_bias, NumericFormat::BF16, {vg.output_hidden});
     }
+    if (plan.features.dflash()) {
+        runtime.dflash = family::materialize_dflash(plan.dflash, backing, g);
+    }
+
 }
 
 } // namespace sinfer::targets::qwen3_5::detail

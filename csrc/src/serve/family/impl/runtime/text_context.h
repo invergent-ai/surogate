@@ -359,6 +359,21 @@ struct PrefillChunkResult {
     bool finalized                 = false;
 };
 
+/// Pipeline stage: the layer range this program runs, and the pinned buffers the residual
+/// crosses at the boundaries (import when first > 0, export when last < layers). Whole-model
+/// programs leave the defaults.
+struct StageSpan {
+    int first                 = 0;
+    int last                  = -1;      // -1: through the last layer
+    const void* import_pinned = nullptr; // [residual, columns] BF16, written by the previous stage
+    void* export_pinned       = nullptr; // [residual, columns] BF16, read by the next stage
+    std::int32_t columns      = 0;       // capacity of both buffers
+    std::size_t column_bytes = 0;
+    std::size_t residual_bytes = 0;
+    Tensor* features = nullptr; // compact DFlash feature columns carried beside the residual
+
+};
+
 struct DFlashFeatureSink {
     static constexpr bool enabled = true;
     using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
@@ -372,6 +387,8 @@ struct DFlashFeatureSink {
     std::int32_t batch_size           = 0;
     std::span<const int> layers;
     PrefillConsumer consume_prefill;
+    StageSpan stage;
+    cudaStream_t stream = nullptr;
     std::uint32_t captured_mask = 0;
     std::int32_t active_tokens  = 0;
 
@@ -383,16 +400,6 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
-/// Pipeline stage: the layer range this program runs, and the pinned buffers the residual
-/// crosses at the boundaries (import when first > 0, export when last < layers). Whole-model
-/// programs leave the defaults.
-struct StageSpan {
-    int first                 = 0;
-    int last                  = -1;      // -1: through the last layer
-    const void* import_pinned = nullptr; // [residual, columns] BF16, written by the previous stage
-    void* export_pinned       = nullptr; // [residual, columns] BF16, read by the next stage
-    std::int32_t columns      = 0;       // capacity of both buffers
-};
 
 class TextContext {
 public:

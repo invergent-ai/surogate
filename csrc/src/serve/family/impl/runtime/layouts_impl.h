@@ -318,8 +318,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .dtype       = DType::BF16,
                 .quant_group = 0,
             };
+            const auto feature_columns = plan.pipeline_stage_last > 0
+                ? std::max(effective_prefill_chunk,
+                    static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency) * (plan.draft_window + 1U)))
+                : effective_prefill_chunk;
             dflash.prefill_features = add_tensor(
-                builder, DType::BF16, {plan.geometry.dflash.feature_rows, effective_prefill_chunk},
+                builder, DType::BF16, {plan.geometry.dflash.feature_rows, feature_columns},
                 "DFlash prefill target features");
             dflash.prefill_positions = add_tensor(builder, DType::I32, {effective_prefill_chunk},
                                                   "DFlash prefill target positions");

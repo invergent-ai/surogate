@@ -671,12 +671,6 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
                                      int layers) {
     const int stage_count = static_cast<int>(options.devices.size());
     if (stage_count > layers) { throw std::invalid_argument("more pipeline stages than layers"); }
-    if (options.speculative.backend == SpeculativeBackend::DFlash) {
-        // The MTP round has the launch/consume halves and the headless body a stage needs
-        // (runtime/engine/pipeline_instance.h); the DFlash round does not yet.
-        throw std::invalid_argument(
-            "pipeline parallelism runs no DFlash round yet: --spec dflash needs a single device");
-    }
     std::vector<std::unique_ptr<DeviceContext>> devices;
     std::vector<std::unique_ptr<Instance>> stages;
     LoadSummary summary;

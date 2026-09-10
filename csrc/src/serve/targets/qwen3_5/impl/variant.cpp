@@ -1,3 +1,4 @@
+#include "family/impl/dflash_profiles.h"
 #include "family/impl/lora_gdn.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "family/impl/storage_workspace.h"
@@ -178,9 +179,9 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     return family::graph_profiles_through(capacity - 1, ends);
 }
 
-std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t, std::uint32_t,
-                                                                  std::uint32_t) {
-    return {};
+std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t capacity,
+    std::uint32_t draft_window, std::uint32_t batch_size) {
+    return family::dflash_graph_profiles(capacity, draft_window, batch_size);
 }
 
 

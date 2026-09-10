@@ -259,6 +259,11 @@ public:
                                    std::span<const std::byte> outcome);
     [[nodiscard]] std::span<const std::byte> lane_draft_state(std::uint32_t lane) const;
     void adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state);
+    void adopt_pipeline_prefill_features(std::uint32_t lane, std::span<const std::byte> packet,
+                                          std::uint32_t tokens);
+    void adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
+                                         std::span<const std::byte> packet);
+
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;

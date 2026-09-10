@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/load/dflash.h"
+
 #include "family/impl/moe/banked_experts.h"
 
 #include <api/targets/qwen3_5_moe/package.h>
@@ -105,23 +107,7 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
-struct DFlashLayerPlan {
-    artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_value;
-    artifact::ObjectHandle query_norm;
-    artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle attention_output;
-    artifact::ObjectHandle post_attention_norm;
-    artifact::ObjectHandle gate_up;
-    artifact::ObjectHandle down;
-};
-
-struct DFlashPlan {
-    artifact::ObjectHandle feature_projection;
-    artifact::ObjectHandle context_norm;
-    std::vector<DFlashLayerPlan> layers;
-    artifact::ObjectHandle final_norm;
-};
+using DFlashPlan = family::DFlashPlan;
 
 struct BindingPlan {
     /// The dimensions bound against: the compiled config with the artifact's

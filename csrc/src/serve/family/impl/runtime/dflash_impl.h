@@ -57,6 +57,8 @@ DFlashFeatureSink prefill_feature_sink_impl(PrefillContext& state,
             .positions       = &dflash_state(state).prefill_positions,
             .layers          = config.target_layers(),
             .consume_prefill = std::move(consume_prefill),
+            .stage = state.execution.stage,
+            .stream = state.execution.device.stream,
         };
     }
 }
@@ -76,6 +78,8 @@ DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tenso
             .batch_width         = width,
             .batch_size          = batch_size,
             .layers              = config.target_layers(),
+            .stage = state.execution.stage,
+            .stream = state.execution.device.stream,
         };
     }
 }
@@ -154,8 +158,14 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 layer_roots.value.view({config.head_dim, config.kv_heads, layer_columns});
             Tensor key_flat   = key_raw.view({config.kv_size(), layer_columns});
             Tensor value_flat = value.view({config.kv_size(), layer_columns});
-            ops::linear_pair(layer_context, weight.context_key, weight.context_value, key_flat,
-                             value_flat, state.execution.device.stream);
+            if (config.kv_size() == 1024 && (config.hidden == 5120 ||
+                (config.hidden == 2048 && config.query_size() == 4096))) {
+                ops::linear_pair(layer_context, weight.context_key, weight.context_value, key_flat,
+                                 value_flat, state.execution.device.stream);
+            } else {
+                ops::linear(layer_context, weight.context_key, key_flat, state.execution.device.stream);
+                ops::linear(layer_context, weight.context_value, value_flat, state.execution.device.stream);
+            }
             Tensor key = layer_roots.key.view({config.head_dim, config.kv_heads, layer_columns});
             ops::rmsnorm(key_raw, weight.key_norm, config.rms_epsilon, false, key,
                          state.execution.device.stream);
@@ -356,15 +366,40 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
                                      lanes, dflash_rows, envelopes.append);
 
-        propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
-        ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
-                                            state.execution.device.stream);
+        const auto& stage = state.execution.stage;
+        const auto metadata = stage.residual_bytes +
+            static_cast<std::size_t>(state.execution.model.geometry.dflash.feature_rows) * sizeof(std::uint16_t);
+        const auto stream = state.execution.device.stream;
+        if (stage.features && stage.first > 0) {
+            const auto* packet = static_cast<const std::byte*>(stage.import_pinned);
+            CUDA_CHECK(cudaMemcpy2DAsync(verify_ids.data, sizeof(std::int32_t), packet + metadata,
+                stage.column_bytes, sizeof(std::int32_t), width * batch_size, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(target_positions.data, sizeof(std::int32_t),
+                packet + metadata + sizeof(std::int32_t), stage.column_bytes, sizeof(std::int32_t),
+                width * batch_size, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(drafts.data, drafts.nb[1],
+                static_cast<const std::int32_t*>(verify_ids.data) + 1, verify_ids.nb[1],
+                k * sizeof(std::int32_t), batch_size, cudaMemcpyDeviceToDevice, stream));
+        } else {
+            propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
+            ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream);
+        }
+        if (stage.features) {
+            auto* packet = static_cast<std::byte*>(stage.export_pinned);
+            CUDA_CHECK(cudaMemcpy2DAsync(packet + metadata, stage.column_bytes,
+                verify_ids.data, sizeof(std::int32_t), sizeof(std::int32_t), width * batch_size,
+                cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(packet + metadata + sizeof(std::int32_t), stage.column_bytes,
+                target_positions.data, sizeof(std::int32_t), sizeof(std::int32_t), width * batch_size,
+                cudaMemcpyDeviceToHost, stream));
+        }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_ple_state(state.execution.ple);
+        card.set_stage(state.execution.stage);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, width, batch_size);
         target_verify_accept(state.execution, state.continuation_hidden_store, card,

@@ -141,7 +141,7 @@ struct SpeculativeOutcome {
     std::int32_t licensed_count  = 0;
     std::int32_t accepted_drafts = 0;
     std::int32_t next_extent     = 0;
-    std::array<TokenId, family::kMtpDecodeMaximumWidth> licensed_tokens{};
+    std::array<TokenId, family::kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<TokenId, family::kMtpDecodeMaximumDrafts> next_drafts{};
 };
 static_assert(std::is_trivially_copyable_v<SpeculativeOutcome>);
@@ -341,7 +341,7 @@ public:
     /// Columns a decode round licenses per lane at most: the draft window plus the anchor
     /// under MTP, one otherwise. The pipeline driver sizes its token and residual carries by it.
     [[nodiscard]] std::uint32_t speculative_round_width() const noexcept {
-        return speculative_backend == SpeculativeBackend::Mtp ? draft_window + 1U : 1U;
+        return speculative_backend != SpeculativeBackend::None ? draft_window + 1U : 1U;
     }
     /// How many decode lanes the executor has in flight this round, across every group of a
     /// pipeline: the MTP round verifies drafts only while that is within
@@ -372,6 +372,11 @@ public:
     /// adoption on a stage whose own prefill proposed nothing.
     [[nodiscard]] std::span<const std::byte> lane_draft_state(std::uint32_t lane) const;
     void adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state);
+    void adopt_pipeline_prefill_features(std::uint32_t lane, std::span<const std::byte> packet,
+                                          std::uint32_t tokens);
+    void adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
+                                         std::span<const std::byte> packet);
+
     void configure_stage(const SequencePlanImpl& plan);
     /// Pipeline stages without the head record a placeholder token per round; the driver
     /// replaces each lane's last ledger entry with the token the last stage sampled.
@@ -382,12 +387,13 @@ public:
                                                            std::span<const runtime::RoundBudget> budgets) {
         if (speculative_backend == SpeculativeBackend::Mtp) { return launch_mtp_round(lanes, budgets); }
         if (speculative_backend == SpeculativeBackend::DFlash) {
-            throw std::logic_error("the DFlash round has no launch and consume halves");
+            return launch_dflash_round(lanes, budgets);
         }
         return launch_ordinary_round(lanes, budgets);
     }
     [[nodiscard]] runtime::BatchedGeneratedRound consume_decode_round(runtime::RoundHandle handle) {
         if (speculative_backend == SpeculativeBackend::Mtp) { return consume_mtp_round(handle); }
+        if (speculative_backend == SpeculativeBackend::DFlash) { return consume_dflash_round(handle); }
         return consume_ordinary_round(handle);
     }
     [[nodiscard]] runtime::RoundHandle launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
@@ -574,6 +580,10 @@ private:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::RoundHandle
+    launch_dflash_round(std::span<const std::uint32_t> lanes,
+                         std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound consume_dflash_round(runtime::RoundHandle handle);
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                              std::uint32_t backend_pages);
     void resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,

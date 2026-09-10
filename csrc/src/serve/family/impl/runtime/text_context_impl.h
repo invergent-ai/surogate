@@ -158,7 +158,7 @@ void DFlashFeatureSink::begin(const Tensor& value) {
     const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
     const bool batch   = batch_features != nullptr && batch_lanes != nullptr &&
                        batch_valid_columns != nullptr && batch_width > 0 && batch_size > 0;
-    if ((!prefill && !batch) || layers.empty()) {
+    if ((!prefill && !batch) || layers.empty() || layers.size() > 32) {
         throw std::logic_error("DFlash feature sink is incomplete");
     }
     captured_mask = 0;
@@ -166,20 +166,36 @@ void DFlashFeatureSink::begin(const Tensor& value) {
     if (value.ne[1] != active_tokens) {
         throw std::logic_error("DFlash batch feature source has an invalid width");
     }
+    if (stage.features) {
+        if (active_tokens > stage.features->ne[1]) {
+            throw std::logic_error("DFlash pipeline feature storage is too small");
+        }
+        const auto bytes = static_cast<std::size_t>(stage.features->ne[0]) * sizeof(std::uint16_t);
+        if (stage.first > 0) {
+            CUDA_CHECK(cudaMemcpy2DAsync(stage.features->data, stage.features->nb[1],
+                static_cast<const std::byte*>(stage.import_pinned) + stage.residual_bytes,
+                stage.column_bytes, bytes, active_tokens, cudaMemcpyHostToDevice, stream));
+            for (std::size_t i = 0; i < layers.size(); ++i) {
+                if (layers[i] < stage.first) { captured_mask |= 1U << i; }
+            }
+        } else {
+            CUDA_CHECK(cudaMemsetAsync(stage.features->data, 0, bytes * active_tokens, stream));
+        }
+    }
 }
 
 void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
     const auto it = std::find(layers.begin(), layers.end(), layer);
     if (it == layers.end()) { return; }
     const std::size_t index = static_cast<std::size_t>(it - layers.begin());
-    Tensor* destination     = batch_features != nullptr ? batch_features : features;
+    Tensor* destination = stage.features ? stage.features : batch_features != nullptr ? batch_features : features;
     if (layers.size() > 32 || active_tokens <= 0 || value.dtype != DType::BF16 ||
         destination == nullptr ||
         value.ne[0] * static_cast<std::int32_t>(layers.size()) != destination->ne[0] ||
         value.ne[1] != active_tokens) {
         throw std::logic_error("DFlash feature capture shape is invalid");
     }
-    if (batch_features != nullptr) {
+    if (batch_features != nullptr && stage.features == nullptr) {
         Tensor source = value.view({value.ne[0], batch_width, batch_size});
         Tensor target =
             batch_features->slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
@@ -187,14 +203,14 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
         captured_mask |= 1U << index;
         return;
     }
-    if (active_tokens > features->ne[1]) {
+    if (active_tokens > destination->ne[1]) {
         throw std::logic_error("DFlash prefill feature capture exceeds its buffer");
     }
     const std::size_t element_bytes = dtype_size(DType::BF16);
     const std::size_t width_bytes   = static_cast<std::size_t>(value.ne[0]) * element_bytes;
     const std::size_t source_pitch  = static_cast<std::size_t>(value.nb[1]);
-    const std::size_t target_pitch  = static_cast<std::size_t>(features->nb[1]);
-    auto* target                    = static_cast<std::byte*>(features->data) + index * width_bytes;
+    const std::size_t target_pitch  = static_cast<std::size_t>(destination->nb[1]);
+    auto* target                    = static_cast<std::byte*>(destination->data) + index * width_bytes;
     CUDA_CHECK(cudaMemcpy2DAsync(target, target_pitch, value.data, source_pitch, width_bytes,
                                  static_cast<std::size_t>(active_tokens), cudaMemcpyDeviceToDevice,
                                  stream));
@@ -202,9 +218,28 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
 }
 
 void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t stream) {
-    const std::uint32_t complete_mask = layers.size() == 32 ? ~0U : ((1U << layers.size()) - 1U);
+    std::uint32_t complete_mask = 0;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (!stage.features || layers[i] < stage.last) { complete_mask |= 1U << i; }
+    }
     if (captured_mask != complete_mask) {
         throw std::logic_error("DFlash target call did not publish every feature layer");
+    }
+    if (stage.features) {
+        const auto bytes = static_cast<std::size_t>(stage.features->ne[0]) * sizeof(std::uint16_t);
+        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(stage.export_pinned) + stage.residual_bytes,
+            stage.column_bytes, stage.features->data, stage.features->nb[1], bytes, active_tokens,
+            cudaMemcpyDeviceToHost, stream));
+        if (batch_features) {
+            Tensor compact = stage.features->slice(1, 0, active_tokens).view(
+                {stage.features->ne[0], batch_width, batch_size});
+            ops::scatter_bf16_batch(compact, *batch_lanes, *batch_valid_columns, *batch_features, stream);
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(stage.export_pinned) +
+                stage.residual_bytes + bytes + sizeof(std::int32_t), stage.column_bytes,
+                source.data, sizeof(std::int32_t), sizeof(std::int32_t), active_tokens,
+                cudaMemcpyDeviceToHost, stream));
+        }
     }
     if (batch_features != nullptr) {
         if (source.dtype != DType::I32 || source.ne[0] != batch_width ||
@@ -2018,9 +2053,10 @@ inline void stage_checksum(const char* what, int first, int last, const void* de
 void TextContext::stage_import(Tensor& x, cudaStream_t stream) {
     const std::int32_t columns = x.ne[1];
     if (columns > stage_.columns) { throw std::logic_error("pipeline stage import wider than its buffer"); }
-    CUDA_CHECK(cudaMemcpyAsync(x.data, stage_.import_pinned,
-                               x.bytes(),
-                               cudaMemcpyHostToDevice, stream));
+    const auto width = static_cast<std::size_t>(x.ne[0]) * dtype_size(x.dtype);
+    CUDA_CHECK(cudaMemcpy2DAsync(x.data, x.nb[1], stage_.import_pinned,
+        stage_.column_bytes ? stage_.column_bytes : width, width, columns,
+        cudaMemcpyHostToDevice, stream));
     stage_checksum("import", stage_first_, stage_last_, x.data, cfg_.residual, columns, stream);
 }
 
@@ -2028,9 +2064,10 @@ void TextContext::stage_export(const Tensor& x, cudaStream_t stream) {
     const std::int32_t columns = x.ne[1];
     if (columns > stage_.columns) { throw std::logic_error("pipeline stage export wider than its buffer"); }
     stage_checksum("export", stage_first_, stage_last_, x.data, cfg_.residual, columns, stream);
-    CUDA_CHECK(cudaMemcpyAsync(stage_.export_pinned, x.data,
-                               x.bytes(),
-                               cudaMemcpyDeviceToHost, stream));
+    const auto width = static_cast<std::size_t>(x.ne[0]) * dtype_size(x.dtype);
+    CUDA_CHECK(cudaMemcpy2DAsync(stage_.export_pinned,
+        stage_.column_bytes ? stage_.column_bytes : width, x.data, x.nb[1], width, columns,
+        cudaMemcpyDeviceToHost, stream));
 }
 
 void TextContext::run_layers(Tensor& x, Phase ph) {
