@@ -128,6 +128,12 @@ sinfer_add_test(sinfer_tensor_test       SOURCES test_tensor.cpp)
 sinfer_add_test(sinfer_arena_test        SOURCES test_arena.cpp)
 sinfer_add_test(sinfer_request_memory_test SOURCES test_request_memory.cpp)
 sinfer_add_test(sinfer_admission_policy_test SOURCES test_admission_policy.cpp)
+sinfer_add_test(sinfer_high_concurrency_test
+  SOURCES test_high_concurrency.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_high_concurrency_test PRIVATE -UNDEBUG)
+set_tests_properties(sinfer_high_concurrency_test PROPERTIES SKIP_RETURN_CODE 77)
+
 sinfer_add_test(sinfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 sinfer_add_test(sinfer_cuda_visibility_test
   SOURCES test_cuda_visibility.cpp

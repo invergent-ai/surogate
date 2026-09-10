@@ -974,8 +974,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                         ops::GqaExecutionEnvelope envelope, Tensor& hidden,
                                         Tensor& logits) {
     const std::int32_t batch = ids.ne[0];
-    if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
-        throw std::invalid_argument("ordinary decode batch size must be in [1,32]");
+    if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumBatchColumns)) {
+        throw std::invalid_argument("ordinary decode batch size is outside the GPU batch capacity");
     }
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
     require_tensor_shape(cache_positions, DType::I32, {batch}, "ordinary decode cache positions");
@@ -1028,7 +1028,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
-        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        batch > static_cast<std::int32_t>(kMaximumBatchColumns)) {
         throw std::invalid_argument("target verify batch shape is outside the supported domain");
     }
     const std::int32_t columns = width * batch;
@@ -1121,7 +1121,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
-        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        batch > static_cast<std::int32_t>(kMaximumBatchColumns)) {
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
@@ -2074,7 +2074,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         throw std::invalid_argument("mixed chunk needs at least one prefill segment");
     }
     const std::int32_t batch = decode.ids.ne[0]; // 0: a batched prefill round without decode lanes
-    if (batch < 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+    if (batch < 0 || batch > static_cast<std::int32_t>(kMaximumBatchColumns)) {
         throw std::invalid_argument("mixed chunk decode batch is out of range");
     }
     cudaStream_t s   = ctx_.stream;
@@ -2117,7 +2117,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     Tensor positions = roots.positions;
     // Each segment owns a column range; ids and positions are laid out segment by segment and
     // every mixer below slices the same ranges.
-    std::array<int, kMaximumConcurrency> segment_begin{};
+    std::array<int, kMaximumBatchColumns> segment_begin{};
     {
         int cursor = 0;
         for (std::size_t i = 0; i < segments.size(); ++i) {

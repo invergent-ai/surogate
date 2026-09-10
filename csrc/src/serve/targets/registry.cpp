@@ -735,8 +735,8 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
         // The widest residual a stage exports: a prefill chunk beside the decode lanes, or a
         // verify's draft window plus one per lane.
         stage_options.pipeline_boundary_columns =
-            std::max(options.prefill_chunk + options.max_concurrency + 128,
-                     options.max_concurrency * (options.speculative.draft_tokens + 1) + 128);
+            std::max(options.prefill_chunk + decode_batch_capacity(options.max_concurrency) + 128,
+                     decode_batch_capacity(options.max_concurrency) * (options.speculative.draft_tokens + 1) + 128);
         // Zero until the preflight below has run, and then the shared values every stage --
         // stage 0 included -- is built with.
         if (resolved_kv != 0) {

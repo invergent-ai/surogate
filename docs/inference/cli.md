@@ -131,14 +131,15 @@ precisions. Force `q4` only when you want the RAM saving from reducing wider wei
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--max-num-seqs N` | 1 | Maximum simultaneous requests, from 1 to 128 |
+| `--max-num-seqs N` | 1 | Maximum active requests per model |
 | `--max-num-batched-tokens N` | 2048 | Prompt tokens processed at a time; must be a positive multiple of 128 |
 | `--max-pending-requests N` | 16 | Additional requests allowed to wait |
 | `--pending-timeout-ms N` | 30000 | Time allowed for prompt preparation and waiting to start generation |
 | `--default-max-tokens N` | 8192 | Output limit when a request omits it |
 
-Raise `--max-num-seqs` when serving multiple users. More simultaneous requests need more
-memory; pair it with `--kv-capacity auto`. The pending timeout does not limit how long an
+Set `--max-num-seqs 256` (or higher) to allow more than 128 active requests per model.
+More simultaneous requests need more memory and may increase response latency; pair this
+setting with `--kv-capacity auto`. The pending timeout does not limit how long an
 already-running response may take.
 
 ### Speculative decoding

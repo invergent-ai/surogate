@@ -79,7 +79,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                            MtpGqaEnvelopes envelopes) {
     return [&state, batch_size, k, envelopes] {
-        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumBatchColumns) ||
             k == 0 || k > kMtpDecodeMaximumDrafts) {
             throw std::logic_error("MTP decode batch state is incomplete");
         }
@@ -227,7 +227,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 auto mtp_narrow_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                            MtpGqaEnvelopes envelopes) {
     return [&state, batch_size, k, envelopes] {
-        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumBatchColumns) ||
             k == 0 || k > kMtpDecodeMaximumDrafts || state.one.data == nullptr) {
             throw std::logic_error("MTP narrow batch state is incomplete");
         }

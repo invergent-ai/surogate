@@ -118,8 +118,8 @@ public:
             for (auto& slot : boundary) { slot.resize(boundary_bytes_); }
         }
         width_ = std::max<std::uint32_t>(1, stages_.front()->program->speculative_round_width());
-        assembled_tokens_.resize(static_cast<std::size_t>(kMaximumConcurrency) * width_);
-        assembled_counts_.resize(kMaximumConcurrency);
+        assembled_tokens_.resize(static_cast<std::size_t>(kMaximumBatchColumns) * width_);
+        assembled_counts_.resize(kMaximumBatchColumns);
         assembled_prefill_tokens_.fill(0);
         flights_.resize(groups_);
         stage_owner_.assign(stages_.size(), -1);

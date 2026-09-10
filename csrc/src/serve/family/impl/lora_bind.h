@@ -29,7 +29,7 @@ inline void configure_lora_store(ops::LoraStore& store, const EngineOptions& opt
     const auto window = options.speculative.backend == SpeculativeBackend::None
                             ? 1U : options.speculative.draft_tokens + 1U;
     store.configure(std::max(options.lora_slots, 1U), std::max(options.lora_max_rank, 1U),
-                    std::max({options.prefill_chunk, options.max_concurrency * window, 1U}));
+                    std::max({options.prefill_chunk, decode_batch_capacity(options.max_concurrency) * window, 1U}));
 }
 
 inline void finish_lora_bind(ops::LoraStore& store, const EngineOptions& options) {

@@ -272,7 +272,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
                          .layers          = geometry_gdn_layers(plan.geometry),
-                         .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                         .record_capacity =
+                             static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency)),
                          .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
                          .conv_channels   = plan.geometry.convolution_dim(),
                          .qk_heads        = plan.geometry.gdn_key_heads,
@@ -340,7 +341,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.round = family::begin_round_state_layout(
         builder, family::RoundStateSpec{.hidden         = round_hidden,
                                          .output_rows    = plan.geometry.output_rows,
-                                         .batch_capacity = plan.max_concurrency,
+                                         .batch_capacity = decode_batch_capacity(plan.max_concurrency),
                                          .draft_window   = plan.draft_window,
                                          .enable_mtp     = plan.features.mtp(),
                                          .enable_dflash  = plan.features.dflash()});
@@ -393,6 +394,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
+    const auto batch_capacity = static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency));
     const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -603,8 +605,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     scratch(text_prefill, ops::sampling_workspace_capacity_bytes(plan.geometry.token_domain, 1, 1));
     out.text_prefill = finish(text_prefill);
 
-    for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
-         ++batch) {
+    for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
         WorkspaceLayoutBuilder ordinary;
         matrix(ordinary, plan.geometry.residual_dtype(), plan.geometry.residual, batch);
         target_body(ordinary, batch, batch, family::TextPhase::Verify, GdnWorkspacePath::Snapshot,
@@ -644,8 +645,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.mtp_round = std::max({accept, finish(mtp_batch), finish(mtp_ar), finish(mtp_proposal)});
         out.ordinary_round = std::max(out.ordinary_round, finish(mtp_align));
 
-        for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
-             ++batch) {
+        for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
             const std::int32_t aggregate = batch * verify;
             WorkspaceLayoutBuilder target;
             matrix(target, plan.geometry.residual_dtype(), plan.geometry.residual, aggregate);
@@ -736,8 +736,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, false);
-            for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
-                 ++batch) {
+            for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
                 const std::int32_t aggregate = verify * batch;
                 WorkspaceLayoutBuilder target;
                 matrix(target, plan.geometry.residual_dtype(), plan.geometry.residual, aggregate);
@@ -909,7 +908,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes =
                 checked_mul(ordinary_graph_allowance_per_lane_bytes<Variant>(impl->weights_profile),
-                            impl->max_concurrency, "ordinary exact-b graph allowance");
+                            decode_batch_capacity(impl->max_concurrency),
+                            "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(
@@ -921,8 +921,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                 },
                 "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(per_batch_allowance, decode_batch_capacity(impl->max_concurrency),
+                            "MTP exact-b graph allowance");
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =
@@ -937,7 +938,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     },
                     "DFlash graph allowance");
             };
-            for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
+            for (std::uint32_t batch_size = 1;
+                 batch_size <= decode_batch_capacity(impl->max_concurrency); ++batch_size) {
                 impl->graph_allowance_bytes =
                     checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
                                 "DFlash exact-b graph allowance");

@@ -58,7 +58,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         // The widest round an adapter can see. This target refuses speculation,
         // so a decode round is one column per lane.
         const std::uint32_t widest =
-            std::max<std::uint32_t>(std::max<std::uint32_t>(options.max_concurrency, 1),
+            std::max<std::uint32_t>(std::max<std::uint32_t>(decode_batch_capacity(options.max_concurrency), 1),
                                     std::max<std::uint32_t>(options.prefill_chunk, 1));
         store.configure(static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_slots, 1)),
                         static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_max_rank, 1)),

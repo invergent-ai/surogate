@@ -595,9 +595,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-model-len");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        // The bound is kMaximumConcurrency; say so rather than restating a
-        // number. This message read "[1,8]" long after the ceiling moved to 64,
-        // which sends anyone hitting it looking in the wrong place.
+        // Device state uses signed 32-bit lane indices; there is no fixed lane array.
         throw std::invalid_argument("--max-num-seqs must be in [1," +
                                     std::to_string(kMaximumConcurrency) + "]");
     }

@@ -3,7 +3,7 @@
 #include "api/types.h"
 #include "runtime/contract/types.h"
 
-#include <array>
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -33,8 +33,8 @@ struct AdmissionProtection {
     std::uint64_t epoch_id        = 0;
     std::uint64_t head_request_id = 0;
     AdmissionResources head_resources;
-    std::array<std::uint64_t, kMaximumConcurrency> incumbent_ids{};
-    std::array<std::uint64_t, kMaximumConcurrency> donor_ids{};
+    std::vector<std::uint64_t> incumbent_ids{};
+    std::vector<std::uint64_t> donor_ids{};
     std::size_t incumbent_count   = 0;
     std::size_t donor_count       = 0;
     std::uint64_t temporal_credit = 0;

@@ -26,11 +26,7 @@
 namespace sinfer {
 
 
-// The ops layer bounds batched work by kMaximumBatchColumns; the serving
-// layer hands it kMaximumConcurrency lanes. They must agree, or a raise on
-// one side silently outruns the other (PATCHES.md #35).
-static_assert(static_cast<std::int32_t>(kMaximumConcurrency) == kMaximumBatchColumns,
-              "serving concurrency ceiling and the ops batch bound must match");namespace {
+namespace {
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
@@ -187,7 +183,7 @@ public:
         set_sleepable_allocations(options.sleep_enable);
         ops::detail::w8fp8_plane_set_enabled(true);
         ops::detail::marlin_plane_set_enabled(true);
-        ops::detail::marlin_set_fixed_m(static_cast<int>(options.max_concurrency));
+        ops::detail::marlin_set_fixed_m(static_cast<int>(decode_batch_capacity(options.max_concurrency)));
         // surogate vendor patch (PATCHES.md #21): NVFP4 prefill profile is
         // an explicit opt-in (quality class change).
         if (const char* mode = std::getenv("SUROGATE_SERVE_PREFILL_QUANT");

@@ -1,5 +1,6 @@
 #pragma once
 #include "api/shared_weights.h"
+#include "core/limits.h"
 
 #include <array>
 #include <chrono>
@@ -24,10 +25,14 @@ class EngineOpsContext;
 
 using TokenId = std::int32_t;
 
-// surogate vendor patch (PATCHES.md #29): raised 8 -> 16 for the multi-user
-// campaign. Every exact-T decode table and the conv-fused GDN path cover
-// T<=16; 32 needs the T=17..32 route coverage first.
-inline constexpr std::uint32_t kMaximumConcurrency = 128; // #79: 64 left a third of a 100-user load queued
+// Request lanes use signed 32-bit indices in device state. Storage is sized by the
+// configured concurrency; GPU rounds have their own bounded batch capacity.
+inline constexpr std::uint32_t kMaximumConcurrency = 0x7FFFFFFFU;
+
+[[nodiscard]] constexpr std::uint32_t decode_batch_capacity(std::uint32_t active_sequences) noexcept {
+    return active_sequences < static_cast<std::uint32_t>(kMaximumBatchColumns)
+               ? active_sequences : static_cast<std::uint32_t>(kMaximumBatchColumns);
+}
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;

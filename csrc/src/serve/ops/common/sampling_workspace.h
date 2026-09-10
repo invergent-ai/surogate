@@ -39,7 +39,7 @@ __host__ __device__ inline int sampler_group_count(int partial_blocks) {
 
 // The multi-block route is deliberately finite. A single final merge tile must
 // hold every group candidate; the registered sampling/speculative routes use at
-// most kSamplerMaxColumns columns (raised with kMaximumConcurrency).
+// most kSamplerMaxColumns columns per GPU round.
 __host__ __device__ inline bool sampler_multiblock_ok(int vocab, int cols, int partial_blocks,
                                                       int group_count) {
     return vocab > kSamplerTileItems && cols > 0 && cols <= kSamplerMaxColumns &&

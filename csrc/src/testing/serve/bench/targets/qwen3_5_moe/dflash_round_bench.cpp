@@ -112,7 +112,7 @@ Options parse_options(int argc, char** argv) {
     if (options.draft_tokens == 0 || options.draft_tokens > 15) {
         throw std::invalid_argument("--draft-tokens must be in [1,15]");
     }
-    if (options.batch_size == 0 || options.batch_size > sinfer::kMaximumConcurrency) {
+    if (options.batch_size == 0 || options.batch_size > sinfer::kMaximumBatchColumns) {
         throw std::invalid_argument("--batch must be in [1,8]");
     }
     return options;
@@ -135,8 +135,8 @@ struct RoundMeasurement {
 
 RoundMeasurement measure_round(target::Package::Program& program, sinfer::DeviceContext& device,
                                std::uint32_t batch_size, std::uint32_t draft_tokens) {
-    std::array<std::uint32_t, sinfer::kMaximumConcurrency> lanes{};
-    std::array<sinfer::runtime::RoundBudget, sinfer::kMaximumConcurrency> budgets{};
+    std::array<std::uint32_t, sinfer::kMaximumBatchColumns> lanes{};
+    std::array<sinfer::runtime::RoundBudget, sinfer::kMaximumBatchColumns> budgets{};
     for (std::uint32_t row = 0; row < batch_size; ++row) {
         lanes[row]   = row;
         budgets[row] = {.generated_tokens_remaining = draft_tokens + 1};
@@ -151,9 +151,9 @@ RoundMeasurement measure_round(target::Package::Program& program, sinfer::Device
     if (round.row_counts.size() != batch_size) {
         throw std::runtime_error("DFlash benchmark round returned invalid row counts");
     }
-    std::array<std::uint32_t, sinfer::kMaximumConcurrency> accepted{};
-    std::array<std::uint8_t, sinfer::kMaximumConcurrency> terminal{};
-    std::array<std::uint8_t, sinfer::kMaximumConcurrency> cancelled{};
+    std::array<std::uint32_t, sinfer::kMaximumBatchColumns> accepted{};
+    std::array<std::uint8_t, sinfer::kMaximumBatchColumns> terminal{};
+    std::array<std::uint8_t, sinfer::kMaximumBatchColumns> cancelled{};
     std::uint32_t licensed = 0;
     for (std::uint32_t row = 0; row < batch_size; ++row) {
         const std::int32_t count = round.row_counts[row];

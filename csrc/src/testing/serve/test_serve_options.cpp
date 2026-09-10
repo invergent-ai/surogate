@@ -100,6 +100,12 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
+    const auto wide = parse({"sinfer-serve", "model.sinfer", "--max-num-seqs", "513",
+                             "--model", "extra=other.sinfer,max-num-seqs=257"});
+    failures += check(wide.max_concurrency == 513 && wide.extra_models.size() == 1 &&
+                          wide.extra_models[0].max_num_seqs == 257,
+                      "concurrency above 128 was rejected or truncated");
+
     const ServeOptions configured = parse({"sinfer-serve",
                                            "model.sinfer",
                                            "--no-prefix-reuse",

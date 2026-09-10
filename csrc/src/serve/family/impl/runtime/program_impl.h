@@ -275,7 +275,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                  DeviceContext& device_in)
     : cfg(model_in.geometry), model(model_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity),
-      max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
+      max_concurrency(plan.max_concurrency),
+      batch_capacity(decode_batch_capacity(plan.max_concurrency)), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_max_lanes(plan.speculative_max_lanes),
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
@@ -285,6 +286,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
+      sequences(plan.max_concurrency), requests(plan.max_concurrency),
       round_host(sizeof(TokenId) + sizeof(float)),
       ordinary_host(
           plan.speculative_backend != SpeculativeBackend::DFlash
@@ -893,7 +895,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                                             std::span<const std::uint32_t> accepted_tokens,
                                             std::span<const std::uint8_t> terminal,
                                             std::span<const std::uint8_t> cancelled) {
-    if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
+    if (lanes.empty() || lanes.size() > batch_capacity || accepted_tokens.size() != lanes.size() ||
         terminal.size() != lanes.size() || cancelled.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
     }
@@ -919,8 +921,8 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         throw std::logic_error("speculative pending batch has no ReplaySSM records");
     }
 
-    std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> hidden_selectors{};
+    std::array<ops::GdnReplayFoldRow, kMaximumBatchColumns> fold_rows{};
+    std::array<std::int32_t, kMaximumBatchColumns> hidden_selectors{};
     bool needs_hidden_correction = false;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
@@ -1007,9 +1009,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         }
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
-            std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
-            std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
-            std::array<std::uint32_t, kMaximumConcurrency> append_counts{};
+            std::array<std::uint32_t, kMaximumBatchColumns> append_lanes{};
+            std::array<std::uint32_t, kMaximumBatchColumns> append_starts{};
+            std::array<std::uint32_t, kMaximumBatchColumns> append_counts{};
             std::size_t append_size = 0;
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (!cancelled[row] && terminal[row]) {
@@ -1333,12 +1335,12 @@ void ProgramImplCore::prepare_graphs() {
                                           std::vector<PagedKVAllocation>& allocations,
                                           const char* label) {
         PagedKVPool& pool = cache.pool();
-        if (pool.capacity_pages() < max_concurrency) {
+        if (pool.capacity_pages() < batch_capacity) {
             throw std::invalid_argument(std::string(label) +
-                                        " cannot provide one Paged KV page per concurrent request");
+                                        " cannot provide one Paged KV page per decode batch row");
         }
-        allocations.reserve(max_concurrency);
-        for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+        allocations.reserve(batch_capacity);
+        for (std::uint32_t row = 0; row < batch_capacity; ++row) {
             allocations.push_back(pool.reserve(1));
             PagedKVAllocation& allocation = allocations.back();
             allocation.bind_row(static_cast<std::int32_t>(row), device.stream);
@@ -1403,7 +1405,7 @@ void ProgramImplCore::prepare_graphs() {
     };
 
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size) {
-        if (batch_size == 0 || batch_size > max_concurrency) {
+        if (batch_size == 0 || batch_size > batch_capacity) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
         work.reset();
@@ -1508,7 +1510,7 @@ void ProgramImplCore::prepare_graphs() {
     if (speculative_backend == SpeculativeBackend::None) {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
-        const std::uint32_t ordinary_batch_limit = max_concurrency;
+        const std::uint32_t ordinary_batch_limit = batch_capacity;
         schedule::OrdinaryBatchContext ordinary_state{execution_core(),      decoder->text_kv,
                                                       *io.ordinary,          *ordinary_host_ingress,
                                                       *ordinary_host_egress, tail_hidden_store,
@@ -1600,8 +1602,8 @@ void ProgramImplCore::prepare_graphs() {
                                    nullptr);
         device.synchronize();
 
-        mtp_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+        mtp_graphs.profiles.reserve(planned_profiles.size() * batch_capacity);
+        for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
             for (const GraphExecutionProfile planned : planned_profiles) {
                 mtp_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
@@ -1609,7 +1611,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.min_execution_frontier = planned.min;
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
+                    planned.topology_class * batch_capacity + (batch_size - 1U);
                 schedule::capture_mtp_decode_batch(
                     mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
                     mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
@@ -1619,7 +1621,7 @@ void ProgramImplCore::prepare_graphs() {
         // the round's own: nothing drafted, one valid column, rope positions at stride one.
         if (speculative_max_lanes != kSpeculateAtAnyWidth) {
             prepare_representative(code_warm.min, 1);
-            for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+            for (std::uint32_t row = 0; row < batch_capacity; ++row) {
                 mtp_host_ingress->current_extents[row]      = 0;
                 mtp_host_ingress->target_valid_columns[row] = 1;
                 mtp_host_ingress->target_rope_positions[row] =
@@ -1630,8 +1632,8 @@ void ProgramImplCore::prepare_graphs() {
                                        mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
                                        nullptr, /*narrow=*/true);
             device.synchronize();
-            mtp_narrow_graphs.profiles.reserve(planned_profiles.size() * max_concurrency);
-            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+            mtp_narrow_graphs.profiles.reserve(planned_profiles.size() * batch_capacity);
+            for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
                 for (const GraphExecutionProfile planned : planned_profiles) {
                     mtp_narrow_graphs.profiles.emplace_back();
                     DecodeGraphProfile& profile    = mtp_narrow_graphs.profiles.back();
@@ -1639,7 +1641,7 @@ void ProgramImplCore::prepare_graphs() {
                     profile.min_execution_frontier = planned.min;
                     profile.max_execution_frontier = planned.max;
                     profile.topology_class =
-                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                        planned.topology_class * batch_capacity + (batch_size - 1U);
                     schedule::capture_mtp_decode_batch(
                         mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
                         mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition,
@@ -1665,8 +1667,8 @@ void ProgramImplCore::prepare_graphs() {
                                       code_warm_target, nullptr);
         device.synchronize();
 
-        dflash_graphs.profiles.reserve(batch_one_profiles.size() * max_concurrency);
-        for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+        dflash_graphs.profiles.reserve(batch_one_profiles.size() * batch_capacity);
+        for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
             const auto planned_profiles =
                 batch_size == 1 ? batch_one_profiles
                                 : dflash_graph_profiles(capacity, draft_window, batch_size);
@@ -1678,7 +1680,7 @@ void ProgramImplCore::prepare_graphs() {
                 profile.min_execution_frontier = planned.min;
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
-                    planned.topology_class * max_concurrency + (batch_size - 1U);
+                    planned.topology_class * batch_capacity + (batch_size - 1U);
                 const ops::GqaExecutionEnvelope target_envelope{
                     1,
                     static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -1706,7 +1708,7 @@ void ProgramImplCore::prepare_graphs() {
             // The narrow round's representative: the same batch, in the narrow ingress shape.
             const auto prepare_narrow = [&](std::uint32_t frontier, std::uint32_t batch_size) {
                 prepare_representative(frontier, batch_size);
-                for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+                for (std::uint32_t row = 0; row < batch_capacity; ++row) {
                     mtp_host_ingress->current_extents[row]      = 0;
                     mtp_host_ingress->target_valid_columns[row] = 1;
                     mtp_host_ingress->target_rope_positions[row] =
@@ -1947,7 +1949,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
                                                     std::span<const std::uint32_t> starts,
                                                     std::span<const std::uint32_t> counts) {
     if (speculative_backend != SpeculativeBackend::DFlash || !dflash || !io.dflash_decode ||
-        lanes.empty() || lanes.size() > max_concurrency || starts.size() != lanes.size() ||
+        lanes.empty() || lanes.size() > batch_capacity || starts.size() != lanes.size() ||
         counts.size() != lanes.size()) {
         throw std::logic_error("DFlash context append has invalid membership");
     }
@@ -2326,7 +2328,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
     if (speculative_backend != SpeculativeBackend::None) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
     }
-    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
+    if (lanes.empty() || lanes.size() > batch_capacity || budgets.size() != lanes.size()) {
         throw std::invalid_argument("ordinary batch membership is invalid");
     }
 
@@ -2450,9 +2452,9 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
                                                         chained);
             }
             burst_copy_ctx[round] = BurstEgressCopy{
-                .destination         = burst_rounds.data() + round * kMaximumConcurrency,
+                .destination         = burst_rounds.data() + round * kMaximumBatchColumns,
                 .source              = ordinary_host_egress->sampled_tokens.data(),
-                .logprob_destination = burst_rounds_logprobs.data() + round * kMaximumConcurrency,
+                .logprob_destination = burst_rounds_logprobs.data() + round * kMaximumBatchColumns,
                 .logprob_source      = ordinary_host_egress->sampled_logprobs.data(),
                 .count               = static_cast<std::int32_t>(lanes.size())};
             CUDA_CHECK(cudaLaunchHostFunc(device.stream, &ProgramImplCore::burst_egress_copy_host,
@@ -2500,8 +2502,8 @@ ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
             TokenId* row_tokens        = burst_tokens.data() + row * burst;
             float* row_logprobs        = burst_logprobs.data() + row * burst;
             for (std::uint32_t round = 0; round < burst; ++round) {
-                row_tokens[round]   = burst_rounds[round * kMaximumConcurrency + row];
-                row_logprobs[round] = burst_rounds_logprobs[round * kMaximumConcurrency + row];
+                row_tokens[round]   = burst_rounds[round * kMaximumBatchColumns + row];
+                row_logprobs[round] = burst_rounds_logprobs[round * kMaximumBatchColumns + row];
             }
             validate_licensed_tokens(std::span<const TokenId>(row_tokens, burst));
             sequence.text_kv_valid     = base_E + burst;
@@ -2595,7 +2597,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
     // the head aligned on it, nothing proposed -- and the head is aligned over every prompt
     // segment as well, so a prompt rides the decode rounds instead of running alone.
     const bool head = speculative_backend == SpeculativeBackend::Mtp;
-    if (speculative_backend == SpeculativeBackend::DFlash || budgets.size() != lanes.size() ||
+    if (speculative_backend == SpeculativeBackend::DFlash || lanes.size() > batch_capacity ||
+        budgets.size() != lanes.size() ||
         prefill_lanes.empty() || prefill_lanes.size() > runtime::kMaximumMixedPrefills ||
         (head && (!io.mtp_decode || decoder->mtp_cache() == nullptr))) {
         throw std::invalid_argument("mixed round requires plain or MTP decode lanes and prefill lanes");
@@ -3172,7 +3175,7 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
     }
-    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
+    if (lanes.empty() || lanes.size() > batch_capacity || budgets.size() != lanes.size()) {
         throw std::invalid_argument("MTP batch membership is invalid");
     }
     if (in_flight_.id != 0 && in_flight_.rows != 0) {
@@ -3372,7 +3375,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
             std::copy(row_tokens.begin(), row_tokens.end(), outcome.licensed_tokens.begin());
             for (std::int32_t step = 0; step < next_i; ++step) {
                 outcome.next_drafts[static_cast<std::size_t>(step)] =
-                    mtp_host_egress->next_drafts[static_cast<std::size_t>(step) * max_concurrency + row];
+                    mtp_host_egress->next_drafts[static_cast<std::size_t>(step) * batch_capacity + row];
             }
             std::memcpy(outcome_export_.data() + row * sizeof(SpeculativeOutcome), &outcome,
                         sizeof(SpeculativeOutcome));
@@ -3433,7 +3436,7 @@ void ProgramImplCore::adopt_speculative_outcome(std::span<const std::uint32_t> l
     if (stage_holds_head()) {
         throw std::logic_error("the stage with the head decides its own speculative rounds");
     }
-    if (lanes.empty() || lanes.size() > max_concurrency ||
+    if (lanes.empty() || lanes.size() > batch_capacity ||
         outcome.size() != lanes.size() * sizeof(SpeculativeOutcome)) {
         throw std::invalid_argument("speculative outcome does not match the round's membership");
     }
@@ -3497,7 +3500,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     if (speculative_backend != SpeculativeBackend::DFlash || !io.dflash_decode || !dflash) {
         throw std::logic_error("DFlash batch execution requires the DFlash backend");
     }
-    if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
+    if (lanes.empty() || lanes.size() > batch_capacity || budgets.size() != lanes.size()) {
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 

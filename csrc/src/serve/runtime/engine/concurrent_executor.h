@@ -1,6 +1,6 @@
 #pragma once
 
-// Small fixed-capacity request scheduling and batched decode execution for every backend.
+// Configurable request scheduling and bounded batched decode execution for every backend.
 
 #include "core/engine_context.h"
 #include "api/types.h"
@@ -64,6 +64,9 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        slots_.resize(max_concurrency_);
+        lane_plan_versions_.resize(max_concurrency_);
+        cancellation_snapshot_.resize(max_concurrency_);
         ops_context_ = options.ops_context;
         // A thread's CUDA device is its own. Everything this engine owns was allocated on the
         // device the options name, so the thread that launches against it has to be on that
@@ -370,8 +373,8 @@ private:
         bool decode_ready = false;
 
         std::optional<BasePlan> base_plan;
-        std::array<std::optional<Plan>, kMaximumConcurrency> lane_plans{};
-        std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions{};
+        std::vector<std::optional<Plan>> lane_plans;
+        std::vector<std::uint64_t> lane_plan_versions;
         AdmissionResources admission_resources;
         std::uint64_t remaining_service_work = 0;
         std::uint64_t backfill_epoch         = 0;
@@ -388,8 +391,8 @@ private:
     };
 
     struct RoundMembership {
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
-        std::array<RoundBudget, kMaximumConcurrency> budgets{};
+        std::array<std::uint32_t, kMaximumBatchColumns> lanes{};
+        std::array<RoundBudget, kMaximumBatchColumns> budgets{};
         std::size_t size = 0;
 
         [[nodiscard]] bool empty() const noexcept { return size == 0; }
@@ -404,7 +407,7 @@ private:
     };
 
     struct ActiveAdmissionSet {
-        std::array<ActiveAdmissionSnapshot, kMaximumConcurrency> requests{};
+        std::vector<ActiveAdmissionSnapshot> requests;
         std::size_t size = 0;
 
         [[nodiscard]] std::span<const ActiveAdmissionSnapshot> span() const noexcept {
@@ -479,7 +482,9 @@ private:
 
     void release_planning_state(const std::shared_ptr<Request>& request) noexcept {
         request->base_plan.reset();
-        for (auto& plan : request->lane_plans) { plan.reset(); }
+        // Per-lane alternatives are only needed while this request waits for admission.
+        std::vector<std::optional<Plan>>{}.swap(request->lane_plans);
+        std::vector<std::uint64_t>{}.swap(request->lane_plan_versions);
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
@@ -591,8 +596,9 @@ private:
         request->remaining_service_work -= std::min<std::uint64_t>(work, ceiling);
     }
 
-    [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
-        std::array<bool, kMaximumConcurrency> cancelled{};
+    [[nodiscard]] std::span<std::uint8_t> snapshot_cancellations() noexcept {
+        auto& cancelled = cancellation_snapshot_;
+        std::fill(cancelled.begin(), cancelled.end(), 0);
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
                 cancelled[lane] = slots_[lane]->cancelled.load(std::memory_order_acquire);
@@ -610,7 +616,7 @@ private:
     }
 
     void
-    cancel_active_requests(const std::array<bool, kMaximumConcurrency>& cancelled_at_boundary) {
+    cancel_active_requests(std::span<const std::uint8_t> cancelled_at_boundary) {
         bool changed = false;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
@@ -667,7 +673,10 @@ private:
 
     [[nodiscard]] RoundMembership build_round_membership() const {
         RoundMembership membership;
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+        for (std::uint32_t offset = 0;
+             offset < max_concurrency_ && membership.size < membership.lanes.size(); ++offset) {
+            const auto lane = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(next_decode_lane_) + offset) % max_concurrency_);
             const auto& request = slots_[lane];
             if (request == nullptr || !request->decode_ready) { continue; }
             if (!request->budget) {
@@ -682,6 +691,7 @@ private:
 
     [[nodiscard]] ActiveAdmissionSet active_admission_set() const {
         ActiveAdmissionSet active;
+        active.requests.resize(max_concurrency_);
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
             if (request == nullptr) { continue; }
@@ -777,6 +787,10 @@ private:
 
     void ensure_lane_plan(const std::shared_ptr<Request>& request, std::uint32_t lane) {
         if (slots_[lane] != nullptr) { return; }
+        if (request->lane_plans.empty()) {
+            request->lane_plans.resize(max_concurrency_);
+            request->lane_plan_versions.resize(max_concurrency_);
+        }
         if (request->lane_plan_versions[lane] == lane_plan_versions_[lane] &&
             request->lane_plans[lane]) {
             return;
@@ -1097,6 +1111,7 @@ private:
         std::size_t staged_count  = 0;
         std::uint32_t prefill_lane = 0;
         std::uint32_t deferred     = 0;
+        std::uint32_t next_lane    = 0;
         bool prefill_flight        = false;
     };
     std::vector<GroupMeta> group_meta_;
@@ -1132,7 +1147,11 @@ private:
             if (program.group_in_flight(g) || program.group_finished_pending(g)) { continue; }
             GroupMeta& meta = group_meta_[g];
             meta.membership = RoundMembership{};
-            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            for (std::uint32_t offset = 0;
+                 offset < max_concurrency_ && meta.membership.size < meta.membership.lanes.size();
+                 ++offset) {
+                const auto lane = static_cast<std::uint32_t>(
+                    (static_cast<std::uint64_t>(meta.next_lane) + offset) % max_concurrency_);
                 if (lane % groups != g) { continue; }
                 const auto& request = slots_[lane];
                 if (request == nullptr || !request->decode_ready) { continue; }
@@ -1201,8 +1220,13 @@ private:
         const std::vector<std::uint32_t> finished = program.tick();
         seg_timer_.decode += std::chrono::duration<double>(Clock::now() - t_round).count();
         for (const std::uint32_t g : finished) {
-            const GroupMeta& meta = group_meta_[g];
-            const auto& result    = program.group_result(g);
+            GroupMeta& meta = group_meta_[g];
+            const auto& result = program.group_result(g);
+            if (!meta.membership.empty() &&
+                result.kind != std::remove_reference_t<decltype(program)>::FlightKind::Prefill) {
+                meta.next_lane =
+                    (meta.membership.lanes[meta.membership.size - 1] + 1U) % max_concurrency_;
+            }
             switch (result.kind) {
             case std::remove_reference_t<decltype(program)>::FlightKind::Decode:
                 process_decode_round(meta.membership, result.round);
@@ -1288,7 +1312,10 @@ private:
             }
         }
         instance_.program->set_round_burst_limit(burst_limit);
-        instance_.program->set_round_width_hint(static_cast<std::uint32_t>(lanes.size()));
+        const auto ready = std::count_if(
+            slots_.begin(), slots_.end(),
+            [](const auto& request) { return request && request->decode_ready; });
+        instance_.program->set_round_width_hint(static_cast<std::uint32_t>(ready));
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
         process_decode_round(membership, round);
@@ -1355,7 +1382,7 @@ private:
                               const BatchedGeneratedRound& round) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
 
-        std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
+        std::array<std::uint8_t, kMaximumBatchColumns> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             cancelled[row] =
                 slots_[lanes[row]]->cancelled.load(std::memory_order_acquire) ? 1U : 0U;
@@ -1368,9 +1395,9 @@ private:
         }
 
         const auto t_preview = Clock::now();
-        std::array<std::uint32_t, kMaximumConcurrency> accepted{};
-        std::array<std::uint8_t, kMaximumConcurrency> terminal{};
-        std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
+        std::array<std::uint32_t, kMaximumBatchColumns> accepted{};
+        std::array<std::uint8_t, kMaximumBatchColumns> terminal{};
+        std::array<FinishReason, kMaximumBatchColumns> finish_reasons{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             const auto& request      = slots_[lane];
@@ -1476,6 +1503,7 @@ private:
             }
         }
         seg_timer_.append += std::chrono::duration<double>(Clock::now() - t_append).count();
+        if (!lanes.empty()) { next_decode_lane_ = (lanes.back() + 1U) % max_concurrency_; }
         cumulative_stats_.decode_row_rounds += lanes.size();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
@@ -1791,7 +1819,7 @@ private:
     std::deque<std::shared_ptr<Request>> pending_;
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;
-    std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
+    std::vector<std::shared_ptr<Request>> slots_;
     // Multi-prompt prefill (#80): several prompts can be staged at once and share a round.
     // The first one owns the round's card; the rest ride along as extra segments.
     class PrefillLaneSet {
@@ -1829,7 +1857,9 @@ private:
     PrefillLaneSet prefill_lanes_;
     // Encoded media survives across prefill chunks in the single frozen transient buffer.
     std::optional<std::uint32_t> transient_owner_;
-    std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
+    std::vector<std::uint64_t> lane_plan_versions_;
+    std::vector<std::uint8_t> cancellation_snapshot_;
+    std::uint32_t next_decode_lane_ = 0;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;

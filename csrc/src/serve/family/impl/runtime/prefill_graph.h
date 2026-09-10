@@ -165,7 +165,7 @@ public:
         // the widths that actually occur cost a graph; if one stops fitting the
         // engine stops rather than degrading, and --enforce-eager is the way to
         // ask for a graph-free run.
-        const auto ceiling = static_cast<std::int32_t>(kMaximumConcurrency);
+        const auto ceiling = static_cast<std::int32_t>(kMaximumBatchColumns);
         return batch > ceiling ? ceiling : batch;
     }
 

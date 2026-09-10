@@ -94,6 +94,22 @@ int main() {
             !sinfer::runtime::admission_resources_fit(AdmissionResources{1, 1, 129}, capacity),
         "independent KV pools were incorrectly treated as interchangeable capacity");
 
+    // A protected request can wait behind more incumbents than fit in one GPU round.
+    std::vector<ActiveAdmissionSnapshot> many(513);
+    for (std::size_t i = 0; i < many.size(); ++i) {
+        many[i] = {.request_id = i + 1, .resources = {1, 1, 1},
+                   .remaining_work_quanta = many.size() - i};
+    }
+    const auto large = sinfer::runtime::make_admission_protection(
+        9, 1000, AdmissionResources{1, 1, 1}, many, AdmissionResources{513, 513, 513});
+    failures += check(large.incumbent_count == 513 && large.incumbent_ids.back() == 513 &&
+                          large.donor_count == 1 && large.donor_ids[0] == 513,
+                      "protected admission lost an incumbent above lane 127");
+    many.pop_back();
+    failures += check(sinfer::runtime::protected_head_safe_without_temporal(
+                          large, many, AdmissionResources{513, 513, 513}),
+                      "releasing a high-numbered incumbent did not admit the protected head");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

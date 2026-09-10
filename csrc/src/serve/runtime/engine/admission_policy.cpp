@@ -65,7 +65,7 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
                                               std::span<const ActiveAdmissionSnapshot> active,
                                               const AdmissionResources& capacity) {
     if (epoch_id == 0 || head_request_id == 0 || active.empty() ||
-        active.size() > kMaximumConcurrency || head_resources.active_lanes == 0 ||
+        head_resources.active_lanes == 0 ||
         !admission_resources_fit(head_resources, capacity)) {
         throw std::invalid_argument("invalid protected-admission frontier");
     }
@@ -75,6 +75,8 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
     out.head_request_id = head_request_id;
     out.head_resources  = head_resources;
     out.incumbent_count = active.size();
+    out.incumbent_ids.resize(active.size());
+    out.donor_ids.resize(active.size());
 
     ResourceTotals survivors;
     for (std::size_t i = 0; i < active.size(); ++i) {
@@ -89,7 +91,7 @@ AdmissionProtection make_admission_protection(std::uint64_t epoch_id, std::uint6
         throw std::invalid_argument("protected head is not blocked by frozen incumbents");
     }
 
-    std::array<std::size_t, kMaximumConcurrency> order{};
+    std::vector<std::size_t> order(active.size());
     for (std::size_t i = 0; i < active.size(); ++i) { order[i] = i; }
     std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(active.size()),
               [&](std::size_t lhs, std::size_t rhs) {

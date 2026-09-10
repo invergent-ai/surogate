@@ -397,6 +397,7 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
+    const std::uint32_t batch_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const std::uint32_t speculative_max_lanes;
@@ -411,7 +412,7 @@ public:
         std::uint32_t maximum_frontier = 0;
         std::int32_t band              = -1;
         bool graph_hit                 = false;
-        std::array<std::uint32_t, kMaximumConcurrency> row_frontiers{};
+        std::array<std::uint32_t, kMaximumBatchColumns> row_frontiers{};
     };
     LastMixedRound last_mixed_round{};
     const ProposalHead proposal_head;
@@ -435,8 +436,8 @@ public:
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
 
-    std::array<SequenceState, kMaximumConcurrency> sequences;
-    std::array<RequestControl, kMaximumConcurrency> requests;
+    std::vector<SequenceState> sequences;
+    std::vector<RequestControl> requests;
 
     DecodeGraphFamily ordinary_graphs;
     // Round chaining (PATCHES.md #32): the chained flavor of every ordinary
@@ -462,22 +463,22 @@ public:
         std::uint32_t rows  = 0;
         std::uint32_t burst = 0;
         std::chrono::steady_clock::time_point start{};
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::array<std::uint32_t, kMaximumBatchColumns> lanes{};
         /// The MTP round checks what it licensed against the budget when it consumes.
-        std::array<runtime::RoundBudget, kMaximumConcurrency> budgets{};
+        std::array<runtime::RoundBudget, kMaximumBatchColumns> budgets{};
         /// An MTP round that verified nothing: one column per lane, tokens at stride one.
         bool narrow = false;
     };
     InFlightRound in_flight_{};
     std::uint32_t round_width_hint_ = 0;
     /// A narrow round licenses exactly one token per lane.
-    std::array<std::int32_t, kMaximumConcurrency> narrow_counts_{};
+    std::array<std::int32_t, kMaximumBatchColumns> narrow_counts_{};
     /// `speculative_outcome()`: the last consumed MTP round's decisions, row-major.
     std::vector<std::byte> outcome_export_;
     /// `lane_draft_state()`: one record, rewritten per call.
     mutable std::array<std::byte, sizeof(LaneDraftState)> draft_state_export_{};
     /// A headless stage's MTP round licenses nothing itself; its result carries these.
-    std::array<std::int32_t, kMaximumConcurrency> headless_counts_{};
+    std::array<std::int32_t, kMaximumBatchColumns> headless_counts_{};
     std::uint64_t in_flight_counter_ = 0;
     // A mixed round between launch and consume (the pipeline driver's seam).
     struct MixedInFlight {
@@ -485,7 +486,7 @@ public:
         std::uint64_t id    = 0;
         std::chrono::steady_clock::time_point start{};
         std::uint32_t rows  = 0;
-        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::array<std::uint32_t, kMaximumBatchColumns> lanes{};
         std::uint32_t prefill_lane_count = 0;
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> prefill_lanes{};
         std::size_t staged_count = 0;
@@ -496,11 +497,11 @@ public:
     MixedInFlight mixed_in_flight_{};
     std::uint64_t mixed_in_flight_counter_ = 0;
 
-    std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_rounds{};
-    std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_tokens{};
-    std::array<float, kMaximumConcurrency * kChainBurstLimit> burst_logprobs{};
-    std::array<float, kMaximumConcurrency * kChainBurstLimit> burst_rounds_logprobs{};
-    std::array<std::int32_t, kMaximumConcurrency> burst_counts{};
+    std::array<TokenId, kMaximumBatchColumns * kChainBurstLimit> burst_rounds{};
+    std::array<TokenId, kMaximumBatchColumns * kChainBurstLimit> burst_tokens{};
+    std::array<float, kMaximumBatchColumns * kChainBurstLimit> burst_logprobs{};
+    std::array<float, kMaximumBatchColumns * kChainBurstLimit> burst_rounds_logprobs{};
+    std::array<std::int32_t, kMaximumBatchColumns> burst_counts{};
     std::array<BurstEgressCopy, kChainBurstLimit> burst_copy_ctx{};
     std::uint32_t round_burst_limit = 1;
     // Prefill CUDA graphs (PATCHES.md #27); engaged in prepare_graphs when the
