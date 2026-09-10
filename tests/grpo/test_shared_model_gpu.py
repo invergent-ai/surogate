@@ -274,9 +274,11 @@ def _check_policy(
         before = generate()
         if glm and seq_len == 512 and rollout_tokens == 248:
             cache = trainer.get_decode_batch_stats()
-            assert cache["sessions"] == 0 and cache["pool_used_bytes"] == 0
+            assert cache["sessions"] == 0 and cache["prefix_entries"] > 0
             assert cache["pool_allocated_bytes"] > 0
         server.begin_training()
+        assert trainer.get_decode_batch_stats()["pool_used_bytes"] == 0
+        assert trainer.get_decode_batch_stats()["prefix_entries"] == 0
         check_scores(before)
         inputs, target_ids = scoring_batch(before)
         kwargs = {}

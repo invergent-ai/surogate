@@ -164,9 +164,10 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
     concurrency = infer_config.max_num_seqs or min(16, orch_config.batch_size or 16)
     settings = dict(host=infer_config.host or "127.0.0.1", port=infer_config.port or 8000,
                     device=0, model=orch_config.model.name, max_context=context,
-                    prefill_chunk=min(256, context), max_concurrency=concurrency,
+                    prefill_chunk=min(getattr(infer_config, "decode_prefill_chunk", 256), context), max_concurrency=concurrency,
                     kv_capacity=context * concurrency, use_cuda_graph=True,
                     decode_cache_bytes=getattr(infer_config, "decode_cache_bytes", 0),
+                    decode_prefix_entries=getattr(infer_config, "decode_prefix_entries", 32),
                     decode_memory_bytes=getattr(infer_config, "decode_memory_bytes", 0),
                     rank=train_config.lora_rank)
     # Enforce the local server address; both components live in this process.

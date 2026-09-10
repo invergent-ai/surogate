@@ -19,7 +19,7 @@ CASES = configurations()
 SELECTED = os.environ.get("SUROGATE_SHARED_CASES", "all").split(",")
 
 
-def make_trainer(root, case, *, graphs=False):
+def make_trainer(root, case, *, graphs=False, sequence=256, config=None):
     from surogate import _surogate as ext
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
     from surogate.kernels.jit_compile import compile_jit_kernels
@@ -27,9 +27,9 @@ def make_trainer(root, case, *, graphs=False):
     if case == "glm":
         from examples.sft.glm.create_dummy import create_dummy
 
-        create_dummy(root, index_topk=32, max_sequence_length=256)
+        create_dummy(root, index_topk=32, max_sequence_length=sequence)
     else:
-        (root / "config.json").write_text(json.dumps(CASES[case]))
+        (root / "config.json").write_text(json.dumps(CASES[case] if config is None else config))
     options = ext.RuntimeOptions(
         recompute="true",
         use_cuda_graphs=graphs,
@@ -50,7 +50,7 @@ def make_trainer(root, case, *, graphs=False):
         config=ext.PretrainedConfig.from_pretrained(str(root), "bf16"),
         options=options,
         batch_size=2,
-        seq_len=256,
+        seq_len=sequence,
         grad_accum=1,
         lora_config=ext.LoRAAdapterConfig(
             rank=8, alpha=13, dropout=0, dtype="bf16" if moe else "fp32", target_modules=["all"]

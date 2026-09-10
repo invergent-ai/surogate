@@ -828,10 +828,12 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
 }
 
 void DslModel::set_decode_cache_budget(std::int64_t bytes) {
+    mDecodePrefixes.clear();
     mDecodePagePool->set_limit(bytes);
 }
 
 void DslModel::set_decode_memory_budget(std::int64_t bytes) {
+    mDecodePrefixes.clear();
     mDecodePagePool->set_memory_limit(bytes);
 }
 
@@ -919,12 +921,7 @@ std::vector<bool> DslModel::admit_decode_sessions(const std::int64_t* sessions,
             it = mDecodeSessions.end();
         }
         const int length = it == mDecodeSessions.end() ? 0 : it->second->length;
-        const auto before = it == mDecodeSessions.end() ? 0 : it->second->storage_bytes();
-        std::int64_t required = 0;
-        for (const auto& spec : mDecodeCacheSpecs)
-            required += spec.bytes(length + counts[i], capacity);
         auto& pool = *mDecodePagePool;
-        if (pool.limit_bytes && pool.used_bytes + pool.auxiliary_bytes + required - before > pool.limit_bytes) continue;
         try {
             prepare_decode_workspace(1, counts[i], capacity, sampling ? sampling + i : nullptr);
         } catch (const DecodeCapacityError&) {
@@ -941,7 +938,7 @@ std::vector<bool> DslModel::admit_decode_sessions(const std::int64_t* sessions,
         const int previous_capacity = state->capacity;
         std::unordered_map<std::string, std::size_t> previous_pages;
         for (const auto& [key, buffer] : state->paged)
-            if (buffer) previous_pages.emplace(key, buffer->pages());
+            if (buffer) previous_pages.emplace(key, buffer->extent());
         auto rollback = [&]() {
             CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
             if (fresh)
@@ -1058,6 +1055,7 @@ std::vector<float> DslModel::decode_batch_logits(const std::int64_t* sessions,
                                     mModelConfig.VocabSize,
                                     result.data() + member * mModelConfig.VocabSize);
                     states[row]->length += T;
+                    states[row]->retire(mDecodeCacheSpecs);
                 }
                 start += B;
             }
@@ -1076,9 +1074,80 @@ void DslModel::release_decode_sessions(const std::vector<std::int64_t>& sessions
         mDecodeSessions.erase(id);
 }
 
+bool DslModel::evict_decode_prefix() {
+    auto oldest = mDecodePrefixes.end();
+    for (auto it = mDecodePrefixes.begin(); it != mDecodePrefixes.end(); ++it)
+        if (it->second.first.use_count() == 1 &&
+            (oldest == mDecodePrefixes.end() || it->second.second < oldest->second.second))
+            oldest = it;
+    if (oldest == mDecodePrefixes.end()) return false;
+    mDecodePrefixes.erase(oldest);
+    ++mDecodePrefixEvictions;
+    return true;
+}
+
+bool DslModel::cache_decode_prefix(std::int64_t session, std::int64_t prefix) {
+    const auto it = mDecodeSessions.find(session);
+    if (prefix < 0 || it == mDecodeSessions.end() || !it->second->active || it->second->length <= 0)
+        throw std::invalid_argument("Prefix caching requires an active nonempty decode session");
+    mDecodePagePool->evict_prefix = [this]() {
+        return evict_decode_prefix();
+    };
+    // Cache entries are expendable; a failed optional snapshot must leave the
+    // source request usable. Every fixed recurrent/count buffer is copied.
+    try {
+        auto state = it->second->fork(mRunState->MainStream);
+        CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+        mDecodePrefixes[prefix] = {std::move(state), ++mDecodePrefixClock};
+        return true;
+    } catch (const DecodeCapacityError&) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+        return false;
+    } catch (const cuda_error& error) {
+        if (error.code != cudaErrorMemoryAllocation) throw;
+        cudaGetLastError();
+        CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+        return false;
+    }
+}
+
+bool DslModel::restore_decode_prefix(std::int64_t prefix, std::int64_t session) {
+    if (session < 0 || mDecodeSessions.contains(session))
+        throw std::invalid_argument("Prefix restore requires a new nonnegative session ID");
+    auto it = mDecodePrefixes.find(prefix);
+    if (it == mDecodePrefixes.end()) return false;
+    auto source = it->second.first;  // Pin this entry while allocation evicts other prefixes.
+    it->second.second = ++mDecodePrefixClock;
+    try {
+        auto state = source->fork(mRunState->MainStream);
+        CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+        mDecodeSessions.emplace(session, std::move(state));
+        ++mDecodePrefixHits;
+        return true;
+    } catch (const DecodeCapacityError&) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+        return false;
+    } catch (const cuda_error& error) {
+        if (error.code != cudaErrorMemoryAllocation) throw;
+        cudaGetLastError();
+        CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+        return false;
+    }
+}
+
+void DslModel::release_decode_prefixes(const std::vector<std::int64_t>& prefixes) {
+    for (auto prefix : prefixes)
+        mDecodePrefixes.erase(prefix);
+}
+
 std::unordered_map<std::string, std::int64_t> DslModel::decode_batch_stats() const {
     std::unordered_map<std::string, std::int64_t> result{
         {"sessions", mDecodeSessions.size()},
+        {"prefix_entries", mDecodePrefixes.size()},
+        {"prefix_hits", mDecodePrefixHits},
+        {"prefix_evictions", mDecodePrefixEvictions},
+        {"copy_on_write_pages", mDecodePagePool->copied_pages},
+        {"recycled_window_pages", mDecodePagePool->recycled_pages},
         {"length", 0},
         {"pages", 0},
         {"bytes", 0},
@@ -1108,6 +1177,7 @@ std::unordered_map<std::string, std::int64_t> DslModel::decode_batch_stats() con
 
 void DslModel::reset_decode_state() {
     mDecodeSessions.clear();
+    mDecodePrefixes.clear();
     if (mGlmDecodeState) {
         mGlmDecodeState.reset();
     }
@@ -1118,11 +1188,9 @@ std::vector<float> DslModel::decode_logits(const std::int32_t* input_ids, int T,
                                           int capacity, NCCLCommunicator& comm) {
     if (T <= 0 || capacity <= 0) throw std::invalid_argument("Decode input must contain at least one token");
     if (reset) {
-        if (!mGlmDecodeState || mGlmDecodeState->limit != capacity) {
-            mGlmDecodeState = std::make_unique<GlmDecodeState>();
-            mGlmDecodeState->page_pool = mDecodePagePool;
-            mGlmDecodeState->limit = capacity;
-        }
+        mGlmDecodeState = std::make_unique<GlmDecodeState>();
+        mGlmDecodeState->page_pool = mDecodePagePool;
+        mGlmDecodeState->limit = capacity;
         mGlmDecodeState->length = 0;
         mGlmDecodeState->active = true;
     }
@@ -1136,6 +1204,7 @@ std::vector<float> DslModel::decode_logits(const std::int32_t* input_ids, int T,
     try {
         auto result = next_token_logits(input_ids, &position, 1, T, comm, mGlmDecodeState.get());
         mGlmDecodeState->length += T;
+        mGlmDecodeState->retire(mDecodeCacheSpecs);
         return result;
     } catch (...) {
         reset_decode_state();

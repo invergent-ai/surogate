@@ -18,6 +18,7 @@ struct DecodeCacheSpec {
     ETensorDType dtype;
     std::vector<long> shape;
     int row_divisor = 0;
+    int window = 0;
     std::int64_t bytes(int tokens, int limit) const {
         long elements = 1;
         for (long d : shape)
@@ -52,12 +53,38 @@ struct GlmDecodeState {
     void prepare(const std::vector<DecodeCacheSpec>& specs, int tokens, cudaStream_t stream) {
         reserve(tokens);
         for (const auto& spec : specs) {
-            if (spec.row_divisor)
-                pages(spec.layer, spec.name.c_str(), spec.dtype, spec.shape.at(0))
-                    .reserve((tokens + spec.row_divisor - 1) / spec.row_divisor, stream);
-            else
+            if (spec.row_divisor) {
+                auto& buffer = pages(spec.layer, spec.name.c_str(), spec.dtype, spec.shape.at(0));
+                const int rows = (tokens + spec.row_divisor - 1) / spec.row_divisor;
+                buffer.reserve(rows, stream);
+                buffer.make_writable(length / spec.row_divisor, rows, stream);
+            } else
                 get(spec.layer, spec.name.c_str(), spec.dtype, spec.shape);
         }
+    }
+    void retire(const std::vector<DecodeCacheSpec>& specs) {
+        for (const auto& spec : specs)
+            if (spec.window > 0)
+                paged.at(std::to_string(spec.layer) + "/" + spec.name)->retire_before(length - spec.window + 1);
+    }
+    std::shared_ptr<GlmDecodeState> fork(cudaStream_t stream) const {
+        auto result = std::make_shared<GlmDecodeState>();
+        result->page_pool = page_pool;
+        result->active = active;
+        result->length = length;
+        result->capacity = capacity;
+        result->limit = limit;
+        for (const auto& [key, buffer] : paged)
+            result->paged.emplace(key, buffer->fork(stream));
+        for (const auto& [key, tensor] : buffers) {
+            const auto split = key.find('/');
+            const auto copy = result->get(std::stoi(key.substr(0, split)),
+                                          key.substr(split + 1).c_str(),
+                                          tensor.DType,
+                                          {tensor.Sizes.begin(), tensor.Sizes.begin() + tensor.Rank});
+            CUDA_CHECK(cudaMemcpyAsync(copy.Data, tensor.Data, tensor.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+        return result;
     }
 
     PagedDecodeBuffer& pages(int layer, const char* name, ETensorDType dtype, long width) {

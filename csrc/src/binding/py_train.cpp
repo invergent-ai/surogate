@@ -3503,6 +3503,52 @@ void MultiGPUPyTrainer::release_decode_sessions(const std::vector<std::int64_t>&
         0);
 }
 
+bool MultiGPUPyTrainer::cache_decode_prefix(std::int64_t session, std::int64_t prefix) {
+    if (mContexts.size() != 1) throw std::invalid_argument("Prefix caching requires one GPU");
+    bool result = false;
+    std::exception_ptr error;
+    run_work(
+        [&](sThreadContext& ctx) {
+            try {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model) throw std::runtime_error("Prefix caching requires a DSL model");
+                result = model->cache_decode_prefix(session, prefix);
+            } catch (...) {
+                error = std::current_exception();
+            }
+        },
+        0);
+    if (error) std::rethrow_exception(error);
+    return result;
+}
+
+bool MultiGPUPyTrainer::restore_decode_prefix(std::int64_t prefix, std::int64_t session) {
+    if (mContexts.size() != 1) throw std::invalid_argument("Prefix caching requires one GPU");
+    bool result = false;
+    std::exception_ptr error;
+    run_work(
+        [&](sThreadContext& ctx) {
+            try {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model) throw std::runtime_error("Prefix caching requires a DSL model");
+                result = model->restore_decode_prefix(prefix, session);
+            } catch (...) {
+                error = std::current_exception();
+            }
+        },
+        0);
+    if (error) std::rethrow_exception(error);
+    return result;
+}
+
+void MultiGPUPyTrainer::release_decode_prefixes(const std::vector<std::int64_t>& prefixes) {
+    run_work(
+        [&](sThreadContext& ctx) {
+            if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) model->release_decode_prefixes(prefixes);
+        },
+        0);
+}
+
 std::unordered_map<std::string, std::int64_t> MultiGPUPyTrainer::get_decode_batch_stats() {
     std::unordered_map<std::string, std::int64_t> result;
     run_work(

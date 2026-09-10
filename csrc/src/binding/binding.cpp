@@ -2523,6 +2523,20 @@ NB_MODULE(_surogate, m) {
              &MultiGPUPyTrainer::set_decode_cache_budget,
              nb::arg("bytes") = 0,
              nb::call_guard<nb::gil_scoped_release>())
+        .def("cache_decode_prefix",
+             &MultiGPUPyTrainer::cache_decode_prefix,
+             nb::arg("session_id"),
+             nb::arg("prefix_id"),
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("restore_decode_prefix",
+             &MultiGPUPyTrainer::restore_decode_prefix,
+             nb::arg("prefix_id"),
+             nb::arg("session_id"),
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("release_decode_prefixes",
+             &MultiGPUPyTrainer::release_decode_prefixes,
+             nb::arg("prefix_ids"),
+             nb::call_guard<nb::gil_scoped_release>())
         .def("set_decode_memory_budget",
              &MultiGPUPyTrainer::set_decode_memory_budget,
              nb::arg("bytes") = 0,

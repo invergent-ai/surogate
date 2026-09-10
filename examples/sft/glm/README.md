@@ -129,23 +129,12 @@ Current limits:
   retain ordinary expert execution. Permutations, residual streams, selected
   attention indices and KDA states still consume sequence-dependent memory.
 - Native-colocate requires one GPU with resident unquantized base weights and
-  BF16 LoRA adapters. Its MLA cache stores latents and reconstructs selected K/V
-  with the original BF16/LoRA arithmetic, adding projection work during decode.
-  Cache histories grow in 128-token pages, and token steps use continuous batching.
-  Stateless token-step segments use CUDA graphs with separate activation arenas.
-  KDA, convolution, the paged indexer and vocabulary projection batch requests;
-  latent reconstruction batches bounded tiles of queries while preserving the
-  original attention reduction order. Stateful operations execute outside capture.
-  Prefill uses the recurrent FLA kernel, without the training chunk kernel's
-  parallelism across tokens.
-- Native-colocate automatically uses the same recurrent KDA forward for rollout
-  and training/scoring, plus fixed-reduction GEMMs and deterministic forward
-  additions. This resolves the previous long-rollout mismatch from BF16 rounding
-  changing hard expert/pool selection. It costs training-forward parallelism;
-  backward still uses FP32 FLA chunk intermediates and derivatives. Ordinary SFT
-  keeps the parallel chunk forward. Direct Python callers must set
-  `options.glm_rollout_parity = True` before constructing the trainer, with
-  `doc_masking: true`. The GLM rollout/scoring regression tolerance is `1e-5`.
+  BF16 LoRA adapters. Continuous batching and prompt caching are automatic;
+  cached prompts are cleared after policy updates. See the
+  [single-GPU GRPO guide](../../../docs/guides/rl-colocate.md) for memory and
+  concurrency settings.
+- Native-colocate keeps rollout and scoring log-probabilities consistent, which
+  can make training slower than ordinary SFT. Set `doc_masking: true`.
 - Indexer auxiliary training, vision training, MTP training and sequence-chunked
   pipeline state carry remain unsupported. Full expert-weight training requires
   `ep_size: 1`. Native exports contain the text-training weights, not a complete

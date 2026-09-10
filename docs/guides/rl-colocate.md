@@ -19,89 +19,52 @@ This mode supports the training families below, excluding **Nemotron**, using
 Multimodal checkpoints use **text prompts only**. Experimental training definitions
 such as DeepSeek-V4 and Flash-Next are not included.
 
-Dense Qwen3 and Qwen3.5 use the optimized generation server. Other families generate
-through the same model instance that performs training. This general path uses
-continuous batching: concurrent requests submit token steps to one compute worker,
-which batches their projections and MLPs. New requests join between rounds;
-prefill is chunked so long prompts do not hold the worker for a complete rollout.
-Each request retains its own attention, convolution and recurrent history.
-Standard attention appends KV and attends across the batch with shared launches.
+Generation uses continuous batching, so new requests can join while other
+requests are generating. Active generation has priority, while waiting prompts
+continue to make progress. Long prompts are processed in smaller chunks to keep
+the server responsive.
 
-Attention history uses 128-token pages from a shared GPU pool, with independent
-page tables per request. Completed requests return pages for reuse. GLM's pooled
-indexer also uses paged history and reuses score scratch across 128-query tiles.
-Its attention cache stores normalized MLA latents, reconstructing selected K/V
-projections with the original BF16 and LoRA arithmetic. Recurrent and convolution
-states use fixed-size request allocations. Context remains bounded by available
-memory, `max_model_len`, and the configured request capacity (`max_num_seqs`).
-The shared training executor also bounds context by the trainer's sequence length.
+Prompt caching reuses previously processed text, which can reduce work when GRPO
+requests several completions for the same prompt or continues a conversation.
+Each request keeps its own sampling settings and seed. Cached prompts are cleared
+before training updates so subsequent rollouts use the updated policy.
+For models with sliding-window attention, older history is released as the window
+advances. Full-attention models still need their complete history.
 
-On the shared training path, `decode_cache_bytes` in `infer.yaml` sets a hard byte
-budget for cache pages, page tables, recurrent/convolution states, and sampling
-token counts. The default `0` chooses 25% of free VRAM after the trainer is
-allocated. `decode_memory_bytes` separately bounds cache storage plus decode
-activation arenas, extra temporary stacks, sampler scratch, and batch metadata.
-Its default `0` selects 80% of free VRAM after trainer allocation. The trainer's
-resident weights and existing execution buffers are outside this incremental
-budget. It includes 64 MiB of reserved headroom for CUDA graph executables and
-library allocations whose exact size cannot be queried in advance.
+Context is limited by available GPU memory, `max_model_len`, and the training
+`sequence_len`. Use `max_num_seqs` to control the number of concurrent requests.
+The entire model and its training buffers must fit alongside generation.
 
-Admission reserves execution workspaces before advancing request histories. It
-evicts unused decode shapes under memory pressure and splits execution into
-smaller batches when a larger shape cannot fit. A request that cannot fit receives
-a capacity error while other requests continue.
-Non-streaming HTTP requests receive status 429. A stream that has already started
-receives a JSON `error` event with a status code, followed by `[DONE]`.
-Release or retry the rejected request after capacity becomes available.
-There is no cache eviction, preemption,
-CPU spill, prefix sharing, or sliding-window page recycling.
+Dense Qwen3 and Qwen3.5 normally use the optimized generation server. The following
+`infer.yaml` settings apply to models using the shared training server:
 
-`trainer.get_decode_batch_stats()` reports active sessions, cached tokens, pages,
-allocated/in-use pool bytes, auxiliary bytes, both budgets, workspace and headroom
-reservations, page reuse, batch splits, and decode shape eviction/compilation/capture/replay
-counts. The server summary reports batch sizes and decode rounds.
-Low-level callers use `decode_batch_logits(session_ids,
-input_ids, offsets, reset)` with flattened token chunks and one reset flag per
-session, then `release_decode_sessions(session_ids)` when requests finish.
-`decode_logits` and `get_decode_cache_stats` remain available for single-session
-callers. An optimizer update or weight/adapter import invalidates every session;
-training also releases unused pool pages. Native decode keeps up to eight compiled
-batch/chunk shapes in an LRU cache with separate activation arenas. With
-`use_cuda_graphs: true`, one-token shapes warm up, then capture and replay stateless
-segments. Attention, recurrent state updates, dynamic MoE operations and the final
-generation head run eagerly. Training's captured graphs retain their buffers.
-Convolution, recurrent state updates, the GLM indexer and the vocabulary projection
-process batches together. GLM reconstructs selected latents in tiles of up to
-eight queries, preserving its BF16/LoRA arithmetic and attention reduction order.
-Decode does not allocate the training-only 256 MiB backward replay arena per shape.
+| Setting | Default | When to change it |
+|---|---|---|
+| `decode_prefill_chunk` | `256` | Lower the maximum prompt tokens processed per round to improve responsiveness during long prompts. The server also reduces chunks automatically when busy or short of memory. |
+| `decode_prefix_entries` | `32` | Increase the number of cached prompt prefixes for more reuse, at the cost of memory. Set `0` to disable prompt caching. |
+| `decode_cache_bytes` | `0` | Cap generation cache memory in bytes. `0` selects 25% of free GPU memory after the trainer is loaded. |
+| `decode_memory_bytes` | `0` | Cap total generation memory in bytes. `0` selects 80% of free GPU memory after the trainer is loaded. |
 
-The HTTP server samples on GPU and transfers only selected tokens and requested
-log-probabilities. Temperature, top-k/top-p/min-p, repetition/presence/frequency
-penalties, logit bias and minimum-length stop-token blocking are supported.
-Log-probabilities describe the temperature-scaled policy **before** penalties and
-filtering, as required by GRPO. Each request owns its seeded random stream; ties
-prefer smaller token IDs. Low-level callers can use `decode_batch_sample` with one
-sampling dictionary per session and a `uniform` draw in `[0, 1)`, after checking
-`admit_decode_sessions`. A nonzero sampling result `status` applies only to that row.
+These memory budgets are additional to the model and training memory already in
+use. The server discards unused cached prompts and reduces batches when memory
+is tight. If a request still cannot fit, it receives HTTP 429; a streaming request
+reports an error and ends. Other requests continue. Retry when capacity becomes
+available, or reduce concurrency or context length. Active requests cannot be
+paused and moved to CPU to make room.
 
-This path supports text completions, streaming, and token-based multi-turn conversations with function
-tools. Structured `response_format` decoding remains unsupported on this path.
+Text completions, streaming, and token-based multi-turn conversations with
+function tools are supported. Sampling options include temperature,
+top-k/top-p/min-p, repetition/presence/frequency penalties, logit bias, and minimum
+completion length. Returned log-probabilities describe the temperature-scaled
+policy before penalties and filtering, as required by GRPO. Structured
+`response_format` decoding remains unsupported on this path.
 
-For GLM, native co-locate automatically enables consistent rollout/scoring
-arithmetic before allocating the trainer: recurrent FLA KDA forward, fixed-order
-dense and expert GEMMs, deterministic BF16 forward additions, and stable sparse
-attention reduction slots even before top-k fills. This avoids
-batch-size rounding differences changing nearly tied expert or sparse-attention
-selections during GRPO scoring. Backward uses the FLA chunk kernels with FP32
-intermediates. Training forward sacrifices token parallelism for agreement with
-decode; ordinary SFT keeps its parallel chunk forward. `doc_masking: true` is
-required. Low-level Python users can select this mode with
-`options.glm_rollout_parity = True` before constructing `SurogateTrainer`.
+For GLM, native co-locate automatically keeps rollout and scoring log-probabilities
+consistent. This can make training slower than ordinary SFT. Set
+`doc_masking: true` in the training config.
 
-Set `long_context: true` and `lora_dropout: 0` in the training config to tile dense
-MLP activations during scoring and updates. GLM also tiles routed and shared expert
-MLPs in resident BF16 execution with `ep_size: 1`. Indexer query tiling and the
-latent decode cache are automatic. See [long-context memory](long-context.md).
+Set `long_context: true` and `lora_dropout: 0` to reduce memory use during scoring
+and training with long sequences. See [long-context memory](long-context.md).
 
 Choose a model and sequence length that fit your GPU together with training
 activations and optimizer state. The entire base must fit on one GPU, including all

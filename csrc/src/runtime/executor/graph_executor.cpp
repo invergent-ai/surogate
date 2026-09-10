@@ -335,14 +335,15 @@ std::vector<DecodeCacheSpec> GraphExecutor::decode_cache_specs() const {
             const auto tensor = mWeights.template_tensor(ref.name);
             return std::vector<long>(tensor.Sizes.begin(), tensor.Sizes.begin() + tensor.Rank);
         };
-        auto add = [&](const char* name, ETensorDType dtype, std::vector<long> dims, int divisor = 0) {
+        auto add = [&](const char* name, ETensorDType dtype, std::vector<long> dims, int divisor = 0, int window = 0) {
             for (const auto& previous : result) {
                 if (previous.layer != layer || previous.name != name) continue;
-                if (previous.dtype != dtype || previous.shape != dims || previous.row_divisor != divisor)
+                if (previous.dtype != dtype || previous.shape != dims || previous.row_divisor != divisor ||
+                    previous.window != window)
                     throw std::logic_error("Conflicting decode cache geometry for " + std::string(name));
                 return;
             }
-            result.push_back({layer, name, dtype, std::move(dims), divisor});
+            result.push_back({layer, name, dtype, std::move(dims), divisor, window});
         };
         switch (op.type) {
             case CompiledOpType::FlashAttention: {
@@ -350,7 +351,10 @@ std::vector<DecodeCacheSpec> GraphExecutor::decode_cache_specs() const {
                 int hq = mConfig.NumQueryHeads, hk = mConfig.NumKeyValHeads;
                 int d = derive_head_size(qkv, hq, hk, mConfig.head_size());
                 resolve_attn_head_dims(mRunState.runtime_config(), layer, qkv, hq, hk, d);
-                add("attention_kv", ETensorDType::BF16, {2L * hk * d}, 1);
+                int window = op.attrs.window_size;
+                if (window <= 0 && mConfig.use_sliding_window && mConfig.is_sliding_layer(layer))
+                    window = mConfig.sliding_window_size;
+                add("attention_kv", ETensorDType::BF16, {2L * hk * d}, 1, window);
                 break;
             }
             case CompiledOpType::MambaConv1d: {

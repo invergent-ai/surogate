@@ -93,6 +93,7 @@ class SharedModelServer:
                 trainer, max_batch=self.capacity,
                 prefill_chunk=max(1, settings.get("prefill_chunk", 256)),
                 token_budget=settings.get("kv_capacity", self.context * self.capacity),
+                prefix_entries=settings.get("decode_prefix_entries", 32),
             )
             self.persistent_decode = True
         # Some chat checkpoints keep the base-model EOS in config.json while
@@ -206,6 +207,8 @@ class SharedModelServer:
             self.condition.wait_for(lambda: self.active == 0)
         if self.persistent_decode:
             self.trainer.reset_decode_state()
+        if self.scheduler:
+            self.scheduler.invalidate_prefixes()
 
     def publish(self, name, modules, version):
         with self.condition:

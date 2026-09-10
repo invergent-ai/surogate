@@ -405,6 +405,10 @@ public:
                                            const DecodeSamplingRequest* sampling = nullptr,
                                            DecodeSampleResult* samples = nullptr);
     void release_decode_sessions(const std::vector<std::int64_t>& sessions);
+    bool cache_decode_prefix(std::int64_t session, std::int64_t prefix);
+    bool restore_decode_prefix(std::int64_t prefix, std::int64_t session);
+    void release_decode_prefixes(const std::vector<std::int64_t>& prefixes);
+    bool evict_decode_prefix();
     void set_decode_cache_budget(std::int64_t bytes);
     void set_decode_memory_budget(std::int64_t bytes);
     void prepare_decode_workspace(int B, int T, int capacity, const DecodeSamplingRequest* sampling);
@@ -699,7 +703,10 @@ private:
     std::string mAdapterPath;
     std::unique_ptr<GlmDecodeState> mGlmDecodeState;
     std::shared_ptr<DecodePagePool> mDecodePagePool = std::make_shared<DecodePagePool>();
-    std::unordered_map<std::int64_t, std::unique_ptr<GlmDecodeState>> mDecodeSessions;
+    std::unordered_map<std::int64_t, std::shared_ptr<GlmDecodeState>> mDecodeSessions;
+    std::unordered_map<std::int64_t, std::pair<std::shared_ptr<GlmDecodeState>, std::uint64_t>> mDecodePrefixes;
+    std::uint64_t mDecodePrefixClock = 0;
+    std::int64_t mDecodePrefixHits = 0, mDecodePrefixEvictions = 0;
     std::vector<DecodeCacheSpec> mDecodeCacheSpecs;
     DecodeWorkspaceAllocator mDecodeMetadataAllocator;
     Tensor mDecodeMetadata;

@@ -291,6 +291,9 @@ public:
                                            const std::int32_t* resets,
                                            int count);
     void release_decode_sessions(const std::vector<std::int64_t>& sessions);
+    bool cache_decode_prefix(std::int64_t session, std::int64_t prefix);
+    bool restore_decode_prefix(std::int64_t prefix, std::int64_t session);
+    void release_decode_prefixes(const std::vector<std::int64_t>& prefixes);
     std::vector<DecodeSampleResult> decode_batch_sample(const std::int64_t* sessions,
                                                         const std::int32_t* ids,
                                                         const std::int32_t* offsets,

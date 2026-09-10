@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -27,6 +28,9 @@ struct DecodePagePool {
     std::int64_t auxiliary_bytes = 0, limit_bytes = 0;
     std::int64_t workspace_bytes = 0, memory_limit_bytes = 0;
     std::int64_t execution_headroom_bytes = 0;
+    std::unordered_map<void*, std::size_t> references;
+    std::function<bool()> evict_prefix;
+    std::int64_t copied_pages = 0, recycled_pages = 0;
 
     std::int64_t memory_bytes() const {
         return allocated_bytes + auxiliary_bytes + workspace_bytes + execution_headroom_bytes;
@@ -39,6 +43,8 @@ struct DecodePagePool {
     }
     void make_memory_room(std::size_t bytes) {
         if (memory_limit_bytes && memory_bytes() + bytes > memory_limit_bytes) trim();
+        while (memory_limit_bytes && memory_bytes() + bytes > memory_limit_bytes && evict_prefix && evict_prefix())
+            trim();
         if (memory_limit_bytes && memory_bytes() + bytes > memory_limit_bytes)
             throw DecodeCapacityError("Decode cache and workspace VRAM budget exhausted");
         std::size_t available = 0, total = 0;
@@ -46,6 +52,10 @@ struct DecodePagePool {
         if (available < bytes + execution_headroom_bytes) {
             trim();
             CUDA_CHECK(cudaMemGetInfo(&available, &total));
+            while (available < bytes + execution_headroom_bytes && evict_prefix && evict_prefix()) {
+                trim();
+                CUDA_CHECK(cudaMemGetInfo(&available, &total));
+            }
             if (available < bytes + execution_headroom_bytes)
                 throw DecodeCapacityError("Insufficient free VRAM for decode execution workspace");
         }
@@ -57,6 +67,8 @@ struct DecodePagePool {
 
     void make_room(std::size_t bytes) {
         if (limit_bytes && allocated_bytes + auxiliary_bytes + bytes > limit_bytes) trim();
+        while (limit_bytes && allocated_bytes + auxiliary_bytes + bytes > limit_bytes && evict_prefix && evict_prefix())
+            trim();
         if (limit_bytes && allocated_bytes + auxiliary_bytes + bytes > limit_bytes)
             throw DecodeCapacityError("Decode cache VRAM budget exhausted");
         make_memory_room(bytes);
@@ -89,9 +101,20 @@ struct DecodePagePool {
             ++reused_pages;
         }
         used_bytes += bytes;
+        references.emplace(result.Data, 1);
         return result;
     }
+    void retain(const Tensor& page) {
+        if (page.Data) ++references.at(page.Data);
+    }
+    bool shared(const Tensor& page) const {
+        return page.Data && references.at(page.Data) > 1;
+    }
     void release(Tensor page) {
+        if (!page.Data) return;
+        auto it = references.find(page.Data);
+        if (--it->second) return;
+        references.erase(it);
         used_bytes -= page.bytes();
         free[page.bytes()].push_back(page);
     }
@@ -179,6 +202,53 @@ public:
         CUDA_CHECK(
             cudaMemcpyAsync(table_.Data, addresses_.data(), needed * sizeof(void*), cudaMemcpyHostToDevice, stream));
     }
+    // Page tables retain absolute token indices. Window retirement leaves holes
+    // that the attention mask never reads; full-attention layers keep every page.
+    void retire_before(int row) {
+        const auto end = std::min<std::size_t>(pages_.size(), std::max(0, row) / DecodePageRows);
+        for (; first_page_ < end; ++first_page_) {
+            pool_->release(pages_[first_page_]);
+            pages_[first_page_] = {};
+            ++pool_->recycled_pages;
+        }
+    }
+    std::unique_ptr<PagedDecodeBuffer> fork(cudaStream_t stream) const {
+        auto result = std::make_unique<PagedDecodeBuffer>(pool_, dtype_, width_, limit_);
+        result->addresses_ = addresses_;
+        result->pages_ = pages_;
+        result->first_page_ = first_page_;
+        for (const auto& page : pages_)
+            pool_->retain(page);
+        CUDA_CHECK(cudaMemcpyAsync(result->table_.Data, table_.Data, table_.bytes(), cudaMemcpyDeviceToDevice, stream));
+        return result;
+    }
+    // Appends may modify a partially filled shared page (including a partial
+    // GLM indexer pool). Detach all pages touched by the upcoming chunk first.
+    void make_writable(int start, int end, cudaStream_t stream) {
+        for (int i = start / DecodePageRows; i < (end + DecodePageRows - 1) / DecodePageRows; ++i) {
+            auto& page = pages_.at(i);
+            if (!pool_->shared(page)) continue;
+            Tensor replacement;
+            try {
+                replacement = pool_->acquire(page.bytes());
+            } catch (const DecodeCapacityError&) {
+                // Admission can evict the snapshot that made this tail shared.
+                // In that case its sole remaining owner can append in place.
+                if (!pool_->shared(page)) continue;
+                throw;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(replacement.Data, page.Data, page.bytes(), cudaMemcpyDeviceToDevice, stream));
+            pool_->release(page);
+            page = replacement;
+            addresses_[i] = page.Data;
+            CUDA_CHECK(cudaMemcpyAsync(table_.Data + i * sizeof(void*),
+                                       addresses_.data() + i,
+                                       sizeof(void*),
+                                       cudaMemcpyHostToDevice,
+                                       stream));
+            ++pool_->copied_pages;
+        }
+    }
     void append(const void* source, int start, int rows, cudaStream_t stream, std::size_t source_stride = 0) {
         reserve(start + rows, stream);
         const auto stride = source_stride ? source_stride : row_bytes();
@@ -212,9 +282,12 @@ public:
         return width_ * get_dtype_size(dtype_);
     }
     [[nodiscard]] std::size_t bytes() const {
-        return pages_.size() * DecodePageRows * row_bytes();
+        return pages() * DecodePageRows * row_bytes();
     }
     [[nodiscard]] std::size_t pages() const {
+        return pages_.size() - first_page_;
+    }
+    [[nodiscard]] std::size_t extent() const {
         return pages_.size();
     }
     [[nodiscard]] std::size_t table_bytes() const {
@@ -233,6 +306,7 @@ private:
     Tensor table_;
     std::vector<Tensor> pages_;
     std::vector<void*> addresses_;
+    std::size_t first_page_ = 0;
 };
 
 inline Tensor decode_batch_row(Tensor tensor, int row) {

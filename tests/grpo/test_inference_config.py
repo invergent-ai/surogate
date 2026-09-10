@@ -62,3 +62,13 @@ def test_shared_decode_memory_budget_defaults_and_validation():
     assert GRPOInferenceConfig(DictDefault({"model": "m", "decode_memory_bytes": 1 << 30})).decode_memory_bytes == 1 << 30
     with pytest.raises(ValueError, match="nonnegative"):
         GRPOInferenceConfig(DictDefault({"model": "m", "decode_memory_bytes": -1}))
+
+
+def test_shared_prefill_and_prefix_cache_settings():
+    defaults = GRPOInferenceConfig(DictDefault({"model": "m"}))
+    assert defaults.decode_prefill_chunk == 256 and defaults.decode_prefix_entries == 32
+    custom = GRPOInferenceConfig(DictDefault({"decode_prefill_chunk": 64, "decode_prefix_entries": 0}))
+    assert custom.decode_prefill_chunk == 64 and custom.decode_prefix_entries == 0
+    for config in ({"decode_prefill_chunk": 0}, {"decode_prefix_entries": -1}):
+        with pytest.raises(ValueError):
+            GRPOInferenceConfig(DictDefault(config))
