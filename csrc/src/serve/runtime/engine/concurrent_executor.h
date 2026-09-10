@@ -173,7 +173,7 @@ public:
 
     Submission submit(family::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
-                      Clock::time_point pending_deadline = {}) {
+                      Clock::time_point pending_deadline = {}, std::shared_ptr<void> lifetime = {}) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -207,7 +207,7 @@ public:
                                                                          options.output);
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
-                                                pending_deadline, submitted);
+                                                pending_deadline, submitted, std::move(lifetime));
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -339,10 +339,11 @@ private:
         Request(std::uint64_t request_identity, family::PreparedPrompt input,
                 family::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
-                Clock::time_point limit, Clock::time_point submit_time)
+                Clock::time_point limit, Clock::time_point submit_time, std::shared_ptr<void> execution_lifetime)
             : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
               prompt_summary(summary), prepare_seconds(frontend_seconds),
-              options(std::move(request_options)), deadline(limit), submitted(submit_time) {}
+              options(std::move(request_options)), deadline(limit), submitted(submit_time),
+              lifetime(std::move(execution_lifetime)) {}
 
         const std::uint64_t id;
         family::PreparedPrompt prompt;
@@ -352,6 +353,7 @@ private:
         ResolvedRequestOptions options;
         Clock::time_point deadline;
         Clock::time_point submitted;
+        std::shared_ptr<void> lifetime;
         std::optional<Clock::time_point> first_token;
         std::optional<GenerationBudget> budget;
         std::optional<BeginSummary> begin;
@@ -461,6 +463,9 @@ private:
     }
 
     bool mark_completed(const std::shared_ptr<Request>& request) noexcept {
+        // The worker has consumed/aborted the final GPU round. An abandoned
+        // consumer must not release an adapter while that round still reads it.
+        request->lifetime.reset();
         bool release = false;
         {
             std::lock_guard lock(request->mutex);

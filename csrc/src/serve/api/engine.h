@@ -108,9 +108,12 @@ public:
 
     // Establishes queue membership synchronously. Destroying an unconsumed handle cancels its
     // request; wait() owns result consumption and may run independently from GPU execution.
+    // lifetime retains external execution resources until GPU work finishes, even
+    // when the handle is abandoned before wait().
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
-           std::chrono::steady_clock::time_point pending_deadline = {});
+           std::chrono::steady_clock::time_point pending_deadline = {},
+           std::shared_ptr<void> lifetime = {});
 
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,

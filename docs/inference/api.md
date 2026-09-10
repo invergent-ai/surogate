@@ -218,13 +218,19 @@ curl -X POST http://localhost:8080/v1/unload_lora_adapter \
 ```
 
 A loaded adapter appears in `/v1/models` and is selected per request by naming
-it in `model`. Loading fails with an explanation if the adapter is incompatible, its name is
-already taken, or `--max-loras` is reached. The default rank limit is 32; use
+it in `model`. Loading an existing name replaces that adapter. Loading fails with an
+explanation if the adapter is incompatible or no slot is available for a new name.
+The default rank limit is 32; use
 `--max-lora-rank` at startup for larger supported adapters.
 
-Wait for an adapter's active requests to finish before unloading it if you need their full
-responses to use the adapter. Unloading affects those requests too: they continue using the
-base model.
+Replacement and unloading wait for requests already using that adapter to finish.
+Those requests keep their original policy for their entire response. New requests for the
+same adapter wait during the update; requests for other adapters and the base model can
+continue. After unloading, requests still waiting for that adapter receive an error.
+
+Waiting for active requests is bounded by `--pending-timeout-ms`. An update that times out returns HTTP 503
+and leaves the current adapter unchanged. An incompatible replacement also leaves it
+unchanged. Replacing an adapter works with `--max-loras 1`.
 
 ## Responses API
 

@@ -91,6 +91,9 @@ public:
     void set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
                          const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
                          std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale);
+    void validate_module(std::int32_t layer, const std::string& module,
+                         const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
+                         std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale) const;
     void validate_device_module(const DeviceAdapterModule& module) const;
     void set_device_module(std::int32_t slot, const DeviceAdapterModule& module);
 
@@ -106,9 +109,7 @@ public:
     [[nodiscard]] bool covers_layer(std::int32_t layer) const;
 
     /// Zeroes a slot across every bank, so a token selecting it adds nothing.
-    /// This is what unloading an adapter does: the memory stays, the contribution
-    /// goes, and a request already in flight that still names the slot degrades to
-    /// the base model rather than reading weights that were freed underneath it.
+    /// The caller must first drain every request that can select this slot.
     void clear_slot(std::int32_t slot);
 
     /// The bank for a projection, or nullptr when it has none. Hot path.
@@ -136,8 +137,8 @@ public:
     [[nodiscard]] bool empty() const noexcept { return banks_.empty(); }
     /// True once any adapter machinery is live for this engine; the projection
     /// hooks read it to skip the lookup in the common case.
-    [[nodiscard]] bool active() const noexcept { return active_; }
-    void set_active(bool active) noexcept { active_ = active; }
+    [[nodiscard]] bool active() const noexcept { return active_.load(std::memory_order_relaxed); }
+    void set_active(bool active) noexcept { active_.store(active, std::memory_order_relaxed); }
     [[nodiscard]] std::int32_t slots() const noexcept { return slots_; }
     [[nodiscard]] std::int32_t max_rank() const noexcept { return max_rank_; }
     /// The device this store's memory lives on, or -1 before anything is built.
@@ -198,7 +199,7 @@ private:
     std::int32_t scratch_tokens_ = 0;
     std::int32_t slots_    = 0;
     std::int32_t max_rank_ = 0;
-    bool active_           = false;
+    std::atomic<bool> active_{false};
     void ensure_raw_round_state();
 };
 

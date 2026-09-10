@@ -231,7 +231,7 @@ private:
 } // namespace
 
 GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
-    : options_(std::move(options)) {
+    : options_(std::move(options)), lora_slots_(options_.max_loras) {
     sinfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.borrowed_weights         = options_.borrowed_weights;
@@ -274,7 +274,6 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         engine_options.lora_enable   = true;
         engine_options.lora_slots    = options_.max_loras;
         engine_options.lora_max_rank = options_.max_lora_rank;
-        std::int32_t slot            = 0;
         if (!options_.lora_modules.empty()) {
             LoraRegistry registry;
             std::vector<std::pair<std::string, std::string>> modules;
@@ -286,6 +285,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
             // them, and a request's adapter is turned into its slot index at
             // admission. The engine below never sees a name.
             for (const auto& [name, adapter] : registry.adapters()) {
+                auto update = lora_slots_.update(name, Clock::time_point::max());
                 std::vector<std::string> skipped;
                 auto payloads = LoraRegistry::read_payloads(adapter, skipped);
                 if (!skipped.empty()) {
@@ -294,16 +294,11 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
                         "' carries no layer index, so it cannot be bound to a projection");
                 }
                 for (auto& payload : payloads) {
-                    payload.slot = slot;
+                    payload.slot = update.slot();
                     engine_options.lora_payloads.push_back(std::move(payload));
                 }
-                lora_slot_of_[name] = slot;
-                ++slot;
+                update.commit();
             }
-        }
-        for (std::int32_t free = slot; free < static_cast<std::int32_t>(options_.max_loras);
-             ++free) {
-            lora_free_slots_.push_back(free);
         }
     }
     engine_options.load_progress            = std::move(load_progress);
@@ -364,10 +359,6 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     }
     PreparedRequest prepared;
     sinfer::RequestOptions request_options = to_request_options(request, options_);
-    // The adapter the request named, as its bank slot. Resolved here rather than
-    // deeper because this is the last place the name exists: the round stages an
-    // integer per lane and nothing below knows adapters by name.
-    request_options.execution.lora_slot = lora_slot(request.lora_adapter);
     // A minimum length is honoured by barring the stop ids until it is reached, and
     // the round only knows numbers -- so resolve which ids those are here, where
     // the model's own stops and the request's are both in reach.
@@ -418,6 +409,10 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.lifetime = acquire_request_lifetime();
 
     try {
+        // Pin before preparation/submission, closing the race with replacement
+        // and unload. The engine owns this lease through completion or cancellation.
+        auto adapter = lora_slots_.acquire(request.lora_adapter, prepared.lifetime->deadline, is_cancelled);
+        request_options.execution.lora_slot = adapter.slot;
         const auto acquisition_started = Clock::now();
         // A raw prompt carries no content parts, so there is nothing to acquire and no
         // template to render: the text is tokenized as written.
@@ -458,7 +453,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         // reliably reproducible by re-rendering the messages.
         if (request.return_token_ids) { prepared.prompt_token_ids = prompt.token_ids(); }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              prepared.lifetime->deadline);
+                                              prepared.lifetime->deadline, std::move(adapter.lifetime));
         prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const sinfer::RequestError& exception) {
         throw_request_error(exception);
@@ -672,117 +667,70 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
                                     "' carries no layer index, so it cannot be bound");
     }
 
-    // Loading a name that is already loaded replaces it, in its own slot.
-    //
-    // This is the operation a training loop performs, once per step: the trainer
-    // writes the adapter it just produced and the sampler is told to load it under
-    // the same name. Refusing the second load as a duplicate -- which is what this
-    // did -- stops the run at its first policy update. The slot is scrubbed before
-    // the new modules land so an adapter that names fewer of them cannot leave the
-    // old one's deltas behind, which means a request in flight sees the base model
-    // for the moment in between rather than a mixture of two adapters.
-    std::int32_t slot     = -1;
-    bool replacing        = false;
-    {
-        const std::lock_guard<std::mutex> lock(lora_mutex_);
-        const auto existing = lora_slot_of_.find(name);
-        if (existing != lora_slot_of_.end()) {
-            slot      = existing->second;
-            replacing = true;
-        } else {
-            if (lora_free_slots_.empty()) {
-                throw std::invalid_argument(
-                    "all " + std::to_string(options_.max_loras) +
-                    " adapter slots are in use -- unload one, or restart with a larger "
-                    "--max-loras");
-            }
-            slot = lora_free_slots_.front();
-            lora_free_slots_.erase(lora_free_slots_.begin());
+    // Validate every module before draining requests or changing a live adapter.
+    // An incompatible replacement leaves the current policy untouched.
+    for (const auto& payload : payloads) {
+        bool applicable = false;
+        for (int device : devices) {
+            const ops::LoraStore* store = stores.peek(device);
+            if (store == nullptr || !store->covers_layer(payload.layer)) { continue; }
+            store->validate_module(payload.layer, payload.module, payload.a, payload.b,
+                                   payload.rank, payload.in_dim, payload.out_dim, payload.scale);
+            applicable = true;
+        }
+        if (!applicable) {
+            throw std::invalid_argument("adapter module '" + payload.module + "' names a layer absent from this model");
         }
     }
-    if (replacing) { clear_lora_slot_everywhere(slot); }
-
-    // The uploads write only this slot's regions, which no request can select yet
-    // -- the name becomes routable below, after every module landed. On failure
-    // the slot is scrubbed and returned, so a half-written adapter is never
-    // servable.
-    // Under a pipeline the adapter's layers are spread over the stages, one store
-    // each, so every module goes to the store that holds its layer. A module no
-    // store claims is the adapter naming a layer this model does not have, which
-    // is worth saying rather than dropping.
+    auto update = lora_slots_.update(name, Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms));
+    const auto slot = update.slot();
+    std::lock_guard memory_lock(adapter_memory_mutex_);
+    if (engine_->is_sleeping()) {
+        throw std::invalid_argument("the model is asleep; wake it before loading an adapter");
+    }
     try {
+        clear_lora_slot_everywhere(slot);
         for (const auto& payload : payloads) {
-            bool applied = false;
             for (int device : devices) {
                 ops::LoraStore* store = stores.peek(device);
                 if (store == nullptr || !store->covers_layer(payload.layer)) { continue; }
                 store->set_module_slot(payload.layer, payload.module, slot, payload.a, payload.b,
                                        payload.rank, payload.in_dim, payload.out_dim,
                                        payload.scale);
-                applied = true;
-            }
-            if (!applied) {
-                throw std::invalid_argument(
-                    "adapter module '" + payload.module + "' names layer " +
-                    std::to_string(payload.layer) +
-                    ", which this model does not have -- the adapter was trained against a "
-                    "different architecture");
             }
         }
+        for (int device : devices) {
+            if (ops::LoraStore* store = stores.peek(device)) { store->set_active(true); }
+        }
+        // A recycled slot can have retained prefixes even when its old adapter
+        // name differs. Invalidate before reopening admission for the new bytes.
+        engine_->shrink_kv();
     } catch (...) {
-        // A half-written adapter is never servable, so the slot is scrubbed and the
-        // name stops resolving -- including a name that resolved a moment ago,
-        // because what it named is gone.
-        clear_lora_slot_everywhere(slot);
-        const std::lock_guard<std::mutex> lock(lora_mutex_);
-        lora_slot_of_.erase(name);
-        lora_free_slots_.push_back(slot);
+        // Device failures cannot expose partially uploaded weights. All users of
+        // the old slot have finished, so removing it cannot change their policy.
+        update.commit(true);
         throw;
     }
-    for (int device : devices) {
-        if (ops::LoraStore* store = stores.peek(device); store != nullptr) {
-            store->set_active(true);
-        }
-    }
-    if (replacing) {
-        // Cached prefixes were computed under the adapter that just went away.
-        // Reusing them would answer with a mixture of two policies, which in a
-        // training loop is off-policy data that nothing downstream can detect.
-        engine_->shrink_kv();
-    }
-    const std::lock_guard<std::mutex> lock(lora_mutex_);
-    lora_slot_of_[name] = slot;
+    update.commit();
 }
 
 void GenerationService::unload_lora_adapter(const std::string& name) {
     if (!options_.borrowed_weights.empty()) {
         throw std::invalid_argument("shared GRPO adapters are owned by the trainer");
     }
-    std::int32_t slot = -1;
-    {
-        const std::lock_guard<std::mutex> lock(lora_mutex_);
-        const auto found = lora_slot_of_.find(name);
-        if (found == lora_slot_of_.end()) {
-            throw std::invalid_argument("adapter '" + name + "' is not loaded");
-        }
-        slot = found->second;
-        lora_slot_of_.erase(found);
-    }
+    auto update = lora_slots_.update(name, Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms), true);
+    std::lock_guard memory_lock(adapter_memory_mutex_);
     if (engine_->is_sleeping()) {
-        // Undo the erase and refuse: clearing banks in a slept model would write
-        // into unmapped memory.
-        const std::lock_guard<std::mutex> relock(lora_mutex_);
-        lora_slot_of_[name] = slot;
-        throw std::invalid_argument(
-            "the model is asleep; wake it before unloading an adapter");
+        throw std::invalid_argument("the model is asleep; wake it before unloading an adapter");
     }
-    // Zeroed, not freed: a request already in flight that selected this slot adds
-    // nothing from here on -- it degrades to the base model instead of reading
-    // another adapter's weights. The slot goes to the back of the free list so it
-    // is the last one a later load reuses.
-    clear_lora_slot_everywhere(slot);
-    const std::lock_guard<std::mutex> lock(lora_mutex_);
-    lora_free_slots_.push_back(slot);
+    try {
+        clear_lora_slot_everywhere(update.slot());
+        engine_->shrink_kv();
+    } catch (...) {
+        update.commit(true);
+        throw;
+    }
+    update.commit(true);
 }
 
 void GenerationService::sleep(bool preempt) {
@@ -792,11 +740,15 @@ void GenerationService::sleep(bool preempt) {
     // Refusing new submissions first turns the drain below into a bounded wait:
     // the engine rejects anything that arrives after this line.
     // (Engine::sleep is idempotent, so two racing sleeps are both fine.)
-    engine_->sleep_begin();
+    {
+        std::lock_guard lock(adapter_memory_mutex_);
+        engine_->sleep_begin();
+    }
     static const bool env_preempt = std::getenv("SUROGATE_SLEEP_PREEMPT") != nullptr;
     if (preempt || env_preempt) {
         // Preemptive: in-flight generations park mid-flight and resume,
         // byte-identical, after the next wake.
+        std::lock_guard lock(adapter_memory_mutex_);
         engine_->sleep(/*allow_active=*/true);
         return;
     }
@@ -807,18 +759,21 @@ void GenerationService::sleep(bool preempt) {
             if (request_capacity_->active == 0) { break; }
         }
         if (std::chrono::steady_clock::now() > deadline) {
+            std::lock_guard lock(adapter_memory_mutex_);
             engine_->wake();
             throw std::runtime_error(
                 "sleep timed out waiting for in-flight requests to finish; the model stays awake");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    std::lock_guard lock(adapter_memory_mutex_);
     engine_->sleep();
 }
 
 void GenerationService::wake_up() {
     std::lock_guard lock(request_capacity_->mutex);
     if (shared_training_) { throw std::logic_error("only the trainer can resume shared GRPO rollouts"); }
+    std::lock_guard memory_lock(adapter_memory_mutex_);
     engine_->wake();
 }
 
@@ -872,12 +827,7 @@ void GenerationService::publish_shared_adapter(const std::string& name,
     for (const auto& module : modules) { store.set_device_module(0, module); }
     store.set_active(true);
     engine_->shrink_kv();
-    {
-        const std::lock_guard lock(lora_mutex_);
-        lora_slot_of_.clear();
-        lora_slot_of_[name] = 0;
-        lora_free_slots_.clear();
-    }
+    lora_slots_.reset_to(name, 0);
     std::lock_guard lock(request_capacity_->mutex);
     shared_training_ = false;
 }

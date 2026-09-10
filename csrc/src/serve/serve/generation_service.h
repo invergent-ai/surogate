@@ -5,6 +5,7 @@
 // streaming callbacks, and tool-call parsing) outside the target package.
 
 #include "api/engine.h"
+#include "serve/lora_slots.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -103,23 +104,12 @@ public:
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
     /// The bank slot for an adapter name, or -1 for the base model.
     [[nodiscard]] std::int32_t lora_slot(const std::string& name) const {
-        const std::lock_guard<std::mutex> lock(lora_mutex_);
-        const auto found = lora_slot_of_.find(name);
-        return found == lora_slot_of_.end() ? -1 : found->second;
+        return lora_slots_.find(name);
     }
     /// The resident adapter names, for /v1/models and model routing.
     [[nodiscard]] std::vector<std::string> lora_adapter_names() const {
-        const std::lock_guard<std::mutex> lock(lora_mutex_);
-        std::vector<std::string> names;
-        names.reserve(lora_slot_of_.size());
-        for (const auto& [name, slot] : lora_slot_of_) { names.push_back(name); }
-        return names;
+        return lora_slots_.names();
     }
-    /// Loads a PEFT adapter directory into a free slot, addressable by `name`
-    /// from the next request on. Throws std::invalid_argument with the reason on
-    /// refusal -- bad adapter, name taken, no free slot, module not applicable.
-    /// Whether any of this engine's stores adapts anything. Under a pipeline the
-    /// stores are per stage, so the question is asked of all of them.
     /// What a request's prompt tokenises to, without generating anything. Ids the
     /// client supplied are returned as given -- they are already the answer.
     [[nodiscard]] std::vector<sinfer::TokenId> tokenize(const GenerationRequest& request);
@@ -129,14 +119,16 @@ public:
     /// to know before it decides a prompt is too long.
     [[nodiscard]] std::uint32_t max_context() const;
 
+    /// Whether any stage of this engine has adapter bindings.
     [[nodiscard]] bool any_lora_bindings() const;
-    /// Scrub one adapter slot on every store, so nothing in flight reads it.
+    /// Scrub a drained adapter slot on every store.
     void clear_lora_slot_everywhere(std::int32_t slot);
 
+    /// Load or replace a PEFT adapter. Replacement drains admitted requests;
+    /// new requests for that adapter wait. Invalid payloads preserve the old
+    /// adapter; RequestError reports a timeout before any bytes are changed.
     void load_lora_adapter(const std::string& name, const std::string& path);
-    /// Unloads by name. The slot is zeroed, so a request already in flight that
-    /// selected it degrades to the base model rather than reading freed weights;
-    /// the slot is reused last among the free ones.
+    /// Drain admitted requests before removing the adapter and recycling its slot.
     void unload_lora_adapter(const std::string& name);
 
     [[nodiscard]] sinfer::LoadSummary load_summary() const { return engine_->load_summary(); }
@@ -175,7 +167,10 @@ public:
     void shrink_kv() { engine_->shrink_kv(); }
     /// Requests currently inside this service (admission-counted).
     [[nodiscard]] std::size_t active_requests() const;
-    void prepare_sleep_backup() { engine_->prepare_sleep_backup(); }
+    void prepare_sleep_backup() {
+        std::lock_guard lock(adapter_memory_mutex_);
+        engine_->prepare_sleep_backup();
+    }
     /// Drain and release serving allocations while the trainer retains the base.
     void begin_shared_training();
     /// Publish a complete adapter from GPU tensors, then reopen generation.
@@ -187,15 +182,9 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 
     ServeOptions options_;
-    /// Adapter name -> bank slot. A request carries the name; the round carries
-    /// the slot, and nothing below this class knows the name. Guarded by
-    /// lora_mutex_ because the runtime endpoints mutate it while request threads
-    /// resolve names. Freed slots go to the back of the free list so a just-
-    /// unloaded slot is the last to be reused -- an in-flight request still naming
-    /// it reads zeros (base model), not another adapter's fresh weights.
-    mutable std::mutex lora_mutex_;
-    std::map<std::string, std::int32_t> lora_slot_of_;
-    std::vector<std::int32_t> lora_free_slots_;
+    LoraSlots lora_slots_;
+    // Sleep/unmap and host uploads cannot access the adapter banks concurrently.
+    mutable std::mutex adapter_memory_mutex_;
     std::unique_ptr<sinfer::Engine> engine_;
     sinfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;

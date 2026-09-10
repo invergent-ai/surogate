@@ -300,10 +300,15 @@ void LoraStore::ensure_banks() {
     banks_built_ = true;
 }
 
-void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
+void LoraStore::validate_module(std::int32_t layer, const std::string& module,
                                 const std::vector<std::uint16_t>& a,
                                 const std::vector<std::uint16_t>& b, std::int32_t rank,
-                                std::int32_t in_dim, std::int32_t out_dim, float scale) {
+                                std::int32_t in_dim, std::int32_t out_dim, float scale) const {
+    if (rank <= 0 || rank > max_rank_ || in_dim <= 0 || out_dim <= 0 || !std::isfinite(scale) ||
+        a.size() != static_cast<std::size_t>(rank) * in_dim ||
+        b.size() != static_cast<std::size_t>(out_dim) * rank) {
+        throw std::invalid_argument("invalid adapter tensor geometry or scale for '" + module + "'");
+    }
     const auto refused = refusals_.find(module);
     if (refused != refusals_.end()) {
         throw std::invalid_argument("adapter module '" + module + "': " + refused->second);
@@ -328,6 +333,14 @@ void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, s
             std::to_string(binding.out) + "," + std::to_string(binding.in) +
             "] -- the adapter was trained against a different model");
     }
+}
+
+void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
+                                const std::vector<std::uint16_t>& a,
+                                const std::vector<std::uint16_t>& b, std::int32_t rank,
+                                std::int32_t in_dim, std::int32_t out_dim, float scale) {
+    validate_module(layer, module, a, b, rank, in_dim, out_dim, scale);
+    const auto& binding = directory_.at({layer, module});
     set_slot(binding.key, binding.port, slot, a, b, rank, in_dim, out_dim, scale);
 }
 

@@ -1,4 +1,12 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(Threads REQUIRED)
+
+add_executable(sinfer_lora_slots_test test_lora_slots.cpp)
+target_include_directories(sinfer_lora_slots_test PRIVATE ${SERVE_ROOT})
+target_link_libraries(sinfer_lora_slots_test PRIVATE Threads::Threads)
+target_compile_options(sinfer_lora_slots_test PRIVATE -UNDEBUG)
+add_test(NAME sinfer_lora_slots_test COMMAND sinfer_lora_slots_test)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_lora_slots_test)
 
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the installed product headers stand alone.
@@ -190,6 +198,11 @@ sinfer_add_test(sinfer_lora_store_test
   SOURCES ops/test_lora_store.cpp
   LIBRARIES sinfer_ops)
 set_tests_properties(sinfer_lora_store_test PROPERTIES SKIP_RETURN_CODE 77)
+sinfer_add_test(sinfer_lora_lifecycle_test
+  SOURCES test_lora_lifecycle.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_lora_lifecycle_test PRIVATE -UNDEBUG)
+set_tests_properties(sinfer_lora_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
 sinfer_add_test(sinfer_w8_quant_planes_test
   SOURCES ops/test_w8_quant_planes.cpp
   LIBRARIES sinfer_ops)

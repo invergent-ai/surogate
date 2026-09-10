@@ -427,6 +427,9 @@ void HttpServer::register_routes() {
                 }
             }
             target.load_lora_adapter(name, path);
+        } catch (const sinfer::RequestError& e) {
+            write_error(res, request_error_to_api_error(e));
+            return;
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(e.what(), "text/plain");
@@ -457,6 +460,9 @@ void HttpServer::register_routes() {
         }
         try {
             routed_management_service(req).unload_lora_adapter(name);
+        } catch (const sinfer::RequestError& e) {
+            write_error(res, request_error_to_api_error(e));
+            return;
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(e.what(), "text/plain");

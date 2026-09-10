@@ -125,8 +125,7 @@ void one_device() {
     check(read_slot_a(*bank, 0, device) == written, "rejected publication leaves the slot intact");
     check(read_slot_a(*bank, 1, device) == written, "GPU publication leaves other slots intact");
 
-    // Unloading scrubs the slot rather than freeing it, so a request still in
-    // flight adds nothing instead of reading another adapter's weights.
+    // A drained slot is zeroed while its bank allocation stays reusable.
     store.clear_slot(1);
     const auto cleared = read_slot_a(*bank, 1, device);
     bool all_zero = true;
