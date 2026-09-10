@@ -21,6 +21,12 @@ using Json = nlohmann::ordered_json;
     throw std::invalid_argument("--lora-modules '" + name + "': " + reason);
 }
 
+[[noreturn]] void unsupported(const std::string& name, const std::string& reason) {
+    bad(name, "cannot load adapter: " + reason +
+        ". Merge the adapter into its base checkpoint with `surogate merge`, "
+        "then convert and serve the merged checkpoint.");
+}
+
 Json read_json(const std::string& name, const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) { bad(name, "cannot read " + path.string()); }
@@ -129,8 +135,11 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
         if (config.contains("modules_to_save") && !config.at("modules_to_save").is_null()) {
             for (const auto& module : config.at("modules_to_save")) {
                 int layer = 0; std::string target;
-                if (!module.is_string() || !split_module(module.get<std::string>(), layer, target) || layer != -1 || target.ends_with(".bias")) {
-                    bad(name, "modules_to_save currently supports embeddings and output heads");
+                if (!module.is_string()) { bad(name, "modules_to_save must contain module names"); }
+                const auto module_name = module.get<std::string>();
+                if (!split_module(module_name, layer, target) || layer != -1 || target.ends_with(".bias")) {
+                    unsupported(name, "full-weight module '" + module_name +
+                        "' in modules_to_save is unsupported; full replacements are supported only for embeddings and output heads");
                 }
             }
         }
@@ -163,11 +172,12 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
             std::string module;
             AdapterTensorKind kind;
             if (!split_lora_key(key, module, kind)) {
-                bad(name, "unsupported adapter tensor '" + key + "'; merge the adapter before serving");
+                unsupported(name, "unsupported adapter tensor '" + key + "'");
             }
             const RawTensor raw = read_entry(name, key, entry);
             if (raw.dtype != "BF16" && raw.dtype != "F16" && raw.dtype != "F32") {
-                bad(name, "tensor '" + key + "' has unsupported dtype " + raw.dtype);
+                unsupported(name, "tensor '" + key + "' has unsupported dtype " + raw.dtype +
+                    "; adapter weights must be BF16, F16 or F32");
             }
             std::uint64_t elements = 1;
             if (raw.shape.empty()) { bad(name, "adapter tensor is scalar"); }
@@ -187,7 +197,8 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
             if (kind == AdapterTensorKind::Base) {
                 int layer = 0; std::string target;
                 if (!split_module(module, layer, target) || layer != -1 || raw.shape.size() != 2) {
-                    bad(name, "saved full weights are only supported for embeddings and output heads");
+                    unsupported(name, "saved full-weight tensor '" + key +
+                        "' is unsupported; only embedding and output-head matrices can be replaced");
                 }
                 if (pair.base_weight.bytes) { bad(name, "duplicate saved weight for '" + module + "'"); }
                 pair.base_weight = {payload_begin + raw.begin, raw.end - raw.begin, elements, raw.dtype};
@@ -212,7 +223,7 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
             }
             if (kind == AdapterTensorKind::B && raw.shape.size() > 2) {
                 for (std::size_t i = 2; i < raw.shape.size(); ++i) {
-                    if (raw.shape[i] != 1) { bad(name, "LoRA B convolution must have a unit spatial kernel"); }
+                    if (raw.shape[i] != 1) { unsupported(name, "LoRA B tensor '" + key + "' has an unsupported spatial kernel; only unit spatial kernels are supported"); }
                 }
             }
             if (kind == AdapterTensorKind::A) {

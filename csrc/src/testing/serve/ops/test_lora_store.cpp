@@ -125,6 +125,18 @@ void one_device() {
     check(read_slot_a(*bank, 0, device) == written, "rejected publication leaves the slot intact");
     check(read_slot_a(*bank, 1, device) == written, "GPU publication leaves other slots intact");
 
+    try {
+        store.set_module_slot(0, "unsupported_proj", 0, ones, ones, 2, 4, 4, 1);
+        check(false, "unsupported adapter module must be refused");
+    } catch (const std::invalid_argument& error) {
+        const std::string message = error.what();
+        check(message.find("unsupported_proj") != std::string::npos &&
+                  message.find("layer 0") != std::string::npos &&
+                  message.find("surogate merge") != std::string::npos,
+              "unsupported adapter warning names its module, layer and remedy");
+    }
+    check(read_slot_a(*bank, 0, device) == written, "unsupported weights leave the current adapter intact");
+
     // A drained slot is zeroed while its bank allocation stays reusable.
     store.clear_slot(1);
     const auto cleared = read_slot_a(*bank, 1, device);

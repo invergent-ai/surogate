@@ -514,19 +514,21 @@ const LoraStore::ModuleParts& LoraStore::module_parts(std::int32_t layer, const 
     if (const auto found = directory_.find({layer, name}); found != directory_.end()) {
         return found->second;
     }
+    const std::string merge_help =
+        ". Check that the adapter matches this base model. For unsupported serving modules, "
+        "merge the adapter into its base checkpoint with `surogate merge`, then convert and serve the merged checkpoint.";
     const auto refused = refusals_.find(name);
     if (refused != refusals_.end()) {
-        throw std::invalid_argument("adapter module '" + module + "': " + refused->second);
+        throw std::invalid_argument("unsupported adapter module '" + module + "': " + refused->second + merge_help);
     }
     const auto layer_refused = layer_refusals_.find({layer, name});
     if (layer_refused != layer_refusals_.end()) {
-        throw std::invalid_argument("adapter module '" + module + "' on layer " +
-                                    std::to_string(layer) + ": " + layer_refused->second);
+        throw std::invalid_argument("unsupported adapter module '" + module + "' on layer " +
+                                    std::to_string(layer) + ": " + layer_refused->second + merge_help);
     }
     throw std::invalid_argument(
             "adapter module '" + module + "' on layer " + std::to_string(layer) +
-            " is not applied by this target; an adapter only partly applied is neither the base "
-            "model nor the fine-tune");
+            " is unsupported by this serving model" + merge_help);
 }
 
 void LoraStore::validate_module(std::int32_t layer, const std::string& module,

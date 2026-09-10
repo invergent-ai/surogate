@@ -141,5 +141,27 @@ int main() {
         try { (void)f.read(skipped); } catch (const std::invalid_argument&) { rejected = true; }
         assert(rejected);
     }
+    // A valid adapter plus one unsupported weight must be rejected with an actionable diagnostic.
+    const auto expect_unsupported = [&](const Json& settings, const std::string& tensor,
+                                        const std::string& named) {
+        f.custom(settings, {{text + ".lora_A.weight", {2, 4}}, {text + ".lora_B.weight", {4, 2}},
+                            {tensor, {4, 4}}});
+        bool rejected = false;
+        try { (void)f.read(skipped); }
+        catch (const std::invalid_argument& error) {
+            rejected = true;
+            const std::string message = error.what();
+            assert(message.find("policy") != std::string::npos);
+            assert(message.find(named) != std::string::npos);
+            assert(message.find("unsupported") != std::string::npos);
+            assert(message.find("surogate merge") != std::string::npos);
+        }
+        assert(rejected);
+    };
+    const std::string full = "base_model.model.model.layers.0.mlp.down_proj.weight";
+    expect_unsupported({{"r", 2}, {"lora_alpha", 2}, {"modules_to_save", {"mlp.down_proj"}}}, full, "mlp.down_proj");
+    expect_unsupported({{"r", 2}, {"lora_alpha", 2}}, full, full);
+    const std::string unknown = "base_model.model.model.layers.0.mlp.down_proj.adapter_scale";
+    expect_unsupported({{"r", 2}, {"lora_alpha", 2}}, unknown, unknown);
     std::cout << "Adapter namespaces, tensor bounds, rank agreement and F16 conversion passed\n";
 }

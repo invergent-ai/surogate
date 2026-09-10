@@ -431,8 +431,10 @@ void HttpServer::register_routes() {
             write_error(res, request_error_to_api_error(e));
             return;
         } catch (const std::exception& e) {
+            const std::string message = "lora: adapter '" + name + "' was not loaded: " + e.what();
+            write_console_log(ConsoleLogLevel::Warning, message);
             res.status = 400;
-            res.set_content(e.what(), "text/plain");
+            res.set_content(message, "text/plain");
             return;
         }
         log_line("lora: loaded adapter '" + name + "' from " + path);

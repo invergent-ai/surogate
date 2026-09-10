@@ -245,8 +245,10 @@ must match the served vocabulary.
 Saved full embedding and output-head weights, including `modules_to_save` exports, are
 also supported. These consume additional GPU memory for each loaded adapter.
 Full replacements of other modules and targets outside the supported
-modules still need `surogate merge` before serving. Unsupported tensors are rejected without
-partially applying the adapter.
+modules still need `surogate merge` before serving. If an adapter contains unsupported weights,
+loading fails with a message naming the affected tensor or module and explaining the next step.
+Runtime loading also writes a warning to the server log. Unsupported weights are never silently
+skipped; a rejected replacement leaves the currently loaded adapter available.
 
 Additional models have their own adapters through `lora=name:path` in `--model`. Every model
 and adapter name must be unique. The runtime load/unload endpoints accept `?model=NAME`; see

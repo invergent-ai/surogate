@@ -291,7 +291,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
                 if (!skipped.empty()) {
                     throw std::invalid_argument(
                         "--lora-modules '" + name + "': module '" + skipped.front() +
-                        "' is outside the supported model namespaces");
+                        "' is unsupported for serving adapters. Merge the adapter into its base checkpoint "
+                        "with `surogate merge`, then convert and serve the merged checkpoint.");
                 }
                 for (auto& payload : payloads) {
                     payload.slot = update.slot();
@@ -323,7 +324,11 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         auto& stores = engine_->lora_stores();
         bool found = false;
         for (int device : stores.devices()) { found |= stores.peek(device)->covers_layer(layer); }
-        if (!found) { throw std::invalid_argument("adapter module '" + module + "' is absent from the served model"); }
+        if (!found) {
+            throw std::invalid_argument("adapter module '" + module +
+                "' is absent from the served model. Check that the adapter matches the base model and enable --vision "
+                "for vision adapters. For unsupported serving modules, use `surogate merge`, then convert and serve the merged checkpoint.");
+        }
     }
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(
@@ -674,7 +679,8 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
     auto payloads = LoraRegistry::read_payloads(found->second, skipped);
     if (!skipped.empty()) {
         throw std::invalid_argument("module '" + skipped.front() +
-                                    "' is outside the supported model namespaces");
+                                    "' is unsupported for serving adapters. Merge the adapter into its base checkpoint "
+                        "with `surogate merge`, then convert and serve the merged checkpoint.");
     }
 
     // Validate every module before draining requests or changing a live adapter.
@@ -689,7 +695,9 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
             applicable = true;
         }
         if (!applicable) {
-            throw std::invalid_argument("adapter module '" + payload.module + "' names a layer absent from this model");
+            throw std::invalid_argument("adapter '" + name + "': module '" + payload.module +
+                "' names a layer absent from this model. Check that the adapter matches the base model and enable --vision "
+                "for vision adapters. For unsupported serving modules, use `surogate merge`, then convert and serve the merged checkpoint.");
         }
     }
     {
