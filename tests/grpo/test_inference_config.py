@@ -1,8 +1,10 @@
 """GRPOInferenceConfig -> the engine command line, for the plumbed scalars."""
 
 import pytest
+import yaml
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
+from surogate.core.config.loader import load_config
 from surogate.grpo.inference import surogate_engine
 from surogate.utils.dict import DictDefault
 
@@ -72,3 +74,65 @@ def test_shared_prefill_and_prefix_cache_settings():
     for config in ({"decode_prefill_chunk": 0}, {"decode_prefix_entries": -1}):
         with pytest.raises(ValueError):
             GRPOInferenceConfig(DictDefault(config))
+
+
+def test_offload_yaml_reaches_the_launched_server(tmp_path, monkeypatch):
+    path = tmp_path / "infer.yaml"
+    path.write_text(
+        "model: fixture\ngpu_layers: ${OFFLOAD_GPU_LAYERS}\nhost_moe_layers: all\n"
+        "expert_slots: 8\nhost_expert_bank: w8\ncpu_moe_share: auto\n"
+        "cpu_moe_prefill_share: 0\ncpu_moe_min_tokens: 1\n"
+    )
+    monkeypatch.setenv("OFFLOAD_GPU_LAYERS", "0")
+    launched = []
+    monkeypatch.setattr(surogate_engine.os, "execv", lambda executable, argv: launched.append((executable, argv)))
+    surogate_engine.server(load_config(GRPOInferenceConfig, str(path)))
+    executable, argv = launched[0]
+    assert executable == argv[0] == "/usr/bin/surogate"
+    assert argv[1:3] == ["serve", "fixture"]
+    assert _value(argv, "--gpu-layers") == "0"
+    assert _value(argv, "--host-moe-layers") == "all"
+    assert _value(argv, "--expert-slots") == "8"
+    assert _value(argv, "--host-expert-bank") == "w8"
+    assert _value(argv, "--cpu-moe-share") == "auto"
+    assert _value(argv, "--cpu-moe-prefill-share") == "0.0"
+    assert _value(argv, "--cpu-moe-min-tokens") == "1"
+    assert "--enable-lora" in argv
+    assert _value(argv, "--kv-capacity") == "auto"
+
+
+@pytest.mark.parametrize("settings", [
+    {"gpu_layers": "all", "host_moe_layers": "auto", "expert_slots": 0, "host_expert_bank": "auto",
+     "cpu_moe_share": 0, "cpu_moe_prefill_share": 1, "cpu_moe_min_tokens": 0},
+    {"gpu_layers": 12, "host_moe_layers": 4, "expert_slots": 16, "host_expert_bank": "q4",
+     "cpu_moe_share": 0.25, "cpu_moe_prefill_share": 0.5, "cpu_moe_min_tokens": 8},
+])
+def test_offload_values_and_explicit_null_preserve_engine_semantics(tmp_path, settings):
+    path = tmp_path / "infer.yaml"
+    path.write_text(yaml.safe_dump({"model": "fixture", **settings}))
+    argv = surogate_engine.build_argv(load_config(GRPOInferenceConfig, str(path)))
+    for name, expected in settings.items():
+        actual = _value(argv, "--" + name.replace("_", "-"))
+        if isinstance(expected, (int, float)):
+            assert float(actual) == expected
+        else:
+            assert actual == expected
+    null_argv = _argv({"model": "fixture", **dict.fromkeys(settings)})
+    assert null_argv == _argv({"model": "fixture"})
+    assert not any("--" + name.replace("_", "-") in null_argv for name in settings)
+
+
+@pytest.mark.parametrize("name,value", [
+    ("gpu_layers", -1), ("gpu_layers", 0.5), ("gpu_layers", False), ("gpu_layers", "auto"),
+    ("gpu_layers", 2**31), ("host_moe_layers", -1), ("host_moe_layers", True),
+    ("expert_slots", 1.5), ("expert_slots", "all"), ("expert_slots", -1),
+    ("cpu_moe_min_tokens", -1), ("cpu_moe_min_tokens", False),
+    ("host_expert_bank", "bf16"), ("host_expert_bank", False),
+    ("cpu_moe_share", -0.1), ("cpu_moe_share", 1.1), ("cpu_moe_share", True),
+    ("cpu_moe_share", "nan"), ("cpu_moe_share", float("inf")),
+    ("cpu_moe_prefill_share", "auto"), ("cpu_moe_prefill_share", float("nan")),
+    ("cpu_moe_prefill_share", -1), ("cpu_moe_prefill_share", 2),
+])
+def test_invalid_offload_settings_fail_before_launch(name, value):
+    with pytest.raises(ValueError, match=name):
+        _argv({"model": "fixture", name: value})

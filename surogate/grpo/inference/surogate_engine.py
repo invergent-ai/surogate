@@ -20,7 +20,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
+from surogate.core.config.grpo_inference_config import SERVING_OFFLOAD_FIELDS, GRPOInferenceConfig
 
 
 def _cli() -> str:
@@ -60,6 +60,10 @@ def build_argv(config: GRPOInferenceConfig) -> list[str]:
         argv += ["--max-model-len", str(config.max_model_len)]
     if config.max_num_seqs is not None:
         argv += ["--max-num-seqs", str(config.max_num_seqs)]
+    for name in SERVING_OFFLOAD_FIELDS:
+        value = getattr(config, name)
+        if value is not None:
+            argv += ["--" + name.replace("_", "-"), str(value)]
     # Size the KV cache from free memory rather than leaving it at its default.
     #
     # A rollout step issues every sequence at once and each may run to the full

@@ -8,6 +8,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from surogate.core.config.grpo_inference_config import SERVING_OFFLOAD_FIELDS
 from surogate.grpo.shared_model import SharedModelServer, shared_execution
 from surogate.grpo.shared_weights import adapter_modules, borrow_weights, write_shared_artifact
 from surogate.utils.logger import get_logger
@@ -19,6 +20,12 @@ def validate_configs(train, infer, orch):
     """Refuse modes whose weight storage cannot be borrowed safely yet."""
     if train.gpus != 1 or infer.tp != 1 or infer.dp != 1:
         raise ValueError("native GRPO colocate currently requires gpus: 1, tp: 1 and dp: 1")
+    for name in SERVING_OFFLOAD_FIELDS:
+        if getattr(infer, name, None) is not None:
+            raise ValueError(
+                f"native GRPO colocate does not support infer.{name}; "
+                "use split-GPU GRPO or grpo-infer for serving offload settings"
+            )
     if not train.lora or train.recipe != "bf16" or train.qlora_config is not None:
         raise ValueError("native GRPO colocate currently requires lora: true, recipe: bf16, without QLoRA")
     if train.master_dtype not in (None, "bf16"):

@@ -7,7 +7,20 @@ from types import SimpleNamespace
 
 import pytest
 
-from surogate.grpo.native_colocate import SharedPolicy, _run
+from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
+from surogate.grpo.native_colocate import SharedPolicy, _run, validate_configs
+
+
+@pytest.mark.parametrize("name,value", [
+    ("gpu_layers", 0), ("host_moe_layers", "auto"), ("expert_slots", 8),
+    ("host_expert_bank", "w8"), ("cpu_moe_share", 0.5),
+    ("cpu_moe_prefill_share", 1), ("cpu_moe_min_tokens", 1),
+])
+def test_serving_offload_cannot_be_silently_ignored_in_colocate(name, value):
+    infer = GRPOInferenceConfig({name: value})
+    # Reject before reading a checkpoint or allocating the trainer.
+    with pytest.raises(ValueError, match=rf"infer\.{name}.*split-GPU"):
+        validate_configs(SimpleNamespace(gpus=1), infer, SimpleNamespace())
 
 
 @pytest.mark.parametrize(

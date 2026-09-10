@@ -299,6 +299,39 @@ The `--infer-gpus` and `--trainer-gpus` CLI flags use **driver-level GPU indices
 
 The CLI applies `CUDA_VISIBLE_DEVICES=<trainer ids>` to the parent process **before** any CUDA-touching import, and `CUDA_VISIBLE_DEVICES=<infer ids>` to the spawned server via its own environment. The two values are interpreted by the CUDA driver independently — the parent's mask does not propagate to the child.
 
+### CPU offloading
+
+For split-GPU runs and `surogate grpo-infer`, configure serving offload in
+`infer.yaml`. For example, let the server choose how many MoE layers' experts
+to keep in CPU RAM so the model fits:
+
+```yaml
+# Add to infer.yaml for a MoE model.
+host_moe_layers: auto
+```
+
+| Setting | Accepted values | Effect |
+| --- | --- | --- |
+| `gpu_layers` | Nonnegative integer or `all` | Keep the first N decoder layers on GPU and offload the rest. `0` offloads all decoder layers; `all` keeps them resident. |
+| `host_moe_layers` | Nonnegative integer, `auto`, or `all` | Keep the routed experts of this many MoE layers in CPU RAM. `auto` chooses enough layers to fit; `all` offloads every MoE layer's routed experts. |
+| `expert_slots` | Nonnegative integer | Set the GPU expert-cache size for offloaded MoE models. |
+| `host_expert_bank` | `auto`, `w8`, or `q4` | Choose the CPU expert storage format. |
+| `cpu_moe_share` | Number from `0` to `1`, or `auto` | Choose the fraction of decode expert cache misses computed on CPU. `auto` tunes the split at startup. |
+| `cpu_moe_prefill_share` | Number from `0` to `1` | Choose the CPU share of expert computation during prompt processing. |
+| `cpu_moe_min_tokens` | Nonnegative integer | Set the minimum token count for CPU expert computation. `0` uses the model's default. |
+
+Omit a setting, or use `null`, to keep the server default. Offloading trades GPU
+memory for CPU RAM and can reduce throughput. Changing the expert storage format
+can also change rollout numerics; monitor `mismatch_kl` when tuning it.
+
+Training offload is configured independently in `train.yaml`. For LoRA training,
+`cpu_training: true` streams the base weights from CPU RAM while adapter training
+stays on GPU. See [CPU offloading](offloading.md) for training settings.
+
+These serving settings are unavailable in `grpo-colocate`, which requires
+resident base weights. Use split-GPU mode when serving or training needs CPU
+weight offload.
+
 ### Weight broadcast
 
 In split mode, weight broadcasts use the filesystem backend regardless of what is configured in the YAML. Each broadcast writes the LoRA adapter (~10 MB) to `{output_dir}/broadcasts/step_N/`; the orchestrator watches for the `STABLE` marker and asks the server to hot-load it.
