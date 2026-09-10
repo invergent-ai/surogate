@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -54,6 +55,10 @@ struct GlmDecodeState;
 struct ExecutionRequest {
     GlmDecodeState* glm_decode_state = nullptr;
     std::vector<GlmDecodeState*> decode_states;
+    std::unordered_map<std::string, Tensor> decode_bindings;
+    [[nodiscard]] const Tensor& decode_binding(int layer, const char* name) const {
+        return decode_bindings.at(std::to_string(layer) + "/" + name);
+    }
     [[nodiscard]] bool decoding() const {
         return glm_decode_state || !decode_states.empty();
     }
@@ -88,10 +93,11 @@ struct ExecutionRequest {
     const modules::BackwardHook* backward_hook = nullptr;
 
     float* logprobs_gpu = nullptr;
-    // Generation selects one position per batch row. Only these vocabulary
-    // vectors leave the GPU; the resident model and adapter stay in place.
+    // Generation selects one position per batch row. Sampling can consume
+    // these logits directly on GPU, or callers can request host logits.
     const std::int32_t* generation_positions_cpu = nullptr;
     Tensor generation_logits_cpu{};
+    Tensor generation_logits_gpu{};
     float* custom_dloss_gpu = nullptr;
     const float* inv_temperature_gpu = nullptr;
 

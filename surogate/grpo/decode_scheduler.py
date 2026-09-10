@@ -1,6 +1,6 @@
 """Batch token steps from independent HTTP workers on one resident trainer.
 
-HTTP workers own sampling, RNG and streaming. The compute thread owns native
+HTTP workers own request parameters, RNG and streaming. The compute thread owns native
 sessions and serializes cache mutations with graph execution. Each worker waits
 only for its current chunk, so requests join and leave between decode rounds.
 """
@@ -15,7 +15,7 @@ import numpy as np
 
 
 class DecodeCapacityError(RuntimeError):
-    """The active requests exceed the configured cache token budget."""
+    """A request exceeds the configured cache token or VRAM budget."""
 
 
 class DecodeScheduler:
@@ -43,16 +43,19 @@ class DecodeScheduler:
                 raise RuntimeError("decode scheduler is closed")
             return next(self.ids)
 
-    def step(self, session, tokens, reset=False):
+    def step(self, session, tokens, reset=False, sampling=None):
         tokens = np.asarray(tokens, dtype=np.int32)
         result = None
         for start in range(0, len(tokens), self.prefill_chunk):
             future = Future()
             chunk = tokens[start : start + self.prefill_chunk]
+            params = sampling
+            if sampling is not None and start + len(chunk) < len(tokens):
+                params = {"enabled": False}
             with self.condition:
                 if self.closed:
                     raise RuntimeError("decode scheduler is closed")
-                self.pending.append((session, chunk, reset and start == 0, future))
+                self.pending.append((session, chunk, reset and start == 0, future, params))
                 self.condition.notify()
             result = future.result()
         return result
@@ -85,7 +88,7 @@ class DecodeScheduler:
             with self.condition:
                 self.condition.wait_for(lambda: self.closed or self.pending or self.releases)
                 if self.closed:
-                    for _, _, _, future in self.pending:
+                    for _, _, _, future, _ in self.pending:
                         future.set_exception(RuntimeError("decode scheduler is closed"))
                     releases = list(self.releases)
                     self.pending.clear()
@@ -94,8 +97,8 @@ class DecodeScheduler:
                     batch = []
                 else:
                     stopping = False
-                    # Briefly coalesce token steps. Streaming and sampling run
-                    # outside this thread and cannot hold the compute lock.
+                    # Briefly coalesce token steps. HTTP streaming and request
+                    # preparation cannot hold the compute lock.
                     deadline = time.monotonic() + 0.001
                     while self.pending and len(self.pending) < self.max_batch and not self.releases:
                         remaining = deadline - time.monotonic()
@@ -107,7 +110,9 @@ class DecodeScheduler:
                     batch, tokens = [], 0
                     while self.pending and len(batch) < self.max_batch:
                         item = self.pending[0]
-                        if tokens + len(item[1]) > self.max_tokens:
+                        if tokens + len(item[1]) > self.max_tokens or (
+                            batch and (item[4] is None) != (batch[0][4] is None)
+                        ):
                             break
                         batch.append(self.pending.popleft())
                         tokens += len(item[1])
@@ -128,24 +133,56 @@ class DecodeScheduler:
                 continue
             try:
                 lengths = self.lengths.copy()
-                for session, tokens, reset, _ in batch:
-                    lengths[session] = (0 if reset else lengths.get(session, 0)) + len(tokens)
-                if sum(lengths.values()) > self.token_budget:
-                    raise DecodeCapacityError("shared decode token budget exhausted")
+                accepted = []
+                rejected = []
+                total = sum(lengths.values())
+                for item in batch:
+                    session, tokens, reset, future, _ = item
+                    before = lengths.get(session, 0)
+                    after = (0 if reset else before) + len(tokens)
+                    if total + after - before > self.token_budget:
+                        rejected.append(item)
+                        total -= before
+                        lengths.pop(session, None)
+                        continue
+                    total += after - before
+                    lengths[session] = after
+                    accepted.append(item)
+                if accepted and hasattr(self.trainer, "admit_decode_sessions"):
+                    admitted = self.trainer.admit_decode_sessions(
+                        np.asarray([item[0] for item in accepted], dtype=np.int64),
+                        np.asarray([len(item[1]) for item in accepted], dtype=np.int32),
+                        np.asarray([item[2] for item in accepted], dtype=np.int32),
+                    )
+                    rejected.extend(item for item, fits in zip(accepted, admitted, strict=True) if not fits)
+                    accepted = [item for item, fits in zip(accepted, admitted, strict=True) if fits]
+                for session, _, _, future, _ in rejected:
+                    self.trainer.release_decode_sessions([session])
+                    self.lengths.pop(session, None)
+                    lengths.pop(session, None)
+                    future.set_exception(DecodeCapacityError("shared decode token or VRAM budget exhausted"))
+                batch = accepted
+                if not batch:
+                    continue
                 offsets = np.cumsum([0] + [len(item[1]) for item in batch], dtype=np.int32)
-                logits = self.trainer.decode_batch_logits(
+                args = (
                     np.asarray([item[0] for item in batch], dtype=np.int64),
                     np.concatenate([item[1] for item in batch]),
                     offsets,
                     np.asarray([item[2] for item in batch], dtype=np.int32),
+                )
+                results = (
+                    self.trainer.decode_batch_sample(*args, [item[4] for item in batch])
+                    if batch[0][4] is not None
+                    else self.trainer.decode_batch_logits(*args)
                 )
                 self.lengths = lengths
                 with self.condition:
                     self.rounds += 1
                     self.batched_rounds += len(batch) > 1
                     self.max_observed_batch = max(self.max_observed_batch, len(batch))
-                for row, (_, _, _, future) in enumerate(batch):
-                    future.set_result(logits[row])
+                for row, (_, _, _, future, _) in enumerate(batch):
+                    future.set_result(results[row])
             except Exception as exc:
                 # The native batch invalidates participating sessions after an
                 # execution failure. Release also covers host-side admission errors.
@@ -153,6 +190,7 @@ class DecodeScheduler:
                     self.trainer.release_decode_sessions([item[0] for item in batch])
                 except Exception:
                     pass  # Report the original execution error to every waiting caller.
-                for session, _, _, future in batch:
+                for session, _, _, future, _ in batch:
                     self.lengths.pop(session, None)
-                    future.set_exception(exc)
+                    if not future.done():
+                        future.set_exception(exc)

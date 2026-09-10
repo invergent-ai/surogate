@@ -195,6 +195,113 @@ def test_decode_between_captured_training_replays(tmp_path, case):
             decode(trainer, [2, 3, 1], [ids[1, 9:10], ids[0, :7], ids[0, 5:6]], [0, 1, 0])
             logits = decode(trainer, [3, 1, 2], [ids[0, 7:8], ids[0, 6:7], ids[1, 10:11]], [0, 0, 0])
             assert np.isfinite(logits).all()
+            for _ in range(4):
+                logits = decode(trainer, [2, 3, 1], [np.array([7], dtype=np.int32)] * 3, [0, 0, 0])
+                assert np.isfinite(logits).all()
+            stats = trainer.get_decode_batch_stats()
+            assert stats["decode_graph_captures"] > 0
+            assert stats["decode_graph_replays"] > stats["decode_graph_captures"]
     np.testing.assert_allclose(norms[2:], norms[1], rtol=0.01, atol=1e-6)
+    del trainer
+    gc.collect()
+
+
+@pytest.mark.parametrize("case", list(CASES) + ["glm"] if SELECTED == ["all"] else SELECTED)
+def test_cache_byte_budget_accounts_for_pages_tables_and_recurrent_state(tmp_path, case):
+    trainer = make_trainer(tmp_path, case)
+
+    def admit(ids, counts, resets):
+        return trainer.admit_decode_sessions(
+            np.asarray(ids, dtype=np.int64), np.asarray(counts, dtype=np.int32), np.asarray(resets, dtype=np.int32)
+        )
+
+    assert admit([1], [5], [1]) == [True]
+    budget = trainer.get_decode_batch_stats()["cache_allocated_bytes"]
+    trainer.set_decode_cache_budget(budget)
+    assert admit([2], [5], [1]) == [False]
+    prompt = np.array([7, 13, 19, 23, 29], dtype=np.int32)
+    before = decode(trainer, [1], [prompt], [1])
+    assert np.isfinite(before).all()
+    assert admit([2, 1], [1, 1], [1, 0]) == [False, True]
+    with pytest.raises(ValueError, match="below live"):
+        trainer.set_decode_cache_budget(budget - 1)
+    assert admit([1], [124], [0]) == [False]
+    assert trainer.get_decode_batch_stats()["length"] == 5
+    assert admit([1], [1], [0]) == [True]
+    actual = decode(trainer, [1], [np.array([31], dtype=np.int32)], [0])
+    assert np.isfinite(actual).all()
+    assert trainer.get_decode_batch_stats()["cache_allocated_bytes"] <= budget
+    trainer.release_decode_sessions([1])
+    assert admit([3], [5], [1]) == [True]
+    assert trainer.get_decode_batch_stats()["cache_allocated_bytes"] <= budget
+    trainer = None
+    gc.collect()
+
+
+@pytest.mark.parametrize("case", ["llama", "qwen3_5", "gemma4_moe", "glm"])
+def test_gpu_sampling_tracks_chunked_history_reordering_and_reset(tmp_path, case):
+    from surogate.grpo.shared_model import sample_logits
+    from tests.grpo.test_decode_sampling_gpu import DEFAULTS
+
+    trainer = make_trainer(tmp_path, case, graphs=True)
+    history = {}
+    rounds = [([1, 2], [[7, 7, 9] * 42, [9, 13] * 60], [1, 1])]
+    rounds += [([2, 1], [[7], [9]], [0, 0])] * 4
+    rounds += [([1, 2], [[13, 13, 13], [19]], [1, 0])]
+    for step, (sessions, chunks, resets) in enumerate(rounds):
+        logits = decode(trainer, [s + 100 for s in sessions], chunks, resets)
+        requests, expected = [], []
+        for row, (session, chunk, reset) in enumerate(zip(sessions, chunks, resets, strict=True)):
+            history[session] = ([] if reset else history[session]) + chunk
+            params = DEFAULTS | dict(
+                temperature=0.7,
+                top_p=0.8,
+                repetition_penalty=1.3,
+                presence_penalty=0.4,
+                frequency_penalty=0.15,
+                top_logprobs=5,
+                logit_bias={7: 2.0},
+            )
+            seed = step * 10 + session
+            requests.append(params | dict(uniform=float(np.random.default_rng(seed).random())))
+            expected.append(sample_logits(logits[row], history[session], params, [], np.random.default_rng(seed)))
+        sampled = trainer.decode_batch_sample(
+            np.asarray(sessions, dtype=np.int64),
+            np.concatenate(chunks).astype(np.int32),
+            np.cumsum([0] + [len(c) for c in chunks], dtype=np.int32),
+            np.asarray(resets, dtype=np.int32),
+            requests,
+        )
+        for actual, reference in zip(sampled, expected, strict=True):
+            assert actual["status"] == 0
+            assert actual["token"] == reference["token"]
+            assert actual["top_ids"] == reference["top_ids"]
+            np.testing.assert_allclose(actual["logprob"], reference["logprob"], atol=1e-8, rtol=0)
+        assert trainer.get_decode_batch_stats()["length"] == 2 * sum(map(len, history.values()))
+    before = trainer.get_decode_batch_stats()
+    with pytest.raises(ValueError, match="sampling parameters"):
+        trainer.decode_batch_sample(
+            np.array([1], dtype=np.int64),
+            np.array([7], dtype=np.int32),
+            np.array([0, 1], dtype=np.int32),
+            np.array([0], dtype=np.int32),
+            [dict(top_p=0)],
+        )
+    assert trainer.get_decode_batch_stats()["length"] == before["length"]
+    assert before["sampling_counts_bytes"] > 0 and before["decode_graph_replays"] > 0
+    del trainer
+    gc.collect()
+
+
+def test_decode_shape_cache_is_bounded_and_reuses_recent_shapes(tmp_path):
+    trainer = make_trainer(tmp_path, "llama", graphs=True)
+    for length in range(2, 12):
+        decode(trainer, [1], [[7] * length], [1])
+    before = trainer.get_decode_batch_stats()
+    assert before["resident_decode_shapes"] == 8 and before["compiled_decode_shapes"] == 10
+    decode(trainer, [2], [[13] * 10], [1])
+    assert trainer.get_decode_batch_stats()["compiled_decode_shapes"] == 10
+    decode(trainer, [1], [[13] * 2], [1])
+    assert trainer.get_decode_batch_stats()["compiled_decode_shapes"] == 11
     del trainer
     gc.collect()

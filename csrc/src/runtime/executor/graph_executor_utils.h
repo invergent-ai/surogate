@@ -140,12 +140,20 @@ inline void trace_or_execute_cuda_graph_with_stack(Function&& function,
 
     cudaGraph_t graph = nullptr;
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
-    function();
+    try {
+        function();
+    } catch (...) {
+        // End even an invalidated capture before any caller frees request
+        // storage. Preserve the original operator error for diagnosis/retry.
+        cudaStreamEndCapture(stream, &graph);
+        if (graph) cudaGraphDestroy(graph);
+        stack.restore(checkpoint);
+        throw;
+    }
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
-
-    CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
-
-    CUDA_CHECK(cudaGraphDestroy(graph));
+    const auto status = cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0);
+    cudaGraphDestroy(graph);
+    CUDA_CHECK(status);
     CUDA_CHECK(cudaGraphLaunch(instance, stream));
 }
 

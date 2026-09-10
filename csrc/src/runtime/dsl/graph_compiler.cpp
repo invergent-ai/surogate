@@ -4182,7 +4182,7 @@ static void maybe_dump_tid_table(const CompiledGraph& graph) {
     }
 }
 
-void CompiledGraph::compute_layer_segments() {
+void CompiledGraph::compute_layer_segments(bool decode) {
     const int num_layers = static_cast<int>(layer_start_indices.size());
     layer_segments.resize(static_cast<std::size_t>(num_layers));
 
@@ -4210,20 +4210,26 @@ void CompiledGraph::compute_layer_segments() {
             // Graph-breaking ops: must run eagerly because they are
             // capture-unsafe (dynamic cu_seqlens, JIT kernel loading,
             // MoE/EP per-step host bookkeeping, etc.)
-            const bool graph_breaking = ty == CompiledOpType::FlashAttention ||
+            // Stateful decode operators carry request-dependent host bookkeeping.
+            // Capture the stateless regions around them for every architecture.
+            const bool decode_dynamic =
+                decode && (ty == CompiledOpType::MambaConv1d || ty == CompiledOpType::GlmCausalConv1d ||
+                           ty == CompiledOpType::ChunkGatedDeltaRule || ty == CompiledOpType::KimiDeltaRule ||
+                           ty == CompiledOpType::GlmDsaIndexer || ty == CompiledOpType::GlmDsaAttention ||
+                           // The final layer span includes the generation head. Its host
+                           // result buffer (or sampler workspace) can change each call.
+                           ty == CompiledOpType::FusedLMHeadLoss);
+            const bool graph_breaking = decode_dynamic || ty == CompiledOpType::FlashAttention ||
                                         ty == CompiledOpType::FlashAttentionBackward || is_capture_unsafe_op_type(ty);
 
             // Check if this op starts an MLP tile group
             auto tile_it = mlp_tile_starts.find(i);
 
-            if (graph_breaking) {
-                if (i > seg_start) {
-                    segs.push_back({seg_start, i, /*eager=*/false});
-                }
-                segs.push_back({i, i + 1, /*eager=*/true});
-                seg_start = i + 1;
-            } else if (tile_it != mlp_tile_starts.end()) {
+            if (tile_it != mlp_tile_starts.end()) {
                 // MLP tile group: emit as one eager segment
+                // A grouped-expert tile starts with a graph-breaking GEMM.
+                // Consume the entire group before considering individual ops,
+                // otherwise replay dispatches its intermediates a second time.
                 if (i > seg_start) {
                     segs.push_back({seg_start, i, /*eager=*/false});
                 }
@@ -4232,6 +4238,12 @@ void CompiledGraph::compute_layer_segments() {
                 segs.push_back({i, tile_end, /*eager=*/true});
                 i = tile_end - 1;  // loop will ++i
                 seg_start = tile_end;
+            } else if (graph_breaking) {
+                if (i > seg_start) {
+                    segs.push_back({seg_start, i, /*eager=*/false});
+                }
+                segs.push_back({i, i + 1, /*eager=*/true});
+                seg_start = i + 1;
             }
         }
         // Trailing graphable segment

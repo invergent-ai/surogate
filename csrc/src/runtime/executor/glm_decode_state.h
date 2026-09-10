@@ -10,6 +10,24 @@
 #include "runtime/executor/paged_decode_cache.h"
 
 namespace dsl {
+// Operator-derived cache geometry. A zero divisor denotes fixed recurrent
+// state; otherwise rows grow as ceil(tokens / row_divisor).
+struct DecodeCacheSpec {
+    int layer;
+    std::string name;
+    ETensorDType dtype;
+    std::vector<long> shape;
+    int row_divisor = 0;
+    std::int64_t bytes(int tokens, int limit) const {
+        long elements = 1;
+        for (long d : shape)
+            elements *= d;
+        if (!row_divisor) return elements * get_dtype_size(dtype);
+        const long rows = (tokens + row_divisor - 1) / row_divisor;
+        return ((rows + DecodePageRows - 1) / DecodePageRows) * DecodePageRows * elements * get_dtype_size(dtype) +
+               ((limit + DecodePageRows - 1) / DecodePageRows) * sizeof(void*);
+    }
+};
 // Request-local history, owned by the model independently of graph recompilation.
 // It contains activations only; weights and adapters remain in the trainer.
 struct GlmDecodeState {
@@ -21,6 +39,26 @@ struct GlmDecodeState {
     std::unordered_map<std::string, Tensor> buffers;
     std::shared_ptr<DecodePagePool> page_pool = std::make_shared<DecodePagePool>();
     std::unordered_map<std::string, std::unique_ptr<PagedDecodeBuffer>> paged;
+    ~GlmDecodeState() {
+        page_pool->auxiliary_bytes -= allocator.total_allocation();
+    }
+
+    std::int64_t storage_bytes() const {
+        std::int64_t total = allocator.total_allocation();
+        for (const auto& [key, value] : paged)
+            if (value) total += value->bytes() + value->table_bytes();
+        return total;
+    }
+    void prepare(const std::vector<DecodeCacheSpec>& specs, int tokens, cudaStream_t stream) {
+        reserve(tokens);
+        for (const auto& spec : specs) {
+            if (spec.row_divisor)
+                pages(spec.layer, spec.name.c_str(), spec.dtype, spec.shape.at(0))
+                    .reserve((tokens + spec.row_divisor - 1) / spec.row_divisor, stream);
+            else
+                get(spec.layer, spec.name.c_str(), spec.dtype, spec.shape);
+        }
+    }
 
     PagedDecodeBuffer& pages(int layer, const char* name, ETensorDType dtype, long width) {
         auto key = std::to_string(layer) + "/" + name;
@@ -57,14 +95,27 @@ struct GlmDecodeState {
     Tensor get(int layer, const char* name, ETensorDType dtype, const std::vector<long>& shape) {
         auto key = std::to_string(layer) + "/" + name;
         auto& tensor = buffers[key];
-        if (!tensor.Data) tensor = allocator.allocate(dtype, key.c_str(), EAllocationType::ON_DEVICE, shape);
+        auto allocate = [&]() {
+            long bytes = get_dtype_size(dtype);
+            for (long d : shape)
+                bytes *= d;
+            page_pool->charge_auxiliary(bytes);
+            try {
+                return allocator.allocate(dtype, key.c_str(), EAllocationType::ON_DEVICE, shape);
+            } catch (...) {
+                page_pool->auxiliary_bytes -= bytes;
+                throw;
+            }
+        };
+        if (!tensor.Data) tensor = allocate();
         // Decode has one request, so growing the time axis preserves a
         // contiguous prefix. Recurrent states have fixed shapes and bypass it.
         if (tensor.DType == dtype && tensor.Rank == shape.size() && shape.size() >= 2 && shape[0] == 1 &&
             tensor.Sizes[0] == 1 && shape[1] > tensor.Sizes[1] &&
             std::equal(shape.begin() + 2, shape.end(), tensor.Sizes.begin() + 2)) {
-            auto grown = allocator.allocate(dtype, key.c_str(), EAllocationType::ON_DEVICE, shape);
+            auto grown = allocate();
             CUDA_CHECK(cudaMemcpy(grown.Data, tensor.Data, tensor.bytes(), cudaMemcpyDeviceToDevice));
+            page_pool->auxiliary_bytes -= tensor.bytes();
             allocator.free(tensor);
             tensor = grown;
         }

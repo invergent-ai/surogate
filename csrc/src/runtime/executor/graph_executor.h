@@ -21,6 +21,7 @@
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
 #include "runtime/executor/execution_request.h"
+#include "runtime/executor/glm_decode_state.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
 #include "utilities/stack.h"
@@ -39,6 +40,7 @@ struct MatmulContext;
 enum class MatmulOp;
 }  // namespace modules
 namespace dsl {
+struct DecodeCacheSpec;
 class DslRunState;
 class DslParamStore;
 class DslGradStore;
@@ -70,7 +72,13 @@ struct GraphExecutorOptions {
 
 class IGraphExecutor {
 public:
+    virtual std::vector<DecodeCacheSpec> decode_cache_specs() const {
+        throw std::runtime_error("This execution topology does not support resident decode caches");
+    }
     virtual ~IGraphExecutor() = default;
+    virtual std::unordered_map<std::string, std::int64_t> decode_execution_stats() const {
+        return {};
+    }
 
     virtual ExecutionResult execute_forward(const ExecutionRequest& request, NCCLCommunicator& comm) = 0;
     virtual ExecutionResult execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) = 0;
@@ -195,6 +203,8 @@ public:
                   const RuntimeOptions& options,
                   const GraphExecutorOptions& exec_options = {});
     ~GraphExecutor() override;
+    std::vector<DecodeCacheSpec> decode_cache_specs() const override;
+    std::unordered_map<std::string, std::int64_t> decode_execution_stats() const override;
 
     void set_lora_state(const modules::ModularLoRAConfig* config,
                         modules::ModularLoRAWeightsManager* weights,
@@ -478,17 +488,13 @@ private:
     // running one GPU on the full batch (it would deadlock waiting for idle GPUs).
     bool mSkipGradReduce = false;
     std::unique_ptr<CompiledExecutor> mCompiledExecutor;
-    // Decode compiles only forward ops and borrows the training workspace.
-    // Its own executor keeps training graphs and weight addresses intact.
+    // Bounded shape cache: each variant owns its executor, captures and arenas.
+    // No decode compilation can replace storage held by training graphs.
+    struct DecodeVariant;
     std::unique_ptr<GraphCompiler> mDecodeCompiler;
-    std::unique_ptr<CompiledExecutor> mDecodeExecutor;
-    std::unique_ptr<CompiledGraph> mDecodePrefillGraph;
-    std::unique_ptr<CompiledGraph> mDecodeTokenGraph;
-    PhaseArenas mDecodePrefillArenas;
-    PhaseArenas mDecodeTokenArenas;
-    long mDecodePrefillT = 0;
-    long mDecodePrefillB = 0;
-    long mDecodeTokenB = 0;
+    std::vector<std::unique_ptr<DecodeVariant>> mDecodeVariants;
+    std::uint64_t mDecodeClock = 0;
+    std::int64_t mDecodeCompilations = 0;
     std::unique_ptr<CompiledGraph> mCompiledForward;
     std::unique_ptr<CompiledGraph> mCompiledBackward;
     long mCompiledB = 0;

@@ -260,8 +260,14 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
 
     if (mExecutionRequest && mExecutionRequest->generation_positions_cpu) {
         const auto& request = *mExecutionRequest;
-        Tensor logits = mRunState.non_block_activations().output;
-        if (request.generation_logits_cpu.DType != logits.DType) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(mRunState.MainStream, &capture_status));
+        if (capture_status != cudaStreamCaptureStatusNone)
+            throw std::logic_error(
+                "Generation logits must execute outside capture: result addresses are request-local");
+        const bool on_gpu = request.generation_logits_gpu.Data != nullptr;
+        Tensor logits = on_gpu ? request.generation_logits_gpu : mRunState.non_block_activations().output;
+        if (!on_gpu && request.generation_logits_cpu.DType != logits.DType) {
             throw std::runtime_error("generation logits dtype does not match the output buffer");
         }
         logits.Rank = 2;
@@ -269,6 +275,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
         logits.Sizes[1] = V;
         const auto row_bytes = static_cast<std::size_t>(V) * get_dtype_size(logits.DType);
         for (long b = 0; b < request.batch; ++b) {
+            if (on_gpu) logits.Data = request.generation_logits_gpu.Data + b * row_bytes;
             const long row = b * request.sequence + request.generation_positions_cpu[b];
             Tensor x = xF_flat;
             x.Data += row * C * get_dtype_size(x.DType);
@@ -279,8 +286,12 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
             if (op.attrs.softcap > 0.0f) {
                 softcap_logits(logits, op.attrs.softcap, 1, V, mRunState.MainStream);
             }
-            CUDA_CHECK(cudaMemcpyAsync(request.generation_logits_cpu.Data + b * row_bytes,
-                                       logits.Data, row_bytes, cudaMemcpyDeviceToHost, mRunState.MainStream));
+            if (!on_gpu)
+                CUDA_CHECK(cudaMemcpyAsync(request.generation_logits_cpu.Data + b * row_bytes,
+                                           logits.Data,
+                                           row_bytes,
+                                           cudaMemcpyDeviceToHost,
+                                           mRunState.MainStream));
         }
         return;
     }

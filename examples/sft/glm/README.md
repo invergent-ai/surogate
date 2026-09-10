@@ -105,7 +105,7 @@ the selected training topology.
 
 Text training supports sequences longer than `index_topk` (32 with the command
 above, 256 by default in the generator, 2048 in the
-released checkpoint). Eight native Triton DSA kernels normalize and pool keys,
+released checkpoint). Native Triton DSA kernels normalize and pool keys,
 score and select pools, expand selected token indices, and run sparse attention
 forward/backward. They live in
 [`surogate/kernels/triton/glm_dsa.py`](../../../surogate/kernels/triton/glm_dsa.py)

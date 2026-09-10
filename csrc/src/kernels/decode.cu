@@ -9,7 +9,7 @@ constexpr int Page = 128;
 
 // Each block reads one physical page. Four warps calculate four QK dots at a
 // time, then update an FP32 softmax accumulator. No full-prefix KV gather.
-template <int MaxD>
+template <int MaxD, bool Batched = false>
 __global__ void page_attention(const nv_bfloat16* qkv,
                                const nv_bfloat16* const* pages,
                                float* partial,
@@ -20,11 +20,25 @@ __global__ void page_attention(const nv_bfloat16* qkv,
                                int D,
                                int window,
                                float scale,
-                               int np) {
-    int page = blockIdx.x, head = blockIdx.y, query = blockIdx.z;
+                               int np,
+                               const DecodeCacheBinding* bindings = nullptr) {
+    const int batch = Batched ? blockIdx.z / T : 0;
+    int head = blockIdx.y, query = blockIdx.z % T;
+    if constexpr (Batched) {
+        position = bindings[batch].length;
+        pages = reinterpret_cast<const nv_bfloat16* const*>(bindings[batch].data);
+    }
+    const int first_page = window > 0 ? max(0, position + query - window + 1) / Page : 0;
+    const int page = blockIdx.x + (Batched ? first_page : 0);
+    const int global_query = batch * T + query;
+    auto* target = partial + ((global_query * Hq + head) * np + blockIdx.x) * (D + 2);
+    if (page * Page > position + query) {
+        for (int d = threadIdx.x; d < D + 2; d += blockDim.x) target[d] = d == D ? -INFINITY : 0;
+        return;
+    }
     int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const int kvhead = head / (Hq / Hkv), absolute = position + query;
-    const nv_bfloat16* q = qkv + (query * (Hq + 2 * Hkv) + head) * D;
+    const nv_bfloat16* q = qkv + (global_query * (Hq + 2 * Hkv) + head) * D;
     const nv_bfloat16* kv = pages[page];
     __shared__ float scores[4], weights[4], alpha, maximum, total;
     float accum[(MaxD + 127) / 128] = {};
@@ -68,7 +82,6 @@ __global__ void page_attention(const nv_bfloat16* qkv,
         }
         __syncthreads();
     }
-    auto* target = partial + ((query * Hq + head) * np + page) * (D + 2);
     for (int j = 0; j < (MaxD + 127) / 128; ++j)
         if (tid + j * 128 < D) target[tid + j * 128] = accum[j];
     if (tid == 0) {
@@ -94,7 +107,17 @@ __global__ void merge_pages(const float* partial, nv_bfloat16* out, float* lse, 
         }
         out[row * D + d] = __float2bfloat16(value / total);
     }
-    if (threadIdx.x == 0) lse[(row % H) * T + row / H] = maximum + logf(total);
+    if (threadIdx.x == 0) lse[((row / (H * T)) * H + row % H) * T + (row / H) % T] = maximum + logf(total);
+}
+
+__global__ void append_batch_kv(const nv_bfloat16* qkv, const DecodeCacheBinding* bindings,
+                                int T, int Hq, int Hkv, int D) {
+    const int row = blockIdx.x / T, token = blockIdx.x % T;
+    const int absolute = bindings[row].length + token;
+    auto* const* pages = reinterpret_cast<nv_bfloat16* const*>(bindings[row].data);
+    auto* destination = pages[absolute / Page] + (absolute % Page) * 2 * Hkv * D;
+    const auto* source = qkv + ((row * T + token) * (Hq + 2 * Hkv) + Hq) * D;
+    for (int col = threadIdx.x; col < 2 * Hkv * D; col += blockDim.x) destination[col] = source[col];
 }
 
 __global__ void
@@ -189,6 +212,33 @@ void decode_paged_attention(const Tensor& qkv,
                                             Hq,
                                             D,
                                             np);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void decode_append_kv_batch(const Tensor& qkv, const Tensor& bindings, int B, int T,
+                            int Hq, int Hkv, int D, cudaStream_t stream) {
+    append_batch_kv<<<B * T, 256, 0, stream>>>(qkv.get<nv_bfloat16>(),
+        reinterpret_cast<const DecodeCacheBinding*>(bindings.Data), T, Hq, Hkv, D);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void decode_paged_attention_batch(const Tensor& qkv, const Tensor& out, const Tensor& lse,
+                                  const Tensor& bindings, const Tensor& scratch, int B, int T,
+                                  int Hq, int Hkv, int D, int pages, int window, float scale,
+                                  cudaStream_t stream) {
+    if (qkv.DType != ETensorDType::BF16 || D <= 0 || D > 1024 || Hkv <= 0 || Hq % Hkv)
+        throw std::runtime_error("Paged batch attention requires BF16 GQA with head size <= 1024");
+    auto launch = [&]<int N>() {
+        page_attention<N, true><<<dim3(pages, Hq, B * T), 128, 0, stream>>>(qkv.get<nv_bfloat16>(), nullptr,
+            reinterpret_cast<float*>(scratch.Data), 0, T, Hq, Hkv, D, window,
+            scale ? scale : 1.f / sqrtf(D), pages, reinterpret_cast<const DecodeCacheBinding*>(bindings.Data));
+    };
+    if (D <= 128) launch.template operator()<128>();
+    else if (D <= 256) launch.template operator()<256>();
+    else if (D <= 512) launch.template operator()<512>();
+    else launch.template operator()<1024>();
+    merge_pages<<<B * T * Hq, 128, 0, stream>>>(reinterpret_cast<float*>(scratch.Data),
+        reinterpret_cast<nv_bfloat16*>(out.Data), reinterpret_cast<float*>(lse.Data), T, Hq, D, pages);
     CUDA_CHECK(cudaGetLastError());
 }
 

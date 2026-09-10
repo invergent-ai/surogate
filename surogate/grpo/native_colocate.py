@@ -166,6 +166,7 @@ def grpo_native_colocate(train_config, infer_config, orch_config):
                     device=0, model=orch_config.model.name, max_context=context,
                     prefill_chunk=min(256, context), max_concurrency=concurrency,
                     kv_capacity=context * concurrency, use_cuda_graph=True,
+                    decode_cache_bytes=getattr(infer_config, "decode_cache_bytes", 0),
                     rank=train_config.lora_rank)
     # Enforce the local server address; both components live in this process.
     orch_config.client.base_url = [f"http://127.0.0.1:{settings['port']}/v1"]

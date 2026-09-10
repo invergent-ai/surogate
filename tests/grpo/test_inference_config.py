@@ -48,3 +48,10 @@ def test_the_served_name_is_the_checkpoint_the_orchestrator_expects():
     assert argv[1:3] == ["serve", "Qwen/Qwen3-0.6B"]
     assert _value(argv, "--served-model-name") == "Qwen/Qwen3-0.6B"
     assert _value(argv, "--port") == "8007"
+
+
+def test_shared_decode_cache_budget_defaults_and_validation():
+    assert GRPOInferenceConfig(DictDefault({"model": "m"})).decode_cache_bytes == 0
+    assert GRPOInferenceConfig(DictDefault({"model": "m", "decode_cache_bytes": 1 << 30})).decode_cache_bytes == 1 << 30
+    with pytest.raises(ValueError, match="nonnegative"):
+        GRPOInferenceConfig(DictDefault({"model": "m", "decode_cache_bytes": -1}))

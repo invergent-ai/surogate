@@ -1164,6 +1164,7 @@ private:
     // around FlashAttention ops. Non-attention segments are captured as CUDA
     // graphs; attention runs eagerly with dynamic cu_seqlens (doc masking).
     bool mSplitAttentionGraphs = false;
+    std::int64_t mForwardSegmentCaptures = 0, mForwardSegmentReplays = 0;
     std::size_t mSegmentDispatchedUntil = 0;  ///< Ops before this index already dispatched by segments
 
     struct SegmentGraphExec {
@@ -1194,6 +1195,9 @@ private:
 public:
     void set_split_attention_graphs(bool enabled) {
         mSplitAttentionGraphs = enabled;
+    }
+    std::pair<std::int64_t, std::int64_t> forward_segment_stats() const {
+        return {mForwardSegmentCaptures, mForwardSegmentReplays};
     }
     void reset_segment_graphs();
     void resize_segment_graphs(const CompiledGraph& fwd_graph, const CompiledGraph& bwd_graph);

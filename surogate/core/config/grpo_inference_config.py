@@ -18,6 +18,8 @@ class GRPOInferenceConfig:
         model: HuggingFace directory, hub id or GGUF the engine builds its artifact from.
         max_model_len: Maximum context length (`--max-model-len`).
         max_num_seqs: Concurrency cap (`--max-num-seqs`).
+        decode_cache_bytes: Persistent cache byte budget on the shared training path;
+            0 selects 25% of free VRAM after trainer allocation.
         kv_cache_dtype: KV cache dtype, e.g. `fp8` (`--kv-dtype`).
         tp: GPUs per replica. With `dp`, the number of GPUs a split run hands the server.
         dp: Replicas.
@@ -36,6 +38,9 @@ class GRPOInferenceConfig:
     # whether a big model + LoRA fits. Lowering the KV budget does NOT help -- it
     # shrinks the very pool those buffers draw from.
     max_num_seqs: int | None = None
+    # Native shared-model cache storage, including recurrent state and tables.
+    # Zero selects 25% of free VRAM after allocating the resident trainer.
+    decode_cache_bytes: int = 0
     # fp8 KV halves cache bytes/token, ~doubling concurrency on a KV-bound server. It
     # also perturbs sampled logprobs, which feed GRPO's importance ratio -- measure
     # mismatch_kl before adopting.
@@ -53,6 +58,9 @@ class GRPOInferenceConfig:
         self.model = cfg.get("model", self.model)
         self.max_model_len = cfg.get("max_model_len", self.max_model_len)
         self.max_num_seqs = cfg.get("max_num_seqs", self.max_num_seqs)
+        self.decode_cache_bytes = int(cfg.get("decode_cache_bytes", self.decode_cache_bytes))
+        if self.decode_cache_bytes < 0:
+            raise ValueError("decode_cache_bytes must be nonnegative")
         self.kv_cache_dtype = cfg.get("kv_cache_dtype", self.kv_cache_dtype)
         self.tp = cfg.get("tp", self.tp)
         self.dp = cfg.get("dp", self.dp)

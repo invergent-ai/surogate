@@ -828,7 +828,7 @@ struct CompiledGraph {
 
     /// Populate layer_segments by scanning each layer for FlashAttention ops.
     /// Call after annotate_layer_boundaries().
-    void compute_layer_segments();
+    void compute_layer_segments(bool decode = false);
 
     /// Shadow-mode phase tree (design/buffer-runtime-v4.md). Built post-hoc by
     /// GraphCompiler::build_phase_tree() after annotate_layer_boundaries().

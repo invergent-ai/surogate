@@ -1587,8 +1587,30 @@ class SurogateTrainer:
         """
     def release_decode_sessions(self, session_ids: list[int]) -> None:
         """Release request state and return its pages to the shared cache pool."""
+    def set_decode_cache_budget(self, bytes: int = 0) -> None:
+        """Set persistent batched cache budget; 0 selects 25% of currently free VRAM.
+
+        Includes pages, tables, recurrent states and sampling counts. Excludes
+        model weights and execution workspaces. Cannot shrink below live usage.
+        """
+    def admit_decode_sessions(self, session_ids: npt.NDArray[np.int64], counts: npt.NDArray[np.int32],
+                              reset: npt.NDArray[np.int32]) -> list[bool]:
+        """Reserve cache per request without advancing token history; False means insufficient capacity."""
+    def decode_batch_sample(self, session_ids: npt.NDArray[np.int64], input_ids: npt.NDArray[np.int32],
+                            offsets: npt.NDArray[np.int32], reset: npt.NDArray[np.int32],
+                            sampling: list[dict]) -> list[dict]:
+        """Append ragged chunks and return compact GPU sampling results per session.
+
+        Parameters: temperature, top_k, top_p, min_p, repetition_penalty,
+        presence_penalty, frequency_penalty, integer-keyed logit_bias,
+        blocked_tokens, top_logprobs (0..20), uniform ([0,1)), enabled (bool).
+        Results: token, logprob, top_ids, top_logprobs and status (0: OK,
+        1: nonfinite logits, 2: constraints removed all tokens). Disabled rows
+        advance history without selecting a token. Logprobs precede penalties
+        and filtering. Ties prefer smaller token IDs.
+        """
     def get_decode_batch_stats(self) -> dict[str, int]:
-        """Report active sessions, tokens, pages, cache bytes and page reuse."""
+        """Report sessions, tokens, cache payload/auxiliary/budget bytes, page reuse and graph statistics."""
     def reset_decode_state(self) -> None:
         """Invalidate all decode sessions and trim unused pages in the shared pool."""
     def decode_logits(self, input_ids: npt.NDArray[np.int32], reset: bool = False) -> npt.NDArray[np.float32]:

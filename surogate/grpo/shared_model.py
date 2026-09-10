@@ -84,6 +84,8 @@ class SharedModelServer:
         eos = settings.get("eos_token_id", text.get("eos_token_id", config.get("eos_token_id", tokenizer.eos_token_id)))
         self.eos = set(eos if isinstance(eos, list) else [eos]) - {None}
         self.scheduler = None
+        if hasattr(trainer, "set_decode_cache_budget"):
+            trainer.set_decode_cache_budget(settings.get("decode_cache_bytes", 0))
         if hasattr(trainer, "decode_batch_logits"):
             self.scheduler = DecodeScheduler(
                 trainer, max_batch=self.capacity,
@@ -208,6 +210,7 @@ class SharedModelServer:
                         serving_base_allocated_bytes=0, base_upload_bytes=0,
                         sleeping=self.sleeping, execution="training", persistent_decode=self.persistent_decode,
                         continuous_batching=self.scheduler is not None,
+                        gpu_sampling=self.scheduler is not None and hasattr(self.trainer, "decode_batch_sample"),
                         **(self.scheduler.summary() if self.scheduler else {}))
 
     def close(self):
@@ -296,7 +299,7 @@ class SharedModelServer:
             session = self.scheduler.new_session()
             try:
                 return self._generate(request, callback,
-                    lambda tokens, reset: self.scheduler.step(session, tokens, reset))
+                    lambda tokens, reset, sampling=None: self.scheduler.step(session, tokens, reset, sampling))
             finally:
                 self.scheduler.release(session)
         # One workspace serves all admitted requests; begin_training waits for
@@ -321,52 +324,41 @@ class SharedModelServer:
         identifier, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
         finish = "length"
         eos = (set() if request.get("ignore_eos", False) else self.eos) | set(request.get("stop_token_ids") or [])
+        gpu_sampling = decode is not None and hasattr(self.trainer, "decode_batch_sample")
+        temperature = float(request.get("temperature", 1.))
+        params = {key: float(request.get(key, default)) for key, default in (
+            ("temperature", 1.), ("top_p", 1.), ("min_p", 0.), ("repetition_penalty", 1.),
+            ("presence_penalty", 0.), ("frequency_penalty", 0.))}
+        params.update(top_k=int(request.get("top_k", -1)), top_logprobs=int(request.get("top_logprobs", 0) or 0),
+                      logit_bias={int(token): float(bias) for token, bias in (request.get("logit_bias") or {}).items()})
         for step in range(request["maximum"]):
             positions[0] = len(prompt) + step - 1
-            if self.persistent_decode:
+            if gpu_sampling:
+                tokens = np.asarray(prompt if step == 0 else [ids[-1]], dtype=np.int32)
+                sampled = decode(tokens, step == 0, params | dict(
+                    uniform=float(rng.random()) if temperature > 0 else 0.,
+                    blocked_tokens=sorted(eos) if step < request["minimum"] else []))
+                if sampled["status"] == 1:
+                    raise RuntimeError("model returned nonfinite logits")
+                if sampled["status"]:
+                    raise ValueError("sampling constraints removed every token")
+            elif self.persistent_decode:
                 tokens = np.asarray(prompt if step == 0 else [ids[-1]], dtype=np.int32)
                 logits = (decode(tokens, step == 0) if decode else
                           self.trainer.decode_logits(tokens, reset=step == 0)).astype(np.float64)
             else:
                 logits = self.trainer.next_token_logits(inputs, positions)[0].astype(np.float64)
-            if not np.isfinite(logits).all():
-                raise RuntimeError("model returned nonfinite logits")
-            temperature = float(request.get("temperature", 1.))
-            logits /= temperature if temperature > 0 else 1.
-            logprobs = logits - np.logaddexp.reduce(logits)
-            sampling = logits.copy()
-            seen, counts = np.unique(prompt + ids, return_counts=True)
-            penalty = float(request.get("repetition_penalty", 1.))
-            sampling[seen] = np.where(sampling[seen] > 0, sampling[seen] / penalty, sampling[seen] * penalty)
-            sampling[seen] -= float(request.get("presence_penalty", 0.)) + counts * float(request.get("frequency_penalty", 0.))
-            for token, bias in (request.get("logit_bias") or {}).items():
-                sampling[int(token)] += float(bias)
-            if step < request["minimum"]:
-                sampling[list(eos)] = -np.inf
-            order = np.argsort(sampling)[::-1]
-            top_k = int(request.get("top_k", -1))
-            if top_k > 0:
-                sampling[order[top_k:]] = -np.inf
-            probabilities = np.exp(sampling - np.max(sampling))
-            probabilities /= probabilities.sum()
-            cumulative = np.cumsum(probabilities[order]) - probabilities[order]
-            sampling[order[cumulative >= float(request.get("top_p", 1.))]] = -np.inf
-            sampling[probabilities < probabilities.max() * float(request.get("min_p", 0.))] = -np.inf
-            probabilities = np.exp(sampling - np.max(sampling))
-            probabilities /= probabilities.sum()
-            if not np.isfinite(probabilities).all():
-                raise ValueError("sampling constraints removed every token or model logits are nonfinite")
-            token = int(np.argmax(sampling) if temperature == 0 else rng.choice(len(sampling), p=probabilities))
+            if not gpu_sampling:
+                sampled = sample_logits(logits, prompt + ids, params, eos if step < request["minimum"] else (), rng)
+            token = sampled["token"]
             ids.append(token)
             if inputs is not None:
                 inputs[0, len(prompt) + step] = token
             piece = self.tokenizer.decode([token], skip_special_tokens=False)
-            score = dict(token=piece, logprob=float(logprobs[token]), bytes=list(piece.encode()), top_logprobs=[])
-            top_count = int(request.get("top_logprobs", 0) or 0)
-            top_tokens = np.argsort(logprobs)[-top_count:][::-1] if top_count else ()
-            for t in top_tokens:
+            score = dict(token=piece, logprob=sampled["logprob"], bytes=list(piece.encode()), top_logprobs=[])
+            for t, logprob in zip(sampled["top_ids"], sampled["top_logprobs"], strict=True):
                 token_text = self.tokenizer.decode([int(t)], skip_special_tokens=False)
-                score["top_logprobs"].append(dict(token=token_text, logprob=float(logprobs[t]), bytes=list(token_text.encode())))
+                score["top_logprobs"].append(dict(token=token_text, logprob=float(logprob), bytes=list(token_text.encode())))
             scores.append(score)
             stopped = token in eos
             # Tool/think delimiters may themselves be special tokens. Preserve
@@ -422,3 +414,39 @@ class SharedModelServer:
 
 class Busy(RuntimeError):
     pass
+
+
+def sample_logits(logits, history, params, blocked, rng):
+    """Compatibility sampler for trainers without the compact GPU sampling API."""
+    logits = logits.astype(np.float64)
+    if not np.isfinite(logits).all():
+        raise RuntimeError("model returned nonfinite logits")
+    temperature = params["temperature"]
+    logits /= temperature if temperature > 0 else 1.
+    logprobs = logits - np.logaddexp.reduce(logits)
+    sampling = logits.copy()
+    seen, counts = np.unique(history, return_counts=True)
+    seen = seen.astype(np.int64)
+    penalty = params["repetition_penalty"]
+    sampling[seen] = np.where(sampling[seen] > 0, sampling[seen] / penalty, sampling[seen] * penalty)
+    sampling[seen] -= params["presence_penalty"] + counts * params["frequency_penalty"]
+    for token, bias in params["logit_bias"].items():
+        sampling[token] += bias
+    sampling[list(blocked)] = -np.inf
+    # Stable ties prefer smaller token IDs on both CPU and GPU.
+    order = np.argsort(-sampling, kind="stable")
+    if params["top_k"] > 0:
+        sampling[order[params["top_k"]:]] = -np.inf
+    with np.errstate(invalid="ignore", divide="ignore"):
+        probabilities = np.exp(sampling - np.max(sampling))
+        probabilities /= probabilities.sum()
+        cumulative = np.cumsum(probabilities[order]) - probabilities[order]
+        sampling[order[cumulative >= params["top_p"]]] = -np.inf
+        sampling[probabilities < probabilities.max() * params["min_p"]] = -np.inf
+        probabilities = np.exp(sampling - np.max(sampling))
+        probabilities /= probabilities.sum()
+    if not np.isfinite(probabilities).all():
+        raise ValueError("sampling constraints removed every token or model logits are nonfinite")
+    token = int(np.argmax(sampling) if temperature == 0 else rng.choice(len(sampling), p=probabilities))
+    top = np.argsort(-logprobs, kind="stable")[:params["top_logprobs"]] if params["top_logprobs"] else np.array([], dtype=np.int64)
+    return dict(token=token, logprob=float(logprobs[token]), top_ids=top.tolist(), top_logprobs=logprobs[top].tolist())

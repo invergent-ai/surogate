@@ -7,6 +7,8 @@
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/executor/compiled_ops_helpers.h"
+#include "runtime/executor/glm_decode_state.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/tensor_role.h"
@@ -45,6 +47,7 @@
 #include "utilities/tensor.h"
 #include "utilities/utils.h"
 #include "kernels/kernels.h"
+#include "kernels/decode_sampling.h"
 #include "recipes/nvfp4/nvfp4_recipe.h"
 
 namespace dsl {
@@ -318,9 +321,104 @@ GraphExecutor::GraphExecutor(const Module& module,
     init(exec_options);
 }
 
+std::vector<DecodeCacheSpec> GraphExecutor::decode_cache_specs() const {
+    if (!mCompiledForward) throw std::logic_error("Decode cache planning requires a compiled training graph");
+    std::vector<DecodeCacheSpec> result{{-1, "sampling_counts", ETensorDType::INT32, {mConfig.VocabSize}, 0}};
+    // Cache geometry follows operators and resolved tensor shapes, never model
+    // names. This includes mixed attention/recurrent layers and expert models.
+    for (const auto& op : mCompiledForward->ops) {
+        const int layer = op_layer_idx(op);
+        auto shape = [&](int input) {
+            const auto& ref = op.inputs.at(input);
+            if (!ref.shape.empty()) return ref.shape;
+            const auto tensor = mWeights.template_tensor(ref.name);
+            return std::vector<long>(tensor.Sizes.begin(), tensor.Sizes.begin() + tensor.Rank);
+        };
+        auto add = [&](const char* name, ETensorDType dtype, std::vector<long> dims, int divisor = 0) {
+            for (const auto& previous : result) {
+                if (previous.layer != layer || previous.name != name) continue;
+                if (previous.dtype != dtype || previous.shape != dims || previous.row_divisor != divisor)
+                    throw std::logic_error("Conflicting decode cache geometry for " + std::string(name));
+                return;
+            }
+            result.push_back({layer, name, dtype, std::move(dims), divisor});
+        };
+        switch (op.type) {
+            case CompiledOpType::FlashAttention: {
+                auto qkv = Tensor::from_pointer(nullptr, 0, ETensorDType::BF16, shape(0));
+                int hq = mConfig.NumQueryHeads, hk = mConfig.NumKeyValHeads;
+                int d = derive_head_size(qkv, hq, hk, mConfig.head_size());
+                resolve_attn_head_dims(mRunState.runtime_config(), layer, qkv, hq, hk, d);
+                add("attention_kv", ETensorDType::BF16, {2L * hk * d}, 1);
+                break;
+            }
+            case CompiledOpType::MambaConv1d: {
+                auto w = shape(1);
+                if (w.at(1) > 1) add("convolution", ETensorDType::BF16, {w[0], w[1] - 1});
+                break;
+            }
+            case CompiledOpType::GlmCausalConv1d: {
+                auto w = shape(1);
+                add("convolution", ETensorDType::BF16, {w.at(0), w.at(2) - 1});
+                break;
+            }
+            case CompiledOpType::ChunkGatedDeltaRule: {
+                auto q = shape(0), v = shape(2);
+                add("delta_state", ETensorDType::FP32, {1, q.at(2), q.at(3), v.at(3)});
+                break;
+            }
+            case CompiledOpType::KimiDeltaRule: {
+                auto q = shape(0);
+                add("kda_state", ETensorDType::FP32, {1, q.at(2), q.at(3), q.at(3)});
+                break;
+            }
+            case CompiledOpType::GlmDsaIndexer: {
+                const auto d = shape(0).at(3), pool = shape(6).at(0);
+                add("index_keys", ETensorDType::BF16, {d}, 1);
+                add("index_gate", ETensorDType::BF16, {d}, 1);
+                add("index_positions", ETensorDType::INT32, {1}, 1);
+                add("index_pooled", ETensorDType::BF16, {d}, pool);
+                add("index_ends", ETensorDType::INT32, {1}, pool);
+                break;
+            }
+            case CompiledOpType::GlmDsaAttention:
+                if (op.inputs.size() != 4)
+                    throw std::logic_error("Paged sparse decode requires its latent projection in the graph");
+                add("mla_latent", ETensorDType::BF16, {shape(3).at(1)}, 1);
+                break;
+            default: break;
+        }
+    }
+    return result;
+}
+
+struct GraphExecutor::DecodeVariant {
+    long batch = 0, sequence = 0;
+    std::uint64_t last_use = 0, calls = 0;
+    PhaseArenas arenas;
+    std::unique_ptr<CompiledGraph> graph;
+    std::unique_ptr<CompiledExecutor> executor;
+    ~DecodeVariant() {
+        executor.reset();  // Destroy captures before their storage.
+        dsl::release_phase_arenas(arenas);
+    }
+};
+
+std::unordered_map<std::string, std::int64_t> GraphExecutor::decode_execution_stats() const {
+    std::unordered_map<std::string, std::int64_t> stats{{"compiled_decode_shapes", mDecodeCompilations},
+                                                        {"resident_decode_shapes", mDecodeVariants.size()},
+                                                        {"decode_graph_captures", 0},
+                                                        {"decode_graph_replays", 0}};
+    for (const auto& variant : mDecodeVariants) {
+        const auto [captures, replays] = variant->executor->forward_segment_stats();
+        stats["decode_graph_captures"] += captures;
+        stats["decode_graph_replays"] += replays;
+    }
+    return stats;
+}
+
 GraphExecutor::~GraphExecutor() {
-    dsl::release_phase_arenas(mDecodePrefillArenas);
-    dsl::release_phase_arenas(mDecodeTokenArenas);
+    mDecodeVariants.clear();
     // Stack arena (if rebased) is owned by DslRunState — adopted buffer
     // persists past this destructor and is cudaFree'd in ~DslRunState.
     // release_phase_arenas below skips unified_stack_ptr because ownership
@@ -1615,80 +1713,98 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
 
     std::vector<RuntimeBinding> runtime_bindings = materialize_runtime_bindings(request);
     if (request.decoding()) {
+        decode_update_counts(request.decode_bindings.at("-1/sampling_counts"),
+                             rs.Inputs,
+                             request.batch,
+                             request.sequence,
+                             mConfig.VocabSize,
+                             rs.MainStream);
         if (!request.disable_forward_saves || !request.generation_positions_cpu)
             throw std::runtime_error("Decode requires forward-only generation requests");
-        if (!mDecodeCompiler) {
+        if (!mDecodeCompiler)
             mDecodeCompiler = std::make_unique<GraphCompiler>(mModule, mConfig, mOptions, mWeights, mGrads);
-            mDecodeExecutor = std::make_unique<CompiledExecutor>(rs, mWeights, mGrads, mConfig, mOptions);
-            mDecodeExecutor->set_schema_hook_registry(mSchemaHookRegistry);
-            if (mOptions.TrainingRecipe) mDecodeExecutor->set_recipe(mOptions.TrainingRecipe.get());
-            auto dump_decode = [this](const std::vector<std::string>& names, int layer) {
+        DecodeVariant* variant = nullptr;
+        for (auto& entry : mDecodeVariants)
+            if (entry->batch == request.batch && entry->sequence == request.sequence) variant = entry.get();
+        if (!variant) {
+            // Bound activation/capture memory even when prompts use many shapes.
+            constexpr std::size_t max_variants = 8;
+            if (mDecodeVariants.size() == max_variants) {
+                CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+                auto oldest = std::min_element(mDecodeVariants.begin(),
+                                               mDecodeVariants.end(),
+                                               [](const auto& a, const auto& b) { return a->last_use < b->last_use; });
+                mDecodeVariants.erase(oldest);
+            }
+            auto entry = std::make_unique<DecodeVariant>();
+            entry->batch = request.batch;
+            entry->sequence = request.sequence;
+            mDecodeCompiler->reset_tid_namespace();
+            entry->graph = std::make_unique<CompiledGraph>(
+                mDecodeCompiler->compile(*mForward, request.batch, request.sequence, false));
+            auto& graph = *entry->graph;
+            CompiledGraph no_backward;
+            finalize_save_for_bwd(graph, no_backward, std::unordered_set<std::string>{}, false);
+            graph.compute_layer_segments(true);
+            dsl::compute_arena_sizes(entry->arenas, graph, no_backward, mConfig.NumLayers);
+            entry->arenas.persistent_bytes = entry->arenas.accumulator_bytes = 0;
+            dsl::allocate_phase_arenas(entry->arenas);
+            entry->executor = std::make_unique<CompiledExecutor>(rs, mWeights, mGrads, mConfig, mOptions);
+            auto* executor = entry->executor.get();
+            executor->set_schema_hook_registry(mSchemaHookRegistry);
+            if (mOptions.TrainingRecipe) executor->set_recipe(mOptions.TrainingRecipe.get());
+            executor->resize_segment_graphs(graph, no_backward);
+            auto dump_decode = [this, executor](const std::vector<std::string>& names, int layer) {
                 const char* dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
                 if (!dir || !*dir) return;
                 const std::string prefix = "blocks[" + std::to_string(layer) + "].";
                 for (const auto& name : names) {
                     if (layer >= 0 && name.rfind(prefix, 0) != 0) continue;
-                    if (const Tensor* t = mDecodeExecutor->try_get_tensor(name); t && t->Data) {
+                    if (const Tensor* t = executor->try_get_tensor(name); t && t->Data) {
                         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
                         debug_dump_tensor("decode_" + name, *t, dir, mRunState.MainStream);
                     }
                 }
             };
-            mDecodeExecutor->set_debug_dump_fn(dump_decode);
-            mDecodeExecutor->set_debug_dump_layer_fn([dump_decode](int layer) {
-                dump_decode(debug_dump_tensor_list(), layer);
-            });
+            executor->set_debug_dump_fn(dump_decode);
+            executor->set_debug_dump_layer_fn(
+                [dump_decode](int layer) { dump_decode(debug_dump_tensor_list(), layer); });
+            variant = entry.get();
+            mDecodeVariants.push_back(std::move(entry));
+            ++mDecodeCompilations;
         }
-        const bool token = request.sequence == 1;
-        auto& graph = token ? mDecodeTokenGraph : mDecodePrefillGraph;
-        auto& arenas = token ? mDecodeTokenArenas : mDecodePrefillArenas;
-        auto& compiled_batch = token ? mDecodeTokenB : mDecodePrefillB;
-        if (!graph || compiled_batch != request.batch || (!token && mDecodePrefillT != request.sequence)) {
-            mDecodeCompiler->reset_tid_namespace();
-            graph = std::make_unique<CompiledGraph>(
-                mDecodeCompiler->compile(*mForward, request.batch, request.sequence, false));
-            // Slot aliases and LoRA hooks read activations outside the explicit
-            // op input list. Use the existing conservative per-block lifetimes;
-            // an empty backward graph allocates no backward saves.
-            CompiledGraph no_backward;
-            finalize_save_for_bwd(*graph, no_backward, std::unordered_set<std::string>{}, false);
-            graph->compute_layer_segments();
-            dsl::release_phase_arenas(arenas);
-            dsl::compute_arena_sizes(arenas, *graph, CompiledGraph{}, mConfig.NumLayers);
-            // Forward activation storage only. Resident base and adapter
-            // weights continue to resolve through their existing owners.
-            arenas.persistent_bytes = 0;
-            arenas.accumulator_bytes = 0;
-            try {
-                dsl::allocate_phase_arenas(arenas);
-            } catch (...) {
-                graph.reset();
-                dsl::release_phase_arenas(arenas);
-                throw;
-            }
-            compiled_batch = request.batch;
-            if (!token) mDecodePrefillT = request.sequence;
-        }
+        variant->last_use = ++mDecodeClock;
+        auto& graph = variant->graph;
+        auto& arenas = variant->arenas;
+        auto& executor = variant->executor;
+        // Warm up kernels and workspace allocations before capturing token steps.
+        executor->set_split_attention_graphs(mOptions.UseCudaGraphs && request.sequence == 1 && variant->calls > 0);
+        // Captured LoRA kernels retain work-buffer addresses; refresh their data
+        // outside capture after adapter import or an optimizer update.
+        if (mLoRAWeights)
+            for (int layer = 0; layer < mConfig.NumLayers; ++layer)
+                mLoRAWeights->get_block(layer, rs.MainStream);
         // Avoid compile_graphs(): it reallocates phase arenas on shape changes,
         // including storage referenced by captured training graphs. Decode uses
         // its own forward activation arena and the resident weight owners.
         static const std::vector<std::string> no_saves;
         auto checkpoint = rs.Stack.checkpoint();
         auto cleanup = [&]() {
-            mDecodeExecutor->set_execution_request_context(nullptr);
-            mDecodeExecutor->set_runtime_bindings(nullptr);
+            executor->set_execution_request_context(nullptr);
+            executor->set_runtime_bindings(nullptr);
             rs.set_active_executor(nullptr);
             rs.Stack.restore(checkpoint);
         };
-        mDecodeExecutor->set_lora_state(mLoRAConfig, mLoRAWeights, mLoRAGrads, mLoRARunState);
-        mDecodeExecutor->set_dimensions(request.batch, request.sequence);
-        mDecodeExecutor->set_phase_arenas(&arenas);
-        mDecodeExecutor->set_forward_graph(graph.get());
-        mDecodeExecutor->set_save_list(&no_saves);
-        mDecodeExecutor->set_runtime_bindings(&runtime_bindings);
-        mDecodeExecutor->set_execution_request_context(&request);
+        executor->set_lora_state(mLoRAConfig, mLoRAWeights, mLoRAGrads, mLoRARunState);
+        executor->set_dimensions(request.batch, request.sequence);
+        executor->set_phase_arenas(&arenas);
+        executor->set_forward_graph(graph.get());
+        executor->set_save_list(&no_saves);
+        executor->set_runtime_bindings(&runtime_bindings);
+        executor->set_execution_request_context(&request);
         try {
-            mDecodeExecutor->execute_forward(*graph, comm, false, nullptr);
+            executor->execute_forward(*graph, comm, false, nullptr);
+            ++variant->calls;
         } catch (...) {
             cleanup();
             throw;

@@ -48,6 +48,52 @@ using TokenArray = nb::ndarray<std::int32_t, nb::shape<-1, -1>, nb::c_contig, nb
 using TokenArray3 = nb::ndarray<std::int32_t, nb::shape<-1, -1, -1>, nb::c_contig, nb::device::cpu>;
 using FloatArray = nb::ndarray<float, nb::shape<-1, -1>, nb::c_contig, nb::device::cpu>;
 
+static std::vector<DecodeSamplingRequest> decode_sampling_requests(const nb::list& items) {
+    std::vector<DecodeSamplingRequest> result;
+    for (auto item : items) {
+        auto values = nb::cast<nb::dict>(item);
+        auto get = [&]<class T>(const char* name, T fallback) {
+            return values.contains(name) ? nb::cast<T>(values[name]) : fallback;
+        };
+        DecodeSamplingRequest request;
+        auto& p = request.params;
+        p.temperature = get("temperature", p.temperature);
+        p.top_p = get("top_p", p.top_p);
+        p.min_p = get("min_p", p.min_p);
+        p.repetition_penalty = get("repetition_penalty", p.repetition_penalty);
+        p.presence_penalty = get("presence_penalty", p.presence_penalty);
+        p.frequency_penalty = get("frequency_penalty", p.frequency_penalty);
+        p.uniform = get("uniform", p.uniform);
+        p.top_k = get("top_k", p.top_k);
+        p.top_count = get("top_logprobs", p.top_count);
+        p.enabled = get("enabled", true);
+        if (values.contains("logit_bias"))
+            for (const auto& [token, bias] : nb::cast<std::unordered_map<int, double>>(values["logit_bias"]))
+                request.bias.emplace_back(token, bias);
+        if (values.contains("blocked_tokens")) request.blocked = nb::cast<std::vector<int>>(values["blocked_tokens"]);
+        result.push_back(std::move(request));
+    }
+    return result;
+}
+
+static nb::list decode_sampling_results(const std::vector<DecodeSampleResult>& samples,
+                                        const std::vector<DecodeSamplingRequest>& requests,
+                                        int vocabulary) {
+    nb::list result;
+    for (std::size_t row = 0; row < samples.size(); ++row) {
+        const auto& sample = samples[row];
+        const int top = sample.token >= 0 ? std::min(requests[row].params.top_count, vocabulary) : 0;
+        nb::dict value;
+        value["token"] = sample.token;
+        value["status"] = sample.status;
+        value["logprob"] = sample.logprob;
+        value["top_ids"] = std::vector<int>(sample.top_ids, sample.top_ids + top);
+        value["top_logprobs"] = std::vector<double>(sample.top_logprobs, sample.top_logprobs + top);
+        result.append(value);
+    }
+    return result;
+}
+
 template <typename Array>
 static Tensor glm_kernel_tensor(const Array& a) {
     Tensor t;
@@ -139,6 +185,41 @@ nb::dlpack::dtype to_dlpack_dtype(ETensorDType dtype) {
 NB_MODULE(_surogate, m) {
     // Install crash handler for better stack traces on segfaults and other crashes
     surogate::install_crash_handler();
+
+    m.def("_decode_sample",
+          [](nb::ndarray<nb::ndim<2>, nb::c_contig, nb::device::cuda> logits,
+             nb::ndarray<int, nb::ndim<2>, nb::c_contig, nb::device::cuda> counts,
+             const nb::list& sampling) {
+              const int B = logits.shape(0), V = logits.shape(1);
+              if (counts.shape(0) != B || counts.shape(1) != V || nb::len(sampling) != B)
+                  throw std::invalid_argument("Sampling fixture shape mismatch");
+              auto requests = decode_sampling_requests(sampling);
+              std::vector<DecodeSampleResult> results(B);
+              {
+                  nb::gil_scoped_release release;
+                  TensorAllocator allocator;
+                  auto metadata = allocator.allocate(ETensorDType::BYTE,
+                                                     "sampling_fixture",
+                                                     EAllocationType::ON_DEVICE,
+                                                     {B * static_cast<long>(sizeof(DecodeCacheBinding))});
+                  std::vector<DecodeCacheBinding> bindings;
+                  for (int row = 0; row < B; ++row)
+                      bindings.push_back({counts.data() + row * V, 1, 0});
+                  CUDA_CHECK(cudaMemcpy(metadata.Data, bindings.data(), metadata.bytes(), cudaMemcpyHostToDevice));
+                  auto source = glm_kernel_tensor(logits);
+                  DecodeSampler sampler;
+                  sampler.prepare(requests.data(), B, V, source.DType, nullptr);
+                  CUDA_CHECK(cudaMemcpyAsync(sampler.logits().Data,
+                                             source.Data,
+                                             source.bytes(),
+                                             cudaMemcpyDeviceToDevice,
+                                             nullptr));
+                  sampler.run(metadata, nullptr);
+                  sampler.copy_results(results.data(), nullptr);
+                  CUDA_CHECK(cudaStreamSynchronize(nullptr));
+              }
+              return decode_sampling_results(results, requests, V);
+          });
 
     nb::class_<GPUUtilInfo>(
         m,
@@ -2438,9 +2519,58 @@ NB_MODULE(_surogate, m) {
              &MultiGPUPyTrainer::release_decode_sessions,
              nb::call_guard<nb::gil_scoped_release>(),
              nb::arg("session_ids"))
+        .def("set_decode_cache_budget",
+             &MultiGPUPyTrainer::set_decode_cache_budget,
+             nb::arg("bytes") = 0,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("admit_decode_sessions",
+             [](MultiGPUPyTrainer* trainer,
+                nb::ndarray<std::int64_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> sessions,
+                nb::ndarray<std::int32_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> counts,
+                nb::ndarray<std::int32_t, nb::ndim<1>, nb::device::cpu, nb::c_contig> resets) {
+                 if (sessions.size() == 0 || sessions.size() != counts.size() || sessions.size() != resets.size())
+                     throw std::invalid_argument("Decode admission arrays must have the same nonzero length");
+                 nb::gil_scoped_release release;
+                 return trainer->admit_decode_sessions(sessions.data(), counts.data(), resets.data(), sessions.size());
+             })
         .def("get_decode_batch_stats",
              &MultiGPUPyTrainer::get_decode_batch_stats,
              nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "decode_batch_sample",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<const int64_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> sessions,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> ids,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> offsets,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> resets,
+               const nb::list& sampling) {
+                const auto B = sessions.size();
+                if (!B || offsets.size() != B + 1 || resets.size() != B || offsets(0) != 0 ||
+                    offsets(B) != ids.size() || nb::len(sampling) != B)
+                    throw std::invalid_argument("Invalid decode sampling arrays");
+                for (std::size_t i = 0; i < B; ++i)
+                    if (offsets(i) < 0 || offsets(i + 1) <= offsets(i))
+                        throw std::invalid_argument("Decode offsets must increase strictly");
+                auto requests = decode_sampling_requests(sampling);
+                std::vector<DecodeSampleResult> samples;
+                {
+                    nb::gil_scoped_release release;
+                    samples = trainer->decode_batch_sample(sessions.data(),
+                                                           ids.data(),
+                                                           offsets.data(),
+                                                           resets.data(),
+                                                           B,
+                                                           requests.data());
+                }
+                return decode_sampling_results(samples, requests, trainer->config().VocabSize);
+            },
+            nb::arg("session_ids"),
+            nb::arg("input_ids"),
+            nb::arg("offsets"),
+            nb::arg("reset"),
+            nb::arg("sampling"),
+            "Append ragged chunks and sample on GPU. Returns compact per-request results; logprobs precede sampling "
+            "penalties.")
         .def(
             "decode_batch_logits",
             [](MultiGPUPyTrainer* trainer,

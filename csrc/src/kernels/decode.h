@@ -1,4 +1,13 @@
 #pragma once
+
+// One row of an operator's request metadata. Pointer tables and state buffers
+// stay request-owned; graph bindings can change membership without embedding
+// request addresses in captured kernels.
+struct DecodeCacheBinding {
+    void* data;
+    int length;
+    int pages;
+};
 #include "utilities/tensor.h"
 #include <cuda_runtime.h>
 
@@ -32,3 +41,26 @@ void decode_delta_rule(const Tensor& q,
                        bool initial,
                        float scale,
                        cudaStream_t stream);
+
+void decode_append_kv_batch(const Tensor& qkv,
+                            const Tensor& bindings,
+                            int B,
+                            int T,
+                            int Hq,
+                            int Hkv,
+                            int D,
+                            cudaStream_t stream);
+void decode_paged_attention_batch(const Tensor& qkv,
+                                  const Tensor& out,
+                                  const Tensor& lse,
+                                  const Tensor& bindings,
+                                  const Tensor& scratch,
+                                  int B,
+                                  int T,
+                                  int Hq,
+                                  int Hkv,
+                                  int D,
+                                  int pages,
+                                  int window,
+                                  float scale,
+                                  cudaStream_t stream);

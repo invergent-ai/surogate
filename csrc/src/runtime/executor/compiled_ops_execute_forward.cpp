@@ -977,6 +977,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             } else {
                                 auto& sg = mFwdSegGraphs[static_cast<std::size_t>(L)][s];
                                 const bool is_capture = (sg.exec == nullptr);
+                                ++(is_capture ? mForwardSegmentCaptures : mForwardSegmentReplays);
                                 std::size_t saved_before = mSaved ? mSaved->size() : 0;
                                 auto run = [&]() {
                                     for (std::size_t i = seg.start_op; i < seg.end_op; ++i) {
@@ -1162,6 +1163,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     } else {
                         auto& sg = mFwdSegGraphs[static_cast<std::size_t>(L)][s];
                         const bool is_capture = (sg.exec == nullptr);
+                        ++(is_capture ? mForwardSegmentCaptures : mForwardSegmentReplays);
                         // Track mSaved entries before segment to detect new ones
                         std::size_t saved_before = mSaved ? mSaved->size() : 0;
                         auto run = [&]() {

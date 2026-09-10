@@ -24,6 +24,7 @@
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "runtime/optimizers/optimizer_config.h"
 #include "runtime/dsl/dsl_debug.h"
+#include "kernels/decode_sampling.h"
 
 class DataLoader;
 class IModel;
@@ -290,7 +291,18 @@ public:
                                            const std::int32_t* resets,
                                            int count);
     void release_decode_sessions(const std::vector<std::int64_t>& sessions);
+    std::vector<DecodeSampleResult> decode_batch_sample(const std::int64_t* sessions,
+                                                        const std::int32_t* ids,
+                                                        const std::int32_t* offsets,
+                                                        const std::int32_t* resets,
+                                                        int count,
+                                                        const DecodeSamplingRequest* sampling);
     std::unordered_map<std::string, std::int64_t> get_decode_batch_stats();
+    void set_decode_cache_budget(std::int64_t bytes);
+    std::vector<bool> admit_decode_sessions(const std::int64_t* sessions,
+                                            const std::int32_t* counts,
+                                            const std::int32_t* resets,
+                                            int count);
     std::unordered_map<std::string, std::int64_t> get_decode_cache_stats();
     std::vector<float> next_token_logits(const std::int32_t* input_ids,
                                          const std::int32_t* last_positions, int B, int T);

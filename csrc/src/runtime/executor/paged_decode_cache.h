@@ -14,23 +14,47 @@
 namespace dsl {
 inline constexpr int DecodePageRows = 128;
 
+struct DecodeCapacityError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 // Shared by all requests on one trainer. Pages are homogeneous byte allocations;
 // a request owns its logical page table, independently of its row in a batch.
 struct DecodePagePool {
     TensorAllocator allocator;
     std::unordered_map<std::size_t, std::vector<Tensor>> free;
     std::int64_t allocated_bytes = 0, used_bytes = 0, reused_pages = 0;
+    std::int64_t auxiliary_bytes = 0, limit_bytes = 0;
+
+    void make_room(std::size_t bytes) {
+        if (!limit_bytes || allocated_bytes + auxiliary_bytes + bytes <= limit_bytes) return;
+        trim();
+        if (allocated_bytes + auxiliary_bytes + bytes > limit_bytes)
+            throw DecodeCapacityError("Decode cache VRAM budget exhausted");
+    }
+    void charge_auxiliary(std::size_t bytes) {
+        make_room(bytes);
+        auxiliary_bytes += bytes;
+    }
+    void set_limit(std::int64_t bytes) {
+        if (bytes < 0 || (bytes && bytes < used_bytes + auxiliary_bytes))
+            throw std::invalid_argument("Decode cache budget is below live cache storage");
+        trim();
+        limit_bytes = bytes;
+    }
 
     Tensor acquire(std::size_t bytes) {
-        auto& available = free[bytes];
         Tensor result;
-        if (available.empty()) {
+        auto it = free.find(bytes);
+        if (it == free.end() || it->second.empty()) {
+            make_room(bytes);
             result = allocator.allocate(ETensorDType::BYTE,
                                         "decode_page",
                                         EAllocationType::ON_DEVICE,
                                         {static_cast<long>(bytes)});
             allocated_bytes += bytes;
         } else {
+            auto& available = it->second;
             result = available.back();
             available.pop_back();
             ++reused_pages;
@@ -61,14 +85,22 @@ public:
           limit_(limit) {
         if (width <= 0 || limit <= 0) throw std::invalid_argument("Invalid decode page geometry");
         addresses_.resize((limit + DecodePageRows - 1) / DecodePageRows);
-        table_ = allocator_.allocate(ETensorDType::BYTE,
-                                     "decode_page_table",
-                                     EAllocationType::ON_DEVICE,
-                                     {static_cast<long>(addresses_.size() * sizeof(void*))});
+        const auto bytes = addresses_.size() * sizeof(void*);
+        pool_->charge_auxiliary(bytes);
+        try {
+            table_ = allocator_.allocate(ETensorDType::BYTE,
+                                         "decode_page_table",
+                                         EAllocationType::ON_DEVICE,
+                                         {static_cast<long>(bytes)});
+        } catch (...) {
+            pool_->auxiliary_bytes -= bytes;
+            throw;
+        }
     }
     ~PagedDecodeBuffer() {
         for (auto& page : pages_)
             pool_->release(page);
+        pool_->auxiliary_bytes -= table_.bytes();
     }
     PagedDecodeBuffer(const PagedDecodeBuffer&) = delete;
     PagedDecodeBuffer& operator=(const PagedDecodeBuffer&) = delete;
@@ -77,9 +109,8 @@ public:
         if (rows < 0 || rows > limit_) throw std::invalid_argument("Decode page limit exceeded");
         const int needed = (rows + DecodePageRows - 1) / DecodePageRows;
         if (needed <= pages_.size()) return;
-        // The host table has stable storage. Fence before modifying entries used
-        // by an earlier asynchronous upload, and publish all newly owned pages.
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Existing entries never change, and earlier uploads cover only their
+        // old prefix. Appending new entries therefore needs no stream fence.
         while (pages_.size() < needed) {
             auto page = pool_->acquire(DecodePageRows * row_bytes());
             addresses_[pages_.size()] = page.Data;
@@ -107,6 +138,13 @@ public:
             input += count * stride;
         }
     }
+    // Admission rollback only: callers fence the stream before returning pages.
+    void truncate_pages(std::size_t count) {
+        while (pages_.size() > count) {
+            pool_->release(pages_.back());
+            pages_.pop_back();
+        }
+    }
     [[nodiscard]] const Tensor& table() const {
         return table_;
     }
@@ -118,6 +156,9 @@ public:
     }
     [[nodiscard]] std::size_t pages() const {
         return pages_.size();
+    }
+    [[nodiscard]] std::size_t table_bytes() const {
+        return table_.bytes();
     }
     [[nodiscard]] bool matches(ETensorDType dtype, long width) const {
         return dtype == dtype_ && width == width_;

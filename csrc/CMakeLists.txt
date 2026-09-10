@@ -475,6 +475,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/glm_dsa.cpp
     src/kernels/glm5.cu
     src/kernels/decode.cu
+    src/kernels/decode_sampling.cu
     src/runtime/ops/repeat_interleave_heads.cpp
 
     src/config/pretrained_config.cpp

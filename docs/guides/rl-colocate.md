@@ -25,6 +25,7 @@ continuous batching: concurrent requests submit token steps to one compute worke
 which batches their projections and MLPs. New requests join between rounds;
 prefill is chunked so long prompts do not hold the worker for a complete rollout.
 Each request retains its own attention, convolution and recurrent history.
+Standard attention appends KV and attends across the batch with shared launches.
 
 Attention history uses 128-token pages from a shared GPU pool, with independent
 page tables per request. Completed requests return pages for reuse. GLM's pooled
@@ -35,15 +36,38 @@ states use fixed-size request allocations. Context remains bounded by available
 memory, `max_model_len`, and the configured request capacity (`max_num_seqs`).
 The shared training executor also bounds context by the trainer's sequence length.
 
+On the shared training path, `decode_cache_bytes` in `infer.yaml` sets a hard byte
+budget for cache pages, page tables, recurrent/convolution states, and sampling
+token counts. The default `0` chooses 25% of free VRAM after the trainer is
+allocated. Model weights, activation arenas and sampling scratch are outside this
+cache budget. Admission checks each request before advancing its history; a
+request that cannot fit receives a capacity error while other requests continue.
+Non-streaming HTTP requests receive status 429. Release or retry the rejected
+request after capacity becomes available. There is no cache eviction, preemption,
+CPU spill, prefix sharing, or sliding-window page recycling.
+
 `trainer.get_decode_batch_stats()` reports active sessions, cached tokens, pages,
-allocated/in-use pool bytes and page reuse. The server summary reports batch sizes
+allocated/in-use pool bytes, auxiliary bytes, the cache budget, page reuse, and
+decode shape compilation/capture/replay counts. The server summary reports batch sizes
 and decode rounds. Low-level callers use `decode_batch_logits(session_ids,
 input_ids, offsets, reset)` with flattened token chunks and one reset flag per
 session, then `release_decode_sessions(session_ids)` when requests finish.
 `decode_logits` and `get_decode_cache_stats` remain available for single-session
 callers. An optimizer update or weight/adapter import invalidates every session;
-training also releases unused pool pages. Native decode runs eagerly in separate
-activation arenas so training's captured graphs retain their buffer addresses.
+training also releases unused pool pages. Native decode keeps up to eight compiled
+batch/chunk shapes in an LRU cache with separate activation arenas. With
+`use_cuda_graphs: true`, one-token shapes warm up, then capture and replay stateless
+segments. Attention, recurrent state updates, dynamic MoE operations and the final
+generation head run eagerly. Training's captured graphs retain their buffers.
+
+The HTTP server samples on GPU and transfers only selected tokens and requested
+log-probabilities. Temperature, top-k/top-p/min-p, repetition/presence/frequency
+penalties, logit bias and minimum-length stop-token blocking are supported.
+Log-probabilities describe the temperature-scaled policy **before** penalties and
+filtering, as required by GRPO. Each request owns its seeded random stream; ties
+prefer smaller token IDs. Low-level callers can use `decode_batch_sample` with one
+sampling dictionary per session and a `uniform` draw in `[0, 1)`, after checking
+`admit_decode_sessions`. A nonzero sampling result `status` applies only to that row.
 
 This path supports text completions, streaming, and token-based multi-turn conversations with function
 tools. Structured `response_format` decoding remains unsupported on this path.
@@ -145,8 +169,8 @@ orchestration, and an orchestrator output directory directly inside the training
 output directory. Start each run in a fresh directory. The runner connects the
 orchestrator to the local server and sets synchronous generation automatically.
 
-Reduce `max_num_seqs` to lower optimized serving memory use. On the general path,
-it limits admitted requests; generation still processes one request at a time.
+Reduce `max_num_seqs` to lower serving concurrency and memory use. On the shared
+training path, `decode_cache_bytes` also caps persistent request cache storage.
 Reduce `sequence_len` and `max_model_len` together to lower memory use. Set `sequence_len` in both the
 training and orchestrator configs. Keep enough generation tokens for the model
 to finish its answer and receive a useful reward.

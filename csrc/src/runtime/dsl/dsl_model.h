@@ -34,6 +34,7 @@
 #include "runtime/core/qlora_provider.h"
 #include "runtime/dsl/mapping_spec.h"
 #include "runtime/executor/glm_decode_state.h"
+#include "kernels/decode_sampling.h"
 
 namespace modules {
 struct HfMapping;
@@ -388,7 +389,9 @@ public:
                                          int T,
                                          NCCLCommunicator& comm,
                                          GlmDecodeState* decode = nullptr,
-                                         const std::vector<GlmDecodeState*>& decode_states = {});
+                                         const std::vector<GlmDecodeState*>& decode_states = {},
+                                         const DecodeSamplingRequest* sampling = nullptr,
+                                         DecodeSampleResult* samples = nullptr);
     std::vector<float> decode_logits(const std::int32_t* input_ids, int T, bool reset,
                                      int capacity, NCCLCommunicator& comm);
     void reset_decode_state();
@@ -398,8 +401,16 @@ public:
                                            const std::int32_t* resets,
                                            int count,
                                            int capacity,
-                                           NCCLCommunicator& comm);
+                                           NCCLCommunicator& comm,
+                                           const DecodeSamplingRequest* sampling = nullptr,
+                                           DecodeSampleResult* samples = nullptr);
     void release_decode_sessions(const std::vector<std::int64_t>& sessions);
+    void set_decode_cache_budget(std::int64_t bytes);
+    std::vector<bool> admit_decode_sessions(const std::int64_t* sessions,
+                                            const std::int32_t* counts,
+                                            const std::int32_t* resets,
+                                            int count,
+                                            int capacity);
     std::unordered_map<std::string, std::int64_t> decode_batch_stats() const;
     std::unordered_map<std::string, std::int64_t> decode_cache_stats() const {
         return mGlmDecodeState ? mGlmDecodeState->stats() : std::unordered_map<std::string, std::int64_t>{};
@@ -686,6 +697,10 @@ private:
     std::unique_ptr<GlmDecodeState> mGlmDecodeState;
     std::shared_ptr<DecodePagePool> mDecodePagePool = std::make_shared<DecodePagePool>();
     std::unordered_map<std::int64_t, std::unique_ptr<GlmDecodeState>> mDecodeSessions;
+    std::vector<DecodeCacheSpec> mDecodeCacheSpecs;
+    TensorAllocator mDecodeMetadataAllocator;
+    Tensor mDecodeMetadata;
+    DecodeSampler mDecodeSampler;
 
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;
