@@ -1,3 +1,4 @@
+#include "api/ops/lora_store.h"
 #include "family/impl/moe/expert_cache.h"
 
 #include "core/device.h"
@@ -1647,6 +1648,13 @@ void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor
     const ops::SparseMoeWeights pooled =
         ops::expert_slot_weights(cache.pool, cache.directory, mixture.layer, op);
     cache.begin_round(layer, tokens);
+    // Host weights can still be offloaded and gathered on demand. Adapted expert
+    // activations are computed together on the GPU until the CPU runner has the
+    // same per-request adapter inputs; a base-only CPU partial would be wrong.
+    if (ops::lora_active() && ops::lora_current_round().valid() &&
+        ops::lora_store_for_current_device().bank_table(op.router_shared_gate.qdata)) {
+        layer.round_split = false;
+    }
     ops::SparseMoeRoundHook hook{&Impl::resolve_round, &layer};
     ops::sparse_moe(hidden, router_input == nullptr ? hidden : *router_input,
                     pooled, ops::SparseMoeEpilogue::AddResidual, destination, leaf, stream,

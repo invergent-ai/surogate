@@ -180,33 +180,34 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
 void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                               const Tensor& router_x, const SparseMoeWeights& weights,
                               Tensor& destination, const SparseMoeDecodeWorkspace& workspace,
-                              cudaStream_t stream, const SparseMoeRoundHook* hook) {
+                              cudaStream_t stream, const SparseMoeRoundHook* hook,
+                              const LoraBank* adapters, const std::int32_t* adapter_slot) {
     if (geometry == kSparseMoeQwen36Geometry) {
-        geometry_qwen36::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        geometry_qwen36::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;
     }
     if (geometry == kSparseMoeFlashNextGeometry) {
-        geometry_flash_next::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        geometry_flash_next::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;
     }
     if (geometry == kSparseMoeQwen3MoeGeometry) {
-        geometry_qwen3_moe::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        geometry_qwen3_moe::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;
     }
     if (geometry == kSparseMoeGlm53Geometry) {
-        geometry_glm53::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        geometry_glm53::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;
     }
     if (geometry == kSparseMoeGemma4Geometry) {
-        geometry_gemma4::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        geometry_gemma4::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;
     }
     if (geometry == kSparseMoeLfm2Moe32Geometry) {
-        geometry_lfm2_moe32::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        geometry_lfm2_moe32::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;
     }
     if (geometry == kSparseMoeLfm2Moe64Geometry) {
-        geometry_lfm2_moe64::decode_launch(x, router_x, weights, destination, workspace, stream, hook);
+        geometry_lfm2_moe64::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled decode kernels");

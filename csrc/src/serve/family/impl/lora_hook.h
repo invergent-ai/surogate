@@ -94,6 +94,7 @@ inline constexpr std::int32_t kOutputPort = 3;
 inline constexpr std::int32_t kDownPort   = 4;
 inline constexpr std::int32_t kGatePort   = 5;
 inline constexpr std::int32_t kUpPort     = 6;
+inline constexpr std::int32_t kAttentionGatePort = 7;
 
 /// Whether a bank exists for this projection's port.
 ///

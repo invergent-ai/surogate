@@ -291,7 +291,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
                 if (!skipped.empty()) {
                     throw std::invalid_argument(
                         "--lora-modules '" + name + "': module '" + skipped.front() +
-                        "' carries no layer index, so it cannot be bound to a projection");
+                        "' is outside the supported text decoder; merge the adapter before serving");
                 }
                 for (auto& payload : payloads) {
                     payload.slot = update.slot();
@@ -664,7 +664,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
     auto payloads = LoraRegistry::read_payloads(found->second, skipped);
     if (!skipped.empty()) {
         throw std::invalid_argument("module '" + skipped.front() +
-                                    "' carries no layer index, so it cannot be bound");
+                                    "' is outside the supported text decoder; merge the adapter before serving");
     }
 
     // Validate every module before draining requests or changing a live adapter.
@@ -681,6 +681,9 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
         if (!applicable) {
             throw std::invalid_argument("adapter module '" + payload.module + "' names a layer absent from this model");
         }
+    }
+    for (int device : devices) {
+        if (const auto* store = stores.peek(device)) { store->validate_payloads(payloads); }
     }
     auto update = lora_slots_.update(name, Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms));
     const auto slot = update.slot();

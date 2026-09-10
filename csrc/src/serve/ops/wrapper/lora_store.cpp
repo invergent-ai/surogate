@@ -14,6 +14,8 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
+#include <tuple>
 #include <stdexcept>
 #include <vector>
 
@@ -203,10 +205,19 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
 // serves -- `set_slot` refuses that, and every registration here runs inside the
 // engine's construction window.
 void LoraStore::register_module(std::int32_t layer, std::string module, ModuleBinding binding) {
-    if (binding.key == nullptr || binding.in <= 0 || binding.out <= 0) {
+    if (binding.key == nullptr || binding.in <= 0 || binding.out <= 0 ||
+        binding.row_offset < 0 || binding.row_group < 0 || binding.row_stride < binding.row_group ||
+        binding.source_row(binding.out - 1) >= binding.checkpoint_out()) {
         throw std::invalid_argument("lora_store: a module binding needs a key and positive shapes");
     }
-    directory_.emplace(std::make_pair(layer, std::move(module)), binding);
+    auto& parts = directory_[{layer, std::move(module)}];
+    for (const auto& part : parts) {
+        if (part.in != binding.in || part.checkpoint_out() != binding.checkpoint_out() ||
+            (part.key == binding.key && part.port == binding.port)) {
+            throw std::invalid_argument("lora_store: inconsistent or duplicate module parts");
+        }
+    }
+    parts.push_back(binding);
 }
 
 bool LoraStore::covers_layer(std::int32_t layer) const {
@@ -255,20 +266,25 @@ void LoraStore::ensure_banks() {
         const ModuleBinding* binding;
     };
     std::vector<Planned> planned;
-    for (const auto& [where, binding] : directory_) {
+    std::unordered_map<Key, const ModuleBinding*, KeyHash> queued;
+    for (const auto& [where, parts] : directory_) {
+      for (const auto& binding : parts) {
         const Key key{binding.key, binding.port};
         if (banks_.find(key) != banks_.end()) { continue; }
-        bool queued = false;
-        for (const auto& item : planned) {
-            if (item.key == key) { queued = true; break; }
+        const auto [existing, inserted] = queued.emplace(key, &binding);
+        if (!inserted) {
+            if (existing->second->in != binding.in || existing->second->out != binding.out) {
+                throw std::logic_error("LoRA aliases disagree on the projection shape");
+            }
+            continue;
         }
-        if (queued) { continue; }
         const std::size_t a_bytes =
             static_cast<std::size_t>(slots_) * max_rank_ * binding.in * sizeof(std::uint16_t);
         const std::size_t b_bytes =
             static_cast<std::size_t>(slots_) * binding.out * max_rank_ * sizeof(std::uint16_t);
         planned.push_back({key, a_bytes, b_bytes, &binding});
         total += a_bytes + b_bytes + 512;
+      }
     }
     if (planned.empty() && !need_round_state) { return; }
 
@@ -298,6 +314,59 @@ void LoraStore::ensure_banks() {
     }
     storage_.push_back(std::move(arena));
     banks_built_ = true;
+    for (const auto& [key, bindings] : table_bindings_) {
+        if (tables_.contains(key)) { continue; }
+        std::vector<LoraBank> views;
+        for (const auto& binding : bindings) {
+            views.push_back(binding.key ? banks_.at(Key{binding.key, binding.port}).view : LoraBank{});
+        }
+        auto table = std::make_unique<DeviceArena>(views.size() * sizeof(LoraBank));
+        CUDA_CHECK(cudaMemcpy(table->base(), views.data(), views.size() * sizeof(LoraBank), cudaMemcpyHostToDevice));
+        tables_.emplace(key, static_cast<const LoraBank*>(table->base()));
+        storage_.push_back(std::move(table));
+    }
+}
+
+void LoraStore::register_bank_table(const void* key, const std::vector<ModuleBinding>& bindings) {
+    if (banks_built_) { throw std::logic_error("LoRA bank tables must be registered before capture"); }
+    table_bindings_.emplace(key, bindings);
+}
+
+const LoraBank* LoraStore::bank_table(const void* key) const noexcept {
+    const auto found = tables_.find(key);
+    return found == tables_.end() ? nullptr : found->second;
+}
+
+const LoraStore::ModuleParts& LoraStore::module_parts(std::int32_t layer, const std::string& module) const {
+    std::string name = module;
+    if (const auto found = directory_.find({layer, name}); found != directory_.end()) {
+        return found->second;
+    }
+    // Keep nested names such as mlp.experts.7.down_proj distinct from the dense
+    // down_proj. Only the conventional, single-component namespaces alias a
+    // target's legacy directory entries.
+    for (const std::string_view prefix : {"self_attn.", "mlp.", "attention.", "feed_forward."}) {
+        if (name.starts_with(prefix) && name.find('.', prefix.size()) == std::string::npos) {
+            name.erase(0, prefix.size());
+            break;
+        }
+    }
+    if (const auto found = directory_.find({layer, name}); found != directory_.end()) {
+        return found->second;
+    }
+    const auto refused = refusals_.find(name);
+    if (refused != refusals_.end()) {
+        throw std::invalid_argument("adapter module '" + module + "': " + refused->second);
+    }
+    const auto layer_refused = layer_refusals_.find({layer, name});
+    if (layer_refused != layer_refusals_.end()) {
+        throw std::invalid_argument("adapter module '" + module + "' on layer " +
+                                    std::to_string(layer) + ": " + layer_refused->second);
+    }
+    throw std::invalid_argument(
+            "adapter module '" + module + "' on layer " + std::to_string(layer) +
+            " is not applied by this target; an adapter only partly applied is neither the base "
+            "model nor the fine-tune");
 }
 
 void LoraStore::validate_module(std::int32_t layer, const std::string& module,
@@ -309,28 +378,12 @@ void LoraStore::validate_module(std::int32_t layer, const std::string& module,
         b.size() != static_cast<std::size_t>(out_dim) * rank) {
         throw std::invalid_argument("invalid adapter tensor geometry or scale for '" + module + "'");
     }
-    const auto refused = refusals_.find(module);
-    if (refused != refusals_.end()) {
-        throw std::invalid_argument("adapter module '" + module + "': " + refused->second);
-    }
-    const auto layer_refused = layer_refusals_.find({layer, module});
-    if (layer_refused != layer_refusals_.end()) {
-        throw std::invalid_argument("adapter module '" + module + "' on layer " +
-                                    std::to_string(layer) + ": " + layer_refused->second);
-    }
-    const auto found = directory_.find({layer, module});
-    if (found == directory_.end()) {
-        throw std::invalid_argument(
-            "adapter module '" + module + "' on layer " + std::to_string(layer) +
-            " is not applied by this target; an adapter only partly applied is neither the base "
-            "model nor the fine-tune");
-    }
-    const ModuleBinding& binding = found->second;
-    if (in_dim != binding.in || out_dim != binding.out) {
+    const auto& binding = module_parts(layer, module).front();
+    if (in_dim != binding.in || out_dim != binding.checkpoint_out()) {
         throw std::invalid_argument(
             "adapter module '" + module + "' on layer " + std::to_string(layer) + " is [" +
             std::to_string(out_dim) + "," + std::to_string(in_dim) + "] but this model's is [" +
-            std::to_string(binding.out) + "," + std::to_string(binding.in) +
+            std::to_string(binding.checkpoint_out()) + "," + std::to_string(binding.in) +
             "] -- the adapter was trained against a different model");
     }
 }
@@ -340,18 +393,31 @@ void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, s
                                 const std::vector<std::uint16_t>& b, std::int32_t rank,
                                 std::int32_t in_dim, std::int32_t out_dim, float scale) {
     validate_module(layer, module, a, b, rank, in_dim, out_dim, scale);
-    const auto& binding = directory_.at({layer, module});
-    set_slot(binding.key, binding.port, slot, a, b, rank, in_dim, out_dim, scale);
+    for (const auto& binding : module_parts(layer, module)) {
+        if (binding.out == out_dim && binding.row_offset == 0 && binding.row_group == 0) {
+            set_slot(binding.key, binding.port, slot, a, b, rank, in_dim, out_dim, scale);
+        } else {
+            std::vector<std::uint16_t> selected(static_cast<std::size_t>(binding.out) * rank);
+            for (std::int32_t row = 0; row < binding.out; ++row) {
+                std::copy_n(b.data() + static_cast<std::size_t>(binding.source_row(row)) * rank,
+                            rank, selected.data() + static_cast<std::size_t>(row) * rank);
+            }
+            set_slot(binding.key, binding.port, slot, a, selected, rank, in_dim, binding.out, scale);
+        }
+    }
 }
 
+
 void LoraStore::validate_device_module(const DeviceAdapterModule& m) const {
-    const auto found = directory_.find({m.layer, m.module});
-    if (found == directory_.end() || m.in != found->second.in || m.out != found->second.out ||
+    const auto& parts = module_parts(m.layer, m.module);
+    if (m.in != parts.front().in || m.out != parts.front().checkpoint_out() ||
         m.rank <= 0 || m.rank > max_rank_ || !std::isfinite(m.scale) || !m.a || !m.b) {
         throw std::invalid_argument("invalid device adapter module: " + m.module);
     }
-    if (!banks_.contains(Key{found->second.key, found->second.port})) {
-        throw std::logic_error("device adapter bank was not created at startup");
+    for (const auto& binding : parts) {
+        if (!banks_.contains(Key{binding.key, binding.port})) {
+            throw std::logic_error("device adapter bank was not created at startup");
+        }
     }
     for (const void* pointer : {m.a, m.b}) {
         cudaPointerAttributes attrs{};
@@ -366,16 +432,24 @@ void LoraStore::set_device_module(std::int32_t slot, const DeviceAdapterModule& 
     validate_device_module(m);
     if (slot < 0 || slot >= slots_) { throw std::invalid_argument("invalid adapter slot"); }
     const ScopedDevice on_store(device_);
-    const auto& binding = directory_.at({m.layer, m.module});
-    auto& bank = banks_.at(Key{binding.key, binding.port});
+    for (const auto& binding : module_parts(m.layer, m.module)) {
+      auto& bank = banks_.at(Key{binding.key, binding.port});
     auto* a = static_cast<std::uint16_t*>(bank.a) + slot * bank.view.a_stride;
     auto* b = static_cast<std::uint16_t*>(bank.b) + slot * bank.view.b_stride;
     CUDA_CHECK(cudaMemset(a, 0, bank.view.a_stride * 2));
     CUDA_CHECK(cudaMemset(b, 0, bank.view.b_stride * 2));
     CUDA_CHECK(cudaMemcpy(a, m.a, static_cast<std::size_t>(m.rank) * m.in * 2, cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy2D(b, max_rank_ * 2, m.b, m.rank * 2, m.rank * 2, m.out, cudaMemcpyDeviceToDevice));
+    const auto group = binding.row_group ? binding.row_group : binding.out;
+    for (std::int32_t row = 0; row < binding.out; row += group) {
+        const auto* source = static_cast<const std::uint16_t*>(m.b) +
+                             static_cast<std::size_t>(binding.source_row(row)) * m.rank;
+        CUDA_CHECK(cudaMemcpy2D(b + static_cast<std::size_t>(row) * max_rank_, max_rank_ * 2,
+                                source, m.rank * 2, m.rank * 2,
+                                std::min(group, binding.out - row), cudaMemcpyDeviceToDevice));
+    }
     Tensor scaled(a, DType::BF16, {m.rank, m.in});
     ops::scale(scaled, m.scale, nullptr);
+    }
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
 

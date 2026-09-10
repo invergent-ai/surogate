@@ -29,6 +29,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <set>
+#include <tuple>
 
 namespace sinfer::ops {
 
@@ -55,6 +57,18 @@ public:
         std::int32_t port = 0;
         std::int32_t in   = 0;
         std::int32_t out  = 0;
+        // A checkpoint projection may fan out into several serving tensors.
+        // Row i of this bank comes from offset + (i/group)*stride + i%group
+        // of the checkpoint's B. Zero group/stride denotes contiguous rows.
+        std::int32_t source_out = 0;
+        std::int32_t row_offset = 0;
+        std::int32_t row_group = 0;
+        std::int32_t row_stride = 0;
+        [[nodiscard]] std::int32_t checkpoint_out() const noexcept { return source_out ? source_out : out; }
+        [[nodiscard]] std::int32_t source_row(std::int32_t i) const noexcept {
+            return row_group ? row_offset + (i / row_group) * row_stride + i % row_group
+                             : row_offset + i;
+        }
     };
 
     /// Target startup registers where every adaptable module of every layer lives,
@@ -85,6 +99,9 @@ public:
     /// while nothing serves. After the freeze, loading an adapter only writes into
     /// memory that already exists.
     void ensure_banks();
+    /// A graph-stable device directory for projections selected by a device expert id.
+    void register_bank_table(const void* key, const std::vector<ModuleBinding>& bindings);
+    [[nodiscard]] const LoraBank* bank_table(const void* key) const noexcept;
 
     /// Writes one adapter module into `slot`, resolving (layer, module) through
     /// the directory. Refusals and missing bindings throw with the module named.
@@ -94,6 +111,19 @@ public:
     void validate_module(std::int32_t layer, const std::string& module,
                          const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
                          std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale) const;
+    template<class Payload>
+    void validate_payloads(const std::vector<Payload>& payloads) const {
+        std::set<std::tuple<std::int32_t, const void*, std::int32_t>> used;
+        for (const auto& p : payloads) {
+            if (!covers_layer(p.layer)) { continue; }
+            validate_module(p.layer, p.module, p.a, p.b, p.rank, p.in_dim, p.out_dim, p.scale);
+            for (const auto& part : module_parts(p.layer, p.module)) {
+                if (!used.emplace(p.slot, part.key, part.port).second) {
+                    throw std::invalid_argument("adapter modules overlap at '" + p.module + "'");
+                }
+            }
+        }
+    }
     void validate_device_module(const DeviceAdapterModule& module) const;
     void set_device_module(std::int32_t slot, const DeviceAdapterModule& module);
 
@@ -188,7 +218,11 @@ private:
     void* scratch_              = nullptr;
     std::int32_t* uniform_cell_ = nullptr;
     bool raw_round_state_       = false; ///< scratch/cell cudaMalloc'd (directory-less use)
-    std::map<std::pair<std::int32_t, std::string>, ModuleBinding> directory_;
+    using ModuleParts = std::vector<ModuleBinding>;
+    [[nodiscard]] const ModuleParts& module_parts(std::int32_t layer, const std::string& module) const;
+    std::map<std::pair<std::int32_t, std::string>, ModuleParts> directory_;
+    std::map<const void*, std::vector<ModuleBinding>> table_bindings_;
+    std::map<const void*, const LoraBank*> tables_;
     std::map<std::string, std::string> refusals_;
     std::map<std::pair<std::int32_t, std::string>, std::string> layer_refusals_;
     /// True once ensure_banks has created any bank. It stops `set_slot` making

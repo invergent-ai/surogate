@@ -9,10 +9,9 @@
 // tensor for a `gate_proj` or `up_proj` delta to be added to. Every adapter PEFT
 // writes names both of them, so refusing them refused the adapter.
 //
-// When either half is bound this takes the parent apart instead: `linear_rows`
-// projects each half of the same weight, the deltas land on the halves, and the
-// activation runs elementwise. It costs one extra launch and two [I,T] buffers,
-// and it is the only route on which a gate or up adapter means anything.
+// Adapters apply before the activation. Addressable parents project each half;
+// other formats project the full parent and then extract its gate/up rows.
+// Both routes keep the original represented base weights.
 //
 // Which route runs is decided by whether the bank exists, and banks are frozen
 // in the engine's construction window -- before the first graph capture. So a
@@ -23,6 +22,7 @@
 #include "api/ops/linear_swiglu_down_add.h"
 #include "api/ops/linear_add.h"
 #include "api/ops/silu_mul.h"
+#include "api/ops/scatter.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 #include "family/impl/lora_hook.h"
@@ -63,11 +63,7 @@ inline void swiglu_mlp_down_add_layout(WorkspaceLayoutBuilder& layout, std::int3
 
 /// Whether this fused parent's two halves can be projected on their own.
 ///
-/// `weight_rows` admits the formats whose rows are independently addressable and
-/// refuses the rest rather than mis-reading them, so this asks it. A target calls
-/// this once, at bind time, and registers a refusal naming the format when the
-/// answer is no -- which is better than binding the module and throwing on every
-/// forward pass.
+/// Otherwise the adapter route projects the complete parent before splitting outputs.
 [[nodiscard]] inline bool swiglu_halves_addressable(const Weight& gate_up) noexcept {
     const std::int32_t rows = gate_up.n / 2;
     if (rows <= 0 || gate_up.n != 2 * rows) { return false; }
@@ -95,8 +91,15 @@ inline void swiglu_mlp(const Tensor& hidden, const Weight& gate_up, Tensor& acti
     // contract; the halves are read here in that order.
     Tensor gate = workspace.alloc(DType::BF16, {rows, columns});
     Tensor up   = workspace.alloc(DType::BF16, {rows, columns});
-    ops::linear_rows(hidden, gate_up, 0, gate, &workspace, stream);
-    ops::linear_rows(hidden, gate_up, rows, up, &workspace, stream);
+    if (swiglu_halves_addressable(gate_up)) {
+        ops::linear_rows(hidden, gate_up, 0, gate, &workspace, stream);
+        ops::linear_rows(hidden, gate_up, rows, up, &workspace, stream);
+    } else {
+        Tensor packed = workspace.alloc(DType::BF16, {2 * rows, columns});
+        ops::linear(hidden, gate_up, packed, policy, workspace, stream);
+        ops::extract_bf16_columns(packed, 0, gate, stream);
+        ops::extract_bf16_columns(packed, rows, up, stream);
+    }
     apply_lora_gate_up(gate_up, hidden, gate, up, stream);
     ops::silu_mul(gate, up, activation, stream);
 }
@@ -120,6 +123,14 @@ inline void swiglu_mlp_layout(WorkspaceLayoutBuilder& layout, std::int32_t inter
         (void)layout.alloc(DType::BF16, {intermediate, last});
         (void)layout.alloc(DType::BF16, {intermediate, last});
         (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(gate_up_qtype, intermediate,
+                                                                     hidden, policy, first, last));
+    }
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc(DType::BF16, {intermediate, last});
+        (void)layout.alloc(DType::BF16, {intermediate, last});
+        (void)layout.alloc(DType::BF16, {2 * intermediate, last});
+        (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(gate_up_qtype, 2 * intermediate,
                                                                      hidden, policy, first, last));
     }
 }

@@ -3,6 +3,7 @@
 #include <api/family/prepared_prompt.h>
 
 #include "artifact/reader.h"
+#include "family/impl/lora_bind.h"
 #include "targets/spark2_5/impl/load/bindings.h"
 #include "targets/spark2_5/impl/variant.h"
 
@@ -69,7 +70,27 @@ SINFER_TARGET_CONSTRUCT_LOADED_MODEL();
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     if (options.lora_enable || !options.lora_payloads.empty()) {
-        throw std::invalid_argument("Spark-X2.5 serving does not support LoRA adapters");
+        auto& store = ops::lora_store_for_current_device();
+        family::configure_lora_store(store, options);
+        const auto& runtime = model.impl_->data.runtime;
+        const auto& g = runtime.geometry;
+        for (std::size_t layer = 0; layer < runtime.full_layers.size(); ++layer) {
+            const auto& full = runtime.full_layers[layer];
+            const auto* qkv = full.projection.query_key_value.qdata;
+            const int total = g.query_size() + 2 * g.kv_size();
+            store.register_module(layer, "q_k_v_proj", {qkv, family::kQueryPort, g.hidden,
+                g.query_size(), total, 0});
+            store.register_module(layer, "q_k_v_proj", {qkv, family::kKeyPort, g.hidden,
+                g.kv_size(), total, g.query_size()});
+            store.register_module(layer, "q_k_v_proj", {qkv, family::kValuePort, g.hidden,
+                g.kv_size(), total, g.query_size() + g.kv_size()});
+            store.register_module(layer, "g_proj", {full.projection.output_gate.qdata,
+                family::kAttentionGatePort, g.hidden, g.query_heads});
+            store.register_module(layer, "out_proj", {full.output.qdata, family::kOutputPort,
+                g.query_size(), g.hidden});
+            family::bind_lora_dense_mlp(store, layer, full.post_mixer, g.hidden, g.intermediate);
+        }
+        family::finish_lora_bind(store, options);
     }
     return family::make_frontend(
         model.impl_->data.frontend,

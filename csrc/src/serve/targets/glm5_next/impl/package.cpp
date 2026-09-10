@@ -3,6 +3,7 @@
 #include <api/family/prepared_prompt.h>
 
 #include "api/ops/lora.h"
+#include "family/impl/lora_bind.h"
 #include "api/ops/lora_store.h"
 #include "family/impl/mlp_swiglu.h"
 #include "artifact/reader.h"
@@ -45,16 +46,8 @@ constexpr SamplingPreset kGlm5NextPreset{.temperature       = 1.0F,
 constexpr ModelSamplingDefaults kGlm5NextDefaults{.thinking     = kGlm5NextPreset,
                                                   .non_thinking = kGlm5NextPreset};
 
-/// This target's adapter directory.
-///
-/// `bind_lora_hybrid` cannot serve it: that one reads a fused `query_key_gate_value`, and this
-/// attention has no q/k/v projection at all -- it compresses the key and value to a latent. What
-/// an adapter can reach here is the attention output projection and, on the three dense layers,
-/// the feed-forward; everything else is refused by name so a request naming it says why.
-///
-/// The convolution layers register their MLP and nothing else: a PEFT adapter for GLM-5.3-Flash targets
-/// the attention projections and the feed-forward, and the mixer's own two projections have no
-/// module name in that vocabulary to bind them under.
+/// Bind the attention output, dense MLPs and each routed/shared expert.
+/// MLA and KDA projection names outside this directory remain explicit refusals.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     using TextConfig      = detail::TextConfig;
@@ -105,15 +98,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
             }
         }
         if (mlp.sparse) {
-            // A routed mixture's expert weights are one stacked parent per projection, and an
-            // adapter names a dense `down_proj`; placing it on 288 experts at once is not what
-            // it was trained for.
-            for (const char* module : {"gate_proj", "up_proj", "down_proj"}) {
-                store.register_layer_refusal(
-                    index, module,
-                    "this layer's feed-forward is a 288-expert mixture; an adapter trained on a "
-                    "dense projection names no matrix it has");
-            }
+            family::bind_lora_moe(store, index, mlp.moe);
             continue;
         }
         store.register_module(
@@ -140,6 +125,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
             }
         }
     }
+    store.validate_payloads(options.lora_payloads);
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {

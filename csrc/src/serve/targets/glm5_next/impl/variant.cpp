@@ -564,9 +564,11 @@ void dense_feed_forward(const Tensor& hidden, const FeedForwardPayload& weights,
     Tensor up   = workspace.alloc(DType::BF16, {width, tokens});
     ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
     ops::linear_rows(hidden, weights.gate_up, width, up, &workspace, stream);
+    family::apply_lora_gate_up(weights.gate_up, hidden, gate, up, stream);
     // Clamped, like every other SwiGLU this model has.
     ops::silu_mul(gate, up, gate, weights.moe.swiglu_limit, stream);
     project("mlp/down", gate, weights.down, out, workspace, stream);
+    family::apply_lora(weights.down, family::kDownPort, gate, out, stream);
 }
 
 std::size_t feed_forward_capacity(const family::TextGeometry& geometry,

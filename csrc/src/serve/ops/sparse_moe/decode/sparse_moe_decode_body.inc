@@ -44,6 +44,60 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
     return warp_reduce_sum(sum);
 }
 
+// Expert indices are selected on the device. Low-rank intermediates therefore
+// follow routed paths, while each bank remains indexed by its checkpoint expert.
+__global__ void moe_lora_low_kernel(const __nv_bfloat16* x, const float* act, const int* ids,
+                                     const LoraBank* banks, const int* slot, float* low, bool down) {
+    const int r = blockIdx.x;
+    const int path = down ? blockIdx.y : blockIdx.y / 2;
+    const int part = down ? 2 : blockIdx.y % 2;
+    const int expert = path < kTopK ? ids[path] : kExperts;
+    const LoraBank bank = banks[2 + 3 * expert + part];
+    if (r >= bank.rank) { return; }
+    float sum = 0;
+    if (*slot >= 0 && bank.a) {
+        const auto* a = static_cast<const __nv_bfloat16*>(bank.a) + *slot * bank.a_stride + r * bank.k;
+        for (int k = threadIdx.x; k < bank.k; k += 32) {
+            const float value = down ? act[path * kIntermediate + k] : __bfloat162float(x[k]);
+            sum = fmaf(__bfloat162float(a[k]), value, sum);
+        }
+    }
+    sum = warp_reduce_sum(sum);
+    if (threadIdx.x == 0) { low[blockIdx.y * kMoeLoraMaxRank + r] = sum; }
+}
+
+__device__ float moe_lora_expand(const LoraBank* banks, int index, const int* slot,
+                                  int row, const float* low) {
+    if (!banks || !slot || *slot < 0) { return 0; }
+    const LoraBank bank = banks[index];
+    if (!bank.b) { return 0; }
+    const auto* b = static_cast<const __nv_bfloat16*>(bank.b) + *slot * bank.b_stride + row * bank.rank;
+    float sum = 0;
+    for (int r = 0; r < bank.rank; ++r) { sum = fmaf(__bfloat162float(b[r]), low[r], sum); }
+    return sum;
+}
+
+__global__ void moe_lora_router_kernel(const __nv_bfloat16* x, const LoraBank* banks,
+                                        const int* slot, float* scores) {
+    if (*slot < 0) { return; }
+    const int row = blockIdx.x;
+    const LoraBank bank = banks[row < kExperts ? 0 : 1];
+    if (!bank.a) { return; }
+    const auto* a = static_cast<const __nv_bfloat16*>(bank.a) + *slot * bank.a_stride;
+    const auto* b = static_cast<const __nv_bfloat16*>(bank.b) + *slot * bank.b_stride +
+                    (row < kExperts ? row : 0) * bank.rank;
+    float delta = 0;
+    for (int r = 0; r < bank.rank; ++r) {
+        float dot = 0;
+        for (int k = threadIdx.x; k < bank.k; k += 32) {
+            dot = fmaf(__bfloat162float(a[r * bank.k + k]), __bfloat162float(x[k]), dot);
+        }
+        dot = warp_reduce_sum(dot);
+        if (threadIdx.x == 0) { delta = fmaf(__bfloat162float(b[r]), dot, delta); }
+    }
+    if (threadIdx.x == 0) { scores[row] += delta; }
+}
+
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
                                      float* __restrict__ scores) {
@@ -341,7 +395,9 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     const std::uint8_t* __restrict__ routed_scales,
     const int* __restrict__ slot_of_expert, const float* __restrict__ routed_gate_up_scale,
     const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act) {
+    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act,
+    const LoraBank* adapters, const int* adapter_slot, const float* lora_low) {
+    if (adapters) { pdl::wait_for_dependencies(); }
     __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -378,7 +434,16 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
         dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
                                        x_shared, 0, kHidden, gate, up);
     }
-    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = gated_clamped(gate, up, kSwigluLimit, kActivation); }
+    if (lane == 0) {
+        if (adapters) {
+            const int expert = warp < kTopK ? ids[warp] : kExperts;
+            gate += moe_lora_expand(adapters, 2 + 3 * expert, adapter_slot, j,
+                                     lora_low + (warp * 2) * kMoeLoraMaxRank);
+            up += moe_lora_expand(adapters, 3 + 3 * expert, adapter_slot, j,
+                                   lora_low + (warp * 2 + 1) * kMoeLoraMaxRank);
+        }
+        act[static_cast<std::int64_t>(warp) * kIntermediate + j] = gated_clamped(gate, up, kSwigluLimit, kActivation);
+    }
 }
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive>
@@ -526,7 +591,8 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     const std::uint8_t* __restrict__ routed_scales,
     const int* __restrict__ slot_of_expert, const float* __restrict__ routed_down_scale,
     const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination) {
+    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination,
+    const LoraBank* adapters, const int* adapter_slot, const float* lora_low) {
     __shared__ float paths[kPaths][Rows];
     pdl::wait_for_dependencies();
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
@@ -544,13 +610,20 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
                                              block * kHidden + row_base,
                                              act + static_cast<std::int64_t>(warp) * kIntermediate,
                                              0, kIntermediate / RoutedCodec::kGroupK, dot);
-            if (routed_down_scale != nullptr) { weight *= routed_down_scale[block]; }
+            if (routed_down_scale != nullptr) {
+                if (!adapters) { weight *= routed_down_scale[block]; }
+                else if (lane == 0) { for (int r = 0; r < Rows; ++r) { dot[r] *= routed_down_scale[block]; } }
+            }
         } else {
             for (int r = 0; r < Rows; ++r) { dot[r] = 0.0f; }
         }
         if (lane == 0) {
 #pragma unroll
-            for (int row = 0; row < Rows; ++row) { paths[warp][row] = weight * dot[row]; }
+            for (int row = 0; row < Rows; ++row) {
+                if (adapters) { dot[row] += moe_lora_expand(adapters, 4 + 3 * expert, adapter_slot,
+                    row_base + row, lora_low + warp * kMoeLoraMaxRank); }
+                paths[warp][row] = weight * dot[row];
+            }
         }
     } else if constexpr (kHasShared) {
         float dot[Rows];
@@ -559,7 +632,11 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
                                      kIntermediate / W8Codec::kGroupK, dot);
         if (lane == 0) {
 #pragma unroll
-            for (int row = 0; row < Rows; ++row) { paths[kTopK][row] = *shared_scale * dot[row]; }
+            for (int row = 0; row < Rows; ++row) {
+                if (adapters) { dot[row] += moe_lora_expand(adapters, 4 + 3 * kExperts, adapter_slot,
+                    row_base + row, lora_low + kTopK * kMoeLoraMaxRank); }
+                paths[kTopK][row] = *shared_scale * dot[row];
+            }
         }
     }
     __syncthreads();
@@ -655,7 +732,8 @@ void launch_d1(const Tensor& x, const Weight& router_shared_gate,
 
 template <class Codec>
 void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
-                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                               const LoraBank* adapters = nullptr, const int* adapter_slot = nullptr) {
     const auto* input         = static_cast<const __nv_bfloat16*>(x.data);
     const auto* ids           = static_cast<const int*>(workspace.ids.data);
     auto* act                 = static_cast<float*>(workspace.scratch.data);
@@ -668,7 +746,8 @@ void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
         {dim3(kIntermediate), dim3(kPaths * 32), 0, stream},
         sparse_moe_d3_nine_warp_kernel<Codec>,
         input, ids, routed_codes, routed_high, routed_scales, weights.slot_of_expert,
-        weights.routed_gate_up_scale, shared_codes, shared_scales, act));
+        weights.routed_gate_up_scale, shared_codes, shared_scales, act,
+        adapters, adapter_slot, static_cast<const float*>(workspace.lora_low.data)));
 }
 
 // How long the routed expert kernels run (SUROGATE_SERVE_D3_PROBE=1). This is the whole of
@@ -734,7 +813,8 @@ inline D3Probe& d3_probe() {
 
 void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                   const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
-                  const SparseMoeRoundHook* hook) {
+                  const SparseMoeRoundHook* hook,
+                  const LoraBank* adapters = nullptr, const int* adapter_slot = nullptr) {
     const auto* scores = static_cast<const float*>(workspace.scratch.data);
     auto* ids          = static_cast<int*>(workspace.ids.data);
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
@@ -749,21 +829,27 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
         hook->resolve(hook->context, workspace.ids, workspace.alpha, x, destination, stream);
     }
 
+    if (adapters) {
+        moe_lora_low_kernel<<<dim3(kMoeLoraMaxRank, 2 * kPaths), 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), nullptr, ids, adapters, adapter_slot,
+            static_cast<float*>(workspace.lora_low.data), false);
+        CUDA_CHECK(cudaGetLastError());
+    }
     d3_probe().begin(stream);
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
-        launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream);
+        launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream, adapters, adapter_slot);
         break;
     case QType::W8G32_F16S:
-        launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream);
+        launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream, adapters, adapter_slot);
         break;
     case QType::NVFP4:
-        launch_d3_dependent_codec<Nvfp4CodecFor<kHidden / 16>>(x, weights, workspace, stream);
+        launch_d3_dependent_codec<Nvfp4CodecFor<kHidden / 16>>(x, weights, workspace, stream, adapters, adapter_slot);
         break;
 #define SINFER_D3_DEP(NAME)                                                                        \
     case QType::NAME:                                                                              \
         launch_d3_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>>(x, weights, workspace,  \
-                                                                            stream);                \
+                                                                            stream, adapters, adapter_slot); \
         break;
         SINFER_GGML_FOR_EACH_TYPE(SINFER_D3_DEP)
 #undef SINFER_D3_DEP
@@ -780,7 +866,8 @@ void require_d4_codec_geometry() {
 
 template <class Codec>
 void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destination,
-                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                               const LoraBank* adapters = nullptr, const int* adapter_slot = nullptr) {
     require_d4_codec_geometry<Codec>();
     const auto* ids           = static_cast<const int*>(workspace.ids.data);
     const auto* alpha         = static_cast<const float*>(workspace.alpha.data);
@@ -802,31 +889,33 @@ void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destinat
                                      sparse_moe_d4_nine_warp_kernel<Codec, kD4Rows>, ids, alpha,
                                      shared_scale, act, routed_codes, routed_high, routed_scales,
                                      weights.slot_of_expert, weights.routed_down_scale,
-                                     shared_codes, shared_scales, output));
+                                     shared_codes, shared_scales, output, adapters, adapter_slot,
+                                     static_cast<const float*>(workspace.lora_low.data)));
 }
 
 void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
-                         const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                         const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                               const LoraBank* adapters = nullptr, const int* adapter_slot = nullptr) {
     switch (weights.routed_down.qtype) {
     case QType::Q5G64_F16S:
-        launch_d4_dependent_codec<Q5Codec>(weights, destination, workspace, stream);
+        launch_d4_dependent_codec<Q5Codec>(weights, destination, workspace, stream, adapters, adapter_slot);
         return;
     case QType::Q6G64_F16S:
-        launch_d4_dependent_codec<Q6Codec>(weights, destination, workspace, stream);
+        launch_d4_dependent_codec<Q6Codec>(weights, destination, workspace, stream, adapters, adapter_slot);
         return;
 #define SINFER_D4_DEP(NAME)                                                                        \
     case QType::NAME:                                                                              \
         launch_d4_dependent_codec<ggml::GgmlMoeCodec<ggml::GgmlType::NAME>>(weights, destination,   \
-                                                                            workspace, stream);     \
+                                                                            workspace, stream, adapters, adapter_slot);     \
         return;
         SINFER_GGML_FOR_EACH_TYPE(SINFER_D4_DEP)
 #undef SINFER_D4_DEP
     case QType::W8G32_F16S:
-        launch_d4_dependent_codec<W8Codec>(weights, destination, workspace, stream);
+        launch_d4_dependent_codec<W8Codec>(weights, destination, workspace, stream, adapters, adapter_slot);
         return;
     case QType::NVFP4:
         launch_d4_dependent_codec<Nvfp4CodecFor<kIntermediate / 16>>(weights, destination,
-                                                                     workspace, stream);
+                                                                     workspace, stream, adapters, adapter_slot);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D4 codec");
@@ -1032,9 +1121,23 @@ void decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destinati
 // residual through `pre_feedforward_layernorm_2`. Two projections of one token.
 void decode_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeights& weights,
                    Tensor& destination, const SparseMoeDecodeWorkspace& workspace,
-                   cudaStream_t stream, const SparseMoeRoundHook* hook) {
+                   cudaStream_t stream, const SparseMoeRoundHook* hook,
+                   const LoraBank* adapters, const int* adapter_slot) {
     launch_d1(router_x, weights.router_shared_gate, workspace, stream);
-    launch_d2_d3(x, weights, destination, workspace, stream, hook);
-    launch_d4_dependent(weights, destination, workspace, stream);
+    if (adapters) {
+        moe_lora_router_kernel<<<kRouterRows, 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(router_x.data), adapters, adapter_slot,
+            static_cast<float*>(workspace.scratch.data));
+        CUDA_CHECK(cudaGetLastError());
+    }
+    launch_d2_d3(x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
+    if (adapters) {
+        moe_lora_low_kernel<<<dim3(kMoeLoraMaxRank, kPaths), 32, 0, stream>>>(
+            nullptr, static_cast<const float*>(workspace.scratch.data),
+            static_cast<const int*>(workspace.ids.data), adapters, adapter_slot,
+            static_cast<float*>(workspace.lora_low.data), true);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    launch_d4_dependent(weights, destination, workspace, stream, adapters, adapter_slot);
 }
 

@@ -1,3 +1,4 @@
+#include "family/impl/lora_gdn.h"
 #include "targets/qwen4exp/impl/variant.h"
 
 #include "family/impl/lora_hook.h"
@@ -419,6 +420,7 @@ void Variant::attention_projection(const Tensor& hidden,
     ops::extract_bf16_columns(fused, 2 * g.query_size() + g.kv_size(), value,
                               stream);
     family::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
+    family::apply_lora(weights.query_key_gate_value, family::kAttentionGatePort, hidden, gate, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
@@ -526,6 +528,7 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     Tensor gate_flat = output_gate.view({g.value_dim(), tokens});
     ops::extract_bf16_columns(fused, 0, qkv_flat, stream);
     ops::extract_bf16_columns(fused, g.convolution_dim(), gate_flat, stream);
+    family::apply_lora_gdn_input(weights, flat_hidden, qkv_flat, gate_flat, stream);
 }
 
 void Variant::gdn_input_projection_snapshot(
@@ -581,6 +584,7 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
     maybe_dump_block("gdn_final", hidden, stream);
     ops::linear(hidden, weight, output, kPolicy, workspace, stream);
     maybe_dump_block("gdn_out", output, stream);
+    family::apply_lora(weight, family::kGdnOutputPort, hidden, output, stream);
     combine_into(output, residual, stream);
 }
 
@@ -597,6 +601,8 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor&,
     ops::detail::bf16_cublaslt_gemm(weights.a_b_projection, hidden, ab, stream);
     Tensor a = rows_of(ab, 0, heads, workspace, stream);
     Tensor b = rows_of(ab, heads, heads, workspace, stream);
+    family::apply_lora(weights.a_b_projection, family::kGdnAPort, hidden, a, stream);
+    family::apply_lora(weights.a_b_projection, family::kGdnBPort, hidden, b, stream);
     ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, gates, beta, stream);
     maybe_dump_block("gdn_ab", ab, stream);
     maybe_dump_block("gdn_g", gates, stream);

@@ -28,6 +28,7 @@ namespace sinfer::serve {
 struct LoraTensorPair {
     std::string module;       ///< e.g. "model.layers.3.self_attn.q_proj"
     std::int32_t rank   = 0;  ///< rows of A / columns of B
+    std::int32_t b_rank = 0;
     std::int32_t in_dim = 0;  ///< columns of A: the projection's k
     std::int32_t out_dim = 0; ///< rows of B: the projection's n
     std::uint64_t a_offset = 0; ///< byte offsets into the safetensors payload
@@ -73,8 +74,8 @@ public:
     [[nodiscard]] const LoraAdapter* find(const std::string& name) const;
 
     /// Reads one adapter's tensors and decodes them to BF16, tagged with the text
-    /// layer and module the name encodes. Modules whose name does not carry a
-    /// layer index (an embedding or head adapter, say) are skipped, and reported
+    /// layer and module the name encodes. Modules outside the text decoder
+    /// (vision, embedding or head adapters) are skipped, and reported
     /// through `skipped` so the caller can refuse rather than quietly drop them.
     [[nodiscard]] static std::vector<EngineOptions::LoraModulePayload> read_payloads(
         const LoraAdapter& adapter, std::vector<std::string>& skipped);

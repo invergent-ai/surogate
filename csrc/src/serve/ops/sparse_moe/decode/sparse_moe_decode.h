@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "api/ops/sparse_moe.h"
+#include "api/ops/lora.h"
 
 #include <cuda_runtime.h>
 
@@ -11,6 +12,8 @@
 #include <cstdint>
 
 namespace sinfer::ops::detail {
+
+inline constexpr int kMoeLoraMaxRank = 256;
 
 enum class SparseMoeSmallTD3Schedule : std::uint8_t;
 enum class SparseMoeSmallTD4Schedule : std::uint8_t;
@@ -24,6 +27,7 @@ struct SparseMoeDecodeWorkspace {
     Tensor alpha;
     Tensor shared_scale;
     Tensor scratch;
+    Tensor lora_low;
 };
 
 template <class Arena>
@@ -39,6 +43,7 @@ SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena,
                                                                     geometry.intermediate - 1) /
                                                                        geometry.intermediate);
     out.scratch = arena.alloc(DType::FP32, {scratch_rows, geometry.intermediate}, 256);
+    out.lora_low = arena.alloc(DType::FP32, {2 * geometry.paths() * kMoeLoraMaxRank}, 256);
     return out;
 }
 
@@ -62,6 +67,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
 void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                               const Tensor& router_x, const SparseMoeWeights& weights,
                               Tensor& destination, const SparseMoeDecodeWorkspace& workspace,
-                              cudaStream_t stream, const SparseMoeRoundHook* hook = nullptr);
+                              cudaStream_t stream, const SparseMoeRoundHook* hook = nullptr,
+                              const LoraBank* adapters = nullptr, const std::int32_t* adapter_slot = nullptr);
 
 } // namespace sinfer::ops::detail

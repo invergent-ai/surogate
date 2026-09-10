@@ -3,6 +3,7 @@
 #include <api/family/prepared_prompt.h>
 
 #include "api/ops/lora.h"
+#include "family/impl/lora_bind.h"
 #include "api/ops/lora_store.h"
 #include "artifact/reader.h"
 #include "targets/gemma4_moe/impl/load/bindings.h"
@@ -102,20 +103,12 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         store.register_module(
             index, "o_proj",
             Binding{attention.output.qdata, 3, query_rows, g.hidden});
-        // The **dense** branch's three matrices, at the dense width. The routed experts get
-        // no modules at all: an adapter sits on a base matrix, and a token's experts are
-        // eight of 128 chosen per token, so there is no single matrix for a delta to sit on.
+        // The dense branch and routed experts have separate checkpoint modules.
         const std::int32_t dense = detail::dense_intermediate(g);
-        store.register_module(
-            index, "down_proj",
-            Binding{attention.post_mixer.down.qdata, 4, dense, g.hidden});
-        store.register_module(
-            index, "gate_proj",
-            Binding{attention.post_mixer.gate.qdata, 5, g.hidden, dense});
-        store.register_module(
-            index, "up_proj",
-            Binding{attention.post_mixer.up.qdata, 6, g.hidden, dense});
+        family::bind_lora_dense_mlp(store, index, attention.post_mixer, g.hidden, dense);
+        family::bind_lora_moe(store, index, attention.post_mixer.op);
     }
+    store.validate_payloads(options.lora_payloads);
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {

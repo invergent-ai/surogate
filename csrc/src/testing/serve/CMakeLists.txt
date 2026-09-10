@@ -203,6 +203,14 @@ sinfer_add_test(sinfer_lora_lifecycle_test
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_lora_lifecycle_test PRIVATE -UNDEBUG)
 set_tests_properties(sinfer_lora_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
+sinfer_add_test(sinfer_lora_coverage_test
+  SOURCES test_lora_coverage.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_lora_coverage_test PRIVATE -UNDEBUG)
+sinfer_add_test(sinfer_lora_registry_test
+  SOURCES test_lora_registry.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_lora_registry_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_w8_quant_planes_test
   SOURCES ops/test_w8_quant_planes.cpp
   LIBRARIES sinfer_ops)

@@ -9,6 +9,7 @@
 #include "api/ops/sigmoid_mul.h"
 
 #include "core/device.h"
+#include "family/impl/lora_hook.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -93,8 +94,9 @@ void Variant::attention_projection(const Tensor& hidden,
                                    WorkspaceArena&, cudaStream_t stream) {
     Tensor head_gate(gate.data, DType::BF16, {weights.output_gate.n, hidden.ne[1]});
     ops::linear(hidden, weights.output_gate, head_gate, stream);
+    family::apply_lora(weights.output_gate, family::kAttentionGatePort, hidden, head_gate, stream);
     ops::attn_input_proj(hidden, weights.query_key_value, query, key, value, stream);
-
+    family::apply_lora_qkv(weights.query_key_value, hidden, query, key, value, stream);
 }
 
 void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& residual,
@@ -116,6 +118,7 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     auto scope = workspace.scope();
     Tensor projected = workspace.alloc(DType::BF16, {weight.n, attention.ne[1]});
     ops::linear(attention, weight, projected, kTextPolicy, workspace, stream);
+    family::apply_lora(weight, family::kOutputPort, attention, projected, stream);
     ops::residual_add(projected, residual, stream);
 
 }
@@ -147,9 +150,11 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
     Tensor up = workspace.alloc(DType::BF16, {weights.gate_up.n / 2, hidden.ne[1]});
     ops::linear_rows(hidden, weights.gate_up, 0, gate, &workspace, stream);
     ops::linear_rows(hidden, weights.gate_up, weights.gate_up.n / 2, up, &workspace, stream);
+    family::apply_lora_gate_up(weights.gate_up, hidden, gate, up, stream);
     ops::gelu_mul(gate, up, ops::GeluMode::Exact, activation, stream, true);
     Tensor projected = workspace.alloc(DType::BF16, {weights.down.n, hidden.ne[1]});
     ops::linear(activation, weights.down, projected, kTextPolicy, workspace, stream);
+    family::apply_lora(weights.down, family::kDownPort, activation, projected, stream);
     ops::residual_add(projected, residual, stream);
 
 }

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace sinfer::serve {
@@ -122,6 +123,13 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
             bad(name, "peft_type is " + config.value("peft_type", std::string("?")) +
                           ", only LORA adapters are served");
         }
+        if (config.value("use_dora", false) || config.value("lora_bias", false) ||
+            config.value("bias", std::string("none")) != "none" ||
+            (config.contains("modules_to_save") && !config.at("modules_to_save").empty()) ||
+            (config.contains("rank_pattern") && !config.at("rank_pattern").empty()) ||
+            (config.contains("alpha_pattern") && !config.at("alpha_pattern").empty())) {
+            bad(name, "this adapter uses additional weights or per-module scaling; merge it before serving");
+        }
         LoraAdapter adapter;
         adapter.name         = name;
         adapter.directory    = directory;
@@ -154,13 +162,24 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
             if (key == "__metadata__") { continue; }
             std::string module;
             bool is_a = false;
-            if (!split_lora_key(key, module, is_a)) { continue; }
+            if (!split_lora_key(key, module, is_a)) {
+                bad(name, "unsupported adapter tensor '" + key + "'; merge the adapter before serving");
+            }
             const RawTensor raw = read_entry(name, key, entry);
             if (raw.shape.size() != 2) {
                 bad(name, "tensor '" + key + "' is not a matrix");
             }
             if (raw.dtype != "BF16" && raw.dtype != "F16" && raw.dtype != "F32") {
                 bad(name, "tensor '" + key + "' has unsupported dtype " + raw.dtype);
+            }
+            if (raw.shape[0] <= 0 || raw.shape[1] <= 0 ||
+                raw.shape[0] > std::numeric_limits<std::int32_t>::max() ||
+                raw.shape[1] > std::numeric_limits<std::int32_t>::max() ||
+                raw.end < raw.begin ||
+                raw.end - raw.begin != static_cast<std::uint64_t>(raw.shape[0]) * raw.shape[1] *
+                                       (raw.dtype == "F32" ? 4U : 2U) ||
+                raw.end > std::filesystem::file_size(weights_path) - payload_begin) {
+                bad(name, "tensor '" + key + "' has inconsistent shape or byte range");
             }
             LoraTensorPair& pair = pairs[module];
             pair.module          = module;
@@ -177,6 +196,7 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
                 pair.b_offset  = payload_begin + raw.begin;
                 pair.b_bytes   = raw.end - raw.begin;
                 pair.b_is_bf16 = raw.dtype == "BF16";
+                pair.b_rank = static_cast<std::int32_t>(raw.shape[1]);
                 if (pair.rank == 0) { pair.rank = static_cast<std::int32_t>(raw.shape[1]); }
             }
         }
@@ -187,7 +207,7 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
             if (pair.a_bytes == 0 || pair.b_bytes == 0) {
                 bad(name, "module '" + module + "' has only one half of its A/B pair");
             }
-            if (pair.rank != adapter.rank) {
+            if (pair.rank != adapter.rank || pair.b_rank != pair.rank) {
                 bad(name, "module '" + module + "' has rank " + std::to_string(pair.rank) +
                               " but adapter_config.json says " + std::to_string(adapter.rank));
             }
@@ -225,7 +245,7 @@ float f16_to_f32(std::uint16_t bits) {
             return zero;
         }
         while ((mantissa & 0x400U) == 0) { mantissa <<= 1U; --exponent; }
-        ++exponent;
+        exponent += 113;
         mantissa &= 0x3FFU;
     } else if (exponent == 31) {
         exponent = 255;
@@ -260,21 +280,29 @@ std::vector<std::uint16_t> read_as_bf16(std::ifstream& file, std::uint64_t offse
     return out;
 }
 
-/// "model.layers.7.self_attn.q_proj" -> (7, "q_proj").
+/// Preserve the complete path inside a layer, including expert and shared-expert names.
 bool split_module(const std::string& module, std::int32_t& layer, std::string& kind) {
     constexpr std::string_view kLayers = ".layers.";
     const std::size_t at = module.find(kLayers);
-    if (at == std::string::npos) { return false; }
-    const std::size_t digits = at + kLayers.size();
+    const bool direct = module.starts_with("layers.");
+    if (!direct && at == std::string::npos) { return false; }
+    const auto prefix = direct ? std::string{} : module.substr(0, at);
+    bool text = false;
+    for (const std::string_view allowed : {"", "model", "model.model", "transformer", "language_model",
+        "language_model.model", "model.language_model", "model.language_model.model", "text_model",
+        "model.text_model", "model.text_model.model"}) {
+        text |= prefix == allowed;
+    }
+    if (!text) { return false; }
+    const std::size_t digits = direct ? std::string_view("layers.").size() : at + kLayers.size();
     std::size_t end          = digits;
     while (end < module.size() && (std::isdigit(static_cast<unsigned char>(module[end])) != 0)) {
         ++end;
     }
     if (end == digits || end >= module.size() || module[end] != '.') { return false; }
     layer = std::stoi(module.substr(digits, end - digits));
-    const std::size_t last = module.rfind('.');
-    if (last == std::string::npos || last + 1 >= module.size()) { return false; }
-    kind = module.substr(last + 1);
+    if (end + 1 >= module.size()) { return false; }
+    kind = module.substr(end + 1);
     return true;
 }
 

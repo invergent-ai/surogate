@@ -9,6 +9,7 @@
 
 #include "core/device.h"
 #include "family/impl/lora_hook.h"
+#include "family/impl/lora_gdn.h"
 #include "family/impl/mlp_swiglu.h"
 
 #include <algorithm>
@@ -203,6 +204,7 @@ void Variant::short_conv_projection(const Tensor& residual, const Tensor& norm_w
     Tensor normalised = workspace.alloc(DType::BF16, {residual.ne[0], residual.ne[1]});
     ops::rmsnorm(residual, norm_weight, eps, Variant::norm_unit_offset, normalised, stream);
     ops::linear(normalised, weights.in_projection, bcx, kTextPolicy, workspace, stream);
+    family::apply_lora(weights.in_projection, 16, normalised, bcx, stream);
 }
 
 std::size_t Variant::short_conv_projection_workspace_capacity_bytes(
@@ -231,6 +233,7 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
     // The mixer's output projection, which the family reaches through the delta net's name
     // because an output projection is the same leaf whichever mixer produced its input.
     ops::linear_add(hidden, weight, residual, kTextPolicy, workspace, stream);
+    family::apply_lora(weight, family::kGdnOutputPort, hidden, residual, stream);
 }
 
 std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(

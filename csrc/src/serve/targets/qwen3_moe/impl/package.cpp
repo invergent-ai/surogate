@@ -3,6 +3,7 @@
 #include <api/family/prepared_prompt.h>
 
 #include "api/ops/lora.h"
+#include "family/impl/lora_bind.h"
 #include "api/ops/lora_store.h"
 #include "family/impl/mlp_swiglu.h"
 #include "artifact/reader.h"
@@ -47,16 +48,7 @@ constexpr ModelSamplingDefaults kQwen3MoeDefaults{
                      .frequency_penalty = 0.0F},
 };
 
-/// This target's adapter directory: the attention projections and nothing else.
-///
-/// `bind_lora_hybrid` cannot serve it -- that one reads a fused payload member named
-/// `query_key_gate_value`, which this ungated projection is not -- so the registrations below
-/// are the same contract over a stack where every layer attends: q/k/v share the fused
-/// weight's pointer and are told apart by port, and o has a weight of its own.
-///
-/// The feed-forward is a routed mixture, so `gate_proj`, `up_proj` and `down_proj` are refused
-/// by name. An adapter trained against them names one weight per expert, and there is no
-/// honest way to add a delta to a hundred and twenty-eight of them from one pair of factors.
+/// Bind ordinary attention projections and each named routed expert independently.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     using TextConfig      = detail::TextConfig;
@@ -91,13 +83,9 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
                               Binding{attention.output.qdata, family::kOutputPort,
                                       g.query_size(),
                                       g.hidden});
-        for (const char* module : {"gate_proj", "up_proj", "down_proj"}) {
-            store.register_layer_refusal(
-                index, module,
-                "this layer's feed-forward is a routed mixture of experts; an adapter for it "
-                "names one weight per expert, which a single low-rank pair cannot address");
-        }
+        family::bind_lora_moe(store, index, attention.post_mixer.op);
     }
+    store.validate_payloads(options.lora_payloads);
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {

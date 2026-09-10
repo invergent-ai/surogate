@@ -3,6 +3,7 @@
 #include <api/family/prepared_prompt.h>
 
 #include "api/ops/lora.h"
+#include "family/impl/lora_bind.h"
 #include "api/ops/lora_store.h"
 #include "family/impl/mlp_swiglu.h"
 #include "artifact/reader.h"
@@ -45,21 +46,9 @@ constexpr SamplingPreset kLfm2Preset{.temperature       = 0.3F,
 constexpr ModelSamplingDefaults kLfm2Defaults{.thinking = kLfm2Preset,
                                               .non_thinking = kLfm2Preset};
 
-/// This target's adapter directory.
-///
-/// `bind_lora_hybrid` cannot serve it: that one reads a fused payload member named
-/// `query_key_gate_value`, which LFM2's ungated projection is not. The registrations below are
-/// the same contract -- q/k/v share the fused weight's pointer and are told apart by port, o and
-/// down have a weight each -- over the attending layers, plus the MLP of every layer.
-///
-/// The convolution layers register their MLP and nothing else: a PEFT adapter for LFM2 targets
-/// the attention projections and the feed-forward, and the mixer's own two projections have no
-/// module name in that vocabulary to bind them under.
+/// Bind full attention, short-convolution projections, dense MLPs and routed experts.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
-    if (runtime.geometry.experts || runtime.vision_geometry.siglip2) {
-        throw std::invalid_argument("LFM2-MoE and LFM2-VL adapters must be merged into the checkpoint before serving");
-    }
     using TextConfig      = detail::TextConfig;
     ops::LoraStore& store = ops::lora_store_for_current_device();
     if (store.empty()) {
@@ -97,40 +86,30 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
             store.register_module(index, "o_proj",
                                   Binding{attention.output.qdata, family::kOutputPort,
                                           g.query_size(), g.hidden});
+            store.register_module(index, "out_proj", {attention.output.qdata,
+                family::kOutputPort, g.query_size(), g.hidden});
         } else {
-            ++conv_index;
+            const auto& conv = runtime.gdn_layers.at(conv_index++);
+            store.register_module(index, "conv.in_proj", {conv.projection.in_projection.qdata,
+                16, g.hidden, 3 * g.hidden});
+            store.register_module(index, "conv.out_proj", {conv.output.qdata,
+                family::kGdnOutputPort, g.hidden, g.hidden});
             for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
                 store.register_layer_refusal(
                     index, module,
                     "this layer is a short-convolution mixer and has no attention projections");
             }
         }
-        store.register_module(
-            index, "down_proj",
-            Binding{mlp.down.qdata, family::kDownPort, g.intermediate, g.hidden});
-        // Gate and up share one fused parent, so they bind the way q/k/v do: one
-        // pointer, told apart by port. `swiglu_mlp` takes the parent apart on a
-        // round that has either of them bound. A format whose halves cannot be
-        // projected on their own is refused here, once, rather than throwing on
-        // every forward pass.
-        const Weight& gate_up = mlp.gate_up;
-        if (family::swiglu_halves_addressable(gate_up)) {
-            store.register_module(
-                index, "gate_proj",
-                Binding{gate_up.qdata, family::kGatePort, g.hidden, g.intermediate});
-            store.register_module(
-                index, "up_proj",
-                Binding{gate_up.qdata, family::kUpPort, g.hidden, g.intermediate});
+        if (mlp.moe.routed_down.n > 0) {
+            family::bind_lora_moe(store, index, mlp.moe);
         } else {
-            for (const char* module : {"gate_proj", "up_proj"}) {
-                store.register_layer_refusal(
-                    index, module,
-                    "this layer stores gate and up in a format whose halves are not "
-                    "independently addressable, so the fused projection cannot be taken apart "
-                    "to add their deltas");
-            }
+            family::bind_lora_dense_mlp(store, index, mlp, g.hidden, g.intermediate);
+            store.register_module(index, "feed_forward.w1", {mlp.gate_up.qdata, family::kGatePort, g.hidden, g.intermediate});
+            store.register_module(index, "feed_forward.w3", {mlp.gate_up.qdata, family::kUpPort, g.hidden, g.intermediate});
+            store.register_module(index, "feed_forward.w2", {mlp.down.qdata, family::kDownPort, g.intermediate, g.hidden});
         }
     }
+    store.validate_payloads(options.lora_payloads);
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {

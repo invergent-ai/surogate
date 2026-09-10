@@ -12,7 +12,10 @@
 
 #include "api/ops/lora_store.h"
 #include "family/impl/mlp_swiglu.h"
+#include "family/impl/lora_gdn.h"
 #include "api/types.h"
+#include "api/ops/sparse_moe.h"
+#include "ops/sparse_moe/decode/sparse_moe_decode.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,184 +23,189 @@
 
 namespace sinfer::family {
 
+inline void configure_lora_store(ops::LoraStore& store, const EngineOptions& options) {
+    if (!store.empty()) { return; }
+    const auto window = options.speculative.backend == SpeculativeBackend::None
+                            ? 1U : options.speculative.draft_tokens + 1U;
+    store.configure(std::max(options.lora_slots, 1U), std::max(options.lora_max_rank, 1U),
+                    std::max({options.prefill_chunk, options.max_concurrency * window, 1U}));
+}
+
+inline void finish_lora_bind(ops::LoraStore& store, const EngineOptions& options) {
+    store.validate_payloads(options.lora_payloads);
+    store.ensure_banks();
+    for (const auto& p : options.lora_payloads) {
+        if (!store.covers_layer(p.layer)) { continue; }
+        store.set_module_slot(p.layer, p.module, p.slot, p.a, p.b,
+                              p.rank, p.in_dim, p.out_dim, p.scale);
+    }
+    store.set_active(true);
+}
+
+// The checkpoint's q_proj produces query and gate interleaved by head. The
+// serving representation may keep those rows in separate weights or tensors.
+template<class Projection, class Geometry>
+void bind_lora_gated_attention(ops::LoraStore& store, int layer,
+                                const Projection& projection, const Geometry& g) {
+    using Binding = ops::LoraStore::ModuleBinding;
+    if constexpr (requires { std::variant_size<Projection>::value; }) {
+        std::visit([&](const auto& p) { bind_lora_gated_attention(store, layer, p, g); }, projection);
+    } else if constexpr (requires { projection.query_gate; }) {
+        store.register_module(layer, "q_proj", {projection.query_gate.qdata, kQueryPort,
+                                                 g.hidden, 2 * g.query_size()});
+        store.register_module(layer, "k_proj", {projection.key.qdata, kKeyPort, g.hidden, g.kv_size()});
+        store.register_module(layer, "v_proj", {projection.value.qdata, kValuePort, g.hidden, g.kv_size()});
+    } else {
+        const void *q, *k, *v, *gate;
+        if constexpr (requires { projection.query_key; }) {
+            q = k = projection.query_key.qdata;
+            v = gate = projection.gate_value.qdata;
+        } else if constexpr (requires { projection.split; }) {
+            if (projection.split) {
+                q = projection.split->query.qdata;
+                k = projection.split->key.qdata;
+                v = projection.split->value.qdata;
+                gate = projection.split->gate.qdata;
+            } else {
+                q = k = v = gate = projection.query_key_gate_value.qdata;
+            }
+        } else {
+            q = k = v = gate = projection.query_key_gate_value.qdata;
+        }
+        store.register_module(layer, "q_proj", Binding{q, kQueryPort, g.hidden, g.query_size(),
+            2 * g.query_size(), 0, g.head_dim, 2 * g.head_dim});
+        store.register_module(layer, "q_proj", Binding{gate, kAttentionGatePort, g.hidden, g.query_size(),
+            2 * g.query_size(), g.head_dim, g.head_dim, 2 * g.head_dim});
+        store.register_module(layer, "k_proj", Binding{k, kKeyPort, g.hidden, g.kv_size()});
+        store.register_module(layer, "v_proj", Binding{v, kValuePort, g.hidden, g.kv_size()});
+    }
+}
+
+template<class Mlp>
+void bind_lora_dense_mlp(ops::LoraStore& store, int layer, const Mlp& mlp,
+                         int hidden, int intermediate, const std::string& prefix = "") {
+    const void* gate = nullptr;
+    const void* up = nullptr;
+    if constexpr (requires { mlp.gate_up; }) { gate = up = mlp.gate_up.qdata; }
+    if constexpr (requires { mlp.gate; mlp.up; }) {
+        if (mlp.gate.qdata) { gate = mlp.gate.qdata; up = mlp.up.qdata; }
+    }
+    store.register_module(layer, prefix + "gate_proj", {gate, kGatePort, hidden, intermediate});
+    store.register_module(layer, prefix + "up_proj", {up, kUpPort, hidden, intermediate});
+    store.register_module(layer, prefix + "down_proj", {mlp.down.qdata, kDownPort, intermediate, hidden});
+    // Surogate's fused gate_up adapters use [up; gate] checkpoint rows.
+    store.register_module(layer, prefix + "gate_up_proj", {up, kUpPort, hidden, intermediate,
+        2 * intermediate, 0});
+    store.register_module(layer, prefix + "gate_up_proj", {gate, kGatePort, hidden, intermediate,
+        2 * intermediate, intermediate});
+}
+
+// Device-selected expert projections retain their complete checkpoint names.
+// Tables are [router, shared gate, (gate, up, down) for each expert, shared expert].
+inline void bind_lora_moe(ops::LoraStore& store, int layer, const ops::SparseMoeWeights& weights) {
+    if (store.max_rank() > ops::detail::kMoeLoraMaxRank) {
+        throw std::invalid_argument("expert LoRA supports --max-lora-rank up to 256");
+    }
+    const auto g = ops::sparse_moe_geometry(weights);
+    const auto* key = weights.router_shared_gate.qdata;
+    using Binding = ops::LoraStore::ModuleBinding;
+    std::vector<Binding> table;
+    const Binding router{key, 32, g.hidden, g.experts};
+    store.register_module(layer, "mlp.gate", router);
+    store.register_module(layer, "router.proj", router);
+    store.register_module(layer, "feed_forward.router", router);
+    store.register_module(layer, "feed_forward.gate", router);
+    table.push_back(router);
+    if (g.has_shared() && g.shared_gated) {
+        const Binding gate{key, 33, g.hidden, 1};
+        store.register_module(layer, "mlp.shared_expert_gate", gate);
+        table.push_back(gate);
+    } else { table.push_back({}); }
+    for (int expert = 0; expert < g.experts + (g.has_shared() ? 1 : 0); ++expert) {
+        const int width = expert == g.experts ? g.shared_intermediate : g.intermediate;
+        const std::string prefix = expert == g.experts ? "mlp.shared_expert."
+                                                      : "mlp.experts." + std::to_string(expert) + ".";
+        const Binding gate{key, 100 + expert * 3, g.hidden, width};
+        const Binding up{key, 101 + expert * 3, g.hidden, width};
+        const Binding down{key, 102 + expert * 3, width, g.hidden};
+        store.register_module(layer, prefix + "gate_proj", gate);
+        store.register_module(layer, prefix + "up_proj", up);
+        store.register_module(layer, prefix + "down_proj", down);
+        auto gate_part = gate;
+        gate_part.source_out = 2 * width;
+        gate_part.row_offset = width;
+        auto up_part = up;
+        up_part.source_out = 2 * width;
+        store.register_module(layer, prefix + "gate_up_proj", up_part);
+        store.register_module(layer, prefix + "gate_up_proj", gate_part);
+        const std::string alternate = expert == g.experts ? "mlp.shared_experts."
+                                                          : "experts." + std::to_string(expert) + ".";
+        store.register_module(layer, alternate + "gate_proj", gate);
+        store.register_module(layer, alternate + "up_proj", up);
+        store.register_module(layer, alternate + "down_proj", down);
+        store.register_module(layer, alternate + "gate_up_proj", up_part);
+        store.register_module(layer, alternate + "gate_up_proj", gate_part);
+        if (expert < g.experts) {
+            const std::string ffn = "feed_forward.experts." + std::to_string(expert) + ".";
+            store.register_module(layer, ffn + "w1", gate);
+            store.register_module(layer, ffn + "w3", up);
+            store.register_module(layer, ffn + "w2", down);
+        }
+        table.insert(table.end(), {gate, up, down});
+    }
+    store.register_bank_table(key, table);
+}
+
 template <class FusedPayload, class Runtime, class IsFull>
 void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFull&& is_full) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
-    ops::LoraStore& store = ops::lora_store_for_current_device();
-    if (store.empty()) {
-        // The widest round an adapter can see: a prefill chunk, or every lane
-        // times the verify window when a draft is in flight. Sizing this for
-        // lanes alone left every prompt without a scratch, so the prompt was
-        // built on the base model while the generated tokens carried the delta --
-        // an adapter that looked weak rather than unapplied.
-        const std::uint32_t window = options.speculative.backend == SpeculativeBackend::None
-                                         ? 1U
-                                         : options.speculative.draft_tokens + 1U;
-        const std::uint32_t decode_columns =
-            std::max<std::uint32_t>(options.max_concurrency, 1) * window;
-        const std::uint32_t widest = std::max<std::uint32_t>(
-            decode_columns, std::max<std::uint32_t>(options.prefill_chunk, 1));
-        store.configure(static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_slots, 1)),
-                        static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_max_rank, 1)),
-                        static_cast<std::int32_t>(widest));
-    }
-
-    // q, k and v leave one fused projection as separate contiguous tensors, so
-    // they share a bank key and are told apart by the port; o and down have a
-    // weight each. Attention modules exist only on the full-attention layers;
-    // the MLP is on every layer, and a real PEFT adapter carries down_proj on
-    // all of them.
+    auto& store = ops::lora_store_for_current_device();
+    configure_lora_store(store, options);
     const auto& g = runtime.geometry;
-    using Binding          = ops::LoraStore::ModuleBinding;
-    std::size_t full_index = 0;
-    std::size_t gdn_index  = 0;
-    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
-        const auto index          = static_cast<std::int32_t>(layer);
-        const void* mlp_down      = nullptr;
-        const Weight* mlp_gate_up = nullptr;
-        if (g.attention_schedule_declared ? g.layer_attends(static_cast<std::int32_t>(layer))
-                                        : is_full(layer)) {
+    std::size_t full_index = 0, linear_index = 0;
+    for (int layer = 0; layer < g.layers; ++layer) {
+        if (g.attention_schedule_declared ? g.layer_attends(layer) : is_full(layer)) {
             const auto& full = runtime.full_layers.at(full_index++);
-            mlp_down         = full.post_mixer.down.qdata;
-            mlp_gate_up      = &full.post_mixer.gate_up;
-            const auto* fused = std::get_if<FusedPayload>(&full.projection);
-            if (fused != nullptr) {
-                const void* qkv = fused->query_key_gate_value.qdata;
-                store.register_module(index, "q_proj",
-                                      Binding{qkv, kQueryPort, g.hidden,
-                                              g.query_size()});
-                store.register_module(index, "k_proj",
-                                      Binding{qkv, kKeyPort, g.hidden,
-                                              g.kv_size()});
-                store.register_module(index, "v_proj",
-                                      Binding{qkv, kValuePort, g.hidden,
-                                              g.kv_size()});
-            } else {
-                store.register_layer_refusal(
-                    index, "q_proj",
-                    "this artifact splits its attention projection, which the attention adapter "
-                    "path does not bind");
-            }
-            store.register_module(index, "o_proj",
-                                  Binding{full.output.qdata, kOutputPort,
-                                          g.query_size(),
-                                          g.hidden});
+            bind_lora_gated_attention(store, layer, full.projection, g);
+            store.register_module(layer, "o_proj", {full.output.qdata, kOutputPort, g.query_size(), g.hidden});
+            bind_lora_dense_mlp(store, layer, full.post_mixer, g.hidden, g.intermediate);
         } else {
-            const auto& linear = runtime.gdn_layers.at(gdn_index++);
-            mlp_down           = linear.post_mixer.down.qdata;
-            mlp_gate_up        = &linear.post_mixer.gate_up;
-            for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
-                store.register_layer_refusal(
-                    index, module,
-                    "this layer is linear attention, which has no self_attn projections; an "
-                    "adapter naming them here was trained against a different architecture");
-            }
-        }
-        store.register_module(
-            index, "down_proj",
-            Binding{mlp_down, kDownPort, g.intermediate, g.hidden});
-        // Gate and up share one fused parent, so they bind the way q/k/v do: one
-        // pointer, told apart by port. `swiglu_mlp` takes the parent apart on a
-        // round that has either of them bound. A format whose halves cannot be
-        // projected on their own is refused here, once, rather than throwing on
-        // every forward pass.
-        if (swiglu_halves_addressable(*mlp_gate_up)) {
-            store.register_module(index, "gate_proj",
-                                  Binding{mlp_gate_up->qdata, kGatePort, g.hidden,
-                                          g.intermediate});
-            store.register_module(index, "up_proj",
-                                  Binding{mlp_gate_up->qdata, kUpPort, g.hidden,
-                                          g.intermediate});
-        } else {
-            for (const char* module : {"gate_proj", "up_proj"}) {
-                store.register_layer_refusal(
-                    index, module,
-                    "this layer stores gate and up in a format whose halves are not "
-                    "independently addressable, so the fused projection cannot be taken apart "
-                    "to add their deltas");
-            }
+            const auto& linear = runtime.gdn_layers.at(linear_index++);
+            bind_lora_gdn(store, layer, linear, g);
+            bind_lora_dense_mlp(store, layer, linear.post_mixer, g.hidden, g.intermediate);
         }
     }
-    store.ensure_banks();
-
-    for (const auto& payload : options.lora_payloads) {
-        // A pipeline hands every stage the whole list; each applies the layers it
-        // holds and leaves the rest to the stage that does.
-        if (!store.covers_layer(payload.layer)) { continue; }
-        store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
-                              payload.rank, payload.in_dim, payload.out_dim, payload.scale);
-    }
-    ops::lora_set_active(true);
+    finish_lora_bind(store, options);
 }
 
-/// The MoE flavor: attention adapters bind; the MLP is routed experts, so its
-/// modules are refused with the reason rather than half-applied. The attention
-/// projection is a plain struct here (always fused), not a variant.
+/// The hybrid MoE directory includes full/linear attention, routers and experts.
 template <class Runtime, class IsFull>
 void bind_lora_moe_hybrid(const Runtime& runtime, const EngineOptions& options, IsFull&& is_full) {
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
-    if (store.empty()) {
-        const std::uint32_t window = options.speculative.backend == SpeculativeBackend::None
-                                         ? 1U
-                                         : options.speculative.draft_tokens + 1U;
-        const std::uint32_t decode_columns =
-            std::max<std::uint32_t>(options.max_concurrency, 1) * window;
-        const std::uint32_t widest = std::max<std::uint32_t>(
-            decode_columns, std::max<std::uint32_t>(options.prefill_chunk, 1));
-        store.configure(static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_slots, 1)),
-                        static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_max_rank, 1)),
-                        static_cast<std::int32_t>(widest));
-    }
+    configure_lora_store(store, options);
 
     const auto& g = runtime.geometry;
-    using Binding          = ops::LoraStore::ModuleBinding;
-    std::size_t full_index = 0;
-    for (std::size_t layer = 0; layer < static_cast<std::size_t>(g.layers); ++layer) {
-        const auto index = static_cast<std::int32_t>(layer);
-        if (g.attention_schedule_declared ? g.layer_attends(static_cast<std::int32_t>(layer))
-                                        : is_full(layer)) {
+    std::size_t full_index = 0, linear_index = 0;
+    for (int layer = 0; layer < g.layers; ++layer) {
+        if (g.attention_schedule_declared ? g.layer_attends(layer) : is_full(layer)) {
             const auto& full = runtime.full_layers.at(full_index++);
-            const void* qkv  = full.projection.query_key_gate_value.qdata;
-            store.register_module(index, "q_proj",
-                                  Binding{qkv, kQueryPort, g.hidden,
-                                          g.query_size()});
-            store.register_module(index, "k_proj",
-                                  Binding{qkv, kKeyPort, g.hidden,
-                                          g.kv_size()});
-            store.register_module(index, "v_proj",
-                                  Binding{qkv, kValuePort, g.hidden,
-                                          g.kv_size()});
-            store.register_module(index, "o_proj",
-                                  Binding{full.output.qdata, kOutputPort,
-                                          g.query_size(),
-                                          g.hidden});
+            bind_lora_gated_attention(store, layer, full.projection, g);
+            store.register_module(layer, "o_proj", {full.output.qdata, kOutputPort, g.query_size(), g.hidden});
+            bind_lora_moe(store, layer, [&]() -> const ops::SparseMoeWeights& {
+                if constexpr (requires { full.post_mixer.op; }) { return full.post_mixer.op; }
+                else { return full.post_mixer.moe; }
+            }());
         } else {
-            for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
-                store.register_layer_refusal(
-                    index, module,
-                    "this layer is linear attention, which has no self_attn projections; an "
-                    "adapter naming them here was trained against a different architecture");
-            }
+            const auto& linear = runtime.gdn_layers.at(linear_index++);
+            bind_lora_gdn(store, layer, linear, g);
+            bind_lora_moe(store, layer, [&]() -> const ops::SparseMoeWeights& {
+                if constexpr (requires { linear.post_mixer.op; }) { return linear.post_mixer.op; }
+                else { return linear.post_mixer.moe; }
+            }());
         }
     }
-    for (const char* module : {"down_proj", "gate_proj", "up_proj"}) {
-        store.register_refusal(
-            module,
-            "this model's MLP is routed experts, and per-expert adapters are not applied; "
-            "merge the adapter into the checkpoint before conversion (`surogate merge`) to "
-            "serve its MLP weights here");
-    }
-    store.ensure_banks();
-
-    for (const auto& payload : options.lora_payloads) {
-        // A pipeline hands every stage the whole list; each applies the layers it
-        // holds and leaves the rest to the stage that does.
-        if (!store.covers_layer(payload.layer)) { continue; }
-        store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
-                              payload.rank, payload.in_dim, payload.out_dim, payload.scale);
-    }
-    ops::lora_set_active(true);
+    finish_lora_bind(store, options);
 }
 
 } // namespace sinfer::family

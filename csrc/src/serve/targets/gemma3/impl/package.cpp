@@ -3,6 +3,7 @@
 #include <api/family/prepared_prompt.h>
 
 #include "api/ops/lora.h"
+#include "family/impl/lora_bind.h"
 #include "api/ops/lora_store.h"
 #include "artifact/reader.h"
 #include "targets/gemma3/impl/load/bindings.h"
@@ -85,19 +86,9 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         store.register_module(
             index, "o_proj",
             Binding{attention.output.qdata, 3, g.query_size(), g.hidden});
-        store.register_module(
-            index, "down_proj",
-            Binding{attention.post_mixer.down.qdata, 4, g.intermediate,
-                    g.hidden});
-        store.register_module(
-            index, "gate_proj",
-            Binding{attention.post_mixer.gate.qdata, 5, g.hidden,
-                    g.intermediate});
-        store.register_module(
-            index, "up_proj",
-            Binding{attention.post_mixer.up.qdata, 6, g.hidden,
-                    g.intermediate});
+        family::bind_lora_dense_mlp(store, index, attention.post_mixer, g.hidden, g.intermediate);
     }
+    store.validate_payloads(options.lora_payloads);
     store.ensure_banks();
 
     for (const auto& payload : options.lora_payloads) {

@@ -1,3 +1,4 @@
+#include "api/ops/lora_store.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "api/ops/sparse_moe.h"
 
@@ -419,8 +420,8 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
         : w8_profile  ? detail::kSparseMoePrefillW8W8Min
                       : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
                                                           : detail::kSparseMoePrefillQ4Q6Min);
-    std::size_t required = 0;
-    if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(geometry); }
+    // Expert adapters can select the per-column route at every prefill width.
+    std::size_t required = detail::sparse_moe_decode_workspace_bytes(geometry);
     const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
     const std::int32_t small_last =
         std::min({max_tokens, detail::kSparseMoeSmallTMax, prefill_first - 1});
@@ -501,11 +502,14 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         return detail::ggml::is_ggml_qtype(qtype);
     };
     const bool ggml_k_routed = is_ggml_k_qtype(gate_up) && is_ggml_k_qtype(down);
-    const bool use_prefill  = nvfp4_routed
+    const auto& adapter_round = lora_current_round();
+    const auto* adapters = lora_active() && adapter_round.valid()
+        ? lora_store_for_current_device().bank_table(weights.router_shared_gate.qdata) : nullptr;
+    const bool use_prefill  = !adapters && (nvfp4_routed
                                   ? tokens >= trtllm_min_tokens()
-                                  : detail::sparse_moe_uses_prefill(tokens, gate_up, down);
+                                  : detail::sparse_moe_uses_prefill(tokens, gate_up, down));
     const bool use_small_t =
-        !use_prefill && (detail::sparse_moe_uses_small_t(tokens) ||
+        !adapters && !use_prefill && (detail::sparse_moe_uses_small_t(tokens) ||
                          ((nvfp4_routed || ggml_k_routed) && tokens > 1));
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
@@ -566,7 +570,10 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         const Tensor router_column = router_x.slice(1, token, 1);
         Tensor destination_column  = destination.slice(1, token, 1);
         detail::sparse_moe_decode_launch(geometry, x_column, router_column, weights,
-                                         destination_column, views, stream, round_hook);
+                                         destination_column, views, stream, round_hook, adapters,
+                                         !adapters ? nullptr : adapter_round.slots
+                                            ? static_cast<const std::int32_t*>(adapter_round.slots->data) + token
+                                            : adapter_round.uniform_cell);
     }
 }
 
