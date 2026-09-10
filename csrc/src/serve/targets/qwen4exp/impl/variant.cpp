@@ -603,6 +603,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor&,
     Tensor b = rows_of(ab, heads, heads, workspace, stream);
     family::apply_lora(weights.a_b_projection, family::kGdnAPort, hidden, a, stream);
     family::apply_lora(weights.a_b_projection, family::kGdnBPort, hidden, b, stream);
+    ops::lora_auto_bias(weights.dt_bias, a, stream);
     ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, gates, beta, stream);
     maybe_dump_block("gdn_ab", ab, stream);
     maybe_dump_block("gdn_g", gates, stream);

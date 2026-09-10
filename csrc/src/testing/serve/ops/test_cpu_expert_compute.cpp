@@ -119,7 +119,7 @@ double dot_ref(const std::int8_t* codes, const std::uint16_t* scales, const std:
     return acc;
 }
 std::vector<double> reference_job(const Bank& b, int expert, const std::vector<std::uint16_t>& x, float weight,
-                                  double limit = 0.0) {
+                                  double limit = 0.0, const ops::LoraBank* adapters = nullptr, int slot = -1) {
     const int H = kGeometry.hidden, I = kGeometry.intermediate;
     std::vector<double> xf(H);
     for (int i = 0; i < H; ++i) { xf[i] = bf16_to_float(x[i]); }
@@ -128,11 +128,25 @@ std::vector<double> reference_job(const Bank& b, int expert, const std::vector<s
     quantise_ref(xf, xq, xs);
     const std::int8_t* gc     = b.gate_codes.data() + static_cast<std::size_t>(expert) * 2 * I * H;
     const std::uint16_t* gs   = b.gate_scales.data() + static_cast<std::size_t>(expert) * 2 * I * (H / 32);
+    const auto adapted = [&](int part, int row, const std::vector<double>& input, double base) {
+        if (!adapters || slot < 0) { return base; }
+        const auto& w = adapters[2 + 3 * expert + part];
+        const auto* a = static_cast<const std::uint16_t*>(w.a) + slot * w.a_stride;
+        const auto* b = static_cast<const std::uint16_t*>(w.b) + slot * w.b_stride + row * w.rank;
+        double delta = 0;
+        for (int r = 0; r < w.rank; ++r) {
+            double low = 0;
+            for (int k = 0; k < w.k; ++k) { low += bf16_to_float(a[r * w.k + k]) * input[k]; }
+            delta += low * bf16_to_float(b[r]);
+        }
+        const auto i = static_cast<std::size_t>(slot) * w.n + row;
+        return (base + delta) * (w.gain ? 1 + w.gain[i] : 1) + (w.bias ? w.bias[i] : 0);
+    };
     std::vector<double> h(I);
     for (int j = 0; j < I; ++j) {
         const double g = dot_ref(gc + j * H, gs + j * (H / 32), xq, xs, H);
         const double u = dot_ref(gc + (I + j) * H, gs + (I + j) * (H / 32), xq, xs, H);
-        h[j]           = swiglu_ref(g, u, limit);
+        h[j]           = swiglu_ref(adapted(0, j, xf, g), adapted(1, j, xf, u), limit);
     }
     std::vector<int> hq;
     std::vector<double> hs;
@@ -140,7 +154,7 @@ std::vector<double> reference_job(const Bank& b, int expert, const std::vector<s
     const std::int8_t* dc   = b.down_codes.data() + static_cast<std::size_t>(expert) * H * I;
     const std::uint16_t* ds = b.down_scales.data() + static_cast<std::size_t>(expert) * H * (I / 32);
     std::vector<double> y(H);
-    for (int r = 0; r < H; ++r) { y[r] = weight * dot_ref(dc + r * I, ds + r * (I / 32), hq, hs, I); }
+    for (int r = 0; r < H; ++r) { y[r] = weight * adapted(2, r, h, dot_ref(dc + r * I, ds + r * (I / 32), hq, hs, I)); }
     return y;
 }
 
@@ -446,6 +460,62 @@ int main() {
         }
         failures += bad;
     }
+    // Mixed adapters on the same expert, including a base token, with nonzero base weights.
+    {
+        constexpr int count = 7, rank = 2;
+        const int entries = 2 + 3 * kGeometry.experts;
+        std::vector<ops::LoraBank> views(entries);
+        std::vector<std::vector<std::uint16_t>> aa(entries), bb(entries);
+        std::vector<std::vector<float>> gains(entries), shifts(entries);
+        for (int i = 2; i < entries; ++i) {
+            aa[i].resize(2 * rank * H); bb[i].resize(2 * H * rank);
+            gains[i].resize(2 * H); shifts[i].resize(2 * H);
+            for (std::size_t k = 0; k < aa[i].size(); ++k) { aa[i][k] = float_to_bf16((int(k % 5) - 2) / 32.F); }
+            for (std::size_t k = 0; k < bb[i].size(); ++k) { bb[i][k] = float_to_bf16((int(k % 3) - 1) / 16.F); }
+            for (int k = 0; k < 2 * H; ++k) {
+                gains[i][k] = (k < H ? .125F : -.25F);
+                shifts[i][k] = (i % 3 - 1) * .03125F;
+            }
+            views[i] = {aa[i].data(), bb[i].data(), rank * H, H * rank, rank, H, H, gains[i].data(), shifts[i].data()};
+        }
+        std::vector<std::uint16_t> inputs(count * H);
+        for (auto& v : inputs) { v = float_to_bf16(act(rng)); }
+        std::vector<ops::CpuExpertJob> jobs;
+        for (int t = 0; t < count; ++t) {
+            jobs.push_back({t, 0, .75F, t % 3 - 1});
+            jobs.push_back({t, 2, .25F, t % 3 - 1});
+        }
+        ops::CpuExpertPool pool(kGeometry, {.threads = 4, .pin_threads = false});
+        const auto run = [&](const ops::CpuExpertBank& weights, const char* label, bool oracle) {
+            std::vector<float> actual(count * H), reference(count * H);
+            pool.run(weights, {inputs.data(), actual.data(), count, jobs, views.data()});
+            for (const auto& job : jobs) {
+                cpu_expert_compute_job(kGeometry, weights, job, inputs.data() + job.token * H,
+                    reference.data() + job.token * H, scratch.data(), views.data());
+            }
+            for (int t = 0; t < count; ++t) {
+                std::vector<double> expected(H);
+                if (oracle) {
+                    std::vector<std::uint16_t> column(inputs.begin() + t * H, inputs.begin() + (t + 1) * H);
+                    for (const auto& job : jobs) {
+                        if (job.token != t) { continue; }
+                        const auto value = reference_job(bank, job.expert, column, job.weight, 0, views.data(), job.adapter_slot);
+                        for (int r = 0; r < H; ++r) { expected[r] += value[r]; }
+                    }
+                } else { std::copy_n(reference.data() + t * H, H, expected.data()); }
+                failures += compare(std::string(label) + " adapter token " + std::to_string(t),
+                    std::vector<float>(actual.begin() + t * H, actual.begin() + (t + 1) * H), expected);
+                failures += compare(std::string(label) + " adapter reference " + std::to_string(t),
+                    std::vector<float>(reference.begin() + t * H, reference.begin() + (t + 1) * H), expected);
+            }
+        };
+        run(bank.view(), "W8", true);
+        const auto q4 = requantise_bank(bank);
+        run(q4.view(), "Q4", false);
+        const auto q5 = make_q5_bank(rng);
+        run(q5.view(), "Q5", false);
+    }
+
     // --- GGML-block bank -------------------------------------------------------------------
     // The blocks are the bank; the CPU path decodes a chunk of rows at a time into W8 staging
     // and reads them at an offset. That offset arithmetic, not the decoders (which

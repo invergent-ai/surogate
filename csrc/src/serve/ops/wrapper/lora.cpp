@@ -113,10 +113,9 @@ void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids
     }
 
     Tensor low(scratch.data, DType::BF16, {bank.rank, tokens});
-    detail::lora_batched_shrink_launch(x, bank.a, ids, low, bank.k, bank.rank, bank.a_stride,
-                                       uniform_slot, stream);
-    detail::lora_batched_expand_launch(low, bank.b, ids, out, bank.n, bank.rank, bank.b_stride,
-                                       uniform_slot, stream);
+    const LoraBank* banks[]{&bank};
+    Tensor* outputs[]{&out};
+    detail::lora_split_delta_launch(x, banks, outputs, 1, ids, uniform_slot, low, stream);
 }
 
 void lora_delta_fused(const Tensor& x, const LoraBank* const* banks, Tensor* const* outs,
@@ -143,10 +142,7 @@ void lora_delta_fused(const Tensor& x, const LoraBank* const* banks, Tensor* con
         if (bank == nullptr || bank->rank <= 0 || bank->a == nullptr || bank->b == nullptr) {
             throw std::invalid_argument("lora_delta_fused: every pair needs a live bank");
         }
-        if (bank->rank > kLoraFusedRankLimit) {
-            throw std::invalid_argument("lora_delta_fused: rank exceeds the fused kernel's limit");
-        }
-        if (out->dtype != DType::BF16 || !out->is_contiguous() || out->ne[1] != tokens) {
+        if (out->dtype != DType::BF16 || out->nb[0] != 2 || out->nb[1] < out->ne[0] * 2 || out->ne[1] != tokens) {
             throw std::invalid_argument("lora_delta_fused: outputs must be contiguous BF16 [n, T]");
         }
         // One x for every pair is the point of the fusion, so one k too.
@@ -168,7 +164,9 @@ void lora_delta_fused(const Tensor& x, const LoraBank* const* banks, Tensor* con
     const std::int64_t redundant_bytes =
         static_cast<std::int64_t>(tokens) * blocks * total_rank * x.ne[0] * 2;
     constexpr std::int64_t kRedundancyBudget = 2LL << 20;
-    if (redundant_bytes <= kRedundancyBudget) {
+    bool fused_rank = true;
+    for (int p = 0; p < pair_count; ++p) { fused_rank &= banks[p]->rank <= kLoraFusedRankLimit; }
+    if (fused_rank && redundant_bytes <= kRedundancyBudget) {
         detail::lora_fused_delta_launch(x, banks, outs, pair_count, ids, uniform_slot, stream);
         return;
     }

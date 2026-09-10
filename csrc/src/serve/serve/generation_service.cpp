@@ -291,7 +291,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
                 if (!skipped.empty()) {
                     throw std::invalid_argument(
                         "--lora-modules '" + name + "': module '" + skipped.front() +
-                        "' is outside the supported text decoder; merge the adapter before serving");
+                        "' is outside the supported model namespaces");
                 }
                 for (auto& payload : payloads) {
                     payload.slot = update.slot();
@@ -303,6 +303,10 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     }
     engine_options.load_progress            = std::move(load_progress);
     const bool lora_requested = engine_options.lora_enable;
+    std::vector<std::pair<int, std::string>> startup_adapter_modules;
+    for (const auto& payload : engine_options.lora_payloads) {
+        startup_adapter_modules.emplace_back(payload.layer, payload.module);
+    }
     engine_              = std::make_unique<sinfer::Engine>(std::move(engine_options));
     // Only a target that binds adapters to its own weights can apply them, and most
     // do not yet. Without this check a request naming an adapter would be answered
@@ -314,6 +318,12 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
             "--enable-lora: this target does not apply adapters, so one would be loaded and "
             "silently ignored. Merge it into the checkpoint before conversion (`surogate merge`) "
             "to serve it here.");
+    }
+    for (const auto& [layer, module] : startup_adapter_modules) {
+        auto& stores = engine_->lora_stores();
+        bool found = false;
+        for (int device : stores.devices()) { found |= stores.peek(device)->covers_layer(layer); }
+        if (!found) { throw std::invalid_argument("adapter module '" + module + "' is absent from the served model"); }
     }
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(
@@ -664,7 +674,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
     auto payloads = LoraRegistry::read_payloads(found->second, skipped);
     if (!skipped.empty()) {
         throw std::invalid_argument("module '" + skipped.front() +
-                                    "' is outside the supported text decoder; merge the adapter before serving");
+                                    "' is outside the supported model namespaces");
     }
 
     // Validate every module before draining requests or changing a live adapter.
@@ -682,8 +692,16 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
             throw std::invalid_argument("adapter module '" + payload.module + "' names a layer absent from this model");
         }
     }
-    for (int device : devices) {
-        if (const auto* store = stores.peek(device)) { store->validate_payloads(payloads); }
+    {
+        // DoRA normalization reads base weights; saved full matrices join the sleep estate.
+        // Keep both mapped while staging, without holding this lock during request draining.
+        std::lock_guard memory_lock(adapter_memory_mutex_);
+        if (engine_->is_sleeping()) {
+            throw std::invalid_argument("the model is asleep; wake it before loading an adapter");
+        }
+        for (int device : devices) {
+            if (const auto* store = stores.peek(device)) { store->validate_payloads(payloads); }
+        }
     }
     auto update = lora_slots_.update(name, Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms));
     const auto slot = update.slot();
@@ -697,9 +715,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
             for (int device : devices) {
                 ops::LoraStore* store = stores.peek(device);
                 if (store == nullptr || !store->covers_layer(payload.layer)) { continue; }
-                store->set_module_slot(payload.layer, payload.module, slot, payload.a, payload.b,
-                                       payload.rank, payload.in_dim, payload.out_dim,
-                                       payload.scale);
+                store->set_payload(slot, payload);
             }
         }
         for (int device : devices) {

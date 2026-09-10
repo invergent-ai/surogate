@@ -1,3 +1,4 @@
+#include "api/ops/lora_store.h"
 #include "api/ops/add_bias.h"
 
 #include "ops/launcher/add_bias.h"
@@ -41,6 +42,7 @@ void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
         throw std::invalid_argument("add_bias: bias/x data must be non-null");
     }
     detail::add_bias_launch(bias, x, stream);
+    lora_auto_bias(bias, x, stream);
 }
 
 } // namespace sinfer::ops

@@ -19,6 +19,27 @@
 namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS::schedule {
 namespace {
 
+// Every prefill publishes its policy, including base requests and vision encoding.
+struct LoraPrefillScope {
+    bool held = false;
+    ops::LoraRound previous = ops::lora_current_round();
+    LoraPrefillScope(std::int32_t slot, std::int32_t columns, cudaStream_t stream) {
+        if (!ops::lora_active()) { return; }
+        ops::LoraRound round;
+        round.uniform = true;
+        round.scratch = ops::lora_store_for_current_device().scratch(columns);
+        if (round.scratch.data == nullptr) { return; }
+        ops::lora_store_for_current_device().write_uniform_slot(slot, stream);
+        round.uniform_cell = ops::lora_store_for_current_device().uniform_cell();
+        ops::lora_set_round(round);
+        held = true;
+    }
+    ~LoraPrefillScope() {
+        if (held) { ops::lora_set_round(previous); }
+    }
+};
+
+
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
     if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
         throw std::logic_error("DFlash prefill controls are unavailable");
@@ -77,38 +98,8 @@ PrefillChunkResult prefill_text_chunk(
             : -1);
     card.set_prefill_graph_family(state.prefill_graphs);
     const std::span<const int> prompt(ids.data(), ids.size());
-    // The prompt must see the same adapter the generated tokens will: prefilling
-    // it on the base model and then decoding with the delta leaves the request
-    // reading a cache the adapter never wrote, which looks like a weak adapter
-    // rather than a bug.
-    // Publish a round for *every* prefill once adapters are loaded, base-model
-    // requests included, and always write the slot -- -1 when the request selected
-    // no adapter.
-    //
-    // The captured prefill graph contains the delta launches unconditionally, and
-    // they read the slot from a device cell. A base request that skipped the write
-    // therefore inherited whatever the previous request left in the cell and was
-    // served that adapter: base-model output varied run to run while an adapter's
-    // did not. The write is the round's statement of "no adapter", not an
-    // optimisation to skip.
-    struct LoraPrefillScope {
-        bool held = false;
-        LoraPrefillScope(std::int32_t slot, std::int32_t columns, cudaStream_t stream) {
-            if (!ops::lora_active()) { return; }
-            ops::LoraRound round;
-            round.uniform = true;
-            round.scratch = ops::lora_store_for_current_device().scratch(columns);
-            if (round.scratch.data == nullptr) { return; }
-            ops::lora_store_for_current_device().write_uniform_slot(slot, stream);
-            round.uniform_cell = ops::lora_store_for_current_device().uniform_cell();
-            ops::lora_set_round(round);
-            held = true;
-        }
-        ~LoraPrefillScope() {
-            if (held) { ops::lora_clear_round(); }
-        }
-    } lora_scope(state.lora_slot, static_cast<std::int32_t>(nominal_length),
-                 state.execution.device.stream);
+    LoraPrefillScope lora_scope(state.lora_slot, static_cast<std::int32_t>(nominal_length),
+                                 state.execution.device.stream);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
@@ -136,6 +127,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
             : -1);
+    LoraPrefillScope lora_scope(state.lora_slot, static_cast<std::int32_t>(nominal_length),
+                                 state.execution.device.stream);
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 
@@ -147,6 +140,7 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
         throw std::logic_error("multimodal MTP bridge does not match the reusable frontier");
     }
 
+    LoraPrefillScope lora_scope(state.lora_slot, 1, state.execution.device.stream);
     Tensor bridge_token = state.execution.io.mtp->target_input_ids.slice(0, 0, 1);
     const TokenId token = prompt.token_ids[state.text_kv_base];
     CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token), cudaMemcpyHostToDevice,
@@ -184,6 +178,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    LoraPrefillScope lora_scope(state.lora_slot, 1, state.execution.device.stream);
     card.logits_from_hidden(hidden, logits);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,

@@ -13,6 +13,7 @@
 #include "api/ops/lora_store.h"
 #include "family/impl/mlp_swiglu.h"
 #include "family/impl/lora_gdn.h"
+#include "family/impl/lora_globals.h"
 #include "api/types.h"
 #include "api/ops/sparse_moe.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
@@ -36,8 +37,7 @@ inline void finish_lora_bind(ops::LoraStore& store, const EngineOptions& options
     store.ensure_banks();
     for (const auto& p : options.lora_payloads) {
         if (!store.covers_layer(p.layer)) { continue; }
-        store.set_module_slot(p.layer, p.module, p.slot, p.a, p.b,
-                              p.rank, p.in_dim, p.out_dim, p.scale);
+        store.set_payload(p.slot, p);
     }
     store.set_active(true);
 }
@@ -116,10 +116,20 @@ inline void bind_lora_moe(ops::LoraStore& store, int layer, const ops::SparseMoe
     store.register_module(layer, "feed_forward.router", router);
     store.register_module(layer, "feed_forward.gate", router);
     table.push_back(router);
+    store.register_base(key, 32, {{weights.router_shared_gate, 0, 0, g.experts}});
     if (g.has_shared() && g.shared_gated) {
         const Binding gate{key, 33, g.hidden, 1};
         store.register_module(layer, "mlp.shared_expert_gate", gate);
         table.push_back(gate);
+        store.register_base(key, 33, {{weights.router_shared_gate, g.experts, 0, 1}});
+    } else if (weights.router_bias) {
+        const Binding correction{key, 34, 1, g.experts};
+        for (const std::string name : {"feed_forward.expert_bias.bias", "mlp.gate.e_score_correction_bias.bias",
+                                       "mlp.experts.e_score_correction_bias.bias"}) {
+            store.register_module(layer, name, correction);
+        }
+        store.register_base(key, 34, {}, Tensor(const_cast<float*>(weights.router_bias), DType::FP32, {g.experts}));
+        table.push_back(correction);
     } else { table.push_back({}); }
     for (int expert = 0; expert < g.experts + (g.has_shared() ? 1 : 0); ++expert) {
         const int width = expert == g.experts ? g.shared_intermediate : g.intermediate;
@@ -151,6 +161,18 @@ inline void bind_lora_moe(ops::LoraStore& store, int layer, const ops::SparseMoe
             store.register_module(layer, ffn + "w3", up);
             store.register_module(layer, ffn + "w2", down);
         }
+        const bool shared = expert == g.experts;
+        const auto& gu = shared ? weights.shared_gate_up : weights.routed_gate_up;
+        const auto& dw = shared ? weights.shared_down : weights.routed_down;
+        const bool up_first = gu.qtype == QType::NVFP4;
+        const int first = shared ? 0 : expert * 2 * width;
+        const auto multiplier = [&](int half) -> const float* {
+            return shared || !weights.routed_gate_up_scale ? nullptr : weights.routed_gate_up_scale + expert * 2 + half;
+        };
+        store.register_base(key, gate.port, {{gu, first + (up_first ? width : 0), 0, width, false, multiplier(up_first ? 1 : 0)}});
+        store.register_base(key, up.port, {{gu, first + (up_first ? 0 : width), 0, width, false, multiplier(up_first ? 0 : 1)}});
+        store.register_base(key, down.port, {{dw, shared ? 0 : expert * g.hidden, 0, g.hidden, false,
+            shared || !weights.routed_down_scale ? nullptr : weights.routed_down_scale + expert}});
         table.insert(table.end(), {gate, up, down});
     }
     store.register_bank_table(key, table);
@@ -161,6 +183,7 @@ void bind_lora_hybrid(const Runtime& runtime, const EngineOptions& options, IsFu
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     auto& store = ops::lora_store_for_current_device();
     configure_lora_store(store, options);
+    bind_lora_globals(store, runtime);
     const auto& g = runtime.geometry;
     std::size_t full_index = 0, linear_index = 0;
     for (int layer = 0; layer < g.layers; ++layer) {
@@ -184,6 +207,7 @@ void bind_lora_moe_hybrid(const Runtime& runtime, const EngineOptions& options, 
     if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
     configure_lora_store(store, options);
+    bind_lora_globals(store, runtime);
 
     const auto& g = runtime.geometry;
     std::size_t full_index = 0, linear_index = 0;

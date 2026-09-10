@@ -28,26 +28,29 @@ struct SparseMoeDecodeWorkspace {
     Tensor shared_scale;
     Tensor scratch;
     Tensor lora_low;
+    std::int32_t slot_stride = 0;
 };
 
 template <class Arena>
 SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena,
-                                                              const SparseMoeGeometry& geometry) {
+                                                              const SparseMoeGeometry& geometry,
+                                                              std::int32_t tokens = 1) {
     SparseMoeDecodeWorkspace out;
-    out.ids          = arena.alloc(DType::I32, {geometry.experts_per_token}, 16);
-    out.alpha        = arena.alloc(DType::FP32, {geometry.experts_per_token}, 16);
-    out.shared_scale = arena.alloc(DType::FP32, {1}, 4);
+    out.ids          = arena.alloc(DType::I32, {geometry.experts_per_token, tokens}, 16);
+    out.alpha        = arena.alloc(DType::FP32, {geometry.experts_per_token, tokens}, 16);
+    out.shared_scale = arena.alloc(DType::FP32, {tokens}, 4);
     // D1 uses the first router_rows values as scores. D3 then reuses the same lifetime for
     // [paths, intermediate] natural FP32 SwiGLU results consumed by D4.
     const std::int32_t scratch_rows = std::max(geometry.paths(), (geometry.router_rows() +
                                                                     geometry.intermediate - 1) /
                                                                        geometry.intermediate);
-    out.scratch = arena.alloc(DType::FP32, {scratch_rows, geometry.intermediate}, 256);
-    out.lora_low = arena.alloc(DType::FP32, {2 * geometry.paths() * kMoeLoraMaxRank}, 256);
+    out.scratch = arena.alloc(DType::FP32, {scratch_rows * geometry.intermediate, tokens}, 256);
+    out.lora_low = arena.alloc(DType::FP32, {2 * geometry.paths() * kMoeLoraMaxRank, tokens}, 256);
     return out;
 }
 
-[[nodiscard]] std::size_t sparse_moe_decode_workspace_bytes(const SparseMoeGeometry& geometry);
+[[nodiscard]] std::size_t sparse_moe_decode_workspace_bytes(const SparseMoeGeometry& geometry,
+                                                           std::int32_t tokens = 1);
 [[nodiscard]] SparseMoeDecodePlan resolve_sparse_moe_decode_plan(const SparseMoeGeometry& geometry,
                                                                  QType routed_gate_up,
                                                                  QType routed_down);

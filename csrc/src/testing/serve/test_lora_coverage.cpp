@@ -3,6 +3,7 @@
 #include "targets/qwen3_5/impl/variant.h"
 #include "targets/spark2_5/impl/variant.h"
 #include "ops/op_tester.h"
+#include "family/impl/moe/expert_cache.h"
 
 #include <cassert>
 #include <cmath>
@@ -151,10 +152,27 @@ static void gated_attention(int storage) {
     test::cuda_check(cudaStreamDestroy(stream), "destroy stream");
 }
 
-static void expert_adapters(bool shared) {
+struct PinnedWeight {
+    void* host = nullptr;
+    Weight weight;
+    explicit PinnedWeight(const Weight& source) : weight(source) {
+        const auto codes = static_cast<std::size_t>(source.n) * source.k;
+        const auto bytes = codes + codes / 32 * 2;
+        test::cuda_check(cudaHostAlloc(&host, bytes, cudaHostAllocMapped), "pinned expert bank");
+        std::memset(host, 0, bytes);
+        void* device = nullptr;
+        test::cuda_check(cudaHostGetDevicePointer(&device, host, 0), "bank alias");
+        weight.payload = weight.qdata = device;
+        weight.scales = static_cast<std::byte*>(device) + codes;
+        weight.payload_bytes = bytes;
+    }
+    ~PinnedWeight() { if (host) { cudaFreeHost(host); } }
+};
+
+static void expert_adapters(bool shared, int tokens = 3, bool cpu = false) {
     Context context;
     const auto g = shared ? ops::kSparseMoeQwen36Geometry : ops::kSparseMoeQwen3MoeGeometry;
-    const int h = g.hidden, m = g.intermediate, e = g.experts, tokens = 3;
+    const int h = g.hidden, m = g.intermediate, e = g.experts;
     ZeroWeight router(g.router_rows(), h), gu(e * 2 * m, h, true), down(e * h, m, true);
     ZeroWeight sgu(shared ? 2 * m : 1, h, true), sd(h, m, true);
     ops::SparseMoeWeights weights;
@@ -186,7 +204,8 @@ static void expert_adapters(bool shared) {
             adapter(store, 0, "mlp.shared_expert.down_proj", slot, m, std::vector<float>(h, 0.25F));
         }
     }
-    const std::vector<int> selected{-1, 0, 1};
+    std::vector<int> selected(tokens);
+    for (int t = 0; t < tokens; ++t) { selected[t] = t % 3 - 1; }
     auto dx = test::to_device_bf16(std::vector<float>(h * tokens, 1));
     auto output = test::to_device_bf16(std::vector<float>(h * tokens, 0.125F));
     auto ids = test::to_device_i32(selected);
@@ -196,13 +215,41 @@ static void expert_adapters(bool shared) {
     DeviceArena arena(
         ops::sparse_moe_workspace_capacity_bytes(g, QType::W8G32_F16S, QType::W8G32_F16S, tokens, tokens));
     WorkspaceArena workspace(DeviceSpan{arena.base(), arena.capacity()});
+    std::unique_ptr<PinnedWeight> host_gu, host_down;
+    family::ExpertCache* cache = nullptr;
+    family::BankedMixture mixture;
+    if (cpu) {
+        setenv("SUROGATE_CPU_EXPERT_THREADS", "4", 1);
+        host_gu = std::make_unique<PinnedWeight>(weights.routed_gate_up);
+        host_down = std::make_unique<PinnedWeight>(weights.routed_down);
+        weights.routed_gate_up = host_gu->weight;
+        weights.routed_down = host_down->weight;
+        EngineOptions options;
+        options.expert_slots = e;
+        options.cpu_moe_share = tokens > 3 ? .5F : 1.0F;
+        options.cpu_moe_prefill_share = options.cpu_moe_share;
+        options.cpu_moe_min_tokens = 1;
+        options.prefill_chunk = tokens;
+        family::ExpertCache::configure(options, 0, e);
+        cache = &family::ExpertCache::for_current_device(g, 1);
+        mixture.layer = 0; mixture.layers = 1; mixture.op = &weights;
+        mixture.host_gate_up = static_cast<const std::byte*>(host_gu->host);
+        mixture.host_down = static_cast<const std::byte*>(host_down->host);
+    }
     auto run = [&](cudaStream_t stream) {
-        ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, result, workspace, stream);
+        if (cache) {
+            cache->run(mixture, x, result, workspace, stream);
+            assert(cache->has_pending_partial());
+            cache->add_pending_partial(result, stream);
+        } else {
+            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, result, workspace, stream);
+        }
     };
     const auto expected = [&] {
         std::vector<double> out(h * tokens, 0.125);
-        for (int token = 1; token < tokens; ++token) {
-            const int slot = token - 1;
+        for (int token = 0; token < tokens; ++token) {
+            const int slot = selected[token];
+            if (slot < 0) { continue; }
             const auto silu = [](double v) {
                 return v / (1 + std::exp(-v));
             };
@@ -233,6 +280,35 @@ static void expert_adapters(bool shared) {
     test::cuda_check(cudaGraphLaunch(executable, stream), "replay");
     test::cuda_synchronize(stream);
     close(test::from_device_bf16(output, h * tokens), expected);
+    if (tokens == 129 && !cpu && std::getenv("SUROGATE_LORA_BENCH")) {
+        const auto measure = [&](auto&& body) {
+            cudaEvent_t begin, end;
+            test::cuda_check(cudaEventCreate(&begin), "timer");
+            test::cuda_check(cudaEventCreate(&end), "timer");
+            body(); test::cuda_synchronize();
+            test::cuda_check(cudaEventRecord(begin, stream), "timer start");
+            for (int i = 0; i < 3; ++i) { body(); }
+            test::cuda_check(cudaEventRecord(end, stream), "timer stop");
+            test::cuda_check(cudaEventSynchronize(end), "timer wait");
+            float ms = 0; test::cuda_check(cudaEventElapsedTime(&ms, begin, end), "elapsed");
+            cudaEventDestroy(begin); cudaEventDestroy(end);
+            return ms / 3;
+        };
+        DeviceArena serial_arena(ops::detail::sparse_moe_decode_workspace_bytes(g));
+        WorkspaceArena serial_workspace(DeviceSpan{serial_arena.base(), serial_arena.capacity()});
+        const auto views = ops::detail::allocate_sparse_moe_decode_workspace(serial_workspace, g);
+        const auto* banks = store.bank_table(weights.router_shared_gate.qdata);
+        const float serial_ms = measure([&] {
+            for (int t = 0; t < tokens; ++t) {
+                auto input = x.slice(1, t, 1), output = result.slice(1, t, 1);
+                ops::detail::sparse_moe_decode_launch(g, input, input, weights, output, views, stream,
+                    nullptr, banks, static_cast<const std::int32_t*>(slots.data) + t);
+            }
+        });
+        const float batch_ms = measure([&] { run(stream); });
+        std::cout << "129-token expert prefill: serial " << serial_ms << " ms, batched " << batch_ms
+                  << " ms (" << serial_ms / batch_ms << "x)" << std::endl;
+    }
     test::cuda_check(cudaGraphExecDestroy(executable), "destroy graph");
     test::cuda_check(cudaGraphDestroy(graph), "destroy graph source");
     test::cuda_check(cudaStreamDestroy(stream), "destroy stream");
@@ -269,6 +345,8 @@ static void gdn_adapters() {
         adapter(store, 0, "linear_attn.in_proj_a", slot, h, std::vector<float>(heads, 0.5F + slot * 0.25F));
         adapter(store, 0, "linear_attn.in_proj_b", slot, h, std::vector<float>(heads, 0.25F + slot * 0.25F));
     }
+    store.set_module_slot(0, "linear_attn.dt_bias.bias", 1, {0}, std::vector<std::uint16_t>(heads),
+                          1, 1, heads, 1, {}, std::vector<float>(heads, .25F));
     const std::vector<int> selection{-1, 0, 1, -1};
     auto ids = test::to_device_i32(selection);
     Tensor slots(ids.p, DType::I32, {tokens});
@@ -285,7 +363,7 @@ static void gdn_adapters() {
     test::cuda_synchronize();
     std::vector<double> expected_g(heads * tokens), expected_b(heads * tokens);
     for (int t = 0; t < tokens; ++t) {
-        const double a = selection[t] < 0 ? 0 : 0.5 + 0.25 * selection[t];
+        const double a = selection[t] < 0 ? 0 : 0.5 + 0.25 * selection[t] + (selection[t] == 1 ? .25 : 0);
         const double b = selection[t] < 0 ? 0 : 0.25 + 0.25 * selection[t];
         for (int i = 0; i < heads; ++i) {
             expected_g[t * heads + i] = -std::log1p(std::exp(a));
@@ -366,5 +444,8 @@ int main() {
     gdn_adapters();
     expert_adapters(false);
     expert_adapters(true);
+    expert_adapters(false, 129);
+    expert_adapters(false, 3, true);
+    expert_adapters(false, 33, true);
     std::cout << "LoRA split/gated attention and routed/shared expert numerical coverage passed\n";
 }

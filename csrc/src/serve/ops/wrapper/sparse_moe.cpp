@@ -1,4 +1,5 @@
 #include "api/ops/lora_store.h"
+#include "api/ops/lora_router.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "api/ops/sparse_moe.h"
 
@@ -420,8 +421,8 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
         : w8_profile  ? detail::kSparseMoePrefillW8W8Min
                       : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
                                                           : detail::kSparseMoePrefillQ4Q6Min);
-    // Expert adapters can select the per-column route at every prefill width.
-    std::size_t required = detail::sparse_moe_decode_workspace_bytes(geometry);
+    // Adapted rounds execute their columns concurrently in one set of launches.
+    std::size_t required = detail::sparse_moe_decode_workspace_bytes(geometry, max_tokens);
     const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
     const std::int32_t small_last =
         std::min({max_tokens, detail::kSparseMoeSmallTMax, prefill_first - 1});
@@ -526,7 +527,7 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
                                                     down)
                 .workspace_bytes;
     } else {
-        required = detail::resolve_sparse_moe_decode_plan(geometry, gate_up, down).workspace_bytes;
+        required = detail::sparse_moe_decode_workspace_bytes(geometry, adapters ? tokens : 1);
     }
     if (workspace.base() == nullptr || workspace.capacity() < required ||
         workspace.used() > workspace.capacity() - required) {
@@ -563,8 +564,28 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
         }
         return;
     }
-    const detail::SparseMoeDecodeWorkspace views =
-        detail::allocate_sparse_moe_decode_workspace(workspace, geometry);
+    auto views = detail::allocate_sparse_moe_decode_workspace(workspace, geometry, adapters ? tokens : 1);
+    if (adapters) {
+        views.slot_stride = adapter_round.slots ? 1 : 0;
+        const auto* slots = adapter_round.slots ? static_cast<const std::int32_t*>(adapter_round.slots->data)
+                                                : adapter_round.uniform_cell;
+        struct Correction {
+            const SparseMoeWeights& weights; const SparseMoeGeometry& geometry;
+            const Tensor& scores; const LoraBank* banks; const std::int32_t* slots;
+            int stride; const SparseMoeRoundHook* next;
+        } correction{weights, geometry, views.scratch, adapters, slots, views.slot_stride, round_hook};
+        const SparseMoeRoundHook corrected{
+            [](void* context, const Tensor& ids, const Tensor& alpha, const Tensor& input,
+               Tensor& output, cudaStream_t stream) {
+                const auto& c = *static_cast<Correction*>(context);
+                lora_router_bias(c.scores, ids, alpha, c.weights.router_bias, c.weights.per_expert_scale,
+                                 c.geometry, c.banks, c.slots, c.stride, stream);
+                if (c.next) { c.next->resolve(c.next->context, ids, alpha, input, output, stream); }
+            }, &correction};
+        detail::sparse_moe_decode_launch(geometry, x, router_x, weights, destination, views,
+            stream, weights.router_bias ? &corrected : round_hook, adapters, slots);
+        return;
+    }
     for (std::int32_t token = 0; token < tokens; ++token) {
         const Tensor x_column      = x.slice(1, token, 1);
         const Tensor router_column = router_x.slice(1, token, 1);

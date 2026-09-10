@@ -1,3 +1,4 @@
+#include "api/ops/lora_store.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "api/ops/linear.h"
 
@@ -206,11 +207,13 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             WorkspaceArena& workspace, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, policy);
     dispatch_linear(x, w, out, policy, &workspace, stream);
+    lora_auto_linear(w, x, out, stream);
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+    lora_auto_linear(w, x, out, stream);
 }
 
 namespace {

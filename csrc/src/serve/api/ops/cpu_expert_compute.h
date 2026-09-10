@@ -14,6 +14,7 @@
 // split, activation/weight hand-off, host-function handshake) follows.
 
 #include "api/ops/sparse_moe.h"
+#include "api/ops/lora.h"
 #include "core/tensor.h"
 
 #include <cstddef>
@@ -76,6 +77,7 @@ struct CpuExpertJob {
     std::int32_t token  = 0;
     std::int32_t expert = 0;
     float weight        = 0.0F;
+    std::int32_t adapter_slot = -1;
 };
 
 /// A round: activations for `tokens` columns (BF16, column-major [hidden, tokens] as the
@@ -86,6 +88,7 @@ struct CpuExpertRound {
     float* out             = nullptr; // FP32 [hidden, tokens], accumulated (weight-scaled)
     std::int32_t tokens    = 0;
     std::span<const CpuExpertJob> jobs;
+    const LoraBank* adapters = nullptr; // host mirror, same expert-indexed order as the GPU
 };
 
 /// Computes one job on the calling thread (reference entry point; the pool uses it too).
@@ -93,7 +96,7 @@ struct CpuExpertRound {
 [[nodiscard]] std::size_t cpu_expert_scratch_bytes(const SparseMoeGeometry& geometry);
 void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBank& bank,
                             const CpuExpertJob& job, const std::uint16_t* x_column, float* out_column,
-                            std::byte* scratch);
+                            std::byte* scratch, const LoraBank* adapters = nullptr);
 
 /// A pool of pinned worker threads (one per physical core by default) that splits a round's
 /// jobs across cores and blocks until they are done. Output columns shared by several jobs

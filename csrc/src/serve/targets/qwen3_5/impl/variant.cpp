@@ -452,6 +452,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
         family::project_gdn_control(hidden, weights, a, b, workspace, stream);
         family::apply_lora(adapter_key, family::kGdnAPort, hidden, a, stream);
         family::apply_lora(adapter_key, family::kGdnBPort, hidden, b, stream);
+        ops::lora_auto_bias(weights.dt_bias, a, stream);
         ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, g, beta, stream);
         return;
     }
@@ -464,6 +465,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
         Tensor b = workspace.alloc(DType::BF16, {control.b_projection.n, hidden.ne[1]});
         ops::linear(hidden, control.a_projection, a, stream);
         ops::linear(hidden, control.b_projection, b, stream);
+        ops::lora_auto_bias(weights.dt_bias, a, stream);
         ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, g, beta, stream);
         return;
     }

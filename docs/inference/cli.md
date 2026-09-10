@@ -212,17 +212,19 @@ requests at the same time.
 | `--max-loras N` | 1 | Maximum loaded adapters per model |
 | `--max-lora-rank N` | 32 | Largest adapter rank accepted |
 
-Adapters support the following text decoder projections, where those modules exist in the
-checkpoint:
+LoRA and DoRA adapters support the following modules, where they exist in the checkpoint:
 
 | Model or component | Adapter modules |
 |---|---|
 | Llama, dense Qwen layers, Gemma 3 and Gemma 4 | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj` |
+| Token embeddings and output head | `embed_tokens` (or the checkpoint’s `embedding`, `tok_embeddings`, `word_embeddings`), `lm_head` |
 | Gemma 4 E2B/E4B per-layer inputs | `per_layer_input_gate`, `per_layer_projection` |
 | Qwen3.5/3.6 and Qwen3.8-Flash-Next attention | `q_proj` (including its attention gate), `k_proj`, `v_proj`, `o_proj` |
 | Qwen hybrid linear attention | `linear_attn.in_proj_qkv`, `linear_attn.in_proj_z`, `linear_attn.in_proj_a`, `linear_attn.in_proj_b`, `linear_attn.out_proj` |
 | Spark-X2.5 | `q_k_v_proj`, `g_proj`, `out_proj`, `gate_proj`, `up_proj`, `down_proj` |
 | LFM2, LFM2-MoE and the text decoder of LFM2-VL | Attention projections, `conv.in_proj`, `conv.out_proj`, and dense `feed_forward.w1`, `w2`, `w3` |
+| Qwen vision towers | Patch projection, attention QKV/output, MLP projections, merger and deepstack projections |
+| LFM2-VL vision tower | Patch projection, attention Q/K/V/output, MLP projections and multimodal projector |
 | Routed experts on supported MoE models | Each expert's `gate_proj`, `up_proj`, `down_proj`; LFM2 expert names `w1`, `w3`, `w2` are also accepted |
 | MoE router and shared expert | `mlp.gate` (or the checkpoint's `router.proj` / `feed_forward.gate`), `mlp.shared_expert_gate`, and the shared expert's `gate_proj`, `up_proj`, `down_proj`, where present |
 
@@ -232,13 +234,19 @@ for each expert and support ranks up to 256. Adapters work with supported quanti
 models, including NVFP4.
 Use the smallest `--max-lora-rank` and `--max-loras` that fit your adapters, especially for MoE models.
 
-Enabling expert adapters can reduce prefill throughput. CPU weight offloading remains
-available, but expert computation runs on the GPU while adapters are enabled; CPU expert
-compute shares do not apply in that mode.
+Expert adapters support batched prefill and CPU expert computation. CPU weight offloading,
+`--cpu-moe-share` and `--cpu-moe-prefill-share` remain available with adapters enabled.
 
-Vision, embedding and output-head adapters, DoRA, saved bias weights, and per-module rank or
-alpha overrides are not supported. Unsupported tensors are rejected without partially
-applying the adapter. Use `surogate merge` before serving adapters that require those features.
+Adapters may include DoRA magnitudes, LoRA B biases, saved base biases, and per-module rank
+or alpha overrides. Set `--max-lora-rank` to cover the largest rank used by any module.
+Vision adapters require a model served with `--vision`; embedding and output-head adapters
+must match the served vocabulary.
+
+Saved full embedding and output-head weights, including `modules_to_save` exports, are
+also supported. These consume additional GPU memory for each loaded adapter.
+Full replacements of other modules and targets outside the supported
+modules still need `surogate merge` before serving. Unsupported tensors are rejected without
+partially applying the adapter.
 
 Additional models have their own adapters through `lora=name:path` in `--model`. Every model
 and adapter name must be unique. The runtime load/unload endpoints accept `?model=NAME`; see

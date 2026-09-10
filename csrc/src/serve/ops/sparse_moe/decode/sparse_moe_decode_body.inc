@@ -1,3 +1,5 @@
+constexpr int kDecodeScratch = std::max(kPaths, (kRouterRows + kIntermediate - 1) / kIntermediate) * kIntermediate;
+
 // Sparse-MoE decode kernels, instantiated per geometry by sparse_moe_decode_kernels.cu; the
 // including namespace defines kHidden, kExperts, kRouterRows, kTopK, and kIntermediate.
 
@@ -47,7 +49,13 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
 // Expert indices are selected on the device. Low-rank intermediates therefore
 // follow routed paths, while each bank remains indexed by its checkpoint expert.
 __global__ void moe_lora_low_kernel(const __nv_bfloat16* x, const float* act, const int* ids,
-                                     const LoraBank* banks, const int* slot, float* low, bool down) {
+                                     const LoraBank* banks, const int* slot, float* low, bool down, int slot_stride) {
+    const int token = blockIdx.z;
+    if (x) { x += token * kHidden; }
+    if (act) { act += token * kDecodeScratch; }
+    ids += token * kTopK;
+    slot += token * slot_stride;
+    low += token * 2 * kPaths * kMoeLoraMaxRank;
     const int r = blockIdx.x;
     const int path = down ? blockIdx.y : blockIdx.y / 2;
     const int part = down ? 2 : blockIdx.y % 2;
@@ -77,8 +85,19 @@ __device__ float moe_lora_expand(const LoraBank* banks, int index, const int* sl
     return sum;
 }
 
+__device__ float moe_lora_adjust(const LoraBank* banks, int index, const int* slot, int row, float value) {
+    if (!banks || !slot || *slot < 0) { return value; }
+    const auto bank = banks[index];
+    const auto offset = static_cast<std::int64_t>(*slot) * bank.n + row;
+    return value * (bank.gain ? 1.0F + bank.gain[offset] : 1.0F) + (bank.bias ? bank.bias[offset] : 0.0F);
+}
+
 __global__ void moe_lora_router_kernel(const __nv_bfloat16* x, const LoraBank* banks,
-                                        const int* slot, float* scores) {
+                                        const int* slot, float* scores, int slot_stride) {
+    const int token = blockIdx.y;
+    x += token * kHidden;
+    slot += token * slot_stride;
+    scores += token * kDecodeScratch;
     if (*slot < 0) { return; }
     const int row = blockIdx.x;
     const LoraBank bank = banks[row < kExperts ? 0 : 1];
@@ -95,12 +114,14 @@ __global__ void moe_lora_router_kernel(const __nv_bfloat16* x, const LoraBank* b
         dot = warp_reduce_sum(dot);
         if (threadIdx.x == 0) { delta = fmaf(__bfloat162float(b[r]), dot, delta); }
     }
-    if (threadIdx.x == 0) { scores[row] += delta; }
+    if (threadIdx.x == 0) { scores[row] = moe_lora_adjust(banks, row < kExperts ? 0 : 1, slot, row < kExperts ? row : 0, scores[row] + delta); }
 }
 
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
                                      float* __restrict__ scores) {
+    x += blockIdx.y * kHidden;
+    scores += blockIdx.y * kDecodeScratch;
     __shared__ float partial[kD1Warps];
     const int row   = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
@@ -120,6 +141,10 @@ __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int*
                                           float* __restrict__ shared_scale,
                                           const float* __restrict__ router_bias,
                                           const float* __restrict__ per_expert_scale) {
+    scores += blockIdx.y * kDecodeScratch;
+    ids += blockIdx.y * kTopK;
+    alpha += blockIdx.y * kTopK;
+    shared_scale += blockIdx.y;
     __shared__ float selected_logits[kTopK];
     if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     sparse_moe_select_top_k_warp<kExperts, kTopK, kHasShared, kGating, kSharedGated,
@@ -396,7 +421,13 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     const int* __restrict__ slot_of_expert, const float* __restrict__ routed_gate_up_scale,
     const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act,
-    const LoraBank* adapters, const int* adapter_slot, const float* lora_low) {
+    const LoraBank* adapters, const int* adapter_slot, const float* lora_low, int slot_stride) {
+    const int token = blockIdx.y;
+    x += token * kHidden;
+    ids += token * kTopK;
+    act += token * kDecodeScratch;
+    if (adapter_slot) { adapter_slot += token * slot_stride; }
+    if (lora_low) { lora_low += token * 2 * kPaths * kMoeLoraMaxRank; }
     if (adapters) { pdl::wait_for_dependencies(); }
     __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
     const int tid  = static_cast<int>(threadIdx.x);
@@ -435,12 +466,14 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
                                        x_shared, 0, kHidden, gate, up);
     }
     if (lane == 0) {
-        if (adapters) {
+        if (adapters && (warp >= kTopK || !slot_of_expert || slot_of_expert[ids[warp]] >= 0)) {
             const int expert = warp < kTopK ? ids[warp] : kExperts;
             gate += moe_lora_expand(adapters, 2 + 3 * expert, adapter_slot, j,
                                      lora_low + (warp * 2) * kMoeLoraMaxRank);
             up += moe_lora_expand(adapters, 3 + 3 * expert, adapter_slot, j,
                                    lora_low + (warp * 2 + 1) * kMoeLoraMaxRank);
+            gate = moe_lora_adjust(adapters, 2 + 3 * expert, adapter_slot, j, gate);
+            up = moe_lora_adjust(adapters, 3 + 3 * expert, adapter_slot, j, up);
         }
         act[static_cast<std::int64_t>(warp) * kIntermediate + j] = gated_clamped(gate, up, kSwigluLimit, kActivation);
     }
@@ -592,7 +625,15 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     const int* __restrict__ slot_of_expert, const float* __restrict__ routed_down_scale,
     const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination,
-    const LoraBank* adapters, const int* adapter_slot, const float* lora_low) {
+    const LoraBank* adapters, const int* adapter_slot, const float* lora_low, int slot_stride) {
+    const int token = blockIdx.y;
+    ids += token * kTopK;
+    alpha += token * kTopK;
+    shared_scale += token;
+    act += token * kDecodeScratch;
+    destination += token * kHidden;
+    if (adapter_slot) { adapter_slot += token * slot_stride; }
+    if (lora_low) { lora_low += token * 2 * kPaths * kMoeLoraMaxRank; }
     __shared__ float paths[kPaths][Rows];
     pdl::wait_for_dependencies();
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
@@ -620,8 +661,9 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
         if (lane == 0) {
 #pragma unroll
             for (int row = 0; row < Rows; ++row) {
-                if (adapters) { dot[row] += moe_lora_expand(adapters, 4 + 3 * expert, adapter_slot,
-                    row_base + row, lora_low + warp * kMoeLoraMaxRank); }
+                if (adapters && block >= 0) { dot[row] += moe_lora_expand(adapters, 4 + 3 * expert, adapter_slot,
+                    row_base + row, lora_low + warp * kMoeLoraMaxRank);
+                    dot[row] = moe_lora_adjust(adapters, 4 + 3 * expert, adapter_slot, row_base + row, dot[row]); }
                 paths[warp][row] = weight * dot[row];
             }
         }
@@ -634,7 +676,8 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
 #pragma unroll
             for (int row = 0; row < Rows; ++row) {
                 if (adapters) { dot[row] += moe_lora_expand(adapters, 4 + 3 * kExperts, adapter_slot,
-                    row_base + row, lora_low + kTopK * kMoeLoraMaxRank); }
+                    row_base + row, lora_low + kTopK * kMoeLoraMaxRank);
+                    dot[row] = moe_lora_adjust(adapters, 4 + 3 * kExperts, adapter_slot, row_base + row, dot[row]); }
                 paths[kTopK][row] = *shared_scale * dot[row];
             }
         }
@@ -723,7 +766,7 @@ __global__ void sparse_moe_d4_token_kernel(
 
 void launch_d1(const Tensor& x, const Weight& router_shared_gate,
                const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
-    sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
+    sparse_moe_d1_kernel<<<dim3(kRouterRows, x.ne[1]), kD1Warps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(router_shared_gate.qdata),
         static_cast<float*>(workspace.scratch.data));
@@ -743,11 +786,11 @@ void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
     const auto* shared_codes  = static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata);
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_gate_up.scales);
     CUDA_CHECK(pdl::launch_dependent(
-        {dim3(kIntermediate), dim3(kPaths * 32), 0, stream},
+        {dim3(kIntermediate, x.ne[1]), dim3(kPaths * 32), 0, stream},
         sparse_moe_d3_nine_warp_kernel<Codec>,
         input, ids, routed_codes, routed_high, routed_scales, weights.slot_of_expert,
         weights.routed_gate_up_scale, shared_codes, shared_scales, act,
-        adapters, adapter_slot, static_cast<const float*>(workspace.lora_low.data)));
+        adapters, adapter_slot, static_cast<const float*>(workspace.lora_low.data), workspace.slot_stride));
 }
 
 // How long the routed expert kernels run (SUROGATE_SERVE_D3_PROBE=1). This is the whole of
@@ -819,7 +862,7 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
     auto* ids          = static_cast<int*>(workspace.ids.data);
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
     auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
-    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale,
+    sparse_moe_d2_warp_kernel<<<dim3(1, x.ne[1]), 32, 0, stream>>>(scores, ids, alpha, shared_scale,
                                                    weights.router_bias,
                                                    weights.per_expert_scale);
     CUDA_CHECK(cudaGetLastError());
@@ -830,9 +873,9 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
     }
 
     if (adapters) {
-        moe_lora_low_kernel<<<dim3(kMoeLoraMaxRank, 2 * kPaths), 32, 0, stream>>>(
+        moe_lora_low_kernel<<<dim3(kMoeLoraMaxRank, 2 * kPaths, x.ne[1]), 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), nullptr, ids, adapters, adapter_slot,
-            static_cast<float*>(workspace.lora_low.data), false);
+            static_cast<float*>(workspace.lora_low.data), false, workspace.slot_stride);
         CUDA_CHECK(cudaGetLastError());
     }
     d3_probe().begin(stream);
@@ -885,12 +928,12 @@ void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destinat
     // was the best of the three there. Measured on a 5090, cold, over Q4_K/Q5_K/Q6_K.
     constexpr int kD4Rows = kIntermediate <= 512 ? 4 : kIntermediate <= 1024 ? 2 : 1;
     static_assert(kHidden % kD4Rows == 0);
-    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden / kD4Rows), dim3(kPaths * 32), 0, stream},
+    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden / kD4Rows, destination.ne[1]), dim3(kPaths * 32), 0, stream},
                                      sparse_moe_d4_nine_warp_kernel<Codec, kD4Rows>, ids, alpha,
                                      shared_scale, act, routed_codes, routed_high, routed_scales,
                                      weights.slot_of_expert, weights.routed_down_scale,
                                      shared_codes, shared_scales, output, adapters, adapter_slot,
-                                     static_cast<const float*>(workspace.lora_low.data)));
+                                     static_cast<const float*>(workspace.lora_low.data), workspace.slot_stride));
 }
 
 void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
@@ -1125,17 +1168,17 @@ void decode_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeigh
                    const LoraBank* adapters, const int* adapter_slot) {
     launch_d1(router_x, weights.router_shared_gate, workspace, stream);
     if (adapters) {
-        moe_lora_router_kernel<<<kRouterRows, 32, 0, stream>>>(
+        moe_lora_router_kernel<<<dim3(kRouterRows, x.ne[1]), 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(router_x.data), adapters, adapter_slot,
-            static_cast<float*>(workspace.scratch.data));
+            static_cast<float*>(workspace.scratch.data), workspace.slot_stride);
         CUDA_CHECK(cudaGetLastError());
     }
     launch_d2_d3(x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
     if (adapters) {
-        moe_lora_low_kernel<<<dim3(kMoeLoraMaxRank, kPaths), 32, 0, stream>>>(
+        moe_lora_low_kernel<<<dim3(kMoeLoraMaxRank, kPaths, x.ne[1]), 32, 0, stream>>>(
             nullptr, static_cast<const float*>(workspace.scratch.data),
             static_cast<const int*>(workspace.ids.data), adapters, adapter_slot,
-            static_cast<float*>(workspace.lora_low.data), true);
+            static_cast<float*>(workspace.lora_low.data), true, workspace.slot_stride);
         CUDA_CHECK(cudaGetLastError());
     }
     launch_d4_dependent(weights, destination, workspace, stream, adapters, adapter_slot);

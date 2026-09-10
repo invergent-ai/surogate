@@ -74,6 +74,20 @@ int main() {
     service.shrink_kv();
     const auto original = generate(service, request);
     assert(original.completion_tokens == request.max_tokens);
+    {
+        // Reuse the complete evaluated prefix: the cached hidden state must still
+        // select the adapter's head when generating its last sampled token again.
+        auto cached = request;
+        cached.raw_prompt.reset();
+        cached.prompt_token_ids = original.prompt_token_ids;
+        cached.prompt_token_ids.insert(cached.prompt_token_ids.end(),
+            original.completion_token_ids.begin(), original.completion_token_ids.end() - 1);
+        cached.max_tokens = 1;
+        const auto replay = generate(service, cached);
+        assert(replay.metrics.prefix_cache_hit_tokens == static_cast<int>(cached.prompt_token_ids.size()));
+        assert(replay.completion_token_ids == std::vector<sinfer::TokenId>{original.completion_token_ids.back()});
+        assert(std::abs(replay.token_logprobs[0] - original.token_logprobs.back()) < .005F);
+    }
     service.shrink_kv();
     {
         auto running = service.prepare(request);

@@ -370,6 +370,7 @@ struct ExpertCache::Impl {
         std::int32_t index     = -1;
         ops::ExpertHostBank bank;
         ops::CpuExpertBank cpu_bank; // host addresses of the same planes
+        const ops::LoraBank* adapters = nullptr;
         std::int32_t round_tokens = 0; // set before the host function of a round is enqueued
         // Round bookkeeping for the CPU split: a round may reach the hook in several slices
         // (prefill and mixed rounds); the split decision is per round and each slice is staged
@@ -415,20 +416,22 @@ struct ExpertCache::Impl {
         // overwriting copy is only *enqueued*, and the main stream cannot reach it until the
         // combine's wait on `join_event` has retired this callback.
         std::uint64_t staged_generation = 0;
+        bool lora_uniform = false;
     };
     std::uint64_t staging_generation = 0;
     std::deque<SliceContext> slice_contexts;
     SliceContext& slice_context(Layer& entry, std::int32_t offset, std::int32_t tokens,
-                                std::int32_t ordinal) {
+                                std::int32_t ordinal, bool lora_uniform) {
         for (SliceContext& c : slice_contexts) {
             if (c.entry == &entry && c.offset == offset && c.tokens == tokens &&
-                c.ordinal == ordinal) {
+                c.ordinal == ordinal && c.lora_uniform == lora_uniform) {
                 return c;
             }
         }
         slice_contexts.push_back(SliceContext{&entry, offset, tokens, ordinal,
                                               &mirrors[static_cast<std::size_t>(ordinal)]});
         SliceContext& created = slice_contexts.back();
+        created.lora_uniform = lora_uniform;
         // The last slot is the probe's; stop one short of it so the two never meet.
         if (handshake.enabled && handshake.used + 1 < handshake_slots()) {
             created.handshake_slot = static_cast<std::int32_t>(handshake.used);
@@ -618,7 +621,7 @@ struct ExpertCache::Impl {
         for (auto stream : {fake_stream, cpu_stream}) {
             if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
         }
-        for (auto pointer : {static_cast<void*>(handshake.ready), static_cast<void*>(x_host),
+        for (auto pointer : {static_cast<void*>(handshake.ready), static_cast<void*>(x_host), static_cast<void*>(adapter_slots_host),
                              static_cast<void*>(out_host), static_cast<void*>(x_check),
                              static_cast<void*>(out_check)}) {
             if (pointer != nullptr) { (void)cudaFreeHost(pointer); }
@@ -639,6 +642,7 @@ struct ExpertCache::Impl {
     ops::ExpertCpuJobList cpu_jobs;
     // Pinned host staging: activations, jobs, count, and the FP32 partial the GPU adds back.
     std::uint16_t* x_host   = nullptr;
+    std::int32_t* adapter_slots_host = nullptr;
     float* out_host         = nullptr;
     void* out_device_alias  = nullptr;
     void* jobs_host_block   = nullptr; // pinned mirror of the device job list (same carve)
@@ -817,10 +821,11 @@ struct ExpertCache::Impl {
         }
         for (long long i = 0; i < count; ++i) {
             cache.job_scratch[static_cast<std::size_t>(i)] = {mirror.tokens[i], mirror.experts[i],
-                                                              mirror.weights[i]};
+                                                              mirror.weights[i], entry->adapters
+                ? cache.adapter_slots_host[slice->offset + (slice->lora_uniform ? 0 : mirror.tokens[i])] : -1};
         }
         ops::CpuExpertRound round{cache.x_host + column0, cache.out_host + column0, tokens,
-                                  cache.job_scratch};
+                                  cache.job_scratch, entry->adapters};
         cache.cpu_pool->run(entry->cpu_bank, round);
         // SUROGATE_SERVE_CPU_MOE_SELFCHECK=1: run the pool a second time and compare (a race
         // in the pool shows as a run-to-run difference far above accumulation-order noise),
@@ -990,7 +995,9 @@ struct ExpertCache::Impl {
         if (ordinal >= kJobMirrors) {
             throw std::logic_error("expert cache: CPU split round has more slices than job mirrors");
         }
-        SliceContext& slice     = slice_context(entry, offset, tokens, ordinal);
+        const auto& adapter_round = ops::lora_current_round();
+        const bool uniform = !adapter_round.slots;
+        SliceContext& slice = slice_context(entry, offset, tokens, ordinal, uniform);
         slice.staged_generation = ++staging_generation;
         const std::size_t column0 = static_cast<std::size_t>(offset) * hidden;
         // The staging copies run on the main stream: they are small, and stream order then
@@ -1000,6 +1007,13 @@ struct ExpertCache::Impl {
         CUDA_CHECK(cudaMemcpyAsync(x_host + column0, x.data,
                                    static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
                                    cudaMemcpyDeviceToHost, stream));
+        if (entry.adapters) {
+            const auto* ids = adapter_round.slots
+                ? static_cast<const std::int32_t*>(adapter_round.slots->data) + offset
+                : adapter_round.uniform_cell;
+            CUDA_CHECK(cudaMemcpyAsync(adapter_slots_host + offset, ids,
+                (uniform ? 1 : tokens) * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
+        }
         CUDA_CHECK(cudaMemcpyAsync(slice.mirror->block, cpu_jobs_memory, jobs_block_bytes,
                                    cudaMemcpyDeviceToHost, stream));
         entry.round_offset = offset + tokens;
@@ -1398,6 +1412,9 @@ struct ExpertCache::Impl {
                 CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&x_host),
                                          static_cast<std::size_t>(hidden) * stage_tokens * sizeof(std::uint16_t),
                                          cudaHostAllocPortable));
+                CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&adapter_slots_host),
+                                         stage_tokens * sizeof(std::int32_t), cudaHostAllocPortable));
+                std::fill_n(adapter_slots_host, stage_tokens, -1);
                 CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&out_host),
                                          static_cast<std::size_t>(hidden) * stage_tokens * sizeof(float),
                                          cudaHostAllocMapped | cudaHostAllocPortable));
@@ -1648,13 +1665,8 @@ void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor
     const ops::SparseMoeWeights pooled =
         ops::expert_slot_weights(cache.pool, cache.directory, mixture.layer, op);
     cache.begin_round(layer, tokens);
-    // Host weights can still be offloaded and gathered on demand. Adapted expert
-    // activations are computed together on the GPU until the CPU runner has the
-    // same per-request adapter inputs; a base-only CPU partial would be wrong.
-    if (ops::lora_active() && ops::lora_current_round().valid() &&
-        ops::lora_store_for_current_device().bank_table(op.router_shared_gate.qdata)) {
-        layer.round_split = false;
-    }
+    layer.adapters = ops::lora_active() && ops::lora_current_round().valid()
+        ? ops::lora_store_for_current_device().host_bank_table(op.router_shared_gate.qdata) : nullptr;
     ops::SparseMoeRoundHook hook{&Impl::resolve_round, &layer};
     ops::sparse_moe(hidden, router_input == nullptr ? hidden : *router_input,
                     pooled, ops::SparseMoeEpilogue::AddResidual, destination, leaf, stream,

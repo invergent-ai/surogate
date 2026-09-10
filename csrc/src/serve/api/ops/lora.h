@@ -64,7 +64,14 @@ struct LoraBank {
     std::int32_t rank     = 0;       ///< max_rank; a shorter adapter is zero-padded
     std::int32_t n        = 0;
     std::int32_t k        = 0;
+    const float* gain = nullptr; ///< [slots,n], multiplicative adjustment (zero means identity)
+    const float* bias = nullptr; ///< [slots,n], additive adjustment after gain
 };
+
+void lora_embedding(const Tensor& token_ids, const LoraBank& bank, const Tensor& slots,
+                    const std::int32_t* uniform, Tensor& out, cudaStream_t stream);
+void lora_shift(const LoraBank& bank, const Tensor& slots, const std::int32_t* uniform,
+                Tensor& out, cudaStream_t stream);
 
 /// out[n, T] += B[ids[t]] · (A[ids[t]] · x[:, t]), per token.
 ///

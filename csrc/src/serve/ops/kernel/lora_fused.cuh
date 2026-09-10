@@ -36,7 +36,10 @@ struct LoraFusedPair {
     std::int64_t a_stride  = 0;       ///< elements between adapter slots of a
     std::int64_t b_stride  = 0;       ///< elements between adapter slots of b
     std::int32_t n         = 0;
+    std::int64_t out_stride = 0;
     std::int32_t rank      = 0;       ///< the bank's padded rank
+    const float* gain = nullptr;
+    const float* bias = nullptr;
     std::int32_t row_begin = 0;       ///< prefix offset in the concatenated rows
 };
 
@@ -124,8 +127,11 @@ __global__ __launch_bounds__(kLoraFusedThreads) void lora_fused_delta_kernel(Lor
     for (int r = 0; r < pair.rank; ++r) {
         acc += __bfloat162float(b_row[r]) * low[q][r];
     }
-    __nv_bfloat16* cell = pair.out + static_cast<std::int64_t>(token) * pair.n + local;
-    *cell               = __float2bfloat16(__bfloat162float(*cell) + acc);
+    __nv_bfloat16* cell = pair.out + static_cast<std::int64_t>(token) * pair.out_stride + local;
+    const auto index = static_cast<std::int64_t>(adapter) * pair.n + local;
+    const float gain = pair.gain ? 1.0F + pair.gain[index] : 1.0F;
+    const float bias = pair.bias ? pair.bias[index] : 0.0F;
+    *cell = __float2bfloat16((__bfloat162float(*cell) + acc) * gain + bias);
 }
 
 /// The split flavor of the same site, for geometries where the one-launch
@@ -223,8 +229,11 @@ __global__ __launch_bounds__(kLoraFusedThreads) void lora_split_expand_kernel(
     for (int r = 0; r < pair.rank; ++r) {
         acc += __bfloat162float(b_row[r]) * __bfloat162float(low_col[r]);
     }
-    __nv_bfloat16* cell = pair.out + static_cast<std::int64_t>(token) * pair.n + local;
-    *cell               = __float2bfloat16(__bfloat162float(*cell) + acc);
+    __nv_bfloat16* cell = pair.out + static_cast<std::int64_t>(token) * pair.out_stride + local;
+    const auto index = static_cast<std::int64_t>(adapter) * pair.n + local;
+    const float gain = pair.gain ? 1.0F + pair.gain[index] : 1.0F;
+    const float bias = pair.bias ? pair.bias[index] : 0.0F;
+    *cell = __float2bfloat16((__bfloat162float(*cell) + acc) * gain + bias);
 }
 
 } // namespace sinfer::ops

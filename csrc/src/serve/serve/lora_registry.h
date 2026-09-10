@@ -24,11 +24,20 @@
 
 namespace sinfer::serve {
 
+struct AdapterTensorRef {
+    std::uint64_t offset = 0, bytes = 0, elements = 0;
+    std::string dtype;
+};
+
 /// One `lora_A`/`lora_B` pair, named by the base module it adapts.
 struct LoraTensorPair {
     std::string module;       ///< e.g. "model.layers.3.self_attn.q_proj"
     std::int32_t rank   = 0;  ///< rows of A / columns of B
     std::int32_t b_rank = 0;
+    double scale = 1.0;
+    AdapterTensorRef magnitude, bias, lora_bias, base_weight;
+    int base_in = 0, base_out = 0;
+    bool bias_only = false;
     std::int32_t in_dim = 0;  ///< columns of A: the projection's k
     std::int32_t out_dim = 0; ///< rows of B: the projection's n
     std::uint64_t a_offset = 0; ///< byte offsets into the safetensors payload
@@ -73,10 +82,9 @@ public:
     /// The adapter a request named, or nullptr when the name is the base model.
     [[nodiscard]] const LoraAdapter* find(const std::string& name) const;
 
-    /// Reads one adapter's tensors and decodes them to BF16, tagged with the text
-    /// layer and module the name encodes. Modules outside the text decoder
-    /// (vision, embedding or head adapters) are skipped, and reported
-    /// through `skipped` so the caller can refuse rather than quietly drop them.
+    /// Reads adapter tensors, preserving FP32 magnitudes/biases and converting weights
+    /// to BF16. Unknown namespaces are reported through `skipped` for the caller
+    /// to refuse rather than silently dropping part of the adapter.
     [[nodiscard]] static std::vector<EngineOptions::LoraModulePayload> read_payloads(
         const LoraAdapter& adapter, std::vector<std::string>& skipped);
 

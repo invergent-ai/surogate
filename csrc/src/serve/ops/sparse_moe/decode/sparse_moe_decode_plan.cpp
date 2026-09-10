@@ -7,9 +7,9 @@
 
 namespace sinfer::ops::detail {
 
-std::size_t sparse_moe_decode_workspace_bytes(const SparseMoeGeometry& geometry) {
+std::size_t sparse_moe_decode_workspace_bytes(const SparseMoeGeometry& geometry, std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
-    (void)allocate_sparse_moe_decode_workspace(layout, geometry);
+    (void)allocate_sparse_moe_decode_workspace(layout, geometry, tokens);
     return layout.peak_bytes(1);
 }
 

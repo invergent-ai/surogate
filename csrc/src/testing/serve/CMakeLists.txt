@@ -207,6 +207,10 @@ sinfer_add_test(sinfer_lora_coverage_test
   SOURCES test_lora_coverage.cpp
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_lora_coverage_test PRIVATE -UNDEBUG)
+sinfer_add_test(sinfer_lora_extended_test
+  SOURCES test_lora_extended.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_lora_extended_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_lora_registry_test
   SOURCES test_lora_registry.cpp
   LIBRARIES sinfer_serve)

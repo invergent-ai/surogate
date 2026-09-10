@@ -14,6 +14,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 namespace sinfer {
 
@@ -146,6 +147,11 @@ struct EngineOptions {
         float scale          = 1.0F;  ///< PEFT alpha/r
         std::vector<std::uint16_t> a; ///< [rank, in_dim] BF16
         std::vector<std::uint16_t> b; ///< [out_dim, rank] BF16
+        mutable std::unordered_map<const void*, std::shared_ptr<void>> prepared_replacements;
+        std::vector<std::uint16_t> base_weight; ///< optional saved embedding/head matrix, BF16
+        std::vector<float> magnitude; ///< DoRA output-channel magnitudes
+        std::vector<float> bias; ///< saved base bias, replacing the original
+        std::vector<float> lora_bias; ///< LoRA B bias, scaled like B @ A
     };
     std::vector<LoraModulePayload> lora_payloads;
     /// Bank geometry: how many adapters may be resident at once and the widest

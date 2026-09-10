@@ -1,3 +1,4 @@
+#include "api/ops/lora_replacement.h"
 // The resident adapter banks (api/ops/lora_store.h).
 
 #include "api/ops/lora_store.h"
@@ -21,6 +22,12 @@
 
 namespace sinfer::ops {
 namespace {
+
+struct StoreContextScope {
+    const void* previous = current_ops_owner();
+    explicit StoreContextScope(const void* owner) { bind_ops_context(static_cast<EngineOpsContext*>(const_cast<void*>(owner))); }
+    ~StoreContextScope() { bind_ops_context(static_cast<EngineOpsContext*>(const_cast<void*>(previous))); }
+};
 
 float bf16_to_float(std::uint16_t bits) {
     const std::uint32_t word = static_cast<std::uint32_t>(bits) << 16U;
@@ -63,6 +70,7 @@ LoraStore::~LoraStore() {
         if (!bank.raw) { continue; }
         cudaFree(bank.a);
         cudaFree(bank.b);
+        cudaFree(bank.affine);
     }
     if (raw_round_state_) {
         cudaFree(scratch_);
@@ -78,6 +86,7 @@ void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_
     if (!banks_.empty()) {
         throw std::logic_error("lora_store: configure must precede any slot");
     }
+    owner_ = current_ops_owner();
     slots_          = slots;
     max_rank_       = max_rank;
     scratch_tokens_ = max_tokens;
@@ -173,6 +182,11 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
         }
     }
 
+    if (!bank.host_a.empty()) {
+        std::copy(a_padded.begin(), a_padded.end(), bank.host_a.begin() + slot * bank.view.a_stride);
+        std::copy(b_padded.begin(), b_padded.end(), bank.host_b.begin() + slot * bank.view.b_stride);
+    }
+
     // The caller may be on another device -- an adapter upload runs on an HTTP
     // handler thread, and under a pipeline this store is one stage's of several.
     // A copy resolves its destination against the current device, not against the
@@ -204,6 +218,123 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
 // the next stage's. What must not happen is a bank appearing once the engine
 // serves -- `set_slot` refuses that, and every registration here runs inside the
 // engine's construction window.
+void LoraStore::register_base_weight(const Weight& weight) {
+    if (weight.qdata && weight.n > 0 && weight.k > 0) { base_weights_.emplace(weight.qdata, weight); }
+}
+void LoraStore::register_base(const void* key, std::int32_t port, std::vector<LoraBaseView> base,
+                               Tensor bias, bool bias_in_output) {
+    bases_[Key{key, port}] = Base{std::move(base), bias, bias_in_output};
+}
+LoraStore::Base LoraStore::base_for(const ModuleBinding& binding) const {
+    if (const auto it = bases_.find(Key{binding.key, binding.port}); it != bases_.end()) { return it->second; }
+    const auto found = base_weights_.find(binding.key);
+    if (found == base_weights_.end()) { throw std::invalid_argument("adapter base projection was not registered"); }
+    const auto& weight = found->second;
+    if (weight.k != binding.in) { throw std::invalid_argument("adapter base projection input shape disagrees"); }
+    if (weight.n == binding.out) { return Base{{LoraBaseView{weight, 0, 0, binding.out}}}; }
+    std::map<int, int> ports;
+    for (const auto& [where, parts] : directory_) {
+        for (const auto& part : parts) {
+            if (part.key == binding.key && part.in == weight.k) { ports.emplace(part.port, part.out); }
+        }
+    }
+    // Fused attention is Q,K,gate,V; dense MLPs are gate,up; GDN controls are a,b.
+    constexpr int order[] = {0, 1, 7, 2, 5, 6, 8, 9, 10, 11};
+    int rows = 0, first = -1;
+    for (int port : order) {
+        if (!ports.contains(port)) { continue; }
+        if (port == binding.port) { first = rows; }
+        rows += ports.at(port);
+    }
+    if (rows != weight.n || first < 0) { throw std::invalid_argument("adapter base projection needs an explicit row mapping"); }
+    return Base{{LoraBaseView{weight, first, 0, binding.out}}};
+}
+
+std::shared_ptr<DeviceArena> LoraStore::stage_replacement(std::int32_t layer, const std::string& module,
+    const std::vector<std::uint16_t>& weight) const {
+    if (weight.empty()) { return {}; }
+    const auto& parts = module_parts(layer, module);
+    if (parts.size() != 1 || !replacements_.contains(Key{parts.front().key, parts.front().port}) ||
+        weight.size() != static_cast<std::size_t>(parts.front().in) * parts.front().out) {
+        throw std::invalid_argument("saved embedding/head shape disagrees with the served vocabulary");
+    }
+    const ScopedDevice device(device_ < 0 ? current_device() : device_);
+    const StoreContextScope owner(owner_);
+    auto staged = std::make_shared<DeviceArena>(weight.size() * 2);
+    CUDA_CHECK(cudaMemcpy(staged->base(), weight.data(), weight.size() * 2, cudaMemcpyHostToDevice));
+    return staged;
+}
+
+std::vector<std::vector<float>> LoraStore::prepare_affine(std::int32_t layer,
+    const std::string& module, const std::vector<std::uint16_t>& a,
+    const std::vector<std::uint16_t>& b, std::int32_t rank, float scale,
+    const std::vector<float>& magnitude, const std::vector<float>& bias,
+    const std::vector<float>& lora_bias, const std::vector<std::uint16_t>& base_weight, std::shared_ptr<DeviceArena> prepared) const {
+    const auto& parts = module_parts(layer, module);
+    const int out = parts.front().checkpoint_out();
+    if (!base_weight.empty() && (parts.size() != 1 ||
+        !replacements_.contains(Key{parts.front().key, parts.front().port}) ||
+        base_weight.size() != static_cast<std::size_t>(parts.front().in) * out)) {
+        throw std::invalid_argument("saved embedding/head shape disagrees with the served vocabulary");
+    }
+    for (const auto* values : {&magnitude, &bias, &lora_bias}) {
+        if (!values->empty() && values->size() != static_cast<std::size_t>(out)) {
+            throw std::invalid_argument("adapter magnitude or bias shape disagrees with '" + module + "'");
+        }
+        for (float value : *values) {
+            if (!std::isfinite(value)) { throw std::invalid_argument("adapter magnitude or bias is nonfinite"); }
+        }
+    }
+    std::vector<std::vector<float>> result;
+    if (magnitude.empty() && bias.empty() && lora_bias.empty()) { return result; }
+    const ScopedDevice device(device_ < 0 ? current_device() : device_);
+    const StoreContextScope owner(owner_);
+    for (const auto& part : parts) {
+        std::vector<float> affine(part.out * 2, 0.0F), norms, original(part.out, 0.0F);
+        auto base = base_for(part);
+        if (!magnitude.empty()) {
+            std::vector<std::uint16_t> selected(static_cast<std::size_t>(part.out) * rank);
+            for (int row = 0; row < part.out; ++row) {
+                std::copy_n(b.data() + static_cast<std::size_t>(part.source_row(row)) * rank,
+                            rank, selected.data() + static_cast<std::size_t>(row) * rank);
+            }
+            auto replacement = prepared;
+            if (!base_weight.empty()) {
+                if (!replacement) { replacement = stage_replacement(layer, module, base_weight); }
+                const bool transpose = part.port == kLoraEmbeddingPort;
+                Weight weight;
+                weight.payload = weight.qdata = replacement->base();
+                weight.payload_bytes = base_weight.size() * 2;
+                weight.qtype = QType::BF16_CTRL; weight.layout = QuantLayout::Contiguous; weight.ndim = 2;
+                weight.n = weight.shape[0] = weight.padded_shape[0] = transpose ? part.in : part.out;
+                weight.k = weight.shape[1] = weight.padded_shape[1] = transpose ? part.out : part.in;
+                base.parts = {{weight, 0, 0, part.out, transpose}};
+            }
+            norms = lora_weight_norms(base.parts, a, selected, rank, part.in, part.out, scale);
+        }
+        if (base.bias.data && (!bias.empty() || (!magnitude.empty() && base.bias_in_output))) {
+            if (base.bias.dtype == DType::FP32) {
+                CUDA_CHECK(cudaMemcpy(original.data(), base.bias.data, original.size() * 4, cudaMemcpyDefault));
+            } else {
+                std::vector<std::uint16_t> raw(part.out);
+                CUDA_CHECK(cudaMemcpy(raw.data(), base.bias.data, raw.size() * 2, cudaMemcpyDefault));
+                for (int row = 0; row < part.out; ++row) { original[row] = bf16_to_float(raw[row]); }
+            }
+        }
+        for (int row = 0; row < part.out; ++row) {
+            const int src = part.source_row(row);
+            const float factor = magnitude.empty() ? 1.0F : magnitude[src] / norms[row];
+            if (!std::isfinite(factor)) { throw std::invalid_argument("DoRA magnitude ratio is nonfinite"); }
+            affine[row] = factor - 1.0F;
+            affine[part.out + row] = (lora_bias.empty() ? 0.0F : scale * factor * lora_bias[src]) +
+                (bias.empty() ? 0.0F : bias[src] - original[row]) -
+                (base.bias_in_output ? (factor - 1.0F) * original[row] : 0.0F);
+        }
+        result.push_back(std::move(affine));
+    }
+    return result;
+}
+
 void LoraStore::register_module(std::int32_t layer, std::string module, ModuleBinding binding) {
     if (binding.key == nullptr || binding.in <= 0 || binding.out <= 0 ||
         binding.row_offset < 0 || binding.row_group < 0 || binding.row_stride < binding.row_group ||
@@ -283,7 +414,8 @@ void LoraStore::ensure_banks() {
         const std::size_t b_bytes =
             static_cast<std::size_t>(slots_) * binding.out * max_rank_ * sizeof(std::uint16_t);
         planned.push_back({key, a_bytes, b_bytes, &binding});
-        total += a_bytes + b_bytes + 512;
+        total += a_bytes + b_bytes + static_cast<std::size_t>(slots_) * binding.out * 8 + 768;
+        if (replacements_.contains(key)) { total += slots_ * sizeof(void*) + 256; }
       }
     }
     if (planned.empty() && !need_round_state) { return; }
@@ -310,6 +442,13 @@ void LoraStore::ensure_banks() {
         bank.view.rank     = max_rank_;
         bank.view.n        = binding.out;
         bank.view.k        = binding.in;
+        bank.affine = arena->alloc_bytes(static_cast<std::size_t>(slots_) * binding.out * 8).data;
+        bank.view.gain = static_cast<const float*>(bank.affine);
+        bank.view.bias = bank.view.gain + static_cast<std::size_t>(slots_) * binding.out;
+        if (auto found = replacements_.find(item.key); found != replacements_.end()) {
+            found->second.table = static_cast<void**>(arena->alloc_bytes(slots_ * sizeof(void*)).data);
+            found->second.values.resize(slots_);
+        }
         banks_.emplace(item.key, bank);
     }
     storage_.push_back(std::move(arena));
@@ -317,7 +456,23 @@ void LoraStore::ensure_banks() {
     for (const auto& [key, bindings] : table_bindings_) {
         if (tables_.contains(key)) { continue; }
         std::vector<LoraBank> views;
+        auto& host = host_tables_[key];
         for (const auto& binding : bindings) {
+            LoraBank cpu;
+            if (binding.key) {
+                auto& bank = banks_.at(Key{binding.key, binding.port});
+                if (bank.host_a.empty()) {
+                    bank.host_a.resize(slots_ * bank.view.a_stride);
+                    bank.host_b.resize(slots_ * bank.view.b_stride);
+                    bank.host_affine.resize(static_cast<std::size_t>(slots_) * bank.view.n * 2);
+                }
+                cpu = bank.view;
+                cpu.a = bank.host_a.data();
+                cpu.b = bank.host_b.data();
+                cpu.gain = bank.host_affine.data();
+                cpu.bias = cpu.gain + static_cast<std::size_t>(slots_) * bank.view.n;
+            }
+            host.push_back(cpu);
             views.push_back(binding.key ? banks_.at(Key{binding.key, binding.port}).view : LoraBank{});
         }
         auto table = std::make_unique<DeviceArena>(views.size() * sizeof(LoraBank));
@@ -335,6 +490,11 @@ void LoraStore::register_bank_table(const void* key, const std::vector<ModuleBin
 const LoraBank* LoraStore::bank_table(const void* key) const noexcept {
     const auto found = tables_.find(key);
     return found == tables_.end() ? nullptr : found->second;
+}
+
+const LoraBank* LoraStore::host_bank_table(const void* key) const noexcept {
+    const auto found = host_tables_.find(key);
+    return found == host_tables_.end() ? nullptr : found->second.data();
 }
 
 const LoraStore::ModuleParts& LoraStore::module_parts(std::int32_t layer, const std::string& module) const {
@@ -391,8 +551,15 @@ void LoraStore::validate_module(std::int32_t layer, const std::string& module,
 void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
                                 const std::vector<std::uint16_t>& a,
                                 const std::vector<std::uint16_t>& b, std::int32_t rank,
-                                std::int32_t in_dim, std::int32_t out_dim, float scale) {
+                                std::int32_t in_dim, std::int32_t out_dim, float scale,
+                                const std::vector<float>& magnitude, const std::vector<float>& bias,
+                                const std::vector<float>& lora_bias, const std::vector<std::uint16_t>& base_weight, std::shared_ptr<DeviceArena> prepared_replacement) {
     validate_module(layer, module, a, b, rank, in_dim, out_dim, scale);
+    if (!base_weight.empty() && !prepared_replacement) { prepared_replacement = stage_replacement(layer, module, base_weight); }
+    const auto affine = prepare_affine(layer, module, a, b, rank, scale, magnitude, bias, lora_bias, base_weight, prepared_replacement);
+    const ScopedDevice device(device_ < 0 ? current_device() : device_);
+    const StoreContextScope owner(owner_);
+    std::size_t index = 0;
     for (const auto& binding : module_parts(layer, module)) {
         if (binding.out == out_dim && binding.row_offset == 0 && binding.row_group == 0) {
             set_slot(binding.key, binding.port, slot, a, b, rank, in_dim, out_dim, scale);
@@ -404,6 +571,29 @@ void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, s
             }
             set_slot(binding.key, binding.port, slot, a, selected, rank, in_dim, binding.out, scale);
         }
+        auto& bank = banks_.at(Key{binding.key, binding.port});
+        if (bank.affine) {
+            std::vector<float> neutral(binding.out * 2, 0.0F);
+            const auto& values = affine.empty() ? neutral : affine[index];
+            auto* dst = static_cast<float*>(bank.affine);
+            const auto stride = static_cast<std::size_t>(slots_) * binding.out;
+            for (int half = 0; half < 2; ++half) {
+                CUDA_CHECK(cudaMemcpy(dst + half * stride + slot * binding.out,
+                    values.data() + half * binding.out, binding.out * 4, cudaMemcpyHostToDevice));
+                if (!bank.host_affine.empty()) {
+                    std::copy_n(values.data() + half * binding.out, binding.out,
+                        bank.host_affine.data() + half * stride + slot * binding.out);
+                }
+            }
+        }
+        if (auto found = replacements_.find(Key{binding.key, binding.port}); found != replacements_.end()) {
+            auto& replacement = found->second;
+            auto uploaded = prepared_replacement;
+            void* pointer = uploaded ? uploaded->base() : nullptr;
+            CUDA_CHECK(cudaMemcpy(replacement.table + slot, &pointer, sizeof(pointer), cudaMemcpyHostToDevice));
+            replacement.values[slot] = std::move(uploaded);
+        }
+        ++index;
     }
 }
 
@@ -433,22 +623,40 @@ void LoraStore::set_device_module(std::int32_t slot, const DeviceAdapterModule& 
     if (slot < 0 || slot >= slots_) { throw std::invalid_argument("invalid adapter slot"); }
     const ScopedDevice on_store(device_);
     for (const auto& binding : module_parts(m.layer, m.module)) {
-      auto& bank = banks_.at(Key{binding.key, binding.port});
-    auto* a = static_cast<std::uint16_t*>(bank.a) + slot * bank.view.a_stride;
-    auto* b = static_cast<std::uint16_t*>(bank.b) + slot * bank.view.b_stride;
-    CUDA_CHECK(cudaMemset(a, 0, bank.view.a_stride * 2));
-    CUDA_CHECK(cudaMemset(b, 0, bank.view.b_stride * 2));
-    CUDA_CHECK(cudaMemcpy(a, m.a, static_cast<std::size_t>(m.rank) * m.in * 2, cudaMemcpyDeviceToDevice));
-    const auto group = binding.row_group ? binding.row_group : binding.out;
-    for (std::int32_t row = 0; row < binding.out; row += group) {
-        const auto* source = static_cast<const std::uint16_t*>(m.b) +
-                             static_cast<std::size_t>(binding.source_row(row)) * m.rank;
-        CUDA_CHECK(cudaMemcpy2D(b + static_cast<std::size_t>(row) * max_rank_, max_rank_ * 2,
-                                source, m.rank * 2, m.rank * 2,
-                                std::min(group, binding.out - row), cudaMemcpyDeviceToDevice));
-    }
-    Tensor scaled(a, DType::BF16, {m.rank, m.in});
-    ops::scale(scaled, m.scale, nullptr);
+        auto& bank = banks_.at(Key{binding.key, binding.port});
+        auto* a = static_cast<std::uint16_t*>(bank.a) + slot * bank.view.a_stride;
+        auto* b = static_cast<std::uint16_t*>(bank.b) + slot * bank.view.b_stride;
+        CUDA_CHECK(cudaMemset(a, 0, bank.view.a_stride * 2));
+        CUDA_CHECK(cudaMemset(b, 0, bank.view.b_stride * 2));
+        CUDA_CHECK(cudaMemcpy(a, m.a, static_cast<std::size_t>(m.rank) * m.in * 2, cudaMemcpyDeviceToDevice));
+        const auto group = binding.row_group ? binding.row_group : binding.out;
+        for (std::int32_t row = 0; row < binding.out; row += group) {
+            const auto* source = static_cast<const std::uint16_t*>(m.b) +
+                                 static_cast<std::size_t>(binding.source_row(row)) * m.rank;
+            CUDA_CHECK(cudaMemcpy2D(b + static_cast<std::size_t>(row) * max_rank_, max_rank_ * 2,
+                                    source, m.rank * 2, m.rank * 2,
+                                    std::min(group, binding.out - row), cudaMemcpyDeviceToDevice));
+        }
+        Tensor scaled(a, DType::BF16, {m.rank, m.in});
+        ops::scale(scaled, m.scale, nullptr);
+        if (bank.affine) {
+            for (int half = 0; half < 2; ++half) {
+                const auto offset = (static_cast<std::size_t>(half) * slots_ + slot) * bank.view.n;
+                CUDA_CHECK(cudaMemset(static_cast<float*>(bank.affine) + offset, 0, bank.view.n * 4));
+                if (!bank.host_affine.empty()) { std::fill_n(bank.host_affine.data() + offset, bank.view.n, 0.0F); }
+            }
+        }
+        if (auto found = replacements_.find(Key{binding.key, binding.port}); found != replacements_.end()) {
+            void* empty = nullptr;
+            CUDA_CHECK(cudaMemcpy(found->second.table + slot, &empty, sizeof(empty), cudaMemcpyHostToDevice));
+            found->second.values[slot].reset();
+        }
+        if (!bank.host_a.empty()) {
+            CUDA_CHECK(cudaMemcpy(bank.host_a.data() + slot * bank.view.a_stride, a,
+                                   bank.view.a_stride * 2, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(bank.host_b.data() + slot * bank.view.b_stride, b,
+                                   bank.view.b_stride * 2, cudaMemcpyDeviceToHost));
+        }
     }
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
 }
@@ -456,7 +664,23 @@ void LoraStore::set_device_module(std::int32_t slot, const DeviceAdapterModule& 
 void LoraStore::clear_slot(std::int32_t slot) {
     if (slot < 0 || slot >= slots_) { return; }
     const ScopedDevice on_store(device_);
+    for (auto& [key, replacement] : replacements_) {
+        void* empty = nullptr;
+        CUDA_CHECK(cudaMemcpy(replacement.table + slot, &empty, sizeof(empty), cudaMemcpyHostToDevice));
+        replacement.values[slot].reset();
+    }
     for (auto& [key, bank] : banks_) {
+        if (bank.affine) {
+            for (int half = 0; half < 2; ++half) {
+                const auto offset = (static_cast<std::size_t>(half) * slots_ + slot) * bank.view.n;
+                CUDA_CHECK(cudaMemset(static_cast<float*>(bank.affine) + offset, 0, bank.view.n * 4));
+                if (!bank.host_affine.empty()) { std::fill_n(bank.host_affine.data() + offset, bank.view.n, 0.0F); }
+            }
+        }
+        if (!bank.host_a.empty()) {
+            std::fill_n(bank.host_a.data() + slot * bank.view.a_stride, bank.view.a_stride, 0);
+            std::fill_n(bank.host_b.data() + slot * bank.view.b_stride, bank.view.b_stride, 0);
+        }
         CUDA_CHECK(cudaMemset(static_cast<std::uint16_t*>(bank.a) +
                                   static_cast<std::size_t>(slot) * bank.view.a_stride,
                               0, static_cast<std::size_t>(bank.view.a_stride) * sizeof(std::uint16_t)));
@@ -525,4 +749,75 @@ void lora_set_round(const LoraRound& round) { t_round = round; }
 void lora_clear_round() { t_round = LoraRound{}; }
 const LoraRound& lora_current_round() { return t_round; }
 
+} // namespace sinfer::ops
+
+namespace sinfer::ops {
+void LoraStore::register_replacement(const void* key, std::int32_t port) {
+    replacements_.try_emplace(Key{key, port});
+}
+const void* const* LoraStore::replacement_table(const void* key, std::int32_t port) const {
+    const auto it = replacements_.find(Key{key, port});
+    return it == replacements_.end() ? nullptr : it->second.table;
+}
+void LoraStore::register_auto(const void* key, AutoProjection projection) {
+    auto& entries = auto_[key];
+    for (const auto& entry : entries) { if (entry.port == projection.port) { return; } }
+    entries.push_back(projection);
+}
+const std::vector<LoraStore::AutoProjection>* LoraStore::auto_projections(const void* key) const {
+    const auto it = auto_.find(key);
+    return it == auto_.end() ? nullptr : &it->second;
+}
+void lora_auto_linear(const Weight& base, const Tensor& x, Tensor& out, cudaStream_t stream) {
+    if (!lora_active() || !lora_current_round().valid()) { return; }
+    auto& store = lora_store_for_current_device();
+    const auto* entries = store.auto_projections(base.qdata);
+    if (!entries) { return; }
+    const auto& round = lora_current_round();
+    for (const auto& entry : *entries) {
+        if (entry.port >= kLoraBiasPort) { continue; }
+        const auto* bank = store.find(base.qdata, entry.port);
+        if (!bank) { continue; }
+        if (const auto* replacement = store.replacement_table(base.qdata, entry.port)) {
+            lora_replace_linear(x, out, replacement, round.slots ? *round.slots : Tensor{}, round.uniform_cell, stream);
+        }
+        for (int offset = 0; offset < x.ne[1]; offset += store.scratch_tokens()) {
+            const int tokens = std::min(store.scratch_tokens(), x.ne[1] - offset);
+            auto input = x.slice(1, offset, tokens);
+            Tensor output(static_cast<std::byte*>(out.data) + offset * out.nb[1] + entry.offset * 2,
+                          DType::BF16, {entry.rows, tokens});
+            output.nb[1] = out.nb[1];
+            auto scratch = store.scratch(tokens);
+            auto slots = round.slots ? round.slots->slice(0, offset, tokens) : Tensor{};
+            const LoraBank* banks[]{bank}; Tensor* outputs[]{&output};
+            lora_delta_fused(input, banks, outputs, 1, slots, round.uniform_cell, scratch, stream);
+        }
+    }
+}
+void lora_auto_bias(const Tensor& base_bias, Tensor& out, cudaStream_t stream) {
+    if (!lora_active() || !lora_current_round().valid()) { return; }
+    auto& store = lora_store_for_current_device();
+    const auto* entries = store.auto_projections(base_bias.data);
+    if (!entries) { return; }
+    const auto& round = lora_current_round();
+    for (const auto& entry : *entries) {
+        if (entry.port < kLoraBiasPort) { continue; }
+        const auto* bank = store.find(base_bias.data, entry.port);
+        Tensor output(static_cast<std::byte*>(out.data) + entry.offset * 2, DType::BF16,
+                      {entry.rows, static_cast<int>(out.numel() / out.ne[0])});
+        output.nb[1] = out.nb[1];
+        lora_shift(*bank, round.slots ? *round.slots : Tensor{}, round.uniform_cell, output, stream);
+    }
+}
+void lora_auto_embedding(const Weight& base, const Tensor& ids, Tensor& out, cudaStream_t stream) {
+    if (!lora_active() || !lora_current_round().valid()) { return; }
+    auto& store = lora_store_for_current_device();
+    const auto* bank = store.find(base.qdata, kLoraEmbeddingPort);
+    if (!bank) { return; }
+    const auto& round = lora_current_round();
+    if (const auto* replacement = store.replacement_table(base.qdata, kLoraEmbeddingPort)) {
+        lora_replace_embedding(ids, out, replacement, round.slots ? *round.slots : Tensor{}, round.uniform_cell, stream);
+    }
+    lora_embedding(ids, *bank, round.slots ? *round.slots : Tensor{}, round.uniform_cell, out, stream);
+}
 } // namespace sinfer::ops

@@ -897,9 +897,37 @@ std::size_t cpu_expert_scratch_bytes(const SparseMoeGeometry& geometry) {
            align(2 * wide) + align(2 * (wide / kGroup) * 2) + 64;
 }
 
+namespace {
+constexpr int kCpuLoraRank = 256;
+void cpu_lora_shrink(const LoraBank* banks, const CpuExpertJob& job, int part,
+                     const float* x, float* low) {
+    std::fill_n(low, kCpuLoraRank, 0.0F);
+    if (!banks || job.adapter_slot < 0) { return; }
+    const auto& bank = banks[2 + 3 * job.expert + part];
+    if (!bank.a) { return; }
+    if (bank.rank > kCpuLoraRank) { throw std::invalid_argument("CPU expert adapter rank exceeds 256"); }
+    const auto* a = static_cast<const std::uint16_t*>(bank.a) + job.adapter_slot * bank.a_stride;
+    for (int r = 0; r < bank.rank; ++r) {
+        float sum = 0;
+        for (int k = 0; k < bank.k; ++k) { sum += bf16_to_float(a[r * bank.k + k]) * x[k]; }
+        low[r] = sum;
+    }
+}
+float cpu_lora_output(const LoraBank* banks, const CpuExpertJob& job, int part,
+                       int row, const float* low, float base) {
+    if (!banks || job.adapter_slot < 0) { return base; }
+    const auto& bank = banks[2 + 3 * job.expert + part];
+    if (!bank.b) { return base; }
+    const auto* b = static_cast<const std::uint16_t*>(bank.b) + job.adapter_slot * bank.b_stride + row * bank.rank;
+    for (int r = 0; r < bank.rank; ++r) { base += bf16_to_float(b[r]) * low[r]; }
+    const auto index = static_cast<std::size_t>(job.adapter_slot) * bank.n + row;
+    return base * (bank.gain ? 1.0F + bank.gain[index] : 1.0F) + (bank.bias ? bank.bias[index] : 0.0F);
+}
+} // namespace
+
 void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBank& bank,
                             const CpuExpertJob& job, const std::uint16_t* x_column, float* out_column,
-                            std::byte* scratch) {
+                            std::byte* scratch, const LoraBank* adapters) {
     require_geometry(geometry);
     if (job.expert < 0 || job.expert >= geometry.experts) {
         throw std::invalid_argument("cpu_expert_compute: expert out of range");
@@ -911,6 +939,9 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
     const Scratch s        = carve_scratch(geometry, scratch);
     for (int i = 0; i < hidden; ++i) { s.x_float[i] = bf16_to_float(x_column[i]); }
     quantise_groups(s.x_float, hidden, s.xq, s.xs);
+    float low[3][kCpuLoraRank]{};
+    cpu_lora_shrink(adapters, job, 0, s.x_float, low[0]);
+    cpu_lora_shrink(adapters, job, 1, s.x_float, low[1]);
 
     const std::size_t gate_rows = static_cast<std::size_t>(2) * intermediate;
     const std::size_t groups_h  = static_cast<std::size_t>(hidden / kGroup);
@@ -943,7 +974,8 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                        bank.gate_up_ggml, hidden, 1);
             float g = 0.0F, u = 0.0F;
             dot_two_rows(s.wq, s.ws, s.wq + hidden, s.ws + groups_h, s.xq, s.xs, hidden, g, u);
-            s.h[j] = swiglu(g, u, limit, activation);
+            s.h[j] = swiglu(cpu_lora_output(adapters, job, 0, j, low[0], g),
+                            cpu_lora_output(adapters, job, 1, j, low[1], u), limit, activation);
         }
     } else if (bank.gate_up_format == ExpertBankFormat::Q4G32AM) {
         // Reference path for the Q4 bank: the scalar Q4 dot is the oracle the SIMD kernels are
@@ -962,7 +994,8 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                 gate4 + static_cast<std::size_t>(intermediate + j) * (hidden / 2),
                 gsc + (intermediate + j) * groups_h, gmn + (intermediate + j) * groups_h, s.xq,
                 s.xs, hidden);
-            s.h[j] = swiglu(g, u, limit, activation);
+            s.h[j] = swiglu(cpu_lora_output(adapters, job, 0, j, low[0], g),
+                            cpu_lora_output(adapters, job, 1, j, low[1], u), limit, activation);
         }
     } else if (bank.gate_up_format == ExpertBankFormat::Q5G32AM) {
         // Reference path for the Q5 bank: the scalar Q5 dot is the oracle the SIMD kernels are
@@ -981,7 +1014,8 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                 gate5 + static_cast<std::size_t>(intermediate + j) * (groups_h * kQ5Bytes),
                 gsc + (intermediate + j) * groups_h, gmn + (intermediate + j) * groups_h, s.xq,
                 s.xs, hidden);
-            s.h[j] = swiglu(g, u, limit, activation);
+            s.h[j] = swiglu(cpu_lora_output(adapters, job, 0, j, low[0], g),
+                            cpu_lora_output(adapters, job, 1, j, low[1], u), limit, activation);
         }
     } else {
         const std::size_t gate_row_codes  = static_cast<std::size_t>(hidden);
@@ -996,10 +1030,13 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                          gate_codes + (intermediate + j) * gate_row_codes,
                          gate_scales + (intermediate + j) * gate_row_scales, s.xq, s.xs, hidden, g,
                          u);
-            s.h[j] = swiglu(g, u, limit, activation);
+            s.h[j] = swiglu(cpu_lora_output(adapters, job, 0, j, low[0], g),
+                            cpu_lora_output(adapters, job, 1, j, low[1], u), limit, activation);
         }
     }
     quantise_groups(s.h, intermediate, s.hq, s.hs);
+    cpu_lora_shrink(adapters, job, 2, s.h, low[2]);
+    const auto adapted = [&](int row, float base) { return cpu_lora_output(adapters, job, 2, row, low[2], base); };
 
     // --- down, by its own format, into the column ---
     if (bank.down_format == ExpertBankFormat::GgmlBlocks) {
@@ -1014,7 +1051,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
         for (int r = 0; r < hidden; ++r) {
             decode_row(down_blocks, down_row, static_cast<std::size_t>(r), bank.down_ggml,
                        intermediate, 0);
-            out_column[r] += job.weight * dot_row(s.wq, s.ws, s.hq, s.hs, intermediate);
+            out_column[r] += job.weight * adapted(r, dot_row(s.wq, s.ws, s.hq, s.hs, intermediate));
         }
         return;
     }
@@ -1026,10 +1063,10 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
         const auto* dmn = reinterpret_cast<const std::uint16_t*>(bank.down_mins) +
                           expert * hidden * groups_i;
         for (int r = 0; r < hidden; ++r) {
-            out_column[r] += job.weight * dot_row_q4_scalar(
+            out_column[r] += job.weight * adapted(r, dot_row_q4_scalar(
                                               down4 + static_cast<std::size_t>(r) * (intermediate / 2),
                                               dsc + r * groups_i, dmn + r * groups_i, s.hq, s.hs,
-                                              intermediate);
+                                              intermediate));
         }
         return;
     }
@@ -1041,10 +1078,10 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
         const auto* dmn = reinterpret_cast<const std::uint16_t*>(bank.down_mins) +
                           expert * hidden * groups_i;
         for (int r = 0; r < hidden; ++r) {
-            out_column[r] += job.weight * dot_row_q5_scalar(
+            out_column[r] += job.weight * adapted(r, dot_row_q5_scalar(
                                               down5 + static_cast<std::size_t>(r) * (groups_i * kQ5Bytes),
                                               dsc + r * groups_i, dmn + r * groups_i, s.hq, s.hs,
-                                              intermediate);
+                                              intermediate));
         }
         return;
     }
@@ -1059,13 +1096,13 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
         dot_two_rows(down_codes + r * down_row_codes, down_scales + r * down_row_scales,
                      down_codes + (r + 1) * down_row_codes, down_scales + (r + 1) * down_row_scales, s.hq, s.hs,
                      intermediate, y0, y1);
-        out_column[r] += job.weight * y0;
-        out_column[r + 1] += job.weight * y1;
+        out_column[r] += job.weight * adapted(r, y0);
+        out_column[r + 1] += job.weight * adapted(r + 1, y1);
     }
     if (hidden % 2 != 0) {
         const int r = hidden - 1;
-        out_column[r] += job.weight * dot_row(down_codes + r * down_row_codes, down_scales + r * down_row_scales,
-                                              s.hq, s.hs, intermediate);
+        out_column[r] += job.weight * adapted(r, dot_row(down_codes + r * down_row_codes, down_scales + r * down_row_scales,
+                                              s.hq, s.hs, intermediate));
     }
 }
 
@@ -1198,6 +1235,7 @@ struct CpuExpertPool::Impl {
     // Per-token quantised activations, per-job intermediates (float, then int8 + scales).
     std::vector<std::int8_t> xq;   // [tokens][hidden]
     std::vector<float> xs;         // [tokens][hidden/32]
+    std::vector<float> lora_low; // [jobs, 3, rank], FP32 before activation quantisation
     std::vector<float> h;          // [jobs][intermediate]
     std::vector<std::int8_t> hq;   // [jobs][intermediate]
     std::vector<float> hs;         // [jobs][intermediate/32]
@@ -1283,9 +1321,20 @@ struct CpuExpertPool::Impl {
         }
     }
 
+    float adapter_down(std::size_t job, int row, float base) const {
+        return cpu_lora_output(round->adapters, round->jobs[job], 2, row,
+            lora_low.data() + (job * 3 + 2) * kCpuLoraRank, base);
+    }
+    float adapter_activation(std::size_t job, int row, float gate, float up) const {
+        const auto* low = lora_low.data() + job * 3 * kCpuLoraRank;
+        return swiglu(cpu_lora_output(round->adapters, round->jobs[job], 0, row, low, gate),
+                      cpu_lora_output(round->adapters, round->jobs[job], 1, row, low + kCpuLoraRank, up),
+                      geometry.swiglu_limit, geometry.activation);
+    }
+
     std::int64_t items_for_phase(int ph) const {
         const auto jobs = static_cast<std::int64_t>(round->jobs.size());
-        if (ph == 0) { return round->tokens; }
+        if (ph == 0) { return round->tokens + (round->adapters ? jobs : 0); }
         if (ph == 1) { return groups * kPhaseAChunks; }
         if (ph == 2) { return jobs; }
         return groups * kPhaseBChunks;
@@ -1299,6 +1348,16 @@ struct CpuExpertPool::Impl {
         const int groups_h     = hidden / kGroup;
         const int groups_i     = intermediate / kGroup;
         if (ph == 0) {
+            if (item >= round->tokens) {
+                const auto j = static_cast<std::size_t>(item - round->tokens);
+                const auto& job = round->jobs[j];
+                float* xf = x_float.data() + static_cast<std::size_t>(worker) * hidden;
+                for (int k = 0; k < hidden; ++k) { xf[k] = bf16_to_float(round->x[job.token * hidden + k]); }
+                auto* low = lora_low.data() + j * 3 * kCpuLoraRank;
+                cpu_lora_shrink(round->adapters, job, 0, xf, low);
+                cpu_lora_shrink(round->adapters, job, 1, xf, low + kCpuLoraRank);
+                return;
+            }
             const auto t = static_cast<std::size_t>(item);
             float* xf    = x_float.data() + static_cast<std::size_t>(worker) * hidden;
             const std::uint16_t* x = round->x + t * hidden;
@@ -1381,8 +1440,8 @@ struct CpuExpertPool::Impl {
                             xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
                             xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga,
                             ua, gb, ub);
-                        h[ia * intermediate + j] = swiglu(ga, ua, limit, activation);
-                        h[ib * intermediate + j] = swiglu(gb, ub, limit, activation);
+                        h[ia * intermediate + j] = adapter_activation(ia, j, ga, ua);
+                        h[ib * intermediate + j] = adapter_activation(ib, j, gb, ub);
                     }
                     if (i < g1) {
                         const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1393,7 +1452,7 @@ struct CpuExpertPool::Impl {
                                         xs.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         xc.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         hidden, ga, ua);
-                        h[ia * intermediate + j] = swiglu(ga, ua, limit, activation);
+                        h[ia * intermediate + j] = adapter_activation(ia, j, ga, ua);
                     }
                 }
                 return;
@@ -1431,8 +1490,8 @@ struct CpuExpertPool::Impl {
                             xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
                             xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga,
                             ua, gb, ub);
-                        h[ia * intermediate + j] = swiglu(ga, ua, limit, activation);
-                        h[ib * intermediate + j] = swiglu(gb, ub, limit, activation);
+                        h[ia * intermediate + j] = adapter_activation(ia, j, ga, ua);
+                        h[ib * intermediate + j] = adapter_activation(ib, j, gb, ub);
                     }
                     if (i < g1) {
                         const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1443,7 +1502,7 @@ struct CpuExpertPool::Impl {
                                         xs.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         xc.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                         hidden, ga, ua);
-                        h[ia * intermediate + j] = swiglu(ga, ua, limit, activation);
+                        h[ia * intermediate + j] = adapter_activation(ia, j, ga, ua);
                     }
                 }
                 return;
@@ -1476,8 +1535,8 @@ struct CpuExpertPool::Impl {
                         dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(b) * bb, hidden, xa, sa, xb, sb, ga, gb);
                         dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(blocks + b) * bb, hidden, xa, sa, xb, sb, ua, ub);
                         for (int r = 0; r < kTileRows; ++r) {
-                            h[ia * intermediate + j0 + b * kTileRows + r] = swiglu(ga[r], ua[r], limit, activation);
-                            if (i + 1 < g1) { h[ib * intermediate + j0 + b * kTileRows + r] = swiglu(gb[r], ub[r], limit, activation); }
+                            h[ia * intermediate + j0 + b * kTileRows + r] = adapter_activation(ia, j0 + b * kTileRows + r, ga[r], ua[r]);
+                            if (i + 1 < g1) { h[ib * intermediate + j0 + b * kTileRows + r] = adapter_activation(ib, j0 + b * kTileRows + r, gb[r], ub[r]); }
                         }
                     }
                 }
@@ -1499,15 +1558,15 @@ struct CpuExpertPool::Impl {
                                             xq.data() + static_cast<std::size_t>(jb.token) * hidden,
                                             xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
                                             xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga, ua, gb, ub);
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j]     = swiglu(ga, ua, limit, activation);
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]) * intermediate + j] = swiglu(gb, ub, limit, activation);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j]     = adapter_activation(static_cast<std::size_t>(order[static_cast<std::size_t>(i)]), j, ga, ua);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]) * intermediate + j] = adapter_activation(static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]), j, gb, ub);
                 }
                 if (i < g1) {
                     const CpuExpertJob& ja = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(i)])];
                     float ga = 0.0F, ua = 0.0F;
                     dot_two_rows(gc, gs, uc, us, xq.data() + static_cast<std::size_t>(ja.token) * hidden,
                                  xs.data() + static_cast<std::size_t>(ja.token) * groups_h, hidden, ga, ua);
-                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j] = swiglu(ga, ua, limit, activation);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j] = adapter_activation(static_cast<std::size_t>(order[static_cast<std::size_t>(i)]), j, ga, ua);
                 }
             }
             return;
@@ -1519,6 +1578,11 @@ struct CpuExpertPool::Impl {
             for (int i = 0; i < intermediate; ++i) {
                 hu[job_index * intermediate + i] =
                     static_cast<std::uint8_t>(static_cast<std::uint8_t>(hq[job_index * intermediate + i]) ^ 0x80U);
+            }
+            if (round->adapters) {
+                const auto j = static_cast<std::size_t>(item);
+                cpu_lora_shrink(round->adapters, round->jobs[j], 2, h.data() + j * intermediate,
+                    lora_low.data() + (j * 3 + 2) * kCpuLoraRank);
             }
             return;
         }
@@ -1579,10 +1643,10 @@ struct CpuExpertPool::Impl {
                                                intermediate, y0a, y1a, y0b, y1b);
                     float* outa = round->out + static_cast<std::size_t>(ja.token) * hidden;
                     float* outb = round->out + static_cast<std::size_t>(jb.token) * hidden;
-                    atomic_add(outa + r, ja.weight * y0a);
-                    atomic_add(outa + r + 1, ja.weight * y1a);
-                    atomic_add(outb + r, jb.weight * y0b);
-                    atomic_add(outb + r + 1, jb.weight * y1b);
+                    atomic_add(outa + r, ja.weight * adapter_down(ia, r, y0a));
+                    atomic_add(outa + r + 1, ja.weight * adapter_down(ia, r + 1, y1a));
+                    atomic_add(outb + r, jb.weight * adapter_down(ib, r, y0b));
+                    atomic_add(outb + r + 1, jb.weight * adapter_down(ib, r + 1, y1b));
                 }
                 if (i < g1) {
                     const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1592,8 +1656,8 @@ struct CpuExpertPool::Impl {
                                     hs.data() + ia * groups_i, hc.data() + ia * groups_i,
                                     intermediate, y0, y1);
                     float* out = round->out + static_cast<std::size_t>(ja.token) * hidden;
-                    atomic_add(out + r, ja.weight * y0);
-                    atomic_add(out + r + 1, ja.weight * y1);
+                    atomic_add(out + r, ja.weight * adapter_down(ia, r, y0));
+                    atomic_add(out + r + 1, ja.weight * adapter_down(ia, r + 1, y1));
                 }
             }
             if (r < r1) {
@@ -1604,10 +1668,10 @@ struct CpuExpertPool::Impl {
                     const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
                     const CpuExpertJob& ja = round->jobs[ia];
                     atomic_add(round->out + static_cast<std::size_t>(ja.token) * hidden + r,
-                               ja.weight * dot_row_q4_scalar(c0, s0, m0,
+                               ja.weight * adapter_down(ia, r, dot_row_q4_scalar(c0, s0, m0,
                                                              hq.data() + ia * intermediate,
                                                              hs.data() + ia * groups_i,
-                                                             intermediate));
+                                                             intermediate)));
                 }
             }
             return;
@@ -1642,10 +1706,10 @@ struct CpuExpertPool::Impl {
                                                intermediate, y0a, y1a, y0b, y1b);
                     float* outa = round->out + static_cast<std::size_t>(ja.token) * hidden;
                     float* outb = round->out + static_cast<std::size_t>(jb.token) * hidden;
-                    atomic_add(outa + r, ja.weight * y0a);
-                    atomic_add(outa + r + 1, ja.weight * y1a);
-                    atomic_add(outb + r, jb.weight * y0b);
-                    atomic_add(outb + r + 1, jb.weight * y1b);
+                    atomic_add(outa + r, ja.weight * adapter_down(ia, r, y0a));
+                    atomic_add(outa + r + 1, ja.weight * adapter_down(ia, r + 1, y1a));
+                    atomic_add(outb + r, jb.weight * adapter_down(ib, r, y0b));
+                    atomic_add(outb + r + 1, jb.weight * adapter_down(ib, r + 1, y1b));
                 }
                 if (i < g1) {
                     const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1655,8 +1719,8 @@ struct CpuExpertPool::Impl {
                                     hs.data() + ia * groups_i, hc.data() + ia * groups_i,
                                     intermediate, y0, y1);
                     float* out = round->out + static_cast<std::size_t>(ja.token) * hidden;
-                    atomic_add(out + r, ja.weight * y0);
-                    atomic_add(out + r + 1, ja.weight * y1);
+                    atomic_add(out + r, ja.weight * adapter_down(ia, r, y0));
+                    atomic_add(out + r + 1, ja.weight * adapter_down(ia, r + 1, y1));
                 }
             }
             if (r < r1) {
@@ -1667,10 +1731,10 @@ struct CpuExpertPool::Impl {
                     const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
                     const CpuExpertJob& ja = round->jobs[ia];
                     atomic_add(round->out + static_cast<std::size_t>(ja.token) * hidden + r,
-                               ja.weight * dot_row_q5_scalar(c0, s0, m0,
+                               ja.weight * adapter_down(ia, r, dot_row_q5_scalar(c0, s0, m0,
                                                              hq.data() + ia * intermediate,
                                                              hs.data() + ia * groups_i,
-                                                             intermediate));
+                                                             intermediate)));
                 }
             }
             return;
@@ -1697,8 +1761,8 @@ struct CpuExpertPool::Impl {
                                                    hu.data() + ia * intermediate, hs.data() + ia * groups_i,
                                                    hu.data() + ib * intermediate, hs.data() + ib * groups_i, ya, yb);
                     for (int rr = 0; rr < kTileRows; ++rr) {
-                        atomic_add(outa + r0 + b * kTileRows + rr, ja.weight * ya[rr]);
-                        if (i + 1 < g1) { atomic_add(outb + r0 + b * kTileRows + rr, jb.weight * yb[rr]); }
+                        atomic_add(outa + r0 + b * kTileRows + rr, ja.weight * adapter_down(ia, r0 + b * kTileRows + rr, ya[rr]));
+                        if (i + 1 < g1) { atomic_add(outb + r0 + b * kTileRows + rr, jb.weight * adapter_down(ib, r0 + b * kTileRows + rr, yb[rr])); }
                     }
                 }
             }
@@ -1725,10 +1789,10 @@ struct CpuExpertPool::Impl {
                                         y0b, y1b);
                 float* outa = round->out + static_cast<std::size_t>(ja.token) * hidden;
                 float* outb = round->out + static_cast<std::size_t>(jb.token) * hidden;
-                atomic_add(outa + r, ja.weight * y0a);
-                atomic_add(outa + r + 1, ja.weight * y1a);
-                atomic_add(outb + r, jb.weight * y0b);
-                atomic_add(outb + r + 1, jb.weight * y1b);
+                atomic_add(outa + r, ja.weight * adapter_down(ia, r, y0a));
+                atomic_add(outa + r + 1, ja.weight * adapter_down(ia, r + 1, y1a));
+                atomic_add(outb + r, jb.weight * adapter_down(ib, r, y0b));
+                atomic_add(outb + r + 1, jb.weight * adapter_down(ib, r + 1, y1b));
             }
             if (i < g1) {
                 const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
@@ -1736,8 +1800,8 @@ struct CpuExpertPool::Impl {
                 float y0 = 0.0F, y1 = 0.0F;
                 dot_two_rows(c0, s0, c1, s1, hq.data() + ia * intermediate, hs.data() + ia * groups_i, intermediate, y0, y1);
                 float* out = round->out + static_cast<std::size_t>(ja.token) * hidden;
-                atomic_add(out + r, ja.weight * y0);
-                atomic_add(out + r + 1, ja.weight * y1);
+                atomic_add(out + r, ja.weight * adapter_down(ia, r, y0));
+                atomic_add(out + r + 1, ja.weight * adapter_down(ia, r + 1, y1));
             }
         }
         if (r < r1) {
@@ -1745,9 +1809,9 @@ struct CpuExpertPool::Impl {
                 const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
                 const CpuExpertJob& ja = round->jobs[ia];
                 atomic_add(round->out + static_cast<std::size_t>(ja.token) * hidden + r,
-                           ja.weight * dot_row(down_codes + static_cast<std::size_t>(r - down_row) * intermediate,
+                           ja.weight * adapter_down(ia, r, dot_row(down_codes + static_cast<std::size_t>(r - down_row) * intermediate,
                                                down_scales + static_cast<std::size_t>(r - down_row) * groups_i,
-                                               hq.data() + ia * intermediate, hs.data() + ia * groups_i, intermediate));
+                                               hq.data() + ia * intermediate, hs.data() + ia * groups_i, intermediate)));
             }
         }
     }
@@ -1932,6 +1996,7 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
     impl.xq.resize(static_cast<std::size_t>(round.tokens) * impl.geometry.hidden);
     impl.xs.resize(static_cast<std::size_t>(round.tokens) * (impl.geometry.hidden / kGroup));
     impl.h.resize(jobs * impl.geometry.intermediate);
+    impl.lora_low.resize(jobs * 3 * kCpuLoraRank);
     impl.hq.resize(jobs * impl.geometry.intermediate);
     impl.hs.resize(jobs * (impl.geometry.intermediate / kGroup));
     impl.xc.resize(static_cast<std::size_t>(round.tokens) * (impl.geometry.hidden / kGroup));

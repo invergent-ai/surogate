@@ -1,3 +1,4 @@
+#include "api/ops/lora_store.h"
 // sinfer::ops - embedding wrapper: public api validation and qtype dispatch.
 #include "api/ops/embedding.h"
 #include "ops/linear/ggml/ggml_embedding.h"
@@ -244,6 +245,7 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");
     }
+    lora_auto_embedding(table, ids, out, stream);
 }
 
 } // namespace sinfer::ops

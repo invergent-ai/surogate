@@ -1,3 +1,4 @@
+#include "api/ops/lora_store.h"
 #include "api/ops/layer_norm.h"
 
 #include "ops/launcher/layer_norm.h"
@@ -60,6 +61,7 @@ void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float
         throw std::invalid_argument("layer_norm: tensor data must be non-null");
     }
     detail::layer_norm_launch(x, weight, bias, eps, out, stream);
+    lora_auto_bias(bias, out, stream);
 }
 
 } // namespace sinfer::ops

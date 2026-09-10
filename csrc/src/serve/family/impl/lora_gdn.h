@@ -1,6 +1,7 @@
 #pragma once
 
 #include "family/impl/lora_hook.h"
+#include "family/impl/lora_globals.h"
 #include "api/ops/linear.h"
 #include "core/layout.h"
 #include <variant>
@@ -76,8 +77,52 @@ void apply_lora_gdn_input(const P& p, const Tensor& hidden, Tensor& qkv, Tensor&
     apply_lora(key, kGdnZPort, hidden, z, stream);
 }
 
+template<class P, class Geometry>
+void bind_gdn_input_base(ops::LoraStore& store, const P& p, const Geometry& g) {
+    if constexpr (requires { std::variant_size<P>::value; }) {
+        std::visit([&](const auto& v) { bind_gdn_input_base(store, v, g); }, p);
+    } else if constexpr (requires { p.input_projection; }) {
+        bind_gdn_input_base(store, p.input_projection, g);
+    } else if constexpr (requires { p.split; }) {
+        if (p.split) { bind_gdn_input_base(store, *p.split, g); }
+        else {
+            const auto& w = p.query_key_value_z;
+            store.register_base(w.qdata, kGdnInputPort, {{w, 0, 0, g.convolution_dim()}});
+            store.register_base(w.qdata, kGdnZPort, {{w, g.convolution_dim(), 0, g.value_dim()}});
+        }
+    } else if constexpr (requires { p.query_key_value; p.z; }) {
+        store.register_base(p.query_key_value.qdata, kGdnInputPort, {{p.query_key_value, 0, 0, g.convolution_dim()}});
+        store.register_base(p.query_key_value.qdata, kGdnZPort, {{p.z, 0, 0, g.value_dim()}});
+    } else if constexpr (requires { p.query_key; p.value_z; }) {
+        store.register_base(p.query_key.qdata, kGdnInputPort,
+            {{p.query_key, 0, 0, p.query_key.n}, {p.value_z, 0, p.query_key.n, g.value_dim()}});
+        store.register_base(p.query_key.qdata, kGdnZPort, {{p.value_z, g.value_dim(), 0, g.value_dim()}});
+    } else {
+        const auto& w = p.query_key_value_z;
+        store.register_base(w.qdata, kGdnInputPort, {{w, 0, 0, g.convolution_dim()}});
+        store.register_base(w.qdata, kGdnZPort, {{w, g.convolution_dim(), 0, g.value_dim()}});
+    }
+}
+template<class P, class Geometry>
+void bind_gdn_control_base(ops::LoraStore& store, const P& p, const Geometry& g) {
+    if constexpr (requires { std::variant_size<P>::value; }) {
+        std::visit([&](const auto& v) { bind_gdn_control_base(store, v, g); }, p);
+    } else if constexpr (requires { p.control_projection; }) {
+        bind_gdn_control_base(store, p.control_projection, g);
+    } else if constexpr (requires { p.a_projection; }) {
+        store.register_base(p.a_projection.qdata, kGdnAPort, {{p.a_projection, 0, 0, g.gdn_value_heads}});
+        store.register_base(p.a_projection.qdata, kGdnBPort, {{p.b_projection, 0, 0, g.gdn_value_heads}});
+    } else {
+        store.register_base(p.a_b_projection.qdata, kGdnAPort, {{p.a_b_projection, 0, 0, g.gdn_value_heads}});
+        store.register_base(p.a_b_projection.qdata, kGdnBPort, {{p.a_b_projection, g.gdn_value_heads, 0, g.gdn_value_heads}});
+    }
+}
+
 template <class Linear, class Geometry>
 void bind_lora_gdn(ops::LoraStore& store, int layer, const Linear& linear, const Geometry& g) {
+    bind_lora_bias(store, layer, "linear_attn.dt_bias", linear.projection.dt_bias);
+    bind_gdn_input_base(store, linear.projection, g);
+    bind_gdn_control_base(store, linear.projection, g);
     const auto* input   = gdn_input_key(linear.projection).qdata;
     const auto* control = gdn_control_key(linear.projection).qdata;
     store.register_module(layer, "linear_attn.in_proj_qkv",

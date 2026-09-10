@@ -90,6 +90,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
                 g.query_size(), g.hidden});
             family::bind_lora_dense_mlp(store, layer, full.post_mixer, g.hidden, g.intermediate);
         }
+        family::bind_lora_globals(store, runtime);
         family::finish_lora_bind(store, options);
     }
     return family::make_frontend(

@@ -9,12 +9,13 @@
 #include <fstream>
 #include <cmath>
 #include <limits>
+#include <regex>
 #include <stdexcept>
 
 namespace sinfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json = nlohmann::ordered_json;
 
 [[noreturn]] void bad(const std::string& name, const std::string& reason) {
     throw std::invalid_argument("--lora-modules '" + name + "': " + reason);
@@ -53,25 +54,27 @@ Json read_safetensors_header(const std::string& name, const std::filesystem::pat
 /// PEFT names a pair `<module>.lora_A.weight` / `.lora_B.weight`, under a
 /// `base_model.model.` prefix that varies with how the adapter was exported.
 /// The base module name is what remains once both are stripped.
-bool split_lora_key(std::string_view key, std::string& module, bool& is_a) {
-    constexpr std::string_view kA = ".lora_A.weight";
-    constexpr std::string_view kB = ".lora_B.weight";
-    if (key.size() > kA.size() && key.substr(key.size() - kA.size()) == kA) {
-        is_a = true;
-        key  = key.substr(0, key.size() - kA.size());
-    } else if (key.size() > kB.size() && key.substr(key.size() - kB.size()) == kB) {
-        is_a = false;
-        key  = key.substr(0, key.size() - kB.size());
-    } else {
-        return false;
+enum class AdapterTensorKind { A, B, Magnitude, Bias, LoraBias, Base };
+bool split_module(const std::string& module, std::int32_t& layer, std::string& kind);
+bool split_lora_key(std::string_view key, std::string& module, AdapterTensorKind& kind) {
+    const std::pair<std::string_view, AdapterTensorKind> suffixes[] = {
+        {".lora_A.weight", AdapterTensorKind::A}, {".lora_B.weight", AdapterTensorKind::B},
+        {".lora_embedding_A", AdapterTensorKind::A}, {".lora_embedding_B", AdapterTensorKind::B},
+        {".lora_magnitude_vector.weight", AdapterTensorKind::Magnitude},
+        {".lora_magnitude_vector", AdapterTensorKind::Magnitude},
+        {".lora_B.bias", AdapterTensorKind::LoraBias}, {".bias", AdapterTensorKind::Bias},
+        {".weight", AdapterTensorKind::Base}};
+    bool matched = false;
+    for (auto [suffix, type] : suffixes) {
+        if (key.ends_with(suffix)) { key.remove_suffix(suffix.size()); kind = type; matched = true; break; }
     }
-    for (const std::string_view prefix : {std::string_view("base_model.model."),
-                                          std::string_view("base_model.")}) {
-        if (key.size() > prefix.size() && key.substr(0, prefix.size()) == prefix) {
-            key = key.substr(prefix.size());
-            break;
-        }
+    if (!matched && (key.ends_with(".dt_bias") || key.ends_with(".expert_bias") || key.ends_with(".e_score_correction_bias"))) { kind = AdapterTensorKind::Bias; matched = true; }
+    if (!matched) { return false; }
+    for (const std::string_view prefix : {"base_model.model.", "base_model."}) {
+        if (key.starts_with(prefix)) { key.remove_prefix(prefix.size()); break; }
     }
+    if (const auto at = key.find(".modules_to_save."); at != std::string_view::npos) { key = key.substr(0, at); }
+    if (key.ends_with(".base_layer")) { key.remove_suffix(std::string_view(".base_layer").size()); }
     module = std::string(key);
     return true;
 }
@@ -123,12 +126,13 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
             bad(name, "peft_type is " + config.value("peft_type", std::string("?")) +
                           ", only LORA adapters are served");
         }
-        if (config.value("use_dora", false) || config.value("lora_bias", false) ||
-            config.value("bias", std::string("none")) != "none" ||
-            (config.contains("modules_to_save") && !config.at("modules_to_save").empty()) ||
-            (config.contains("rank_pattern") && !config.at("rank_pattern").empty()) ||
-            (config.contains("alpha_pattern") && !config.at("alpha_pattern").empty())) {
-            bad(name, "this adapter uses additional weights or per-module scaling; merge it before serving");
+        if (config.contains("modules_to_save") && !config.at("modules_to_save").is_null()) {
+            for (const auto& module : config.at("modules_to_save")) {
+                int layer = 0; std::string target;
+                if (!module.is_string() || !split_module(module.get<std::string>(), layer, target) || layer != -1 || target.ends_with(".bias")) {
+                    bad(name, "modules_to_save currently supports embeddings and output heads");
+                }
+            }
         }
         LoraAdapter adapter;
         adapter.name         = name;
@@ -137,10 +141,6 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
         adapter.rank         = config.value("r", 0);
         adapter.alpha        = config.value("lora_alpha", 0.0);
         if (adapter.rank <= 0) { bad(name, "adapter_config.json has no positive rank r"); }
-        if (static_cast<std::uint32_t>(adapter.rank) > max_rank) {
-            bad(name, "rank " + std::to_string(adapter.rank) + " exceeds --max-lora-rank " +
-                          std::to_string(max_rank));
-        }
         // PEFT scales the delta by alpha/r. `use_rslora` scales by alpha/sqrt(r)
         // instead, and silently applying the wrong one would change every adapted
         // projection by a constant factor -- fluent output, quietly wrong.
@@ -161,32 +161,64 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
         for (const auto& [key, entry] : header.items()) {
             if (key == "__metadata__") { continue; }
             std::string module;
-            bool is_a = false;
-            if (!split_lora_key(key, module, is_a)) {
+            AdapterTensorKind kind;
+            if (!split_lora_key(key, module, kind)) {
                 bad(name, "unsupported adapter tensor '" + key + "'; merge the adapter before serving");
             }
             const RawTensor raw = read_entry(name, key, entry);
-            if (raw.shape.size() != 2) {
-                bad(name, "tensor '" + key + "' is not a matrix");
-            }
             if (raw.dtype != "BF16" && raw.dtype != "F16" && raw.dtype != "F32") {
                 bad(name, "tensor '" + key + "' has unsupported dtype " + raw.dtype);
             }
-            if (raw.shape[0] <= 0 || raw.shape[1] <= 0 ||
-                raw.shape[0] > std::numeric_limits<std::int32_t>::max() ||
-                raw.shape[1] > std::numeric_limits<std::int32_t>::max() ||
-                raw.end < raw.begin ||
-                raw.end - raw.begin != static_cast<std::uint64_t>(raw.shape[0]) * raw.shape[1] *
-                                       (raw.dtype == "F32" ? 4U : 2U) ||
+            std::uint64_t elements = 1;
+            if (raw.shape.empty()) { bad(name, "adapter tensor is scalar"); }
+            for (auto extent : raw.shape) {
+                if (extent <= 0 || extent > std::numeric_limits<std::int32_t>::max() ||
+                    elements > std::numeric_limits<std::uint64_t>::max() / 4 / extent) {
+                    bad(name, "adapter tensor shape is invalid");
+                }
+                elements *= extent;
+            }
+            if (raw.end < raw.begin || raw.end - raw.begin != elements * (raw.dtype == "F32" ? 4U : 2U) ||
                 raw.end > std::filesystem::file_size(weights_path) - payload_begin) {
                 bad(name, "tensor '" + key + "' has inconsistent shape or byte range");
             }
             LoraTensorPair& pair = pairs[module];
             pair.module          = module;
-            if (is_a) {
+            if (kind == AdapterTensorKind::Base) {
+                int layer = 0; std::string target;
+                if (!split_module(module, layer, target) || layer != -1 || raw.shape.size() != 2) {
+                    bad(name, "saved full weights are only supported for embeddings and output heads");
+                }
+                if (pair.base_weight.bytes) { bad(name, "duplicate saved weight for '" + module + "'"); }
+                pair.base_weight = {payload_begin + raw.begin, raw.end - raw.begin, elements, raw.dtype};
+                const bool embedding = target != "lm_head";
+                pair.base_in = static_cast<int>(raw.shape[embedding ? 0 : 1]);
+                pair.base_out = static_cast<int>(raw.shape[embedding ? 1 : 0]);
+                continue;
+            }
+            if (kind != AdapterTensorKind::A && kind != AdapterTensorKind::B) {
+                if ((kind == AdapterTensorKind::LoraBias && !config.value("lora_bias", false)) ||
+                    (kind == AdapterTensorKind::Magnitude && !config.value("use_dora", false))) {
+                    bad(name, "tensor '" + key + "' is not declared by adapter_config.json");
+                }
+                auto& ref = kind == AdapterTensorKind::Magnitude ? pair.magnitude :
+                            kind == AdapterTensorKind::Bias ? pair.bias : pair.lora_bias;
+                if (ref.bytes) { bad(name, "duplicate adapter tensor for '" + module + "'"); }
+                ref = {payload_begin + raw.begin, raw.end - raw.begin, elements, raw.dtype};
+                continue;
+            }
+            if (raw.shape.size() < 2 || elements / raw.shape[0] > std::numeric_limits<std::int32_t>::max()) {
+                bad(name, "adapter A/B tensor is not a matrix or flattened convolution");
+            }
+            if (kind == AdapterTensorKind::B && raw.shape.size() > 2) {
+                for (std::size_t i = 2; i < raw.shape.size(); ++i) {
+                    if (raw.shape[i] != 1) { bad(name, "LoRA B convolution must have a unit spatial kernel"); }
+                }
+            }
+            if (kind == AdapterTensorKind::A) {
                 // A is [r, in]
                 pair.rank      = static_cast<std::int32_t>(raw.shape[0]);
-                pair.in_dim    = static_cast<std::int32_t>(raw.shape[1]);
+                pair.in_dim    = static_cast<std::int32_t>(elements / raw.shape[0]);
                 pair.a_offset  = payload_begin + raw.begin;
                 pair.a_bytes   = raw.end - raw.begin;
                 pair.a_is_bf16 = raw.dtype == "BF16";
@@ -204,12 +236,58 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
             bad(name, "adapter_model.safetensors holds no lora_A/lora_B pairs");
         }
         for (auto& [module, pair] : pairs) {
+            if (pair.bias.bytes && config.value("bias", std::string("none")) == "none" &&
+                !pair.base_weight.bytes) {
+                bad(name, "saved bias for '" + module + "' is not declared in the adapter config");
+            }
+            if (pair.a_bytes == 0 && pair.b_bytes == 0 && pair.base_weight.bytes) {
+                if (pair.magnitude.bytes || pair.lora_bias.bytes) { bad(name, "saved module has adapter extras without A/B"); }
+                pair.rank = pair.b_rank = 1; pair.in_dim = pair.base_in; pair.out_dim = pair.base_out;
+                if (pair.bias.bytes && pair.bias.elements != static_cast<std::uint64_t>(pair.out_dim)) { bad(name, "saved module bias shape is inconsistent"); }
+                adapter.pairs.push_back(pair); continue;
+            }
+            if (pair.a_bytes == 0 && pair.b_bytes == 0 && pair.bias.bytes &&
+                !pair.magnitude.bytes && !pair.lora_bias.bytes) {
+                pair.bias_only = true;
+                pair.rank = pair.b_rank = pair.in_dim = 1;
+                pair.out_dim = static_cast<std::int32_t>(pair.bias.elements);
+                pair.module += ".bias";
+                adapter.pairs.push_back(pair);
+                continue;
+            }
             if (pair.a_bytes == 0 || pair.b_bytes == 0) {
                 bad(name, "module '" + module + "' has only one half of its A/B pair");
             }
-            if (pair.rank != adapter.rank || pair.b_rank != pair.rank) {
-                bad(name, "module '" + module + "' has rank " + std::to_string(pair.rank) +
-                              " but adapter_config.json says " + std::to_string(adapter.rank));
+            if (pair.base_weight.bytes && (pair.base_in != pair.in_dim || pair.base_out != pair.out_dim)) {
+                bad(name, "saved embedding/head weight disagrees with its adapter");
+            }
+            // PEFT matches overrides against the complete module name, in config order.
+            const auto pattern_value = [&](const char* field, double fallback) {
+                if (!config.contains(field) || config.at(field).is_null()) { return fallback; }
+                if (!config.at(field).is_object()) { bad(name, std::string(field) + " must be an object"); }
+                for (const auto& [pattern, value] : config.at(field).items()) {
+                    try {
+                        if (std::regex_match(module, std::regex("(.*\\.)?(" + pattern + ")$"))) {
+                            return value.get<double>();
+                        }
+                    } catch (const std::regex_error&) { bad(name, "invalid module pattern '" + pattern + "'"); }
+                }
+                return fallback;
+            };
+            const double rank = pattern_value("rank_pattern", adapter.rank);
+            const double alpha = pattern_value("alpha_pattern", adapter.alpha);
+            if (!std::isfinite(rank) || rank <= 0 || rank != std::floor(rank) || rank > max_rank ||
+                pair.rank != rank || pair.b_rank != pair.rank || !std::isfinite(alpha)) {
+                bad(name, "module '" + module + "' has inconsistent rank/alpha or exceeds --max-lora-rank");
+            }
+            pair.scale = alpha / (config.value("use_rslora", false) ? std::sqrt(rank) : rank);
+            if (config.value("use_dora", false) && !pair.magnitude.bytes) {
+                bad(name, "DoRA module '" + module + "' has no magnitude vector");
+            }
+            for (const auto* ref : {&pair.magnitude, &pair.bias, &pair.lora_bias}) {
+                if (ref->bytes && ref->elements != static_cast<std::uint64_t>(pair.out_dim)) {
+                    bad(name, "magnitude or bias shape disagrees with '" + module + "'");
+                }
             }
             adapter.pairs.push_back(pair);
         }
@@ -282,6 +360,23 @@ std::vector<std::uint16_t> read_as_bf16(std::ifstream& file, std::uint64_t offse
 
 /// Preserve the complete path inside a layer, including expert and shared-expert names.
 bool split_module(const std::string& module, std::int32_t& layer, std::string& kind) {
+    for (const std::string_view prefix : {"model.vision_tower.vision_model.", "vision_tower.vision_model.",
+        "model.vision_model.", "vision_model.", "model.visual.", "visual.", "model.vision_tower.", "vision_tower."}) {
+        if (module.starts_with(prefix)) { layer = -2; kind = "vision." + module.substr(prefix.size()); return true; }
+    }
+    for (const std::string_view prefix : {"model.multi_modal_projector.", "multi_modal_projector."}) {
+        if (module.starts_with(prefix)) { layer = -2; kind = "vision.projector." + module.substr(prefix.size()); return true; }
+    }
+    for (const std::string_view prefix : {"model.language_model.model.", "model.language_model.",
+        "language_model.model.", "language_model.", "model.text_model.model.", "model.text_model.",
+        "text_model.", "model.model.", "model.", ""}) {
+        if (!module.starts_with(prefix)) { continue; }
+        const auto name = module.substr(prefix.size());
+        if (name == "embed_tokens" || name == "embedding" || name == "tok_embeddings" || name == "word_embeddings" ||
+            name == "lm_head" || name == "lm_head.bias" || name == "embed_tokens.bias") {
+            layer = -1; kind = name; return true;
+        }
+    }
     constexpr std::string_view kLayers = ".layers.";
     const std::size_t at = module.find(kLayers);
     const bool direct = module.starts_with("layers.");
@@ -323,7 +418,44 @@ std::vector<EngineOptions::LoraModulePayload> LoraRegistry::read_payloads(
         payload.rank    = pair.rank;
         payload.in_dim  = pair.in_dim;
         payload.out_dim = pair.out_dim;
-        payload.scale   = static_cast<float>(adapter.scale);
+        payload.scale   = static_cast<float>(pair.scale);
+        const auto read_vector = [&](const AdapterTensorRef& ref) {
+            std::vector<float> values(ref.elements);
+            if (!ref.bytes) { return values; }
+            if (ref.dtype == "F32") {
+                file.seekg(ref.offset);
+                file.read(reinterpret_cast<char*>(values.data()), ref.bytes);
+            } else {
+                std::vector<std::uint16_t> bits(ref.elements);
+                file.seekg(ref.offset);
+                file.read(reinterpret_cast<char*>(bits.data()), ref.bytes);
+                for (std::size_t i = 0; i < values.size(); ++i) {
+                    if (ref.dtype == "F16") { values[i] = f16_to_f32(bits[i]); }
+                    else {
+                        const std::uint32_t word = static_cast<std::uint32_t>(bits[i]) << 16U;
+                        std::memcpy(&values[i], &word, sizeof(float));
+                    }
+                }
+            }
+            return values;
+        };
+        if (pair.base_weight.bytes) {
+            const auto& ref = pair.base_weight;
+            payload.base_weight = read_as_bf16(file, ref.offset, ref.bytes, ref.dtype == "BF16", ref.dtype == "F16", ref.elements);
+        }
+        payload.magnitude = read_vector(pair.magnitude);
+        payload.bias = read_vector(pair.bias);
+        payload.lora_bias = read_vector(pair.lora_bias);
+        if (pair.base_weight.bytes && !pair.a_bytes) {
+            payload.a.assign(pair.in_dim, 0); payload.b.assign(pair.out_dim, 0);
+            if (!file) { bad(adapter.name, "truncated while reading " + pair.module); }
+            payloads.push_back(std::move(payload)); continue;
+        }
+        if (pair.bias_only) {
+            payload.a.assign(1, 0); payload.b.assign(pair.out_dim, 0);
+            if (!file) { bad(adapter.name, "truncated while reading " + pair.module); }
+            payloads.push_back(std::move(payload)); continue;
+        }
         payload.a = read_as_bf16(file, pair.a_offset, pair.a_bytes, pair.a_is_bf16,
                                  !pair.a_is_bf16 && pair.a_bytes ==
                                      static_cast<std::uint64_t>(pair.rank) * pair.in_dim * 2,

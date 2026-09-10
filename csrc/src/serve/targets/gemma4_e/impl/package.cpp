@@ -103,6 +103,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
                                   {input.projection.qdata, 8, input.projection.k, input.projection.n});
         }
     }
+    family::bind_lora_globals(store, runtime);
     store.validate_payloads(options.lora_payloads);
     store.ensure_banks();
 
@@ -110,8 +111,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         // A pipeline hands every stage the whole list; each applies the layers it
         // holds and leaves the rest to the stage that does.
         if (!store.covers_layer(payload.layer)) { continue; }
-        store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
-                              payload.rank, payload.in_dim, payload.out_dim, payload.scale);
+        store.set_payload(payload.slot, payload);
     }
     ops::lora_set_active(true);
 }

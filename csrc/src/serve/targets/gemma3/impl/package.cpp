@@ -88,6 +88,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
             Binding{attention.output.qdata, 3, g.query_size(), g.hidden});
         family::bind_lora_dense_mlp(store, index, attention.post_mixer, g.hidden, g.intermediate);
     }
+    family::bind_lora_globals(store, runtime);
     store.validate_payloads(options.lora_payloads);
     store.ensure_banks();
 
@@ -95,8 +96,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         // A pipeline hands every stage the whole list; each applies the layers it
         // holds and leaves the rest to the stage that does.
         if (!store.covers_layer(payload.layer)) { continue; }
-        store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
-                              payload.rank, payload.in_dim, payload.out_dim, payload.scale);
+        store.set_payload(payload.slot, payload);
     }
     ops::lora_set_active(true);
 }

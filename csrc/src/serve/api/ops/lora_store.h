@@ -16,6 +16,7 @@
 // and what lets tokens of different adapters share a kernel.
 
 #include "api/ops/lora.h"
+#include "api/ops/lora_base.h"
 #include "api/shared_weights.h"
 #include "core/arena.h"
 
@@ -77,6 +78,9 @@ public:
     /// and the store knows the rest, whether the load happens at startup or from a
     /// runtime endpoint.
     void register_module(std::int32_t layer, std::string module, ModuleBinding binding);
+    void register_base_weight(const Weight& weight);
+    void register_base(const void* key, std::int32_t port, std::vector<LoraBaseView> base,
+                       Tensor bias = {}, bool bias_in_output = false);
     /// A module refused on every layer (e.g. gate/up fused into SwiGLU).
     void register_refusal(std::string module, std::string reason);
     /// A module refused on one layer (e.g. attention names on a linear-attention layer).
@@ -102,12 +106,22 @@ public:
     /// A graph-stable device directory for projections selected by a device expert id.
     void register_bank_table(const void* key, const std::vector<ModuleBinding>& bindings);
     [[nodiscard]] const LoraBank* bank_table(const void* key) const noexcept;
+    [[nodiscard]] const LoraBank* host_bank_table(const void* key) const noexcept;
+    struct AutoProjection { std::int32_t port = 0, offset = 0, rows = 0; };
+    void register_auto(const void* key, AutoProjection projection);
+    void register_replacement(const void* key, std::int32_t port);
+    [[nodiscard]] const void* const* replacement_table(const void* key, std::int32_t port) const;
+    [[nodiscard]] const std::vector<AutoProjection>* auto_projections(const void* key) const;
+    [[nodiscard]] std::int32_t scratch_tokens() const noexcept { return scratch_tokens_; }
 
     /// Writes one adapter module into `slot`, resolving (layer, module) through
     /// the directory. Refusals and missing bindings throw with the module named.
     void set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
                          const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
-                         std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale);
+                         std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale,
+                         const std::vector<float>& magnitude = {}, const std::vector<float>& bias = {},
+                         const std::vector<float>& lora_bias = {}, const std::vector<std::uint16_t>& base_weight = {},
+                         std::shared_ptr<DeviceArena> prepared_replacement = {});
     void validate_module(std::int32_t layer, const std::string& module,
                          const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
                          std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale) const;
@@ -117,12 +131,26 @@ public:
         for (const auto& p : payloads) {
             if (!covers_layer(p.layer)) { continue; }
             validate_module(p.layer, p.module, p.a, p.b, p.rank, p.in_dim, p.out_dim, p.scale);
+            auto staged = stage_replacement(p.layer, p.module, p.base_weight);
+            (void)prepare_affine(p.layer, p.module, p.a, p.b, p.rank, p.scale,
+                                  p.magnitude, p.bias, p.lora_bias, p.base_weight, staged);
+            if (staged) { p.prepared_replacements[this] = std::move(staged); }
             for (const auto& part : module_parts(p.layer, p.module)) {
                 if (!used.emplace(p.slot, part.key, part.port).second) {
                     throw std::invalid_argument("adapter modules overlap at '" + p.module + "'");
                 }
             }
         }
+    }
+    template<class Payload>
+    void set_payload(std::int32_t slot, const Payload& p) {
+        std::shared_ptr<DeviceArena> staged;
+        if (const auto it = p.prepared_replacements.find(this); it != p.prepared_replacements.end()) {
+            staged = std::static_pointer_cast<DeviceArena>(it->second);
+        }
+        set_module_slot(p.layer, p.module, slot, p.a, p.b, p.rank, p.in_dim, p.out_dim, p.scale,
+                         p.magnitude, p.bias, p.lora_bias, p.base_weight, std::move(staged));
+        p.prepared_replacements.erase(this);
     }
     void validate_device_module(const DeviceAdapterModule& module) const;
     void set_device_module(std::int32_t slot, const DeviceAdapterModule& module);
@@ -187,6 +215,9 @@ private:
         void* a  = nullptr;
         void* b  = nullptr;
         bool raw = false; ///< individually cudaMalloc'd (directory-less path); arena otherwise
+        std::vector<std::uint16_t> host_a, host_b;
+        void* affine = nullptr;
+        std::vector<float> host_affine;
     };
     struct Key {
         const void* weight = nullptr;
@@ -201,6 +232,17 @@ private:
         }
     };
     std::unordered_map<Key, Bank, KeyHash> banks_;
+    struct Base { std::vector<LoraBaseView> parts; Tensor bias; bool bias_in_output = false; };
+    std::unordered_map<const void*, Weight> base_weights_;
+    std::unordered_map<Key, Base, KeyHash> bases_;
+    [[nodiscard]] Base base_for(const ModuleBinding& binding) const;
+    [[nodiscard]] std::vector<std::vector<float>> prepare_affine(std::int32_t layer,
+        const std::string& module, const std::vector<std::uint16_t>& a,
+        const std::vector<std::uint16_t>& b, std::int32_t rank, float scale,
+        const std::vector<float>& magnitude, const std::vector<float>& bias,
+        const std::vector<float>& lora_bias, const std::vector<std::uint16_t>& base_weight, std::shared_ptr<DeviceArena> prepared = {}) const;
+    [[nodiscard]] std::shared_ptr<DeviceArena> stage_replacement(std::int32_t layer, const std::string& module,
+        const std::vector<std::uint16_t>& weight) const;
     /// The arenas holding every bank plus the round state, allocated by
     /// ensure_banks. Each is an owning DeviceArena, so under sleep mode it joins
     /// the engine's sleepable estate as an Offload region: a slept model's
@@ -223,6 +265,14 @@ private:
     std::map<std::pair<std::int32_t, std::string>, ModuleParts> directory_;
     std::map<const void*, std::vector<ModuleBinding>> table_bindings_;
     std::map<const void*, const LoraBank*> tables_;
+    std::map<const void*, std::vector<LoraBank>> host_tables_;
+    std::unordered_map<const void*, std::vector<AutoProjection>> auto_;
+    struct Replacement {
+        void** table = nullptr;
+        std::vector<std::shared_ptr<DeviceArena>> values;
+    };
+    std::unordered_map<Key, Replacement, KeyHash> replacements_;
+    const void* owner_ = nullptr;
     std::map<std::string, std::string> refusals_;
     std::map<std::pair<std::int32_t, std::string>, std::string> layer_refusals_;
     /// True once ensure_banks has created any bank. It stops `set_slot` making
@@ -307,5 +357,12 @@ struct LoraRound {
 void lora_set_round(const LoraRound& round);
 void lora_clear_round();
 [[nodiscard]] const LoraRound& lora_current_round();
+
+inline constexpr int kLoraEmbeddingPort = 800;
+inline constexpr int kLoraAutomaticPort = 810;
+inline constexpr int kLoraBiasPort = 900;
+void lora_auto_linear(const Weight& base, const Tensor& x, Tensor& out, cudaStream_t stream);
+void lora_auto_bias(const Tensor& base_bias, Tensor& out, cudaStream_t stream);
+void lora_auto_embedding(const Weight& base, const Tensor& ids, Tensor& out, cudaStream_t stream);
 
 } // namespace sinfer::ops
