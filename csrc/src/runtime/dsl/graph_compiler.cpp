@@ -3125,13 +3125,25 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
     int dispatch_sections = 0;
     if (const char* e = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS")) dispatch_sections = std::atoi(e);
 
+    // A tile group executes as one fused operation. Its output is written
+    // while later input tiles are still being read, so arena coloring must
+    // keep the retained input/output buffers live across the whole group.
+    std::vector<std::pair<std::size_t, std::size_t>> op_lifetimes;
+    op_lifetimes.reserve(graph.ops.size());
+    for (std::size_t i = 0; i < graph.ops.size(); ++i)
+        op_lifetimes.emplace_back(i, i);
+    for (const auto& group : graph.mlp_tile_groups)
+        for (std::size_t i = group.start_op_idx; i <= group.end_op_idx; ++i)
+            op_lifetimes[i] = {group.start_op_idx, group.end_op_idx};
+
     for (std::size_t i = 0; i < graph.ops.size(); ++i) {
         const auto& op = graph.ops[i];
         auto visit = [&](const TensorRef& ref) {
             if (ref.tensor_id < 0 || static_cast<std::size_t>(ref.tensor_id) >= num_tids) return;
+            if (graph.mlp_tile_internal_tids.count(ref.tensor_id)) return;
             auto& ti = info[static_cast<std::size_t>(ref.tensor_id)];
-            ti.first_use = std::min(ti.first_use, i);
-            ti.last_use = std::max(ti.last_use, i);
+            ti.first_use = std::min(ti.first_use, op_lifetimes[i].first);
+            ti.last_use = std::max(ti.last_use, op_lifetimes[i].second);
             ti.live = true;
             // Take max over refs. A tid can be referenced via views of
             // different rank and — more importantly — via refs that
@@ -3799,7 +3811,9 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.compiled_save_for_bwd_bytes = total;
     arenas.save_for_bwd_bytes = arenas.compiled_save_for_bwd_bytes;
 
-    if (arenas.schema_allocation_authoritative) {
+    // The schema describes the untiled logical activations. Once a tile group
+    // replaces its intermediates, use the compiled live layout for these arenas.
+    if (arenas.schema_allocation_authoritative && fwd.mlp_tile_groups.empty()) {
         if (arenas.schema_frame_arena_bytes > 0) {
             arenas.fwd_stack_bytes = std::max(arenas.compiled_fwd_stack_bytes, arenas.schema_frame_arena_bytes);
             if (arenas.compiled_fwd_stack_bytes > arenas.schema_frame_arena_bytes) {
@@ -6919,7 +6933,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
         const auto& ops = result.ops;
         for (std::size_t i = 0; i < ops.size(); ++i) {
             // Look for matmul ops with mlp_up_weight
-            if (ops[i].type != CompiledOpType::Matmul && ops[i].type != CompiledOpType::MatmulBias) continue;
+            if (ops[i].type != CompiledOpType::Matmul || ops[i].attrs.transpose != EMMTranspose::NT) continue;
 
             bool is_up = false;
             for (const auto& inp : ops[i].inputs) {
@@ -6934,13 +6948,15 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             // The view op before it is the group start.
             if (i == 0) continue;
             std::size_t start = i - 1;
-            if (ops[start].type != CompiledOpType::View) continue;
+            if (ops[start].type != CompiledOpType::View ||
+                ops[start].outputs[0].tensor_id != ops[i].inputs[0].tensor_id)
+                continue;
 
             // Walk forward to find mlp_down_weight matmul
             std::size_t down_idx = 0;
             bool found_down = false;
             for (std::size_t j = i + 1; j < ops.size() && j <= i + 5; ++j) {
-                if (ops[j].type != CompiledOpType::Matmul && ops[j].type != CompiledOpType::MatmulBias) continue;
+                if (ops[j].type != CompiledOpType::Matmul || ops[j].attrs.transpose != EMMTranspose::NT) continue;
                 for (const auto& inp : ops[j].inputs) {
                     if (inp.name.size() >= 15 && inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
                         down_idx = j;
@@ -6954,17 +6970,34 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
 
             // The view op after the down matmul is the group end
             std::size_t end = down_idx + 1;
-            if (end >= ops.size() || ops[end].type != CompiledOpType::View) {
-                end = down_idx;  // fallback: end at the matmul itself
-            }
+            if (end >= ops.size() || ops[end].type != CompiledOpType::View ||
+                ops[end].inputs[0].tensor_id != ops[down_idx].outputs[0].tensor_id ||
+                ops[i].attrs.layer_idx != ops[down_idx].attrs.layer_idx)
+                continue;
 
-            result.mlp_tile_groups.push_back(MlpTileGroup{start, end});
+            bool supported = false;
+            for (std::size_t j = i + 1; j < down_idx; ++j) {
+                if (ops[j].inputs[0].tensor_id != ops[j - 1].outputs[0].tensor_id) {
+                    supported = false;
+                    break;
+                }
+                if (ops[j].type == CompiledOpType::SwiGLU && !supported)
+                    supported = true;
+                else if (ops[j].type != CompiledOpType::View && !(ops[j].type == CompiledOpType::Clamp && !supported)) {
+                    supported = false;
+                    break;
+                }
+            }
+            supported &= ops[down_idx].inputs[0].tensor_id == ops[down_idx - 1].outputs[0].tensor_id;
+            if (supported) result.mlp_tile_groups.push_back(MlpTileGroup{start, end});
         }
         // Also detect backward MLP tile groups (MatmulBackward ops).
         // In the backward graph, the down-proj backward comes BEFORE the up-proj backward (reversed).
         // Backward sequence: view_bwd → matmul_bwd(down) → view_bwd → swiglu_bwd → view_bwd → matmul_bwd(up) → view_bwd
         for (std::size_t i = 0; i < ops.size(); ++i) {
-            if (ops[i].type != CompiledOpType::MatmulBackward) continue;
+            if (ops[i].type != CompiledOpType::MatmulBackward || ops[i].attrs.transpose != EMMTranspose::NT ||
+                ops[i].outputs.size() != 2)
+                continue;
 
             bool is_down = false;
             for (const auto& inp : ops[i].inputs) {
@@ -6996,6 +7029,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                 if (found_up) break;
             }
             if (!found_up) continue;
+            if (ops[up_idx].attrs.transpose != EMMTranspose::NT || ops[up_idx].outputs.size() != 2 ||
+                ops[i].attrs.layer_idx != ops[up_idx].attrs.layer_idx)
+                continue;
 
             // The view_backward after the up matmul_backward is the group end
             std::size_t end = up_idx + 1;
@@ -7003,8 +7039,140 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                 end = up_idx;
             }
 
-            result.mlp_tile_groups.push_back(MlpTileGroup{start, end});
+            bool supported = false;
+            for (std::size_t j = i + 1; j < up_idx; ++j) {
+                if (ops[j].inputs[0].tensor_id != ops[j - 1].outputs[0].tensor_id) {
+                    supported = false;
+                    break;
+                }
+                if (ops[j].type == CompiledOpType::SwiGLUBackward && !supported)
+                    supported = true;
+                else if (ops[j].type != CompiledOpType::ViewBackward && ops[j].type != CompiledOpType::View &&
+                         !(ops[j].type == CompiledOpType::ClampBackward && supported)) {
+                    supported = false;
+                    break;
+                }
+            }
+            supported &= ops[up_idx].inputs[0].tensor_id == ops[up_idx - 1].outputs[0].tensor_id;
+            if (supported) result.mlp_tile_groups.push_back(MlpTileGroup{start, end});
         }
+
+        // The routed FFN is token independent after permutation. Bound its
+        // wide activations while preserving the existing router/permutation.
+        if (mConfig.ModelTypeName == "glm5_next" && mOptions.EPSize == 1 && !mOptions.CpuTraining &&
+            mOptions.ModelType == ETensorDType::BF16) {
+            const auto first =
+                is_backward ? CompiledOpType::MoEGroupedGemmDownBackward : CompiledOpType::MoEGroupedGemmGateUp;
+            const auto last =
+                is_backward ? CompiledOpType::MoEGroupedGemmGateUpBackward : CompiledOpType::MoEGroupedGemmDown;
+            for (std::size_t i = 0; i < ops.size(); ++i) {
+                if (ops[i].type != first) continue;
+                std::size_t end = i + 1;
+                for (; end < ops.size() && end <= i + 3; ++end) {
+                    auto type = ops[end].type;
+                    if (type == last) break;
+                    if (type != CompiledOpType::SwiGLU && type != CompiledOpType::Clamp &&
+                        type != CompiledOpType::SwiGLUBackward && type != CompiledOpType::ClampBackward)
+                        break;
+                }
+                if (end < ops.size() && ops[end].type == last && ops[i].attrs.layer_idx == ops[end].attrs.layer_idx)
+                    result.mlp_tile_groups.push_back(MlpTileGroup{i, end, true});
+            }
+            for (std::size_t i = 0; i < ops.size(); ++i) {
+                auto matches = [&](std::size_t idx, const char* weight) {
+                    if (idx >= ops.size()) return false;
+                    const auto type = is_backward ? CompiledOpType::MatmulBackward : CompiledOpType::Matmul;
+                    return ops[idx].type == type && ops[idx].inputs[is_backward ? 2 : 1].name.ends_with(weight);
+                };
+                if (!matches(i, is_backward ? "shared_expert_down" : "shared_expert_gate")) continue;
+                std::size_t end = i + 1;
+                for (; end < ops.size() && end <= i + 6; ++end) {
+                    if (matches(end, is_backward ? "shared_expert_gate" : "shared_expert_down")) break;
+                    const auto type = ops[end].type;
+                    if (type != CompiledOpType::Matmul && type != CompiledOpType::Clamp &&
+                        type != CompiledOpType::Silu && type != CompiledOpType::Mul &&
+                        type != CompiledOpType::MatmulBackward && type != CompiledOpType::ClampBackward &&
+                        type != CompiledOpType::SiluBackward && type != CompiledOpType::MulBackward)
+                        break;
+                }
+                if (!matches(end, is_backward ? "shared_expert_gate" : "shared_expert_down")) continue;
+                if (is_backward) {
+                    // The two input gradients merge immediately after gate backward.
+                    if (end + 1 >= ops.size() || ops[end + 1].type != CompiledOpType::Add ||
+                        ops[end + 1].inputs[1].tensor_id != ops[end].outputs[0].tensor_id)
+                        continue;
+                    ++end;
+                }
+                result.mlp_tile_groups.push_back(MlpTileGroup{i, end, false, true});
+            }
+        }
+
+        std::vector<MlpTileGroup> accepted_groups;
+        for (const auto& group : result.mlp_tile_groups) {
+            std::unordered_set<int> internal, retained;
+            auto retain = [&](const TensorRef& ref) {
+                retained.insert(ref.tensor_id);
+            };
+            if ((group.grouped_experts || group.shared_expert) && is_backward) {
+                retain(ops[group.start_op_idx].inputs[0]);
+                if (group.grouped_experts)
+                    retain(ops[group.end_op_idx].inputs[1]);
+                else
+                    for (std::size_t j = group.start_op_idx; j <= group.end_op_idx; ++j)
+                        if (ops[j].type == CompiledOpType::MatmulBackward &&
+                            ops[j].inputs[2].name.ends_with("shared_expert_gate"))
+                            retain(ops[j].inputs[1]);
+            } else
+                for (const auto& ref : ops[group.start_op_idx].inputs)
+                    retain(ref);
+            for (const auto& ref : ops[group.end_op_idx].outputs)
+                retain(ref);
+            if (!is_backward && !group.grouped_experts && !group.shared_expert)
+                for (const auto& ref : ops[group.start_op_idx].outputs)
+                    retain(ref);
+            for (std::size_t j = group.start_op_idx; j <= group.end_op_idx; ++j) {
+                const auto& op = ops[j];
+                for (const auto& ref : op.inputs)
+                    internal.insert(ref.tensor_id);
+                for (const auto& ref : op.outputs)
+                    internal.insert(ref.tensor_id);
+                if (group.grouped_experts)
+                    for (const auto& ref : op.inputs)
+                        if (ref.dtype == ETensorDType::INT32) retain(ref);
+                if (op.type == CompiledOpType::Matmul && op.inputs[1].name.ends_with("mlp_down_weight"))
+                    retain(op.outputs[0]);
+                if (op.type == CompiledOpType::MatmulBackward && !group.shared_expert) {
+                    if (op.inputs[2].name.ends_with("mlp_up_weight")) {
+                        retain(op.inputs[1]);
+                        retain(op.outputs[0]);
+                    } else
+                        retain(op.inputs[0]);
+                    for (std::size_t k = 1; k < op.outputs.size(); ++k)
+                        retain(op.outputs[k]);
+                }
+            }
+            std::erase_if(internal, [&](int tid) {
+                if (tid < 0 || retained.count(tid)) return true;
+                const auto kind = result.tensor_meta.at(tid).kind;
+                return kind == TensorKind::ForwardParam || kind == TensorKind::ParamGrad ||
+                       kind == TensorKind::AccumTemp;
+            });
+            // A tile may discard only intermediates private to this op group.
+            // Fall back to ordinary execution for a branched/custom MLP graph.
+            bool private_intermediates = true;
+            for (std::size_t j = 0; j < ops.size() && private_intermediates; ++j) {
+                if (j >= group.start_op_idx && j <= group.end_op_idx) continue;
+                for (const auto& ref : ops[j].inputs)
+                    if (internal.count(ref.tensor_id)) private_intermediates = false;
+            }
+            if (private_intermediates) {
+                accepted_groups.push_back(group);
+                result.mlp_tile_internal_tids.insert(internal.begin(), internal.end());
+            }
+        }
+        result.mlp_tile_groups = std::move(accepted_groups);
+        if (!result.mlp_tile_groups.empty())
+            compute_layout(result, is_backward, /*fwd_per_layer_sections=*/!mOptions.recompute_enabled());
 
         if (!result.mlp_tile_groups.empty()) {
             std::fprintf(stderr,

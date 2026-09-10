@@ -116,6 +116,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
         }
         expert_offsets_ptr = moe_offsets_fwd_ptr;
     }
+    if (mFfnTileOffsets.Data) expert_offsets_ptr = &mFfnTileOffsets;
     Tensor& expert_offsets = *expert_offsets_ptr;
     if (expert_offsets.DType != ETensorDType::INT32) {
         throw std::runtime_error("moe_grouped_gemm_gate_up: expert_offsets dtype is not INT32");
@@ -762,6 +763,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
         }
         expert_offsets_ptr = moe_offsets_bwd_ptr;
     }
+    if (mFfnTileOffsets.Data) expert_offsets_ptr = &mFfnTileOffsets;
 
     int num_experts = num_experts_for_offsets;
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
@@ -1268,6 +1270,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
             if (mLoRAGrads && mComm && (!llep_lora_active || llep_wgrad)) {
                 lora_grads = &mLoRAGrads->get_block_full(layer_idx, mRunState.MainStream, *mComm, lora_accum);
             }
+            lora_accum |= mFfnTileAccumulate;
             const float grad_beta = lora_accum ? 1.0f : 0.0f;
 
             auto merged_temp = [&](long rows, long cols) -> Tensor {

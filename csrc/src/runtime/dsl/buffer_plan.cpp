@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include "runtime/core/model_config.h"
@@ -885,17 +886,20 @@ namespace {
 
 }  // namespace
 
-long BufferPlan::plan_stack_peak_bytes() const {
+long BufferPlan::plan_stack_peak_bytes(long mlp_tokens) const {
     // Each block below mirrors a simulation in `allocate_simplified_*` —
     // same allocations, same order, same dtypes. Peak is the max across
     // blocks since each block fully releases before the next runs (the sim
     // `free()`s in reverse at the end of each block).
 
+    // The early estimate may use a tile width. After compilation the graph
+    // walk accounts for actual tile groups, or full ops if detection declined.
+    const long mlp_rows = mlp_tokens > 0 ? std::min(B * T, mlp_tokens) : B * T;
     // Forward FFN temps: mlp_up + swiglu (both live simultaneously).
     long ffn_peak = 0;
     if (ffn_temps_on_stack) {
-        ffn_peak += align_stack_bytes(bytes_of(B * T * MUp, act_dtype));  // mlp_up
-        ffn_peak += align_stack_bytes(bytes_of(B * T * M, act_dtype));    // swiglu
+        ffn_peak += align_stack_bytes(bytes_of(mlp_rows * MUp, act_dtype));  // mlp_up
+        ffn_peak += align_stack_bytes(bytes_of(mlp_rows * M, act_dtype));    // swiglu
     }
 
     // Backward temps: d_qkv, d_mlp_up, d_swiglu, d_up (all live simultaneously).
@@ -904,13 +908,13 @@ long BufferPlan::plan_stack_peak_bytes() const {
     if (large_bwd_temps_on_stack) {
         bwd_peak += align_stack_bytes(bytes_of(B * T * QKV, grad_dtype));  // d_qkv
         if (has_mlp_up_slot) {
-            bwd_peak += align_stack_bytes(bytes_of(B * T * MUp, grad_dtype));  // d_mlp_up
+            bwd_peak += align_stack_bytes(bytes_of(mlp_rows * MUp, grad_dtype));  // d_mlp_up
         }
         if (has_swiglu_slot) {
-            bwd_peak += align_stack_bytes(bytes_of(B * T * M, grad_dtype));  // d_swiglu
+            bwd_peak += align_stack_bytes(bytes_of(mlp_rows * M, grad_dtype));  // d_swiglu
         }
         if (has_mlp_up_slot) {
-            bwd_peak += align_stack_bytes(bytes_of(B * T * MUp, grad_dtype));  // d_up
+            bwd_peak += align_stack_bytes(bytes_of(mlp_rows * MUp, grad_dtype));  // d_up
         }
     }
 
@@ -935,9 +939,16 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
     long peak = 0;
     long current = 0;
 
-    for (const auto& op : bwd_graph->ops) {
+    // Tiled groups restore their scratch after each tile. Logical full-size
+    // intermediates and the ordinary dispatchers' bounds do not apply to them.
+    std::unordered_map<std::size_t, const MlpTileGroup*> tile_starts;
+    for (const auto& group : bwd_graph->mlp_tile_groups)
+        tile_starts[group.start_op_idx] = &group;
+
+    auto count_outputs = [&](const CompiledOp& op) {
         // (1) Graph-level outputs that land on the stack.
         for (const auto& ref : op.outputs) {
+            if (bwd_graph->mlp_tile_internal_tids.count(ref.tensor_id)) continue;
             if (ref.shape.empty()) continue;
             bool on_stack = false;
             switch (ref.slot) {
@@ -953,6 +964,35 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
                 current += tensor_stack_bytes(ref.dtype, ref.shape);
             }
         }
+    };
+
+    for (std::size_t i = 0; i < bwd_graph->ops.size(); ++i) {
+        const auto& op = bwd_graph->ops[i];
+        if (const auto it = tile_starts.find(i); it != tile_starts.end()) {
+            const auto& group = *it->second;
+            bool clamped = false;
+            for (std::size_t j = i; j <= group.end_op_idx; ++j) {
+                count_outputs(bwd_graph->ops[j]);
+                clamped |= bwd_graph->ops[j].type == CompiledOpType::ClampBackward;
+            }
+            const long rows = std::min(plan.B * plan.T * (group.grouped_experts ? plan.TopK : 1), plan.C);
+            const long width = group.grouped_experts ? plan.MoeM
+                               : group.shared_expert ? bwd_graph->ops[i].inputs[2].shape.back()
+                                                     : plan.M;
+            const long up = tensor_stack_bytes(plan.act_dtype, {rows, 2 * width});
+            const long act = tensor_stack_bytes(plan.act_dtype, {rows, width});
+            // up, d_up, activation, d_activation; GLM additionally keeps the
+            // clamped projection and FP32 clamp gradient until tile restore.
+            long scratch = 2 * up + 2 * act;
+            if (clamped) scratch += up + tensor_stack_bytes(ETensorDType::FP32, {rows, 2 * width});
+            if (group.grouped_experts || group.shared_expert)
+                scratch += 4 * up + tensor_stack_bytes(plan.act_dtype, {rows, 4 * plan.C});
+            peak = std::max(peak, current + scratch);
+            i = group.end_op_idx;
+            if (bwd_graph->ops[i].layer_end >= 0) current = 0;
+            continue;
+        }
+        count_outputs(op);
 
         // (2) Op-internal temps allocated by dispatch functions — workspaces,
         //     recompute scratch, fused-kernel temps — that are NOT visible
@@ -994,7 +1034,8 @@ namespace {
 /// accounting for the unmodeled SwiGLU-backward + LoRA-hook transient peak.
 [[nodiscard]] long qwen3_5_lora_heuristic_slack(const BufferPlan& plan, const RuntimeOptions& options) {
     const long dtype_bytes = static_cast<long>(get_dtype_size(plan.act_dtype));
-    const long swiglu_peak = plan.B * plan.T * plan.MUp * dtype_bytes;
+    const long rows = options.LongContext ? std::min(plan.B * plan.T, plan.C) : plan.B * plan.T;
+    const long swiglu_peak = rows * plan.MUp * dtype_bytes;
     long slack = std::max(128L * 1024 * 1024, swiglu_peak + 64L * 1024 * 1024);
     if (options.UseCudaGraphs) {
         // CUDA graph capture retains additional transient tensors during
@@ -1015,7 +1056,7 @@ qwen3_5_lora_floor(const BufferPlan& plan, const PretrainedConfig& cfg, const Ru
 /// MoE backward temps are op-internal (`gpt_oss_moe_act_backward` allocates
 /// in intermediate dim, not hidden dim) and not yet modeled in
 /// `graph_backward_stack_peak`. This reproduces the legacy slack.
-[[nodiscard]] long moe_op_internal_estimate(const BufferPlan& plan) {
+[[nodiscard]] long moe_op_internal_estimate(const BufferPlan& plan, bool tiled) {
     if (!plan.has_moe()) return 0;
     // Matches `moe_extra` in the pre-refactor heuristic, but in plan units.
     // With expert parallelism only the local expert shard can appear in any
@@ -1026,16 +1067,17 @@ qwen3_5_lora_floor(const BufferPlan& plan, const PretrainedConfig& cfg, const Ru
     const long expert_gate_up = local_experts * plan.MoeMUp * plan.C * kBytesBF16;
     const long expert_down = local_experts * plan.MoeM * plan.C * kBytesBF16;
     const long permuted_tokens = 2L * plan.B * plan.T * plan.TopK * plan.C * kBytesBF16;
-    const long moe_bwd_act = 2L * plan.B * plan.T * plan.TopK * plan.MoeMUp * kBytesBF16;
+    const long expert_rows = tiled ? std::min(plan.B * plan.T * plan.TopK, plan.C) : plan.B * plan.T * plan.TopK;
+    const long moe_bwd_act = (tiled ? 8L : 2L) * expert_rows * plan.MoeMUp * kBytesBF16;
     return expert_gate_up + expert_down + permuted_tokens + moe_bwd_act;
 }
 
 /// Extra BF16 slack for ops whose backward peak is not yet modeled.
-/// Inherits the legacy `extra_tmp = max(BT*C, BT*QKV, BT*MUp) * dtype_size`.
-[[nodiscard]] long unmodeled_bwd_tmp(const BufferPlan& plan) {
+/// MLP scratch follows the tile width; attention and residual scratch remain full-size.
+[[nodiscard]] long unmodeled_bwd_tmp(const BufferPlan& plan, long mlp_tokens) {
     const long BT = plan.B * plan.T;
     const long dtype_bytes = static_cast<long>(get_dtype_size(plan.act_dtype));
-    return std::max({BT * plan.C, BT * plan.QKV, BT * plan.MUp}) * dtype_bytes;
+    return std::max({BT * plan.C, BT * plan.QKV, mlp_tokens * plan.MUp}) * dtype_bytes;
 }
 
 [[nodiscard]] bool schema_allocation_can_tighten_stack(const BufferPlan& plan) {
@@ -1058,15 +1100,18 @@ static long heuristic_required_bytes(const BufferPlan& plan,
                                      const PretrainedConfig& cfg,
                                      const RuntimeOptions& options,
                                      long moe_stack_slack) {
-    const long plan_peak = plan.plan_stack_peak_bytes();
+    const long mlp_tokens = options.LongContext ? std::min(plan.B * plan.T, plan.C) : plan.B * plan.T;
+    const long plan_peak = plan.plan_stack_peak_bytes(mlp_tokens);
     const bool schema_tight_stack = schema_allocation_can_tighten_stack(plan);
     const long base_multiplier = (options.CpuTraining || schema_tight_stack) ? 1L : 2L;
-    const long moe_extra = moe_op_internal_estimate(plan);
+    const bool tiled_experts = options.LongContext && cfg.ModelTypeName == "glm5_next" && options.EPSize == 1 &&
+                               !options.CpuTraining && options.ModelType == ETensorDType::BF16;
+    const long moe_extra = moe_op_internal_estimate(plan, tiled_experts);
     const long safety_floor = schema_tight_stack ? (32L * 1024 * 1024)
                               : plan.lora_only   ? (32L * 1024 * 1024)
                                                  : (64L * 1024 * 1024);
     const long safety_bytes = std::max(safety_floor, plan_peak / 8);
-    const long extra_tmp = unmodeled_bwd_tmp(plan);
+    const long extra_tmp = unmodeled_bwd_tmp(plan, mlp_tokens);
 
     long required = std::max(1024L * 1024, plan_peak * base_multiplier + moe_extra + safety_bytes + extra_tmp);
 
@@ -1115,6 +1160,9 @@ static long min_stack_floor(const BufferPlan& plan, const PretrainedConfig& cfg,
         floor = std::max(floor, plan.lora_only ? (1024L * 1024 * 1024) : (4L * 1024 * 1024 * 1024));
     }
     floor = std::max(floor, qwen3_5_lora_floor(plan, cfg, options));
+    // GLM's FLA/DSA dispatchers publish shape-dependent stack bounds. Keep
+    // the heuristic and graph estimates, without the unrelated 3–4 GiB floor.
+    if (cfg.ModelTypeName == "glm5_next") floor = 256L * 1024 * 1024;
     if (const char* env = std::getenv("SUROGATE_MIN_STACK_MB")) {
         const long mb = std::max(64L, std::atol(env));
         floor = mb * 1024 * 1024;
@@ -1129,7 +1177,7 @@ long required_stack_bytes(const BufferPlan& plan,
     // Global MoE slack (applied to both heuristic path and floor). Env-
     // override kept for operator control when a model spikes beyond the
     // built-in 2 GiB allowance.
-    long moe_stack_slack = plan.has_moe() ? (2048L * 1024 * 1024) : 0L;
+    long moe_stack_slack = plan.has_moe() && cfg.ModelTypeName != "glm5_next" ? (2048L * 1024 * 1024) : 0L;
     if (const char* env = std::getenv("SUROGATE_STACK_SLACK_MB")) {
         const long mb = std::max(0L, std::atol(env));
         moe_stack_slack = std::max(moe_stack_slack, mb * 1024 * 1024);

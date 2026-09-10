@@ -1575,6 +1575,24 @@ class SurogateTrainer:
 
         Requires single-GPU LoRA without quantization or weight offloading.
         """
+    def get_decode_cache_stats(self) -> dict[str, int]:
+        """Return the single-session decode length, limit and cache payload bytes."""
+    def decode_batch_logits(self, session_ids: npt.NDArray[np.int64], input_ids: npt.NDArray[np.int32],
+                            offsets: npt.NDArray[np.int32], reset: npt.NDArray[np.int32]) -> npt.NDArray[np.float32]:
+        """Append ragged chunks to sessions; return [len(session_ids), vocab_size] logits.
+
+        Offsets has N+1 entries delimiting flattened input_ids. Each session must
+        be distinct; reset=1 starts its prefill. Training updates invalidate all
+        sessions. Uses one GPU with resident unquantized LoRA weights.
+        """
+    def release_decode_sessions(self, session_ids: list[int]) -> None:
+        """Release request state and return its pages to the shared cache pool."""
+    def get_decode_batch_stats(self) -> dict[str, int]:
+        """Report active sessions, tokens, pages, cache bytes and page reuse."""
+    def reset_decode_state(self) -> None:
+        """Invalidate all decode sessions and trim unused pages in the shared pool."""
+    def decode_logits(self, input_ids: npt.NDArray[np.int32], reset: bool = False) -> npt.NDArray[np.float32]:
+        """Prefill with reset=True, then append tokens and return next-token logits."""
     def get_lora_weights(self, gpu_id: int) -> dict:
         """Return owner-retaining CUDA views of the live LoRA parameters."""
     def get_lora_gradients(self, gpu_id: int) -> dict:

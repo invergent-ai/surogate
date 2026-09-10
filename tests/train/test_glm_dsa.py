@@ -10,7 +10,7 @@ pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(),
 
 
 @functools.lru_cache
-def runner(dim, ih, idim, pool, topk, tail=True):
+def runner(dim, ih, idim, pool, topk, tail=True, max_seq=128):
     from surogate import _surogate as ext
     from surogate.kernels.jit_compile import _compile_glm_dsa
 
@@ -25,7 +25,7 @@ def runner(dim, ih, idim, pool, topk, tail=True):
                 index_kpool=pool,
                 index_topk=topk,
                 index_kpool_always_select_tail=tail,
-                max_seq=128,
+                max_seq=max_seq,
             )
         )
     )
@@ -155,3 +155,71 @@ def test_cached_indexer_and_attention_match_full_prefix():
     ids, scratch = run_indexer(kernel, chunk, 8, cache=cache)
     out, _ = run_attention(kernel, qkv[:, :3].contiguous(), ids, scratch, cache)
     torch.testing.assert_close(out, expected[:, :3], atol=0.005, rtol=0.03)
+
+
+@pytest.mark.parametrize("topk,max_seq", [(32, 512), (160, 512), (1024, 256)])
+def test_early_decode_preserves_attention_reduction_slots(topk, max_seq):
+    from surogate import _surogate as ext
+
+    kernel = runner(64, 4, 32, 4, topk, max_seq=max_seq)
+    x, qkv = inputs(1, 193, 64, 4, 32, 4)
+    selected, work = run_indexer(kernel, x, topk)
+    expected, _ = run_attention(kernel, qkv, selected, work)
+    cache = ext._GlmDecodeState()
+    cache.capacity = 256
+    start = 0
+    # Begin before top-k fills, cross pool boundaries, then exceed top-k.
+    # Moving the unfinished pool into earlier empty slots changes the FP32
+    # reduction tree and can round an attention output to a different BF16.
+    for length in (1, 2, 2, 14, 4, 137, 33):
+        chunk = [v[:, start : start + length].contiguous() if i in (0, 1, 2, 3, 7) else v for i, v in enumerate(x)]
+        ids, scratch = run_indexer(kernel, chunk, topk, cache=cache)
+        torch.testing.assert_close(ids, selected[:, start : start + length], atol=0, rtol=0)
+        out, _ = run_attention(kernel, qkv[:, start : start + length].contiguous(), ids, scratch, cache)
+        torch.testing.assert_close(out, expected[:, start : start + length], atol=0, rtol=0)
+        start += length
+        cache.length = start
+
+
+@pytest.mark.parametrize("tail", [True, False])
+def test_query_tiles_preserve_packed_selection_and_bound_workspace(tail):
+    kernel = runner(64, 4, 32, 4, 8, tail, max_seq=1024)
+    x, _ = inputs(2, 513, 64, 4, 32, 4)
+    lengths = [[513], [3, 127, 129, 254]]
+    x[-1][1] = torch.cat([torch.arange(n, device="cuda") for n in lengths[1]])
+    selected, _ = run_indexer(kernel, x, 8, tail)
+    expected = reference_mask(x, lengths, 8, tail)
+    actual = torch.zeros_like(expected, dtype=torch.int32)
+    actual.scatter_add_(2, selected.clamp_min(0).long(), (selected >= 0).int())
+    torch.testing.assert_close(actual.bool(), expected)
+    assert actual.max() == 1
+
+    # Sizing does not allocate memory. Doubling a long context must now grow
+    # scratch linearly, including the indexer score and top-k buffers.
+    small = kernel.workspace_bytes(1, 8192)
+    large = kernel.workspace_bytes(1, 16384)
+    assert large <= 2 * small + 1024
+    old_scores = 4 * 16384 * (16384 // 4)
+    assert large < old_scores // 32
+
+
+def test_tiled_prefill_cache_and_exact_ties():
+    from surogate import _surogate as ext
+
+    kernel = runner(64, 4, 32, 4, 8, max_seq=1024)
+    x, qkv = inputs(1, 521, 64, 4, 32, 4)
+    x[0].zero_()  # Every visible pool ties; preserve the earlier-pool rule.
+    selected, work = run_indexer(kernel, x, 8)
+    expected, _ = run_attention(kernel, qkv, selected, work)
+    assert selected[0, 256, :8].tolist() == list(range(8))
+    cache = ext._GlmDecodeState()
+    cache.capacity = 1024
+    start = 0
+    for length in (257, 1, 259, 4):
+        chunk = [v[:, start : start + length].contiguous() if i in (0, 1, 2, 3, 7) else v for i, v in enumerate(x)]
+        ids, scratch = run_indexer(kernel, chunk, 8, cache=cache)
+        torch.testing.assert_close(ids, selected[:, start : start + length])
+        out, _ = run_attention(kernel, qkv[:, start : start + length].contiguous(), ids, scratch, cache)
+        torch.testing.assert_close(out, expected[:, start : start + length], atol=0.005, rtol=0.03)
+        start += length
+        cache.length = start

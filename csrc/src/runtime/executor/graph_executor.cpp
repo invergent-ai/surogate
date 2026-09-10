@@ -932,6 +932,11 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 std::make_unique<CompiledGraph>(mCompiler->compile(*mBackward, B, T, /*is_backward=*/true));
             mCompiledBackward->compute_layer_segments();
         }
+        if (mCompiledForward && !mCompiledForward->mlp_tile_internal_tids.empty()) {
+            std::erase_if(mSaveList, [&](const std::string& name) {
+                return mCompiledForward->mlp_tile_internal_tids.count(mCompiledForward->find_tensor_id(name));
+            });
+        }
 
         // Cross-graph region fixup: promote forward activations consumed by
         // backward to SaveForBwd in both compiles. Filtered to match the
@@ -1034,7 +1039,13 @@ void GraphExecutor::compile_graphs(long B, long T) {
                 }
                 // moe_saved arena sized 256 MiB when NumExperts > 0.
                 // Cross-step monotonic bump; cudaMalloc fallback on exhaustion.
-                const std::size_t moe_saved_bytes = mConfig.NumExperts > 0 ? 256ULL * 1024 * 1024 : 0;
+                // GLM saves through the measured per-tensor cache. Its eager
+                // warmup allocates those buffers before graph capture.
+                const bool glm =
+                    std::any_of(mCompiledForward->ops.begin(), mCompiledForward->ops.end(), [](const CompiledOp& op) {
+                        return op.type == CompiledOpType::GlmDsaAttention;
+                    });
+                const std::size_t moe_saved_bytes = mConfig.NumExperts > 0 && !glm ? 256ULL * 1024 * 1024 : 0;
                 dsl::compute_arena_sizes(mPhaseArenas,
                                          *mCompiledForward,
                                          *mCompiledBackward,
@@ -1355,7 +1366,10 @@ void GraphExecutor::execute_forward(long B,
         // backend_mem_eff's per-op temps don't need temp_alloc from the
         // stack arena. One attention op at a time, so ~128 MiB per op
         // peak is enough; 256 MiB gives comfortable margin.
-        mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
+        if (std::any_of(mCompiledForward->ops.begin(), mCompiledForward->ops.end(), [](const CompiledOp& op) {
+                return op.type == CompiledOpType::FlashAttention;
+            }))
+            mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
 
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
@@ -1473,7 +1487,10 @@ void GraphExecutor::execute_backward(long B,
         prime_profile_fp8_weight_caches(/*backward=*/true, /*transposed=*/true);
         prime_fp4_weight_cache({});
         mCompiledExecutor->prepare_replay_persist_arena_for_capture();
-        mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
+        if (std::any_of(mCompiledBackward->ops.begin(), mCompiledBackward->ops.end(), [](const CompiledOp& op) {
+                return op.type == CompiledOpType::FlashAttentionBackward;
+            }))
+            mCompiledExecutor->prepare_mem_eff_scratch_for_capture(1024ull * 1024 * 1024);
     } else if (!in_capture) {
         if (enable_fp8_weight_cache) {
             prime_fp8_weight_cache_transposed({});
@@ -1528,9 +1545,11 @@ std::vector<RuntimeBinding> materialize_runtime_bindings(const ExecutionRequest&
     bindings.reserve(bindings.size() + request.input_copies.size());
     for (const auto& copy : request.input_copies) {
         Tensor destination = copy.destination;
-        if (request.glm_decode_state) {
+        if (request.decoding()) {
             const std::vector<long> shape(copy.source.Sizes.begin(), copy.source.Sizes.begin() + copy.source.Rank);
-            destination = view_tensor(destination, shape);
+            destination = copy.transform == RuntimeCopyTransform::ReplicateSinglePlaneToThree
+                              ? view_tensor(destination, {3, request.batch, request.sequence})
+                              : view_tensor(destination, shape);
         }
         bindings.push_back(RuntimeBinding{copy.name, destination});
     }
@@ -1544,9 +1563,10 @@ void copy_runtime_inputs(const ExecutionRequest& request, cudaStream_t stream) {
                                      "' has null source or destination");
         }
         if (copy.transform == RuntimeCopyTransform::ReplicateSinglePlaneToThree) {
-            const std::size_t plane_bytes = static_cast<std::size_t>(copy.destination.Sizes[1]) *
-                                            static_cast<std::size_t>(copy.destination.Sizes[2]) *
-                                            get_dtype_size(copy.destination.DType);
+            const std::size_t plane_bytes =
+                static_cast<std::size_t>(request.decoding() ? request.batch : copy.destination.Sizes[1]) *
+                static_cast<std::size_t>(request.decoding() ? request.sequence : copy.destination.Sizes[2]) *
+                get_dtype_size(copy.destination.DType);
             for (int p = 0; p < 3; ++p) {
                 auto* dst = static_cast<std::byte*>(copy.destination.Data) + p * plane_bytes;
                 CUDA_CHECK(cudaMemcpyAsync(dst, copy.source.Data, copy.source.bytes(), copy.kind, stream));
@@ -1594,9 +1614,9 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
     record_event_if_not_capturing(rs.TransferDone, rs.MainStream);
 
     std::vector<RuntimeBinding> runtime_bindings = materialize_runtime_bindings(request);
-    if (request.glm_decode_state) {
-        if (request.batch != 1 || !request.disable_forward_saves || !request.generation_positions_cpu)
-            throw std::runtime_error("GLM decode requires one forward-only generation request");
+    if (request.decoding()) {
+        if (!request.disable_forward_saves || !request.generation_positions_cpu)
+            throw std::runtime_error("Decode requires forward-only generation requests");
         if (!mDecodeCompiler) {
             mDecodeCompiler = std::make_unique<GraphCompiler>(mModule, mConfig, mOptions, mWeights, mGrads);
             mDecodeExecutor = std::make_unique<CompiledExecutor>(rs, mWeights, mGrads, mConfig, mOptions);
@@ -1622,9 +1642,11 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
         const bool token = request.sequence == 1;
         auto& graph = token ? mDecodeTokenGraph : mDecodePrefillGraph;
         auto& arenas = token ? mDecodeTokenArenas : mDecodePrefillArenas;
-        if (!graph || (!token && mDecodePrefillT != request.sequence)) {
+        auto& compiled_batch = token ? mDecodeTokenB : mDecodePrefillB;
+        if (!graph || compiled_batch != request.batch || (!token && mDecodePrefillT != request.sequence)) {
             mDecodeCompiler->reset_tid_namespace();
-            graph = std::make_unique<CompiledGraph>(mDecodeCompiler->compile(*mForward, 1, request.sequence, false));
+            graph = std::make_unique<CompiledGraph>(
+                mDecodeCompiler->compile(*mForward, request.batch, request.sequence, false));
             // Slot aliases and LoRA hooks read activations outside the explicit
             // op input list. Use the existing conservative per-block lifetimes;
             // an empty backward graph allocates no backward saves.
@@ -1644,6 +1666,7 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
                 dsl::release_phase_arenas(arenas);
                 throw;
             }
+            compiled_batch = request.batch;
             if (!token) mDecodePrefillT = request.sequence;
         }
         // Avoid compile_graphs(): it reallocates phase arenas on shape changes,
@@ -1658,7 +1681,7 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
             rs.Stack.restore(checkpoint);
         };
         mDecodeExecutor->set_lora_state(mLoRAConfig, mLoRAWeights, mLoRAGrads, mLoRARunState);
-        mDecodeExecutor->set_dimensions(1, request.sequence);
+        mDecodeExecutor->set_dimensions(request.batch, request.sequence);
         mDecodeExecutor->set_phase_arenas(&arenas);
         mDecodeExecutor->set_forward_graph(graph.get());
         mDecodeExecutor->set_save_list(&no_saves);
@@ -1773,9 +1796,10 @@ ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request,
                                      "' has null source or destination");
         }
         if (copy.transform == RuntimeCopyTransform::ReplicateSinglePlaneToThree) {
-            const std::size_t plane_bytes = static_cast<std::size_t>(copy.destination.Sizes[1]) *
-                                            static_cast<std::size_t>(copy.destination.Sizes[2]) *
-                                            get_dtype_size(copy.destination.DType);
+            const std::size_t plane_bytes =
+                static_cast<std::size_t>(request.decoding() ? request.batch : copy.destination.Sizes[1]) *
+                static_cast<std::size_t>(request.decoding() ? request.sequence : copy.destination.Sizes[2]) *
+                get_dtype_size(copy.destination.DType);
             for (int p = 0; p < 3; ++p) {
                 auto* dst = static_cast<std::byte*>(copy.destination.Data) + p * plane_bytes;
                 CUDA_CHECK(cudaMemcpyAsync(dst, copy.source.Data, copy.source.bytes(), copy.kind, copy_stream));

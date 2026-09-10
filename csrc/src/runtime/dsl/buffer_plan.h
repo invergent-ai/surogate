@@ -383,7 +383,7 @@ struct BufferPlan {
     /// Does NOT include op-internal temps (flash-attention workspace, Mamba
     /// scan buffers, ChunkGatedDeltaRule recompute, etc.) — those require
     /// walking the compiled backward graph; see `graph_backward_stack_peak`.
-    [[nodiscard]] long plan_stack_peak_bytes() const;
+    [[nodiscard]] long plan_stack_peak_bytes(long mlp_tokens = 0) const;
 
     // ---------------- Builder ----------------
     static BufferPlan build(const PretrainedConfig& cfg,

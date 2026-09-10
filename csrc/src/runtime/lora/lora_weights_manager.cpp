@@ -610,19 +610,20 @@ LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cu
     sync_layer(work.attention.v, master.attention.v, "v_proj");
     sync_layer(work.attention.o, master.attention.o, "o_proj");
 
-    // MLP LoRA
+    // A block can contain both a dense MLP and grouped experts (Gemma4 MoE).
+    // Sync every allocated projection; the dense work buffers must not retain
+    // uninitialized data or an adapter from an earlier policy version.
+    sync_layer(work.mlp.gate, master.mlp.gate, "gate_proj");
+    sync_layer(work.mlp.gate_up, master.mlp.gate_up, "gate_up_proj");
+    sync_layer(work.mlp.up, master.mlp.up, "up_proj");
+    sync_layer(work.mlp.down, master.mlp.down, "down_proj");
+
     if (work.moe.use_grouped) {
         sync_grouped(work.moe.grouped.gate, master.moe.grouped.gate, "moe_gate_grouped");
         sync_grouped(work.moe.grouped.gate_up, master.moe.grouped.gate_up, "moe_gate_up_grouped");
         sync_grouped(work.moe.grouped.up, master.moe.grouped.up, "moe_up_grouped");
         sync_grouped(work.moe.grouped.down, master.moe.grouped.down, "moe_down_grouped");
     } else {
-        // Dense MLP LoRA
-        sync_layer(work.mlp.gate, master.mlp.gate, "gate_proj");
-        sync_layer(work.mlp.gate_up, master.mlp.gate_up, "gate_up_proj");
-        sync_layer(work.mlp.up, master.mlp.up, "up_proj");
-        sync_layer(work.mlp.down, master.mlp.down, "down_proj");
-
         // MoE expert LoRA
         for (int e = 0; e < (int)master.moe.experts.size(); ++e) {
             auto& master_expert = master.moe.experts[e];

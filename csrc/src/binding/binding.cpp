@@ -1,3 +1,4 @@
+#include "kernels/decode.h"
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // Copyright (c) 2025, IST Austria, developed by Erik Schultheis
 // SPDX-License-Identifier: Apache-2.0
@@ -1300,7 +1301,9 @@ NB_MODULE(_surogate, m) {
              nb::arg("path"),
              "Export model weights and config to a directory.\n\n"
              "Parameters:\n- path: Output directory path.")
-        .def("import_adapter", &MultiGPUPyTrainer::import_adapter, nb::arg("path"),
+        .def("import_adapter",
+             &MultiGPUPyTrainer::import_adapter,
+             nb::arg("path"),
              "Load adapter_model.safetensors into a trainer configured with matching LoRA targets and rank.")
         .def("export_adapter",
              &MultiGPUPyTrainer::export_adapter,
@@ -1930,18 +1933,27 @@ NB_MODULE(_surogate, m) {
             "Parameters:\n- gpu_id: Which GPU's LoRA weights to return.\n\n"
             "Returns: dict[str, ndarray] mapping PEFT parameter name -> GPU tensor view.\n"
             "Tensors are live views into surogate's GPU memory (zero-copy via DLPack).")
-        .def("get_shared_base_weights", [](nb::object owner) {
-            auto* trainer = nb::cast<MultiGPUPyTrainer*>(owner);
-            auto raw = trainer->get_shared_base_weights();
-            nb::dict result;
-            for (const auto& [name, tensor] : raw) {
-                std::array<std::size_t, 6> shape{};
-                std::copy_n(tensor.Sizes.begin(), tensor.Rank, shape.begin());
-                result[nb::cast(name)] = nb::ndarray<>(tensor.Data, tensor.Rank, shape.data(),
-                    owner, nullptr, to_dlpack_dtype(tensor.DType), nb::device::cuda::value, tensor.Device);
-            }
-            return result;
-        }, "Borrow frozen resident BF16 base weights. Views retain the trainer's lifetime.")
+        .def(
+            "get_shared_base_weights",
+            [](nb::object owner) {
+                auto* trainer = nb::cast<MultiGPUPyTrainer*>(owner);
+                auto raw = trainer->get_shared_base_weights();
+                nb::dict result;
+                for (const auto& [name, tensor] : raw) {
+                    std::array<std::size_t, 6> shape{};
+                    std::copy_n(tensor.Sizes.begin(), tensor.Rank, shape.begin());
+                    result[nb::cast(name)] = nb::ndarray<>(tensor.Data,
+                                                           tensor.Rank,
+                                                           shape.data(),
+                                                           owner,
+                                                           nullptr,
+                                                           to_dlpack_dtype(tensor.DType),
+                                                           nb::device::cuda::value,
+                                                           tensor.Device);
+                }
+                return result;
+            },
+            "Borrow frozen resident BF16 base weights. Views retain the trainer's lifetime.")
         .def("get_valid_token_count",
              &MultiGPUPyTrainer::get_valid_token_count,
              nb::arg("gpu_id"),
@@ -2422,39 +2434,90 @@ NB_MODULE(_surogate, m) {
             "Returns: float32 log-probabilities shaped [B, T].\n"
             "         Masked positions (target==-100) receive 0.")
         .def("reset_decode_state", &MultiGPUPyTrainer::reset_decode_state, nb::call_guard<nb::gil_scoped_release>())
-        .def("decode_logits", [](MultiGPUPyTrainer* trainer,
-                                  nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> ids,
-                                  bool reset) {
-            std::vector<float> logits;
-            {
-                nb::gil_scoped_release release;
-                logits = trainer->decode_logits(ids.data(), static_cast<int>(ids.size()), reset);
-            }
-            auto* data = new float[logits.size()];
-            std::copy(logits.begin(), logits.end(), data);
-            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
-            return nb::ndarray<nb::numpy, float, nb::ndim<1>>(data, {logits.size()}, owner);
-        }, nb::arg("input_ids"), nb::arg("reset") = false,
-        "Prefill with reset=true, then append tokens using persistent GLM state; return the last next-token logits.")
-        .def("next_token_logits", [](MultiGPUPyTrainer* trainer,
-                                     nb::ndarray<const int32_t, nb::numpy, nb::ndim<2>, nb::c_contig, nb::device::cpu> ids,
-                                     nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> positions) {
-            if (positions.shape(0) != ids.shape(0)) {
-                throw std::invalid_argument("last_positions must contain one index per input row");
-            }
-            std::vector<float> logits;
-            {
-                nb::gil_scoped_release release;
-                logits = trainer->next_token_logits(ids.data(), positions.data(),
-                                                     static_cast<int>(ids.shape(0)), static_cast<int>(ids.shape(1)));
-            }
-            const auto B = ids.shape(0), V = logits.size() / B;
-            auto* data = new float[logits.size()];
-            std::copy(logits.begin(), logits.end(), data);
-            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
-            return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {B, V}, owner);
-        }, nb::arg("input_ids"), nb::arg("last_positions"),
-        "Return float32 next-token logits from the resident policy, one selected position per batch row.")
+        .def("release_decode_sessions",
+             &MultiGPUPyTrainer::release_decode_sessions,
+             nb::call_guard<nb::gil_scoped_release>(),
+             nb::arg("session_ids"))
+        .def("get_decode_batch_stats",
+             &MultiGPUPyTrainer::get_decode_batch_stats,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "decode_batch_logits",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<const int64_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> sessions,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> ids,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> offsets,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> resets) {
+                const auto B = sessions.size();
+                if (!B || offsets.size() != B + 1 || resets.size() != B || offsets(0) != 0 || offsets(B) != ids.size())
+                    throw std::invalid_argument("Invalid decode batch arrays");
+                for (std::size_t i = 0; i < B; ++i)
+                    if (offsets(i) < 0 || offsets(i + 1) <= offsets(i))
+                        throw std::invalid_argument("Decode offsets must increase strictly");
+                std::vector<float> logits;
+                {
+                    nb::gil_scoped_release release;
+                    logits =
+                        trainer->decode_batch_logits(sessions.data(), ids.data(), offsets.data(), resets.data(), B);
+                }
+                auto* data = new float[logits.size()];
+                std::copy(logits.begin(), logits.end(), data);
+                nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+                return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {B, logits.size() / B}, owner);
+            },
+            nb::arg("session_ids"),
+            nb::arg("input_ids"),
+            nb::arg("offsets"),
+            nb::arg("reset"),
+            "Append ragged token chunks to independent sessions and return one logits vector per session.")
+        .def("get_decode_cache_stats",
+             &MultiGPUPyTrainer::get_decode_cache_stats,
+             nb::call_guard<nb::gil_scoped_release>(),
+             "Current GLM decode length, capacity, limit and allocated bytes by cache type.")
+        .def(
+            "decode_logits",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> ids,
+               bool reset) {
+                std::vector<float> logits;
+                {
+                    nb::gil_scoped_release release;
+                    logits = trainer->decode_logits(ids.data(), static_cast<int>(ids.size()), reset);
+                }
+                auto* data = new float[logits.size()];
+                std::copy(logits.begin(), logits.end(), data);
+                nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+                return nb::ndarray<nb::numpy, float, nb::ndim<1>>(data, {logits.size()}, owner);
+            },
+            nb::arg("input_ids"),
+            nb::arg("reset") = false,
+            "Prefill with reset=true, then append tokens using persistent GLM state; return the last next-token "
+            "logits.")
+        .def(
+            "next_token_logits",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<2>, nb::c_contig, nb::device::cpu> ids,
+               nb::ndarray<const int32_t, nb::numpy, nb::ndim<1>, nb::c_contig, nb::device::cpu> positions) {
+                if (positions.shape(0) != ids.shape(0)) {
+                    throw std::invalid_argument("last_positions must contain one index per input row");
+                }
+                std::vector<float> logits;
+                {
+                    nb::gil_scoped_release release;
+                    logits = trainer->next_token_logits(ids.data(),
+                                                        positions.data(),
+                                                        static_cast<int>(ids.shape(0)),
+                                                        static_cast<int>(ids.shape(1)));
+                }
+                const auto B = ids.shape(0), V = logits.size() / B;
+                auto* data = new float[logits.size()];
+                std::copy(logits.begin(), logits.end(), data);
+                nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+                return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {B, V}, owner);
+            },
+            nb::arg("input_ids"),
+            nb::arg("last_positions"),
+            "Return float32 next-token logits from the resident policy, one selected position per batch row.")
         .def_prop_ro("world_size", &MultiGPUPyTrainer::world_size, "Number of participating GPUs.")
         .def_prop_ro("batch_size", &MultiGPUPyTrainer::batch_size, "Per-GPU batch size configured for this trainer.")
         .def_prop_ro("seq_length", &MultiGPUPyTrainer::seq_length, "Sequence length configured for this trainer.")
@@ -3662,6 +3725,50 @@ NB_MODULE(_surogate, m) {
             "Parameters:\n"
             "- batch: List of conversations, each a list of message dicts.\n"
             "- strategy: 'default', 'last_round', 'thinking_only', 'final_only', or 'all'.");
+
+    m.def("_decode_attention",
+          [](nb::ndarray<nb::device::cuda, nb::c_contig> input,
+             nb::ndarray<nb::device::cuda, nb::c_contig> output,
+             nb::ndarray<nb::device::cuda, nb::c_contig> logsumexp,
+             int position,
+             int heads,
+             int kv_heads,
+             int window,
+             std::uintptr_t stream_ptr) {
+              auto qkv = glm_kernel_tensor(input), out = glm_kernel_tensor(output), lse = glm_kernel_tensor(logsumexp);
+              if (qkv.DType != ETensorDType::BF16 || out.DType != ETensorDType::BF16 ||
+                  lse.DType != ETensorDType::FP32 || qkv.Rank != 4 || qkv.Sizes[0] != 1 || position < 0 ||
+                  position >= qkv.Sizes[1] || qkv.Sizes[2] != heads + 2 * kv_heads || heads <= 0 || kv_heads <= 0)
+                  throw std::invalid_argument("Invalid paged attention test dimensions");
+              const int D = qkv.Sizes[3], T = qkv.Sizes[1] - position;
+              if (out.nelem() != T * heads * D || lse.nelem() != T * heads)
+                  throw std::invalid_argument("Invalid paged attention outputs");
+              auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+              auto pool = std::make_shared<dsl::DecodePagePool>();
+              dsl::PagedDecodeBuffer cache(pool, qkv.DType, 2L * kv_heads * D, qkv.Sizes[1]);
+              cache.append(qkv.Data + heads * D * 2L, 0, qkv.Sizes[1], stream, (heads + 2L * kv_heads) * D * 2);
+              TensorAllocator allocator;
+              auto scratch = allocator.allocate(ETensorDType::FP32,
+                                                "decode_test_scratch",
+                                                EAllocationType::ON_DEVICE,
+                                                {T, heads, static_cast<long>(cache.pages()), D + 2L});
+              qkv.Data += position * (heads + 2L * kv_heads) * D * 2;
+              qkv.Sizes[1] = T;
+              decode_paged_attention(qkv,
+                                     out,
+                                     lse,
+                                     cache.table(),
+                                     scratch,
+                                     position,
+                                     T,
+                                     heads,
+                                     kv_heads,
+                                     D,
+                                     window,
+                                     0,
+                                     stream);
+              CUDA_CHECK(cudaStreamSynchronize(stream));
+          });
 
     nb::class_<dsl::GlmDecodeState>(m, "_GlmDecodeState")
         .def(nb::init<>())

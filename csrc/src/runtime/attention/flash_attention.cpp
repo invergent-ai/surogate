@@ -3,6 +3,8 @@
 //
 
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/executor/glm_decode_state.h"
+#include "kernels/decode.h"
 
 #include <algorithm>
 #include <atomic>
@@ -506,6 +508,52 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         params.chunk_max_q = packed ? mChunkPack.max_q : static_cast<int>(mT);
         params.chunk_max_k = packed ? mChunkPack.max_k : params.chunk_kv_len;
         params.chunk_append_pos = mChunkIdx * static_cast<int>(mT);
+    }
+
+    if (mExecutionRequest && mExecutionRequest->decoding()) {
+        for (int row = 0; row < mB; ++row) {
+            auto* state = mExecutionRequest->decode_state(row);
+            auto input = decode_batch_row(qkv, row);
+            auto output = decode_batch_row(out, row);
+            auto logsumexp = decode_batch_row(lse, row);
+            auto& cache = state->pages(layer_idx, "attention_kv", qkv.DType, 2L * Hkv * Hs);
+            cache.append(input.Data + Hq * Hs * get_dtype_size(qkv.DType),
+                         state->length,
+                         mT,
+                         params.stream,
+                         (Hq + 2L * Hkv) * Hs * get_dtype_size(qkv.DType));
+            // Initial prefill uses the ordinary tensor-core attention backend.
+            // Subsequent chunks access physical pages directly.
+            if (state->length == 0) {
+                auto single = params;
+                single.B = 1;
+                single.qkv = input;
+                single.out = output;
+                single.lse = logsumexp;
+                AttentionBackendRegistry::instance().select(single).forward(single);
+            } else {
+                const long pages = (state->length + mT + DecodePageRows - 1) / DecodePageRows;
+                auto scratch = mRunState.temp_alloc(ETensorDType::FP32, {mT, Hq, pages, Hs + 2L}, "decode_attention");
+                decode_paged_attention(input,
+                                       output,
+                                       logsumexp,
+                                       cache.table(),
+                                       scratch,
+                                       state->length,
+                                       mT,
+                                       Hq,
+                                       Hkv,
+                                       Hs,
+                                       window_size,
+                                       params.softmax_scale,
+                                       params.stream);
+                mRunState.Stack.free(scratch);
+            }
+        }
+        if (sinks) apply_sinks_forward(out, lse, *sinks, mB, mT, Hq, Hs, mTemps, mRunState, params.stream);
+        store_tensor(op.outputs[0], out);
+        store_tensor(op.outputs[1], lse);
+        return;
     }
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);

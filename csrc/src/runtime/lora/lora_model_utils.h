@@ -26,6 +26,14 @@ inline bool lora_uses_input_dropout(bool is_training, float dropout_prob) {
     return is_training && dropout_prob > 0.0f;
 }
 
+// Decode and tiled FFNs share the trainer's larger allocation. Restrict
+// elementwise scaling to the active rows without changing its owner/geometry.
+inline Tensor lora_intermediate_view(const Tensor& buffer, int rows, int rank) {
+    if (rows < 0 || rank <= 0 || static_cast<long>(rows) * rank > buffer.nelem())
+        throw std::logic_error("LoRA intermediate exceeds workspace capacity");
+    return Tensor::from_pointer(buffer.Data, buffer.Device, buffer.DType, std::vector<long>{rows, rank});
+}
+
 inline Tensor materialize_lora_dropout_input(const Tensor& input,
                                              Tensor& scratch,
                                              int rows,
@@ -65,7 +73,7 @@ inline void apply_lora_contribution(Tensor& output,
                                     int output_offset,
                                     const Tensor& input,
                                     const LoRALayerWeights<Tensor>& lora,
-                                    Tensor& intermediate,
+                                    Tensor& intermediate_buffer,
                                     Tensor& slice_buffer,
                                     float scaling,
                                     float dropout_prob,
@@ -80,6 +88,7 @@ inline void apply_lora_contribution(Tensor& output,
                                     cudaStream_t stream) {
     if (!lora.has_value()) return;
     if (out_features <= 0 || BT <= 0) return;
+    Tensor intermediate = lora_intermediate_view(intermediate_buffer, BT, rank);
     const long total_out_features = output.Sizes[output.Rank - 1];
 
     // For BF16 LoRA (rank is typically small), some GPU/cuBLAS combinations can reject
@@ -844,7 +853,7 @@ inline void backward_lora_layer(Tensor& dA,
                                 float dropout_prob,
                                 unsigned int dropout_seed,
                                 bool is_training,
-                                Tensor& intermediate,
+                                Tensor& intermediate_buffer,
                                 Tensor& slice_buffer,
                                 int BT,
                                 int in_features,
@@ -856,6 +865,7 @@ inline void backward_lora_layer(Tensor& dA,
                                 cudaStream_t stream,
                                 bool skip_dx = false) {
     if (!A.Data || !B.Data) return;
+    Tensor intermediate = lora_intermediate_view(intermediate_buffer, BT, rank);
     if (!x.Data) {
         throw std::logic_error("backward_lora_layer: missing input activation tensor");
     }

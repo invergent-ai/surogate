@@ -1,107 +1,129 @@
 # Long Context Training
 
-When fine-tuning at very long sequence lengths (8K, 32K, 128K+ tokens), MLP intermediate activations become the dominant source of GPU memory consumption. The `long_context` option enables **tiled MLP execution**, which chunks the MLP computation along the sequence dimension to reduce peak memory usage.
-
-## The problem
-
-In a standard transformer MLP, the intermediate activations have shape `[B*T, intermediate_size]`. For a 7B model with `intermediate_size = 11008` at 128K context in BF16:
-
-- `gate_proj` output: `B*T * 11008 * 2 bytes` = 2.7 GB per layer
-- `up_proj` output: 2.7 GB per layer
-- SwiGLU output: 1.4 GB per layer
-
-Even with gradient checkpointing (`recompute: true`), the backward pass must recompute these intermediates and hold them in memory while computing gradients. At long sequence lengths, this can easily exceed GPU memory.
-
-## How tiled MLP works
-
-MLPs have **no cross-token dependencies** -- each token is processed independently through the gate/up projection, activation function, and down projection. This means the computation can be split along the sequence (token) dimension without changing the result.
-
-With `long_context: true`, Surogate:
-
-1. **Detects MLP op groups** at graph compilation time by scanning for `mlp_up_weight` / `mlp_down_weight` matmul patterns
-2. **Chunks forward execution**: instead of computing `[B*T, intermediate]` in one shot, processes `[chunk_size, intermediate]` at a time, freeing intermediates after each chunk
-3. **Chunks backward execution**: for each chunk, recomputes the forward (up-proj + SwiGLU), then immediately runs the backward (down-proj grad, SwiGLU grad, up-proj grad), accumulating weight gradients across chunks
-4. **Invokes LoRA hooks** per-chunk so adapter gradients are computed correctly
-
-The chunk size is `min(B*T, hidden_dim)`. At short sequences where `B*T <= hidden_dim`, this results in a single chunk -- zero overhead, identical execution to the non-tiled path.
-
-### Memory savings
-
-Per-layer MLP memory drops from `O(B*T * intermediate_size)` to `O(chunk_size * intermediate_size)`:
-
-| Context length | Without tiling | With tiling | Savings |
-|---------------|---------------|-------------|---------|
-| 2K            | 42 MB         | 42 MB       | 0       |
-| 32K           | 672 MB        | 168 MB      | 504 MB  |
-| 128K          | 2.7 GB        | 168 MB      | 2.5 GB  |
-
-*(Llama-7B, intermediate_size=11008, BF16)*
-
-### Performance
-
-- **Short sequences** (T <= hidden_dim): single chunk, zero overhead
-- **Long sequences**: ~5-10% slower step time due to per-chunk recomputation in backward. The tradeoff is worthwhile since it enables training at sequence lengths that would otherwise OOM
-
-## Usage
-
-Add `long_context: true` to your config:
+Use `long_context: true` to reduce MLP activation memory during training
+and policy scoring. It processes tokens in tiles through the up/gate projection,
+SwiGLU and down projection. Backward recomputes each tile and immediately consumes
+it, accumulating weight and LoRA gradients across tiles.
 
 ```yaml
-model: Qwen/Qwen3-0.6B
 sequence_len: 32768
 long_context: true
-
+recompute: true
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 16
-
-lora: true
-lora_rank: 16
-lora_target_modules:
-  - q_proj
-  - k_proj
-  - v_proj
-  - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
-
-datasets:
-  - path: "emozilla/pg19-test"
-    split: test
-    type: auto
+lora_dropout: 0
 ```
 
-When `long_context` is enabled, CUDA graphs are automatically disabled (required because sequence lengths vary with sample packing).
+Choose a sequence length within the model's context limit and available memory.
+The same training options apply to SFT and GRPO. See the
+[local GLM example](../../examples/sft/glm/dummy-long-context.yaml) for a small
+checkpoint that can exercise this path on one GPU.
 
-## Supported models
+## Dense MLP memory
 
-Tiled MLP applies to **dense models** that use the standard gate+up / SwiGLU / down MLP pattern:
+An MLP processes each token independently. Tiling reduces its intermediate
+storage from `O(B*T*intermediate_size)` to
+`O(min(B*T, hidden_size)*intermediate_size)`. Inputs, outputs and residual streams
+still cover the full sequence. The compiler excludes tile intermediates from
+full-sequence activation arenas and saved tensors.
 
-- Llama (all variants)
-- Qwen3
-- Qwen3.5 (both attention and linear recurrence blocks)
-- Qwen3-VL
+For example, one BF16 intermediate buffer with width 11,008, hidden size 4,096
+and batch size one uses:
 
-Models that are **not** tiled (their MLP patterns differ):
+| Tokens | Ordinary buffer | Tiled buffer |
+|---:|---:|---:|
+| 2,048 | 43 MiB | 43 MiB |
+| 32,768 | 688 MiB | 86 MiB |
+| 131,072 | 2,752 MiB | 86 MiB |
 
-- **MoE models** (Qwen3-MoE, GPT-OSS, NemotronH-MoE): use grouped GEMM with dynamic routing
-- **NemotronH MLP blocks**: use ReLU^2 activation, not SwiGLU
+The fused up/gate projection is twice this size; SwiGLU has the size shown.
+These are individual buffer sizes, not total training memory. Backward also
+needs tile gradients and, for GLM, unclamped projection values.
 
-No configuration is needed to exclude these -- the detection is automatic based on weight naming conventions.
+Tiling trades additional launches and backward recomputation for memory.
+The cost depends on the model, tile count and hardware. Short inputs use one
+tile and therefore gain little memory.
 
-## Correctness
+## Supported paths
 
-The tiled implementation is **numerically identical** to the non-tiled version. Matrix multiplication distributes over concatenation along the token dimension, so chunking produces the same result regardless of chunk count. This has been verified with bit-for-bit loss and gradient norm matching across all training steps.
+The compiler recognizes the dense, bias-free up/gate → SwiGLU → down pattern
+used by Llama, Qwen3, dense Qwen3.5 blocks, Qwen3-VL and GLM's leading dense
+layers. It preserves GLM's asymmetric activation clamps and applies LoRA in
+both forward execution and backward recomputation.
 
-## Combining with other options
+GLM also tiles routed and shared expert MLPs in resident BF16 training with
+`ep_size: 1`. Routed tiles operate on the permuted tokens, preserving routing,
+asymmetric clamps and grouped LoRA arithmetic. Wide expert intermediates shrink
+from `O(B*T*top_k*moe_intermediate_size)` to
+`O(min(B*T*top_k, hidden_size)*moe_intermediate_size)`. The permutation, routing
+and hidden-width input/output buffers still span the full sequence.
 
-`long_context` works with:
+Expert tiling with CPU weight streaming or expert parallelism is not covered.
+Other models' MoE branches and activations such as NemotronH's ReLU-squared MLP
+retain their existing execution paths.
 
-- **LoRA / QLoRA**: LoRA backward hooks are invoked per-chunk with correctly shaped tensors
-- **Gradient checkpointing** (`recompute: true`): tiled MLP is used during both the forward replay and the backward pass
-- **Sample packing** (`sample_packing: true`): works correctly since CUDA graphs are disabled
-- **Multi-GPU** (`gpus > 1`): compatible with all ZeRO levels
-- **FP8 / FP4 recipes**: compatible (the tiled path uses the same matmul dispatch)
+BF16 full training and LoRA are covered by native GPU regression tests, including
+packed documents, gradient accumulation and recomputation. Tiling changes GEMM
+shapes and gradient reduction order, so BF16 gradients need not be bit-identical.
+The tests compare numerical tolerances and check scoring with identical weights.
+
+Use `lora_dropout: 0`: nonzero adapter dropout is rejected because tile
+recomputation does not preserve the ordinary path's dropout mask. The tiled
+GEMMs do not use the ordinary FP8/FP4 recipe dispatch; those recipes are not
+validated by the BF16 checks described here.
+
+`use_cuda_graphs: true` can remain enabled. The runtime uses split execution:
+tiled MLP groups run eagerly, and eligible surrounding segments use CUDA graphs.
+Capture-unsafe operations can still force eager execution.
+
+## GLM sparse indexer memory
+
+GLM's frozen DSA indexer automatically scores **128 queries at a time** in both
+training and prefill. This is independent of `long_context`. Keys are pooled
+once; each query tile is scored, selected and expanded before its scratch
+buffer is reused. Packed-document boundaries and deterministic tie ordering
+are preserved.
+
+The FP32 score buffer shrinks from `B*T*ceil(T/index_kpool)` elements to
+`B*min(T,128)*ceil(T/index_kpool)`. At 131,072 tokens, batch size one and pool
+size 16, that is **4 GiB → 4 MiB** for scores alone. Key buffers and selected
+token indices remain linear in sequence length; the latter also scale with
+`index_topk` and the optional tail width. Tiling bounds score storage, but each
+query still scans the pools and top-k still uses sorting.
+
+GLM native-colocate stores normalized MLA latents and reconstructs only the
+selected K/V projections during decode. Its MLA and indexer histories grow in
+128-token pages, returned to a shared pool when a request finishes. Reconstruction applies the original BF16 projection and LoRA
+operations to preserve rollout/scoring parity; it trades additional projection
+work for lower persistent cache memory. Use `options.glm_rollout_parity = True`
+for consistent GLM rollout/scoring arithmetic. Native co-locate enables it automatically.
+
+GLM workspace sizing keeps the shape-based heuristic and graph bounds, without
+the legacy multi-GiB minimum and MoE allowance. Graphs containing no standard
+FlashAttention operations do not reserve its 1 GiB attention workspace. Saved
+MoE buffers are allocated as needed before capture.
+
+On GPU 7 (RTX 5090), the 4,096-token dummy GLM with BF16 LoRA rank 8 and
+`recompute: true` used the following device allocations after two updates:
+
+| Configuration | Allocated memory |
+|---|---:|
+| Before expert tiling and workspace changes | 7,306 MiB |
+| Current runtime, `long_context: false` | 4,962 MiB |
+| Current runtime, `long_context: true` | 4,852 MiB |
+
+The combined reduction is about 34%. These measurements include library caches
+and describe this small checkpoint; they are not transient peak measurements
+or full-model capacity estimates. Reproduce the current comparison in separate
+processes on an otherwise idle GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python benchmarks/bench_glm_memory.py
+CUDA_VISIBLE_DEVICES=7 python benchmarks/bench_glm_memory.py --tiled
+```
+
+Model/optimizer state, KDA chunk states, residual streams, token permutations and
+sparse attention indices can still be substantial at long context. See
+[GLM limitations](../../examples/sft/glm/README.md) and [native-colocate](rl-colocate.md).
 
 ## See also
 

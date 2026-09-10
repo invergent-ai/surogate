@@ -53,6 +53,13 @@ struct ExecutionResult {
 struct GlmDecodeState;
 struct ExecutionRequest {
     GlmDecodeState* glm_decode_state = nullptr;
+    std::vector<GlmDecodeState*> decode_states;
+    [[nodiscard]] bool decoding() const {
+        return glm_decode_state || !decode_states.empty();
+    }
+    [[nodiscard]] GlmDecodeState* decode_state(int row) const {
+        return decode_states.empty() ? glm_decode_state : decode_states.at(row);
+    }
     long batch = 0;
     long sequence = 0;
     ExecutionMode mode = ExecutionMode::Forward;

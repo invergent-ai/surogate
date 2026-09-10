@@ -5,6 +5,7 @@
 // Extracted from compiled_ops.cpp to reduce file size; behavior unchanged.
 
 #include "runtime/executor/compiled_ops.h"
+#include "kernels/glm5.h"
 
 #include <algorithm>
 #include <array>
@@ -46,9 +47,198 @@
 
 namespace dsl {
 
+namespace {
+Glm5Options clamp_options(const CompiledOp& op) {
+    Glm5Options result;
+    result.clamp_min = op.attrs.clamp_min;
+    result.clamp_max = op.attrs.clamp_max;
+    result.fused_gate_up = op.attrs.clamp_fused_gate_up;
+    return result;
+}
+}  // namespace
+
 // ============================================================================
 // Tiled MLP execution for long-context mode
 // ============================================================================
+void CompiledExecutor::execute_tiled_experts(const CompiledGraph& graph, const MlpTileGroup& group, bool backward) {
+    const int layer = graph.ops[group.start_op_idx].attrs.layer_idx;
+    const CompiledGraph* forward = backward ? mForwardGraph : &graph;
+    const MlpTileGroup* fg = backward ? nullptr : &group;
+    if (backward && forward) {
+        for (const auto& candidate : forward->mlp_tile_groups)
+            if (candidate.grouped_experts == group.grouped_experts && candidate.shared_expert == group.shared_expert &&
+                forward->ops[candidate.start_op_idx].attrs.layer_idx == layer)
+                fg = &candidate;
+    }
+    if (!fg) throw std::runtime_error("Tiled expert backward requires its forward group");
+    const auto& first = graph.ops[group.start_op_idx];
+    const auto& last = graph.ops[group.end_op_idx];
+    TensorRef input_ref = backward ? last.inputs[1] : first.inputs[0];
+    if (backward && group.shared_expert)
+        for (std::size_t i = group.start_op_idx; i <= group.end_op_idx; ++i)
+            if (graph.ops[i].type == CompiledOpType::MatmulBackward &&
+                graph.ops[i].inputs[2].name.ends_with("shared_expert_gate"))
+                input_ref = graph.ops[i].inputs[1];
+    Tensor input = resolve_tensor(input_ref);
+    Tensor incoming = backward ? resolve_tensor(first.inputs[0]) : Tensor{};
+    Tensor output = ensure_output_tensor(last.outputs[0]);
+    const long rows = input.Sizes[0];
+    if (input.Rank != 2 || output.Rank != 2 || output.Sizes[0] != rows)
+        throw std::runtime_error("Tiled experts require flat permuted activations");
+    const long tile = std::min<long>(rows, mConfig.HiddenSize);
+
+    const std::string offsets_key = "blocks[" + std::to_string(layer) + "].moe_expert_offsets";
+    const int experts = mConfig.NumLocalExperts;
+    const int* offsets = nullptr;
+    std::vector<int> full_host;
+    if (group.grouped_experts) {
+        auto saved = mSavedCache.buffers().find(offsets_key);
+        if (saved == mSavedCache.buffers().end() || !saved->second)
+            throw std::runtime_error("Tiled experts require saved routing offsets");
+        offsets = static_cast<const int*>(saved->second);
+        const int* host = get_or_sync_moe_host_offsets(layer, offsets, experts);
+        full_host.assign(host, host + experts + 1);
+    }
+
+    std::vector<CompiledOp> fops(forward->ops.begin() + fg->start_op_idx, forward->ops.begin() + fg->end_op_idx + 1);
+    std::vector<CompiledOp> bops;
+    if (backward) bops.assign(graph.ops.begin() + group.start_op_idx, graph.ops.begin() + group.end_op_idx + 1);
+    // Forward and backward graphs have different IDs for saved activations.
+    auto remap = [&](TensorRef& ref) {
+        if (mCurrentGraph) {
+            ref.tensor_id = mCurrentGraph->find_tensor_id(ref.name);
+            if (ref.tensor_id < 0) ref.tensor_id = mCurrentGraph->find_tensor_id("saved." + ref.name);
+        }
+    };
+    for (auto& op : fops) {
+        for (auto& ref : op.inputs)
+            remap(ref);
+        for (auto& ref : op.outputs)
+            remap(ref);
+    }
+    // Keep external bindings intact: tile outputs must not leave dangling
+    // scratch pointers in either the name map or the compiled ID table.
+    std::unordered_map<int, Tensor> ids_before;
+    std::unordered_map<std::string, std::optional<Tensor>> names_before;
+    std::unordered_set<std::string> private_names;
+    auto remember = [&](const TensorRef& ref) {
+        if (ref.tensor_id >= 0 && ref.tensor_id < mTensors.size())
+            ids_before.try_emplace(ref.tensor_id, mTensors[ref.tensor_id]);
+        auto found = mNamedTensors.find(ref.name);
+        names_before.try_emplace(ref.name,
+                                 found == mNamedTensors.end() ? std::nullopt : std::optional<Tensor>(found->second));
+    };
+    auto prepare = [&](const CompiledOp& op) {
+        for (const auto& ref : op.inputs)
+            remember(ref);
+        for (std::size_t i = 0; i < op.outputs.size(); ++i) {
+            const auto& ref = op.outputs[i];
+            remember(ref);
+            if (i > 0 &&
+                (op.type == CompiledOpType::MatmulBackward || op.type == CompiledOpType::MoEGroupedGemmDownBackward ||
+                 op.type == CompiledOpType::MoEGroupedGemmGateUpBackward))
+                continue;
+            if (ref.slot != TensorSlot::Parameter && !ref.name.empty() && ref.dtype != ETensorDType::INT32)
+                private_names.insert(ffn_tile_name(ref.name));
+        }
+    };
+    for (const auto& op : fops)
+        prepare(op);
+    for (const auto& op : bops)
+        prepare(op);
+    private_names.insert(ffn_tile_name(input_ref.name));
+    if (backward) private_names.insert(ffn_tile_name(first.inputs[0].name));
+
+    auto outer_checkpoint = mRunState.Stack.checkpoint();
+    const auto outer_temps = mTemps.size();
+    auto restore = [&]() {
+        mFfnTileTensors.clear();
+        mFfnTileOffsets = Tensor{};
+        mFfnTileAccumulate = false;
+        for (const auto& [id, tensor] : ids_before)
+            mTensors[id] = tensor;
+        for (const auto& [name, tensor] : names_before) {
+            if (tensor)
+                mNamedTensors[name] = *tensor;
+            else
+                mNamedTensors.erase(name);
+        }
+        mRunState.Stack.restore(outer_checkpoint);
+        mTemps.resize(outer_temps);
+    };
+    auto narrow = [](Tensor tensor, long start, long count) {
+        tensor.Data += start * tensor.Sizes[1] * get_dtype_size(tensor.DType);
+        tensor.Sizes[0] = count;
+        return tensor;
+    };
+    try {
+        if (group.grouped_experts) {
+            mFfnTileOffsets = mRunState.temp_alloc(ETensorDType::INT32, {experts + 1L}, "ffn_tile_offsets");
+            mFfnTileHostOffsets.resize(experts + 1);
+        }
+        for (long start = 0; start < rows; start += tile) {
+            const long count = std::min(tile, rows - start);
+            auto checkpoint = mRunState.Stack.checkpoint();
+            auto temp_mark = mTemps.size();
+            for (const auto& name : private_names)
+                mFfnTileTensors[name] = Tensor{};
+            mFfnTileTensors[ffn_tile_name(input_ref.name)] = narrow(input, start, count);
+            if (backward) mFfnTileTensors[ffn_tile_name(first.inputs[0].name)] = narrow(incoming, start, count);
+            if (group.grouped_experts) {
+                for (int e = 0; e <= experts; ++e)
+                    mFfnTileHostOffsets[e] = std::clamp<long>(full_host[e] - start, 0, count);
+                glm5_tile_expert_offsets(offsets,
+                                         mFfnTileOffsets.get<int>(),
+                                         experts,
+                                         start,
+                                         count,
+                                         mRunState.MainStream);
+            }
+            mFfnTileAccumulate = start > 0;
+            auto run = [&](CompiledOp op, bool reverse) {
+                for (std::size_t i = 0; i < op.outputs.size(); ++i) {
+                    auto& ref = op.outputs[i];
+                    if (!private_names.count(ffn_tile_name(ref.name))) continue;
+                    if (op.type == CompiledOpType::Clamp || op.type == CompiledOpType::Silu ||
+                        op.type == CompiledOpType::Mul || op.type == CompiledOpType::Add) {
+                        ref.shape = {count, resolve_tensor(op.inputs[0]).Sizes[1]};
+                    } else if (op.type == CompiledOpType::ClampBackward || op.type == CompiledOpType::SiluBackward ||
+                               op.type == CompiledOpType::SwiGLUBackward || op.type == CompiledOpType::MulBackward) {
+                        ref.shape = {
+                            count,
+                            resolve_tensor(op.inputs[op.type == CompiledOpType::MulBackward ? i + 1 : 1]).Sizes[1]};
+                    } else if (!ref.shape.empty())
+                        ref.shape[0] = count;
+                }
+                if (reverse)
+                    dispatch_backward_op(op, nullptr);
+                else
+                    dispatch_forward_op(op, nullptr);
+            };
+            // Down-projection output is not needed when recomputing backward.
+            for (std::size_t i = 0; i < fops.size() - (backward ? 1 : 0); ++i)
+                run(fops[i], false);
+            if (backward)
+                for (const auto& op : bops)
+                    run(op, true);
+            const auto& result = mFfnTileTensors.at(ffn_tile_name(last.outputs[0].name));
+            Tensor destination = narrow(output, start, count);
+            CUDA_CHECK(cudaMemcpyAsync(destination.Data,
+                                       result.Data,
+                                       destination.bytes(),
+                                       cudaMemcpyDeviceToDevice,
+                                       mRunState.MainStream));
+            mRunState.Stack.restore(checkpoint);
+            mTemps.resize(temp_mark);
+        }
+        restore();
+    } catch (...) {
+        restore();
+        throw;
+    }
+    store_tensor(last.outputs[0], output);
+}
+
 // Executes an MLP tile group (view→matmul→view→swiglu→view→matmul→view) in
 // chunks along the flattened B*T dimension. Reduces peak MLP activation memory
 // from O(B*T * intermediate) to O(chunk_size * intermediate).
@@ -61,6 +251,10 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
                                          long B,
                                          long T,
                                          const modules::ForwardHook* hook) {
+    if (group.grouped_experts || group.shared_expert) {
+        execute_tiled_experts(graph, group, false);
+        return;
+    }
     // The first op is a view: [B,T,C] → [B*T,C]. Get the 3D input.
     const auto& first_view_op = graph.ops[group.start_op_idx];
     Tensor full_input_3d = resolve_tensor(first_view_op.inputs[0]);
@@ -73,8 +267,10 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
     Tensor down_weight{};
     const CompiledOp* up_matmul_op = nullptr;
     const CompiledOp* down_matmul_op = nullptr;
+    const CompiledOp* clamp_op = nullptr;
     for (std::size_t idx = group.start_op_idx; idx <= group.end_op_idx; ++idx) {
         const auto& op = graph.ops[idx];
+        if (op.type == CompiledOpType::Clamp) clamp_op = &op;
         if (op.type != CompiledOpType::Matmul && op.type != CompiledOpType::MatmulBias) continue;
         for (const auto& inp : op.inputs) {
             if (inp.name.size() >= 13 && inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
@@ -96,7 +292,7 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
     const ETensorDType dtype = full_input.DType;
 
     // Pre-allocate full output [B*T, C]
-    Tensor full_output = mRunState.temp_alloc(dtype, {BT, C}, "tiled_mlp_out");
+    Tensor full_output = ensure_output_tensor(down_matmul_op->outputs[0]);
 
     // Chunk size: min(B*T, C) — Unsloth's "arctic" strategy
     const long chunk_size = std::min(BT, C);
@@ -139,6 +335,22 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
                    mRunState.MainStream);
         }
 
+        modules::detail::apply_lora_slices_forward(up_matmul_op->attrs.lora_slices,
+                                                   up_matmul_op->attrs.layer_idx,
+                                                   chunk_in,
+                                                   up_out,
+                                                   N,
+                                                   mLoRAWeights,
+                                                   mLoRAConfig,
+                                                   mLoRARunState,
+                                                   mRunState.CublasLtHandle,
+                                                   mRunState.CuBlasWorkspace,
+                                                   mRunState.MainStream);
+        if (clamp_op) {
+            std::vector<Tensor> outputs{up_out};
+            glm5_forward(Glm5Kernel::Clamp, {up_out}, outputs, clamp_options(*clamp_op), mRunState.MainStream);
+        }
+
         // 2) SwiGLU: [N, MUp] → [N, M] (operate in 2D, swiglu_forward handles it as B=1, T=N)
         Tensor act_out = mRunState.temp_alloc(dtype, {N, M}, "act_out");
         mTemps.push_back(act_out);
@@ -167,6 +379,18 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
                    false,
                    mRunState.MainStream);
         }
+
+        modules::detail::apply_lora_slices_forward(down_matmul_op->attrs.lora_slices,
+                                                   down_matmul_op->attrs.layer_idx,
+                                                   act_out,
+                                                   chunk_out,
+                                                   N,
+                                                   mLoRAWeights,
+                                                   mLoRAConfig,
+                                                   mLoRARunState,
+                                                   mRunState.CublasLtHandle,
+                                                   mRunState.CuBlasWorkspace,
+                                                   mRunState.MainStream);
 
         // Restore stack — free chunk intermediates (up_out, act_out)
         mRunState.Stack.restore(ckpt);
@@ -211,13 +435,19 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
                                                   long B,
                                                   long T,
                                                   const modules::BackwardHook* hook) {
+    if (group.grouped_experts || group.shared_expert) {
+        execute_tiled_experts(bwd_graph, group, true);
+        return;
+    }
     const long BT = B * T;
 
     // Find the matmul_backward ops and extract weight/gradient references
     const CompiledOp* down_bwd_op = nullptr;
     const CompiledOp* up_bwd_op = nullptr;
+    const CompiledOp* clamp_op = nullptr;
     for (std::size_t idx = group.start_op_idx; idx <= group.end_op_idx; ++idx) {
         const auto& op = bwd_graph.ops[idx];
+        if (op.type == CompiledOpType::ClampBackward) clamp_op = &op;
         if (op.type != CompiledOpType::MatmulBackward) continue;
         for (const auto& inp : op.inputs) {
             if (inp.name.size() >= 15 && inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
@@ -263,7 +493,7 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
     const int layer_idx = down_bwd_op->attrs.layer_idx;
 
     // Allocate full d_ln2_flat [B*T, C] output
-    Tensor d_ln2_flat = mRunState.temp_alloc(dtype, {BT, C}, "d_ln2_flat");
+    Tensor d_ln2_flat = ensure_output_tensor(up_bwd_op->outputs[0]);
     fill_zero(d_ln2_flat, mRunState.MainStream);
     mTemps.push_back(d_ln2_flat);
 
@@ -335,7 +565,7 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
         auto narrow = [&](const Tensor& full, long cols) -> Tensor {
             Tensor chunk = full;
             const std::size_t byte_off = static_cast<std::size_t>(offset) * static_cast<std::size_t>(cols) *
-                                         static_cast<std::size_t>(get_dtype_size(dtype));
+                                         static_cast<std::size_t>(get_dtype_size(full.DType));
             chunk.Data = static_cast<std::byte*>(full.Data) + byte_off;
             chunk.Sizes[0] = N;
             return chunk;
@@ -365,6 +595,24 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
                    swap_transpose(fwd_mode),
                    false,
                    mRunState.MainStream);
+        }
+
+        modules::detail::apply_lora_slices_forward(up_bwd_op->attrs.lora_slices,
+                                                   layer_idx,
+                                                   ln2_chunk,
+                                                   up_out,
+                                                   N,
+                                                   mLoRAWeights,
+                                                   mLoRAConfig,
+                                                   mLoRARunState,
+                                                   mRunState.CublasLtHandle,
+                                                   mRunState.CuBlasWorkspace,
+                                                   mRunState.MainStream);
+        Tensor raw_up = up_out;
+        if (clamp_op) {
+            up_out = mRunState.temp_alloc(dtype, {N, MUp}, "clamped_up");
+            std::vector<Tensor> outputs{up_out};
+            glm5_forward(Glm5Kernel::Clamp, {raw_up}, outputs, clamp_options(*clamp_op), mRunState.MainStream);
         }
 
         // 2) SwiGLU: act_out = swiglu(up_out) → [N, M]
@@ -435,6 +683,18 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
                         static_cast<int>(N),
                         static_cast<int>(M),
                         mRunState.MainStream);
+
+        if (clamp_op) {
+            Tensor raw_grad = mRunState.temp_alloc(ETensorDType::FP32, {N, MUp}, "d_clamp");
+            std::vector<Tensor> outputs{raw_grad};
+            glm5_backward(Glm5Kernel::Clamp,
+                          {d_up, raw_up},
+                          outputs,
+                          clamp_options(*clamp_op),
+                          {},
+                          mRunState.MainStream);
+            glm5_copy_gradient(raw_grad, d_up, false, mRunState.MainStream);
+        }
 
         // 5) Up-proj backward: dA = d_up @ up_weight (activation grad → d_ln2_chunk)
         {

@@ -20,24 +20,49 @@ Multimodal checkpoints use **text prompts only**. Experimental training definiti
 such as DeepSeek-V4 and Flash-Next are not included.
 
 Dense Qwen3 and Qwen3.5 use the optimized generation server. Other families generate
-through the same model instance that performs training. This general path processes
-requests one at a time. GLM prefills once, then carries recurrent, convolution,
-indexer and attention history across tokens. Other families recompute the prefix
-for each token. GLM's cache uses expanded K/V and its pooled indexer still allocates
-scores over all pools, so context length remains limited by available memory.
-State resets between requests and after training updates. This path supports text
-completions, streaming, and token-based multi-turn conversations with function
+through the same model instance that performs training. This general path uses
+continuous batching: concurrent requests submit token steps to one compute worker,
+which batches their projections and MLPs. New requests join between rounds;
+prefill is chunked so long prompts do not hold the worker for a complete rollout.
+Each request retains its own attention, convolution and recurrent history.
+
+Attention history uses 128-token pages from a shared GPU pool, with independent
+page tables per request. Completed requests return pages for reuse. GLM's pooled
+indexer also uses paged history and reuses score scratch across 128-query tiles.
+Its attention cache stores normalized MLA latents, reconstructing selected K/V
+projections with the original BF16 and LoRA arithmetic. Recurrent and convolution
+states use fixed-size request allocations. Context remains bounded by available
+memory, `max_model_len`, and the configured request capacity (`max_num_seqs`).
+The shared training executor also bounds context by the trainer's sequence length.
+
+`trainer.get_decode_batch_stats()` reports active sessions, cached tokens, pages,
+allocated/in-use pool bytes and page reuse. The server summary reports batch sizes
+and decode rounds. Low-level callers use `decode_batch_logits(session_ids,
+input_ids, offsets, reset)` with flattened token chunks and one reset flag per
+session, then `release_decode_sessions(session_ids)` when requests finish.
+`decode_logits` and `get_decode_cache_stats` remain available for single-session
+callers. An optimizer update or weight/adapter import invalidates every session;
+training also releases unused pool pages. Native decode runs eagerly in separate
+activation arenas so training's captured graphs retain their buffer addresses.
+
+This path supports text completions, streaming, and token-based multi-turn conversations with function
 tools. Structured `response_format` decoding remains unsupported on this path.
 
 For GLM, native co-locate automatically enables consistent rollout/scoring
 arithmetic before allocating the trainer: recurrent FLA KDA forward, fixed-order
-dense and expert GEMMs, and deterministic BF16 forward additions. This avoids
+dense and expert GEMMs, deterministic BF16 forward additions, and stable sparse
+attention reduction slots even before top-k fills. This avoids
 batch-size rounding differences changing nearly tied expert or sparse-attention
 selections during GRPO scoring. Backward uses the FLA chunk kernels with FP32
 intermediates. Training forward sacrifices token parallelism for agreement with
 decode; ordinary SFT keeps its parallel chunk forward. `doc_masking: true` is
 required. Low-level Python users can select this mode with
 `options.glm_rollout_parity = True` before constructing `SurogateTrainer`.
+
+Set `long_context: true` and `lora_dropout: 0` in the training config to tile dense
+MLP activations during scoring and updates. GLM also tiles routed and shared expert
+MLPs in resident BF16 execution with `ep_size: 1`. Indexer query tiling and the
+latent decode cache are automatic. See [long-context memory](long-context.md).
 
 Choose a model and sequence length that fit your GPU together with training
 activations and optimizer state. The entire base must fit on one GPU, including all

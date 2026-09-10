@@ -17,9 +17,27 @@ public:
     GlmDsaKernels& operator=(GlmDsaKernels&&) = default;
     void load(const std::unordered_map<std::string, std::string>& manifests);
     [[nodiscard]] bool is_ready() const {
-        return mKernels.size() == 8;
+        return mKernels.size() == 13;
     }
     [[nodiscard]] std::size_t workspace_bytes(int B, int T, int length = 0) const;
+    // Bound live score storage independently of the query sequence length.
+    static constexpr int IndexerQueryTile = 128;
+    [[nodiscard]] static std::size_t indexer_workspace_bytes(int B, int T, int TK, int D, int P, int select);
+    [[nodiscard]] int selection_slots() const;
+    void gather_latents(const Tensor& latent,
+                        const Tensor& indices,
+                        const Tensor& out,
+                        const Tensor& selected,
+                        int slots,
+                        cudaStream_t stream) const;
+    void repack_kv(const Tensor& projected, const Tensor& out, cudaStream_t stream) const;
+    void attention_selected(const Tensor& qkv,
+                            const Tensor& indices,
+                            const Tensor& kv,
+                            const Tensor& out,
+                            const Tensor& lse,
+                            int slots,
+                            cudaStream_t stream) const;
     void indexer(const std::vector<Tensor>& inputs,
                  const Tensor& indices,
                  const Tensor& workspace,

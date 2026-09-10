@@ -290,7 +290,9 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
     if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
         const auto& moe_cfg = *mModelConfig.moe_config;
         const int top_k = moe_cfg.top_k;
-        const int total_tokens = BT * top_k;
+        const bool tiled = mOptions.LongContext && mModelConfig.ModelTypeName == "glm5_next" && mOptions.EPSize == 1 &&
+                           !mOptions.CpuTraining && mOptions.ModelType == ETensorDType::BF16;
+        const int total_tokens = tiled ? std::min(BT * top_k, mModelConfig.HiddenSize) : BT * top_k;
         const int expert_D =
             moe_cfg.moe_intermediate_size > 0 ? moe_cfg.moe_intermediate_size : mModelConfig.IntermediateSize;
         const int moe_M = (is_gated_activation(mModelConfig.activation_type) ? 2 : 1) * expert_D;
@@ -299,10 +301,6 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
                                                                      "moe_lora_intermediate1",
                                                                      EAllocationType::ON_DEVICE,
                                                                      {total_tokens, rank});
-        mLoRARunState->moe_lora_intermediate2 = mAllocator->allocate(work_dtype,
-                                                                     "moe_lora_intermediate2",
-                                                                     EAllocationType::ON_DEVICE,
-                                                                     {total_tokens, expert_D});
         mLoRARunState->moe_lora_gate =
             mAllocator->allocate(work_dtype, "moe_lora_gate", EAllocationType::ON_DEVICE, {total_tokens, expert_D});
         mLoRARunState->moe_lora_up =

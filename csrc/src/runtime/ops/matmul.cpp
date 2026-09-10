@@ -752,7 +752,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                      static_cast<void*>(d_out.Data));
     }
 
-    bool do_accumulate = mAccumulateTensors.count(dB_name) > 0;
+    bool do_accumulate = mFfnTileAccumulate || mAccumulateTensors.count(dB_name) > 0;
     if (!do_accumulate && !dB_name.empty() && mCurrentGraph) {
         // Classifier-backed accum lookup: the name of the underlying parameter
         // comes from TensorKind::ParamGrad's base_param_tid — never a string-strip.

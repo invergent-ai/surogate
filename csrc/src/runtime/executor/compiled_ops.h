@@ -495,6 +495,14 @@ public:
 
 private:
     // Execute an MLP tile group in chunks along the sequence dimension.
+    void execute_tiled_experts(const CompiledGraph& graph, const MlpTileGroup& group, bool backward);
+    std::unordered_map<std::string, Tensor> mFfnTileTensors;
+    Tensor mFfnTileOffsets;
+    std::vector<int> mFfnTileHostOffsets;
+    bool mFfnTileAccumulate = false;
+    static std::string ffn_tile_name(const std::string& name) {
+        return name.starts_with("saved.") ? name.substr(6) : name;
+    }
     // Used when long_context mode is enabled to reduce peak MLP activation memory.
     void execute_tiled_mlp(const CompiledGraph& graph,
                            const MlpTileGroup& group,
@@ -1087,6 +1095,10 @@ private:
     // Store a tensor by its pre-resolved TensorRef into the flat vector.
     // Use this in dispatch functions instead of direct mTensors assignment.
     void store_tensor(const TensorRef& ref, const Tensor& t) {
+        if (!mFfnTileTensors.empty()) {
+            auto it = mFfnTileTensors.find(ffn_tile_name(ref.name));
+            if (it != mFfnTileTensors.end()) it->second = t;
+        }
         if (!ref.name.empty()) {
             mNamedTensors[ref.name] = t;
         }

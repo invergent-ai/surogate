@@ -1375,6 +1375,13 @@ Tensor* CompiledExecutor::executor_tid_slot(int layer_idx, TensorSlot slot) {
 }
 
 Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
+    if (!mFfnTileTensors.empty()) {
+        auto it = mFfnTileTensors.find(ffn_tile_name(ref.name));
+        if (it != mFfnTileTensors.end()) {
+            if (!it->second.Data) throw std::runtime_error("Uninitialized FFN tile: " + ref.name);
+            return it->second;
+        }
+    }
     auto& rs = mRunState;
     const int tid = ref.tensor_id;
     const bool debug_dtype = []() {
@@ -1481,8 +1488,8 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             // Decode runs one shorter sequence inside the trainer's activation
             // capacity. Keep the owner's geometry intact for captured training
             // graphs, and bind only a prefix view in the dedicated executor.
-            const bool decode_prefix = mExecutionRequest && mExecutionRequest->glm_decode_state &&
-                                       mB == 1 && shape_nelem(ref.shape) <= base->nelem();
+            const bool decode_prefix =
+                mExecutionRequest && mExecutionRequest->decoding() && shape_nelem(ref.shape) <= base->nelem();
             Tensor view = decode_prefix ? view_tensor(*base, ref.shape) : view_for_shape(*base, ref.shape, ref.name);
             if (tid >= 0) {
                 mTensors[static_cast<std::size_t>(tid)] = view;
@@ -1825,6 +1832,17 @@ void CompiledExecutor::check_op_io_aliasing(const CompiledOp& op, std::size_t op
 }
 
 Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
+    if (!mFfnTileTensors.empty()) {
+        auto it = mFfnTileTensors.find(ffn_tile_name(ref.name));
+        if (it != mFfnTileTensors.end()) {
+            if (!it->second.Data) {
+                it->second = mRunState.temp_alloc(ref.dtype, ref.shape, "ffn_tile_output");
+                mTemps.push_back(it->second);
+                if (ref.name.starts_with("d_")) fill_zero(it->second, mRunState.MainStream);
+            }
+            return it->second;
+        }
+    }
     const int tid = ref.tensor_id;
     // `normalized_name` exists for historical compatibility with the old
     // accumulator-alias path (strip `_from_N` / `_accum_N`, then look up the
@@ -1873,8 +1891,8 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
         if (t.Data) {
             Tensor resolved = t;
             if (!ref.shape.empty()) {
-                const bool decode_prefix = mExecutionRequest && mExecutionRequest->glm_decode_state &&
-                                           mB == 1 && shape_nelem(ref.shape) <= t.nelem();
+                const bool decode_prefix =
+                    mExecutionRequest && mExecutionRequest->decoding() && shape_nelem(ref.shape) <= t.nelem();
                 resolved = decode_prefix ? view_tensor(t, ref.shape) : view_for_shape(t, ref.shape, ref.name);
             }
             if (tid >= 0) {

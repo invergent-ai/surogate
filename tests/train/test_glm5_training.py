@@ -198,19 +198,21 @@ def test_unsupported_attention_and_routing_are_rejected(checkpoint, tmp_path, ca
 
 
 @pytest.mark.parametrize(
-    "lora,graphs,packed,grad_accum,doc_masking,topk,rollout_parity",
+    "lora,graphs,packed,grad_accum,doc_masking,topk,rollout_parity,long_context",
     [
-        (False, False, False, 1, True, 256, False),
-        (True, False, False, 1, True, 256, False),
-        (False, True, True, 1, True, 256, False),
-        (True, True, True, 1, True, 256, False),
-        (False, True, True, 2, True, 256, False),
-        (True, True, True, 2, True, 256, False),
-        (False, False, False, 1, False, 256, False),
-        (False, True, True, 1, True, 8, False),
-        (True, True, True, 1, True, 8, False),
-        (False, True, True, 1, True, 8, True),
-        (True, True, True, 1, True, 8, True),
+        (False, False, False, 1, True, 256, False, False),
+        (True, False, False, 1, True, 256, False, False),
+        (False, True, True, 1, True, 256, False, False),
+        (True, True, True, 1, True, 256, False, False),
+        (False, True, True, 2, True, 256, False, False),
+        (True, True, True, 2, True, 256, False, False),
+        (False, False, False, 1, False, 256, False, False),
+        (False, True, True, 1, True, 8, False, False),
+        (True, True, True, 1, True, 8, False, False),
+        (False, True, True, 1, True, 8, True, False),
+        (True, True, True, 1, True, 8, True, False),
+        (False, True, True, 2, True, 8, False, True),
+        (True, True, True, 2, True, 8, False, True),
     ],
     ids=[
         "full",
@@ -224,10 +226,12 @@ def test_unsupported_attention_and_routing_are_rejected(checkpoint, tmp_path, ca
         "lora-sparse",
         "full-rollout-parity",
         "lora-rollout-parity",
+        "full-sparse-tiled",
+        "lora-sparse-tiled",
     ],
 )
 def test_dummy_checkpoint_forward_backward_and_update(
-    checkpoint, tmp_path, monkeypatch, lora, graphs, packed, grad_accum, doc_masking, topk, rollout_parity
+    checkpoint, tmp_path, monkeypatch, lora, graphs, packed, grad_accum, doc_masking, topk, rollout_parity, long_context
 ):
     from transformers import Glm5NextForConditionalGeneration
     from transformers.models.glm5_next import modeling_glm5_next as glm
@@ -257,6 +261,7 @@ def test_dummy_checkpoint_forward_backward_and_update(
         offload_grads=False,
         offload_optimizer=False,
         doc_masking=doc_masking,
+        long_context=long_context,
     )
     options.dsl_ir_json = build_dsl_ir_for_model(str(checkpoint))
     options.glm_rollout_parity = rollout_parity
@@ -440,6 +445,9 @@ def test_persistent_decode_matches_prefix_and_invalidates_on_updates(checkpoint,
         offload_grads=False,
         offload_optimizer=False,
     )
+    # Use the same arithmetic as native-colocate. The parallel SFT forward
+    # intentionally permits BF16 differences that can change hard top-k.
+    options.glm_rollout_parity = True
     options.dsl_ir_json = build_dsl_ir_for_model(str(tmp_path))
     options.jit_kernel_manifests = compile_jit_kernels(options.dsl_ir_json)
     trainer = ext.SurogateTrainer(
@@ -469,21 +477,16 @@ def test_persistent_decode_matches_prefix_and_invalidates_on_updates(checkpoint,
             # A fresh prefill uses the same recurrence but none of the carried
             # convolution, recurrent, pooled-indexer or KV history under test.
             expected = trainer.decode_logits(tokens[:end], reset=True)
-            np.testing.assert_allclose(actual, expected, atol=0.015, rtol=0, err_msg=f"prefix length {end}")
-            if end <= 8:
-                # Before sparse selection, also compare to the training graph.
-                # Beyond top-k, BF16 chunk/recurrent rounding can change which
-                # pools the hard indexer selects; kernel tests check each path
-                # independently against its mathematical reference.
-                positions[0] = end - 1
-                expected = trainer.next_token_logits(padded, positions)[0]
-                np.testing.assert_allclose(actual, expected, atol=0.035, rtol=0)
+            np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=0, err_msg=f"prefix length {end}")
+            positions[0] = end - 1
+            expected = trainer.next_token_logits(padded, positions)[0]
+            np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=0)
 
     compare_chunks()
     # A new prompt reuses allocations but starts clean, including an incomplete pool.
     restarted = trainer.decode_logits(tokens[:3], reset=True)
     positions[0] = 2
-    np.testing.assert_allclose(restarted, trainer.next_token_logits(padded, positions)[0], atol=0.035, rtol=0)
+    np.testing.assert_allclose(restarted, trainer.next_token_logits(padded, positions)[0], atol=1e-5, rtol=0)
     trainer.reset_decode_state()
     with pytest.raises(RuntimeError, match="prefill"):
         trainer.decode_logits(tokens[:1])

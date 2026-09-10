@@ -292,6 +292,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
         }
     }
     mOptions = options;
+    if (mOptions.LongContext && mLoRAConfig && mLoRAConfig->dropout != 0)
+        throw std::runtime_error("Tiled MLP execution requires lora_dropout: 0 for consistent recomputation");
     if (qlora_enabled() && mQLoRAConfig.is_fp4()) {
         mOptions.UseCudaGraphs = false;
     }
@@ -334,7 +336,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
         std::cerr
-            << "[DEBUG-STACK] plan_peak=" << initial_plan.plan_stack_peak_bytes() / (1024 * 1024) << " MiB"
+            << "[DEBUG-STACK] plan_peak="
+            << initial_plan.plan_stack_peak_bytes(mOptions.LongContext ? initial_plan.C : 0) / (1024 * 1024) << " MiB"
             << ", initial_required=" << required_size / (1024 * 1024) << " MiB"
             << ", block_schema_records=" << initial_plan.schema_record_count
             << ", block_schema_routing_layers=" << initial_plan.schema_routing_layers
@@ -700,7 +703,11 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
 
 std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
                                                const std::int32_t* last_positions,
-                                               int B, int T, NCCLCommunicator& comm, GlmDecodeState* decode) {
+                                               int B,
+                                               int T,
+                                               NCCLCommunicator& comm,
+                                               GlmDecodeState* decode,
+                                               const std::vector<GlmDecodeState*>& decode_states) {
     if (!mExecutor || !mRunState || !lora_enabled() || mWeightManager || qlora_enabled()) {
         throw std::runtime_error("next_token_logits requires initialized resident LoRA weights");
     }
@@ -723,23 +730,30 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
     std::vector<std::byte> raw(static_cast<std::size_t>(B) * V * get_dtype_size(dtype));
     std::vector<std::int32_t> positions(static_cast<std::size_t>(B) * T), targets(positions.size(), -100);
     for (int b = 0; b < B; ++b) {
-        std::iota(positions.begin() + b * T, positions.begin() + (b + 1) * T, decode ? decode->length : 0);
+        std::iota(positions.begin() + b * T,
+                  positions.begin() + (b + 1) * T,
+                  !decode_states.empty() ? decode_states.at(b)->length
+                  : decode               ? decode->length
+                                         : 0);
     }
     auto cpu_tokens = [B, T](const std::int32_t* data) {
         return Tensor::from_pointer(reinterpret_cast<std::byte*>(const_cast<std::int32_t*>(data)),
                                     -1, ETensorDType::INT32, std::vector<long>{B, T});
     };
     const auto inputs = cpu_tokens(input_ids), pos = cpu_tokens(positions.data());
-    if (decode) {
+    const bool decoding = decode || !decode_states.empty();
+    if (decoding) {
         // Reuse the trainer's capacity without replacing buffers referenced by
         // its captured optimizer/backward graphs. LoRA forward derives active
         // dimensions from the input tensors.
         if (!mLoRARunState || B * T > mLoRARunState->B * mLoRARunState->T)
             throw std::runtime_error("Decode exceeds the trainer's LoRA workspace capacity");
-    } else ensure_lora_run_state(comm, B, T);
+    } else
+        ensure_lora_run_state(comm, B, T);
     const bool was_training = mLoRARunState->is_training;
     mLoRARunState->is_training = false;
-    const bool masked = !decode && causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, pos);
+    const bool masked =
+        !decoding && causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, pos);
     auto request = causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, pos,
                                                          cpu_tokens(targets.data()), 0);
     request.mode = ExecutionMode::Forward;
@@ -747,6 +761,7 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
     request.disable_forward_saves = true;
     request.generation_positions_cpu = last_positions;
     request.glm_decode_state = decode;
+    request.decode_states = decode_states;
     request.generation_logits_cpu = Tensor::from_pointer(raw.data(), -1, dtype, std::vector<long>{B, V});
     try {
         mExecutor->execute_forward(request, comm);
@@ -773,7 +788,104 @@ std::vector<float> DslModel::next_token_logits(const std::int32_t* input_ids,
     return result;
 }
 
+std::vector<float> DslModel::decode_batch_logits(const std::int64_t* sessions,
+                                                 const std::int32_t* ids,
+                                                 const std::int32_t* offsets,
+                                                 const std::int32_t* resets,
+                                                 int count,
+                                                 int capacity,
+                                                 NCCLCommunicator& comm) {
+    if (count <= 0 || capacity <= 0 || offsets[0] != 0 || !mLoRARunState)
+        throw std::invalid_argument("Invalid decode batch");
+    std::unordered_set<std::int64_t> unique;
+    std::unordered_map<int, std::vector<int>> groups;
+    const long workspace_rows = mLoRARunState->B * mLoRARunState->T;
+    // Validate the entire submission before mutating any request's history.
+    for (int i = 0; i < count; ++i) {
+        if (sessions[i] < 0 || !unique.insert(sessions[i]).second)
+            throw std::invalid_argument("Decode sessions must be distinct nonnegative IDs");
+        int n = offsets[i + 1] - offsets[i];
+        if (n <= 0 || n > capacity || n > workspace_rows || (resets[i] != 0 && resets[i] != 1))
+            throw std::invalid_argument("Invalid decode token offsets or reset flags");
+        auto it = mDecodeSessions.find(sessions[i]);
+        if (!resets[i] && (it == mDecodeSessions.end() || !it->second->active))
+            throw std::runtime_error("Decode requires a prefill call after release or training");
+        if (!resets[i] && (it->second->limit != capacity || n > capacity - it->second->length))
+            throw std::invalid_argument("Decode exceeds maximum context length");
+        for (int j = offsets[i]; j < offsets[i + 1]; ++j)
+            if (ids[j] < 0 || ids[j] >= mModelConfig.VocabSize)
+                throw std::invalid_argument("Decode token is outside vocabulary");
+        groups[n].push_back(i);
+    }
+    std::vector<float> result(static_cast<std::size_t>(count) * mModelConfig.VocabSize);
+    try {
+        for (int i = 0; i < count; ++i) {
+            auto& state = mDecodeSessions[sessions[i]];
+            if (resets[i]) {
+                state = std::make_unique<GlmDecodeState>();
+                state->page_pool = mDecodePagePool;
+                state->limit = capacity;
+                state->active = true;
+            }
+            state->reserve(state->length + offsets[i + 1] - offsets[i]);
+        }
+        // Equal-size chunks share a graph invocation; all active one-token
+        // decodes therefore share the projection and MLP GEMMs. Chunk groups
+        // are bounded by the trainer's existing activation/LoRA input capacity.
+        for (const auto& [T, members] : groups) {
+            const int max_batch = std::max<long>(1, workspace_rows / T);
+            for (std::size_t start = 0; start < members.size(); start += max_batch) {
+                const int B = std::min<std::size_t>(max_batch, members.size() - start);
+                std::vector<int> tokens(B * T), positions(B, T - 1);
+                std::vector<GlmDecodeState*> states;
+                for (int row = 0; row < B; ++row) {
+                    const int member = members[start + row];
+                    std::copy_n(ids + offsets[member], T, tokens.data() + row * T);
+                    states.push_back(mDecodeSessions.at(sessions[member]).get());
+                }
+                auto logits = next_token_logits(tokens.data(), positions.data(), B, T, comm, nullptr, states);
+                for (int row = 0; row < B; ++row) {
+                    const int member = members[start + row];
+                    std::copy_n(logits.data() + row * mModelConfig.VocabSize,
+                                mModelConfig.VocabSize,
+                                result.data() + member * mModelConfig.VocabSize);
+                    states[row]->length += T;
+                }
+            }
+        }
+    } catch (...) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+        for (int i = 0; i < count; ++i)
+            mDecodeSessions.erase(sessions[i]);
+        throw;
+    }
+    return result;
+}
+
+void DslModel::release_decode_sessions(const std::vector<std::int64_t>& sessions) {
+    for (auto id : sessions)
+        mDecodeSessions.erase(id);
+}
+
+std::unordered_map<std::string, std::int64_t> DslModel::decode_batch_stats() const {
+    std::unordered_map<std::string, std::int64_t> result{{"sessions", mDecodeSessions.size()},
+                                                         {"length", 0},
+                                                         {"pages", 0},
+                                                         {"bytes", 0},
+                                                         {"page_size", DecodePageRows},
+                                                         {"pool_allocated_bytes", mDecodePagePool->allocated_bytes},
+                                                         {"pool_used_bytes", mDecodePagePool->used_bytes},
+                                                         {"reused_pages", mDecodePagePool->reused_pages}};
+    for (const auto& [id, state] : mDecodeSessions)
+        for (const auto& [name, value] : state->stats())
+            if (name == "length" || name == "pages" || name == "bytes" || name.ends_with("_bytes"))
+                result[name] += value;
+    return result;
+}
+
 void DslModel::reset_decode_state() {
+    mDecodeSessions.clear();
+    mDecodePagePool->trim();
     if (mGlmDecodeState) {
         mGlmDecodeState->active = false;
         mGlmDecodeState->length = 0;
@@ -782,21 +894,21 @@ void DslModel::reset_decode_state() {
 
 std::vector<float> DslModel::decode_logits(const std::int32_t* input_ids, int T, bool reset,
                                           int capacity, NCCLCommunicator& comm) {
-    const auto* type = internal::find_key(&mModule->hf_config, "model_type");
-    if (!type || internal::as_string(*type).value_or("") != "glm5_next")
-        throw std::runtime_error("Persistent training-model decode currently supports GLM-5.3-Flash");
     if (T <= 0 || capacity <= 0) throw std::invalid_argument("Decode input must contain at least one token");
     if (reset) {
-        if (!mGlmDecodeState || mGlmDecodeState->capacity != capacity) {
+        if (!mGlmDecodeState || mGlmDecodeState->limit != capacity) {
             mGlmDecodeState = std::make_unique<GlmDecodeState>();
-            mGlmDecodeState->capacity = capacity;
+            mGlmDecodeState->limit = capacity;
         }
         mGlmDecodeState->length = 0;
         mGlmDecodeState->active = true;
     }
     if (!mGlmDecodeState || !mGlmDecodeState->active)
         throw std::runtime_error("Decode requires a prefill call with reset=true after reset or training");
+    if (capacity != mGlmDecodeState->limit)
+        throw std::invalid_argument("Decode context limit changed; reset the session");
     if (T > capacity - mGlmDecodeState->length) throw std::invalid_argument("Decode exceeds maximum context length");
+    mGlmDecodeState->reserve(mGlmDecodeState->length + T);
     int position = T - 1;
     try {
         auto result = next_token_logits(input_ids, &position, 1, T, comm, mGlmDecodeState.get());

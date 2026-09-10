@@ -40,6 +40,7 @@ void glm5_backward(Glm5Kernel kind,
                    Tensor checkpoints,
                    cudaStream_t stream);
 void glm5_copy_gradient(const Tensor& src, Tensor& dst, bool accumulate, cudaStream_t stream);
+void glm5_tile_expert_offsets(const int* offsets, int* output, int experts, int start, int rows, cudaStream_t stream);
 void glm5_convolution_state(const Tensor& x, const Tensor& weight, const Tensor& state,
                             const Tensor& output, bool initial, cudaStream_t stream);
 

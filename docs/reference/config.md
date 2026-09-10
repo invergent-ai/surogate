@@ -561,7 +561,7 @@ desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
 | -------------------------- | ---- | ------- | --------------------------------------------------------------------------------------------------------- |
 | `lmhead_chunks`            | int  | `1`     | Split LM-head computation into N chunks to reduce logit tensor size by factor of N.                       |
 | `attn_bwd_chunks`          | int  | `1`     | Split attention backward pass into N chunks to save workspace memory.                                     |
-| `long_context`             | bool | `false` | Enable tiled MLP execution for long-context training. Chunks MLP computation along the sequence dimension during both forward and backward passes, reducing per-layer MLP memory from O(B\*T \* intermediate) to O(chunk\_size \* intermediate). Automatically disables CUDA graphs. Only applies to dense models (Llama, Qwen3, Qwen3.5, Qwen3-VL); MoE models are excluded. |
+| `long_context`             | bool | `false` | Tile dense SwiGLU MLPs during forward and backward, plus GLM's routed/shared experts in resident BF16 training with `ep_size: 1`. Bounds wide intermediates by the tile size; routing and residual buffers remain proportional to context. Requires `lora_dropout: 0`; eligible surrounding ops can still use CUDA graphs. See [long context](../guides/long-context.md). |
 | `init_projections_to_zero` | bool | `false` | Initialize projection weights (FFN down and attention out) to zero. Only used when training from scratch. |
 
 ## LoRA Settings

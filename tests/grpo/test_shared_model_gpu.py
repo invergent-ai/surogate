@@ -64,8 +64,13 @@ def glm_checkpoint(tmp_path_factory):
     return root
 
 
-@pytest.mark.parametrize("batch_size,graphs,alpha,temperature", [(1, False, 16, 0), (2, True, 13, 1)])
-def test_glm_long_rollout_matches_packed_scoring_after_updates(glm_checkpoint, batch_size, graphs, alpha, temperature):
+@pytest.mark.parametrize(
+    "batch_size,graphs,alpha,temperature,long_context",
+    [(1, False, 16, 0, False), (2, True, 13, 1, False), (2, True, 13, 1, True)],
+)
+def test_glm_long_rollout_matches_packed_scoring_after_updates(
+    glm_checkpoint, batch_size, graphs, alpha, temperature, long_context
+):
     _check_policy(
         glm_checkpoint,
         load_weights=True,
@@ -76,7 +81,62 @@ def test_glm_long_rollout_matches_packed_scoring_after_updates(glm_checkpoint, b
         alpha=alpha,
         packed=True,
         temperature=temperature,
+        long_context=long_context,
     )
+
+
+def test_glm_latent_cache_grows_and_preserves_chunked_decode(glm_checkpoint, tmp_path):
+    from surogate import _surogate as ext
+    from surogate.dsl.ir_builder import build_dsl_ir_for_model
+    from surogate.kernels.jit_compile import compile_jit_kernels
+
+    config = json.loads((glm_checkpoint / "config.json").read_text())
+    # More than 128 selected keys exercises multiple projection tiles and a tail.
+    config["text_config"]["index_topk"] = 160
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    options = ext.RuntimeOptions(
+        recompute="true",
+        use_cuda_graphs=False,
+        master_dtype="bf16",
+        offload_master=False,
+        offload_grads=False,
+        offload_optimizer=False,
+        doc_masking=True,
+    )
+    options.glm_rollout_parity = True
+    options.dsl_ir_json = build_dsl_ir_for_model(str(tmp_path))
+    options.jit_kernel_manifests = compile_jit_kernels(options.dsl_ir_json)
+    trainer = ext.SurogateTrainer(
+        ngpu=1,
+        config=ext.PretrainedConfig.from_pretrained(str(tmp_path), "bf16"),
+        options=options,
+        batch_size=1,
+        seq_len=512,
+        grad_accum=1,
+        lora_config=ext.LoRAAdapterConfig(rank=8, alpha=13, dropout=0, dtype="bf16", target_modules=["all"]),
+    )
+    trainer.import_weights(str(glm_checkpoint / "model.safetensors"))
+    for name, value in trainer.get_lora_weights(0).items():
+        if ".lora_B." in name:
+            torch.from_dlpack(value).fill_(0.003)
+    torch.cuda.synchronize()
+    tokens = np.random.default_rng(91).integers(3, 259, size=278, dtype=np.int32)
+    end = 0
+    results = []
+    for count, capacity in [(5, 128), (128, 256), (128, 512), (17, 512)]:
+        logits = trainer.decode_logits(tokens[end : end + count], reset=end == 0)
+        end += count
+        cache = trainer.get_decode_cache_stats()
+        assert cache["length"] == end and cache["capacity"] == capacity and cache["limit"] == 512
+        assert cache["mla_latent_bytes"] > 0 and cache.get("mla_kv_bytes", 0) == 0
+        results.append((end, logits))
+    for end, logits in results:
+        fresh = trainer.decode_logits(tokens[:end], reset=True)
+        np.testing.assert_allclose(logits, fresh, atol=1e-5, rtol=0, err_msg=f"prefix {end}")
+    trainer.reset_decode_state()
+    with pytest.raises(RuntimeError, match="prefill"):
+        trainer.decode_logits(tokens[:1])
+    np.testing.assert_allclose(trainer.decode_logits(tokens[:5], reset=True), results[0][1], atol=1e-5, rtol=0)
 
 
 def _check_policy(
@@ -91,6 +151,7 @@ def _check_policy(
     alpha=16,
     packed=False,
     temperature=0,
+    long_context=False,
 ):
     from surogate import _surogate as ext
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
@@ -105,6 +166,7 @@ def _check_policy(
         offload_master=False,
         offload_grads=False,
         offload_optimizer=False,
+        long_context=long_context,
     )
     options.dsl_ir_json = build_dsl_ir_for_model(str(root))
     manifests = compile_jit_kernels(options.dsl_ir_json)
@@ -210,6 +272,10 @@ def _check_policy(
         assert requests.post(url, json=body, timeout=10).status_code == 429
         server.publish("policy", [], 0)
         before = generate()
+        if glm and seq_len == 512 and rollout_tokens == 248:
+            cache = trainer.get_decode_batch_stats()
+            assert cache["sessions"] == 0 and cache["pool_used_bytes"] == 0
+            assert cache["pool_allocated_bytes"] > 0
         server.begin_training()
         check_scores(before)
         inputs, target_ids = scoring_batch(before)
@@ -236,6 +302,7 @@ def _check_policy(
         server.begin_training()
         check_scores(after)
         summary = server.summary()
+        assert summary["continuous_batching"] and summary["max_decode_batch"] >= 2
         assert summary["base_upload_bytes"] == summary["serving_base_allocated_bytes"] == 0
         assert summary["shared_base_bytes"] > 0
         assert original == {n: torch.from_dlpack(t).data_ptr() for n, t in trainer.get_shared_base_weights().items()}

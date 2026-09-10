@@ -195,6 +195,7 @@ bool refresh_moe_experts_if_needed(int layer_idx,
 }
 
 const int* CompiledExecutor::get_or_sync_moe_host_offsets(int layer_idx, const int* device_offsets, int num_experts) {
+    if (mFfnTileOffsets.Data) return mFfnTileHostOffsets.data();
     if (layer_idx < 0 || num_experts <= 0 || !device_offsets) {
         return nullptr;
     }

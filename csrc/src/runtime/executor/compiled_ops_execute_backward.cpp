@@ -1046,7 +1046,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     std::unordered_map<std::size_t, const MlpTileGroup*> bwd_tile_group_starts;
     for (const auto& tg : graph.mlp_tile_groups) {
         for (std::size_t i = tg.start_op_idx; i <= tg.end_op_idx && i < graph.ops.size(); ++i) {
-            if (graph.ops[i].type == CompiledOpType::MatmulBackward) {
+            if (graph.ops[i].type == CompiledOpType::MatmulBackward ||
+                graph.ops[i].type == CompiledOpType::MoEGroupedGemmDownBackward) {
                 bwd_tile_group_starts[tg.start_op_idx] = &tg;
                 break;
             }

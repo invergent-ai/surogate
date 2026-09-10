@@ -119,6 +119,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         }
         expert_offsets_ptr = moe_offsets_ptr;
     }
+    if (mFfnTileOffsets.Data) expert_offsets_ptr = &mFfnTileOffsets;
     Tensor& expert_offsets = *expert_offsets_ptr;
 
     // LLEP per-expert weight pointer override: when LLEP is active, use per-expert
@@ -598,6 +599,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         expert_offsets_ptr = static_cast<const int*>(mMoEExpertOffsetsGPU);
     }
 
+    if (mFfnTileOffsets.Data) expert_offsets_ptr = mFfnTileOffsets.get<int>();
     int num_experts = num_experts_for_offsets;
     const int hidden_size = static_cast<int>(mConfig.HiddenSize);
     // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
@@ -1198,6 +1200,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                 if (mLoRAGrads && mComm && (!llep_lora_active || llep_wgrad)) {
                     lora_grads = &mLoRAGrads->get_block_full(layer_idx, mRunState.MainStream, *mComm, lora_accum);
                 }
+                lora_accum |= mFfnTileAccumulate;
                 const float grad_beta = lora_accum ? 1.0f : 0.0f;
 
                 auto merged_temp = [&](long rows, long cols) -> Tensor {

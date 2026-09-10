@@ -4,6 +4,8 @@
 // Qwen3.5 gated delta rule operation dispatch using JIT-compiled Triton kernels.
 
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/executor/glm_decode_state.h"
+#include "kernels/decode.h"
 
 #include <cmath>
 #include <cstdint>
@@ -222,6 +224,31 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
         }
         q_eff = q_norm.Data;
         k_eff = k_norm.Data;
+    }
+
+    if (mExecutionRequest && mExecutionRequest->decoding()) {
+        Tensor query = q, key = k;
+        query.Data = static_cast<std::byte*>(q_eff);
+        key.Data = static_cast<std::byte*>(k_eff);
+        for (int row = 0; row < B; ++row) {
+            auto* state = mExecutionRequest->decode_state(row);
+            auto history = state->get(op_layer_idx(op), "delta_state", ETensorDType::FP32, {1, H, K, V});
+            decode_delta_rule(decode_batch_row(query, row),
+                              decode_batch_row(key, row),
+                              decode_batch_row(v, row),
+                              decode_batch_row(g_input, row),
+                              decode_batch_row(beta, row),
+                              history,
+                              decode_batch_row(out_val, row),
+                              state->length == 0,
+                              scale,
+                              stream);
+            auto target = decode_batch_row(state_val, row);
+            CUDA_CHECK(cudaMemcpyAsync(target.Data, history.Data, history.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+        store_tensor(op.outputs[0], out_val);
+        if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], state_val);
+        return;
     }
 
     // Allocate intermediates

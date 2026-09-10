@@ -882,9 +882,16 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 continue;
             }
 
+            // Canonical training buffers can be larger than a decode output.
+            // Only inspect the active view; its unwritten capacity is scratch.
+            Tensor active = *t;
+            if (mExecutionRequest && mExecutionRequest->decoding() && !ref.shape.empty() &&
+                shape_nelem(ref.shape) < static_cast<std::size_t>(active.nelem())) {
+                active = view_tensor(active, ref.shape);
+            }
             Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1}, "non_finite_count");
             CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
-            count_non_finite(non_finite_count, *t, mRunState.MainStream);
+            count_non_finite(non_finite_count, active, mRunState.MainStream);
             int host_count = 0;
             CUDA_CHECK(cudaMemcpyAsync(&host_count,
                                        non_finite_count.get<int>(),
@@ -898,10 +905,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 std::ostringstream oss;
                 oss << "Non-finite detected in forward output tensor '" << ref.name << "' at op id=" << op.op_id
                     << " type=" << op_type_to_string(op.type) << " count=" << host_count
-                    << " dtype=" << static_cast<int>(t->DType) << " shape=[";
-                for (int d = 0; d < t->Rank; ++d) {
+                    << " dtype=" << static_cast<int>(active.DType) << " shape=[";
+                for (int d = 0; d < active.Rank; ++d) {
                     if (d > 0) oss << ",";
-                    oss << t->Sizes[d];
+                    oss << active.Sizes[d];
                 }
                 oss << "]";
                 throw std::runtime_error(oss.str());
@@ -921,7 +928,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // loop below remains the path when capturing (CUDA graph capture needs
     // the single-pass op walk) or when the compiler did not emit an
     // instruction stream.
-    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing && !mForceLinear;
+    const bool stream_driven =
+        !graph.instruction_stream.empty() && !mCapturing && !mForceLinear && tile_group_starts.empty();
     if (stream_driven) {
         if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
             if (std::string(env) == "1") {
@@ -1025,6 +1033,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             try {
                                 op.fn(*this, op, static_cast<const void*>(hook));
                                 sync_after_forward_op(op);
+                                check_nonfinite_refs(op, op.outputs);
                             } catch (const std::exception& e) {
                                 std::ostringstream oss;
                                 oss << "execute_forward stream op=" << i << " type=" << op_type_to_string(op.type)

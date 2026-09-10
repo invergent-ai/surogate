@@ -543,6 +543,8 @@ struct GraphSegment {
 struct MlpTileGroup {
     std::size_t start_op_idx;  // first op in MLP sequence (view before up-proj matmul)
     std::size_t end_op_idx;    // last op in MLP sequence (view after down-proj matmul)
+    bool grouped_experts = false;
+    bool shared_expert = false;
 };
 
 // ============================================================================
@@ -814,6 +816,9 @@ struct CompiledGraph {
     // Forward groups: view → matmul_up → view → swiglu → view → matmul_down → view
     // Backward groups: view_bwd → matmul_bwd(down) → ... → matmul_bwd(up) → view_bwd
     std::vector<MlpTileGroup> mlp_tile_groups;
+    // Logical intermediates replaced by tile-local scratch. They require no
+    // full-sequence arena slot or saved activation.
+    std::unordered_set<int> mlp_tile_internal_tids;
 
     // Per-layer segments for split-attention CUDA graph mode.
     // When populated, each layer is split into alternating graph-captured and

@@ -1,0 +1,32 @@
+# Create models/dummy-glm-long with --max-sequence-length 2048; see README.md.
+model: ./models/dummy-glm-long
+output_dir: ./outputs/sft/glm/dummy-long-context
+resume_from_checkpoint: false
+gpus: 1
+recipe: bf16
+train_vision: false
+lora: true
+lora_rank: 8
+lora_alpha: 16
+lora_dtype: bf16
+lora_dropout: 0
+lora_target_modules: [all]
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+sequence_len: 2048
+long_context: true
+sample_packing: true
+recompute: true
+max_steps: 10
+learning_rate: 1e-3
+lr_scheduler_type: constant
+warmup_ratio: 0
+optimizer: adamw
+save_steps: 0
+eval_steps: 0
+validation_split_ratio: 0
+dataloader_num_workers: 1
+datasets:
+  - path: ./examples/datasets/conversations.jsonl
+    type: conversation
+    messages_field: dialog

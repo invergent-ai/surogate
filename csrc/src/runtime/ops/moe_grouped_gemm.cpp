@@ -56,7 +56,7 @@ void CompiledExecutor::backward_moe_base_weights(const CompiledOp& op,
         if (type == ETensorDType::FP32) return CUDA_R_32F;
         throw std::runtime_error("Expert weight gradients require BF16/FP32 tensors");
     };
-    const bool accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
+    const bool accumulate = mFfnTileAccumulate || mAccumulateTensors.count(op.outputs[1].name) > 0;
     if (!accumulate) fill_zero(dw, mRunState.MainStream);
     const float alpha = 1.f, beta = accumulate ? 1.f : 0.f;
     CUBLAS_CHECK(cublasSetStream(mRunState.cublas_handle(), mRunState.MainStream));

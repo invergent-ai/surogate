@@ -284,6 +284,14 @@ public:
     // Returns B*T float log-probs; masked positions (target==-100) receive 0.
     std::vector<float> decode_logits(const std::int32_t* input_ids, int T, bool reset);
     void reset_decode_state();
+    std::vector<float> decode_batch_logits(const std::int64_t* sessions,
+                                           const std::int32_t* ids,
+                                           const std::int32_t* offsets,
+                                           const std::int32_t* resets,
+                                           int count);
+    void release_decode_sessions(const std::vector<std::int64_t>& sessions);
+    std::unordered_map<std::string, std::int64_t> get_decode_batch_stats();
+    std::unordered_map<std::string, std::int64_t> get_decode_cache_stats();
     std::vector<float> next_token_logits(const std::int32_t* input_ids,
                                          const std::int32_t* last_positions, int B, int T);
 

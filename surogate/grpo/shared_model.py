@@ -1,7 +1,7 @@
 """Text rollouts through the same native DSL model used for training.
 
-Generation is serialized on the trainer's workspace. GLM keeps recurrent and
-attention history across decode calls; other families recompute the prefix.
+Token steps are continuously batched on the trainer's workspace. Requests keep
+independent paged attention history and recurrent/convolution states.
 Weights and adapters belong to the trainer throughout generation.
 """
 
@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
+from surogate.grpo.decode_scheduler import DecodeCapacityError, DecodeScheduler
 from surogate.grpo.tool_protocol import request_tools, select_protocol
 
 
@@ -82,6 +83,14 @@ class SharedModelServer:
         self.vocab = text["vocab_size"]
         eos = settings.get("eos_token_id", text.get("eos_token_id", config.get("eos_token_id", tokenizer.eos_token_id)))
         self.eos = set(eos if isinstance(eos, list) else [eos]) - {None}
+        self.scheduler = None
+        if hasattr(trainer, "decode_batch_logits"):
+            self.scheduler = DecodeScheduler(
+                trainer, max_batch=self.capacity,
+                prefill_chunk=max(1, settings.get("prefill_chunk", 256)),
+                token_budget=settings.get("kv_capacity", self.context * self.capacity),
+            )
+            self.persistent_decode = True
         # Some chat checkpoints keep the base-model EOS in config.json while
         # the tokenizer uses a different end-of-turn token (Qwen3.5-0.8B).
         if tokenizer.eos_token_id is not None:
@@ -155,7 +164,7 @@ class SharedModelServer:
                     pass
                 except Exception as exc:
                     if not started:
-                        status = 429 if isinstance(exc, Busy) else 400 if isinstance(exc, (ValueError, TypeError, KeyError)) else 500
+                        status = 429 if isinstance(exc, (Busy, DecodeCapacityError)) else 400 if isinstance(exc, (ValueError, TypeError, KeyError)) else 500
                         self.send_json(status, {"error": {"message": str(exc), "type": "invalid_request_error"}})
 
         self.http = ThreadingHTTPServer((settings["host"], settings["port"]), Handler)
@@ -197,7 +206,9 @@ class SharedModelServer:
         with self.condition:
             return dict(policy_version=self.version, shared_base_bytes=self.base_bytes,
                         serving_base_allocated_bytes=0, base_upload_bytes=0,
-                        sleeping=self.sleeping, execution="training", persistent_decode=self.persistent_decode)
+                        sleeping=self.sleeping, execution="training", persistent_decode=self.persistent_decode,
+                        continuous_batching=self.scheduler is not None,
+                        **(self.scheduler.summary() if self.scheduler else {}))
 
     def close(self):
         with self.condition:
@@ -206,6 +217,8 @@ class SharedModelServer:
             self.closed = self.sleeping = True
         self.http.shutdown()
         self.begin_training()
+        if self.scheduler:
+            self.scheduler.close()
         self.http.server_close()
         self.thread.join()
         self.trainer = None
@@ -279,6 +292,13 @@ class SharedModelServer:
                            minimum=minimum, stop=stop, parsed_tools=tools, protocol=protocol, prompt_tail=tail)
 
     def generate(self, request, callback=None):
+        if self.scheduler:
+            session = self.scheduler.new_session()
+            try:
+                return self._generate(request, callback,
+                    lambda tokens, reset: self.scheduler.step(session, tokens, reset))
+            finally:
+                self.scheduler.release(session)
         # One workspace serves all admitted requests; begin_training waits for
         # both the running request and admitted requests waiting on this lock.
         with self.compute_lock:
@@ -288,7 +308,7 @@ class SharedModelServer:
                 if self.persistent_decode:
                     self.trainer.reset_decode_state()
 
-    def _generate(self, request, callback):
+    def _generate(self, request, callback, decode=None):
         prompt = request["prompt_ids"]
         inputs = None if self.persistent_decode else np.zeros((self.trainer.batch_size, self.trainer.seq_length), dtype=np.int32)
         if inputs is not None:
@@ -305,7 +325,8 @@ class SharedModelServer:
             positions[0] = len(prompt) + step - 1
             if self.persistent_decode:
                 tokens = np.asarray(prompt if step == 0 else [ids[-1]], dtype=np.int32)
-                logits = self.trainer.decode_logits(tokens, reset=step == 0).astype(np.float64)
+                logits = (decode(tokens, step == 0) if decode else
+                          self.trainer.decode_logits(tokens, reset=step == 0)).astype(np.float64)
             else:
                 logits = self.trainer.next_token_logits(inputs, positions)[0].astype(np.float64)
             if not np.isfinite(logits).all():

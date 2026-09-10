@@ -1,11 +1,22 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: Apache-2.0
 #include "kernels/glm5.h"
-
 #include <cmath>
 #include <stdexcept>
 #include <cuda_bf16.h>
 #include "utilities/utils.h"
+
+namespace {
+__global__ void tile_expert_offsets_kernel(const int* offsets, int* output, int experts, int start, int rows) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e <= experts) output[e] = min(max(offsets[e] - start, 0), rows);
+}
+}  // namespace
+
+void glm5_tile_expert_offsets(const int* offsets, int* output, int experts, int start, int rows, cudaStream_t stream) {
+    tile_expert_offsets_kernel<<<(experts + 256) / 256, 256, 0, stream>>>(offsets, output, experts, start, rows);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 namespace {
 struct Ptr {

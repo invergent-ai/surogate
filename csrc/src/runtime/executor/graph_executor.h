@@ -487,6 +487,8 @@ private:
     PhaseArenas mDecodePrefillArenas;
     PhaseArenas mDecodeTokenArenas;
     long mDecodePrefillT = 0;
+    long mDecodePrefillB = 0;
+    long mDecodeTokenB = 0;
     std::unique_ptr<CompiledGraph> mCompiledForward;
     std::unique_ptr<CompiledGraph> mCompiledBackward;
     long mCompiledB = 0;

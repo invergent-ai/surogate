@@ -3372,10 +3372,62 @@ std::vector<float> MultiGPUPyTrainer::decode_logits(const std::int32_t* input_id
     return result;
 }
 
+std::vector<float> MultiGPUPyTrainer::decode_batch_logits(const std::int64_t* sessions,
+                                                          const std::int32_t* ids,
+                                                          const std::int32_t* offsets,
+                                                          const std::int32_t* resets,
+                                                          int count) {
+    if (mContexts.size() != 1) throw std::invalid_argument("Batched decode requires one GPU");
+    std::vector<float> result;
+    std::exception_ptr error;
+    run_work(
+        [&](sThreadContext& ctx) {
+            try {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model) throw std::runtime_error("Batched decode requires a DSL model");
+                result =
+                    model->decode_batch_logits(sessions, ids, offsets, resets, count, seq_length(), *ctx.Communicator);
+            } catch (...) {
+                error = std::current_exception();
+            }
+        },
+        0);
+    if (error) std::rethrow_exception(error);
+    return result;
+}
+
+void MultiGPUPyTrainer::release_decode_sessions(const std::vector<std::int64_t>& sessions) {
+    run_work(
+        [&](sThreadContext& ctx) {
+            if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) model->release_decode_sessions(sessions);
+        },
+        0);
+}
+
+std::unordered_map<std::string, std::int64_t> MultiGPUPyTrainer::get_decode_batch_stats() {
+    std::unordered_map<std::string, std::int64_t> result;
+    run_work(
+        [&](sThreadContext& ctx) {
+            if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) result = model->decode_batch_stats();
+        },
+        0);
+    return result;
+}
+
 void MultiGPUPyTrainer::reset_decode_state() {
     run_work([](sThreadContext& ctx) {
         if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) model->reset_decode_state();
     });
+}
+
+std::unordered_map<std::string, std::int64_t> MultiGPUPyTrainer::get_decode_cache_stats() {
+    std::unordered_map<std::string, std::int64_t> result;
+    run_work(
+        [&](sThreadContext& ctx) {
+            if (auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) result = model->decode_cache_stats();
+        },
+        0);
+    return result;
 }
 
 std::vector<float> MultiGPUPyTrainer::next_token_logits(const std::int32_t* input_ids,

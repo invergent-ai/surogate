@@ -384,10 +384,26 @@ public:
     /// Evaluate selected next-token logits using the resident policy, without saving backward activations.
     std::vector<float> next_token_logits(const std::int32_t* input_ids,
                                          const std::int32_t* last_positions,
-                                         int B, int T, NCCLCommunicator& comm, GlmDecodeState* decode = nullptr);
+                                         int B,
+                                         int T,
+                                         NCCLCommunicator& comm,
+                                         GlmDecodeState* decode = nullptr,
+                                         const std::vector<GlmDecodeState*>& decode_states = {});
     std::vector<float> decode_logits(const std::int32_t* input_ids, int T, bool reset,
                                      int capacity, NCCLCommunicator& comm);
     void reset_decode_state();
+    std::vector<float> decode_batch_logits(const std::int64_t* sessions,
+                                           const std::int32_t* ids,
+                                           const std::int32_t* offsets,
+                                           const std::int32_t* resets,
+                                           int count,
+                                           int capacity,
+                                           NCCLCommunicator& comm);
+    void release_decode_sessions(const std::vector<std::int64_t>& sessions);
+    std::unordered_map<std::string, std::int64_t> decode_batch_stats() const;
+    std::unordered_map<std::string, std::int64_t> decode_cache_stats() const {
+        return mGlmDecodeState ? mGlmDecodeState->stats() : std::unordered_map<std::string, std::int64_t>{};
+    }
 
     /// Run one training micro-step with externally-computed per-token gradient multipliers.
     ///
@@ -668,6 +684,8 @@ private:
     // Adapter merge state (optional — stacked LoRA)
     std::string mAdapterPath;
     std::unique_ptr<GlmDecodeState> mGlmDecodeState;
+    std::shared_ptr<DecodePagePool> mDecodePagePool = std::make_shared<DecodePagePool>();
+    std::unordered_map<std::int64_t, std::unique_ptr<GlmDecodeState>> mDecodeSessions;
 
     // QLoRA state (optional)
     modules::QLoRAConfig mQLoRAConfig;

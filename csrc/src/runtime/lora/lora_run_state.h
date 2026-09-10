@@ -25,7 +25,6 @@ struct LoRARunState {
 
     // Grouped MoE LoRA scratch buffers
     Tensor moe_lora_intermediate1;  // (total_tokens, rank)
-    Tensor moe_lora_intermediate2;  // (total_tokens, D)
     Tensor moe_lora_gate;           // (total_tokens, D) - contiguous buffer for gate projection
     Tensor moe_lora_up;             // (total_tokens, D) - contiguous buffer for up projection
     Tensor moe_lora_gate_up;        // (total_tokens, 2*D) - combined gate+up buffer

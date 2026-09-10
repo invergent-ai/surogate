@@ -70,6 +70,7 @@ For the 2,040-token diagnostic, create a separate checkpoint with a larger conte
 ```bash
 python examples/sft/glm/create_dummy.py --output models/dummy-glm-long \
   --index-topk 32 --max-sequence-length 2048
+CUDA_VISIBLE_DEVICES=7 surogate sft examples/sft/glm/dummy-long-context.yaml
 CUDA_VISIBLE_DEVICES=0 SUROGATE_SHARED_MODEL="$PWD/models/dummy-glm-long" \
   SUROGATE_SHARED_GRAPHS=1 SUROGATE_SHARED_BATCH=2 \
   SUROGATE_SHARED_SEQ_LEN=2048 SUROGATE_SHARED_TOKENS=2040 \
@@ -81,10 +82,22 @@ within `3.9e-7` before and after adapter updates. This validates the random tiny
 checkpoint at that context length; it is not a full-checkpoint throughput or
 memory measurement.
 
+The long-context SFT config tiles dense, routed and shared expert MLPs with `long_context: true`.
+GLM's clamps and LoRA contributions are preserved during tile recomputation.
+The indexer also reuses score scratch across 128-query tiles automatically.
+See [long-context memory](../../../docs/guides/long-context.md) for buffer sizes
+and the remaining costs. The native MLP regression checks full training and LoRA
+with packing, gradient accumulation, recomputation and CUDA graph settings:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 pytest tests/train/test_glm_long_context.py -q
+```
+
 Native-colocate uses the trainer's model. GLM prefills each prompt once and keeps
-FP32 KDA state, convolution history, pooled indexer keys and MLA KV history across
-decode calls. It processes one request at a time, resetting state between requests
-and after adapter or base-weight changes. Training and serving share the base and
+FP32 KDA state, convolution history, pooled indexer keys and normalized MLA latents across
+decode calls. Concurrent requests share batched projection/MLP execution and retain
+separate page tables and recurrent states. Completed requests return cache pages
+to the pool; adapter or base-weight changes invalidate all sessions. Training and serving share the base and
 adapter allocations, including when training uses CUDA graphs.
 The frozen reference policy excludes LoRA updates. Use BF16 adapters with the MoE
 layers. This fixture fits one GPU; the full checkpoint's base weights must still fit
@@ -107,13 +120,19 @@ Current limits:
   MLA layer. Pool size must be a power of two and divide `index_topk`. Both tail
   selection settings are supported. Context is bounded by the configured maximum
   sequence length and available memory.
-- Attention visits selected keys, but indexer scores still need
-  `O(B * T * ceil(T / pool_size))` FP32 workspace during training/prefill. This is
-  not yet a memory-efficient long-context indexer. Top-k uses sorting rather than
-  a tuned radix-selection kernel.
+- Indexer score scratch is bounded to
+  `O(B * min(T, 128) * ceil(T / pool_size))` FP32 elements during training/prefill.
+  Keys and selected token indices still scale with context length. Each query
+  scans all pools, and top-k uses sorting rather than a tuned radix-selection kernel.
+- `long_context: true` tiles dense, routed and shared expert MLPs in resident
+  BF16 training with `ep_size: 1`. CPU weight streaming and expert parallelism
+  retain ordinary expert execution. Permutations, residual streams, selected
+  attention indices and KDA states still consume sequence-dependent memory.
 - Native-colocate requires one GPU with resident unquantized base weights and
-  BF16 LoRA adapters. Its MLA cache stores expanded per-head K/V; latent compression,
-  paged caches, continuous batching and captured decode graphs are not implemented.
+  BF16 LoRA adapters. Its MLA cache stores latents and reconstructs selected K/V
+  with the original BF16/LoRA arithmetic, adding projection work during decode.
+  Cache histories grow in 128-token pages, and token steps use continuous batching.
+  Decode graphs are not captured; the training graph's buffers remain stable.
   Prefill uses the recurrent FLA kernel, without the training chunk kernel's
   parallelism across tokens.
 - Native-colocate automatically uses the same recurrent KDA forward for rollout

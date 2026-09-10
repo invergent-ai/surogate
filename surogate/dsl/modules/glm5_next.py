@@ -528,7 +528,9 @@ class Glm5NextLatentAttention(Module):
             out_name=index_slot,
             index_size=self.index_topk + (pool - 1 if self.index_tail else 0),
         )
-        attn_out = g.custom("glm_dsa_attention", qkv, indices, out_name=att_slot)
+        # Decode stores the normalized latent and expands only selected keys.
+        # Training differentiates through qkv; the extra inputs are cache-only.
+        attn_out = g.custom("glm_dsa_attention", qkv, indices, kv_n, kv_b_w, out_name=att_slot)
 
         att_flat = g.view(attn_out, shape=[B * T, self.VDim], out_name=tracer.prefixed("att_flat"))
         out_flat = g.matmul(att_flat, out_w, transpose="NT", out_name=tracer.prefixed("att_out_flat"))
