@@ -211,6 +211,53 @@ void two_devices(int second) {
     check(read_slot_a(*second_bank, 0, second)[0] == 0x3F80, "stage 1's adapter landed on its own");
 }
 
+void speculative_columns() {
+    sinfer::ops::EngineOpsContext context;
+    sinfer::ops::bind_ops_context(&context);
+    auto& store = sinfer::ops::lora_store_for_current_device();
+    build(store, reinterpret_cast<const void*>(0x4000), 0);
+    sinfer::ops::lora_set_active(true);
+    sinfer::DeviceBuffer row_storage(3 * sizeof(std::int32_t));
+    sinfer::DeviceBuffer column_storage(48 * sizeof(std::int32_t));
+    sinfer::Tensor rows(row_storage.p, sinfer::DType::I32, {3});
+    sinfer::Tensor storage(column_storage.p, sinfer::DType::I32, {48});
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    for (int width : {1, 4, 16}) {
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        auto columns = sinfer::ops::speculative_lora_columns(rows, storage, width, 3, stream);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        for (const std::vector<std::int32_t> selected : {std::vector<std::int32_t>{-1, 0, 1}, {1, -1, 0}}) {
+            row_storage.copy_from_host(selected.data(), row_storage.bytes);
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<std::int32_t> actual(width * 3);
+            CUDA_CHECK(cudaMemcpy(actual.data(), columns.data, columns.bytes(), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < width * 3; ++i) {
+                check(actual[i] == selected[i / width], "speculative graph reads each row's current adapter");
+            }
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    {
+        sinfer::ops::ScopedLoraColumns outer(rows);
+        const auto* selected = sinfer::ops::lora_current_round().slots;
+        {
+            sinfer::ops::ScopedLoraColumns inner(rows.slice(0, 1, 1));
+            check(sinfer::ops::lora_current_round().slots->data != selected->data,
+                  "a subset head selects its own columns");
+        }
+        check(sinfer::ops::lora_current_round().slots == selected, "a subset head restores the enclosing selection");
+    }
+    check(!sinfer::ops::lora_current_round().valid(), "the completed round leaves no adapter selection");
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    sinfer::ops::bind_ops_context(nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -220,6 +267,7 @@ int main() {
         return 77;
     }
     one_device();
+    speculative_columns();
     if (count >= 2) {
         write_from_another_device(1);
         two_devices(1);

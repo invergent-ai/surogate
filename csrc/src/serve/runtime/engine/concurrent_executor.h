@@ -52,6 +52,7 @@ public:
 
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
         : instance_(instance), max_concurrency_(options.max_concurrency),
+          max_round_rows_(decode_batch_capacity(options.max_concurrency, options.speculative.backend)),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -705,7 +706,7 @@ private:
     [[nodiscard]] RoundMembership build_round_membership() const {
         RoundMembership membership;
         for (std::uint32_t offset = 0;
-             offset < max_concurrency_ && membership.size < membership.lanes.size(); ++offset) {
+             offset < max_concurrency_ && membership.size < max_round_rows_; ++offset) {
             const auto lane = static_cast<std::uint32_t>(
                 (static_cast<std::uint64_t>(next_decode_lane_) + offset) % max_concurrency_);
             const auto& request = slots_[lane];
@@ -1182,7 +1183,7 @@ private:
             GroupMeta& meta = group_meta_[g];
             meta.membership = RoundMembership{};
             for (std::uint32_t offset = 0;
-                 offset < max_concurrency_ && meta.membership.size < meta.membership.lanes.size();
+                 offset < max_concurrency_ && meta.membership.size < max_round_rows_;
                  ++offset) {
                 const auto lane = static_cast<std::uint32_t>(
                     (static_cast<std::uint64_t>(meta.next_lane) + offset) % max_concurrency_);
@@ -1203,7 +1204,7 @@ private:
                 const auto& owner = slots_[candidate];
                 if (owner == nullptr || owner->decode_ready) { continue; }
                 if (lone_lane == max_concurrency_) { lone_lane = candidate; }
-                if (!program.mixed_round_supported(candidate)) { continue; }
+                if (!program.mixed_round_supported(candidate, meta.membership.size)) { continue; }
                 meta.staged[meta.staged_count++] = candidate;
             }
             // Prefill batching (#88) in the pipelined loop: let a group's staged set grow for a
@@ -1390,7 +1391,7 @@ private:
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> staged{};
         std::size_t staged_count = 0;
         for (const std::uint32_t candidate : prefill_lanes_.span()) {
-            if (!instance_.program->mixed_round_supported(candidate)) { continue; }
+            if (!instance_.program->mixed_round_supported(candidate, membership.size)) { continue; }
             const auto& owner = slots_[candidate];
             if (owner == nullptr || owner->decode_ready) { continue; }
             staged[staged_count++] = candidate;
@@ -1678,7 +1679,7 @@ private:
                     }
                     deferred_mixed_rounds_ = 0;
                     if (!membership.empty() &&
-                        instance_.program->mixed_round_supported(prefill_lanes_.front())) {
+                        instance_.program->mixed_round_supported(prefill_lanes_.front(), membership.size)) {
                         const auto t_mixed = Clock::now();
                         last_round_ = LastRound{"mixed",
                                                 static_cast<std::uint32_t>(membership.size),
@@ -1842,6 +1843,7 @@ private:
 
     Instance& instance_;
     const std::uint32_t max_concurrency_;
+    const std::uint32_t max_round_rows_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;

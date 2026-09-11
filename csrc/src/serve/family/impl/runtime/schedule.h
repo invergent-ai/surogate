@@ -100,6 +100,9 @@ struct MtpBatchContext {
     Tensor one;
 };
 
+struct TargetVerifyFrameView;
+using MixedTargetForward = std::function<void(TextContext&, TargetVerifyFrameView, ops::GqaExecutionEnvelope)>;
+
 struct DFlashBatchContext {
     ExecutionCore execution;
     const family::PagedKVCache& text_cache;
@@ -108,6 +111,7 @@ struct DFlashBatchContext {
     const family::DFlashDecodeIngress& host_ingress;
     family::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    MixedTargetForward mixed_target;
 };
 
 struct DFlashAppendContext {
@@ -155,15 +159,18 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
+    Tensor lora_columns;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
                          std::int32_t rewrite_checkpoint_state_slot,
                          std::uint32_t mtp_proposal_extent);
+[[nodiscard]] VisionChunk prepare_mixed_vision(VisionPrefillSession& vision,
+    std::uint32_t begin, std::uint32_t count, std::int32_t lora_slot, cudaStream_t stream);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
-                          ops::GqaExecutionEnvelope envelope);
+                          ops::GqaExecutionEnvelope envelope, const MixedTargetForward& mixed_target = {});
 
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(
     PrefillContext& state, std::span<const TokenId> ids, std::uint32_t nominal_length,

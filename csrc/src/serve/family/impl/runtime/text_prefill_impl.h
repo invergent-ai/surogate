@@ -69,6 +69,12 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
 
 } // namespace
 
+VisionChunk prepare_mixed_vision(VisionPrefillSession& vision, std::uint32_t begin,
+                                std::uint32_t count, std::int32_t lora_slot, cudaStream_t stream) {
+    LoraPrefillScope adapter(lora_slot, count, stream);
+    return vision.prepare_chunk(begin, count);
+}
+
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t current_state_slot,
                          std::int32_t rewrite_checkpoint_state_slot,

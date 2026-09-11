@@ -159,6 +159,13 @@ More simultaneous requests need more memory and may increase response latency; p
 setting with `--kv-capacity auto`. The pending timeout does not limit how long an
 already-running response may take.
 
+Incoming prompts can share a batch with requests already generating, including requests
+using different LoRA adapters, DFlash, and images or video. Lower `--max-num-batched-tokens`
+to reduce the time spent on each prompt chunk when streaming responsiveness matters;
+larger values can improve prompt throughput. Image encoding and image blocks that must be
+processed together can still pause text generation. DFlash needs room in the batch for
+both prompt tokens and the proposed tokens it checks.
+
 ### Speculative decoding
 
 Speculative decoding can make generation faster by proposing several tokens for the model to

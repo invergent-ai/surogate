@@ -87,6 +87,14 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
 };
 
+// Draft attention supports eight rows per GPU round. Extra active requests use
+// subsequent rounds; the configured number of request lanes stays independent.
+[[nodiscard]] constexpr std::uint32_t decode_batch_capacity(
+    std::uint32_t active_sequences, SpeculativeBackend backend) noexcept {
+    const auto capacity = decode_batch_capacity(active_sequences);
+    return backend == SpeculativeBackend::DFlash && capacity > 8 ? 8 : capacity;
+}
+
 /// `SpeculativeOptions::max_lanes` meaning "verify at any width".
 inline constexpr std::uint32_t kSpeculateAtAnyWidth = 0xFFFFFFFFu;
 /// The width a round may reach and still verify drafts, when the run does not say. A verify

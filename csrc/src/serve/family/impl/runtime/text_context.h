@@ -399,6 +399,7 @@ struct DFlashFeatureSink {
 };
 
 class VisionPrefillSession;
+struct VisionChunk;
 
 
 class TextContext {
@@ -504,7 +505,8 @@ public:
     // all columns; the mixers split per slice (prefill kernels over the
     // chunk columns, batch forms over the decode columns).
     struct MixedDecodeSlice {
-        Tensor ids;                // I32 [B]
+        Tensor ids;                // I32 [width * B]
+        Tensor lora_slots;         // I32 [B], optional when adapters are disabled
         Tensor cache_positions;    // I32 [B]
         Tensor rope_positions;     // I32 [B]
         Tensor kv_table_rows;      // I32 [B]
@@ -512,6 +514,9 @@ public:
         ops::GqaExecutionEnvelope envelope{};
         Tensor hidden;             // BF16 [hidden, B] out
         Tensor logits;             // BF16 [vocab, B] out
+        std::int32_t width = 1;
+        Tensor valid_columns;
+        const GdnReplayRecords* replay_records = nullptr;
     };
     [[nodiscard]] PrefillChunkResult
     mixed_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
@@ -536,6 +541,9 @@ public:
         std::int32_t mtp_kv_table_row = -1;
         family::PagedKVCacheView mtp_kv{};
         std::span<const int> mtp_shifted_ids{};
+        std::int32_t lora_slot = -1;
+        const family::PreparedPromptData* prompt = nullptr;
+        const VisionChunk* vision = nullptr;
     };
     // Staging for the segments that finish in this round: their last hidden columns are
     // gathered into `hidden`, one lm_head produces `logits`, and the batched sampler writes
@@ -550,7 +558,8 @@ public:
     };
     [[nodiscard]] PrefillChunkResult
     mixed_chunk_multi(std::span<const MixedPrefillSegment> segments,
-                      const MixedDecodeSlice& decode, const MixedPrefillFinalize& finalize);
+                      const MixedDecodeSlice& decode, const MixedPrefillFinalize& finalize,
+                      DFlashFeatureSink* sink = nullptr);
 
     // Mixed-round CUDA graphs (PATCHES.md #30): the mixed body captured at a
     // (chunk bucket, batch bucket) pair. The decode slice must be sliced to

@@ -97,16 +97,16 @@ struct PrefillStepResult {
     GeneratedRound round;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    std::uint32_t feature_offset = 0;
+    std::int32_t feature_base = -1;
 };
 
 struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
 };
 
-// Mixed-token round (PATCHES.md #30): one forward advanced the prefill lane
-// by a chunk AND produced one decode token per active lane.
-// A mixed round advances one decode step for every lane plus a prefill chunk for each staged
-// prompt (#80). `prefills[i]` belongs to the i-th lane the caller passed in.
+// A mixed round advances prompt chunks alongside ordinary decode or speculative
+// verification. Decode rows use BatchedGeneratedRound's counts and stride. `prefills[i]` belongs to the i-th lane the caller passed in.
 inline constexpr std::size_t kMaximumMixedPrefills = 8;
 
 struct MixedRoundResult {

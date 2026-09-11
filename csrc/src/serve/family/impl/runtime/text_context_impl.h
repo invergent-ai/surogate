@@ -30,6 +30,7 @@
 #include "api/ops/gdn_input_proj.h"
 #include "api/ops/gqa_attention.h"
 #include "api/ops/linear.h"
+#include "api/ops/lora_store.h"
 #include "api/ops/linear_add.h"
 #include "api/ops/linear_pair.h"
 #include "api/ops/linear_swiglu.h"
@@ -2122,11 +2123,16 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
 
 PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSegment> segments,
                                                   const MixedDecodeSlice& decode,
-                                                  const MixedPrefillFinalize& finalize) {
+                                                  const MixedPrefillFinalize& finalize, DFlashFeatureSink* sink) {
     if (segments.empty()) {
         throw std::invalid_argument("mixed chunk needs at least one prefill segment");
     }
-    const std::int32_t batch = decode.ids.ne[0]; // 0: a batched prefill round without decode lanes
+    const std::int32_t width = decode.width;
+    if (width < 1 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || decode.ids.ne[0] % width != 0) {
+        throw std::invalid_argument("mixed chunk verification width is invalid");
+    }
+    const std::int32_t batch = decode.ids.ne[0] / width;
+    const std::int32_t decode_columns = width * batch; // 0: a batched prefill round without decode lanes
     if (batch < 0 || batch > static_cast<std::int32_t>(kMaximumBatchColumns)) {
         throw std::invalid_argument("mixed chunk decode batch is out of range");
     }
@@ -2143,7 +2149,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     if (finalizers > 0 && (finalize.tokens.data == nullptr || finalize.sampling == nullptr)) {
         throw std::invalid_argument("mixed chunk finalizers need sampler staging");
     }
-    const int total  = prefill_cols + batch;
+    const int total  = prefill_cols + decode_columns;
     const int base_i = segments.front().kv_base;
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
 
@@ -2159,12 +2165,44 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         CUDA_CHECK(cudaEventRecord(body_begin, s));
     }
 
+    bool multimodal = false;
+    std::array<std::vector<std::int32_t>, kMaximumBatchColumns> visual_indices;
+    std::array<std::int32_t, kMaximumBatchColumns> visual_begins{};
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        const auto& segment = segments[i];
+        multimodal |= segment.vision || (segment.prompt && segment.prompt->has_media());
+        if (!segment.vision || !segment.vision->control) { continue; }
+        const auto& scatter = segment.vision->control->scatter_indices;
+        auto begin = std::lower_bound(scatter.begin(), scatter.end(), segment.kv_base);
+        auto end = std::lower_bound(begin, scatter.end(), segment.kv_base + segment.ids.size());
+        visual_begins[i] = begin - scatter.begin();
+        for (auto it = begin; it != end; ++it) { visual_indices[i].push_back(*it - segment.kv_base); }
+    }
     work_.reset();
-    const auto roots = workspace_recipe::text_prefill_roots(work_, cfg_geometry(), total, 0, 0);
+    const auto roots = workspace_recipe::text_prefill_roots(
+        work_, cfg_geometry(), total, multimodal ? 3 : 1, multimodal ? total : 0);
+    if (ops::lora_active()) {
+        int column = 0;
+        for (const auto& segment : segments) {
+            Tensor slots = roots.lora_slots.slice(0, column, segment.ids.size());
+            prologue_staging::fill_i32(slots, segment.lora_slot, s);
+            column += segment.ids.size();
+        }
+        if (batch > 0) {
+            Tensor slots = roots.lora_slots.slice(0, prefill_cols, decode_columns);
+            for (int row = 0; row < batch; ++row) {
+                Tensor part = slots.slice(0, row * width, width);
+                Tensor selected = decode.lora_slots.slice(0, row, 1);
+                CUDA_CHECK(cudaMemsetAsync(part.data, 0, part.bytes(), s));
+                ops::offset_i32_positions(part, selected, part, s);
+            }
+        }
+    }
+    ops::ScopedLoraColumns lora_columns(roots.lora_slots);
     Tensor ids_device = roots.ids;
-    Tensor ids_decode = ids_device.slice(0, prefill_cols, batch);
+    Tensor ids_decode = ids_device.slice(0, prefill_cols, decode_columns);
     CUDA_CHECK(cudaMemcpyAsync(ids_decode.data, decode.ids.data,
-                               static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                               static_cast<std::size_t>(decode_columns) * sizeof(std::int32_t),
                                cudaMemcpyDeviceToDevice, s));
 
     Tensor positions = roots.positions;
@@ -2178,12 +2216,26 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             segment_begin[i]      = cursor;
             Tensor ids_segment    = ids_device.slice(0, cursor, length);
             Tensor position_range = positions.slice(0, cursor, length);
-            copy_i32(segments[i].ids.data(), ids_segment, s);
+            if (weights_.vision_geometry.gemma_version && !visual_indices[i].empty()) {
+                std::vector<std::int32_t> text_ids(segments[i].ids.begin(), segments[i].ids.end());
+                for (auto index : visual_indices[i]) { text_ids[index] = weights_.vision_geometry.gemma_pad_token; }
+                copy_i32(text_ids.data(), ids_segment, s);
+            } else { copy_i32(segments[i].ids.data(), ids_segment, s); }
+            const auto* prompt = segments[i].prompt;
+            for (int axis = 0; axis < (multimodal ? 3 : 1); ++axis) {
+                Tensor rope = roots.rope_positions.slice(1, axis, 1).view({total}).slice(0, cursor, length);
+                if (prompt && !prompt->positions.empty()) {
+                    copy_i32(prompt->positions.data() + axis * prompt->token_ids.size() + segments[i].kv_base, rope, s);
+                } else {
+                    ops::fill_i32_positions(rope, segments[i].kv_base + (prompt ? prompt->rope_delta : 0), s);
+                }
+            }
             ops::fill_i32_positions(position_range, segments[i].kv_base, s);
             cursor += length;
         }
     }
     if constexpr (Hooks::prologue) {
+        if (width != 1) { throw std::logic_error("mixed speculative prologue is unavailable"); }
         // Segment columns take their segment's start and slot; the decode lanes behind them
         // are one-column segments on their own slots.
         std::vector<int> begin_host(static_cast<std::size_t>(total));
@@ -2209,21 +2261,44 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         copy_i32(last_host.data(), prologue_.segment_last, s);
         Tensor slots_prefill = prologue_.slots.slice(0, 0, prefill_cols);
         copy_i32(slot_host.data(), slots_prefill, s);
-        Tensor slots_decode = prologue_.slots.slice(0, prefill_cols, batch);
+        Tensor slots_decode = prologue_.slots.slice(0, prefill_cols, decode_columns);
         CUDA_CHECK(cudaMemcpyAsync(slots_decode.data, decode.linear_state_slots.data,
-                                   static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                                   static_cast<std::size_t>(decode_columns) * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToDevice, s));
     }
-    Tensor positions_decode = positions.slice(0, prefill_cols, batch);
+    Tensor positions_decode = positions.slice(0, prefill_cols, decode_columns);
     CUDA_CHECK(cudaMemcpyAsync(positions_decode.data, decode.cache_positions.data,
-                               static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                               static_cast<std::size_t>(decode_columns) * sizeof(std::int32_t),
                                cudaMemcpyDeviceToDevice, s));
 
 
+    for (int axis = 0; batch > 0 && axis < (multimodal ? 3 : 1); ++axis) {
+        Tensor rope = roots.rope_positions.slice(1, axis, 1).view({total}).slice(0, prefill_cols, decode_columns);
+        CUDA_CHECK(cudaMemcpyAsync(rope.data, decode.rope_positions.data, rope.bytes(), cudaMemcpyDeviceToDevice, s));
+    }
     Tensor x = roots.residual;
     active_ids_ = ids_device;
     if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
+    for (std::size_t sg = 0; stage_embeds() && sg < segments.size(); ++sg) {
+        if (visual_indices[sg].empty()) { continue; }
+        Tensor indices = roots.scatter_indices.slice(0, 0, visual_indices[sg].size());
+        copy_i32(visual_indices[sg].data(), indices, s);
+        Tensor embedding = segments[sg].vision->embeddings.slice(1, visual_begins[sg], visual_indices[sg].size());
+        Tensor residual = x.slice(1, segment_begin[sg], segments[sg].ids.size());
+        ops::scatter(embedding, indices, residual, s);
+    }
     capture_per_layer_source(x, s);
+    if constexpr (Hooks::per_layer_inputs) {
+        for (std::size_t sg = 0; sg < segments.size(); ++sg) {
+            if (visual_indices[sg].empty()) { continue; }
+            Tensor indices = roots.scatter_indices.slice(0, 0, visual_indices[sg].size());
+            copy_i32(visual_indices[sg].data(), indices, s);
+            Tensor embedding = segments[sg].vision->embeddings.slice(1, visual_begins[sg], visual_indices[sg].size());
+            Tensor source = active_embedded_.slice(1, segment_begin[sg], segments[sg].ids.size());
+            ops::scatter(embedding, indices, source, s);
+        }
+    }
+    if (sink) { sink->begin(x); }
     debug_probe<Variant>("mixed_embed_out", x, cfg_.n_layers, s);
 
     PrefillFamilyTimer& timer = prefill_family_timer();
@@ -2298,22 +2373,19 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 debug_probe<Variant>("q_post_headnorm", qn.view({layer_q_size, total}), cfg_.n_layers, s);
                 debug_probe<Variant>("k_post_headnorm", kn.view({layer_kv_size, total}), cfg_.n_layers, s);
 
-                Tensor rope_positions = roots.positions;
-                if (rope_delta_ != 0) {
-                    throw std::logic_error("mixed chunk does not support rope-delta prompts yet");
-                }
-                Tensor rope_all = rope_positions.view({total});
-                if (batch > 0) {
-                    Tensor rope_decode = rope_positions.slice(0, prefill_cols, batch);
-                    CUDA_CHECK(cudaMemcpyAsync(rope_decode.data, decode.rope_positions.data,
-                                               static_cast<std::size_t>(batch) *
-                                                   sizeof(std::int32_t),
-                                               cudaMemcpyDeviceToDevice, s));
+                Tensor rope_all = text_rope_positions<Variant>(roots.rope_positions);
+                if (weights_.vision_geometry.gemma_version && rope_all.ne[1] == 3) {
+                    rope_all = rope_all.slice(1, 0, 1).view({total});
                 }
                 if constexpr (applies_rotary<Variant>()) {
-                    ops::rope(rope_all, cfg_.layer_rotary_dim(layer),
-                              cfg_.layer_rotary_pairs(layer),
-                              layer_rope_theta(layer, weights_.geometry), qn, kn, s);
+                    const auto& g = weights_.geometry;
+                    if (rope_all.ne[1] == 3 && g.mrope_temporal) {
+                        ops::rope_interleaved(rope_all, cfg_.layer_rotary_dim(layer), layer_rope_theta(layer, g),
+                            {g.mrope_temporal, g.mrope_height, g.mrope_width}, qn, kn, s);
+                    } else {
+                        ops::rope(rope_all, cfg_.layer_rotary_dim(layer), cfg_.layer_rotary_pairs(layer),
+                                  layer_rope_theta(layer, g), qn, kn, s);
+                    }
                 }
                 // A windowed layer looks at fewer keys than the round is sized for;
                 // see layer_sliding_window() in residual_policy.h.
@@ -2336,40 +2408,52 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     Tensor ka = kn.slice(2, off, len);
                     Tensor va = v.slice(2, off, len);
                     Tensor aa = a.slice(2, off, len);
+                    auto selection_scope = work_.scope();
+                    const auto& segment = segments[sg];
+                    ops::GqaBlockMask selection = text_indexer_selection(
+                        full, h.slice(1, off, len), len, positions.slice(0, off, len),
+                        rope_all.slice(0, off, len), io_.text_kv_table_row, len, seen, kv_view);
+                    if (segment.vision && segment.vision->control &&
+                        (weights_.vision_geometry.attention_mode == 1 ||
+                         (weights_.vision_geometry.attention_mode == 2 && layer_window > 0))) {
+                        const auto& scatter = segment.vision->control->scatter_indices;
+                        selection.image_begin = scatter.front();
+                        selection.image_end = scatter.back() + 1;
+                    }
                     if (owns_kv) {
                         ops::gqa_attention(qa, ka, va, positions.slice(0, off, len), Tensor{},
                                            io_.text_kv_table_row, cfg_.attention_scale,
-                                           kv_view, envelope, work_, aa, s);
+                                           kv_view, envelope, work_, aa, s, selection);
                     } else {
                         ops::gqa_attention_cached(qa, positions.slice(0, off, len), Tensor{},
                                                   io_.text_kv_table_row, cfg_.attention_scale,
-                                                  kv_view, envelope, work_, aa, s);
+                                                  kv_view, envelope, work_, aa, s, selection);
                     }
                 }
                 if (batch > 0) {
-                    Tensor qb = qn.slice(2, prefill_cols, batch)
-                                    .view({layer_head_dim, cfg_.n_q, 1, batch});
-                    Tensor kb = kn.slice(2, prefill_cols, batch)
-                                    .view({layer_head_dim, layer_n_kv, 1, batch});
-                    Tensor vb = v.slice(2, prefill_cols, batch)
-                                    .view({layer_head_dim, layer_n_kv, 1, batch});
-                    Tensor ab = a.slice(2, prefill_cols, batch)
-                                    .view({layer_head_dim, cfg_.n_q, 1, batch});
-                    Tensor position_batch = decode.cache_positions.view({1, batch});
+                    Tensor qb = qn.slice(2, prefill_cols, decode_columns)
+                                    .view({layer_head_dim, cfg_.n_q, width, batch});
+                    Tensor kb = kn.slice(2, prefill_cols, decode_columns)
+                                    .view({layer_head_dim, layer_n_kv, width, batch});
+                    Tensor vb = v.slice(2, prefill_cols, decode_columns)
+                                    .view({layer_head_dim, layer_n_kv, width, batch});
+                    Tensor ab = a.slice(2, prefill_cols, decode_columns)
+                                    .view({layer_head_dim, cfg_.n_q, width, batch});
+                    Tensor position_batch = decode.cache_positions.view({width, batch});
                     auto decode_scope = work_.scope();
                     const ops::GqaBlockMask decode_selection = text_indexer_selection(
-                        full, h.slice(1, prefill_cols, batch), batch, decode.cache_positions,
-                        rope_all.slice(0, prefill_cols, batch), decode.kv_table_rows, 1,
+                        full, h.slice(1, prefill_cols, decode_columns), decode_columns, decode.cache_positions,
+                        rope_all.slice(0, prefill_cols, decode_columns), decode.kv_table_rows, width,
                         static_cast<std::int32_t>(decode.envelope.max_visible_keys),
                         kv_view);
                     ops::GqaExecutionEnvelope decode_layer_envelope = decode.envelope;
                     decode_layer_envelope.sliding_window                = layer_window;
                     if (owns_kv) {
-                        ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
+                        ops::gqa_attention(qb, kb, vb, position_batch, decode.valid_columns, decode.kv_table_rows,
                                            cfg_.attention_scale, kv_view, decode_layer_envelope,
                                            work_, ab, s, decode_selection);
                     } else {
-                        ops::gqa_attention_cached(qb, position_batch, Tensor{}, decode.kv_table_rows,
+                        ops::gqa_attention_cached(qb, position_batch, decode.valid_columns, decode.kv_table_rows,
                                                   cfg_.attention_scale, kv_view,
                                                   decode_layer_envelope, work_, ab, s,
                                                   decode_selection);
@@ -2401,7 +2485,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                      static_cast<std::int32_t>(segments[sg].ids.size()),
                                      static_cast<std::int32_t>(segments[sg].state_slot)});
                 }
-                short_conv_mix_mixed(gdn, x, gidx, parts, prefill_cols, batch, Tensor{},
+                short_conv_mix_mixed(gdn, x, gidx, parts, prefill_cols, decode_columns, Tensor{},
                                      decode.linear_state_slots);
                 if (timing) { lap(timer.begin, timer.gdn, acc_gdn); }
             } else {
@@ -2442,14 +2526,17 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     }
                 }
                 if (batch > 0) {
-                    Tensor qkv_b  = qkv.slice(1, prefill_cols, batch)
-                                       .view({cfg_.conv_dim, 1, batch});
-                    Tensor qkv_cb = qkv_c.slice(1, prefill_cols, batch)
-                                        .view({cfg_.conv_dim, 1, batch});
-                    ops::causal_conv1d_silu_snapshot(qkv_b, *gdn.conv1d,
-                                                     state_.conv.at(static_cast<std::size_t>(gidx)),
-                                                     Tensor{}, decode.linear_state_slots,
-                                                     decode.linear_state_slots, qkv_cb, s);
+                    Tensor qkv_b  = qkv.slice(1, prefill_cols, decode_columns)
+                                       .view({cfg_.conv_dim, width, batch});
+                    Tensor qkv_cb = qkv_c.slice(1, prefill_cols, decode_columns)
+                                        .view({cfg_.conv_dim, width, batch});
+                    if (width == 1) {
+                        ops::causal_conv1d_silu_snapshot(qkv_b, *gdn.conv1d,
+                            state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
+                            decode.linear_state_slots, decode.linear_state_slots, qkv_cb, s);
+                    } else {
+                        CUDA_CHECK(cudaMemsetAsync(qkv_cb.data, 0, qkv_cb.bytes(), s));
+                    }
                 }
                 if (timing) { lap(timer.begin, timer.g_conv, acc_g_conv); cudaEventRecord(timer.begin, s); }
                 debug_probe<Variant>("mixed_gdn_conv", qkv_c, cfg_.n_layers, s);
@@ -2458,6 +2545,20 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 ops::extract_bf16_columns(qkv_c, 2 * cfg_.key_dim, vc, s);
                 if (timing) { lap(timer.begin, timer.g_extract, acc_g_extract); cudaEventRecord(timer.begin, s); }
 
+                if (batch > 0 && width > 1) {
+                    if (!decode.replay_records) { throw std::logic_error("mixed verification has no replay records"); }
+                    auto records = decode.replay_records->layer(gidx, batch);
+                    Tensor input = h.slice(1, prefill_cols, decode_columns).view({cfg_.hidden, width, batch});
+                    Tensor query = qc.slice(1, prefill_cols, decode_columns).view({cfg_.key_dim, width, batch});
+                    Tensor key = kc.slice(1, prefill_cols, decode_columns).view({cfg_.key_dim, width, batch});
+                    Tensor value = vc.slice(1, prefill_cols, decode_columns).view({cfg_.value_dim, width, batch});
+                    Tensor gate = z.slice(2, prefill_cols, decode_columns).view({cfg_.value_dim, width, batch});
+                    ops::ScopedLoraColumns verify_lora(roots.lora_slots.slice(0, prefill_cols, decode_columns));
+                    Variant::gdn_input_projection_record(input, *gdn.projection, *gdn.conv1d,
+                        state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
+                        decode.linear_state_slots, records.conv, query, key, value, gate,
+                        Phase::Verify, work_, s);
+                }
                 Tensor q_recurrent = qc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor k_recurrent = kc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor vv          = vc.view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
@@ -2482,23 +2583,31 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     }
                 }
                 if (batch > 0) {
-                    Tensor qb = q_recurrent.slice(2, prefill_cols, batch)
-                                    .view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, 1, batch});
-                    Tensor kb = k_recurrent.slice(2, prefill_cols, batch)
-                                    .view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, 1, batch});
-                    Tensor vb = vv.slice(2, prefill_cols, batch)
-                                    .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1, batch});
+                    Tensor qb = q_recurrent.slice(2, prefill_cols, decode_columns)
+                                    .view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, width, batch});
+                    Tensor kb = k_recurrent.slice(2, prefill_cols, decode_columns)
+                                    .view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, width, batch});
+                    Tensor vb = vv.slice(2, prefill_cols, decode_columns)
+                                    .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, width, batch});
                     Tensor gb = family::detail::linear_gate_view<Variant>(
-                        g.slice(1, prefill_cols, batch), cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1,
+                        g.slice(1, prefill_cols, decode_columns), cfg_.gdn_v_dim, cfg_.gdn_v_heads, width,
                         batch);
                     Tensor bb =
-                        beta.slice(1, prefill_cols, batch).view({cfg_.gdn_v_heads, 1, batch});
-                    Tensor ob = o.slice(2, prefill_cols, batch)
-                                    .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, 1, batch});
-                    family::detail::linear_recurrence_snapshot<Variant>(
-                        qb, kb, vb, gb, bb, cfg_.gdn_scale,
-                        state_.recurrent.at(static_cast<std::size_t>(gidx)), Tensor{},
-                        decode.linear_state_slots, decode.linear_state_slots, ob, s);
+                        beta.slice(1, prefill_cols, decode_columns).view({cfg_.gdn_v_heads, width, batch});
+                    Tensor ob = o.slice(2, prefill_cols, decode_columns)
+                                    .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, width, batch});
+                    if (width > 1) {
+                        auto records = decode.replay_records->layer(gidx, batch);
+                        family::detail::linear_recurrence_record<Variant>(
+                            qb, kb, vb, gb, bb, cfg_.gdn_scale,
+                            state_.recurrent.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
+                            decode.linear_state_slots, records, ob, s);
+                    } else {
+                        family::detail::linear_recurrence_snapshot<Variant>(
+                            qb, kb, vb, gb, bb, cfg_.gdn_scale,
+                            state_.recurrent.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
+                            decode.linear_state_slots, decode.linear_state_slots, ob, s);
+                    }
                 }
                 Tensor on = workspace_recipe::gdn_normalized_output(work_, cfg_geometry(), total)
                                 .view({cfg_.gdn_v_dim, cfg_.gdn_v_heads, total});
@@ -2518,7 +2627,16 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 if (timing) { lap(timer.begin, timer.mlp_gdn, acc_mlp_gdn); }
             }
         }
+        for (std::size_t sg = 0; sg < segments.size(); ++sg) {
+            const auto* visual = segments[sg].vision;
+            if (!visual || !visual->deepstack.data || visual_indices[sg].empty() || layer >= visual->deepstack.ne[2]) { continue; }
+            Tensor residual = x.slice(1, segment_begin[sg], segments[sg].ids.size());
+            Tensor additions = visual->deepstack.slice(1, visual_begins[sg], visual_indices[sg].size()).slice(2, layer, 1);
+            family::detail::add_visual_embeddings(residual, additions, visual_indices[sg], s);
+        }
+        if (sink) { sink->capture_layer(layer, x, s); }
     }
+    if (sink) { sink->capture_positions(positions, s); }
     if (timing) {
         timer.t_attn += acc_attn; timer.t_mlp_full += acc_mlp_full;
         timer.t_gdn += acc_gdn;   timer.t_mlp_gdn += acc_mlp_gdn;
@@ -2550,18 +2668,19 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     }
 
     if (batch > 0) {
-        Tensor xf_decode = xf.slice(1, prefill_cols, batch);
-        Tensor xl_decode = xl.slice(1, prefill_cols, batch);
+        Tensor xf_decode = xf.slice(1, prefill_cols, decode_columns);
+        Tensor xl_decode = xl.slice(1, prefill_cols, decode_columns);
         // The decode columns' boundary hidden, as wide as the round's: the residual where a
         // trunk-block draft head widened it. This copied the model width of it, so a lane's
         // tail hidden -- what a zero-suffix reuse samples from, and what the head aligns on
         // below -- was short by the rest under such a head.
-        if (decode.hidden.ne[0] != xf.ne[0] || decode.hidden.ne[1] != batch) {
+        if (decode.hidden.ne[0] != xf.ne[0] || decode.hidden.ne[1] != decode_columns) {
             throw std::logic_error("mixed chunk decode hidden does not match the round's width");
         }
         CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data, xf_decode.bytes(),
                                    cudaMemcpyDeviceToDevice, s));
         Tensor logits_decode = decode.logits;
+        ops::ScopedLoraColumns decode_lora(roots.lora_slots.slice(0, prefill_cols, decode_columns));
         ops::linear(xl_decode, *lm_head_, logits_decode, s);
         apply_logit_softcap(cfg_, logits_decode, s);
     }
@@ -2605,9 +2724,33 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         copy_i32(segment.mtp_shifted_ids.data(), shifted, s);
         ops::set_i32_scalar(io_.backend_kv_table_row, segment.mtp_kv_table_row, s);
         Tensor segment_hidden    = xf.slice(1, segment_begin[sg], count);
+        ops::ScopedLoraColumns segment_lora(roots.lora_slots.slice(0, segment_begin[sg], count));
         Tensor segment_positions = positions.slice(0, segment_begin[sg], count);
+        Tensor segment_rope = work_.alloc(DType::I32, {count, roots.rope_positions.ne[1]});
+        const auto rope_source = roots.rope_positions.slice(0, segment_begin[sg], count);
+        CUDA_CHECK(cudaMemcpy2DAsync(segment_rope.data, segment_rope.nb[1], rope_source.data,
+            rope_source.nb[1], count * sizeof(std::int32_t), segment_rope.ne[1], cudaMemcpyDeviceToDevice, s));
+        Tensor input_embeddings;
+        if (segment.vision) {
+            input_embeddings = work_.alloc(DType::BF16, {cfg_.hidden, count});
+            ops::embedding(shifted, *embed_, input_embeddings, s);
+            if (segment.vision->control) {
+                const auto& scatter = segment.vision->control->scatter_indices;
+                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), segment.kv_base + 1);
+                const auto end = std::lower_bound(begin, scatter.end(), segment.kv_base + 1 + count);
+                if (begin != end) {
+                    std::vector<std::int32_t> indices;
+                    for (auto it = begin; it != end; ++it) { indices.push_back(*it - segment.kv_base - 1); }
+                    Tensor indices_device = work_.alloc(DType::I32, {static_cast<int>(indices.size())});
+                    copy_i32(indices.data(), indices_device, s);
+                    Tensor embedding = segment.vision->embeddings.slice(1, begin - scatter.begin(), end - begin);
+                    ops::scatter(embedding, indices_device, input_embeddings, s);
+                }
+            }
+        }
         const auto seen          = static_cast<std::uint32_t>(segment.kv_base + count);
-        mtp_prefill_chunk(shifted, segment_hidden, nullptr, segment_positions, segment_positions,
+        mtp_prefill_chunk(shifted, segment_hidden, input_embeddings.data ? &input_embeddings : nullptr,
+                          segment_positions, segment_rope,
                           ops::GqaExecutionEnvelope{seen, seen}, false, nullptr, nullptr, nullptr);
         if (timing) {
             const double host_ms = std::chrono::duration<double, std::milli>(
@@ -2654,6 +2797,15 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                 static_cast<int>(segments.back().ids.size()) - 1,
                                          1);
         Tensor logits   = finalize.logits.slice(1, 0, finalizers);
+        if (ops::lora_active()) {
+            int index = 0;
+            for (const auto& segment : segments) {
+                if (!segment.finalize) { continue; }
+                Tensor selected = roots.lora_slots.slice(0, index++, 1);
+                ops::set_i32_scalar(selected, segment.lora_slot, s);
+            }
+        }
+        ops::ScopedLoraColumns final_lora(roots.lora_slots.slice(0, 0, finalizers));
         ops::linear(lm_head_view(gathered, s), *lm_head_, logits, s);
         apply_logit_softcap(cfg_, logits, s);
         Tensor sampled   = finalize.tokens.slice(0, 0, finalizers);
@@ -2778,6 +2930,19 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
 
     work_.reset();
     const auto roots = workspace_recipe::text_prefill_roots(work_, cfg_geometry(), total, 0, 0);
+    if (ops::lora_active()) {
+        Tensor slots = roots.lora_slots.slice(0, 0, prefill_cols);
+        CUDA_CHECK(cudaMemsetAsync(slots.data, 0, slots.bytes(), s));
+        Tensor uniform(const_cast<std::int32_t*>(ops::lora_store_for_current_device().uniform_cell()),
+                       DType::I32, {1});
+        ops::offset_i32_positions(slots, uniform, slots, s);
+        if (batch > 0) {
+            Tensor decode_slots = roots.lora_slots.slice(0, prefill_cols, batch);
+            CUDA_CHECK(cudaMemcpyAsync(decode_slots.data, decode.lora_slots.data,
+                                       decode_slots.bytes(), cudaMemcpyDeviceToDevice, s));
+        }
+    }
+    ops::ScopedLoraColumns lora_columns(roots.lora_slots);
 
     Tensor ingress = family.ingress_device();
     CUDA_CHECK(cudaMemcpyAsync(ingress.data, family.ingress_staging(),
@@ -3094,6 +3259,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
     CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data, xf_decode.bytes(),
                                cudaMemcpyDeviceToDevice, s));
     Tensor logits_decode = decode.logits;
+    ops::ScopedLoraColumns decode_lora(roots.lora_slots.slice(0, prefill_cols, batch));
     ops::linear(xl_decode, *lm_head_, logits_decode, s);
     apply_logit_softcap(cfg_, logits_decode, s);
 }

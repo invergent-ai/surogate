@@ -9,6 +9,7 @@
 #include "api/ops/embedding.h"
 #include "api/ops/kv_cache_append_prefix.h"
 #include "api/ops/linear.h"
+#include "api/ops/lora_store.h"
 #include "api/ops/linear_add.h"
 #include "api/ops/linear_pair.h"
 #include "api/ops/linear_swiglu.h"
@@ -396,15 +397,6 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
             ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream);
         }
-        if (stage.features) {
-            auto* packet = static_cast<std::byte*>(stage.export_pinned);
-            CUDA_CHECK(cudaMemcpy2DAsync(packet + metadata, stage.column_bytes,
-                verify_ids.data, sizeof(std::int32_t), sizeof(std::int32_t), width * batch_size,
-                cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpy2DAsync(packet + metadata + sizeof(std::int32_t), stage.column_bytes,
-                target_positions.data, sizeof(std::int32_t), sizeof(std::int32_t), width * batch_size,
-                cudaMemcpyDeviceToHost, stream));
-        }
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
                          state.execution.linear_attention, state.execution.io,
@@ -414,6 +406,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         card.set_stage(state.execution.stage);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, width, batch_size);
+        Tensor adapter_columns = ops::speculative_lora_columns(frame.lora_slots, frame.lora_columns,
+            width, batch_size, stream);
         target_verify_accept(state.execution, state.continuation_hidden_store, card,
                              TargetVerifyFrameView{
                                  .ids             = verify_ids,
@@ -436,8 +430,18 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                  .replay_records  = state.execution.replay_records,
                                  .sampling        = frame.sampling,
                                  .feature_sink    = &sink,
+                                 .lora_columns = adapter_columns,
                              },
-                             target_envelope);
+                             target_envelope, state.mixed_target);
+        if (stage.features) {
+            auto* packet = static_cast<std::byte*>(stage.export_pinned);
+            CUDA_CHECK(cudaMemcpy2DAsync(packet + metadata, stage.column_bytes,
+                verify_ids.data, sizeof(std::int32_t), sizeof(std::int32_t), width * batch_size,
+                cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(packet + metadata + sizeof(std::int32_t), stage.column_bytes,
+                target_positions.data, sizeof(std::int32_t), sizeof(std::int32_t), width * batch_size,
+                cudaMemcpyDeviceToHost, stream));
+        }
         auto* scores = reinterpret_cast<RawTokenScores*>(static_cast<std::byte*>(frame.egress.data) +
             offsetof(family::DFlashDecodeEgress, scores));
         ops::score_logprobs_device(target_logits, licensed_tokens, state.execution.model.geometry.token_domain,

@@ -274,7 +274,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             builder, GdnReplayRecordSpec{
                          .layers          = geometry_gdn_layers(plan.geometry),
                          .record_capacity =
-                             static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency)),
+                             static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency, plan.speculative_backend)),
                          .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
                          .conv_channels   = plan.geometry.convolution_dim(),
                          .qk_heads        = plan.geometry.gdn_key_heads,
@@ -325,7 +325,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             };
             const auto feature_columns = plan.pipeline_stage_last > 0
                 ? std::max(effective_prefill_chunk,
-                    static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency) * (plan.draft_window + 1U)))
+                    static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency, plan.speculative_backend) * (plan.draft_window + 1U)))
                 : effective_prefill_chunk;
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {plan.geometry.dflash.feature_rows, feature_columns},
@@ -350,7 +350,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.round = family::begin_round_state_layout(
         builder, family::RoundStateSpec{.hidden         = round_hidden,
                                          .output_rows    = plan.geometry.output_rows,
-                                         .batch_capacity = decode_batch_capacity(plan.max_concurrency),
+                                         .batch_capacity = decode_batch_capacity(plan.max_concurrency, plan.speculative_backend),
                                          .draft_window   = plan.draft_window,
                                          .enable_mtp     = plan.features.mtp(),
                                          .enable_dflash  = plan.features.dflash()});
@@ -370,7 +370,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (plan.draft_window > 0) {
         out.speculative_token_bitmask = add_tensor(builder, DType::I32,
             {(plan.geometry.token_domain + 31) / 32, static_cast<int32_t>(plan.draft_window + 1),
-             static_cast<int32_t>(decode_batch_capacity(plan.max_concurrency))}, "speculative allowed tokens");
+             static_cast<int32_t>(decode_batch_capacity(plan.max_concurrency, plan.speculative_backend))}, "speculative allowed tokens");
     }
     out.logit_bias = add_tensor(builder, DType::FP32,
         {plan.geometry.token_domain, static_cast<std::int32_t>(plan.max_concurrency)},
@@ -414,7 +414,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
-    const auto batch_capacity = static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency));
+    const auto batch_capacity = static_cast<std::int32_t>(decode_batch_capacity(plan.max_concurrency, plan.speculative_backend));
     const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -428,7 +428,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     const auto text_common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
         (void)workspace_recipe::text_prefill_roots(
-            layout, plan.geometry, tokens, plan.features.vision ? 3 : 0, plan.features.vision ? tokens : 0);
+            layout, plan.geometry, tokens, plan.features.vision ? 3 : 1, plan.features.vision ? tokens : 0);
     };
     const auto attention_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                      std::int32_t last, family::TextPhase phase,
@@ -937,7 +937,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes =
                 checked_mul(ordinary_graph_allowance_per_lane_bytes<Variant>(impl->weights_profile),
-                            decode_batch_capacity(impl->max_concurrency),
+                            decode_batch_capacity(impl->max_concurrency, impl->speculative_backend),
                             "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
@@ -951,7 +951,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes =
-                checked_mul(per_batch_allowance, decode_batch_capacity(impl->max_concurrency),
+                checked_mul(per_batch_allowance, decode_batch_capacity(impl->max_concurrency, impl->speculative_backend),
                             "MTP exact-b graph allowance");
         } else {
             for (auto window : dflash_draft_windows(impl->draft_window, impl->adaptive_dflash)) {
@@ -968,7 +968,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         "DFlash graph allowance");
                 };
                 for (std::uint32_t batch_size = 1;
-                     batch_size <= decode_batch_capacity(impl->max_concurrency); ++batch_size) {
+                     batch_size <= decode_batch_capacity(impl->max_concurrency, impl->speculative_backend); ++batch_size) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
                                     "DFlash exact-b graph allowance");

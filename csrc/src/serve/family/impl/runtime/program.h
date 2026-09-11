@@ -309,7 +309,7 @@ public:
     [[nodiscard]] runtime::MixedRoundResult
     advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes, std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);
-    [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept;
+    [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane, std::uint32_t decode_rows) const noexcept;
     [[nodiscard]] std::string last_mixed_round_description(std::size_t row) const;
     void set_round_burst_limit(std::uint32_t limit) noexcept { round_burst_limit = limit; }
     static void burst_egress_copy_host(void* user) noexcept;
@@ -404,7 +404,7 @@ public:
     [[nodiscard]] std::span<const std::byte> lane_draft_state(std::uint32_t lane) const;
     void adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state);
     void adopt_pipeline_prefill_features(std::uint32_t lane, std::span<const std::byte> packet,
-                                          std::uint32_t tokens);
+                                          std::uint32_t tokens, std::int32_t mixed_base = -1);
     void adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
                                          std::span<const std::byte> packet);
 
@@ -429,7 +429,8 @@ public:
     }
     [[nodiscard]] runtime::RoundHandle launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
                                                           std::span<const std::uint32_t> lanes,
-                                                          std::span<const runtime::RoundBudget> budgets);
+                                                          std::span<const runtime::RoundBudget> budgets,
+                                                          schedule::TargetVerifyFrameView* verify = nullptr);
     [[nodiscard]] runtime::MixedRoundResult consume_mixed_round(runtime::RoundHandle handle);
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
@@ -442,6 +443,7 @@ public:
     std::optional<std::uint32_t> pipeline_dflash_window;
     std::optional<GdnReplayRecords> dflash_record_storage;
     std::chrono::steady_clock::time_point dflash_measurement_started{};
+    bool dflash_measurement_mixed = false;
     const std::uint32_t speculative_max_lanes;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
@@ -626,7 +628,8 @@ private:
                         std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] runtime::RoundHandle
     launch_dflash_round(std::span<const std::uint32_t> lanes,
-                         std::span<const runtime::RoundBudget> budgets);
+                         std::span<const runtime::RoundBudget> budgets,
+                         std::span<const std::uint32_t> prefill_lanes = {});
     [[nodiscard]] runtime::BatchedGeneratedRound consume_dflash_round(runtime::RoundHandle handle);
     void reserve_sequence_kv(SequenceState& sequence, std::uint32_t text_pages,
                              std::uint32_t backend_pages);

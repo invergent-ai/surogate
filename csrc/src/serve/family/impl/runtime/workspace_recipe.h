@@ -26,6 +26,7 @@ Tensor vector(Allocator& allocator, DType dtype, std::int32_t elements) {
 
 struct TextPrefillRoots {
     Tensor ids;
+    Tensor lora_slots;
     Tensor positions;
     Tensor rope_positions;
     Tensor residual;
@@ -37,6 +38,7 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const family::TextGeom
                                     std::int32_t rope_axes, std::int32_t scatter_tokens) {
     TextPrefillRoots out;
     out.ids       = vector(allocator, DType::I32, tokens);
+    out.lora_slots = vector(allocator, DType::I32, tokens);
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
     out.residual = matrix(allocator, geometry.residual_dtype(), geometry.residual, tokens);

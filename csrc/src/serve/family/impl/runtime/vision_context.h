@@ -45,6 +45,7 @@ public:
                          const VisionPrefillPlan& plan, runtime::TransientRegion transient);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
+    [[nodiscard]] std::uint32_t chunk_length(std::uint32_t begin, std::uint32_t nominal_length) const;
     void release_encoded_media_payloads() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
 

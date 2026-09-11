@@ -278,5 +278,62 @@ int main() {
         assert(result.get() == batched[lane++]);
     }
     pipeline.wake_up();
+    if (std::getenv("SUROGATE_MULTI_DEVICE_TEST_MIXED")) {
+        pipeline.shrink_kv();
+        GenerationRequest active;
+        active.raw_prompt = "Continue: 1, 2, 3, 4,";
+        active.max_tokens = 192;
+        active.max_tokens_set = true;
+        active.ignore_eos = true;
+        active.sampling.temperature = 0;
+        active.want_logprobs = true;
+        active.return_token_ids = true;
+        active.lora_adapter = request.lora_adapter;
+        auto running = pipeline.prepare(active);
+        const auto deadline = std::chrono::steady_clock::now() + 60s;
+        while (pipeline.runtime_stats().decode_ready_requests == 0) {
+            assert(std::chrono::steady_clock::now() < deadline);
+            std::this_thread::sleep_for(1ms);
+        }
+        std::vector<GenerationRequest> inputs{active};
+        std::vector<std::unique_ptr<PreparedRequest>> incoming;
+        for (int i = 0; i < 3; ++i) {
+            auto prompt = active;
+            prompt.raw_prompt.reset();
+            prompt.max_tokens = 24;
+            for (int j = 0; j < 90; ++j) {
+                for (int token : {100 + i, 110 + i, 120 + i}) { prompt.prompt_token_ids.push_back(token); }
+            }
+            inputs.push_back(prompt);
+            incoming.push_back(std::make_unique<PreparedRequest>(pipeline.prepare(prompt)));
+        }
+        std::vector<GenerationOutcome> outcomes;
+        outcomes.push_back(pipeline.run(running, nullptr));
+        for (auto& item : incoming) { outcomes.push_back(pipeline.run(*item, nullptr)); }
+        for (std::size_t i = 0; i < outcomes.size(); ++i) {
+            const auto& actual = outcomes[i];
+            auto replay = inputs[i];
+            replay.raw_prompt.reset();
+            replay.prompt_token_ids = actual.prompt_token_ids;
+            replay.prompt_token_ids.insert(replay.prompt_token_ids.end(), actual.completion_token_ids.begin(), actual.completion_token_ids.end());
+            replay.max_tokens = 1;
+            replay.prompt_logprobs = 0;
+            pipeline.shrink_kv();
+            auto prepared = pipeline.prepare(replay);
+            auto reference = pipeline.run(prepared, nullptr);
+            assert(actual.token_logprobs.size() == actual.completion_token_ids.size());
+            float peak = 0, sum = 0;
+            for (std::size_t j = 0; j < actual.token_logprobs.size(); ++j) {
+                const auto& expected = reference.prompt_scores.at(actual.prompt_token_ids.size() + j).selected;
+                assert(expected.token_id == actual.completion_token_ids[j]);
+                const float error = std::abs(expected.logprob - actual.token_logprobs[j]);
+                peak = std::max(peak, error);
+                sum += error;
+            }
+            std::cout << "mixed pipeline score error: max=" << peak << " mean=" << sum / actual.token_logprobs.size() << '\n';
+            assert(peak <= (options.speculative.adaptive ? .25F : .12F));
+            if (options.speculative.adaptive) { assert(sum / actual.token_logprobs.size() <= .035F); }
+        }
+    }
     std::cout << "pipeline parity, per-device footprints, sleep isolation and active resume passed\n";
 }

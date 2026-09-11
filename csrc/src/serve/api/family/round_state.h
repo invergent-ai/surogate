@@ -68,6 +68,7 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumBatchColumns> mtp_kv_table_rows{};
     std::array<std::int32_t, kMaximumBatchColumns> lanes{};
     std::array<std::int32_t, kMaximumBatchColumns> rope_deltas{};
+    std::array<std::int32_t, kMaximumBatchColumns> lora_slots{};
     std::array<ops::SamplingConfig, kMaximumBatchColumns> sampling{};
 };
 
@@ -96,6 +97,7 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumBatchColumns> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumBatchColumns> dflash_kv_table_rows{};
     std::array<std::int32_t, kMaximumBatchColumns> lanes{};
+    std::array<std::int32_t, kMaximumBatchColumns> lora_slots{};
     std::array<ops::SamplingConfig, kMaximumBatchColumns> sampling{};
 };
 
@@ -129,6 +131,7 @@ struct MtpDecodeStateLayout {
     LayoutRegion ingress;
     LayoutRegion egress;
     TensorRegion verify_ids;
+    TensorRegion lora_columns;
     TensorRegion target_positions;
     TensorRegion target_argmax;
     TensorRegion target_logits;
@@ -153,6 +156,7 @@ struct DFlashDecodeStateLayout {
     TensorRegion append_counts;
     TensorRegion draft_tokens;
     TensorRegion verify_ids;
+    TensorRegion lora_columns;
     TensorRegion target_argmax;
     TensorRegion target_logits;
     TensorRegion target_hidden;
@@ -259,6 +263,8 @@ struct MtpDecodeState {
     Tensor text_kv_table_rows;
     Tensor mtp_kv_table_rows;
     Tensor lanes;
+    Tensor lora_slots;
+    Tensor lora_columns;
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
@@ -298,6 +304,8 @@ struct DFlashDecodeState {
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
     Tensor lanes;
+    Tensor lora_slots;
+    Tensor lora_columns;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;

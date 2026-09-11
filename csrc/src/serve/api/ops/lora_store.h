@@ -17,8 +17,10 @@
 
 #include "api/ops/lora.h"
 #include "api/ops/lora_base.h"
+#include "api/ops/position.h"
 #include "api/shared_weights.h"
 #include "core/arena.h"
+#include "core/device.h"
 
 #include <array>
 #include <atomic>
@@ -31,6 +33,7 @@
 #include <utility>
 #include <vector>
 #include <set>
+#include <stdexcept>
 #include <tuple>
 
 namespace sinfer::ops {
@@ -357,6 +360,45 @@ struct LoraRound {
 void lora_set_round(const LoraRound& round);
 void lora_clear_round();
 [[nodiscard]] const LoraRound& lora_current_round();
+
+inline Tensor speculative_lora_columns(const Tensor& slots, const Tensor& storage,
+                                      std::int32_t width, std::int32_t batch, cudaStream_t stream) {
+    Tensor columns = storage.view({static_cast<std::int32_t>(storage.numel())}).slice(0, 0, width * batch);
+    if (lora_active()) {
+        CUDA_CHECK(cudaMemsetAsync(columns.data, 0, columns.bytes(), stream));
+        for (std::int32_t row = 0; row < batch; ++row) {
+            Tensor part = columns.slice(0, row * width, width);
+            ops::offset_i32_positions(part, slots.slice(0, row, 1), part, stream);
+        }
+    }
+    return columns;
+}
+
+// Own the selection view as well as restoring the enclosing round. Subprojections
+// (an output head or MTP alignment) select only their columns of a mixed batch.
+class ScopedLoraColumns {
+public:
+    explicit ScopedLoraColumns(Tensor slots) : slots_(slots), previous_(lora_current_round()) {
+        if (!lora_active()) { return; }
+        auto& store = lora_store_for_current_device();
+        LoraRound round;
+        round.slots = &slots_;
+        round.scratch = store.scratch(slots_.ne[0]);
+        round.uniform_cell = store.uniform_cell();
+        if (round.scratch.data == nullptr) {
+            throw std::logic_error("mixed adapter round exceeds configured scratch capacity");
+        }
+        lora_set_round(round);
+        held_ = true;
+    }
+    ~ScopedLoraColumns() { if (held_) { lora_set_round(previous_); } }
+    ScopedLoraColumns(const ScopedLoraColumns&) = delete;
+    ScopedLoraColumns& operator=(const ScopedLoraColumns&) = delete;
+private:
+    Tensor slots_;
+    LoraRound previous_;
+    bool held_ = false;
+};
 
 inline constexpr int kLoraEmbeddingPort = 800;
 inline constexpr int kLoraAutomaticPort = 810;

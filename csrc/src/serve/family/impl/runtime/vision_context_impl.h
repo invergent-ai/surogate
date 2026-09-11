@@ -53,31 +53,37 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
     timers_.reserve(plan_.uses.size());
 }
 
+std::uint32_t VisionPrefillSession::chunk_length(std::uint32_t begin, std::uint32_t nominal_length) const {
+    if (nominal_length == 0 || begin >= prompt_.token_ids.size()) { return 0; }
+    auto end = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        std::uint64_t(begin) + nominal_length, prompt_.token_ids.size()));
+    bool active = false;
+    for (const auto& use : plan_.uses) {
+        if (use.end <= begin) { continue; }
+        if (use.begin >= end) { break; }
+        if (!active) {
+            if (context_.geometry().attention_mode && begin < use.begin) { end = use.begin; break; }
+            if (context_.geometry().attention_mode && end < use.end) { return 0; }
+            active = true;
+        } else { end = std::min(end, use.begin); break; }
+    }
+    return end - begin;
+}
+
 VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length) {
     if (nominal_length == 0 || begin >= prompt_.token_ids.size()) {
         throw std::invalid_argument("Vision chunk range is empty or outside the prompt");
     }
-    const std::uint64_t nominal_end64 =
-        static_cast<std::uint64_t>(begin) + static_cast<std::uint64_t>(nominal_length);
-    std::uint32_t end = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(nominal_end64, prompt_.token_ids.size()));
-
+    const auto length = chunk_length(begin, nominal_length);
+    if (length == 0) { throw std::logic_error("image attention block exceeds prefill workspace"); }
+    const auto end = begin + length;
     const VisionUseSpan* active = nullptr;
     for (const VisionUseSpan& use : plan_.uses) {
         if (use.end <= begin) { continue; }
         if (use.begin >= end) { break; }
-        if (active == nullptr) {
-            if (context_.geometry().attention_mode && begin < use.begin) { end = use.begin; break; }
-            if (context_.geometry().attention_mode && end < use.end) {
-                throw std::logic_error("image attention block exceeds prefill workspace");
-            }
-            active = &use;
-        } else {
-            end = std::min(end, use.begin);
-            break;
-        }
+        active = &use;
+        break;
     }
-    if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }

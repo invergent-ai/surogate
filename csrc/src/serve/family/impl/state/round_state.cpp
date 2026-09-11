@@ -163,6 +163,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.egress  = builder.add(sizeof(MtpDecodeEgress), kArenaAlign, "MTP decode egress");
         const auto batch =
             checked_i32(layout.spec.batch_capacity, "RoundState MTP batch capacity exceeds int32");
+        decode.lora_columns = add_tensor(builder, DType::I32, {columns, batch}, "speculative adapter columns");
         decode.verify_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "MTP decode verify ids");
         decode.target_positions =
@@ -213,6 +214,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         decode.append_counts = add_tensor(builder, DType::I32, {batch}, "DFlash append counts");
         decode.draft_tokens =
             add_tensor(builder, DType::I32, {columns - 1, batch}, "DFlash proposal draft tokens");
+        decode.lora_columns = add_tensor(builder, DType::I32, {columns, batch}, "speculative adapter columns");
         decode.verify_ids =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash target verify ids");
         decode.target_argmax =
@@ -259,6 +261,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
                                    std::initializer_list<std::int32_t> shape) {
         return Tensor(static_cast<unsigned char*>(egress.data) + offset, dtype, shape);
     };
+    lora_slots = ingress_tensor(offsetof(MtpDecodeIngress, lora_slots), DType::I32, {batch});
+    lora_columns = layout.lora_columns.bind(backing);
     anchors = ingress_tensor(offsetof(MtpDecodeIngress, anchors), DType::I32, {batch});
     base_frontiers =
         ingress_tensor(offsetof(MtpDecodeIngress, base_frontiers), DType::I32, {batch});
@@ -349,6 +353,8 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
                                    std::initializer_list<std::int32_t> shape) {
         return Tensor(static_cast<unsigned char*>(egress.data) + offset, dtype, shape);
     };
+    lora_slots = ingress_tensor(offsetof(DFlashDecodeIngress, lora_slots), DType::I32, {batch});
+    lora_columns = layout.lora_columns.bind(backing);
     anchors = ingress_tensor(offsetof(DFlashDecodeIngress, anchors), DType::I32, {batch});
     execution_frontiers =
         ingress_tensor(offsetof(DFlashDecodeIngress, execution_frontiers), DType::I32, {batch});

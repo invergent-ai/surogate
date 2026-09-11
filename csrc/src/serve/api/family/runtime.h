@@ -196,7 +196,7 @@ public:
     [[nodiscard]] runtime::MixedRoundResult
     advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes, std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);
-    [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept;
+    [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane, std::uint32_t decode_rows) const noexcept;
     // One line describing the most recent mixed round for a given decode row:
     // the band its graph was keyed on, the batch maximum frontier, and the
     // row's own frontier. Used by the executor's corruption attribution.
@@ -265,7 +265,7 @@ public:
     [[nodiscard]] std::span<const std::byte> lane_draft_state(std::uint32_t lane) const;
     void adopt_lane_draft_state(std::uint32_t lane, std::span<const std::byte> state);
     void adopt_pipeline_prefill_features(std::uint32_t lane, std::span<const std::byte> packet,
-                                          std::uint32_t tokens);
+                                          std::uint32_t tokens, std::int32_t mixed_base = -1);
     void adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
                                          std::span<const std::byte> packet);
 

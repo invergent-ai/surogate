@@ -4,6 +4,7 @@
 
 #include "api/ops/mtp_round.h"
 #include "api/ops/scatter.h"
+#include "api/ops/lora_store.h"
 #include "api/ops/scalar.h"
 #include "api/ops/position.h"
 #include "api/ops/sampling.h"
@@ -134,6 +135,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
+        Tensor adapter_columns = ops::speculative_lora_columns(frame.lora_slots, frame.lora_columns,
+            verify_ids.ne[0], batch_size, state.execution.device.stream);
         if (!card.stage_finishes()) {
             // A pipeline stage without the head: the verify forward over the draft columns
             // for its own layers, the recurrent state recorded for the fold, the residual
@@ -145,6 +148,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             }
             card.set_gdn_state_action(GdnStateAction::RecordForReplay,
                                       state.execution.replay_records);
+            ops::ScopedLoraColumns adapter(adapter_columns);
             card.target_verify_batch(verify_ids, target_positions, target_rope, target_valid,
                                      text_rows, lanes, envelopes.target_verify, target_hidden,
                                      target_logits, target_tokens);
@@ -171,6 +175,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                  .selected_hidden = selected_hidden,
                                  .replay_records  = state.execution.replay_records,
                                  .sampling        = frame.sampling,
+                                 .lora_columns = adapter_columns,
                              },
                              envelopes.target_verify);
 
@@ -287,9 +292,12 @@ auto mtp_narrow_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         // candidate marked in-place commits zero columns to the fold).
         narrow_step = "verify";
         card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
-        card.target_verify_batch(verify_ids, target_positions, target_rope, target_valid, text_rows,
-                                 lanes, envelopes.target_verify, target_hidden, target_logits,
-                                 target_tokens);
+        {
+            ops::ScopedLoraColumns adapter(frame.lora_slots.slice(0, 0, batch_size));
+            card.target_verify_batch(verify_ids, target_positions, target_rope, target_valid, text_rows,
+                                     lanes, envelopes.target_verify, target_hidden, target_logits,
+                                     target_tokens);
+        }
         if (!card.stage_finishes()) { return; } // a stage without the head: exported, done
 
         // The token, sampled the way the ordinary round samples; it is the round's whole licence.

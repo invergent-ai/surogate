@@ -238,16 +238,19 @@ public:
             .tokens     = std::span<const TokenId>(assembled_tokens_.data(), lanes.size() * width_),
             .row_counts = std::span<const std::int32_t>(assembled_counts_.data(), lanes.size()),
             .row_stride = width_};
-        propagate_round_tokens(lanes, result.round, assembled_outcome_);
+        std::uint32_t feature_columns = 0;
+        for (std::size_t i = 0; i < result.prefill_count; ++i) { feature_columns += result.prefill_at(i).processed_prompt_tokens; }
+        propagate_round_tokens(lanes, result.round, assembled_outcome_, feature_columns);
         for (std::size_t i = 0; i < result.prefill_count && i < prefill_lanes.size(); ++i) {
             const PrefillStepResult& step = result.prefill_at(i);
+            propagate_prefill_features(prefill_lanes[i], step);
             if (step.complete) { propagate_prefill_token(prefill_lanes[i], step); }
         }
         return result;
     }
-    [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
+    [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane, std::uint32_t decode_rows) const noexcept {
         for (Stage* stage : stages_) {
-            if (!stage->program->mixed_round_supported(prefill_lane)) { return false; }
+            if (!stage->program->mixed_round_supported(prefill_lane, decode_rows)) { return false; }
         }
         return true;
     }
@@ -487,10 +490,11 @@ private:
         f.prefill_lane = prefill_lane;
         f.width_hint   = width_hint_;
         f.verifying    = false;
-        if (kind == FlightKind::Decode && width_ > 1 && !lanes.empty()) {
+        if ((kind == FlightKind::Decode || kind == FlightKind::Mixed) && width_ > 1 && !lanes.empty()) {
             select(0);
             stages_[0]->program->set_round_width_hint(f.width_hint);
-            f.verifying = !stages_[0]->program->speculative_round_is_narrow(lanes.size());
+            f.verifying = kind == FlightKind::Decode ? !stages_[0]->program->speculative_round_is_narrow(lanes.size())
+                : !stages_[0]->program->speculative_round_is_narrow(0);
             f.dflash_window = stages_[0]->program->select_dflash_draft_window(lanes);
         }
         f.result       = GroupResult{};
@@ -552,10 +556,17 @@ private:
                 propagate_prefill_token(f.prefill_lane, f.result.prefill);
             }
         } else {
-            propagate_round_tokens(f.lanes, f.result.round, f.outcome);
+            std::uint32_t feature_columns = 0;
+            if (f.kind == FlightKind::Mixed) {
+                for (std::size_t i = 0; i < f.result.mixed.prefill_count; ++i) {
+                    feature_columns += f.result.mixed.prefill_at(i).processed_prompt_tokens;
+                }
+            }
+            propagate_round_tokens(f.lanes, f.result.round, f.outcome, feature_columns);
             if (f.kind == FlightKind::Mixed) {
                 for (std::size_t i = 0; i < f.result.mixed.prefill_count && i < f.prefill_lanes.size(); ++i) {
                     PrefillStepResult& step = f.result.mixed.prefills[i];
+                    propagate_prefill_features(f.prefill_lanes[i], step);
                     if (!step.complete) { continue; }
                     store_prefill_token(step, f.prefill_tokens[i]);
                     propagate_prefill_token(f.prefill_lanes[i], step);
@@ -775,17 +786,20 @@ private:
         for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
             select(s);
             stages_[s]->program->adopt_pipeline_prefill_features(lane,
-                {static_cast<const std::byte*>(packet), boundary_bytes_}, result.processed_prompt_tokens);
+                std::span<const std::byte>(static_cast<const std::byte*>(packet), boundary_bytes_)
+                    .subspan(result.feature_offset * column_bytes_),
+                result.processed_prompt_tokens, result.feature_base);
         }
     }
     void propagate_round_tokens(std::span<const std::uint32_t> lanes, const BatchedGeneratedRound& round,
-                                const std::vector<std::byte>& outcome) {
+                                const std::vector<std::byte>& outcome, std::uint32_t feature_columns = 0) {
         if (stages_.size() < 2 || lanes.empty()) { return; }
         if (const auto* packet = stages_.back()->program->stage_export_buffer()) {
             for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
                 select(s);
                 stages_[s]->program->adopt_pipeline_decode_features(lanes,
-                    {static_cast<const std::byte*>(packet), boundary_bytes_});
+                    std::span<const std::byte>(static_cast<const std::byte*>(packet), boundary_bytes_)
+                        .subspan(feature_columns * column_bytes_));
             }
         }
         if (width_ > 1) {

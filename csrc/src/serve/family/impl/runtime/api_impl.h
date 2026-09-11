@@ -183,8 +183,8 @@ Program<Variant>::advance_prefill_mixed(std::span<const std::uint32_t> prefill_l
 }
 
 template <>
-bool Program<Variant>::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
-    return impl_->mixed_round_supported(prefill_lane);
+bool Program<Variant>::mixed_round_supported(std::uint32_t prefill_lane, std::uint32_t decode_rows) const noexcept {
+    return impl_->mixed_round_supported(prefill_lane, decode_rows);
 }
 
 template <>
@@ -356,8 +356,8 @@ bool Program<Variant>::speculative_round_is_narrow(std::size_t lanes) const noex
 
 template <>
 void Program<Variant>::adopt_pipeline_prefill_features(std::uint32_t lane,
-    std::span<const std::byte> packet, std::uint32_t tokens) {
-    impl_->adopt_pipeline_prefill_features(lane, packet, tokens);
+    std::span<const std::byte> packet, std::uint32_t tokens, std::int32_t mixed_base) {
+    impl_->adopt_pipeline_prefill_features(lane, packet, tokens, mixed_base);
 }
 
 template <>
