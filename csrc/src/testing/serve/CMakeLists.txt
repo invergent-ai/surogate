@@ -515,6 +515,11 @@ sinfer_add_test(sinfer_json_constraint_test
   LIBRARIES sinfer_engine)
 target_compile_options(sinfer_json_constraint_test PRIVATE -UNDEBUG)
 
+sinfer_add_test(sinfer_tool_constraints_test
+  SOURCES test_tool_constraints.cpp
+  LIBRARIES sinfer_serve)
+target_compile_options(sinfer_tool_constraints_test PRIVATE -UNDEBUG)
+
 # The aggregate: `cmake --build <dir> --target serve-tests` builds every registered test,
 # and `ctest` then has a binary for each of them.
 get_property(_sinfer_serve_test_targets GLOBAL PROPERTY SINFER_SERVE_TEST_TARGETS)

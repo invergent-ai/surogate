@@ -193,6 +193,12 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
     } else {
         bad_request("unsupported tool_choice type: " + type, "tool_choice");
     }
+    if (choice.contains("disable_parallel_tool_use")) {
+        if (!choice["disable_parallel_tool_use"].is_boolean()) {
+            bad_request("disable_parallel_tool_use must be boolean", "tool_choice");
+        }
+        out.parallel_tool_calls = !choice["disable_parallel_tool_use"].get<bool>();
+    }
     if (out.tool_choice.mode != ToolChoiceMode::None && out.tools.empty()) {
         bad_request("tool_choice requires tools", "tool_choice");
     }

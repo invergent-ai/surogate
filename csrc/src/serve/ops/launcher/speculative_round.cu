@@ -57,14 +57,18 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t cols              = drafts.ne[0] + 1;
     const std::int32_t batch             = drafts.ne[1];
+    const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
+    const SamplingWorkspace scratch = layout.bind(workspace);
+    const auto* sorted = sampling_sort_launch(logits, token_domain, configs,
+        static_cast<const int32_t*>(drafts.data), static_cast<const int32_t*>(current_extents.data),
+        cols, batch, scratch, layout.bytes, stream);
     speculative_accept_wide_kernel<<<batch, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int32_t*>(drafts.data),
         static_cast<const int32_t*>(current_extents.data), static_cast<int32_t*>(lengths.data),
         static_cast<int32_t*>(anchors.data), static_cast<int32_t*>(licensed_tokens.data),
         static_cast<int32_t*>(licensed_counts.data), static_cast<int32_t*>(accepted.data),
-        configs, token_domain, physical_rows, drafts.ne[0]);
+        configs, token_domain, physical_rows, drafts.ne[0], sorted, layout.bytes);
     CUDA_CHECK(cudaGetLastError());
-    const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, cols);
     if (!layout.multiblock) {
         speculative_accept_greedy_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
@@ -81,7 +85,6 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     }
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const std::int32_t groups         = sampler_group_count(partial_blocks);
-    const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
     speculative_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(

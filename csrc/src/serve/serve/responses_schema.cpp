@@ -478,21 +478,18 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", "tools");
             }
-            if (item.at("strict").get<bool>()) {
-                bad_request("strict function schema enforcement is not supported", "tools",
-                            "strict_tools_not_supported");
-            }
         }
-        tool.strict          = false;
+        tool.strict_set = item.contains("strict") && item["strict"].is_boolean();
+        tool.strict = item.contains("strict") && item["strict"].is_boolean() && item["strict"].get<bool>();
         tool.parameters_json = parameters.dump();
         Json canonical       = {{"type", "function"},
                                 {"name", tool.name},
                                 {"parameters", parameters},
-                                {"strict", false}};
+                                {"strict", tool.strict}};
         if (!tool.description.empty()) { canonical["description"] = tool.description; }
         Json nested = {
             {"type", "function"},
-            {"function", Json{{"name", tool.name}, {"parameters", parameters}, {"strict", false}}}};
+            {"function", Json{{"name", tool.name}, {"parameters", parameters}, {"strict", tool.strict}}}};
         if (!tool.description.empty()) { nested["function"]["description"] = tool.description; }
         tool.definition_json = nested.dump();
         out.generation.tools.push_back(std::move(tool));
@@ -513,18 +510,30 @@ void parse_tool_choice(const Json& body, ResponsesRequest& out) {
         } else if (value == "none") {
             out.generation.tool_choice.mode = ToolChoiceMode::None;
         } else if (value == "required") {
-            bad_request("tool_choice 'required' is not supported", "tool_choice",
-                        "tool_choice_not_supported");
+            out.generation.tool_choice.mode = ToolChoiceMode::Required;
         } else {
-            bad_request("tool_choice must be 'auto' or 'none'", "tool_choice");
+            bad_request("tool_choice must be auto, none, required, or a named function", "tool_choice");
         }
         out.tool_choice = value;
     } else if (choice.is_object()) {
-        bad_request("named tool_choice is not supported", "tool_choice",
-                    "tool_choice_not_supported");
+        if (choice.value("type", std::string{}) != "function") {
+            bad_request("only function tool_choice objects are supported", "tool_choice");
+        }
+        out.generation.tool_choice.mode = ToolChoiceMode::Named;
+        out.generation.tool_choice.name = require_function_name(choice, "tool_choice");
+        out.tool_choice = choice;
     } else {
         bad_request("tool_choice must be a string or object", "tool_choice");
     }
+    const auto& selected = out.generation.tool_choice;
+    if (selected.mode == ToolChoiceMode::Required && out.generation.tools.empty()) {
+        bad_request("tool_choice required needs tools", "tool_choice");
+    }
+    if (selected.mode == ToolChoiceMode::Named && std::none_of(out.generation.tools.begin(), out.generation.tools.end(),
+        [&](const ToolDefinition& tool) { return tool.name == selected.name; })) {
+        bad_request("tool_choice references unknown function: " + selected.name, "tool_choice");
+    }
+
 }
 
 void parse_reasoning(const Json& body, ResponsesRequest& out) {
@@ -640,10 +649,6 @@ void reject_server_managed_features(const Json& body) {
         if (!body.at("parallel_tool_calls").is_boolean()) {
             bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
         }
-        if (!body.at("parallel_tool_calls").get<bool>()) {
-            bad_request("parallel_tool_calls=false cannot be enforced", "parallel_tool_calls",
-                        "parallel_tool_calls_not_supported");
-        }
     }
     if (body.contains("top_logprobs") && !body.at("top_logprobs").is_null()) {
         const std::optional<int> value = optional_int(body, "top_logprobs");
@@ -730,6 +735,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     out.store             = optional_bool(body, "store", true);
     out.stream            = optional_bool(body, "stream", false);
     out.generation.stream = out.stream;
+    out.generation.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
     validate_metadata(body, out);
     parse_tools(body, out);
     parse_tool_choice(body, out);
@@ -816,7 +822,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"max_tool_calls", nullptr},
         {"metadata", request.metadata},
         {"model", request.generation.model},
-        {"parallel_tool_calls", true},
+        {"parallel_tool_calls", request.generation.parallel_tool_calls},
         {"previous_response_id",
          request.previous_response_id ? Json(*request.previous_response_id) : Json(nullptr)},
         {"reasoning", reasoning},

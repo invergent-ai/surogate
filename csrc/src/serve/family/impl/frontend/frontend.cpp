@@ -847,6 +847,7 @@ class Frontend::Impl {
 public:
     mutable std::mutex constraint_mutex;
     mutable std::unique_ptr<JsonConstraintCompiler> constraint_compiler;
+    mutable std::unique_ptr<ToolConstraintCompiler> tool_constraint_compiler;
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
         : chat_template(compile_chat_template(resources, options.chat_template_override)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
@@ -1374,6 +1375,22 @@ std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint
             [tokenizer = impl_->tokenizer](std::string_view text) { return tokenizer->encode(text); });
     }
     return impl_->constraint_compiler->compile(schema);
+}
+
+std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_tool_constraint(const std::string& tag) const {
+    std::lock_guard lock(impl_->constraint_mutex);
+    if (!impl_->tool_constraint_compiler) {
+        const auto& tokenizer = *impl_->tokenizer;
+        std::vector<std::string> vocab(tokenizer.vocabulary_size());
+        for (std::size_t i = 0; i < vocab.size(); ++i) {
+            if (tokenizer.is_valid_token(static_cast<int>(i))) {
+                vocab[i] = tokenizer.decode_token_bytes(static_cast<int>(i));
+            }
+        }
+        impl_->tool_constraint_compiler = std::make_unique<ToolConstraintCompiler>(
+            std::move(vocab), tokenizer.default_stop_token_ids());
+    }
+    return impl_->tool_constraint_compiler->compile(tag);
 }
 
 std::vector<std::string> Frontend::token_texts(std::span<const TokenId> ids) const {

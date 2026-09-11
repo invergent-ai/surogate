@@ -1,5 +1,6 @@
 #include "runtime/contract/constraint.h"
 #include <llguidance.h>
+#include <xgrammar/xgrammar.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <mutex>
@@ -175,5 +176,53 @@ std::shared_ptr<const CompiledTokenConstraint> JsonConstraintCompiler::compile(c
     } catch (const std::exception& error) {
         throw std::invalid_argument(std::string("invalid or unsupported JSON schema: ") + error.what());
     }
+}
+namespace {
+class ToolConstraintState final : public TokenConstraintState {
+    xgrammar::GrammarMatcher matcher_;
+public:
+    explicit ToolConstraintState(xgrammar::GrammarMatcher matcher) : matcher_(std::move(matcher)) {}
+    bool stopped() const override { return matcher_.IsTerminated(); }
+    bool try_accept(TokenId token) override { return !stopped() && matcher_.AcceptToken(token); }
+    void accept(TokenId token) override {
+        if (!try_accept(token)) { throw std::logic_error("token violates tool constraint: " + std::to_string(token)); }
+    }
+    std::unique_ptr<TokenConstraintState> fork() const override {
+        return std::make_unique<ToolConstraintState>(matcher_.Fork());
+    }
+    void fill(std::span<int32_t> mask) override {
+        int64_t shape = static_cast<int64_t>(mask.size());
+        DLTensor tensor{.data = mask.data(), .device = {kDLCPU, 0}, .ndim = 1,
+            .dtype = {kDLInt, 32, 1}, .shape = &shape, .strides = nullptr, .byte_offset = 0};
+        matcher_.FillNextTokenBitmask(&tensor);
+        if (std::none_of(mask.begin(), mask.end(), [](auto word) { return word != 0; })) {
+            throw std::invalid_argument("tool constraint has no continuation in this vocabulary");
+        }
+    }
+};
+class ToolConstraint final : public CompiledTokenConstraint {
+    xgrammar::CompiledGrammar grammar_;
+public:
+    explicit ToolConstraint(xgrammar::CompiledGrammar grammar) : grammar_(std::move(grammar)) {}
+    std::unique_ptr<TokenConstraintState> create_state() const override {
+        return std::make_unique<ToolConstraintState>(xgrammar::GrammarMatcher(grammar_));
+    }
+};
+} // namespace
+class ToolConstraintCompiler::Impl {
+public:
+    xgrammar::GrammarCompiler compiler;
+    std::mutex mutex;
+    Impl(const std::vector<std::string>& vocab, const std::vector<TokenId>& stops)
+        : compiler(xgrammar::TokenizerInfo(vocab, xgrammar::VocabType::RAW,
+            static_cast<int>(vocab.size()), stops), 1, true, 128LL << 20) {}
+};
+ToolConstraintCompiler::ToolConstraintCompiler(std::vector<std::string> vocab, std::vector<TokenId> stops)
+    : impl_(std::make_unique<Impl>(vocab, stops)) {}
+ToolConstraintCompiler::~ToolConstraintCompiler() = default;
+std::shared_ptr<const CompiledTokenConstraint> ToolConstraintCompiler::compile(const std::string& tag) {
+    std::lock_guard lock(impl_->mutex);
+    try { return std::make_shared<ToolConstraint>(impl_->compiler.CompileStructuralTag(tag)); }
+    catch (const std::exception& error) { throw std::invalid_argument(std::string("invalid tool constraint: ") + error.what()); }
 }
 } // namespace sinfer

@@ -14,6 +14,8 @@
 
 namespace sinfer::ops {
 
+inline constexpr int kSamplerSortItems = 4;
+inline constexpr int kSamplerSortTile = 256 * kSamplerSortItems;
 inline constexpr int kSamplerBlock               = 256;
 inline constexpr int kSamplerTileItems           = 256;
 inline constexpr int kSamplerItemsPerThread      = 2;
@@ -55,9 +57,13 @@ struct SamplingWorkspace {
     std::int32_t* group_done                 = nullptr;
     std::int32_t* speculative_finalize_count = nullptr;
     std::int32_t partial_stride              = 0;
+    unsigned long long* sort_keys_a = nullptr;
+    unsigned long long* sort_keys_b = nullptr;
 };
 
 struct SamplingWorkspaceLayout {
+    TensorRegion sort_keys_a;
+    TensorRegion sort_keys_b;
     TensorRegion partial_keys;
     TensorRegion dist_idx;
     TensorRegion dist_prob;
@@ -69,15 +75,16 @@ struct SamplingWorkspaceLayout {
     bool multiblock             = false;
 
     [[nodiscard]] SamplingWorkspace bind(DeviceSpan backing) const {
-        if (!multiblock) { return {}; }
         return {
-            static_cast<unsigned long long*>(partial_keys.bind(backing).data),
-            static_cast<std::int32_t*>(dist_idx.bind(backing).data),
-            static_cast<float*>(dist_prob.bind(backing).data),
-            static_cast<std::int32_t*>(dist_support.bind(backing).data),
-            static_cast<std::int32_t*>(group_done.bind(backing).data),
-            static_cast<std::int32_t*>(speculative_finalize_count.bind(backing).data),
+            multiblock ? static_cast<unsigned long long*>(partial_keys.bind(backing).data) : nullptr,
+            multiblock ? static_cast<std::int32_t*>(dist_idx.bind(backing).data) : nullptr,
+            multiblock ? static_cast<float*>(dist_prob.bind(backing).data) : nullptr,
+            multiblock ? static_cast<std::int32_t*>(dist_support.bind(backing).data) : nullptr,
+            multiblock ? static_cast<std::int32_t*>(group_done.bind(backing).data) : nullptr,
+            multiblock ? static_cast<std::int32_t*>(speculative_finalize_count.bind(backing).data) : nullptr,
             partial_stride,
+            sort_keys_a.region.bytes ? static_cast<unsigned long long*>(sort_keys_a.bind(backing).data) : nullptr,
+            sort_keys_b.region.bytes ? static_cast<unsigned long long*>(sort_keys_b.bind(backing).data) : nullptr,
         };
     }
 };
@@ -89,24 +96,29 @@ inline SamplingWorkspaceLayout make_sampling_workspace_layout(std::int32_t token
 
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const std::int32_t groups         = sampler_group_count(partial_blocks);
-    if (!sampler_multiblock_ok(token_domain, columns, partial_blocks, groups)) { return out; }
-
-    out.multiblock     = true;
+    out.multiblock = sampler_multiblock_ok(token_domain, columns, partial_blocks, groups);
+    if (!out.multiblock && token_domain <= kSamplerSortTile) { return out; }
     out.partial_stride = partial_blocks + groups;
 
     LayoutBuilder layout;
-    out.partial_keys =
-        layout.add_tensor(DType::I64, {kSamplerCandidateCap, out.partial_stride, columns}, 256,
-                          "sampling partial keys");
-    out.dist_idx  = layout.add_tensor(DType::I32, {kSamplerCandidateCap, columns}, 256,
-                                      "sampling speculative distribution indices");
-    out.dist_prob = layout.add_tensor(DType::FP32, {kSamplerCandidateCap, columns}, 256,
-                                      "sampling speculative distribution probabilities");
-    out.dist_support =
-        layout.add_tensor(DType::I32, {columns}, 256, "sampling speculative support sizes");
-    out.group_done = layout.add_tensor(DType::I32, {columns}, 256, "sampling group counters");
-    out.speculative_finalize_count =
-        layout.add_tensor(DType::I32, {1}, 256, "sampling speculative finalize counter");
+    if (token_domain > kSamplerSortTile) {
+        out.sort_keys_a = layout.add_tensor(DType::I64, {token_domain, columns}, 256, "sampling sort keys A");
+        out.sort_keys_b = layout.add_tensor(DType::I64, {token_domain, columns}, 256, "sampling sort keys B");
+    }
+    if (out.multiblock) {
+        out.partial_keys =
+            layout.add_tensor(DType::I64, {kSamplerCandidateCap, out.partial_stride, columns}, 256,
+                              "sampling partial keys");
+        out.dist_idx  = layout.add_tensor(DType::I32, {kSamplerCandidateCap, columns}, 256,
+                                          "sampling speculative distribution indices");
+        out.dist_prob = layout.add_tensor(DType::FP32, {kSamplerCandidateCap, columns}, 256,
+                                          "sampling speculative distribution probabilities");
+        out.dist_support =
+            layout.add_tensor(DType::I32, {columns}, 256, "sampling speculative support sizes");
+        out.group_done = layout.add_tensor(DType::I32, {columns}, 256, "sampling group counters");
+        out.speculative_finalize_count =
+            layout.add_tensor(DType::I32, {1}, 256, "sampling speculative finalize counter");
+    }
     // Speculative acceptance replicates this complete layout once per batch row. Preserve the
     // strongest member alignment in the row stride so every replicated partial-key array remains
     // correctly aligned.

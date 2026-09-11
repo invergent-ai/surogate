@@ -28,9 +28,16 @@ std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::in
     if (token_domain <= 0 || min_lanes <= 0 || max_lanes < min_lanes) {
         throw std::invalid_argument("sampling workspace: invalid profile or lane interval");
     }
-    if (token_domain <= kSamplerTileItems || min_lanes > kSamplerMaxColumns) { return 0; }
-    return detail::sampling_workspace_exact_bytes(token_domain,
-                                                  std::min(max_lanes, kSamplerMaxColumns));
+    if (token_domain <= kSamplerTileItems) { return 0; }
+    if (token_domain <= kSamplerSortTile) {
+        if (min_lanes > kSamplerMaxColumns) { return 0; }
+        return detail::sampling_workspace_exact_bytes(token_domain, std::min(max_lanes, kSamplerMaxColumns));
+    }
+    auto bytes = detail::sampling_workspace_exact_bytes(token_domain, max_lanes);
+    if (min_lanes <= kSamplerMaxColumns && max_lanes > kSamplerMaxColumns) {
+        bytes = std::max(bytes, detail::sampling_workspace_exact_bytes(token_domain, kSamplerMaxColumns));
+    }
+    return bytes;
 }
 
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,

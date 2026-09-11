@@ -74,6 +74,7 @@ struct ToolDefinition {
     std::string parameters_json;
     std::string definition_json; // normalized OpenAI function-tool object for Qwen prompt rendering
     bool strict = false;
+    bool strict_set = false;
 };
 
 struct ToolCall {
@@ -179,6 +180,7 @@ struct GenerationRequest {
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;
     ToolChoice tool_choice;
+    bool parallel_tool_calls = true;
     std::vector<std::string> stop_strings;
     // Benchmark knob (vLLM-compatible): generation ignores the model's stop tokens and runs to
     // max_tokens, so throughput is measured on a fixed output length.

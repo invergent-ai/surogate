@@ -516,14 +516,24 @@ int filtered_distribution_contract() {
 }
 
 int wide_nucleus_contract() {
-    const std::vector<float> column(128, 0.0F);
-    ops::SamplingConfig config;
-    config.temperature = 1;
-    config.top_p = 0.75F;
-    const auto oracle = distribution_oracle(column, 128, config);
-    if (oracle.tokens.size() != 96) { return 1; }
-    const auto result = run_repeated(column, 128, 8192, 32, config, 0, ops::kSamplePurposeDecode);
-    return result.integrity_failures + verify_distribution("full-vocabulary nucleus", result.tokens, oracle);
+    int failures = 0;
+    for (int domain : {128, 4099}) {
+        const std::vector<float> column(domain, 0.0F);
+        ops::SamplingConfig config;
+        config.temperature = 1;
+        config.top_p = 0.75F;
+        const auto oracle = distribution_oracle(column, domain, config);
+        if (oracle.tokens.size() != static_cast<size_t>(std::ceil(0.75 * domain))) { return 1; }
+        const auto result = run_repeated(column, domain, 8192, 32, config, 0, ops::kSamplePurposeDecode);
+        failures += result.integrity_failures + verify_distribution("full-vocabulary nucleus", result.tokens, oracle);
+        if (oracle.tokens.size() > ops::kSamplerSortTile) {
+            const double expected_tail = double(oracle.tokens.size() - ops::kSamplerSortTile) / oracle.tokens.size();
+            const double observed_tail = double(std::count_if(result.tokens.begin(), result.tokens.end(),
+                [](int token) { return token >= ops::kSamplerSortTile; })) / result.tokens.size();
+            if (std::abs(expected_tail - observed_tail) > 0.04) { ++failures; }
+        }
+    }
+    return failures;
 }
 
 int large_vocabulary_filters_contract() {

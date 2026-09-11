@@ -7,7 +7,7 @@
 // group merges through caller-owned workspace; unsupported finite geometries
 // use the semantically identical single-block fallback.
 
-#include "ops/kernel/sampling_exact.cuh"
+#include "ops/kernel/sampling_sorted.cuh"
 
 namespace sinfer::ops {
 

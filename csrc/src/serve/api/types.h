@@ -343,6 +343,8 @@ class CompiledTokenConstraint;
 struct ExecutionOptions {
     /// Empty means unconstrained output; otherwise a JSON Schema for the generated text.
     std::string json_schema;
+    /// Native tool-call delimiters and argument schemas; mutually exclusive with json_schema.
+    std::string structural_tag;
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;

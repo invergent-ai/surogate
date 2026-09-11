@@ -34,4 +34,14 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+class ToolConstraintCompiler {
+public:
+    ToolConstraintCompiler(std::vector<std::string> vocabulary, std::vector<TokenId> stops);
+    ~ToolConstraintCompiler();
+    [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile(const std::string& structural_tag);
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 } // namespace sinfer

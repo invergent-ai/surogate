@@ -77,7 +77,7 @@ int test_malformed_falls_back_to_text() {
     return failures;
 }
 
-int test_suffix_after_tool_falls_back_to_text() {
+int test_suffix_after_tool_preserves_content() {
     const std::string text = "<tool_call>\n"
                              "<function=get_weather>\n"
                              "<parameter=city>\nParis\n</parameter>\n"
@@ -87,8 +87,8 @@ int test_suffix_after_tool_falls_back_to_text() {
     const sinfer::serve::ParsedToolCallOutput parsed =
         sinfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
-    failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
-    failures += check(parsed.content == text, "suffix fallback preserves text");
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1, "call preserved with trailing text");
+    failures += check(parsed.content == "\nextra answer", "trailing answer preserved separately");
     return failures;
 }
 
@@ -190,7 +190,7 @@ int main() {
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();
-    failures += test_suffix_after_tool_falls_back_to_text();
+    failures += test_suffix_after_tool_preserves_content();
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();

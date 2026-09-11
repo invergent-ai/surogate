@@ -35,7 +35,8 @@ def server(tmp_path_factory):
         binary, os.environ["SUROGATE_SAMPLING_TEST_ARTIFACT"], "--port", str(port),
         "--served-model-name", "test", "--max-model-len", "512", "--kv-capacity", "2048",
         "--max-num-seqs", "4", "--no-thinking", "--enable-sleep-mode",
-        "--request-log-jsonl", str(records),
+        "--request-log-jsonl", str(records), "--enable-auto-tool-choice",
+        "--tool-call-parser", os.getenv("SUROGATE_SAMPLING_TEST_TOOL_PARSER", "qwen3_xml"),
     ]
     if devices := os.getenv("SUROGATE_SAMPLING_TEST_DEVICES"):
         command += ["--devices", devices]
@@ -108,7 +109,8 @@ def test_invalid_bias_rejected(server, bias):
 
 
 @pytest.mark.parametrize("temperature", [0, 1])
-def test_json_schema_nested_output(server, temperature):
+@pytest.mark.parametrize(("top_k", "top_p"), [(0, 1), (0, 0.9), (64, 0.9)])
+def test_json_schema_nested_output(server, temperature, top_k, top_p):
     schema = {
         "type": "object", "properties": {
             "label": {"type": "string", "enum": ["yes", "no"]},
@@ -116,7 +118,7 @@ def test_json_schema_nested_output(server, temperature):
             "flags": {"type": "array", "items": {"type": "boolean"}, "minItems": 2, "maxItems": 2},
         }, "required": ["label", "count", "flags"], "additionalProperties": False,
     }
-    response = chat(server, response_format=schema_format(schema), temperature=temperature, top_k=0, top_p=1)
+    response = chat(server, response_format=schema_format(schema), temperature=temperature, top_k=top_k, top_p=top_p)
     assert response.ok, response.text
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "stop", response.text

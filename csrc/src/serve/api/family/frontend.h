@@ -165,6 +165,8 @@ public:
     void validate_sampling_tokens(const ResolvedSamplingParameters& sampling) const;
     [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_json_constraint(
         const std::string& schema) const;
+    [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_tool_constraint(
+        const std::string& structural_tag) const;
     [[nodiscard]] std::vector<std::string> token_texts(std::span<const TokenId> ids) const;
 
 private:

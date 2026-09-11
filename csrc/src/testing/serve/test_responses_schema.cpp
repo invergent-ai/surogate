@@ -315,16 +315,20 @@ int test_explicit_rejections() {
     Json strict     = base;
     strict["tools"] = Json::array({Json{
         {"type", "function"}, {"name", "f"}, {"parameters", Json::object()}, {"strict", true}}});
-    failures += check(api_code([&] { (void)parse_responses_request(strict, limits()); }) ==
-                          "strict_tools_not_supported",
-                      "strict tools rejected explicitly");
+    failures += check(parse_responses_request(strict, limits()).generation.tools[0].strict,
+                      "strict tool schemas retained");
 
     Json required           = base;
     required["tools"]       = Json::array({Json{{"type", "function"}, {"name", "f"}}});
     required["tool_choice"] = "required";
-    failures += check(api_code([&] { (void)parse_responses_request(required, limits()); }) ==
-                          "tool_choice_not_supported",
-                      "required tool choice rejected explicitly");
+    failures += check(parse_responses_request(required, limits()).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "required tool choice accepted");
+    required["tool_choice"] = {{"type", "function"}, {"name", "f"}};
+    required["parallel_tool_calls"] = false;
+    const auto named = parse_responses_request(required, limits());
+    failures += check(named.generation.tool_choice.mode == ToolChoiceMode::Named &&
+                      named.generation.tool_choice.name == "f" && !named.generation.parallel_tool_calls,
+                      "named choice and parallel flag retained");
 
     Json structured = base;
     structured["text"] = Json{{"format", Json{{"type", "json_schema"}, {"name", "result"},

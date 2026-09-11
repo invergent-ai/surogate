@@ -1,6 +1,7 @@
 #include "serve/translate.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <random>
 #include <stdexcept>
@@ -267,9 +268,13 @@ sinfer::RequestOptions to_request_options(const GenerationRequest& request,
     sinfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
-    options.execution.json_schema = request.json_schema;
-    if (!request.json_schema.empty() && (request.ignore_eos || request.min_tokens != 0 || request.uses_tools() || !request.stop_strings.empty())) {
-        invalid_sampling("JSON response formats require ignore_eos=false, min_tokens=0, no custom stops, and no active tools", "response_format");
+    const bool constrained_tools = request.uses_tools() &&
+        (request.tool_choice.mode != ToolChoiceMode::Auto ||
+         std::any_of(request.tools.begin(), request.tools.end(), [](const ToolDefinition& tool) { return tool.strict; }));
+    // Match vLLM: tool-derived constraints take precedence over response_format.
+    options.execution.json_schema = constrained_tools ? std::string{} : request.json_schema;
+    if (!options.execution.json_schema.empty() && (request.ignore_eos || request.min_tokens != 0 || !request.stop_strings.empty())) {
+        invalid_sampling("JSON response formats require ignore_eos=false, min_tokens=0, and no custom stops", "response_format");
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;

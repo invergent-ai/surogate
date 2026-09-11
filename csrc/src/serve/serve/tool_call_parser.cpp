@@ -232,12 +232,27 @@ static ParsedToolCallOutput parse_tagged_tool_call_output(const std::string& tex
 
     std::size_t pos = first;
     while (pos < text.size()) {
-        skip_ws(text, pos);
-        if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
-        const std::size_t inner_begin = pos + kToolOpen.size();
-        const std::size_t close       = text.find(kToolClose, inner_begin);
+        const auto next = text.find(kToolOpen, pos);
+        if (next == std::string::npos) {
+            out.content += rtrim_ascii(std::string_view(text).substr(pos));
+            break;
+        }
+        if (next != pos) {
+            const auto between = std::string_view(text).substr(pos, next - pos);
+            if (!trim_ascii(between).empty()) { out.content += between; }
+        }
+        const std::size_t inner_begin = next + kToolOpen.size();
+        std::size_t close = text.find(kToolClose, inner_begin);
         if (close == std::string::npos) { return fallback(text); }
+        // A JSON string argument may itself contain the closing marker.
+        std::size_t body_begin = inner_begin;
+        skip_ws(text, body_begin);
+        if (!spark && body_begin < text.size() && text[body_begin] == '{') {
+            while (close != std::string::npos && Json::parse(text.substr(inner_begin, close - inner_begin), nullptr, false).is_discarded()) {
+                close = text.find(kToolClose, close + kToolClose.size());
+            }
+            if (close == std::string::npos) { return fallback(text); }
+        }
         ToolCall call;
         const auto parser = spark ? parse_spark_call : parse_one_tool_call;
         if (!parser(std::string_view(text).substr(inner_begin, close - inner_begin),
@@ -273,7 +288,10 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
 
     constexpr std::string_view kToolOpen = "<tool_call>";
     pending_.append(text);
-    const std::size_t marker = pending_.find(kToolOpen);
+    std::size_t marker = pending_.find(kToolOpen);
+    if (json_tools_) {
+        for (const auto candidate : {"<|python_tag|>", "{", "["}) { marker = std::min(marker, pending_.find(candidate)); }
+    }
     if (marker != std::string::npos) {
         std::size_t safe_end = marker;
         while (safe_end != 0 &&
@@ -288,7 +306,8 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
         return visible;
     }
 
-    const std::size_t prefix = longest_suffix_prefix(pending_, kToolOpen);
+    std::size_t prefix = longest_suffix_prefix(pending_, kToolOpen);
+    if (json_tools_) { prefix = std::max(prefix, longest_suffix_prefix(pending_, "<|python_tag|>")); }
     std::size_t safe_end     = pending_.size() - prefix;
     while (safe_end != 0 && std::isspace(static_cast<unsigned char>(pending_[safe_end - 1])) != 0) {
         --safe_end;

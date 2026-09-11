@@ -84,6 +84,9 @@ struct PreparedRequest {
     int prompt_tokens                      = 0;
     bool include_usage                     = false;
     bool tool_capable                      = false;
+    bool constrained_tools                 = false;
+    ToolChoice tool_choice;
+    bool parallel_tool_calls               = true;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length       = 64;
     bool enable_thinking                   = true;

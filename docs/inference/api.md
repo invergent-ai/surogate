@@ -68,6 +68,7 @@ management requests to select the model.
 | `logit_bias` | Map token-id strings to biases in `[-100,100]`; applies to greedy and sampled generation |
 | `tools`, `tool_choice` | Function tools only; `none`, `auto`, `required`, or a named function object. Automatic choice requires `--enable-auto-tool-choice` |
 | `response_format` | `text`, `json_object`, or `json_schema`; see [Structured output](#structured-output) |
+| `parallel_tool_calls` | Defaults to `true`; `false` returns at most one tool call |
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; the loaded template must support the requested value |
 | `chat_template_kwargs.enable_thinking` | Per-request thinking toggle; also accepted as top-level `enable_thinking` |
 | `chat_template_kwargs.preserve_thinking` | Keep earlier assistant reasoning in later prompts; also accepted as top-level `preserve_thinking` |
@@ -87,8 +88,38 @@ local paths, HTTP(S) URLs, or base64 data URIs. `input_audio` is refused with
 
 For automatic tool choice, start the server with `--enable-auto-tool-choice` and a matching
 `--tool-call-parser` (default `qwen3_xml`; `hermes`, `spark25`, `llama3_json`, and `llama4_json` are also
-accepted). The model generates tool calls, and your application executes them. Validate the
-arguments before use: the server does not guarantee that they match the tool's schema.
+accepted). The model generates tool calls, and your application executes them.
+
+Tool choice follows these rules for Chat Completions and Responses:
+
+| Choice | Behavior |
+|---|---|
+| `none` | Tools are disabled, and their argument schemas are not enforced. |
+| `auto`, with no tool marked `strict: true` | The model freely chooses an answer or tool calls. Argument schemas are not enforced. |
+| `auto`, with at least one tool marked `strict: true` | Normal text remains allowed. When the model starts a tool call, its name and arguments are constrained. Tools explicitly marked `strict: false` remain exempt from argument-schema enforcement; tools with omitted `strict` use their schemas. |
+| `required` | A completed response must contain a tool call. Argument schemas apply unless a tool explicitly sets `strict: false`. |
+| Named function | A completed response calls the selected function once. Its argument schema applies unless it explicitly sets `strict: false`. |
+
+As in vLLM, automatic choice with `parallel_tool_calls: false` returns only the first call if
+multiple calls were generated. The setting does not change automatic generation; usage and
+raw token details still cover the whole generated sequence.
+
+Constrained tool arguments support nested objects and arrays, required properties,
+additional-property rules, enums, constants, numeric bounds, array length limits, `anyOf`,
+and local references. Declare required fields in `properties`. Their schema support is narrower
+than JSON answer formats: string patterns, string length limits, formats, `multipleOf`,
+`allOf`, `oneOf`, and assertion siblings alongside `$ref` or `anyOf` are currently rejected.
+Unsupported tool constraints return HTTP `400` with `tool_schema_not_supported`; they are
+not silently ignored. Schemas on disabled or unconstrained tools are not compiled.
+
+Constrained tools require `ignore_eos: false`, `min_tokens: 0`, and no custom stop strings.
+If generation reaches its output or context limit, the call may be incomplete; no executable
+tool call is returned from that incomplete response. Validate unconstrained arguments in your
+application before executing them.
+
+When tool-derived constraints are active, they take precedence over `response_format`
+(or Responses `text.format`), matching vLLM. With unconstrained automatic tools, a JSON answer
+format still applies to the generated answer.
 
 `logprobs: true` returns each generated token's log-probability and text in `choices[].logprobs.content`;
 `top_logprobs` entries are empty. `return_token_ids: true` adds the exact prompt and completion
@@ -174,7 +205,7 @@ before using it.
 
 The constraint applies while generating, including streaming. An answer stopped by a token or
 context limit can still be incomplete; check `finish_reason` before parsing it. Use sufficient
-`max_tokens`, keep `ignore_eos` false and `min_tokens` at zero, and omit custom `stop` strings and active tools. JSON is
+`max_tokens`, keep `ignore_eos` false and `min_tokens` at zero, and omit custom `stop` strings. JSON is
 returned as answer content without a separate reasoning response.
 
 Structured requests work on single- and multi-GPU servers, including MTP and DFlash speculative
@@ -320,6 +351,11 @@ unchanged. Replacing an adapter works with `--max-loras 1`.
 semantic SSE events when streaming. Stored state is **process-local** — it does not survive a
 restart and is not shared between replicas — and bounded by `--response-store-max-records`
 (1024) and `--response-store-max-mib` (256). Pass `store: false` for stateless use.
+
+Responses accepts `tool_choice: "auto"`, `"none"`, `"required"`, or a named function such as
+`{"type":"function","name":"weather"}`. Define function tools with `name`, `parameters`, and
+optional `strict` directly on the tool object. Both strict tools and `parallel_tool_calls: false`
+work with streaming and stored responses; the tool-choice rules above apply unchanged.
 
 Background execution and compaction are unsupported. `/v1/responses/compact` returns
 `400 compaction_not_supported`. `/v1/responses/{id}/cancel` returns

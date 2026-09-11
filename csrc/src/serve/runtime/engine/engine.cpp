@@ -388,7 +388,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
 
     const std::string json_schema = options.execution.json_schema;
-    if (!json_schema.empty() && (!options.stop.include_model_defaults || options.execution.min_tokens != 0 ||
+    const std::string tool_tag = options.execution.structural_tag;
+    if (!json_schema.empty() && !tool_tag.empty()) { throw std::invalid_argument("conflicting output constraints"); }
+    if ((!json_schema.empty() || !tool_tag.empty()) && (!options.stop.include_model_defaults || options.execution.min_tokens != 0 ||
         !options.stop.strings.empty() || !options.stop.token_ids.empty())) {
         throw std::invalid_argument("JSON constraints require model stop tokens, min_tokens=0, and no custom stops");
     }
@@ -403,6 +405,11 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         }, impl_->active);
         // JSON is answer text even for a template that opens a reasoning region.
         resolved_options.output.structured = true;
+    }
+    if (!tool_tag.empty()) {
+        resolved_options.execution.constraint = std::visit([&](const auto& target) {
+            return target->loaded->frontend.compile_tool_constraint(tool_tag);
+        }, impl_->active);
     }
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 

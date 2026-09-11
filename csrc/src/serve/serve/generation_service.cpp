@@ -8,6 +8,7 @@
 #include "serve/lora_registry.h"
 #include "serve/output_parsers.h"
 #include "serve/tool_call_parser.h"
+#include "serve/tool_constraints.h"
 #include "serve/translate.h"
 
 #include <algorithm>
@@ -196,8 +197,8 @@ void check_preparation_control(Clock::time_point deadline,
 
 class ServiceOutputSink final : public sinfer::OutputSink {
 public:
-    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls)
-        : sink_(&sink), filter_tool_calls_(filter_tool_calls) {}
+    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls, bool json_tools)
+        : sink_(&sink), filter_tool_calls_(filter_tool_calls), tool_filter_(json_tools) {}
 
     void publish(sinfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
@@ -413,6 +414,10 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.tool_name_max_length          = request.tool_name_max_length;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
+    request_options.execution.structural_tag = make_tool_constraint(request, options_.tool_call_format, semantics.enable_thinking);
+    prepared.constrained_tools = !request_options.execution.structural_tag.empty();
+    prepared.tool_choice = request.tool_choice;
+    prepared.parallel_tool_calls = request.parallel_tool_calls;
     prepared.enable_thinking                   = semantics.enable_thinking;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
@@ -512,7 +517,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) {
-        output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared.tool_capable);
+        output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared.tool_capable,
+            options_.tool_call_format == ToolCallFormat::Llama3Json);
     }
     sinfer::OutputSink* public_sink = output_sink.get();
     sinfer::CancellationView cancellation;
@@ -571,6 +577,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (prepared.tool_capable) {
         ParsedToolCalls parsed = parse_tool_calls(options_.tool_call_format, outcome.text,
                                                   prepared.tool_name_max_length, prepared.tools);
+        if (!prepared.parallel_tool_calls && parsed.tool_calls.size() > 1) { parsed.tool_calls.resize(1); }
         if ((outcome.finish_reason != sinfer::FinishReason::StopToken &&
              outcome.finish_reason != sinfer::FinishReason::StopString) ||
             std::any_of(parsed.tool_calls.begin(), parsed.tool_calls.end(), [&](const ToolCall& call) {
@@ -579,6 +586,20 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
             })) {
             parsed = {};
             parsed.content = outcome.text;
+        }
+        if (prepared.constrained_tools && outcome.finish_reason == sinfer::FinishReason::StopToken) {
+            for (const auto& call : parsed.tool_calls) {
+                const auto tool = std::find_if(prepared.tools.begin(), prepared.tools.end(), [&](const auto& item) { return item.name == call.name; });
+                if (tool == prepared.tools.end() || !tool_arguments_match_schema(*tool, call.arguments_json)) {
+                    throw ApiException({.status=500, .type="server_error", .message="generated arguments failed validation for tool " + call.name, .code="tool_output_invalid"});
+                }
+            }
+            const bool required = prepared.tool_choice.mode == ToolChoiceMode::Required || prepared.tool_choice.mode == ToolChoiceMode::Named;
+            if ((required && parsed.tool_calls.empty()) ||
+                (prepared.tool_choice.mode == ToolChoiceMode::Named &&
+                 (parsed.tool_calls.size() != 1 || parsed.tool_calls.front().name != prepared.tool_choice.name))) {
+                throw ApiException({.status=500, .type="server_error", .message="generated tool response violated the requested tool choice", .code="tool_output_invalid"});
+            }
         }
         outcome.text           = std::move(parsed.content);
         is_tool_call_response  = parsed.is_tool_call_response;

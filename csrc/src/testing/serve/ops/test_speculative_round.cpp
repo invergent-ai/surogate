@@ -3,6 +3,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -275,8 +276,9 @@ int deterministic_sampling_case() {
                                token_counts, expected);
 }
 
-int constrained_sampling_columns_case() {
-    constexpr int domain = 257, k = 3, words = (domain + 31) / 32;
+int constrained_sampling_columns_case(int domain = 257) {
+    constexpr int k = 3;
+    const int words = (domain + 31) / 32;
     const std::vector<int32_t> drafts{71, 143, 199};
     const std::vector<int32_t> winners{71, 143, 211, 255};
     std::vector<int32_t> masks(words * (k + 1), 0);
@@ -300,9 +302,8 @@ int constrained_sampling_columns_case() {
     return failures;
 }
 
-int batched_sampling_workspace_stride_case() {
-    constexpr int physical_rows = 257;
-    constexpr int token_domain  = 257;
+int batched_sampling_workspace_stride_case(int token_domain = 257, int first_k = 1, int second_k = 1) {
+    const int physical_rows = token_domain;
     constexpr int k             = 3;
     constexpr int batch         = 2;
     constexpr int columns       = k + 1;
@@ -333,7 +334,10 @@ int batched_sampling_workspace_stride_case() {
     ops::SamplingConfig config{};
     config.temperature = 1.0f;
     config.top_k       = 1;
-    const std::vector<ops::SamplingConfig> configs{config, config};
+    std::vector<ops::SamplingConfig> configs{config, config};
+    configs[0].top_k = first_k;
+    configs[1].top_k = second_k;
+    for (auto& item : configs) { item.top_p = 0.8F; item.min_p = 0.5F; }
     DeviceBuffer d_configs = to_device(configs);
 
     Tensor targets(d_targets.p, DType::I32, {columns, batch});
@@ -366,6 +370,60 @@ int batched_sampling_workspace_stride_case() {
     failures += verify_exact("speculative sampling B=2 anchors",
                              from_device<std::int32_t>(d_anchors, batch), {20, 33});
     return failures;
+}
+
+int wide_speculative_distribution_case() {
+    constexpr int domain = 4099, batch = 512, iterations = 32;
+    std::vector<uint16_t> host_logits(domain * 2 * batch, f32_to_bf16(0.0F));
+    for (int col = 0; col < 2 * batch; ++col) { host_logits[col * domain] = f32_to_bf16(7.0F); }
+    auto d_logits = to_device(host_logits);
+    auto d_drafts = to_device(std::vector<int32_t>(batch, 0));
+    auto d_extents = to_device(std::vector<int32_t>(batch, 1));
+    auto d_lengths = to_device(std::vector<int32_t>(batch, 100));
+    auto d_anchors = to_device(std::vector<int32_t>(batch, 0));
+    auto d_targets = to_device(std::vector<int32_t>(2 * batch, 0));
+    DeviceBuffer d_tokens(2 * batch * sizeof(int32_t)), d_counts(batch * sizeof(int32_t)), d_accepted(batch * sizeof(int32_t));
+    std::vector<ops::SamplingConfig> configs(batch);
+    for (int row = 0; row < batch; ++row) {
+        configs[row].temperature = 1.0F;
+        configs[row].top_p = 0.75F;
+        configs[row].seed = 77123 + row;
+    }
+    auto d_configs = to_device(configs);
+    Tensor logits(d_logits.p, DType::BF16, {domain, 2, batch}), targets(d_targets.p, DType::I32, {2, batch});
+    Tensor drafts(d_drafts.p, DType::I32, {1, batch}), extents(d_extents.p, DType::I32, {batch});
+    Tensor lengths(d_lengths.p, DType::I32, {batch}), anchors(d_anchors.p, DType::I32, {batch});
+    Tensor tokens(d_tokens.p, DType::I32, {2, batch}), counts(d_counts.p, DType::I32, {batch}), accepted(d_accepted.p, DType::I32, {batch});
+    WorkspaceArena workspace(ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(domain, 1, 1, batch, batch));
+    const double largest = std::exp(7.0);
+    const int support = 1 + static_cast<int>(std::ceil(0.75 * (largest + domain - 1) - largest));
+    const double normalizer = largest + support - 1;
+    int zero_count = 0, tail_count = 0;
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        ops::speculative_accept_greedy_drafts(targets, logits, drafts, extents, lengths, anchors,
+            tokens, counts, accepted, domain, static_cast<const ops::SamplingConfig*>(d_configs.p), workspace, nullptr);
+        cuda_synchronize();
+        const auto sampled = from_device<int32_t>(d_tokens, batch * 2);
+        const auto accepted_values = from_device<int32_t>(d_accepted, batch);
+        const auto count_values = from_device<int32_t>(d_counts, batch);
+        for (int row = 0; row < batch; ++row) {
+            const int first = sampled[row * 2];
+            if (first < 0 || first >= support || accepted_values[row] != int(first == 0) || count_values[row] != 1 + accepted_values[row]) { return 1; }
+            zero_count += first == 0;
+            tail_count += first >= ops::kSamplerSortTile;
+        }
+    }
+    const double samples = batch * iterations;
+    const auto agrees = [&](int observed, double expected) {
+        return std::abs(observed / samples - expected) < 7 * std::sqrt(expected * (1 - expected) / samples) + 2 / samples;
+    };
+    if (!agrees(zero_count, largest / normalizer) ||
+        !agrees(tail_count, (support - ops::kSamplerSortTile) / normalizer)) {
+        std::cerr << "wide speculative acceptance/residual distribution mismatch\n";
+        return 1;
+    }
+    std::cout << "wide speculative acceptance/residual distribution: PASS\n";
+    return 0;
 }
 
 int select_hidden_case(int rows, int columns, int accepted_value) {
@@ -487,7 +545,11 @@ int main() {
     failures += greedy_accept_case(15, 7, 257);
     failures += deterministic_sampling_case();
     failures += constrained_sampling_columns_case();
+    failures += constrained_sampling_columns_case(32769);
     failures += batched_sampling_workspace_stride_case();
+    failures += batched_sampling_workspace_stride_case(32769, 64, 1);
+    failures += batched_sampling_workspace_stride_case(32769, 0, 64);
+    failures += wide_speculative_distribution_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);
     failures += select_hidden_case(2048, 16, 7);

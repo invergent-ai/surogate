@@ -30,8 +30,11 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     const std::int32_t batch             = logits.ne[1];
     const auto* positions                = static_cast<const std::int32_t*>(logical_positions.data);
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, batch);
+    const SamplingWorkspace scratch = layout.bind(workspace);
+    const auto* sorted = sampling_sort_launch(logits, token_domain, configs, nullptr, nullptr,
+        1, batch, scratch, static_cast<size_t>(token_domain) * sizeof(unsigned long long), stream);
     sampling_wide_kernel<<<batch, kSamplerBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), static_cast<int32_t*>(out.data), configs,
+        static_cast<const __nv_bfloat16*>(logits.data), sorted, static_cast<int32_t*>(out.data), configs,
         positions, purpose, token_domain, physical_rows);
     CUDA_CHECK(cudaGetLastError());
     // Rows that asked for no truncation are drawn from the whole vocabulary. Which
@@ -53,7 +56,6 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     }
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const std::int32_t groups         = sampler_group_count(partial_blocks);
-    const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(batch));
     sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(

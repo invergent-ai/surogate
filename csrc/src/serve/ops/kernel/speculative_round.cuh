@@ -6,7 +6,7 @@
 // registered full-vocabulary stochastic route uses the sampling partial/group
 // pipeline and caller-owned workspace, while greedy commit remains one thread.
 
-#include "ops/kernel/sampling_exact.cuh"
+#include "ops/kernel/sampling_sorted.cuh"
 
 #include <cuda_bf16.h>
 
@@ -72,21 +72,34 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
 __global__ void speculative_accept_wide_kernel(
     const __nv_bfloat16* logits, const int32_t* drafts, const int32_t* extents,
     int32_t* lengths, int32_t* anchors, int32_t* tokens, int32_t* counts, int32_t* accepted,
-    const SamplingConfig* configs, int domain, int physical_rows, int k) {
+    const SamplingConfig* configs, int domain, int physical_rows, int k,
+    const unsigned long long* sorted, size_t sorted_row_stride) {
     const int row = blockIdx.x, width = k + 1;
     const SamplingConfig cfg = configs[row];
     if (!sampling_wide(cfg)) { return; }
     const int extent = min(k, max(0, extents[row]));
     const int length = lengths[row];
     const auto* row_drafts = drafts + row * k;
-    __shared__ ExactSamplingScratch scratch;
+    __shared__ union { ExactSamplingScratch untruncated; SortedSamplingScratch filtered; } scratch;
     __shared__ int stop;
     __shared__ int produced;
     for (int col = 0; col <= extent; ++col) {
         const int draft = col < extent ? row_drafts[col] : -1;
         const int purpose = col < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
-        auto result = sampling_exact(logits + (int64_t(row) * width + col) * physical_rows,
-            domain, cfg, length + col + 1, purpose, scratch, draft, draft, row_drafts, col);
+        const auto* column = logits + (int64_t(row) * width + col) * physical_rows;
+        ExactSample result;
+        if (sampling_untruncated(cfg)) {
+            result = sampling_untruncated_exact(column, domain, cfg, length + col + 1,
+                purpose, scratch.untruncated, draft, draft, row_drafts, col);
+        } else {
+            const auto* keys = sorted ? reinterpret_cast<const unsigned long long*>(
+                reinterpret_cast<const char*>(sorted) + row * sorted_row_stride) + int64_t(col) * domain :
+                sampling_sort_local(column, domain, cfg, scratch.filtered, row_drafts, col);
+            const float x = draft >= 0 && draft < domain ? sampling_adjusted_logit(
+                __bfloat162float(column[draft]), draft, cfg, row_drafts, col) : -CUDART_INF_F;
+            result = sampling_sorted(keys, domain, cfg, length + col + 1, purpose, scratch.filtered,
+                isfinite(x) ? sampling_sort_key(x, draft) : 0, draft);
+        }
         if (threadIdx.x == 0) {
             const bool keep = col < extent && sampling_uniform(cfg.seed, length + col + 1,
                 kSamplePurposeSpeculativeAccept, 0) < result.candidate_probability;
@@ -104,7 +117,10 @@ __global__ void speculative_accept_wide_kernel(
         lengths[row] = length + produced;
         for (int i = produced; i < width; ++i) { tokens[row * width + i] = 0; }
         if (cfg.token_counts) {
-            for (int i = 0; i < produced; ++i) { atomicAdd(cfg.token_counts + tokens[row * width + i], 1); }
+            for (int i = 0; i < produced; ++i) {
+                const int token = tokens[row * width + i];
+                if (token >= 0 && token < domain) { atomicAdd(cfg.token_counts + token, 1); }
+            }
         }
     }
 }

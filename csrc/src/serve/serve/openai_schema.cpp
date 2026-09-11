@@ -348,6 +348,7 @@ void parse_tools(const Json& body, GenerationRequest& out) {
                 bad_request("function strict must be a boolean", "tools");
             }
             tool.strict = fn.at("strict").get<bool>();
+            tool.strict_set = true;
         } else {
             fn["strict"] = false;
         }
@@ -678,6 +679,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
+    out.parallel_tool_calls = get_bool(body, "parallel_tool_calls", true);
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);
