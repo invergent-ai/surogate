@@ -280,9 +280,6 @@ sinfer_add_test(sinfer_openai_schema_test
 sinfer_add_test(sinfer_responses_schema_test
   SOURCES test_responses_schema.cpp
   LIBRARIES sinfer_serve)
-sinfer_add_test(sinfer_response_store_test
-  SOURCES test_response_store.cpp
-  LIBRARIES sinfer_serve)
 sinfer_add_test(sinfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
   LIBRARIES sinfer_serve)

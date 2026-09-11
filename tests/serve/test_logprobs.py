@@ -163,9 +163,7 @@ def test_responses_scores(server, stream):
         deltas = [event for event in events if event["type"] == "response.output_text.delta" and event["logprobs"]]
         assert len(deltas) > 1
         assert [entry for event in deltas for entry in event["logprobs"]] == entries
-    stored = requests.get(server + "/v1/responses/" + body["id"], timeout=30)
-    assert stored.ok, stored.text
-    assert stored.json()["output"] == body["output"]
+    assert body["store"] is False
 
 
 def test_constrained_scores(server):

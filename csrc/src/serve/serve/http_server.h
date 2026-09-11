@@ -1,7 +1,6 @@
 #pragma once
 
 #include "serve/generation_service.h"
-#include "serve/response_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
 
@@ -56,10 +55,6 @@ private:
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_responses(const httplib::Request& req, httplib::Response& res);
     void handle_response_input_tokens(const httplib::Request& req, httplib::Response& res);
-    void handle_response_get(const httplib::Request& req, httplib::Response& res);
-    void handle_response_delete(const httplib::Request& req, httplib::Response& res);
-    void handle_response_input_items(const httplib::Request& req, httplib::Response& res);
-    void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     /// GET /kv_stats: per-model KV pool physical occupancy, for elastic-KV sizing.
@@ -102,7 +97,6 @@ private:
     GenerationService& route_model(const std::string& model, std::string* lora_adapter);
     /// The service a management endpoint (?model=) addresses; primary default.
     GenerationService& routed_management_service(const httplib::Request& req);
-    ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     /// Set by stop(); every in-flight request's cancellation predicate reads it.

@@ -455,7 +455,6 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.parallel_tool_calls = request.parallel_tool_calls;
     prepared.enable_thinking                   = semantics.enable_thinking;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
-    prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
     const bool request_has_media               = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");

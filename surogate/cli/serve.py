@@ -89,8 +89,7 @@ _VALUE_OPTIONS = {
         --host --port --api-key --served-model-name --max-model-len --max-num-seqs
         --max-pending-requests --pending-timeout-ms --max-num-batched-tokens
         --log-stats-interval-ms --max-request-mib --media-cache-mib --media-live-mib
-        --media-preprocess-threads --request-log-jsonl --response-store-max-records
-        --response-store-max-mib --kv-cache-dtype --kv-cache-dtype-skip-layers
+        --media-preprocess-threads --request-log-jsonl --kv-cache-dtype --kv-cache-dtype-skip-layers
         --default-max-tokens --reasoning-parser --tool-call-parser --chat-template
         --model-priority --model --lora-modules --max-loras --max-lora-rank
     """.split()),

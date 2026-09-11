@@ -183,7 +183,6 @@ Json request_json(const RequestLogContext& context) {
                 {"has_tool_history", context.has_tool_history},
                 {"enable_thinking", context.enable_thinking},
                 {"preserve_thinking", context.preserve_thinking},
-                {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -316,7 +315,6 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
     context.preserve_thinking                  = prepared.preserve_thinking;
-    context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
     context.sampling                           = prepared.sampling;
     context.acquisition_seconds                = prepared.acquisition_seconds;
     context.preparation                        = prepared.preparation;
@@ -354,7 +352,6 @@ std::string format_request_start(const RequestLogContext& context) {
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
         << " thinking=" << (context.enable_thinking ? "on" : "off")
         << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
-        << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
         << " sampler=[" << sampler_str(context.sampling) << ']';
     if (context.media_item_count != 0) {
         out << " prepare=" << seconds_str(context.preparation.seconds)

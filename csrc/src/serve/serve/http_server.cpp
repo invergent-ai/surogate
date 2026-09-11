@@ -136,7 +136,6 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
-      response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
     std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
@@ -333,22 +332,6 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_compact(req, res);
                  });
-    server_.Post(R"(/v1/responses/([^/]+)/cancel)",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_cancel(req, res);
-                 });
-    server_.Get(R"(/v1/responses/([^/]+)/input_items)",
-                [this](const httplib::Request& req, httplib::Response& res) {
-                    handle_response_input_items(req, res);
-                });
-    server_.Get(R"(/v1/responses/([^/]+))",
-                [this](const httplib::Request& req, httplib::Response& res) {
-                    handle_response_get(req, res);
-                });
-    server_.Delete(R"(/v1/responses/([^/]+))",
-                   [this](const httplib::Request& req, httplib::Response& res) {
-                       handle_response_delete(req, res);
-                   });
     // vLLM's sleep-mode routes: sleeping releases VRAM (state parked in host
     // RAM), waking restores it in about the PCIe copy time. Generation while
     // asleep is refused by the engine with a 503 naming /wake_up.

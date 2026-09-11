@@ -17,8 +17,6 @@ namespace sinfer::serve {
 // clamps the request to its effective context capacity.
 inline constexpr int kDefaultMaxTokens                    = 8192;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
-inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
-inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
     bool help_requested = false;
@@ -88,8 +86,6 @@ struct ServeOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
-    std::size_t response_store_max_records = kDefaultResponseStoreRecords;
-    std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     std::vector<int> devices;                    // --devices a,b,c (pipeline stages, in order)
     KvCacheStorage kv_cache                = KvCacheStorage::Auto;

@@ -34,7 +34,6 @@ struct RequestLogContext {
     bool has_tool_history                  = false;
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
-    bool preserve_thinking_semantic_change = false;
     sinfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     sinfer::PromptPreparationStats preparation;

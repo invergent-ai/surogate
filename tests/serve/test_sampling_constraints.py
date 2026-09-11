@@ -226,8 +226,7 @@ def test_responses_structured_output(server):
     assert result["text"]["format"] == fmt
     text = "".join(part["text"] for item in result["output"] if item["type"] == "message" for part in item["content"])
     assert json.loads(text) == expected
-    stored = requests.get(server + "/v1/responses/" + result["id"], timeout=10)
-    assert stored.ok and stored.json()["text"]["format"] == fmt
+    assert result["store"] is False
     response = requests.post(server + "/v1/responses", json={**payload, "stream": True}, timeout=90)
     assert response.ok, response.text
     pieces = []

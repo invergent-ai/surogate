@@ -123,7 +123,6 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
-           "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-cache-dtype auto|bf16|fp8|fp8_e4m3|int8] [--kv-cache-dtype-skip-layers L,...] "
            "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] "
            "[--default-max-tokens N] "
@@ -145,8 +144,6 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --served-model-name overrides the artifact identity.model_id reported by the server\n"
-           "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
-           "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables image/video input for a supported model\n"
            "       --kv-capacity auto leaves " +
@@ -330,20 +327,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
-        } else if (arg == "--response-store-max-records") {
-            const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
-                                                      "response-store-max-records");
-            if (records == 0) {
-                throw std::invalid_argument("--response-store-max-records must be positive");
-            }
-            options.response_store_max_records = static_cast<std::size_t>(records);
-        } else if (arg == "--response-store-max-mib") {
-            const std::uint64_t mib =
-                parse_u64(require_value("--response-store-max-mib"), "response-store-max-mib");
-            if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
-                throw std::invalid_argument("--response-store-max-mib is out of range");
-            }
-            options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--devices") {

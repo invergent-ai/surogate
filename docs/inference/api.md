@@ -28,10 +28,6 @@ the server reports, which is how you keep a client's hard-coded model string wor
 | `POST` | `/v1/completions` | Raw text completion without a chat template |
 | `POST` | `/tokenize` | Render and tokenize `messages` or a raw `prompt` without generating |
 | `POST` | `/v1/responses` | Responses API |
-| `GET` | `/v1/responses/{id}` | Fetch a stored response |
-| `DELETE` | `/v1/responses/{id}` | Delete a stored response |
-| `POST` | `/v1/responses/{id}/cancel` | Background cancellation is unsupported; see [Responses API](#responses-api) |
-| `GET` | `/v1/responses/{id}/input_items` | List the input items of a stored response |
 | `POST` | `/v1/responses/input_tokens` | Count input tokens without generating |
 | `POST` | `/v1/responses/compact` | Returns `400 compaction_not_supported` |
 | `GET` | `/v1/models`, `/v1/models/{id}` | Model listing |
@@ -258,7 +254,7 @@ place `name`, `strict`, and `schema` directly inside the format object:
 ```
 
 Use `"text": {"format": {"type": "json_object"}}` when any JSON object is sufficient.
-Both formats work with streaming and are preserved when retrieving a stored response.
+Both formats work with streaming and non-streaming requests.
 
 ### Streaming shape
 
@@ -373,15 +369,18 @@ unchanged. Replacing an adapter works with `--max-loras 1`.
 ## Responses API
 
 `POST /v1/responses` accepts `input` (string or typed items), `instructions`,
-`previous_response_id`, `metadata`, `tools`, `tool_choice`, `store`, and `stream`, and emits
-semantic SSE events when streaming. Stored state is **process-local** — it does not survive a
-restart and is not shared between replicas — and bounded by `--response-store-max-records`
-(1024) and `--response-store-max-mib` (256). Pass `store: false` for stateless use.
+`metadata`, `tools`, `tool_choice`, and `stream`, and emits semantic SSE events when streaming.
+Requests are stateless: include the complete conversation history in `input`, including prior
+assistant outputs and tool results. The server does not store conversations or provide
+response retrieval, deletion, or input-item listing endpoints.
+
+Omit `store` or set it to `false`. `store: true` and non-null `previous_response_id` return
+HTTP `400`. Responses report `store: false`; their IDs cannot be used to continue a conversation.
 
 Responses accepts `tool_choice: "auto"`, `"none"`, `"required"`, or a named function such as
 `{"type":"function","name":"weather"}`. Define function tools with `name`, `parameters`, and
 optional `strict` directly on the tool object. Both strict tools and `parallel_tool_calls: false`
-work with streaming and stored responses; the tool-choice rules above apply unchanged.
+work with streaming and non-streaming requests; the tool-choice rules above apply unchanged.
 
 For generated-token probabilities, set `include: ["message.output_text.logprobs"]` and
 optionally `top_logprobs` (0–20). Scores appear on the output-text content part and in the
@@ -391,9 +390,7 @@ optionally `top_logprobs` (0–20). Scores appear on the output-text content par
 tokens, including reasoning and tool syntax, using the same probabilities as Chat Completions.
 
 Background execution and compaction are unsupported. `/v1/responses/compact` returns
-`400 compaction_not_supported`. `/v1/responses/{id}/cancel` returns
-`400 background_not_supported` for a stored id and `404` for an unknown id; it does not cancel
-foreground generation. Disconnecting the client cancels its active generation request.
+`400 compaction_not_supported`. Disconnecting the client cancels its active generation request.
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses \

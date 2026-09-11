@@ -6,17 +6,12 @@
 
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <iterator>
 #include <memory>
-#include <optional>
 #include <string>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -33,7 +28,6 @@ public:
 struct StreamingResponse {
     PreparedRequest prepared;
     ResponsesRequest request;
-    ResponseContext previous_context;
     RequestLogContext log_context;
     std::unique_ptr<ResponsesEventStream> encoder;
     std::atomic<bool> cancelled{false};
@@ -55,16 +49,6 @@ ApiError internal_error(const std::exception& exception) {
     error.status  = 500;
     error.type    = "server_error";
     error.message = exception.what();
-    return error;
-}
-
-ApiError response_not_found(const std::string& id) {
-    ApiError error;
-    error.status  = 404;
-    error.type    = "invalid_request_error";
-    error.param   = "response_id";
-    error.code    = "response_not_found";
-    error.message = "response '" + id + "' not found";
     return error;
 }
 
@@ -115,12 +99,6 @@ void set_owned_content(httplib::Response& response, std::string body,
     response.hold_resource(std::move(lifetime));
 }
 
-ResponseContext terminal_context(const ResponseContext& previous, const ResponsesRequest& request,
-                                 const BuiltResponse& response) {
-    ResponseContext input = append_response_context(previous, request.input_turns);
-    return append_response_context(std::move(input), response.output_history);
-}
-
 ResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
                                       const GenerationOutcome* outcome = nullptr) {
     ResponsesRuntimeValues runtime;
@@ -132,81 +110,10 @@ ResponsesRuntimeValues runtime_values(const PreparedRequest& prepared,
     return runtime;
 }
 
-std::string path_response_id(const httplib::Request& request) {
-    return request.matches.size() > 1 ? request.matches[1].str() : std::string();
-}
-
-int parse_limit(const httplib::Request& request) {
-    if (!request.has_param("limit")) { return 20; }
-    const std::string value = request.get_param_value("limit");
-    int parsed              = 0;
-    const auto result       = std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || parsed < 1 ||
-        parsed > 100) {
-        ApiError error;
-        error.status  = 400;
-        error.param   = "limit";
-        error.code    = "invalid_pagination";
-        error.message = "limit must be an integer in [1,100]";
-        throw ApiException(std::move(error));
-    }
-    return parsed;
-}
-
-Json paginated_input_items(const httplib::Request& request, const std::vector<Json>& stored_items) {
-    if (request.has_param("include") && !request.get_param_value("include").empty()) {
-        ApiError error;
-        error.status  = 400;
-        error.param   = "include";
-        error.code    = "include_not_supported";
-        error.message = "additional input Item fields are not supported";
-        throw ApiException(std::move(error));
-    }
-    const int limit   = parse_limit(request);
-    std::string order = request.has_param("order") ? request.get_param_value("order") : "desc";
-    if (order != "asc" && order != "desc") {
-        ApiError error;
-        error.status  = 400;
-        error.param   = "order";
-        error.code    = "invalid_pagination";
-        error.message = "order must be 'asc' or 'desc'";
-        throw ApiException(std::move(error));
-    }
-
-    std::vector<Json> ordered = stored_items;
-    if (order == "desc") { std::reverse(ordered.begin(), ordered.end()); }
-    std::size_t begin = 0;
-    if (request.has_param("after")) {
-        const std::string after = request.get_param_value("after");
-        const auto found = std::find_if(ordered.begin(), ordered.end(), [&](const Json& item) {
-            return item.contains("id") && item.at("id").is_string() &&
-                   item.at("id").get<std::string>() == after;
-        });
-        if (found == ordered.end()) {
-            ApiError error;
-            error.status  = 400;
-            error.param   = "after";
-            error.code    = "invalid_pagination";
-            error.message = "after does not identify an input Item in this response";
-            throw ApiException(std::move(error));
-        }
-        begin = static_cast<std::size_t>(std::distance(ordered.begin(), found)) + 1;
-    }
-    const std::size_t end = std::min(ordered.size(), begin + static_cast<std::size_t>(limit));
-    Json data             = Json::array();
-    for (std::size_t index = begin; index < end; ++index) { data.push_back(ordered[index]); }
-    return Json{{"object", "list"},
-                {"data", data},
-                {"first_id", data.empty() ? Json(nullptr) : data.front().at("id")},
-                {"last_id", data.empty() ? Json(nullptr) : data.back().at("id")},
-                {"has_more", end < ordered.size()}};
-}
-
 } // namespace
 
 void HttpServer::handle_responses(const httplib::Request& req, httplib::Response& res) {
     ResponsesRequest request;
-    ResponseContext previous_context;
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -221,16 +128,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             }
         }
         if (scheduler_ != nullptr) { scheduler_->ensure_awake(&svc()); }
-        if (request.previous_response_id) {
-            const std::shared_ptr<const StoredResponse> previous =
-                response_store_.get(*request.previous_response_id);
-            if (!previous) {
-                throw ApiException(response_not_found(*request.previous_response_id));
-            }
-            inherit_responses_preserve_thinking(request, previous->preserve_thinking);
-            previous_context = previous->context;
-        }
-        compose_responses_generation_messages(request, flatten_response_context(previous_context));
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
         return;
@@ -269,15 +166,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 svc().run(prepared, nullptr, [&req] { return disconnected(req); });
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
-            if (request.store) {
-                StoredResponse stored;
-                stored.id                = id;
-                stored.response          = response.body;
-                stored.input_items       = request.input_items;
-                stored.context           = terminal_context(previous_context, request, response);
-                stored.preserve_thinking = prepared.preserve_thinking;
-                response_store_.put(std::move(stored));
-            }
             log_request_done(log_context, outcome);
             set_owned_content(res, response.body.dump(), prepared.lifetime);
         } catch (const ApiException& exception) {
@@ -294,7 +182,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     auto stream              = std::make_shared<StreamingResponse>();
     stream->prepared         = std::move(prepared);
     stream->request          = std::move(request);
-    stream->previous_context = std::move(previous_context);
     stream->log_context      = log_context;
     stream->encoder          = std::make_unique<ResponsesEventStream>(id, created, stream->request,
                                                                       runtime_values(stream->prepared));
@@ -329,16 +216,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
-                if (stream->request.store) {
-                    StoredResponse stored;
-                    stored.id          = finished.response.body.at("id").get<std::string>();
-                    stored.response    = finished.response.body;
-                    stored.input_items = stream->request.input_items;
-                    stored.context     = terminal_context(stream->previous_context, stream->request,
-                                                          finished.response);
-                    stored.preserve_thinking = stream->prepared.preserve_thinking;
-                    response_store_.put(std::move(stored));
-                }
                 write_stream_items(sink, *stream, std::move(finished.events_before_terminal));
                 log_request_done(stream->log_context, outcome);
                 write_stream_item(sink, *stream, stream->encoder->terminal(finished.response));
@@ -390,53 +267,6 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));
     } catch (const std::exception& exception) { write_error(res, internal_error(exception)); }
-}
-
-void HttpServer::handle_response_get(const httplib::Request& req, httplib::Response& res) {
-    const std::string id                               = path_response_id(req);
-    const std::shared_ptr<const StoredResponse> stored = response_store_.get(id);
-    if (!stored) {
-        write_error(res, response_not_found(id));
-        return;
-    }
-    res.set_content(stored->response.dump(), "application/json");
-}
-
-void HttpServer::handle_response_delete(const httplib::Request& req, httplib::Response& res) {
-    const std::string id = path_response_id(req);
-    if (!response_store_.erase(id)) {
-        write_error(res, response_not_found(id));
-        return;
-    }
-    res.set_content(Json{{"id", id}, {"object", "response.deleted"}, {"deleted", true}}.dump(),
-                    "application/json");
-}
-
-void HttpServer::handle_response_input_items(const httplib::Request& req, httplib::Response& res) {
-    const std::string id                               = path_response_id(req);
-    const std::shared_ptr<const StoredResponse> stored = response_store_.get(id);
-    if (!stored) {
-        write_error(res, response_not_found(id));
-        return;
-    }
-    try {
-        res.set_content(paginated_input_items(req, stored->input_items).dump(), "application/json");
-    } catch (const ApiException& exception) { write_error(res, exception.error()); }
-}
-
-void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Response& res) {
-    const std::string id = path_response_id(req);
-    if (!response_store_.get(id)) {
-        write_error(res, response_not_found(id));
-        return;
-    }
-    ApiError error;
-    error.status  = 400;
-    error.type    = "invalid_request_error";
-    error.code    = "background_not_supported";
-    error.message = "only background responses can be cancelled; SInfer does not support "
-                    "background execution";
-    write_error(res, error);
 }
 
 void HttpServer::handle_response_compact(const httplib::Request&, httplib::Response& res) {

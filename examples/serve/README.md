@@ -166,7 +166,7 @@ With `launch.sh chat` running, choose any client command:
 | `tools` | Auto tool selection, argument validation, local function and tool-result round trip |
 | `completions` | Raw text without a chat template, greedy decoding and stop string |
 | `tokens` | Tokenization with token strings, then generation from exact prompt IDs |
-| `responses` | Stored conversation, continuation by ID, retrieval, input items/count, deletion |
+| `responses` | Conversation history supplied by the client, follow-up generation and input token counts |
 | `anthropic` | Messages and message token counts |
 | `concurrent` | Eight simultaneous requests with a common prefix; use the concurrent launch |
 | `status` | Health, model names, KV statistics and Prometheus metrics |
@@ -177,11 +177,9 @@ python examples/serve/client.py anthropic
 python examples/serve/client.py tokens
 ```
 
-The server has no constrained JSON/schema decoding or prompt-logprob scoring;
-RULER judges and distillation teachers need the external services described in their
-examples. `top_logprobs` alternatives are unavailable in native generation.
-Responses state is local to the running process; background execution and
-compaction are unsupported.
+Responses requests are stateless: keep conversation history in the client and include it
+in each request. Background execution and compaction are unsupported. See the
+[API guide](../../docs/inference/api.md) for structured output, token scores and other options.
 
 For authentication, export the same `SUROGATE_API_KEY` in server and client terminals.
 The launch script passes it as `--api-key`; the client sends a bearer header.

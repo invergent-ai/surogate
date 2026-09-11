@@ -91,14 +91,6 @@ std::string require_function_name(const Json& object, const char* param) {
     return name;
 }
 
-std::string item_id(const Json& item, const char* prefix, const char* param) {
-    if (!item.contains("id") || item.at("id").is_null()) { return new_response_item_id(prefix); }
-    if (!item.at("id").is_string() || item.at("id").get<std::string>().empty()) {
-        bad_request("input Item id must be a non-empty string", param);
-    }
-    return item.at("id").get<std::string>();
-}
-
 sinfer::product::media_acquire::Source parse_image_source(const Json& part) {
     if (part.contains("file_id") && !part.at("file_id").is_null()) {
         bad_request("input_image.file_id is not supported; use image_url", "input",
@@ -148,12 +140,7 @@ sinfer::product::media_acquire::Source parse_video_source(const Json& part) {
     return source;
 }
 
-struct ParsedMessage {
-    ChatTurn turn;
-    Json canonical;
-};
-
-ParsedMessage parse_message_item(const Json& item, std::size_t index) {
+ChatTurn parse_message_item(const Json& item, std::size_t index) {
     if (!item.contains("role") || !item.at("role").is_string()) {
         bad_request("input message " + std::to_string(index) + " must contain a string role",
                     "input");
@@ -183,18 +170,14 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
         bad_request("input message " + std::to_string(index) + " must contain content", "input");
     }
 
-    ParsedMessage parsed;
-    parsed.turn.role       = parsed_role;
-    Json content           = Json::array();
+    ChatTurn parsed;
+    parsed.role            = parsed_role;
     const auto append_text = [&](const std::string& text, const std::string& wire_type) {
         ContentPart part;
         part.kind     = ContentKind::Text;
         part.text     = text;
         part.type_raw = wire_type;
-        parsed.turn.content.push_back(std::move(part));
-        Json canonical = {{"type", wire_type}, {"text", text}};
-        if (wire_type == "output_text") { canonical["annotations"] = Json::array(); }
-        content.push_back(std::move(canonical));
+        parsed.content.push_back(std::move(part));
     };
 
     if (item.at("content").is_string()) {
@@ -222,10 +205,7 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
                 part.kind     = ContentKind::Image;
                 part.type_raw = type;
                 part.source   = parse_image_source(value);
-                parsed.turn.content.push_back(std::move(part));
-                content.push_back(Json{{"type", "input_image"},
-                                       {"image_url", value.at("image_url")},
-                                       {"detail", "auto"}});
+                parsed.content.push_back(std::move(part));
             } else if (type == "input_video") {
                 if (parsed_role != ChatRole::User) {
                     bad_request("input_video is only supported on user messages", "input");
@@ -234,9 +214,7 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
                 part.kind     = ContentKind::Video;
                 part.type_raw = type;
                 part.source   = parse_video_source(value);
-                parsed.turn.content.push_back(std::move(part));
-                content.push_back(
-                    Json{{"type", "input_video"}, {"video_url", value.at("video_url")}});
+                parsed.content.push_back(std::move(part));
             } else if (type == "input_file") {
                 bad_request("input_file is not supported", "input", "file_inputs_not_supported");
             } else if (type == "input_audio") {
@@ -249,18 +227,12 @@ ParsedMessage parse_message_item(const Json& item, std::size_t index) {
     } else {
         bad_request("input message content must be a string or array", "input");
     }
-    if (parsed.turn.content.empty()) {
-        bad_request("input message content must not be empty", "input");
-    }
+    if (parsed.content.empty()) { bad_request("input message content must not be empty", "input"); }
 
-    parsed.canonical = {{"id", item_id(item, "msg", "input")},
-                        {"type", "message"},
-                        {"role", role},
-                        {"content", std::move(content)}};
     return parsed;
 }
 
-std::string parse_reasoning_item(const Json& item, Json& canonical) {
+std::string parse_reasoning_item(const Json& item) {
     if (item.contains("encrypted_content") && !item.at("encrypted_content").is_null()) {
         bad_request("encrypted reasoning content is not supported", "input",
                     "encrypted_reasoning_not_supported");
@@ -278,7 +250,6 @@ std::string parse_reasoning_item(const Json& item, Json& canonical) {
         bad_request("reasoning Item must contain a content array", "input");
     }
     std::string text;
-    Json content = Json::array();
     for (const Json& part : item.at("content")) {
         if (!part.is_object() || !part.contains("type") || !part.at("type").is_string() ||
             part.at("type").get<std::string>() != "reasoning_text" || !part.contains("text") ||
@@ -286,16 +257,11 @@ std::string parse_reasoning_item(const Json& item, Json& canonical) {
             bad_request("reasoning content only supports reasoning_text parts", "input");
         }
         text += part.at("text").get<std::string>();
-        content.push_back(Json{{"type", "reasoning_text"}, {"text", part.at("text")}});
     }
-    canonical = {{"id", item_id(item, "rs", "input")},
-                 {"type", "reasoning"},
-                 {"summary", Json::array()},
-                 {"content", std::move(content)}};
     return text;
 }
 
-ToolCall parse_function_call_item(const Json& item, Json& canonical) {
+ToolCall parse_function_call_item(const Json& item) {
     ToolCall call;
     if (!item.contains("call_id") || !item.at("call_id").is_string() ||
         item.at("call_id").get<std::string>().empty()) {
@@ -315,16 +281,10 @@ ToolCall parse_function_call_item(const Json& item, Json& canonical) {
         (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
         bad_request("function_call status must be 'completed'", "input");
     }
-    canonical = {{"id", item_id(item, "fc", "input")},
-                 {"type", "function_call"},
-                 {"status", "completed"},
-                 {"call_id", call.id},
-                 {"name", call.name},
-                 {"arguments", call.arguments_json}};
     return call;
 }
 
-ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
+ChatTurn parse_function_call_output_item(const Json& item) {
     if (!item.contains("call_id") || !item.at("call_id").is_string() ||
         item.at("call_id").get<std::string>().empty()) {
         bad_request("function_call_output must contain a non-empty call_id", "input");
@@ -344,11 +304,6 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
     content.type_raw = "input_text";
     content.text     = item.at("output").get<std::string>();
     turn.content.push_back(std::move(content));
-    canonical = {{"id", item_id(item, "fco", "input")},
-                 {"type", "function_call_output"},
-                 {"status", "completed"},
-                 {"call_id", turn.tool_call_id},
-                 {"output", item.at("output")}};
     return turn;
 }
 
@@ -384,35 +339,34 @@ void parse_input(const Json& input, ResponsesRequest& out) {
             bad_request("input Item must contain type", "input");
         }
 
-        Json canonical;
         if (type == "message") {
-            ParsedMessage message = parse_message_item(item, index);
+            ChatTurn message = parse_message_item(item, index);
             if (pending_reasoning_present) {
-                if (message.turn.role != ChatRole::Assistant) {
+                if (message.role != ChatRole::Assistant) {
                     bad_request("a reasoning Item must be followed by an assistant output Item",
                                 "input");
                 }
-                message.turn.reasoning_content = std::move(pending_reasoning);
+                message.reasoning_content = std::move(pending_reasoning);
                 pending_reasoning.clear();
                 pending_reasoning_present = false;
             }
-            out.input_turns.push_back(std::move(message.turn));
-            canonical                = std::move(message.canonical);
+            out.generation.messages.push_back(std::move(message));
             can_group_function_calls = false;
         } else if (type == "reasoning") {
             if (pending_reasoning_present) {
                 bad_request("adjacent reasoning Items are not supported", "input");
             }
-            pending_reasoning         = parse_reasoning_item(item, canonical);
+            pending_reasoning         = parse_reasoning_item(item);
             pending_reasoning_present = true;
             can_group_function_calls  = false;
         } else if (type == "function_call") {
-            ToolCall call = parse_function_call_item(item, canonical);
+            ToolCall call = parse_function_call_item(item);
             if (can_group_function_calls && !pending_reasoning_present &&
-                !out.input_turns.empty() && out.input_turns.back().role == ChatRole::Assistant &&
-                out.input_turns.back().content.empty() &&
-                !out.input_turns.back().tool_calls.empty()) {
-                out.input_turns.back().tool_calls.push_back(std::move(call));
+                !out.generation.messages.empty() &&
+                out.generation.messages.back().role == ChatRole::Assistant &&
+                out.generation.messages.back().content.empty() &&
+                !out.generation.messages.back().tool_calls.empty()) {
+                out.generation.messages.back().tool_calls.push_back(std::move(call));
             } else {
                 ChatTurn turn;
                 turn.role              = ChatRole::Assistant;
@@ -420,7 +374,7 @@ void parse_input(const Json& input, ResponsesRequest& out) {
                 pending_reasoning.clear();
                 pending_reasoning_present = false;
                 turn.tool_calls.push_back(std::move(call));
-                out.input_turns.push_back(std::move(turn));
+                out.generation.messages.push_back(std::move(turn));
             }
             can_group_function_calls = true;
         } else if (type == "function_call_output") {
@@ -428,7 +382,7 @@ void parse_input(const Json& input, ResponsesRequest& out) {
                 bad_request("a reasoning Item must be followed by an assistant output Item",
                             "input");
             }
-            out.input_turns.push_back(parse_function_call_output_item(item, canonical));
+            out.generation.messages.push_back(parse_function_call_output_item(item));
             can_group_function_calls = false;
         } else if (type == "input_file") {
             bad_request("input_file is not supported", "input", "file_inputs_not_supported");
@@ -436,9 +390,13 @@ void parse_input(const Json& input, ResponsesRequest& out) {
             bad_request("unsupported input Item type: " + type, "input", "item_type_not_supported");
         }
 
-        const std::string id = canonical.at("id").get<std::string>();
-        if (!ids.insert(id).second) { bad_request("duplicate input Item id: " + id, "input"); }
-        out.input_items.push_back(std::move(canonical));
+        if (item.contains("id") && !item.at("id").is_null()) {
+            if (!item.at("id").is_string() || item.at("id").get<std::string>().empty()) {
+                bad_request("input Item id must be a non-empty string", "input");
+            }
+            const auto id = item.at("id").get<std::string>();
+            if (!ids.insert(id).second) { bad_request("duplicate input Item id: " + id, "input"); }
+        }
     }
     if (pending_reasoning_present) {
         bad_request("a reasoning Item must be followed by an assistant output Item", "input");
@@ -726,14 +684,15 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         out.instructions = body.at("instructions").get<std::string>();
     }
     if (body.contains("previous_response_id") && !body.at("previous_response_id").is_null()) {
-        if (!body.at("previous_response_id").is_string() ||
-            body.at("previous_response_id").get<std::string>().empty()) {
-            bad_request("previous_response_id must be a non-empty string", "previous_response_id");
-        }
-        out.previous_response_id = body.at("previous_response_id").get<std::string>();
+        bad_request(
+            "previous_response_id is not supported; include the complete conversation in input",
+            "previous_response_id", "previous_response_id_not_supported");
+    }
+    if (optional_bool(body, "store", false)) {
+        bad_request("Responses storage is not supported; omit store or set it to false", "store",
+                    "response_storage_not_supported");
     }
 
-    out.store             = optional_bool(body, "store", true);
     out.stream            = optional_bool(body, "stream", false);
     out.generation.stream = out.stream;
     out.generation.top_logprobs = optional_int(body, "top_logprobs").value_or(0);
@@ -771,7 +730,16 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         out.generation.max_tokens     = limits.default_max_tokens;
         out.generation.max_tokens_set = false;
     }
-    out.generation.messages = out.input_turns;
+    if (out.instructions) {
+        ChatTurn instructions;
+        instructions.role = ChatRole::Developer;
+        ContentPart part;
+        part.kind     = ContentKind::Text;
+        part.type_raw = "input_text";
+        part.text     = *out.instructions;
+        instructions.content.push_back(std::move(part));
+        out.generation.messages.insert(out.generation.messages.begin(), std::move(instructions));
+    }
     return out;
 }
 
@@ -830,11 +798,10 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"metadata", request.metadata},
         {"model", request.generation.model},
         {"parallel_tool_calls", request.generation.parallel_tool_calls},
-        {"previous_response_id",
-         request.previous_response_id ? Json(*request.previous_response_id) : Json(nullptr)},
+        {"previous_response_id", nullptr},
         {"reasoning", reasoning},
         {"service_tier", "default"},
-        {"store", request.store},
+        {"store", false},
         {"temperature", runtime.temperature},
         {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
@@ -851,7 +818,7 @@ Json response_logprobs(const GenerationOutcome& outcome) {
         Json bytes = Json::array();
         for (unsigned char byte : text) bytes.push_back(static_cast<int>(byte));
         // Token pieces can end inside a UTF-8 character. Keep their exact bytes,
-        // but normalize the display string before it enters stored/SSE JSON.
+        // but normalize the display string before it enters response/SSE JSON.
         const Json display = Json::parse(Json(text).dump(-1, ' ', false, Json::error_handler_t::replace));
         return Json{{"token", display}, {"logprob", token.logprob}, {"bytes", std::move(bytes)}};
     };
@@ -915,19 +882,6 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
                                           {"arguments", call.arguments_json}});
     }
 
-    ChatTurn history;
-    history.role              = ChatRole::Assistant;
-    history.reasoning_content = outcome.reasoning;
-    history.tool_calls        = outcome.tool_calls;
-    if (!outcome.text.empty()) {
-        ContentPart part;
-        part.kind     = ContentKind::Text;
-        part.type_raw = "output_text";
-        part.text     = outcome.text;
-        history.content.push_back(std::move(part));
-    }
-    built.output_history.push_back(std::move(history));
-
     Json response            = response_common(id, created_at, request, runtime);
     response["status"]       = status;
     response["completed_at"] = completion_time_now();
@@ -981,39 +935,9 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
         }
     }
     ResponsesRequest parsed  = parse_request_impl(body, limits);
-    parsed.store             = false;
     parsed.stream            = false;
     parsed.generation.stream = false;
     return parsed;
-}
-
-void inherit_responses_preserve_thinking(ResponsesRequest& request, bool parent_value) {
-    if (request.generation.preserve_thinking) {
-        request.generation.preserve_thinking_semantic_change =
-            *request.generation.preserve_thinking != parent_value;
-        return;
-    }
-    request.generation.preserve_thinking = parent_value;
-}
-
-void compose_responses_generation_messages(ResponsesRequest& request,
-                                           const std::vector<ChatTurn>& previous_context) {
-    std::vector<ChatTurn> messages;
-    messages.reserve((request.instructions ? 1U : 0U) + previous_context.size() +
-                     request.input_turns.size());
-    if (request.instructions) {
-        ChatTurn instructions;
-        instructions.role = ChatRole::Developer;
-        ContentPart part;
-        part.kind     = ContentKind::Text;
-        part.type_raw = "input_text";
-        part.text     = *request.instructions;
-        instructions.content.push_back(std::move(part));
-        messages.push_back(std::move(instructions));
-    }
-    messages.insert(messages.end(), previous_context.begin(), previous_context.end());
-    messages.insert(messages.end(), request.input_turns.begin(), request.input_turns.end());
-    request.generation.messages = std::move(messages);
 }
 
 BuiltResponse make_response_object(const std::string& id, std::int64_t created_at,

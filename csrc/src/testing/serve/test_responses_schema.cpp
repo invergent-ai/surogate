@@ -78,49 +78,62 @@ Json parse_event(const std::string& event) {
 }
 
 int test_basic_request() {
-    const Json body                = {{"model", "qwen3.6-27b"},
-                                      {"input", "hello"},
-                                      {"instructions", "be concise"},
-                                      {"previous_response_id", "resp_previous"},
-                                      {"max_output_tokens", 64},
-                                      {"temperature", 0.3},
-                                      {"top_p", 0.8},
-                                      {"reasoning", Json{{"effort", "medium"}}},
-                                      {"metadata", Json{{"trace", "abc"}}}};
+    const Json body = {{"model", "qwen3.6-27b"},
+                       {"input", "hello"},
+                       {"instructions", "be concise"},
+                       {"max_output_tokens", 64},
+                       {"temperature", 0.3},
+                       {"top_p", 0.8},
+                       {"reasoning", Json{{"effort", "medium"}}},
+                       {"metadata", Json{{"trace", "abc"}}}};
     const ResponsesRequest request = parse_responses_request(body, limits());
-    int failures                   = 0;
+    int failures = 0;
     failures += check(request.generation.model == "qwen3.6-27b", "model parsed");
-    failures += check(request.input_turns.size() == 1 &&
-                          request.input_turns[0].role == sinfer::ChatRole::User &&
-                          request.input_turns[0].content[0].text == "hello",
-                      "string input normalized to a user turn");
-    failures += check(request.input_items[0].at("type") == "message" &&
-                          request.input_items[0].at("content")[0].at("type") == "input_text" &&
-                          request.input_items[0].contains("id"),
-                      "canonical input Item built with an id");
+    failures += check(request.generation.messages.size() == 2 &&
+                          request.generation.messages[0].role == sinfer::ChatRole::Developer &&
+                          request.generation.messages[0].content[0].text == "be concise" &&
+                          request.generation.messages[1].role == sinfer::ChatRole::User &&
+                          request.generation.messages[1].content[0].text == "hello",
+                      "instructions and string input compose a stateless prompt");
     failures += check(request.instructions && *request.instructions == "be concise",
-                      "instructions parsed separately");
-    failures +=
-        check(request.previous_response_id && *request.previous_response_id == "resp_previous",
-              "previous response id parsed");
+                      "instructions retained for response envelope");
     failures += check(request.generation.max_tokens == 64 && request.generation.max_tokens_set,
                       "max_output_tokens reaches generation request");
     failures += check(request.generation.reasoning_effort == RequestedReasoningEffort::Medium,
                       "medium reasoning effort was not parsed");
-    failures += check(request.store && !request.stream, "Responses defaults applied");
-    ResponsesRequest composed = request;
-    ChatTurn previous;
-    previous.role = sinfer::ChatRole::Assistant;
-    ContentPart previous_text;
-    previous_text.kind = ContentKind::Text;
-    previous_text.text = "old answer";
-    previous.content.push_back(std::move(previous_text));
-    compose_responses_generation_messages(composed, {previous});
-    failures += check(composed.generation.messages.size() == 3 &&
-                          composed.generation.messages[0].role == sinfer::ChatRole::Developer &&
-                          composed.generation.messages[1].content[0].text == "old answer" &&
-                          composed.generation.messages[2].content[0].text == "hello",
-                      "instructions, previous context, and current input composed in order");
+    failures += check(!request.stream, "Responses defaults applied");
+
+    Json conversation = body;
+    conversation["input"] = Json::array(
+        {Json{{"role", "assistant"}, {"content", "old answer"}}, Json{{"role", "user"}, {"content", "hello"}}});
+    const auto continued = parse_responses_request(conversation, limits());
+    failures += check(continued.generation.messages.size() == 3 &&
+                          continued.generation.messages[1].content[0].text == "old answer" &&
+                          continued.generation.messages[2].content[0].text == "hello",
+                      "explicit conversation history reaches generation in order");
+    for (const Json store : {Json(false), Json(nullptr)}) {
+        Json stateless = body;
+        stateless["store"] = store;
+        stateless["previous_response_id"] = nullptr;
+        failures += check(parse_responses_request(stateless, limits()).generation.messages.size() == 2,
+                          "inert storage fields changed the prompt");
+    }
+    Json storage = body;
+    storage["store"] = true;
+    failures +=
+        check(api_code([&] { (void)parse_responses_request(storage, limits()); }) == "response_storage_not_supported",
+              "store=true was accepted");
+    for (const Json id : {Json("resp_previous"), Json(""), Json(42)}) {
+        storage = body;
+        storage["previous_response_id"] = id;
+        failures += check(api_code([&] { (void)parse_responses_request(storage, limits()); }) ==
+                              "previous_response_id_not_supported",
+                          "response-ID continuation was accepted");
+    }
+    storage = body;
+    storage["store"] = "false";
+    failures +=
+        check(throws_api([&] { (void)parse_responses_request(storage, limits()); }), "non-boolean store was accepted");
     return failures;
 }
 
@@ -134,17 +147,11 @@ int test_instruction_message_order() {
                    Json{{"type", "message"}, {"role", "developer"}, {"content", "current"}}})},
              {"max_output_tokens", 32}},
         limits());
-    int failures = check(request.input_turns.size() == 3 &&
-                             request.input_turns[0].role == sinfer::ChatRole::System &&
-                             request.input_turns[1].role == sinfer::ChatRole::User &&
-                             request.input_turns[2].role == sinfer::ChatRole::Developer,
+    int failures = check(request.generation.messages.size() == 3 &&
+                             request.generation.messages[0].role == sinfer::ChatRole::System &&
+                             request.generation.messages[1].role == sinfer::ChatRole::User &&
+                             request.generation.messages[2].role == sinfer::ChatRole::Developer,
                          "Responses input instruction roles were lowered or reordered");
-    compose_responses_generation_messages(request, {});
-    failures += check(request.generation.messages.size() == 3 &&
-                          request.generation.messages[0].role == sinfer::ChatRole::System &&
-                          request.generation.messages[1].role == sinfer::ChatRole::User &&
-                          request.generation.messages[2].role == sinfer::ChatRole::Developer,
-                      "Responses composition changed input instruction order");
     return failures;
 }
 
@@ -203,7 +210,7 @@ int test_reasoning_effort() {
     return failures;
 }
 
-int test_preserve_thinking_options_and_inheritance() {
+int test_preserve_thinking_options() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
 
@@ -213,24 +220,13 @@ int test_preserve_thinking_options_and_inheritance() {
     failures += check(request.generation.preserve_thinking == true,
                       "Responses chat_template_kwargs preserve_thinking parsed");
 
-    ResponsesRequest inherited = parse_responses_request(base, limits());
-    inherit_responses_preserve_thinking(inherited, true);
-    failures += check(inherited.generation.preserve_thinking == true &&
-                          !inherited.generation.preserve_thinking_semantic_change,
-                      "Responses child did not inherit parent preserve_thinking");
-
-    ResponsesRequest unchanged = request;
-    inherit_responses_preserve_thinking(unchanged, true);
-    failures += check(!unchanged.generation.preserve_thinking_semantic_change,
-                      "equal explicit preserve value marked a semantic change");
-
-    Json explicit_false                 = base;
+    const auto defaults = parse_responses_request(base, limits());
+    failures += check(!defaults.generation.preserve_thinking.has_value(),
+                      "Responses preserve_thinking should use the server default when omitted");
+    Json explicit_false = base;
     explicit_false["preserve_thinking"] = false;
-    ResponsesRequest changed            = parse_responses_request(explicit_false, limits());
-    inherit_responses_preserve_thinking(changed, true);
-    failures += check(changed.generation.preserve_thinking == false &&
-                          changed.generation.preserve_thinking_semantic_change,
-                      "explicit Responses preserve branch was not marked");
+    failures += check(parse_responses_request(explicit_false, limits()).generation.preserve_thinking == false,
+                      "explicit Responses preserve_thinking=false was lost");
 
     Json conflict                 = kwargs;
     conflict["preserve_thinking"] = false;
@@ -288,15 +284,15 @@ int test_typed_items_and_tools() {
 
     const ResponsesRequest request = parse_responses_request(body, limits());
     int failures                   = 0;
-    failures += check(request.input_turns.size() == 3, "typed Items grouped into three turns");
-    failures += check(request.input_turns[0].role == sinfer::ChatRole::Assistant &&
-                          request.input_turns[0].reasoning_content == "need tools" &&
-                          request.input_turns[0].tool_calls.size() == 2,
+    failures += check(request.generation.messages.size() == 3, "typed Items grouped into three turns");
+    failures += check(request.generation.messages[0].role == sinfer::ChatRole::Assistant &&
+                          request.generation.messages[0].reasoning_content == "need tools" &&
+                          request.generation.messages[0].tool_calls.size() == 2,
                       "reasoning and adjacent function calls grouped into one assistant turn");
-    failures += check(request.input_turns[1].role == sinfer::ChatRole::Tool &&
-                          request.input_turns[1].tool_call_id == "call_1",
+    failures += check(request.generation.messages[1].role == sinfer::ChatRole::Tool &&
+                          request.generation.messages[1].tool_call_id == "call_1",
                       "function output translated to tool turn");
-    failures += check(request.input_turns[2].content[0].kind == ContentKind::Image,
+    failures += check(request.generation.messages[2].content[0].kind == ContentKind::Image,
                       "input image translated to media part");
     failures += check(request.generation.tools.size() == 1 &&
                           request.generation.tools[0].name == "weather" &&
@@ -400,11 +396,8 @@ int test_response_object() {
                   response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
                   response.at("usage").at("total_tokens") == 18,
               "Responses usage details serialized");
-    failures += check(built.output_history.size() == 1 &&
-                          built.output_history[0].reasoning_content == "thought" &&
-                          built.output_history[0].content[0].text == "answer",
-                      "terminal output converted to continuation history");
-
+    failures += check(response.at("store") == false && response.at("previous_response_id").is_null(),
+                      "Responses must advertise stateless operation");
     GenerationOutcome incomplete = sample_outcome();
     incomplete.finish_reason     = sinfer::FinishReason::OutputLimit;
     const Json limited = make_response_object("resp_limit", 123, request, runtime, incomplete).body;
@@ -528,7 +521,7 @@ int test_input_tokens_schema() {
     const ResponsesRequest request = parse_response_input_tokens_request(
         Json{{"model", "qwen3.6-27b"}, {"input", "hello"}}, limits());
     int failures = 0;
-    failures += check(!request.store && !request.stream, "input_tokens request is stateless");
+    failures += check(!request.stream, "input_tokens request is stateless");
     failures += check(Json::parse(make_response_input_tokens_body(9)) ==
                           Json{{"object", "response.input_tokens"}, {"input_tokens", 9}},
                       "input_tokens response shape");
@@ -548,7 +541,7 @@ int main() {
     int failures = 0;
     failures += test_basic_request();
     failures += test_instruction_message_order();
-    failures += test_preserve_thinking_options_and_inheritance();
+    failures += test_preserve_thinking_options();
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();

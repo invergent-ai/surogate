@@ -340,12 +340,6 @@ supported GGUF text quantization.
 Qwen3-VL image and video serving has been checked with the 2B and 30B-A3B GGUF checkpoints.
 The complete 235B-A22B checkpoint has not yet been tested.
 
-### Responses state
-
-`--response-store-max-records N` (1024) and `--response-store-max-mib N` (256) limit stored
-Responses API conversations. They are lost when the server restarts and are not shared across
-separate servers.
-
 ## `--generate`: one-shot
 
 ```bash

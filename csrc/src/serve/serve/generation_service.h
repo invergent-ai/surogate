@@ -95,7 +95,6 @@ struct PreparedRequest {
     std::size_t tool_name_max_length       = 64;
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
-    bool preserve_thinking_semantic_change = false;
     /// What the client asked to be given back, and the prompt ids to give it.
     /// Snapshotted before the prompt is submitted, because submitting consumes it.
     int top_logprobs = 0;

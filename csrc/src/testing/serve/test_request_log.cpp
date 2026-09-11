@@ -180,7 +180,6 @@ int main() {
     PreparedRequest prepared;
     prepared.enable_thinking                           = false;
     prepared.preserve_thinking                         = true;
-    prepared.preserve_thinking_semantic_change         = true;
     prepared.sampling.temperature                      = 0.6F;
     prepared.sampling.top_p                            = 0.95F;
     prepared.sampling.top_k                            = 20;
@@ -206,8 +205,7 @@ int main() {
                       "request output budget missing");
     failures += check(started.at("request").at("enable_thinking") == false,
                       "resolved thinking mode missing");
-    failures += check(started.at("request").at("preserve_thinking") == true &&
-                          started.at("request").at("preserve_thinking_semantic_change") == true,
+    failures += check(started.at("request").at("preserve_thinking") == true,
                       "resolved preserve-thinking metadata missing");
     failures += check(started.at("request").at("sampling").at("seed") == 7632647173703958409ULL,
                       "resolved seed missing");

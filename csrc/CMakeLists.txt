@@ -1547,7 +1547,6 @@ if(SINFER_BUILD_SERVE)
     ${SERVE_ROOT}/serve/openai_schema.cpp
     ${SERVE_ROOT}/serve/responses_schema.cpp
     ${SERVE_ROOT}/serve/anthropic_schema.cpp
-    ${SERVE_ROOT}/serve/response_store.cpp
     ${SERVE_ROOT}/serve/lora_registry.cpp
     ${SERVE_ROOT}/serve/output_parsers.cpp
     ${SERVE_ROOT}/serve/tool_call_parser.cpp

@@ -10,7 +10,6 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-
 # A one-pixel PNG. The target frontend performs its normal resize/patch expansion.
 _IMAGE_DATA_URI = (
     "data:image/png;base64,"
@@ -30,7 +29,8 @@ class Response:
     body: bytes
 
 
-def request(base_url: str, method: str, path: str, payload: Any | None = None) -> Response:
+def request(base_url: str, method: str, path: str, payload: Any | None = None,
+            *, expected_status: int = 200) -> Response:
     body = None
     headers = {"Accept": "application/json"}
     if payload is not None:
@@ -45,6 +45,8 @@ def request(base_url: str, method: str, path: str, payload: Any | None = None) -
                 body=response.read(),
             )
     except urllib.error.HTTPError as error:
+        if error.code == expected_status:
+            return Response(error.code, error.headers.get("Content-Type", ""), error.read())
         detail = error.read().decode("utf-8", errors="replace")
         raise ContractError(f"{method} {path} returned HTTP {error.code}: {detail}") from error
 
@@ -240,19 +242,14 @@ def responses_nonstream(
     base_url: str,
     model: str,
     input_value: Any,
-    *,
-    store: bool,
-    previous_response_id: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
         "input": input_value,
         "max_output_tokens": 16,
         "temperature": 0,
-        "store": store,
+        "store": False,
     }
-    if previous_response_id is not None:
-        payload["previous_response_id"] = previous_response_id
     response = json_response(base_url, "POST", "/v1/responses", payload)
     if response.get("object") != "response" or response.get("status") not in {
         "completed",
@@ -261,7 +258,7 @@ def responses_nonstream(
         raise ContractError("Responses non-streaming envelope has the wrong shape")
     if not isinstance(response.get("id"), str) or not response["id"].startswith("resp_"):
         raise ContractError("Responses non-streaming envelope has an invalid id")
-    if response.get("model") != model or response.get("store") is not store:
+    if response.get("model") != model or response.get("store") is not False:
         raise ContractError("Responses non-streaming request fields were not echoed")
     require_responses_usage(response.get("usage"))
     response_text(response)
@@ -386,7 +383,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     ):
         raise ContractError("Responses input_tokens returned the wrong shape")
     response_sync = responses_nonstream(
-        base_url, model, responses_input, store=False
+        base_url, model, responses_input
     )
     response_sync_text, response_sync_reasoning = response_text(response_sync)
     response_prompt_tokens, response_output_tokens = require_responses_usage(
@@ -417,44 +414,29 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     if streamed_output_tokens != response_output_tokens:
         raise ContractError("Responses streaming output-token usage differs")
 
-    stored_response = responses_nonstream(
-        base_url, model, "Remember the code word ORCHID. Reply briefly.", store=True
-    )
-    stored_id = stored_response.get("id")
-    if not isinstance(stored_id, str) or not stored_id.startswith("resp_"):
-        raise ContractError("stored Response has an invalid id")
-    retrieved = json_response(base_url, "GET", f"/v1/responses/{stored_id}")
-    if retrieved != stored_response:
-        raise ContractError("retrieved Response differs from the created Response")
-    input_items = json_response(
-        base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc"
-    )
-    if input_items.get("object") != "list" or len(input_items.get("data", [])) != 1:
-        raise ContractError("Responses input_items list has the wrong shape")
+    initial_input = "Remember the code word ORCHID. Reply briefly."
+    first_response = responses_nonstream(base_url, model, initial_input)
+    for method, suffix in (("GET", ""), ("DELETE", ""), ("GET", "/input_items"), ("POST", "/cancel")):
+        missing = request(base_url, method, f"/v1/responses/{first_response['id']}{suffix}",
+                          expected_status=404)
+        if missing.status != 404:
+            raise ContractError("removed Responses storage route is still available")
+    for field, value in (("store", True), ("previous_response_id", first_response["id"])):
+        refused = request(base_url, "POST", "/v1/responses",
+                          {"model": model, "input": "Continue", field: value}, expected_status=400)
+        if refused.status != 400:
+            raise ContractError(f"Responses accepted unsupported {field}")
     continuation_input = "What code word was given? Reply with only that word."
-    continuation = responses_nonstream(
-        base_url,
-        model,
-        continuation_input,
-        store=True,
-        previous_response_id=stored_id,
-    )
-    standalone_continuation_count = json_response(
-        base_url,
-        "POST",
-        "/v1/responses/input_tokens",
-        {"model": model, "input": continuation_input},
-    )["input_tokens"]
+    history = [{"role": "user", "content": initial_input}]
+    history.extend({key: value for key, value in item.items() if key != "status"}
+                   for item in first_response["output"])
+    history.append({"role": "user", "content": continuation_input})
+    continuation = responses_nonstream(base_url, model, history)
+    expected_tokens = json_response(base_url, "POST", "/v1/responses/input_tokens",
+                                   {"model": model, "input": history})["input_tokens"]
     continuation_prompt_tokens, _ = require_responses_usage(continuation.get("usage"))
-    if continuation.get("previous_response_id") != stored_id or (
-        continuation_prompt_tokens <= standalone_continuation_count
-    ):
-        raise ContractError("previous_response_id did not reconstruct stored context")
-    continuation_id = continuation.get("id")
-    for response_id in (continuation_id, stored_id):
-        deleted = json_response(base_url, "DELETE", f"/v1/responses/{response_id}")
-        if deleted != {"id": response_id, "object": "response.deleted", "deleted": True}:
-            raise ContractError("Responses delete returned the wrong object")
+    if continuation_prompt_tokens != expected_tokens:
+        raise ContractError("explicit Responses conversation history was not rendered in full")
 
     image_messages = [
         {

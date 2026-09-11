@@ -33,6 +33,9 @@ int main() {
         const auto gen = cli::parse_options;
         const auto server = serve::parse_serve_options;
         const auto embed = encoder::parse_options;
+        for (const auto flag : {"--response-store-max-records", "--response-store-max-mib"}) {
+            rejects(server, {"serve", "model.sinfer", flag, "1"});
+        }
         for (const auto flag : {"--cpu-moe-share", "--cpu-moe-prefill-share"}) {
             for (const auto value : {"junk", "0.5suffix", "nan", "inf", "-0.1", "1.1", ""}) {
                 rejects(gen, {"generate", "model.sinfer", "--prompt", "x", flag, value});

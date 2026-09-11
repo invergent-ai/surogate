@@ -52,9 +52,6 @@ int main() {
                       "default KV capacity does not auto-resolve with the context");
     failures += check(defaults.speculative.backend == sinfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
-    failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
-                          defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
-                      "Responses store defaults mismatch");
     failures += check(!defaults.model_id_override.has_value(),
                       "model id override is unexpectedly configured by default");
     failures += check(
@@ -172,13 +169,6 @@ int main() {
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
 
-    const ServeOptions response_store =
-        parse({"sinfer-serve", "model.sinfer", "--response-store-max-records", "42",
-               "--response-store-max-mib", "8"});
-    failures += check(response_store.response_store_max_records == 42 &&
-                          response_store.response_store_max_bytes == (8ULL << 20),
-                      "Responses store limits did not reach serving options");
-
     const ServeOptions sampling =
         parse({"sinfer-serve", "model.sinfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
                "40", "--min-p", "0.1", "--presence-penalty", "1.25", "--frequency-penalty", "-0.5",
@@ -232,9 +222,6 @@ int main() {
                       "serve help omits media preparation controls");
     failures += check(serve_usage_text("sinfer-serve").find("--kv-capacity") != std::string::npos,
                       "serve help omits --kv-capacity");
-    failures += check(serve_usage_text("sinfer-serve").find("--response-store-max-mib") !=
-                          std::string::npos,
-                      "serve help omits Responses store limits");
     failures +=
         check(serve_usage_text("sinfer-serve").find("identity.model_id") != std::string::npos,
               "serve help omits the artifact-derived model id default");

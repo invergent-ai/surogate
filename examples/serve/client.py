@@ -100,41 +100,26 @@ def run(args):
             ),
         }
     if command == "responses":
+        history = [{"role": "user", "content": "Remember this word: otter."}]
         first = client.request(
             "/v1/responses",
-            {
-                "model": args.model,
-                "input": "Remember this word: otter.",
-                "max_output_tokens": 256,
-                "store": True,
-            },
+            {"model": args.model, "input": history, "max_output_tokens": 256},
         )
+        # Keep prior output in the client and supply it with the next request.
+        history.extend({key: value for key, value in item.items() if key != "status"}
+                       for item in first["output"])
+        history.append({"role": "user", "content": "Which word did I ask you to remember?"})
         second = client.request(
             "/v1/responses",
-            {
-                "model": args.model,
-                "input": "Which word did I ask you to remember?",
-                "previous_response_id": first["id"],
-                "max_output_tokens": 256,
-                "store": True,
-            },
+            {"model": args.model, "input": history, "max_output_tokens": 256},
         )
-        result = {
+        return {
             "first": first,
             "followup": second,
-            "stored": client.request("/v1/responses/" + second["id"]),
-            "input_items": client.request("/v1/responses/" + second["id"] + "/input_items"),
             "input_tokens": client.request(
-                "/v1/responses/input_tokens",
-                {
-                    "model": args.model,
-                    "input": "Count this input.",
-                },
+                "/v1/responses/input_tokens", {"model": args.model, "input": history}
             ),
         }
-        for response in (second, first):
-            client.request("/v1/responses/" + response["id"], method="DELETE")
-        return result
     if command == "anthropic":
         body = {"model": args.model, "system": "Be concise.", "messages": messages, "max_tokens": 256}
         return {

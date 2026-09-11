@@ -133,7 +133,7 @@
   },
   "responses": {
     "parent_input": "Remember that the fixture label is ORCHID and reply briefly.",
-    "inherited_child_input": "Repeat the fixture label.",
+    "continued_child_input": "Repeat the fixture label.",
     "changed_child_input": "Repeat the fixture label once more."
   }
 }

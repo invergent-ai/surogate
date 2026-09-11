@@ -74,8 +74,7 @@ def test_responses_tool_parity(server, choice, stream):
     calls = [item for item in result["output"] if item["type"] == "function_call"]
     assert len(calls) == 1, response.text
     verify_calls([{"function": call} for call in calls])
-    stored = requests.get(server + "/v1/responses/" + result["id"], timeout=10)
-    assert stored.ok and stored.json()["tools"][0]["strict"] is True
+    assert result["store"] is False and result["tools"][0]["strict"] is True
 
 
 def test_none_does_not_enforce_unused_schema(server):

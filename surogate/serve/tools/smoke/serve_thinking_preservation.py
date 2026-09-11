@@ -80,13 +80,13 @@ def chat_prompt_tokens(response: dict[str, Any]) -> int:
     return int(usage["prompt_tokens"])
 
 
-def response_payload(model: str, input_text: str, preserve: bool | None) -> dict[str, Any]:
+def response_payload(model: str, input_text: str | list[dict[str, Any]], preserve: bool | None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
         "input": input_text,
         "max_output_tokens": 16,
         "temperature": 0,
-        "store": True,
+        "store": False,
     }
     if preserve is not None:
         payload["chat_template_kwargs"] = {"preserve_thinking": preserve}
@@ -171,18 +171,13 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         "/v1/responses",
         response_payload(model, responses_fixture["parent_input"], True),
     )
-    parent_id = parent.get("id")
-    require(isinstance(parent_id, str) and parent_id, "Responses parent id is invalid")
-
-    inherited_payload = response_payload(
-        model, responses_fixture["inherited_child_input"], None
-    )
-    inherited_payload["previous_response_id"] = parent_id
-    request_json(base_url, "POST", "/v1/responses", inherited_payload)
-
-    changed_payload = response_payload(model, responses_fixture["changed_child_input"], False)
-    changed_payload["previous_response_id"] = parent_id
-    request_json(base_url, "POST", "/v1/responses", changed_payload)
+    history = [{"role": "user", "content": responses_fixture["parent_input"]}]
+    history.extend({key: value for key, value in item.items() if key != "status"}
+                   for item in parent["output"])
+    continued_input = [*history, {"role": "user", "content": responses_fixture["continued_child_input"]}]
+    request_json(base_url, "POST", "/v1/responses", response_payload(model, continued_input, True))
+    changed_input = [*history, {"role": "user", "content": responses_fixture["changed_child_input"]}]
+    request_json(base_url, "POST", "/v1/responses", response_payload(model, changed_input, False))
 
     events = read_events(log_path)
     chat_done = protocol_events(events, "request_done", "openai_chat_completions")
@@ -226,17 +221,9 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
 
     responses_start = protocol_events(events, "request_start", "openai_responses")
     require(len(responses_start) == 3, "expected three Responses request_start events")
-    response_semantics = [
-        (
-            item["request"].get("preserve_thinking"),
-            item["request"].get("preserve_thinking_semantic_change"),
-        )
-        for item in responses_start
-    ]
-    require(
-        response_semantics == [(True, False), (True, False), (False, True)],
-        f"unexpected Responses preserve semantics: {response_semantics}",
-    )
+    response_semantics = [item["request"].get("preserve_thinking") for item in responses_start]
+    require(response_semantics == [True, True, False],
+            f"unexpected explicit Responses preserve settings: {response_semantics}")
     responses_done = protocol_events(events, "request_done", "openai_responses")
     require(len(responses_done) == 3, "expected three Responses request_done events")
     response_paths = [
