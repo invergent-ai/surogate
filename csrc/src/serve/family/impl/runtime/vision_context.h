@@ -38,6 +38,13 @@ struct VisionChunk {
     Tensor deepstack;
 };
 
+struct ImageTextPrefillState {
+    std::uint32_t begin = 0;
+    std::int32_t next_layer = 0;
+    Tensor residual;
+};
+inline constexpr std::int32_t kImageTextLayersPerSlice = 4;
+
 class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
@@ -48,6 +55,8 @@ public:
     [[nodiscard]] std::uint32_t chunk_length(std::uint32_t begin, std::uint32_t nominal_length) const;
     [[nodiscard]] bool chunk_ready(std::uint32_t begin, std::uint32_t nominal_length) const;
     [[nodiscard]] bool advance_encoding(std::uint32_t begin, std::uint32_t nominal_length);
+    [[nodiscard]] bool needs_text_slicing(std::uint32_t begin, std::uint32_t count) const;
+    ImageTextPrefillState& text_state(std::uint32_t begin, const Tensor& residual);
     void release_encoded_media_payloads() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
 
@@ -62,6 +71,7 @@ private:
     std::optional<std::uint32_t> active_item_;
     std::optional<std::uint32_t> encoding_item_;
     family::VisionEncodeState encoding_;
+    std::optional<ImageTextPrefillState> text_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
 };

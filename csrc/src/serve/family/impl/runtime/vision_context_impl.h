@@ -87,6 +87,28 @@ bool VisionPrefillSession::chunk_ready(std::uint32_t begin, std::uint32_t nomina
     return use == nullptr || (active_item_ && *active_item_ == use->item_index);
 }
 
+bool VisionPrefillSession::needs_text_slicing(std::uint32_t begin, std::uint32_t count) const {
+    return context_.geometry().attention_mode && use_for_chunk(begin, count) != nullptr;
+}
+
+ImageTextPrefillState& VisionPrefillSession::text_state(std::uint32_t begin, const Tensor& residual) {
+    if (!active_item_ || encoding_item_) { throw std::logic_error("image text block precedes its encoder"); }
+    if (!text_ || text_->begin != begin) {
+        const auto offset = VisionContext::output_transient_bytes(
+            context_.geometry(), plan_.control->items[*active_item_].merged_count);
+        if (offset > transient_.size || residual.bytes() > transient_.size - offset) {
+            throw std::logic_error("image text residual exceeds its transient allocation");
+        }
+        text_ = ImageTextPrefillState{.begin = begin,
+            .residual = Tensor(static_cast<std::byte*>(transient_.data) + offset, residual.dtype,
+                               {residual.ne[0], residual.ne[1]})};
+    }
+    if (text_->residual.bytes() != residual.bytes() || text_->residual.ne[1] != residual.ne[1]) {
+        throw std::logic_error("image text block changed shape while suspended");
+    }
+    return *text_;
+}
+
 VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length) {
     // The serving scheduler prepares the tower incrementally before entering
     // this text chunk. Keep the synchronous form for standalone/bridge callers.

@@ -2369,6 +2369,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                     schedule_state, std::span<const TokenId>(staged.prompt.token_ids), nominal,
                     rewrite_checkpoint_capture_frontier, final_candidate);
             }
+            if (result.layer_slice_pending) {
+                staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+                if (round_trace_enabled()) {
+                    std::fprintf(stderr, "round-trace: image-text-step lane=%u cursor=%u\n",
+                                 sequence.lane, staged.cursor);
+                }
+                return runtime::PrefillStepResult{.summary = summary, .has_stage_residual = true};
+            }
             if (result.processed_tokens == 0 || result.processed_tokens > nominal) {
                 throw std::logic_error("ordinary prefill chunk made invalid progress");
             }
@@ -2818,6 +2826,10 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane, std::uin
         return false;
     }
     if (staged.vision && !staged.vision->chunk_ready(staged.cursor, prefill_chunk - reserved_columns)) {
+        return false;
+    }
+    if (staged.vision && speculative_backend == SpeculativeBackend::None &&
+        staged.vision->needs_text_slicing(staged.cursor, prefill_chunk - reserved_columns)) {
         return false;
     }
     if (staged.mtp_bridge != MtpBridgeMode::None ||

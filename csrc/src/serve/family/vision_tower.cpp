@@ -190,11 +190,14 @@ std::size_t VisionContext::output_transient_bytes(const VisionGeometry& geometry
 }
 
 std::size_t VisionContext::encoding_transient_bytes(const VisionGeometry& geometry,
-                                                    std::size_t merged_tokens) {
+                                                    std::size_t merged_tokens,
+                                                    std::size_t text_residual_bytes) {
     const auto output = output_transient_bytes(geometry, merged_tokens);
     const auto patches = checked_mul(merged_tokens, geometry.merge_unit(), "encoding patches");
-    const auto residual = checked_mul(checked_mul(patches, geometry.hidden, "encoding residual"),
-                                      sizeof(std::uint16_t), "encoding residual bytes");
+    // Once the tower finishes, the same storage holds the text block's residual.
+    const auto residual = std::max(text_residual_bytes,
+        checked_mul(checked_mul(patches, geometry.hidden, "encoding residual"),
+                    sizeof(std::uint16_t), "encoding residual bytes"));
     if (output > std::numeric_limits<std::size_t>::max() - residual) {
         throw std::overflow_error("Vision encoding transient overflows size_t");
     }

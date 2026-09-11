@@ -30,6 +30,9 @@ int main() {
     ServeOptions options;
     options.artifact_path = artifact;
     options.max_context = 512;
+    if (const auto* context = std::getenv("SUROGATE_MULTI_DEVICE_TEST_CONTEXT")) {
+        options.max_context = std::stoul(context);
+    }
     options.kv_capacity = sinfer::KvCapacityPolicy::explicit_capacity(2048);
     options.max_concurrency = 4;
     options.enable_sleep_mode = true;
@@ -90,6 +93,11 @@ int main() {
         *request.raw_prompt += "\nContinue: 1, 2, 3, 4,";
     }
     request.max_tokens = vision ? 16 : 128;
+    if (vision) {
+        if (const auto* tokens = std::getenv("SUROGATE_MULTI_DEVICE_TEST_VISION_TOKENS")) {
+            request.max_tokens = std::stoul(tokens);
+        }
+    }
     if (vision) {
         request.raw_prompt.reset();
         request.enable_thinking = false;

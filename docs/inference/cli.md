@@ -162,11 +162,10 @@ already-running response may take.
 Incoming prompts can share a batch with requests already generating, including requests
 using different LoRA adapters, DFlash, and images or video. Lower `--max-num-batched-tokens`
 to reduce the time spent on each prompt chunk when streaming responsiveness matters;
-larger values can improve prompt throughput. Active text requests continue generating while
-images and video frames are encoded, on one or multiple GPUs. Sharing the GPU can delay the
-image response, and large image blocks that must be processed together can still cause longer
-streaming gaps. DFlash needs room in the batch for both prompt tokens and the proposed tokens
-it checks.
+larger values can improve prompt throughput. Active text requests continue generating throughout
+image and video processing, on one or multiple GPUs. Sharing the GPU can delay image responses;
+lower image resolution or fewer video frames can improve latency. DFlash needs room in the batch
+for both prompt tokens and the proposed tokens it checks.
 
 ### Speculative decoding
 

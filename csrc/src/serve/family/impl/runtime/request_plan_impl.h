@@ -64,6 +64,15 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
     return prefill_units + decode_units;
 }
 
+std::uint64_t projected_vision_work(const family::VisionGeometry& vision, std::int32_t text_layers,
+                                    std::size_t items) noexcept {
+    const auto encoder_slices = (std::uint64_t(vision.layers) + 1 + family::kVisionEncodeStepsPerSlice) /
+                                family::kVisionEncodeStepsPerSlice;
+    const auto extra_text_slices = vision.attention_mode
+        ? (std::uint64_t(text_layers) - 1) / schedule::kImageTextLayersPerSlice : 0;
+    return items * (encoder_slices + extra_text_slices);
+}
+
 } // namespace
 
 RequestBasePlan
@@ -196,7 +205,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             max_merged   = std::max(max_merged, item.merged_count);
         }
         base->vision_transient_bytes =
-            schedule::VisionContext::encoding_transient_bytes(vision, max_merged);
+            schedule::VisionContext::encoding_transient_bytes(vision, max_merged,
+                vision.attention_mode ? std::size_t(prefill_chunk) * cfg.residual *
+                    dtype_size(cfg.residual_dtype()) : 0);
         base->vision_control         = std::move(control);
     }
 
@@ -216,9 +227,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
              : 0ULL);
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits) +
-        (base->vision_control ? base->vision_control->items.size() *
-            ((std::uint64_t(model.vision_geometry.layers) + 1 + family::kVisionEncodeStepsPerSlice) /
-             family::kVisionEncodeStepsPerSlice) : 0);
+        projected_vision_work(model.vision_geometry, cfg.layers,
+                              base->vision_control ? base->vision_control->items.size() : 0);
     return RequestBasePlan(std::move(base));
 }
 
@@ -413,9 +423,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
              : 0ULL);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits) +
-        (plan->vision ? plan->vision->uses.size() *
-            ((std::uint64_t(model.vision_geometry.layers) + 1 + family::kVisionEncodeStepsPerSlice) /
-             family::kVisionEncodeStepsPerSlice) : 0);
+        projected_vision_work(model.vision_geometry, cfg.layers,
+                              plan->vision ? plan->vision->uses.size() : 0);
     return RequestPlan(std::move(plan));
 }
 

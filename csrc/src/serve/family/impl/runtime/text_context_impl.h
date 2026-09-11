@@ -1831,7 +1831,8 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, in
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepstack,
-                              std::span<const std::int32_t> visual_indices) {
+                              std::span<const std::int32_t> visual_indices,
+                              int first_layer, int last_layer) {
     const bool prefill = ph == Phase::Prefill;
     PrefillFamilyTimer& timer = prefill_family_timer();
     // Event synchronisation is illegal inside stream capture, and a captured
@@ -1854,7 +1855,9 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap, const Tensor* deepst
         std::fprintf(stderr, "stage-trace: layers [%d, %d) of %d, columns %d\n", stage_first_,
                      stage_last_, cfg_.n_layers, x.ne[1]);
     }
-    for (int layer = stage_first_; layer < stage_last_; ++layer) {
+    const int begin = first_layer < 0 ? stage_first_ : std::max(stage_first_, first_layer);
+    const int end = last_layer < 0 ? stage_last_ : std::min(stage_last_, last_layer);
+    for (int layer = begin; layer < end; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (cfg_.is_full(layer)) {
             const int fidx         = cfg_.full_idx(layer);
@@ -3611,15 +3614,42 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 image_attention_begin_ = vision_chunk.control->scatter_indices.front();
                 image_attention_end_   = vision_chunk.control->scatter_indices.back() + 1;
             }
+            ImageTextPrefillState* image_text = nullptr;
+            if constexpr (!Tap::enabled) {
+                if (image_attention_end_ && !prepare_mtp_prompt) {
+                    image_text = &multimodal->vision->text_state(prompt_t0, x);
+                    // Rebuild the original embedding/per-layer inputs above, then
+                    // resume this stage's residual. Stages that have not reached
+                    // their first layer import the upstream stage's latest output.
+                    if (image_text->next_layer <= stage_first_) {
+                        CUDA_CHECK(cudaMemcpyAsync(image_text->residual.data, x.data, x.bytes(),
+                                                   cudaMemcpyDeviceToDevice, s));
+                    }
+                    x = image_text->residual;
+                }
+            }
             try {
                 run_layers(x, Phase::Prefill, tap, deepstack.data ? &deepstack : nullptr,
-                           local_scatter_indices);
+                           local_scatter_indices, image_text ? image_text->next_layer : -1,
+                           image_text ? image_text->next_layer + kImageTextLayersPerSlice : -1);
             } catch (...) {
                 image_attention_begin_ = image_attention_end_ = 0;
                 throw;
             }
             image_attention_begin_ = image_attention_end_ = 0;
             window_laps.mark_layers();
+            if (image_text) {
+                // All pipeline stages advance the same global layer range, even
+                // when this slice has no layers on a particular stage.
+                image_text->next_layer = std::min(cfg_.n_layers,
+                    image_text->next_layer + kImageTextLayersPerSlice);
+                if (image_text->next_layer < cfg_.n_layers) {
+                    if (!stage_finishes()) { stage_export(x, s); }
+                    ctx_.synchronize();
+                    work_.reset();
+                    return PrefillChunkResult{.layer_slice_pending = true};
+                }
+            }
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }

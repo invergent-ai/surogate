@@ -72,7 +72,8 @@ public:
     [[nodiscard]] static std::size_t output_transient_bytes(const VisionGeometry& geometry,
                                                             std::size_t merged_tokens);
     [[nodiscard]] static std::size_t encoding_transient_bytes(const VisionGeometry& geometry,
-                                                              std::size_t merged_tokens);
+                                                              std::size_t merged_tokens,
+                                                              std::size_t text_residual_bytes = 0);
     [[nodiscard]] static std::size_t workspace_bytes(const VisionGeometry& geometry,
                                                      const VisionItemControl& item);
     [[nodiscard]] static std::size_t workspace_capacity_bytes(const VisionGeometry& geometry,

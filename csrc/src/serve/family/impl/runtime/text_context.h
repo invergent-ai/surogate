@@ -357,6 +357,7 @@ struct NullTap {
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
+    bool layer_slice_pending       = false;
 };
 
 /// Pipeline stage: the layer range this program runs, and the pinned buffers the residual
@@ -658,7 +659,8 @@ private:
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap, const Tensor* deepstack = nullptr,
-                    std::span<const std::int32_t> visual_indices = {});
+                    std::span<const std::int32_t> visual_indices = {},
+                    int first_layer = -1, int last_layer = -1);
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,

@@ -99,6 +99,8 @@ struct PrefillStepResult {
     bool complete                         = false;
     std::uint32_t feature_offset = 0;
     std::int32_t feature_base = -1;
+    // A suspended text-layer slice still forwards its residual to the next stage.
+    bool has_stage_residual = false;
 };
 
 struct RoundBudget {
