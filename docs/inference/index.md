@@ -91,7 +91,7 @@ Llama, and FP8 for hybrid models such as Qwen3.5/3.6/3.8. Explicit `fp8` uses ha
 storage of BF16; explicit `bf16` keeps BF16 regardless of model family. Changing cache
 precision can affect output quality. `int8` is also available for comparison.
 
-DFlash requires `--kv-cache-dtype bf16`.
+DFlash supports BF16 and FP8 caches. Use `--kv-cache-dtype fp8` to reduce cache memory.
 
 ## Model families
 

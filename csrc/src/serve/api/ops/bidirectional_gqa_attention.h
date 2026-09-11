@@ -36,7 +36,8 @@ struct GqaContextExecutionEnvelope {
  * context_lengths, valid_columns, and table_rows are contiguous device I32 [B]. Row b has
  * V=valid_columns[b] live query columns and reads logical context [0,context_lengths[b]) through
  * table row table_rows[b]. Columns i>=V are an inert physical tail and produce zero output.
- * context is a read-only paged BF16 cache with head-major page planes [128,64,Nphysical,8]. scale
+ * context is a read-only paged BF16 or FP8 E4M3FN cache with head-major page planes
+ * [128,64,Nphysical,8]. FP8 codes are widened exactly before attention. scale
  * is 1/sqrt(128).
  *
  * There is no causal triangle: every live query row attends every other live query K/V row in the

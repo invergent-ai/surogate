@@ -33,8 +33,10 @@ def test_generated_alternatives(server, count):
 
 
 @pytest.mark.parametrize("sampling", [{}, {"temperature": 0.7}, {"temperature": 0.7, "logit_bias": {"100": 100}}])
-def test_prompt_scores_match_next_token_predictions(server, sampling):
-    first = chat(server, max_tokens=8, logprobs=True, top_logprobs=5, ignore_eos=True, **sampling)
+@pytest.mark.parametrize("output_tokens", [8, 32])
+def test_prompt_scores_match_next_token_predictions(server, sampling, output_tokens):
+    # The longer sequence spans multiple rounds even with the maximum DFlash window.
+    first = chat(server, max_tokens=output_tokens, logprobs=True, top_logprobs=5, ignore_eos=True, **sampling)
     generated = scores(first)
     body = first.json()
     prompt = body["prompt_token_ids"]

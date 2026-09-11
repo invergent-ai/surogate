@@ -61,7 +61,7 @@ context is explicit, omitted cache capacity defaults to that same token count. U
 `--kv-capacity auto` explicitly to make more cache available for simultaneous requests.
 
 Cache precision `auto` selects BF16 for models such as Qwen3 and Llama, and FP8 for hybrid
-models such as Qwen3.5/3.6/3.8. FP8 uses half the cache storage of BF16. DFlash requires BF16.
+models such as Qwen3.5/3.6/3.8, including with DFlash. FP8 uses half the cache storage of BF16.
 
 With `--elastic-kv-overcommit`, `--kv-capacity` becomes a guaranteed minimum; `auto` guarantees
 enough for one full-context request per model. See [Serving models](serving-models.md#several-models-on-one-gpu).
@@ -168,7 +168,7 @@ workload: more simultaneous requests or heavy CPU offload can reduce the benefit
 | Flag | Meaning |
 |---|---|
 | `--spec mtp` | Enable MTP on a supported model; supports one or multiple GPUs |
-| `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; requires `--kv-cache-dtype bf16` and no `--vision` |
+| `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; supports BF16 or FP8 caches and requires no `--vision` |
 | `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec` |
 | `--spec-max-lanes N\|all` | MTP checks drafts only while at most N requests are decoding. Default (or `0`) is 1; `all` keeps checking at every concurrency level. Does not affect DFlash |
 | `--lm-head-draft` | Use a smaller draft vocabulary when the checkpoint provides one |
@@ -176,6 +176,10 @@ workload: more simultaneous requests or heavy CPU offload can reduce the benefit
 MTP needs the checkpoint's MTP weights, which some community exports omit. DFlash
 needs a compatible drafter included during model preparation. Missing draft weights produce
 a startup error. See [Preparing a DFlash pair](serving-models.md#preparing-a-dflash-pair).
+
+With DFlash, `--kv-cache-dtype fp8` reduces cache memory for both the target and drafter.
+Use `--kv-cache-dtype bf16` for higher cache precision. FP8 can change generated output and
+draft acceptance, so compare memory use and generation speed on your workload.
 
 ### Serving several models from one process
 

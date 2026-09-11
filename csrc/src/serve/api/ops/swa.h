@@ -32,7 +32,8 @@ struct SwaContextExecutionEnvelope {
  * lanes[b] selects its cyclic-cache lane. Columns i>=V are an inert physical tail and produce
  * zero output.
  *
- * The read-only cyclic context contains committed absolute positions [max(0,L-4096),L), with
+ * The read-only BF16 or FP8 E4M3FN cyclic context contains committed absolute positions
+ * [max(0,L-4096),L), with FP8 codes widened exactly before attention and
  * absolute position p stored at physical slot p mod 4096. Query K/V is a separate temporary
  * segment at positions [L,L+V). For every live query position p_i, admitted populated keys satisfy
  * abs(p_j-p_i)<4096. Thus distance 4095 is included, distance 4096 is excluded, and every query

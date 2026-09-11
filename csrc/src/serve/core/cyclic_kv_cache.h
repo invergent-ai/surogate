@@ -12,7 +12,7 @@
 namespace sinfer {
 
 /**
- * Fixed cyclic BF16 K/V storage with absolute-position addressing.
+ * Fixed cyclic BF16 or FP8 E4M3 K/V storage with absolute-position addressing.
  *
  * A logical absolute position p resides in physical slot p % capacity. The view deliberately
  * carries no mutable frontier: callers supply the live absolute interval to the consuming Op.
@@ -41,7 +41,8 @@ struct CyclicKVCacheLayout {
 
 [[nodiscard]] CyclicKVCacheLayout
 plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
-                     std::int32_t num_kv_heads, std::int32_t head_dim, std::int32_t lane_capacity);
+                     std::int32_t num_kv_heads, std::int32_t head_dim, std::int32_t lane_capacity,
+                     DType dtype = DType::BF16);
 
 class CyclicKVCache {
 public:
@@ -63,6 +64,8 @@ public:
     [[nodiscard]] std::int32_t head_dim() const noexcept { return head_dim_; }
 
     [[nodiscard]] std::int32_t lane_capacity() const noexcept { return lane_capacity_; }
+
+    [[nodiscard]] DType dtype() const noexcept { return k_.front().dtype; }
 
     [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
 

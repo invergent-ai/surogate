@@ -11,27 +11,40 @@
 
 namespace {
 
-sinfer::EngineOptions ordinary_engine_options(const char* artifact) {
+// The original MoE fixture uses its optimized proposal head. A dense Qwen3.5
+// target/drafter pair can exercise the same cache and scheduler paths via the
+// full head, without requiring a proposal shortlist in the artifact.
+struct TestConfig {
+    const char* artifact;
+    sinfer::KvCacheStorage kv_cache = sinfer::KvCacheStorage::BFloat16;
+    std::uint32_t draft_tokens = 3;
+    sinfer::ProposalHead proposal = sinfer::ProposalHead::Optimized;
+};
+
+sinfer::EngineOptions ordinary_engine_options(const TestConfig& config) {
     sinfer::EngineOptions options;
-    options.artifact_path  = artifact;
+    options.artifact_path = config.artifact;
     options.max_context    = 128;
     options.kv_capacity    = sinfer::KvCapacityPolicy::explicit_capacity(128);
     options.prefill_chunk  = 128;
-    options.kv_cache       = sinfer::KvCacheStorage::BFloat16;
+    options.kv_cache = config.kv_cache;
     options.use_cuda_graph = false;
     options.enable_vision  = false;
     return options;
 }
 
-sinfer::EngineOptions dflash_engine_options(const char* artifact, sinfer::ProposalHead proposal,
-                                            std::uint32_t max_context) {
-    sinfer::EngineOptions options     = ordinary_engine_options(artifact);
+sinfer::EngineOptions
+dflash_engine_options(const TestConfig& config, sinfer::ProposalHead proposal, std::uint32_t max_context) {
+    sinfer::EngineOptions options = ordinary_engine_options(config);
     options.max_context               = max_context;
     options.kv_capacity               = sinfer::KvCapacityPolicy::explicit_capacity(max_context);
     options.speculative.backend       = sinfer::SpeculativeBackend::DFlash;
-    options.speculative.draft_tokens  = 3;
+    options.speculative.draft_tokens = config.draft_tokens;
     options.speculative.proposal_head = proposal;
     options.use_cuda_graph            = true;
+    options.rewrite_checkpoints       = true;
+    // Compare payload sizes without the demand-mapped pool's allocation rounding.
+    options.elastic_kv                = false;
     return options;
 }
 
@@ -90,21 +103,19 @@ sinfer::PromptInput altered_history_after_boundary() {
     return input;
 }
 
-int verify_dflash_load(const sinfer::Engine& engine) {
+int verify_dflash_load(const sinfer::Engine& engine, sinfer::KvCacheStorage kv_cache) {
     const sinfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_5_moe" || load.weights_id != "groupwise-int" ||
+    if ((load.target != "qwen3_5_moe" && load.target != "qwen3_5") || load.weights_id != "groupwise-int" ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "DFlash Engine materialized an invalid artifact payload: target="
                   << load.target << " weights=" << load.weights_id << '\n';
         return 1;
     }
     const sinfer::MemorySummary memory = engine.memory_summary();
-    if (memory.max_context != 4352 || memory.kv_cache != sinfer::KvCacheStorage::BFloat16 ||
-        memory.kv_payload_bytes == 0 || memory.weights.capacity_bytes == 0 ||
-        memory.weights.used_bytes == 0 ||
-        memory.weights.used_bytes > memory.weights.capacity_bytes ||
-        memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
-        memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
+    if (memory.max_context != 4352 || memory.kv_cache != kv_cache || memory.kv_payload_bytes == 0 ||
+        memory.weights.capacity_bytes == 0 || memory.weights.used_bytes == 0 ||
+        memory.weights.used_bytes > memory.weights.capacity_bytes || memory.sequence.capacity_bytes == 0 ||
+        memory.sequence.used_bytes == 0 || memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
         memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes != 0 ||
         memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
@@ -216,10 +227,31 @@ int exercise_long_boundary_restore(sinfer::Engine& engine) {
 } // namespace
 
 int main() {
-    const char* artifact = std::getenv("SINFER_QWEN3_6_35B_A3B_WEIGHTS");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: SINFER_QWEN3_6_35B_A3B_WEIGHTS is not set\n";
+    TestConfig config{.artifact = std::getenv("SINFER_QWEN3_5_DFLASH_WEIGHTS")};
+    if (config.artifact != nullptr && *config.artifact != '\0') {
+        config.proposal = sinfer::ProposalHead::Full;
+    } else {
+        config.artifact = std::getenv("SINFER_QWEN3_6_35B_A3B_WEIGHTS");
+    }
+    if (config.artifact == nullptr || *config.artifact == '\0') {
+        std::cout << "skip: neither SINFER_QWEN3_5_DFLASH_WEIGHTS nor "
+                     "SINFER_QWEN3_6_35B_A3B_WEIGHTS is set\n";
         return 77;
+    }
+    if (const char* dtype = std::getenv("SINFER_DFLASH_TEST_KV_DTYPE")) {
+        if (std::string(dtype) == "fp8") {
+            config.kv_cache = sinfer::KvCacheStorage::Fp8E4M3;
+        } else if (std::string(dtype) != "bf16") {
+            std::cerr << "SINFER_DFLASH_TEST_KV_DTYPE must be bf16 or fp8\n";
+            return 1;
+        }
+    }
+    if (const char* drafts = std::getenv("SINFER_DFLASH_TEST_DRAFT_TOKENS")) {
+        config.draft_tokens = static_cast<std::uint32_t>(std::stoul(drafts));
+        if (config.draft_tokens == 0 || config.draft_tokens > 15) {
+            std::cerr << "SINFER_DFLASH_TEST_DRAFT_TOKENS must be in [1, 15]\n";
+            return 1;
+        }
     }
 
     const std::vector<sinfer::TokenId> prompt{
@@ -228,7 +260,7 @@ int main() {
     };
     std::vector<sinfer::TokenId> target_output;
     {
-        sinfer::Engine ordinary(ordinary_engine_options(artifact));
+        sinfer::Engine ordinary(ordinary_engine_options(config));
         target_output =
             ordinary.generate(ordinary.prepare_tokens(prompt), greedy_options(24, false))
                 .generated_token_ids;
@@ -239,8 +271,7 @@ int main() {
     }
 
     {
-        sinfer::EngineOptions options =
-            dflash_engine_options(artifact, sinfer::ProposalHead::Full, 128);
+        sinfer::EngineOptions options = dflash_engine_options(config, sinfer::ProposalHead::Full, 128);
         options.max_concurrency = 2;
         sinfer::Engine full(std::move(options));
         auto first  = full.submit(full.prepare_tokens(prompt), greedy_options(17, false));
@@ -262,8 +293,29 @@ int main() {
         }
     }
 
-    sinfer::Engine engine(dflash_engine_options(artifact, sinfer::ProposalHead::Optimized, 4352));
-    if (const int result = verify_dflash_load(engine); result != 0) { return result; }
+    std::size_t bf16_payload_bytes = 0;
+    if (config.kv_cache == sinfer::KvCacheStorage::Fp8E4M3) {
+        TestConfig bf16_config = config;
+        bf16_config.kv_cache = sinfer::KvCacheStorage::BFloat16;
+        sinfer::Engine bf16(dflash_engine_options(bf16_config, config.proposal, 4352));
+        if (const int result = verify_dflash_load(bf16, bf16_config.kv_cache); result != 0) {
+            return result;
+        }
+        bf16_payload_bytes = bf16.memory_summary().kv_payload_bytes;
+    }
+    sinfer::Engine engine(dflash_engine_options(config, config.proposal, 4352));
+    if (const int result = verify_dflash_load(engine, config.kv_cache); result != 0) {
+        return result;
+    }
+    if (bf16_payload_bytes != 0) {
+        const auto fp8_payload_bytes = engine.memory_summary().kv_payload_bytes;
+        if (2 * fp8_payload_bytes != bf16_payload_bytes) {
+            std::cerr << "FP8 did not halve the combined target, draft, and snapshot KV payload: " << "bf16="
+                      << bf16_payload_bytes << " fp8=" << fp8_payload_bytes << '\n';
+            return 1;
+        }
+        std::cout << "KV payload: bf16=" << bf16_payload_bytes << " fp8=" << fp8_payload_bytes << '\n';
+    }
     engine.reset_memory_peaks();
     const sinfer::GenerationResult dflash =
         engine.generate(engine.prepare_tokens(prompt), greedy_options(24, false));

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.cuh"
+#include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 
@@ -74,11 +75,11 @@ __device__ __forceinline__ void noncausal_gqa_row_to_qt(int row, int kv_head, in
     q_head            = kv_head * kBidirectionalGqaGroup + q_local;
 }
 
-template <bool CyclicSwa, int KeyBlock, int Threads>
+template <bool CyclicSwa, int KeyBlock, int Threads, typename CacheT>
 __device__ __forceinline__ void
-bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
-                             const __nv_bfloat16* query, int key0, int valid_keys, bool query_tile,
-                             int kv_head, int context_stride, int physical_page, int tid) {
+bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const CacheT* context, const __nv_bfloat16* query,
+                             int key0, int valid_keys, bool query_tile, int kv_head,
+                             int context_stride, int physical_page, int tid) {
     constexpr int VecsPerRow = kBidirectionalGqaHeadDim / 8;
     constexpr int Page       = 64;
     const std::int64_t paged_base =
@@ -101,18 +102,25 @@ bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
                             : paged_base + d +
                                   static_cast<std::int64_t>(kBidirectionalGqaHeadDim) * safe_row;
         }
-        const __nv_bfloat16* src = query_tile ? query + src_index : context + src_index;
         __nv_bfloat16* smem = &dst[row * kBidirectionalGqaHeadDim + bidirectional_gqa_swz(row, d)];
-        cp_async_zfill<16, Cache::cg>(smem, src, live ? 16 : 0);
+        if (query_tile) {
+            cp_async_zfill<16, Cache::cg>(smem, query + src_index, live ? 16 : 0);
+        } else if constexpr (GqaKvIsFp8<CacheT>::value) {
+            store_vec(smem, live ? gqa_kv_dequant_fp8x8_from(context + src_index)
+                                 : make_int4(0, 0, 0, 0));
+        } else {
+            cp_async_zfill<16, Cache::cg>(smem, context + src_index, live ? 16 : 0);
+        }
     }
 }
 
-template <bool CyclicSwa, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+template <bool CyclicSwa, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput,
+          typename CacheT>
 __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_state,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ selectors,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const CacheT* __restrict__ context_k, const CacheT* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int context_stride, int logical_pages,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
@@ -519,12 +527,13 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     }
 }
 
-template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput,
+          typename CacheT = __nv_bfloat16>
 __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_partial_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const CacheT* __restrict__ context_k, const CacheT* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int physical_pages, int logical_pages,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
@@ -534,15 +543,15 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
         partial_acc, partial_m, partial_l, out);
 }
 
-template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput,
+          typename CacheT = __nv_bfloat16>
 __launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
-    int padded_context, int max_context, int split_capacity, float scale,
-    __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
-    float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+    const CacheT* __restrict__ context_k, const CacheT* __restrict__ context_v, int padded_context,
+    int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
+    float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     noncausal_gqa_split_partial_body<true, Tokens, WarpsPerCta, KeyBlock, DirectOutput>(
         q, query_k, query_v, positions, valid_columns, lanes, context_k, context_v, nullptr,
         padded_context, 0, max_context, split_capacity, scale, partial_acc, partial_m, partial_l,

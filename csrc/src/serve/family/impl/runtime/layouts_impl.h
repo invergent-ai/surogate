@@ -290,14 +290,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
             dflash.geometry = plan.geometry.dflash;
-            dflash.local = plan_cyclic_kv_cache(builder, plan.geometry.dflash.local_layers,
-                                                plan.geometry.dflash.local_capacity,
-                                                plan.geometry.dflash.kv_heads, plan.geometry.dflash.head_dim,
-                                                static_cast<std::int32_t>(plan.max_concurrency));
+            const DType draft_kv_dtype =
+                plan.kv_dtype == DType::FP8_E4M3FN ? DType::FP8_E4M3FN : DType::BF16;
+            dflash.local = plan_cyclic_kv_cache(
+                builder, plan.geometry.dflash.local_layers, plan.geometry.dflash.local_capacity,
+                plan.geometry.dflash.kv_heads, plan.geometry.dflash.head_dim,
+                static_cast<std::int32_t>(plan.max_concurrency), draft_kv_dtype);
             dflash.rewrite_checkpoint_local = plan_cyclic_kv_cache(
                 builder, plan.geometry.dflash.local_layers, plan.geometry.dflash.local_capacity,
                 plan.geometry.dflash.kv_heads, plan.geometry.dflash.head_dim,
-                static_cast<std::int32_t>(plan.max_concurrency));
+                static_cast<std::int32_t>(plan.max_concurrency), draft_kv_dtype);
             PagedKVPoolSpec full_pool{
                 .page_group_count      = plan.main_page_groups,
                 .logical_page_capacity = logical_pages,
@@ -305,8 +307,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .plane_order           = PagedKVPlaneOrder::HeadMajor,
                 .planes =
                     {
-                        {DType::BF16, plan.geometry.dflash.head_dim, plan.geometry.dflash.kv_heads, 256},
-                        {DType::BF16, plan.geometry.dflash.head_dim, plan.geometry.dflash.kv_heads, 256},
+                        {draft_kv_dtype, plan.geometry.dflash.head_dim,
+                         plan.geometry.dflash.kv_heads, 256},
+                        {draft_kv_dtype, plan.geometry.dflash.head_dim,
+                         plan.geometry.dflash.kv_heads, 256},
                     },
             };
             dflash.full = family::PagedKVCacheLayout{
@@ -315,7 +319,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .max_context = plan.capacity,
                 .kv_heads    = plan.geometry.dflash.kv_heads,
                 .head_dim    = plan.geometry.dflash.head_dim,
-                .dtype       = DType::BF16,
+                .dtype       = draft_kv_dtype,
                 .quant_group = 0,
             };
             const auto feature_columns = plan.pipeline_stage_last > 0
@@ -983,16 +987,6 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         throw std::invalid_argument("vision planning requires the checkpoint's vision geometry");
     }
     const KvCacheStorage kv_storage = resolve_kv_storage(options.kv_cache, geometry);
-    if (kv_storage == KvCacheStorage::Fp8E4M3 &&
-        options.speculative.backend == SpeculativeBackend::DFlash) {
-        // DFlash commits its draft through kv_cache_append_prefix, which has no e4m3
-        // path. Refuse the pair at startup: the alternative is an exception thrown
-        // mid-round once a draft first lands.
-        throw std::invalid_argument(
-            "--spec dflash needs a bf16 KV cache (pass --kv-cache-dtype bf16); its draft commit "
-            "has no fp8 path");
-    }
-
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .geometry            = geometry,

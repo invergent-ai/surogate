@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "ops/op_tester.h"
+#include "ops/fp8_reference.h"
 
 #include <algorithm>
 #include <cmath>
@@ -29,6 +30,15 @@ constexpr ReductionCriterion kSwaBf16Criterion{
     .relative_l2                     = 3.95e-3,
     .gross_absolute                  = 3e-4,
     .gross_relative_to_max_reference = 3.0e-3,
+};
+
+// Coarse FP8 inputs can align the rounding of BF16 split partials and the
+// final BF16 output. Budget both roundings pointwise, retain the L2 bound,
+// and below require exact agreement with the widened BF16-cache control.
+constexpr ReductionCriterion kSwaFp8Criterion{
+    .relative_l2 = kSwaBf16Criterion.relative_l2,
+    .gross_absolute = kSwaBf16Criterion.gross_absolute,
+    .gross_relative_to_max_reference = 2.0 / 256.0,
 };
 
 std::size_t q_index(int d, int q_head, int token) {
@@ -131,8 +141,8 @@ enum class InputProfile {
     WindowBoundary,
 };
 
-int run_case(int tokens, int context_length, InputProfile profile = InputProfile::Random,
-             int envelope_max = -1) {
+template <typename CacheBits = std::uint16_t>
+int run_case(int tokens, int context_length, InputProfile profile = InputProfile::Random, int envelope_max = -1) {
     if (envelope_max < 0) envelope_max = context_length;
     const std::size_t q_count        = static_cast<std::size_t>(kD) * kQHeads * tokens;
     const std::size_t query_kv_count = static_cast<std::size_t>(kD) * kKVHeads * tokens;
@@ -168,8 +178,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     round_to_bf16(q);
     round_to_bf16(query_k);
     round_to_bf16(query_v);
-    round_to_bf16(context_k);
-    round_to_bf16(context_v);
+    round_kv_reference<CacheBits>(context_k);
+    round_kv_reference<CacheBits>(context_v);
 
     std::vector<int> positions(static_cast<std::size_t>(tokens));
     for (int token = 0; token < tokens; ++token) {
@@ -181,8 +191,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     const auto q_expected         = bf16_bits(q);
     const auto query_k_expected   = bf16_bits(query_k);
     const auto query_v_expected   = bf16_bits(query_v);
-    const auto context_k_expected = bf16_bits(context_k);
-    const auto context_v_expected = bf16_bits(context_v);
+    const auto context_k_expected = kv_reference_bits<CacheBits>(context_k);
+    const auto context_v_expected = kv_reference_bits<CacheBits>(context_v);
 
     DeviceBuffer d_q         = to_device(q_expected);
     DeviceBuffer d_query_k   = to_device(query_k_expected);
@@ -203,6 +213,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     Tensor lane_tensor(d_lane.p, DType::I32, {1});
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
     CyclicKVCacheLayerView context = make_context_view(d_context_k, d_context_v);
+    context.k = Tensor(d_context_k.p, kv_reference_dtype<CacheBits>, {kD, kWindow, kKVHeads, 1});
+    context.v = Tensor(d_context_v.p, kv_reference_dtype<CacheBits>, {kD, kWindow, kKVHeads, 1});
     const ops::SwaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes =
         ops::swa_workspace_capacity_bytes(envelope, tokens, tokens, 1);
@@ -218,8 +230,38 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     }
     if (profile == InputProfile::WindowBoundary) label += " window-boundary";
 
-    int failures = verify_reduction(label.c_str(), from_device_bf16(d_out.data(), q_count),
-                                    reference, kSwaBf16Criterion);
+    if constexpr (sizeof(CacheBits) == 1) {
+        label += " fp8";
+    }
+    const auto criterion = sizeof(CacheBits) == 1 ? kSwaFp8Criterion : kSwaBf16Criterion;
+    int failures = verify_reduction(label.c_str(), from_device_bf16(d_out.data(), q_count), reference, criterion);
+    if constexpr (sizeof(CacheBits) == 1) {
+        DeviceBuffer widened_k = to_device(bf16_bits(context_k));
+        DeviceBuffer widened_v = to_device(bf16_bits(context_v));
+        auto widened = make_context_view(widened_k, widened_v);
+        GuardedDeviceBuffer control(q_count * sizeof(std::uint16_t));
+        Tensor control_tensor(control.data(), DType::BF16, {kD, kQHeads, tokens, 1});
+        ops::swa(q_tensor,
+                 query_k_tensor,
+                 query_v_tensor,
+                 positions_tensor,
+                 valid_tensor,
+                 lane_tensor,
+                 kScale,
+                 widened,
+                 envelope,
+                 workspace,
+                 control_tensor,
+                 nullptr);
+        cuda_synchronize();
+        failures += verify_exact((label + " widened BF16 equivalence").c_str(),
+                                 from_device<std::uint16_t>(d_out.data(), q_count),
+                                 from_device<std::uint16_t>(control.data(), q_count));
+        failures += verify_reduction((label + " widened BF16 oracle").c_str(),
+                                     from_device_bf16(control.data(), q_count),
+                                     reference,
+                                     criterion);
+    }
     failures += d_out.verify_guards((label + " output guards").c_str());
     failures += verify_exact((label + " q unchanged").c_str(),
                              from_device<std::uint16_t>(d_q, q_count), q_expected);
@@ -231,12 +273,12 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
                      from_device<std::uint16_t>(d_query_v, query_kv_count), query_v_expected);
     failures += verify_exact((label + " positions unchanged").c_str(),
                              from_device<int>(d_positions, positions.size()), positions);
-    failures +=
-        verify_exact((label + " context k unchanged").c_str(),
-                     from_device<std::uint16_t>(d_context_k, context_count), context_k_expected);
-    failures +=
-        verify_exact((label + " context v unchanged").c_str(),
-                     from_device<std::uint16_t>(d_context_v, context_count), context_v_expected);
+    failures += verify_exact((label + " context k unchanged").c_str(),
+                             from_device<CacheBits>(d_context_k, context_count),
+                             context_k_expected);
+    failures += verify_exact((label + " context v unchanged").c_str(),
+                             from_device<CacheBits>(d_context_v, context_count),
+                             context_v_expected);
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
@@ -349,6 +391,12 @@ int main() {
     failures += run_case(16, 4096);
     failures += run_case(2, 4096, InputProfile::WindowBoundary);
     failures += run_case(2, 8194);
+    for (int width = 1; width <= 16; ++width) {
+        failures += run_case<std::uint8_t>(width, 65, InputProfile::Random, 4096);
+    }
+    failures += run_case<std::uint8_t>(16, 0);
+    failures += run_case<std::uint8_t>(16, 4096, InputProfile::WindowBoundary);
+    failures += run_case<std::uint8_t>(16, 8194);
     failures += run_batch_case();
 
     if (failures != 0) {

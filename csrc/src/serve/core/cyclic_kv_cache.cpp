@@ -25,10 +25,12 @@ std::uint32_t align_up_u32(std::uint32_t value, std::uint32_t alignment) {
 
 CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers,
                                          std::uint32_t capacity, std::int32_t num_kv_heads,
-                                         std::int32_t head_dim, std::int32_t lane_capacity) {
+                                         std::int32_t head_dim, std::int32_t lane_capacity,
+                                         DType dtype) {
     if (layers == 0 || capacity == 0 ||
         capacity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
-        num_kv_heads <= 0 || head_dim <= 0 || lane_capacity <= 0) {
+        num_kv_heads <= 0 || head_dim <= 0 || lane_capacity <= 0 ||
+        (dtype != DType::BF16 && dtype != DType::FP8_E4M3FN)) {
         throw std::invalid_argument("Cyclic KV geometry is invalid");
     }
 
@@ -43,12 +45,10 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t l
     const auto padded = static_cast<std::int32_t>(layout.padded_capacity);
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const std::string prefix = "Cyclic KV layer " + std::to_string(layer);
-        layout.k.push_back(builder.add_tensor(DType::BF16,
-                                              {head_dim, padded, num_kv_heads, lane_capacity},
-                                              kArenaAlign, prefix + " K"));
-        layout.v.push_back(builder.add_tensor(DType::BF16,
-                                              {head_dim, padded, num_kv_heads, lane_capacity},
-                                              kArenaAlign, prefix + " V"));
+        layout.k.push_back(builder.add_tensor(
+            dtype, {head_dim, padded, num_kv_heads, lane_capacity}, kArenaAlign, prefix + " K"));
+        layout.v.push_back(builder.add_tensor(
+            dtype, {head_dim, padded, num_kv_heads, lane_capacity}, kArenaAlign, prefix + " V"));
     }
     return layout;
 }
@@ -74,7 +74,9 @@ CyclicKVCache::CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layo
     k_.reserve(layout.k.size());
     v_.reserve(layout.v.size());
     for (std::size_t layer = 0; layer < layout.k.size(); ++layer) {
-        if (layout.k[layer].dtype != DType::BF16 || layout.v[layer].dtype != DType::BF16 ||
+        if ((layout.k[layer].dtype != DType::BF16 && layout.k[layer].dtype != DType::FP8_E4M3FN) ||
+            layout.k[layer].dtype != layout.k.front().dtype ||
+            layout.v[layer].dtype != layout.k[layer].dtype ||
             layout.k[layer].shape != expected_shape || layout.v[layer].shape != expected_shape) {
             throw std::invalid_argument("Cyclic KV layer layout is inconsistent");
         }
@@ -104,7 +106,8 @@ void CyclicKVCache::copy_lane_from(const CyclicKVCache& source, std::int32_t lan
                                    cudaStream_t stream) {
     if (source.layer_count() != layer_count() || source.capacity_ != capacity_ ||
         source.padded_capacity_ != padded_capacity_ || source.num_kv_heads_ != num_kv_heads_ ||
-        source.head_dim_ != head_dim_ || source.lane_capacity_ != lane_capacity_) {
+        source.head_dim_ != head_dim_ || source.lane_capacity_ != lane_capacity_ ||
+        source.dtype() != dtype()) {
         throw std::invalid_argument("Cyclic KV copy requires identical layouts");
     }
     if (lane < 0 || lane >= lane_capacity_) {

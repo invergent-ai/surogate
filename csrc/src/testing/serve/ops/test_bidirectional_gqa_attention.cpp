@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "ops/op_tester.h"
+#include "ops/fp8_reference.h"
 
 #include <algorithm>
 #include <array>
@@ -200,8 +201,12 @@ enum class InputProfile {
     QueryVisibility,
 };
 
-int run_case(int tokens, int context_length, InputProfile profile = InputProfile::Random,
-             int envelope_max = -1, MappingPattern mapping_pattern = MappingPattern::Identity) {
+template <typename CacheBits = std::uint16_t>
+int run_case(int tokens,
+             int context_length,
+             InputProfile profile = InputProfile::Random,
+             int envelope_max = -1,
+             MappingPattern mapping_pattern = MappingPattern::Identity) {
     if (envelope_max < 0) envelope_max = context_length;
     const int max_context            = std::max({context_length, envelope_max, 1});
     const int logical_pages          = (max_context + kPage - 1) / kPage;
@@ -242,8 +247,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     round_to_bf16(q);
     round_to_bf16(query_k);
     round_to_bf16(query_v);
-    round_to_bf16(context_k);
-    round_to_bf16(context_v);
+    round_kv_reference<CacheBits>(context_k);
+    round_kv_reference<CacheBits>(context_v);
 
     std::vector<double> reference;
     bidirectional_gqa_oracle(q, query_k, query_v, context_k, context_v, tokens, context_length,
@@ -269,8 +274,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     const auto q_expected         = bf16_bits(q);
     const auto query_k_expected   = bf16_bits(query_k);
     const auto query_v_expected   = bf16_bits(query_v);
-    const auto context_k_expected = bf16_bits(physical_k);
-    const auto context_v_expected = bf16_bits(physical_v);
+    const auto context_k_expected = kv_reference_bits<CacheBits>(physical_k);
+    const auto context_v_expected = kv_reference_bits<CacheBits>(physical_v);
     const std::vector<int> length_expected{context_length};
 
     DeviceBuffer d_q         = to_device(q_expected);
@@ -294,6 +299,9 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
     PagedKVBatchLayerView context =
         make_context_view(d_context_k, d_context_v, d_table, logical_pages, physical_pages);
+    context.dtype = kv_reference_dtype<CacheBits>;
+    context.k_pages = Tensor(d_context_k.p, context.dtype, {kD, kPage, physical_pages, kKVHeads});
+    context.v_pages = Tensor(d_context_v.p, context.dtype, {kD, kPage, physical_pages, kKVHeads});
     const ops::GqaContextExecutionEnvelope envelope{0, static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes =
         ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1);
@@ -312,6 +320,9 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     }
     if (profile == InputProfile::QueryVisibility) label += " query-visibility";
 
+    if constexpr (sizeof(CacheBits) == 1) {
+        label += " fp8";
+    }
     int failures = verify_reduction(label.c_str(), from_device_bf16(d_out.data(), q_count),
                                     reference, kBidirectionalGqaBf16Criterion);
     failures += d_out.verify_guards((label + " output guards").c_str());
@@ -324,10 +335,10 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
         verify_exact((label + " query v unchanged").c_str(),
                      from_device<std::uint16_t>(d_query_v, query_kv_count), query_v_expected);
     failures += verify_exact((label + " context k unchanged").c_str(),
-                             from_device<std::uint16_t>(d_context_k, physical_context_count),
+                             from_device<CacheBits>(d_context_k, physical_context_count),
                              context_k_expected);
     failures += verify_exact((label + " context v unchanged").c_str(),
-                             from_device<std::uint16_t>(d_context_v, physical_context_count),
+                             from_device<CacheBits>(d_context_v, physical_context_count),
                              context_v_expected);
     failures += verify_exact((label + " block table unchanged").c_str(),
                              from_device<std::int32_t>(d_table, mapping.size()), mapping);
@@ -591,6 +602,11 @@ int main() {
     failures += run_case(16, 257);
     failures += run_case(1, 4096, InputProfile::Random, -1, MappingPattern::Fragmented);
     failures += run_case(4, 0, InputProfile::QueryVisibility);
+    for (int width = 1; width <= 16; ++width) {
+        failures += run_case<std::uint8_t>(width, 65, InputProfile::Random, 4096, MappingPattern::Fragmented);
+    }
+    failures += run_case<std::uint8_t>(16, 0, InputProfile::QueryVisibility);
+    failures += run_case<std::uint8_t>(16, 257, InputProfile::Random, 65537, MappingPattern::Fragmented);
     failures += graph_mapping_replay_case();
     failures += batch_table_case();
 

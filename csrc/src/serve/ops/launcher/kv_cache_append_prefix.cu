@@ -18,13 +18,14 @@ void validate_plan(const Tensor& k, const KVCacheAppendPrefixPlan& plan) {
     }
 }
 
+template <typename CacheT>
 void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
                   const Tensor& table_rows, PagedKVBatchLayerView cache,
                   const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     validate_plan(k, plan);
     if (plan.max_count == 0) return;
-    auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k_pages.data);
-    auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v_pages.data);
+    auto* cache_k       = static_cast<CacheT*>(cache.k_pages.data);
+    auto* cache_v       = static_cast<CacheT*>(cache.v_pages.data);
     const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);
     const auto* input_v = static_cast<const __nv_bfloat16*>(v.data);
     const auto* pos     = static_cast<const std::int32_t*>(positions.data);
@@ -39,13 +40,14 @@ void launch_paged(const Tensor& k, const Tensor& v, const Tensor& positions, con
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename CacheT>
 void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, const Tensor& counts,
                    const Tensor& lanes, CyclicKVCacheLayerView cache,
                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     validate_plan(k, plan);
     if (plan.max_count == 0) return;
-    auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k.data);
-    auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v.data);
+    auto* cache_k       = static_cast<CacheT*>(cache.k.data);
+    auto* cache_v       = static_cast<CacheT*>(cache.v.data);
     const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);
     const auto* input_v = static_cast<const __nv_bfloat16*>(v.data);
     const auto* pos     = static_cast<const std::int32_t*>(positions.data);
@@ -83,14 +85,22 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
                                    const Tensor& counts, const Tensor& table_rows,
                                    PagedKVBatchLayerView cache, const KVCacheAppendPrefixPlan& plan,
                                    cudaStream_t stream) {
-    launch_paged(k, v, positions, counts, table_rows, cache, plan, stream);
+    if (cache.dtype == DType::FP8_E4M3FN) {
+        launch_paged<std::uint8_t>(k, v, positions, counts, table_rows, cache, plan, stream);
+    } else {
+        launch_paged<__nv_bfloat16>(k, v, positions, counts, table_rows, cache, plan, stream);
+    }
 }
 
 void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                    const Tensor& counts, const Tensor& lanes,
                                    CyclicKVCacheLayerView cache,
                                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
-    launch_cyclic(k, v, positions, counts, lanes, cache, plan, stream);
+    if (cache.k.dtype == DType::FP8_E4M3FN) {
+        launch_cyclic<std::uint8_t>(k, v, positions, counts, lanes, cache, plan, stream);
+    } else {
+        launch_cyclic<__nv_bfloat16>(k, v, positions, counts, lanes, cache, plan, stream);
+    }
 }
 
 } // namespace sinfer::ops::detail

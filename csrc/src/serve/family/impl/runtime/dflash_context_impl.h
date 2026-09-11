@@ -14,15 +14,18 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
     if (local.layer_count() != layout.geometry.local_layers ||
         rewrite_checkpoint_local.layer_count() != layout.geometry.local_layers ||
         local.capacity() != layout.geometry.local_capacity ||
-        rewrite_checkpoint_local.capacity() != layout.geometry.local_capacity || full.layers() != 1 ||
-        full.max_context() != layout.full.max_context || full.pool().plane_count() != 2 ||
-        local.num_kv_heads() != layout.geometry.kv_heads ||
+        rewrite_checkpoint_local.capacity() != layout.geometry.local_capacity ||
+        full.layers() != 1 || full.max_context() != layout.full.max_context ||
+        full.pool().plane_count() != 2 || local.num_kv_heads() != layout.geometry.kv_heads ||
         rewrite_checkpoint_local.num_kv_heads() != layout.geometry.kv_heads ||
         local.head_dim() != layout.geometry.head_dim ||
         rewrite_checkpoint_local.head_dim() != layout.geometry.head_dim ||
         local.lane_capacity() != rewrite_checkpoint_local.lane_capacity() ||
         local.lane_capacity() != full.pool().table_row_count() ||
-        full.pool().plane(0).dtype != DType::BF16 ||
+        (full.pool().plane(0).dtype != DType::BF16 &&
+         full.pool().plane(0).dtype != DType::FP8_E4M3FN) ||
+        full.pool().plane(0).dtype != local.dtype() ||
+        local.dtype() != rewrite_checkpoint_local.dtype() ||
         full.pool().plane(0).ne[0] != layout.geometry.head_dim ||
         full.pool().plane(0).ne[1] != kPagedKVPageSize ||
         full.pool().plane(0).ne[3] != layout.geometry.kv_heads) {

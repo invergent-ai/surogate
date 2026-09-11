@@ -80,11 +80,12 @@ const char* swa_route_name(SwaRoute route) {
     return "unknown";
 }
 
-void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
-                const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
-                float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
-                Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                cudaStream_t stream) {
+template <typename CacheT>
+void swa_launch_typed(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                      const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
+                      float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
+                      Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                      cudaStream_t stream) {
     dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
         const bool direct = plan.route == SwaRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
@@ -96,7 +97,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
             2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
         if (direct) {
             const dim3 direct_grid(kBidirectionalGqaKVHeads, 1, q.ne[3]);
-            swa_split_partial_kernel<Tokens, Warps, KeyBlock, true>
+            swa_split_partial_kernel<Tokens, Warps, KeyBlock, true, CacheT>
                 <<<direct_grid, Warps * 32, SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
@@ -104,8 +105,8 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                     static_cast<const std::int32_t*>(positions.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(lanes.data),
-                    static_cast<const __nv_bfloat16*>(context.k.data),
-                    static_cast<const __nv_bfloat16*>(context.v.data),
+                    static_cast<const CacheT*>(context.k.data),
+                    static_cast<const CacheT*>(context.v.data),
                     static_cast<int>(context.padded_capacity), plan.max_context, 1, scale,
                     static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
@@ -115,7 +116,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
         }
 
         const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
-        swa_split_partial_kernel<Tokens, Warps, KeyBlock, false>
+        swa_split_partial_kernel<Tokens, Warps, KeyBlock, false, CacheT>
             <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(query_k.data),
@@ -123,8 +124,8 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 static_cast<const std::int32_t*>(positions.data),
                 static_cast<const std::int32_t*>(valid_columns.data),
                 static_cast<const std::int32_t*>(lanes.data),
-                static_cast<const __nv_bfloat16*>(context.k.data),
-                static_cast<const __nv_bfloat16*>(context.v.data),
+                static_cast<const CacheT*>(context.k.data),
+                static_cast<const CacheT*>(context.v.data),
                 static_cast<int>(context.padded_capacity), plan.max_context, plan.split_capacity,
                 scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
@@ -144,6 +145,22 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     });
+}
+
+void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
+                float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
+                Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                cudaStream_t stream) {
+    if (context.k.dtype == DType::FP8_E4M3FN) {
+        swa_launch_typed<std::uint8_t>(q, query_k, query_v, positions, valid_columns, lanes, scale,
+                                       context, plan, partial_acc, partial_m, partial_l, out,
+                                       stream);
+    } else {
+        swa_launch_typed<__nv_bfloat16>(q, query_k, query_v, positions, valid_columns, lanes, scale,
+                                        context, plan, partial_acc, partial_m, partial_l, out,
+                                        stream);
+    }
 }
 
 } // namespace sinfer::ops::detail
