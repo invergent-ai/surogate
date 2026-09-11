@@ -129,7 +129,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     const int k              = static_cast<int>(drafts.size());
     DeviceBuffer d_targets   = to_device(target_tokens);
     DeviceBuffer d_logits    = to_device(logits_bits);
-    DeviceBuffer d_drafts    = to_device(drafts);
+    DeviceBuffer d_drafts = to_device(drafts.empty() ? std::vector<std::int32_t>{0} : drafts);
     DeviceBuffer d_counts    = to_device(initial_token_counts);
     config.token_counts      = static_cast<std::int32_t*>(d_counts.p);
     DeviceBuffer d_config    = device_config(config);
@@ -149,7 +149,7 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {physical_rows, k + 1});
-    Tensor draft_tensor(d_drafts.p, DType::I32, {k});
+    Tensor draft_tensor(d_drafts.p, DType::I32, {std::max(1, k)});
     Tensor extent(d_extent.p, DType::I32, {1});
     Tensor length(d_length.data(), DType::I32, {1});
     Tensor token(d_token.data(), DType::I32, {1});
@@ -159,9 +159,20 @@ int execute_accept_case(const std::string& label, const std::vector<std::int32_t
     const std::size_t workspace_bytes =
         ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain, k, k, 1, 1);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
-    ops::speculative_accept_greedy_drafts(
-        targets, logits, draft_tensor, extent, length, token, sampled, num_sampled, accepted,
-        token_domain, static_cast<const ops::SamplingConfig*>(d_config.p), workspace, nullptr);
+    ops::speculative_accept_greedy_drafts(targets,
+                                          logits,
+                                          draft_tensor,
+                                          extent,
+                                          length,
+                                          token,
+                                          sampled,
+                                          num_sampled,
+                                          accepted,
+                                          token_domain,
+                                          static_cast<const ops::SamplingConfig*>(d_config.p),
+                                          workspace,
+                                          nullptr,
+                                          k == 0);
     cuda_synchronize();
 
     int failures = verify_exact((label + " sampled").c_str(), read<std::int32_t>(d_sampled, k + 1),
@@ -534,11 +545,31 @@ int main() {
            "did not saturate a draft interval that runs past the column cap");
     expect(accept(15, 15, 2) == 2 * k15, "did not scale by the batch bound");
     try {
-        (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
+        (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, -1, 15, 1, 1);
         std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
     for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
+    failures += greedy_accept_case(0, 0);
+    for (const int domain : {257, 32769}) {
+        for (const int top_k : {1, 64, 0}) {
+            std::vector<std::uint16_t> logits(domain, f32_to_bf16(-INFINITY));
+            logits[5] = f32_to_bf16(0.0F);
+            ops::SamplingConfig config{};
+            config.temperature = 1;
+            config.top_k = top_k;
+            failures += execute_accept_case("zero drafts sampled",
+                                            {5},
+                                            logits,
+                                            domain,
+                                            {},
+                                            123,
+                                            domain,
+                                            config,
+                                            std::vector<std::int32_t>(domain, 0),
+                                            {{5}, 1, 0, 124, 5});
+        }
+    }
     failures += greedy_accept_case(1, 0);
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);

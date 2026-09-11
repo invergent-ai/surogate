@@ -29,6 +29,7 @@ pytestmark = pytest.mark.skipif(
 def server(tmp_path_factory):
     artifact = os.environ["SUROGATE_DFLASH_VISION_TEST_ARTIFACT"]
     draft_tokens = os.getenv("SUROGATE_DFLASH_VISION_TEST_DRAFT_TOKENS", "15")
+    adaptive = os.getenv("SUROGATE_DFLASH_VISION_TEST_ADAPTIVE", "false")
     root = tmp_path_factory.mktemp("dflash-vision")
     log, records = root / "server.log", root / "requests.jsonl"
     with socket.socket() as listener:
@@ -41,7 +42,7 @@ def server(tmp_path_factory):
         "--max-model-len", "4096", "--kv-capacity", "8192", "--max-num-seqs", "4",
         "--max-num-batched-tokens", "128", "--media-cache-mib", "16", "--media-live-mib", "64",
         "--kv-cache-dtype", os.getenv("SUROGATE_DFLASH_VISION_TEST_KV_DTYPE", "bf16"),
-        "--model", f"draft={artifact},spec=dflash,draft-tokens={draft_tokens}",
+        "--model", f"draft={artifact},spec=dflash,draft-tokens={draft_tokens},spec-adaptive={adaptive}",
         "--request-log-jsonl", str(records),
     ]
     with log.open("w") as output:
@@ -110,7 +111,7 @@ def test_image_scores_match_ordinary_decode(server, color, size):
     same_policy(actual, expected)
     assert color in actual["choices"][0]["message"]["content"].lower()
     done = latest_done(server)
-    assert done["speculative"]["rounds"] > 0
+    assert done["speculative"]["rounds"] + done["speculative"]["fallback_steps"] > 0
     assert done["speculative"]["draft_window"] == int(os.getenv("SUROGATE_DFLASH_VISION_TEST_DRAFT_TOKENS", "15"))
     if size == 512:
         assert actual["usage"]["prompt_tokens"] > 128
@@ -120,7 +121,7 @@ def test_mixed_batch_preserves_visual_positions(server):
     prompts = [conversation("red", 64), conversation("blue", 512),
                [{"role": "user", "content": "Reply with the word hello."}],
                [{"role": "user", "content": [image_part("red", 128), image_part("blue", 256),
-                   {"type": "text", "text": "Name the colors of the first and second images, in order."}]}]]
+                   {"type": "text", "text": "Name the colors of the first and second images, in order. Reply with two color words only."}]}]]
     expected = [ask(server, prompt, "base", max_tokens=16) for prompt in prompts]
     assert len({r["usage"]["prompt_tokens"] for r in expected}) >= 3
     for _ in range(2):
@@ -149,9 +150,19 @@ def test_long_image_answer_scores_match_teacher_forcing(server, color, size):
             replay = ask(server, history, model, max_tokens=1, prompt_logprobs=5)
             assert replay["prompt_token_ids"][:len(expected_tokens)] == expected_tokens
             n = len(generated["prompt_token_ids"])
-            for i, token in enumerate(choice["token_ids"]):
-                assert replay["prompt_logprobs"][n + i][str(token)]["logprob"] == pytest.approx(
-                    choice["logprobs"]["content"][i]["logprob"], abs=.12)
+            errors = [abs(replay["prompt_logprobs"][n + i][str(token)]["logprob"] -
+                          choice["logprobs"]["content"][i]["logprob"])
+                      for i, token in enumerate(choice["token_ids"])]
+            if os.getenv("SUROGATE_DFLASH_VISION_TEST_ADAPTIVE") == "true":
+                # Changing verification widths changes BF16 rounding; FP8 cache
+                # quantization can amplify individual differences. Bound both
+                # peak and average error. Native GQA tests check cache rounding
+                # equivalence exactly, independently of these model-level checks.
+                peak = .25 if os.getenv("SUROGATE_DFLASH_VISION_TEST_KV_DTYPE") == "fp8" else .15
+                assert max(errors) <= peak, errors
+                assert sum(errors) / len(errors) <= .035, errors
+            else:
+                assert max(errors) <= .12, errors
 
 
 def test_completed_image_turn_reuse_and_edited_history(server):

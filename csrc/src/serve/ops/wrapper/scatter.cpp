@@ -37,7 +37,7 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
     if (source.dtype != DType::BF16 || destination.dtype != DType::BF16 ||
         lanes.dtype != DType::I32 || valid_columns.dtype != DType::I32 || source.ne[0] <= 0 ||
         (source.ne[0] % 8) != 0 || width <= 0 || batch <= 0 || source.ne[3] != 1 ||
-        destination.ne[0] != source.ne[0] || destination.ne[1] != width || destination.ne[2] <= 0 ||
+        destination.ne[0] != source.ne[0] || destination.ne[1] < width || destination.ne[2] <= 0 ||
         destination.ne[3] != 1 || lanes.ne[0] != batch || valid_columns.ne[0] != batch ||
         lanes.ne[1] != 1 || valid_columns.ne[1] != 1 || lanes.ne[2] != 1 ||
         valid_columns.ne[2] != 1 || lanes.ne[3] != 1 || valid_columns.ne[3] != 1) {

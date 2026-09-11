@@ -107,6 +107,8 @@ struct SpeculativeOptions {
     /// proposing as usual -- so a draft head never costs a throughput-bound batch. 0 takes
     /// `kDefaultSpeculationLanes`; `kSpeculateAtAnyWidth` verifies always.
     std::uint32_t max_lanes = 0;
+    /// Learn DFlash draft length from measured throughput; draft_tokens is the ceiling.
+    bool adaptive = false;
 };
 
 struct LoadProgress {
@@ -686,6 +688,7 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    std::vector<std::uint64_t> rounds_per_draft_window;
 };
 
 enum class PrefixReusePath : std::uint8_t {

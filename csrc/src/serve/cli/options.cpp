@@ -82,15 +82,18 @@ std::string usage_text(const char* argv0) {
            " <model.sinfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] "
            "[--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank auto|w8|q4] "
-           "[--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
+           "[--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
+           "[--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices A,B,...]\n"
-           "       [--kv-dtype auto|bf16|fp8|fp8_e4m3|int8] [--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all]\n"
+           "       [--kv-dtype auto|bf16|fp8|fp8_e4m3|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--spec-max-lanes N|all] [--spec-adaptive]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--prefill-warmup]\n"
-           "       [--reasoning-effort minimal|low|medium|high|xhigh|max] [--vision] [--offload-vision] [--offload-embeddings] [--offload-output-head]\n"
+           "       [--reasoning-effort minimal|low|medium|high|xhigh|max] [--vision] "
+           "[--offload-vision] [--offload-embeddings] [--offload-output-head]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -197,6 +200,8 @@ Options parse_options(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
+        } else if (arg == "--spec-adaptive") {
+            options.speculative.adaptive = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--spec-max-lanes") {

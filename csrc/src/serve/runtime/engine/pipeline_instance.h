@@ -465,6 +465,7 @@ private:
         TokenId lone_prefill_token = 0;
         std::vector<std::byte> park;
         std::size_t carry_bytes = 0; // bytes of residual this flight carries across a boundary
+        std::uint32_t dflash_window = 0;
         std::uint32_t width_hint = 0; // the round width the flight was launched under
         GroupResult result{};
     };
@@ -490,6 +491,7 @@ private:
             select(0);
             stages_[0]->program->set_round_width_hint(f.width_hint);
             f.verifying = !stages_[0]->program->speculative_round_is_narrow(lanes.size());
+            f.dflash_window = stages_[0]->program->select_dflash_draft_window(lanes);
         }
         f.result       = GroupResult{};
         // A decode round's residual is exactly `width` columns per lane (one, or the verify's
@@ -595,6 +597,7 @@ private:
             }
             stage_owner_[s] = pick;
             stages_[s]->program->set_round_width_hint(f.width_hint);
+            stages_[s]->program->set_dflash_draft_window(f.dflash_window);
             if (f.kind == FlightKind::Mixed) {
                 trace("launch_mixed_round", s, f.prefill_lanes.size() * 1000 + f.lanes.size());
                 f.handle = stages_[s]->program->launch_mixed_round(f.prefill_lanes, f.lanes, f.budgets);
@@ -684,7 +687,11 @@ private:
         std::vector<bool> in_flight_mixed(N, false);
         assembled_mixed_ = MixedRoundResult{};
         const std::uint32_t width_hint = width_hint_; // one decision for every stage of the round
-        for (Stage* stage : stages_) { stage->program->set_round_width_hint(width_hint); }
+        const auto dflash_window = stages_.front()->program->select_dflash_draft_window(lanes);
+        for (Stage* stage : stages_) {
+            stage->program->set_round_width_hint(width_hint);
+            stage->program->set_dflash_draft_window(dflash_window);
+        }
         for (std::size_t t = 0; t + 1 < G + N + 1; ++t) {
             for (std::size_t s = 0; s < N; ++s) {
                 if (t >= s + 1 && t - s - 1 < G) {

@@ -65,6 +65,36 @@ int main() {
         require(offload_gen.offload_vision && offload_gen.offload_embeddings && offload_gen.offload_output_head &&
                     offload_server.offload_vision && offload_server.offload_embeddings && offload_server.offload_output_head,
                 "component offload options lost");
+        const auto adaptive_gen = parse(gen,
+                                        {"generate",
+                                         "model.sinfer",
+                                         "--prompt",
+                                         "x",
+                                         "--spec",
+                                         "dflash",
+                                         "--draft-tokens",
+                                         "15",
+                                         "--spec-adaptive"});
+        const auto adaptive_server = parse(server,
+                                           {"serve",
+                                            "model.sinfer",
+                                            "--spec",
+                                            "dflash",
+                                            "--draft-tokens",
+                                            "15",
+                                            "--spec-adaptive",
+                                            "--model",
+                                            "other=other.sinfer,spec=dflash,spec-adaptive=true"});
+        require(adaptive_gen.speculative.adaptive && adaptive_server.speculative.adaptive &&
+                    adaptive_server.extra_models.front().speculative.adaptive,
+                "adaptive DFlash options lost");
+        rejects(gen, {"generate", "model.sinfer", "--prompt", "x", "--spec-adaptive"});
+        rejects(server, {"serve", "model.sinfer", "--spec-adaptive"});
+        rejects(
+            gen,
+            {"generate", "model.sinfer", "--prompt", "x", "--spec", "mtp", "--draft-tokens", "3", "--spec-adaptive"});
+        rejects(server, {"serve", "model.sinfer", "--spec", "mtp", "--draft-tokens", "3", "--spec-adaptive"});
+        rejects(server, {"serve", "model.sinfer", "--model", "other=other.sinfer,spec=dflash,spec-adaptive=yes"});
         const auto vision_dflash = parse(gen,
                                          {"generate",
                                           "model.sinfer",

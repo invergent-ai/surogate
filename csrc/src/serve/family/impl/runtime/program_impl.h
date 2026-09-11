@@ -281,13 +281,14 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in)
     : cfg(model_in.geometry), model(model_in), device(device_in), capacity(plan.capacity),
-      kv_capacity(plan.kv_capacity),
-      max_concurrency(plan.max_concurrency),
-      batch_capacity(decode_batch_capacity(plan.max_concurrency)), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window), speculative_max_lanes(plan.speculative_max_lanes),
-      speculative_backend(plan.speculative_backend),
-      kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
-      rewrite_checkpoints(plan.rewrite_checkpoints),
+      kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
+      batch_capacity(decode_batch_capacity(plan.max_concurrency)),
+      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      adaptive_dflash(plan.adaptive_dflash ? std::make_optional<AdaptiveDFlash>(plan.draft_window)
+                                           : std::nullopt),
+      active_dflash_window(plan.draft_window), speculative_max_lanes(plan.speculative_max_lanes),
+      speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
+      kv_quant_group(plan.kv_quant_group), rewrite_checkpoints(plan.rewrite_checkpoints),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -360,6 +361,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     decoder = std::make_unique<family::DecoderState>(backing, plan.persistent.decoder, &elastic_kv);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
+        if (speculative_backend == SpeculativeBackend::DFlash) {
+            dflash_record_storage = replay_records;
+        }
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
@@ -1063,7 +1067,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             }
         }
 
-        if (anything_to_fold || needs_hidden_correction) {
+        if (anything_to_fold || needs_hidden_correction || speculative_backend == SpeculativeBackend::DFlash) {
             device.synchronize();
             work.reset();
         }
@@ -1079,6 +1083,25 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
+    if (adaptive_dflash) {
+        std::uint32_t committed = 0, frontier = 0;
+        bool complete = true;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            // Terminal rounds count too: measure useful tokens, including when
+            // EOS cuts a licensed block short. Otherwise short answers never
+            // finish calibration and can get stuck on an expensive probe.
+            complete = complete && !cancelled[row];
+            committed += accepted_tokens[row];
+            frontier = std::max(frontier, requests[lanes[row]].pending.base_E);
+        }
+        if (complete) {
+            adaptive_dflash->observe(
+                static_cast<std::uint32_t>(lanes.size()), frontier, active_dflash_window,
+                std::chrono::duration<double>(Clock::now() - dflash_measurement_started).count(),
+                committed);
+        }
+    }
+
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence = sequences[lanes[row]];
@@ -1574,7 +1597,7 @@ void ProgramImplCore::prepare_graphs() {
         if (io.dflash_decode) {
             *dflash_host_ingress       = {};
             *dflash_host_egress        = {};
-            const std::uint32_t extent = std::min(draft_window, capacity - frontier - 1U);
+            const std::uint32_t extent = std::min(active_dflash_window, capacity - frontier - 1U);
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 dflash_host_ingress->anchors[row] = 0;
                 dflash_host_ingress->execution_frontiers[row] =
@@ -1584,8 +1607,9 @@ void ProgramImplCore::prepare_graphs() {
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
-                for (std::uint32_t j = 0; j <= draft_window; ++j) {
-                    dflash_host_ingress->target_rope_positions[row * (draft_window + 1U) + j] =
+                for (std::uint32_t j = 0; j <= active_dflash_window; ++j) {
+                    dflash_host_ingress
+                        ->target_rope_positions[row * (active_dflash_window + 1U) + j] =
                         static_cast<std::int32_t>(frontier + std::min(j, extent));
                 }
                 dflash_host_ingress->text_kv_table_rows[row]   = static_cast<std::int32_t>(row);
@@ -1796,46 +1820,49 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
-        validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
-        schedule::DFlashBatchContext dflash_state{
-            execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
-            *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
-        dflash_state.execution.constraints = speculative_constraints.get();
-        const GraphExecutionProfile code_warm = batch_one_profiles.front();
-        const ops::GqaExecutionEnvelope code_warm_target{
-            1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                   capacity, static_cast<std::uint64_t>(code_warm.max) + draft_window + 1ULL))};
-        prepare_representative(code_warm.min, 1);
-        device.synchronize();
-        schedule::dflash_decode_batch(dflash_state, 1, draft_window,
-                                      dflash_envelopes(code_warm.min, code_warm.max, draft_window),
-                                      code_warm_target, nullptr);
-        device.synchronize();
+        for (auto window : dflash_draft_windows(draft_window, adaptive_dflash.has_value())) {
+            bind_dflash_window(window);
+            auto& graphs                  = dflash_graphs[window];
+            const auto batch_one_profiles = dflash_graph_profiles(capacity, window, 1);
+            validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
+            schedule::DFlashBatchContext dflash_state{
+                execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
+                *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
+            dflash_state.execution.constraints    = speculative_constraints.get();
+            const GraphExecutionProfile code_warm = batch_one_profiles.front();
+            const ops::GqaExecutionEnvelope code_warm_target{
+                1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                       capacity, static_cast<std::uint64_t>(code_warm.max) + window + 1ULL))};
+            prepare_representative(code_warm.min, 1);
+            device.synchronize();
+            schedule::dflash_decode_batch(dflash_state, 1, window,
+                                          dflash_envelopes(code_warm.min, code_warm.max, window),
+                                          code_warm_target, nullptr);
+            device.synchronize();
 
-        dflash_graphs.profiles.reserve(batch_one_profiles.size() * batch_capacity);
-        for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
-            const auto planned_profiles =
-                batch_size == 1 ? batch_one_profiles
-                                : dflash_graph_profiles(capacity, draft_window, batch_size);
-            validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
-            for (const GraphExecutionProfile planned : planned_profiles) {
-                dflash_graphs.profiles.emplace_back();
-                DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
-                profile.batch_size             = batch_size;
-                profile.min_execution_frontier = planned.min;
-                profile.max_execution_frontier = planned.max;
-                profile.topology_class =
-                    planned.topology_class * batch_capacity + (batch_size - 1U);
-                const ops::GqaExecutionEnvelope target_envelope{
-                    1,
-                    static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
+            graphs.profiles.reserve(batch_one_profiles.size() * batch_capacity);
+            for (std::uint32_t batch_size = 1; batch_size <= batch_capacity; ++batch_size) {
+                const auto planned_profiles =
+                    batch_size == 1 ? batch_one_profiles
+                                    : dflash_graph_profiles(capacity, window, batch_size);
+                validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
+                for (const GraphExecutionProfile planned : planned_profiles) {
+                    graphs.profiles.emplace_back();
+                    DecodeGraphProfile& profile    = graphs.profiles.back();
+                    profile.batch_size             = batch_size;
+                    profile.min_execution_frontier = planned.min;
+                    profile.max_execution_frontier = planned.max;
+                    profile.topology_class =
+                        planned.topology_class * batch_capacity + (batch_size - 1U);
+                    const ops::GqaExecutionEnvelope target_envelope{
+                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                               capacity, static_cast<std::uint64_t>(planned.max) + window + 1ULL))};
 
-                schedule::capture_dflash_decode_batch(
-                    dflash_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    dflash_envelopes(planned.min, planned.max, draft_window), target_envelope,
-                    profile.definition);
+                    schedule::capture_dflash_decode_batch(
+                        dflash_state, static_cast<std::int32_t>(batch_size), window,
+                        dflash_envelopes(planned.min, planned.max, window), target_envelope,
+                        profile.definition);
+                }
             }
         }
     }
@@ -1865,7 +1892,12 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_representative);
+        for (auto window : dflash_draft_windows(draft_window, adaptive_dflash.has_value())) {
+            bind_dflash_window(window);
+            instantiate_graph_family(dflash_graphs[window], "DFlash", device,
+                                     prepare_representative);
+        }
+        bind_dflash_window(draft_window);
     }
 
     ordered_reset(sequence);
@@ -2065,10 +2097,13 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     request.sampling_host     = config;
     update_constraint(sequence, request);
     request.speculative_stats = SpeculativeStats{
-        .backend               = speculative_backend,
-        .enabled               = speculative_backend != SpeculativeBackend::None,
-        .draft_window          = draft_window,
-        .accepted_per_position = std::vector<std::uint64_t>(draft_window, 0),
+        .backend                 = speculative_backend,
+        .enabled                 = speculative_backend != SpeculativeBackend::None,
+        .draft_window            = draft_window,
+        .accepted_per_position   = std::vector<std::uint64_t>(draft_window, 0),
+        .rounds_per_draft_window = speculative_backend == SpeculativeBackend::DFlash
+                                       ? std::vector<std::uint64_t>(draft_window + 1, 0)
+                                       : std::vector<std::uint64_t>{},
     };
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F ||
@@ -3724,7 +3759,7 @@ void ProgramImplCore::adopt_pipeline_prefill_features(std::uint32_t lane,
 void ProgramImplCore::adopt_pipeline_decode_features(std::span<const std::uint32_t> lanes,
     std::span<const std::byte> packet) {
     if (!stage.features || lanes.empty()) { return; }
-    const auto width = draft_window + 1U;
+    const auto width   = active_dflash_window + 1U;
     const auto columns = width * lanes.size();
     if (lanes.size() > batch_capacity || columns > static_cast<std::size_t>(dflash->prefill_features.ne[1]) ||
         packet.size() < columns * stage.column_bytes) {
@@ -3773,6 +3808,25 @@ void ProgramImplCore::adopt_lane_draft_state(std::uint32_t lane, std::span<const
     sequence.mtp_drafts      = adopted.drafts;
 }
 
+void ProgramImplCore::bind_dflash_window(std::uint32_t drafts) {
+    if (drafts > draft_window) {
+        throw std::invalid_argument("DFlash window exceeds configured maximum");
+    }
+    active_dflash_window = drafts;
+    io.dflash_decode->set_width(drafts + 1);
+    if (dflash_record_storage) { replay_records = dflash_record_storage->with_width(drafts + 1); }
+    speculative_constraints->set_width(drafts + 1);
+}
+
+std::uint32_t ProgramImplCore::select_dflash_draft_window(std::span<const std::uint32_t> lanes) {
+    if (!adaptive_dflash || lanes.empty()) { return draft_window; }
+    std::uint32_t frontier = 0;
+    for (auto lane : lanes) {
+        frontier = std::max(frontier, sequences.at(lane).execution_frontier);
+    }
+    return adaptive_dflash->choose(static_cast<std::uint32_t>(lanes.size()), frontier);
+}
+
 runtime::RoundHandle
 ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                      std::span<const runtime::RoundBudget> budgets) {
@@ -3783,7 +3837,11 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
-    const std::uint32_t width           = draft_window + 1U;
+    const auto selected_window =
+        pipeline_dflash_window ? *pipeline_dflash_window : select_dflash_draft_window(lanes);
+    pipeline_dflash_window.reset();
+    bind_dflash_window(selected_window);
+    const std::uint32_t width           = active_dflash_window + 1U;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -3801,7 +3859,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
-            sequence.execution_frontier - sequence.dflash_context_frontier > width ||
+            sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier) {
@@ -3810,8 +3868,8 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
-        const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+        const std::uint32_t extent        = std::min(
+            {active_dflash_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -3820,21 +3878,24 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
     const auto started = Clock::now();
     try {
         DecodeGraphExecutable* executable   = nullptr;
-        schedule::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
+        schedule::DFlashEnvelopes envelopes =
+            dflash_envelopes(0, maximum_frontier, active_dflash_window);
         ops::GqaExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
-            DecodeGraphProfile& profile =
-                select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "DFlash batch");
-            executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch", device.stream);
+            DecodeGraphProfile& profile = select_graph_profile(
+                dflash_graphs[active_dflash_window], static_cast<std::uint32_t>(lanes.size()),
+                maximum_frontier, "DFlash batch");
+            executable      = &install_graph_profile(dflash_graphs[active_dflash_window], profile,
+                                                     "DFlash batch", device.stream);
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
-                                               profile.max_execution_frontier, draft_window);
+                                               profile.max_execution_frontier, active_dflash_window);
             target_envelope = {
                 1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
                        capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
+                                     active_dflash_window + 1ULL))};
         }
 
+        dflash_measurement_started = Clock::now();
         speculative_constraints->reset();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
@@ -3844,7 +3905,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
             const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                std::min({active_dflash_window, max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -3852,9 +3913,9 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
             dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
-            for (std::uint32_t j = 0; j <= draft_window; ++j) {
+            for (std::uint32_t j = 0; j <= active_dflash_window; ++j) {
                 const auto position = frontier + std::min(j, extent);
-                dflash_host_ingress->target_rope_positions[row * (draft_window + 1U) + j] =
+                dflash_host_ingress->target_rope_positions[row * width + j] =
                     checked_i32(position, "DFlash batch RoPE position") + sequence.rope_delta;
             }
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
@@ -3879,7 +3940,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                      draft_window, envelopes, target_envelope, executable);
+                                      active_dflash_window, envelopes, target_envelope, executable);
         in_flight_ = InFlightRound{.id = ++in_flight_counter_,
                                     .rows = static_cast<std::uint32_t>(lanes.size()),
                                     .start = started};
@@ -3902,7 +3963,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
     const std::span<const std::uint32_t> lanes(in_flight_.lanes.data(), in_flight_.rows);
     const std::span<const runtime::RoundBudget> budgets(in_flight_.budgets.data(), in_flight_.rows);
     const auto started = in_flight_.start;
-    const std::uint32_t width = draft_window + 1U;
+    const std::uint32_t width = active_dflash_window + 1U;
     try {
         device.synchronize();
         speculative_constraints->check();
@@ -3913,7 +3974,8 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
                 auto& request = requests[lane];
                 sequence.dflash_context_frontier = sequence.execution_frontier;
                 request.pending = PendingCandidate{.kind = PendingKind::Speculative,
-                    .base_E = sequence.execution_frontier, .base_S = sequence.ledger_frontier};
+                    .base_E = sequence.execution_frontier, .base_S = sequence.ledger_frontier,
+                    .in_place_state = active_dflash_window == 0};
                 request.lifecycle = Lifecycle::Pending;
                 request.timings.decode_seconds += std::chrono::duration<double>(Clock::now() - started).count();
             }
@@ -3929,8 +3991,9 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
             const std::uint32_t base_S    = sequence.ledger_frontier;
             const std::int32_t count_i    = dflash_host_egress->licensed_counts[row];
             const std::int32_t accepted_i = dflash_host_egress->accepted_drafts[row];
-            const std::uint32_t extent = std::min({draft_window,
-                budgets[row].generated_tokens_remaining - 1U, capacity - base_E - 1U});
+            const std::uint32_t extent =
+                std::min({active_dflash_window, budgets[row].generated_tokens_remaining - 1U,
+                          capacity - base_E - 1U});
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || accepted_i > static_cast<std::int32_t>(extent) ||
                 static_cast<std::uint32_t>(count_i) > budgets[row].generated_tokens_remaining ||
@@ -3951,6 +4014,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
             std::copy(row_tokens.begin(), row_tokens.end(), request.outcome.licensed_tokens.begin());
             std::memcpy(outcome_export_.data() + row * sizeof(SpeculativeOutcome),
                         &request.outcome, sizeof(SpeculativeOutcome));
+            request.speculative_stats.rounds_per_draft_window[active_dflash_window] += 1;
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
@@ -3969,6 +4033,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
                                  .base_S        = base_S,
                                  .prompt_tokens = 0,
                                  .produced      = static_cast<std::uint32_t>(count_i),
+                                 .in_place_state = active_dflash_window == 0,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;

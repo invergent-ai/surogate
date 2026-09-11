@@ -1,4 +1,5 @@
 #pragma once
+#include "family/impl/adaptive_dflash.h"
 #include "runtime/contract/constraint.h"
 #include "family/impl/runtime/speculative_constraint.h"
 #include <api/family/text_geometry.h>
@@ -365,8 +366,11 @@ public:
     [[nodiscard]] bool stage_holds_head() const noexcept {
         return !(stage.last >= 0 && stage.last < cfg.layers);
     }
-    /// Columns a decode round licenses per lane at most: the draft window plus the anchor
-    /// under MTP, one otherwise. The pipeline driver sizes its token and residual carries by it.
+    /// The pipeline chooses one draft count and applies it to every stage of the flight.
+    [[nodiscard]] std::uint32_t select_dflash_draft_window(std::span<const std::uint32_t> lanes);
+
+    void set_dflash_draft_window(std::uint32_t drafts) { pipeline_dflash_window = drafts; }
+    /// Maximum columns per lane; pipeline storage remains sized for the configured ceiling.
     [[nodiscard]] std::uint32_t speculative_round_width() const noexcept {
         return speculative_backend != SpeculativeBackend::None ? draft_window + 1U : 1U;
     }
@@ -433,6 +437,11 @@ public:
     const std::uint32_t batch_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    std::optional<AdaptiveDFlash> adaptive_dflash;
+    std::uint32_t active_dflash_window = 0;
+    std::optional<std::uint32_t> pipeline_dflash_window;
+    std::optional<GdnReplayRecords> dflash_record_storage;
+    std::chrono::steady_clock::time_point dflash_measurement_started{};
     const std::uint32_t speculative_max_lanes;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
@@ -549,7 +558,7 @@ public:
     DecodeGraphFamily mtp_graphs;
     /// The narrow round's graphs, captured only when a width limit makes them reachable.
     DecodeGraphFamily mtp_narrow_graphs;
-    DecodeGraphFamily dflash_graphs;
+    std::array<DecodeGraphFamily, 16> dflash_graphs;
 
     PinnedHostBuffer round_host;
     TokenId* host_tokens = nullptr;
@@ -571,6 +580,7 @@ private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
+    void bind_dflash_window(std::uint32_t drafts);
     [[nodiscard]] ops::SamplingConfig staged_sampling(RequestControl& request,
                                                       const SequenceState& sequence) const;
     void update_constraint(const SequenceState& sequence, RequestControl& request) const;

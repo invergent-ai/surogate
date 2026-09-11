@@ -1,6 +1,12 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(Threads REQUIRED)
 
+add_executable(sinfer_adaptive_dflash_test test_adaptive_dflash.cpp)
+target_include_directories(sinfer_adaptive_dflash_test PRIVATE ${SERVE_ROOT})
+target_compile_options(sinfer_adaptive_dflash_test PRIVATE -UNDEBUG -fno-fast-math)
+add_test(NAME sinfer_adaptive_dflash_test COMMAND sinfer_adaptive_dflash_test)
+set_property(GLOBAL APPEND PROPERTY SINFER_SERVE_TEST_TARGETS sinfer_adaptive_dflash_test)
+
 add_executable(sinfer_lora_slots_test test_lora_slots.cpp)
 target_include_directories(sinfer_lora_slots_test PRIVATE ${SERVE_ROOT})
 target_link_libraries(sinfer_lora_slots_test PRIVATE Threads::Threads)

@@ -46,6 +46,8 @@ def server(tmp_path_factory):
                     "--kv-cache-dtype", os.getenv("SUROGATE_SAMPLING_TEST_KV_DTYPE", "bf16")]
     elif dtype := os.getenv("SUROGATE_SAMPLING_TEST_KV_DTYPE"):
         command += ["--kv-cache-dtype", dtype]
+    if os.getenv("SUROGATE_SAMPLING_TEST_ADAPTIVE") == "1":
+        command += ["--spec-adaptive"]
     with log.open("w") as output:
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
         try:
@@ -255,3 +257,16 @@ def test_constrained_drafts_are_accepted(server):
             break
         assert time.monotonic() < deadline, done[-1] if done else "no request log"
         time.sleep(0.05)
+
+
+@pytest.mark.skipif(os.getenv("SUROGATE_SAMPLING_TEST_ADAPTIVE") != "1", reason="requires adaptive DFlash")
+def test_adaptive_dflash_uses_multiple_windows_and_target_only_steps(server):
+    response = chat(server, logit_bias={"100": 100}, max_tokens=96, ignore_eos=True)
+    assert response.ok, response.text
+    ids = response.json()["choices"][0]["token_ids"]
+    assert len(ids) == 96 and set(ids) == {100}
+    done = [json.loads(line) for line in server.records.read_text().splitlines()
+            if json.loads(line).get("event") == "request_done"][-1]
+    windows = done["speculative"]["rounds_per_draft_window"]
+    assert windows[0] > 0, windows
+    assert sum(count > 0 for count in windows) > 1, windows

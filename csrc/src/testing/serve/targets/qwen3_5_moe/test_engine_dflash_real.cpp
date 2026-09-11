@@ -40,6 +40,7 @@ dflash_engine_options(const TestConfig& config, sinfer::ProposalHead proposal, s
     options.kv_capacity               = sinfer::KvCapacityPolicy::explicit_capacity(max_context);
     options.speculative.backend       = sinfer::SpeculativeBackend::DFlash;
     options.speculative.draft_tokens = config.draft_tokens;
+    options.speculative.adaptive = std::getenv("SINFER_DFLASH_TEST_ADAPTIVE") != nullptr;
     options.speculative.proposal_head = proposal;
     options.use_cuda_graph            = true;
     options.rewrite_checkpoints       = true;

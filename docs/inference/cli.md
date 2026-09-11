@@ -169,9 +169,12 @@ workload: more simultaneous requests or heavy CPU offload can reduce the benefit
 |---|---|
 | `--spec mtp` | Enable MTP on a supported model; supports one or multiple GPUs |
 | `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; supports BF16 or FP8 caches and can be combined with `--vision` |
-| `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec` |
+| `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec`. With `--spec-adaptive`, sets the maximum |
+| `--spec-adaptive` | Adjust DFlash draft length to measured throughput. Can temporarily stop drafting and retry it later. Off by default |
 | `--spec-max-lanes N\|all` | MTP checks drafts only while at most N requests are decoding. Default (or `0`) is 1; `all` keeps checking at every concurrency level. Does not affect DFlash |
 | `--lm-head-draft` | Use a smaller draft vocabulary when the checkpoint provides one |
+
+For workloads where DFlash acceptance or concurrency varies, use `--spec dflash --draft-tokens 15 --spec-adaptive`. The engine learns from completed decode rounds, so short requests may finish before it has enough measurements. It keeps separate measurements for different batch sizes and context lengths. Adaptive mode uses more GPU memory and can take longer to start. Calibration and periodic retries add some overhead; compare throughput on your workload. This option also works with vision prompts, BF16 or FP8 caches, and pipeline serving. Omitting `--spec-adaptive` keeps the requested draft length fixed. Changing draft lengths can also change individual token scores or greedy wording through numerical rounding, especially with an FP8 cache.
 
 MTP needs the checkpoint's MTP weights, which some community exports omit. DFlash
 needs a compatible drafter included during model preparation. Missing draft weights produce
@@ -201,7 +204,7 @@ The first, positional model still accepts a repo id, safetensors directory, or G
 | `devices=A:B:...` | Split this model across these GPUs |
 | `max-model-len=N` | Override its context limit |
 | `spec=mtp\|dflash` | Enable speculation for this model; defaults its draft token count to 3 |
-| `draft-tokens=N`, `spec-max-lanes=N\|all` | Override this model's speculation settings |
+| `draft-tokens=N`, `spec-max-lanes=N\|all`, `spec-adaptive=true\|false` | Override this model's speculation settings |
 | `lora=name:path` | Add an adapter to this model; repeatable |
 | `priority=high\|normal\|low` | Priority when models compete for memory; defaults to `normal` |
 | `--model-priority high\|normal\|low` | Set the first model's priority |

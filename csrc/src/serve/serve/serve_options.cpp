@@ -114,19 +114,24 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.sinfer> [--host H] [--port N] [--api-key KEY] "
-           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--gpu-layers N|all] [--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank auto|w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
+           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--gpu-layers "
+           "N|all] [--host-moe-layers N|auto|all] [--expert-slots N] [--host-expert-bank "
+           "auto|w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens "
+           "N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices A,B,...] "
+           "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices "
+           "A,B,...] "
            "[--reasoning-parser NAME] [--tool-call-parser NAME] [--enable-auto-tool-choice] "
            "[--chat-template FILE] [--enable-prefix-caching|--no-enable-prefix-caching] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--kv-cache-dtype auto|bf16|fp8|fp8_e4m3|int8] [--kv-cache-dtype-skip-layers L,...] "
-           "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] "
+           "[--spec mtp|dflash --draft-tokens N] [--spec-max-lanes N|all] [--spec-adaptive] "
            "[--default-max-tokens N] "
-           "[--vision] [--offload-vision] [--offload-embeddings] [--offload-output-head] [--enforce-eager] [--no-prefix-reuse] "
+           "[--vision] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
+           "[--enforce-eager] [--no-prefix-reuse] "
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
            "[--rewrite-checkpoints|--no-rewrite-checkpoints] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
@@ -143,38 +148,47 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
-           "       --served-model-name overrides the artifact identity.model_id reported by the server\n"
+           "       --served-model-name overrides the artifact identity.model_id reported by the "
+           "server\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables image/video input for a supported model\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
-           "       --kv-cache-dtype defaults to auto: BF16 for attention-only models, FP8 for hybrids.\n"
+           "       --kv-cache-dtype defaults to auto: BF16 for attention-only models, FP8 for "
+           "hybrids.\n"
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
            "       --rewrite-checkpoints uses extra memory to speed up editing the last turn.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --no-elastic-kv reserves the full cache; --elastic-kv grows it with demand.\n"
            "       --elastic-kv-overcommit guarantees each model only its\n"
-           "                    --kv-capacity (one full-context request when auto) and admits every\n"
-           "                    page past that against the device's free memory, shared across models\n"
+           "                    --kv-capacity (one full-context request when auto) and admits "
+           "every\n"
+           "                    page past that against the device's free memory, shared across "
+           "models\n"
            "       --enable-sleep-mode adds POST /sleep and /wake_up: sleeping releases VRAM\n"
-           "                           (weights and cache parked in host RAM), waking restores in ~a second\n"
+           "                           (weights and cache parked in host RAM), waking restores in "
+           "~a second\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --reasoning-parser selects how a reasoning span is recognised (default qwen3);\n"
            "         --tool-call-parser how a tool call is (default qwen3_xml). Both accept the\n"
            "         vLLM names, and an unknown one is refused with the supported list.\n"
-           "       --enable-auto-tool-choice permits tool_choice 'auto'; it needs a tool-call parser.\n"
-           "       --chat-template replaces the artifact's Jinja template with one read from FILE.\n"
+           "       --enable-auto-tool-choice permits tool_choice 'auto'; it needs a tool-call "
+           "parser.\n"
+           "       --chat-template replaces the artifact's Jinja template with one read from "
+           "FILE.\n"
            "       --enable-prefix-caching is this engine's default; the flag is accepted for\n"
            "         command-line compatibility, and --no-enable-prefix-caching turns it off.\n"
            "       --gpu-layers N (aliases -ngl, --n-gpu-layers) keeps the first N decoder layers\n"
            "         on the GPU; 0 offloads them all, all keeps them resident.\n"
            "       --model adds a prepared model with optional device=N or devices=A:B:C,\n"
-           "         kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, spec-max-lanes,\n"
+           "         kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, spec-max-lanes, "
+           "spec-adaptive,\n"
            "         priority and lora overrides.\n"
-           "       --enable-lora enables adapters; --lora-modules loads named adapters at startup.\n"
+           "       --enable-lora enables adapters; --lora-modules loads named adapters at "
+           "startup.\n"
            "         --max-loras defaults to 1 and --max-lora-rank to 32 per model.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
@@ -356,6 +370,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
+        } else if (arg == "--spec-adaptive") {
+            options.speculative.adaptive = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
@@ -489,6 +505,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                         throw std::invalid_argument("--model: lora= takes name:path");
                     }
                     extra.lora.push_back({val.substr(0, colon), val.substr(colon + 1)});
+                } else if (key == "spec-adaptive") {
+                    if (val != "true" && val != "false") {
+                        throw std::invalid_argument("--model: spec-adaptive takes true or false");
+                    }
+                    extra.speculative.adaptive = val == "true";
                 } else if (key == "draft-tokens") {
                     extra.speculative.draft_tokens = parse_model_count(val, "draft-tokens");
                     draft_explicit = true;
@@ -497,10 +518,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                         val == "all" ? kSpeculateAtAnyWidth
                                      : parse_model_count(val, "spec-max-lanes", true);
                 } else {
-                    throw std::invalid_argument(
-                        "--model: unknown key '" + key +
-                        "' (device, devices, kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, "
-                        "spec-max-lanes, priority, lora)");
+                    throw std::invalid_argument("--model: unknown key '" + key +
+                                                "' (device, devices, kv-tokens, max-num-seqs, "
+                                                "max-model-len, spec, draft-tokens, "
+                                                "spec-max-lanes, spec-adaptive, priority, lora)");
                 }
                 if (comma == std::string::npos) { break; }
                 cursor = comma + 1;

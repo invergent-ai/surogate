@@ -1417,6 +1417,66 @@ int run_geometry(const Geometry& geometry) {
 // the head counts into its addressing, so the wrong one reads the wrong strides.
 // Driven off the registry macro, so registering a shape extends this coverage by
 // itself.
+int verify_fp8_current_tokens_match_cached(int dim, int heads, int kv_heads) {
+    int failures = 0;
+    for (bool weighted : {false, true}) {
+    for (int batch : {1, 2, 4}) {
+        for (int width : {1, 2, 4, 8, 16}) {
+            DeviceArena arena(16U << 20);
+            Tensor q = arena.alloc(DType::BF16, {dim, heads, width, batch});
+            Tensor k = arena.alloc(DType::BF16, {dim, kv_heads, width, batch});
+            Tensor v = arena.alloc(DType::BF16, {dim, kv_heads, width, batch});
+            Tensor positions = arena.alloc(DType::I32, {width, batch});
+            Tensor rows = arena.alloc(DType::I32, {batch});
+            Tensor appended = arena.alloc(DType::BF16, {dim, heads, width, batch});
+            Tensor cached = arena.alloc(DType::BF16, {dim, heads, width, batch});
+            std::vector<std::uint16_t> queries(q.numel(), f32_to_bf16(weighted ? .25F : 0.0F));
+            std::vector<std::uint16_t> keys(k.numel(), f32_to_bf16(weighted ? 1.0625F : 0.0F));
+            CUDA_CHECK(cudaMemcpy(q.data, queries.data(), q.bytes(), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(k.data, keys.data(), k.bytes(), cudaMemcpyHostToDevice));
+            // 1.0625 is BF16 but rounds to 1.0 in E4M3. Every existing cache value
+            // is also 1.0 in the uniform case. The weighted case varies
+            // current vs historical K/V, so it also detects unrounded keys.
+            std::vector<std::uint16_t> values(v.numel(), f32_to_bf16(weighted ? 3.125F : 1.0625F));
+            CUDA_CHECK(cudaMemcpy(v.data, values.data(), v.bytes(), cudaMemcpyHostToDevice));
+            std::vector<int> pos(width * batch), table(3 * batch), row_ids(batch);
+            for (int row = 0; row < batch; ++row) {
+                row_ids[row] = row;
+                for (int col = 0; col < width; ++col) { pos[row * width + col] = (row % 2 ? 63 : 0) + col; }
+                for (int page = 0; page < 3; ++page) { table[row * 3 + page] = row * 3 + (page + 1) % 3; }
+            }
+            CUDA_CHECK(cudaMemcpy(positions.data, pos.data(), positions.bytes(), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(rows.data, row_ids.data(), rows.bytes(), cudaMemcpyHostToDevice));
+            PagedKVBatchLayerView cache;
+            cache.head_dim = dim;
+            cache.num_kv_heads = kv_heads;
+            cache.dtype = DType::FP8_E4M3FN;
+            cache.k_pages = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, 3 * batch});
+            cache.v_pages = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, 3 * batch});
+            cache.block_tables = arena.alloc(DType::I32, {3, batch});
+            CUDA_CHECK(cudaMemset(cache.k_pages.data, 0, cache.k_pages.bytes()));
+            CUDA_CHECK(cudaMemset(cache.v_pages.data, 0x38, cache.v_pages.bytes()));
+            CUDA_CHECK(cudaMemcpy(cache.block_tables.data, table.data(), cache.block_tables.bytes(), cudaMemcpyHostToDevice));
+            const ops::GqaExecutionEnvelope envelope{1, 128};
+            WorkspaceArena scratch(std::max<std::size_t>(256, ops::gqa_attention_workspace_capacity_bytes(
+                dim, heads, kv_heads, cache.dtype, envelope, batch, width, width)));
+            ops::gqa_attention(q, k, v, positions, Tensor{}, rows, 1.0F / 16.0F,
+                               cache, envelope, scratch, appended, nullptr);
+            ops::gqa_attention_cached(q, positions, Tensor{}, rows, 1.0F / 16.0F,
+                                      cache, envelope, scratch, cached, nullptr);
+            cuda_synchronize();
+            const auto a = from_device<std::uint16_t>(appended.data, appended.numel());
+            const auto b = from_device<std::uint16_t>(cached.data, cached.numel());
+            if (a != b || (!weighted && std::any_of(a.begin(), a.end(), [](auto x) { return x != f32_to_bf16(1.0F); }))) {
+                std::cerr << "FP8 current/cached attention differs: B=" << batch << " W=" << width << "\n";
+                ++failures;
+            }
+        }
+    }
+    }
+    return failures;
+}
+
 int verify_fp8_image_attention() {
     int failures = 0;
     constexpr int dim = 256, tokens = 130;
@@ -1583,6 +1643,9 @@ int main() {
     int failures = 0;
     failures += verify_geometry_registration_contract();
     failures += verify_workspace_capacity_contract();
+    failures += verify_fp8_current_tokens_match_cached(256, 8, 1);
+    failures += verify_fp8_current_tokens_match_cached(256, 16, 4);
+    failures += verify_fp8_current_tokens_match_cached(128, 32, 4);
     failures += verify_fp8_image_attention();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     for (const Geometry geometry : {Geometry{"fallback_16q8_d64", 16, 8, 64},

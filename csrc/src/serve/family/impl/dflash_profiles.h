@@ -7,7 +7,7 @@ namespace sinfer::family {
 inline std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t capacity,
                                                                 std::uint32_t draft_window,
                                                                 std::uint32_t batch_size) {
-    if (draft_window == 0 || capacity == 0) { return {}; }
+    if (capacity == 0) { return {}; }
     const std::uint32_t block = draft_window + 1;
     std::vector<std::uint32_t> ends{
         96U, 127U, 511U, 1023U, 2047U, 4095U, 8191U, 16383U, 32767U, 65536U, 131072U, 196608U,

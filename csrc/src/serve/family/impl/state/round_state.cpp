@@ -309,6 +309,24 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     }
 }
 
+void DFlashDecodeState::set_width(std::uint32_t width) {
+    const auto w      = static_cast<std::int32_t>(width);
+    const auto batch  = anchors.ne[0];
+    const auto matrix = [w, batch](Tensor& t) { t = Tensor(t.data, t.dtype, {w, batch}); };
+    matrix(target_rope_positions);
+    matrix(licensed_tokens);
+    matrix(proposal_ids);
+    matrix(proposal_positions);
+    matrix(verify_ids);
+    matrix(target_argmax);
+    draft_tokens = Tensor(draft_tokens.data, draft_tokens.dtype, {std::max(1, w - 1), batch});
+    target_logits =
+        Tensor(target_logits.data, target_logits.dtype, {target_logits.ne[0], w, batch});
+    target_hidden =
+        Tensor(target_hidden.data, target_hidden.dtype, {target_hidden.ne[0], w, batch});
+    // append_positions retains maximum width: the previous round can be wider.
+}
+
 DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
                                      std::uint32_t batch_capacity, std::uint32_t draft_window) {
     if (batch_capacity == 0 || batch_capacity > kMaximumBatchColumns || draft_window == 0 ||

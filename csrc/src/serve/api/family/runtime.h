@@ -255,6 +255,8 @@ public:
     /// Decode lanes in flight this round, across every group of a pipeline: an MTP round
     /// verifies drafts only within the run's width limit and runs its narrow round otherwise.
     void set_round_width_hint(std::uint32_t lanes) noexcept;
+    [[nodiscard]] std::uint32_t select_dflash_draft_window(std::span<const std::uint32_t> lanes);
+    void set_dflash_draft_window(std::uint32_t drafts);
     /// Whether an MTP round of `lanes` rows would run narrow under the current width hint.
     [[nodiscard]] bool speculative_round_is_narrow(std::size_t lanes) const noexcept;
     [[nodiscard]] std::span<const std::byte> speculative_outcome() const noexcept;

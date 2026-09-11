@@ -47,6 +47,7 @@ int main() {
         options.speculative.draft_tokens = 3;
         options.kv_cache = sinfer::KvCacheStorage::BFloat16;
     }
+    options.speculative.adaptive = std::getenv("SUROGATE_MULTI_DEVICE_TEST_ADAPTIVE") != nullptr;
     if (const auto* count = std::getenv("SUROGATE_MULTI_DEVICE_TEST_DRAFT_TOKENS")) {
         options.speculative.draft_tokens = std::stoul(count);
     }
@@ -127,7 +128,7 @@ int main() {
         if (options.speculative.backend == sinfer::SpeculativeBackend::DFlash) {
             std::cout << "DFlash rounds=" << result.metrics.speculative_rounds
                       << " accepted=" << result.metrics.speculative_accepted_tokens << '\n';
-            assert(result.metrics.speculative_rounds > 0);
+            assert(result.metrics.speculative_rounds + result.metrics.speculative_fallback_steps > 0);
         }
         if (score_tokens) {
             assert(result.token_logprobs.size() == result.completion_token_ids.size());

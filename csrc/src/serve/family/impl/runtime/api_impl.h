@@ -335,6 +335,16 @@ std::uint32_t Program<Variant>::speculative_round_width() const noexcept {
 }
 
 template <>
+std::uint32_t Program<Variant>::select_dflash_draft_window(std::span<const std::uint32_t> lanes) {
+    return impl_->select_dflash_draft_window(lanes);
+}
+
+template <>
+void Program<Variant>::set_dflash_draft_window(std::uint32_t drafts) {
+    impl_->set_dflash_draft_window(drafts);
+}
+
+template <>
 void Program<Variant>::set_round_width_hint(std::uint32_t lanes) noexcept {
     impl_->set_round_width_hint(lanes);
 }

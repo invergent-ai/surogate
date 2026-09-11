@@ -328,7 +328,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                               ops::GqaExecutionEnvelope target_envelope) {
     return [&state, batch_size, k, envelopes, target_envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumBatchColumns) ||
-            k == 0 || k > kDFlashDecodeMaximumDrafts) {
+            k > kDFlashDecodeMaximumDrafts) {
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         family::DFlashDecodeState& frame = state.frame;
@@ -361,12 +361,14 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {state.execution.model.geometry.dflash.feature_rows, width, batch_size});
+            DType::BF16, {state.execution.model.geometry.dflash.feature_rows,
+                          frame.append_positions.ne[0], batch_size});
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, lanes, context_starts,
                                    frontiers, compact_features, append_positions, append_counts,
                                    state.execution.device.stream);
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
-                                     lanes, dflash_rows, envelopes.append);
+                                     lanes, dflash_rows,
+                                     {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});
 
         const auto& stage = state.execution.stage;
         const auto metadata = stage.residual_bytes +
@@ -379,9 +381,17 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             CUDA_CHECK(cudaMemcpy2DAsync(target_positions.data, sizeof(std::int32_t),
                 packet + metadata + sizeof(std::int32_t), stage.column_bytes, sizeof(std::int32_t),
                 width * batch_size, cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpy2DAsync(drafts.data, drafts.nb[1],
-                static_cast<const std::int32_t*>(verify_ids.data) + 1, verify_ids.nb[1],
-                k * sizeof(std::int32_t), batch_size, cudaMemcpyDeviceToDevice, stream));
+            if (k > 0) {
+                CUDA_CHECK(cudaMemcpy2DAsync(drafts.data, drafts.nb[1],
+                                             static_cast<const std::int32_t*>(verify_ids.data) + 1,
+                                             verify_ids.nb[1], k * sizeof(std::int32_t), batch_size,
+                                             cudaMemcpyDeviceToDevice, stream));
+            }
+        } else if (k == 0) {
+            CUDA_CHECK(cudaMemcpyAsync(verify_ids.data, anchors.data, anchors.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(target_positions.data, frontiers.data, frontiers.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
         } else {
             propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
             ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids, stream);

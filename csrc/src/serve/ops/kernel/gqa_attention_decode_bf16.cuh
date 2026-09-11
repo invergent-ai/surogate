@@ -327,8 +327,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                         new_token >= 0 && new_token < valid_tokens && key >= first_pos;
                     if (from_new) {
                         const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
-                        sinfer::ops::cp_async<16>(k_dst, &input.k[off]);
-                        sinfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                        if constexpr (kFp8Cache) {
+                            store_vec(k_dst, gqa_kv_round_fp8x8(&input.k[off]));
+                            store_vec(v_dst, gqa_kv_round_fp8x8(&input.v[off]));
+                        } else {
+                            sinfer::ops::cp_async<16>(k_dst, &input.k[off]);
+                            sinfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                        }
                     } else {
                         const std::int64_t off = gqa_cache_index<Geometry>(
                             physical_page, kv_head, d, key & kPagedKVPageMask);

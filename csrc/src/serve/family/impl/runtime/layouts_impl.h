@@ -1,5 +1,6 @@
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/layouts.h"
+#include "family/impl/adaptive_dflash.h"
 #include "family/impl/runtime/residual_policy.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "family/impl/runtime/linear_state_slots.h"
@@ -755,18 +756,26 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, false);
-            for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
-                const std::int32_t aggregate = verify * batch;
-                WorkspaceLayoutBuilder target;
-                matrix(target, plan.geometry.residual_dtype(), plan.geometry.residual, aggregate);
-                target_body(target, aggregate, aggregate, family::TextPhase::Verify,
-                            GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
-                const std::size_t accept =
-                    ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                        plan.geometry.token_domain, drafts, drafts, batch, batch);
-                const std::size_t proposal = dflash_proposal_capacity(verify, batch);
-                out.dflash_round           = std::max({out.dflash_round, finish(target), accept,
-                                                       dflash_context_capacity(aggregate, true), proposal});
+            for (auto window : dflash_draft_windows(plan.draft_window, plan.adaptive_dflash)) {
+                const auto round_width = static_cast<std::int32_t>(window + 1);
+                for (std::int32_t batch = 1; batch <= batch_capacity; ++batch) {
+                    const std::int32_t aggregate = round_width * batch;
+                    WorkspaceLayoutBuilder target;
+                    matrix(target, plan.geometry.residual_dtype(), plan.geometry.residual,
+                           aggregate);
+                    target_body(target, aggregate, aggregate, family::TextPhase::Verify,
+                                window == 0 ? GdnWorkspacePath::Snapshot : GdnWorkspacePath::ReplayRecord,
+                                batch, round_width, round_width,
+                                text_envelope);
+                    const std::size_t accept =
+                        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                            plan.geometry.token_domain, window, window, batch, batch);
+                    const std::size_t proposal =
+                        window == 0 ? 0 : dflash_proposal_capacity(round_width, batch);
+                    out.dflash_round =
+                        std::max({out.dflash_round, finish(target), accept,
+                                  dflash_context_capacity(verify * batch, true), proposal});
+                }
             }
         }
     }
@@ -830,6 +839,9 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         break;
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
+    }
+    if (options.speculative.adaptive && options.speculative.backend != SpeculativeBackend::DFlash) {
+        throw std::invalid_argument("adaptive speculation requires DFlash");
     }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
@@ -895,6 +907,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->pipeline_stage_last  = inputs.pipeline_stage_last;
     impl->pipeline_import_pinned = inputs.pipeline_import_pinned;
     impl->pipeline_boundary_columns = inputs.pipeline_boundary_columns;
+    impl->adaptive_dflash           = inputs.adaptive_dflash;
     impl->draft_window        = inputs.draft_window;
     impl->speculative_max_lanes = inputs.speculative_max_lanes;
     impl->speculative_backend = inputs.speculative_backend;
@@ -941,24 +954,25 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 checked_mul(per_batch_allowance, decode_batch_capacity(impl->max_concurrency),
                             "MTP exact-b graph allowance");
         } else {
-            const auto class_allowance = [&](std::uint32_t batch_size) {
-                const auto profiles =
-                    dflash_graph_profiles(impl->capacity, impl->draft_window, batch_size);
-                return graph_topology_allowance(
-                    profiles,
-                    [&](GraphExecutionProfile profile) {
-                        const std::uint64_t final_visible = std::min<std::uint64_t>(
-                            impl->capacity,
-                            static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
-                    },
-                    "DFlash graph allowance");
-            };
-            for (std::uint32_t batch_size = 1;
-                 batch_size <= decode_batch_capacity(impl->max_concurrency); ++batch_size) {
-                impl->graph_allowance_bytes =
-                    checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
-                                "DFlash exact-b graph allowance");
+            for (auto window : dflash_draft_windows(impl->draft_window, impl->adaptive_dflash)) {
+                const auto class_allowance = [&](std::uint32_t batch_size) {
+                    const auto profiles = dflash_graph_profiles(impl->capacity, window, batch_size);
+                    return graph_topology_allowance(
+                        profiles,
+                        [&](GraphExecutionProfile profile) {
+                            const std::uint64_t final_visible = std::min<std::uint64_t>(
+                                impl->capacity,
+                                static_cast<std::uint64_t>(profile.max) + window + 1ULL);
+                            return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                        },
+                        "DFlash graph allowance");
+                };
+                for (std::uint32_t batch_size = 1;
+                     batch_size <= decode_batch_capacity(impl->max_concurrency); ++batch_size) {
+                    impl->graph_allowance_bytes =
+                        checked_add(impl->graph_allowance_bytes, class_allowance(batch_size),
+                                    "DFlash exact-b graph allowance");
+                }
             }
         }
     }
@@ -985,31 +999,37 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     }
     const KvCacheStorage kv_storage = resolve_kv_storage(options.kv_cache, geometry);
     SequencePlanningInputs inputs{
-        .weights_profile     = weights_profile,
-        .geometry            = geometry,
-        .vision_geometry     = vision_geometry,
-        .capacity            = options.max_context,
-        .max_concurrency     = options.max_concurrency,
-        .prefill_chunk       = std::min(std::max(options.prefill_chunk,
-            options.enable_vision && vision_geometry.attention_mode
-                ? ((static_cast<std::uint32_t>(vision_geometry.max_image_tokens)+127U)/128U)*128U : 0U), options.max_context),
-        .draft_window        = options.speculative.draft_tokens,
+        .weights_profile = weights_profile,
+        .geometry        = geometry,
+        .vision_geometry = vision_geometry,
+        .capacity        = options.max_context,
+        .max_concurrency = options.max_concurrency,
+        .prefill_chunk   = std::min(
+            std::max(options.prefill_chunk,
+                     options.enable_vision && vision_geometry.attention_mode
+                           ? ((static_cast<std::uint32_t>(vision_geometry.max_image_tokens) + 127U) /
+                            128U) *
+                               128U
+                           : 0U),
+            options.max_context),
+        .adaptive_dflash       = options.speculative.adaptive,
+        .draft_window          = options.speculative.draft_tokens,
         .speculative_max_lanes = options.speculative.max_lanes == 0 ? kDefaultSpeculationLanes
-                                                                     : options.speculative.max_lanes,
-        .speculative_backend = options.speculative.backend,
-        .kv_dtype       = kv_storage_dtype(kv_storage),
+                                                                    : options.speculative.max_lanes,
+        .speculative_backend   = options.speculative.backend,
+        .kv_dtype              = kv_storage_dtype(kv_storage),
         .kv_quant_group = kv_storage == KvCacheStorage::Int8Group64 ? family::kKvQuantGroup : 0,
         .kv_skip_layers = options.kv_cache_skip_layers,
-        .rewrite_checkpoints = options.rewrite_checkpoints,
-        .elastic_kv     = options.elastic_kv,
-        .elastic_kv_overcommit = options.elastic_kv_overcommit,
-        .proposal_head  = options.speculative.proposal_head,
-        .features       = family::startup_features(options),
-        .use_cuda_graph = options.use_cuda_graph,
-        .device         = options.device,
-        .pipeline_stage_first = options.pipeline_stage_first,
-        .pipeline_stage_last = options.pipeline_stage_last,
-        .pipeline_import_pinned = options.pipeline_import_pinned,
+        .rewrite_checkpoints       = options.rewrite_checkpoints,
+        .elastic_kv                = options.elastic_kv,
+        .elastic_kv_overcommit     = options.elastic_kv_overcommit,
+        .proposal_head             = options.speculative.proposal_head,
+        .features                  = family::startup_features(options),
+        .use_cuda_graph            = options.use_cuda_graph,
+        .device                    = options.device,
+        .pipeline_stage_first      = options.pipeline_stage_first,
+        .pipeline_stage_last       = options.pipeline_stage_last,
+        .pipeline_import_pinned    = options.pipeline_import_pinned,
         .pipeline_boundary_columns = options.pipeline_boundary_columns,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

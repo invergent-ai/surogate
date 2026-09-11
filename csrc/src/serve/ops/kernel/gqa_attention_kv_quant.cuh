@@ -137,6 +137,19 @@ __device__ __forceinline__ void gqa_kv_store_fp8x8(std::uint8_t* dst8,
     store_vec(dst8, *reinterpret_cast<const int2*>(codes));
 }
 
+// Current tokens can be staged directly from the BF16 input while other CTAs
+// publish the cache. Round them through the same codec so attention cannot depend
+// on whether a token belongs to this round or a previous one.
+__device__ __forceinline__ int4 gqa_kv_round_fp8x8(const __nv_bfloat16* src8) {
+    const int4 raw = load_vec<int4>(src8);
+    const auto* values = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    int2 codes{};
+    auto* bytes = reinterpret_cast<std::uint8_t*>(&codes);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { bytes[i] = gqa_kv_fp8_code(__bfloat162float(values[i])); }
+    return gqa_kv_dequant_fp8x8_raw(codes);
+}
+
 // Selects the cache codec at compile time without pulling in <type_traits>:
 // the KV kernels are shared between the bf16 cache and the e4m3 one, and this
 // is the only thing that distinguishes their storage.

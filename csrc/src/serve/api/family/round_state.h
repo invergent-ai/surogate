@@ -313,6 +313,7 @@ struct DFlashDecodeState {
     Tensor target_hidden;
     Tensor target_continuation_hidden;
 
+    void set_width(std::uint32_t width);
     DFlashDecodeState() = default;
     DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
                       std::uint32_t batch_capacity, std::uint32_t draft_window);

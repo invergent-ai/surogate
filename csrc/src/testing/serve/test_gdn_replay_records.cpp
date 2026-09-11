@@ -82,6 +82,20 @@ int main() {
     auto backing            = make_backing(bytes);
     const sinfer::GdnReplayRecords records({backing.get(), bytes}, layout);
 
+    for (const auto width : {1, 2, 4}) {
+        const auto compact = records.with_width(width);
+        const auto last = compact.layer(2, 5);
+        failures += expect_shape(last.conv, 256, width, 5, 1, "compact last layer");
+        failures += expect(last.key.is_contiguous() && last.value.is_contiguous() && last.gate.is_contiguous(),
+                           "compact replay planes must remain contiguous");
+        failures += expect(compact.conv.data == records.conv.data && compact.key.data == records.key.data,
+                           "compact replay changed allocation addresses");
+        failures += expect(static_cast<std::byte*>(last.conv.data) + last.conv.bytes() <=
+                               static_cast<std::byte*>(records.conv.data) + records.conv.bytes(),
+                           "compact replay exceeded storage");
+    }
+    failures += expect_throw([&] { (void)records.with_width(0); }, "zero replay width");
+    failures += expect_throw([&] { (void)records.with_width(5); }, "excess replay width");
     failures += expect_shape(records.conv, 256, 4, 15, 1, "conv plane");
     failures += expect_shape(records.key, 128, 2, 4, 15, "key plane");
     failures += expect_shape(records.value, 128, 6, 4, 15, "value plane");

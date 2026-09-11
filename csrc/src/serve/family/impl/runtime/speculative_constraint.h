@@ -36,6 +36,8 @@ public:
           masks_(width * words * batch * sizeof(int32_t)), device_masks_(masks), states_(batch, nullptr) {
         std::memset(masks_.data(), 0xff, masks_.size());
     }
+
+    void set_width(std::size_t width) { width_ = width; }
     void reset() { std::fill(states_.begin(), states_.end(), nullptr); error_ = {}; }
     void stage(std::size_t row, TokenConstraintState* state, ops::SamplingConfig& config) {
         states_.at(row) = state;
@@ -45,7 +47,10 @@ public:
         }
     }
     void enqueue(const Tensor& drafts, cudaStream_t stream) {
-        CUDA_CHECK(cudaMemcpyAsync(drafts_.data(), drafts.data, drafts.bytes(), cudaMemcpyDeviceToHost, stream));
+        if (width_ > 1) {
+            CUDA_CHECK(cudaMemcpyAsync(drafts_.data(), drafts.data, drafts.bytes(),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
         CUDA_CHECK(cudaLaunchHostFunc(stream, &fill, this));
         CUDA_CHECK(cudaMemcpyAsync(device_masks_.data, masks_.data(),
             static_cast<std::size_t>(drafts.ne[1]) * width_ * words_ * sizeof(int32_t), cudaMemcpyHostToDevice, stream));

@@ -141,6 +141,23 @@ GdnReplayRecords::GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayo
     validate_layout(layout);
 }
 
+GdnReplayRecords GdnReplayRecords::with_width(std::int32_t width) const {
+    if (width <= 0 || width > spec.width) {
+        throw std::invalid_argument("GDN replay width exceeds storage");
+    }
+    auto out         = *this;
+    out.spec.width   = width;
+    const auto outer = spec.layers * spec.record_capacity;
+    out.conv         = Tensor(conv.data, conv.dtype, {spec.conv_channels, width, outer});
+    out.key          = Tensor(key.data, key.dtype, {spec.key_dim, spec.qk_heads, width, outer});
+    out.value = Tensor(value.data, value.dtype, {spec.value_dim, spec.value_heads, width, outer});
+    out.gate  = Tensor(gate.data, gate.dtype, {spec.gate_rows(), spec.value_heads, width, outer});
+    if (spec.diagonal_gate) {
+        out.beta = Tensor(beta.data, beta.dtype, {spec.value_heads, width, outer});
+    }
+    return out;
+}
+
 GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int32_t rows) const {
     validate_spec(spec);
     if (layer_index < 0 || layer_index >= spec.layers) {

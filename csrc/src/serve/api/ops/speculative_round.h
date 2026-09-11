@@ -67,6 +67,7 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B], drafts is
  *   I32 [K,B], logits is BF16 [physical_rows,K+1,B], and current_extents/lengths/anchors/
  *   licensed_counts/accepted are I32 [B]. token_domain is in [1,physical_rows], K>=1, B>=1, and
+ *   With no_drafts=true, K=0 and drafts is unused I32 [1,B] storage.
  *   configs points to a device-resident SamplingConfig[B]. Tensor arguments, configs, and
  *   configs[b].token_counts do not overlap except for the explicitly mutated objects.
  *
@@ -91,7 +92,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
                                       Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                       Tensor& licensed_counts, Tensor& accepted,
                                       std::int32_t token_domain, const SamplingConfig* configs,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      WorkspaceArena& workspace, cudaStream_t stream,
+                                      bool no_drafts = false);
 
 /**
  * Op: speculative_select_accepted_hidden
