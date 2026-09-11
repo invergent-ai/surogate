@@ -24,9 +24,9 @@ public:
         if (capacity != 0) {
             CUDA_CHECK(cudaSetDevice(device));
             arena = std::make_unique<DeviceArena>(capacity);
-            // Per-request transient scratch: activated and rewritten for each
-            // request, so sleep can drop its pages instead of backing them up.
-            sleep_tag_region(arena->base(), SleepTag::Discard);
+            // Image features and a partially encoded image survive across
+            // scheduler rounds. Preemptive sleep must restore them as well.
+            sleep_tag_region(arena->base(), SleepTag::Offload);
         }
     }
 

@@ -70,23 +70,41 @@ std::uint32_t VisionPrefillSession::chunk_length(std::uint32_t begin, std::uint3
     return end - begin;
 }
 
-VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length) {
-    if (nominal_length == 0 || begin >= prompt_.token_ids.size()) {
-        throw std::invalid_argument("Vision chunk range is empty or outside the prompt");
-    }
+const VisionUseSpan* VisionPrefillSession::use_for_chunk(std::uint32_t begin,
+                                                        std::uint32_t nominal_length) const {
     const auto length = chunk_length(begin, nominal_length);
-    if (length == 0) { throw std::logic_error("image attention block exceeds prefill workspace"); }
-    const auto end = begin + length;
-    const VisionUseSpan* active = nullptr;
-    for (const VisionUseSpan& use : plan_.uses) {
+    if (length == 0) { throw std::invalid_argument("Vision chunk cannot make progress"); }
+    for (const auto& use : plan_.uses) {
         if (use.end <= begin) { continue; }
-        if (use.begin >= end) { break; }
-        active = &use;
-        break;
+        if (use.begin >= begin + length) { break; }
+        return &use;
     }
-    if (active == nullptr) {
-        return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
-    }
+    return nullptr;
+}
+
+bool VisionPrefillSession::chunk_ready(std::uint32_t begin, std::uint32_t nominal_length) const {
+    const auto* use = use_for_chunk(begin, nominal_length);
+    return use == nullptr || (active_item_ && *active_item_ == use->item_index);
+}
+
+VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length) {
+    // The serving scheduler prepares the tower incrementally before entering
+    // this text chunk. Keep the synchronous form for standalone/bridge callers.
+    while (!chunk_ready(begin, nominal_length)) { (void)advance_encoding(begin, nominal_length); }
+    const auto* active = use_for_chunk(begin, nominal_length);
+    const auto length = static_cast<std::int32_t>(chunk_length(begin, nominal_length));
+    if (!active) { return VisionChunk{length, nullptr, {}}; }
+    const auto& control = plan_.control->items[active->item_index];
+    const auto& g = context_.geometry();
+    Tensor output(transient_.data, DType::BF16,
+                  {g.output_hidden, static_cast<std::int32_t>(control.merged_count), 1 + g.deepstack_layers});
+    return VisionChunk{length, &control, output.slice(2, 0, 1),
+                       g.deepstack_layers ? output.slice(2, 1, g.deepstack_layers) : Tensor{}};
+}
+
+bool VisionPrefillSession::advance_encoding(std::uint32_t begin, std::uint32_t nominal_length) {
+    const auto* active = use_for_chunk(begin, nominal_length);
+    if (!active || (active_item_ && *active_item_ == active->item_index)) { return true; }
     if (active->item_index >= plan_.control->items.size() ||
         active->item_index >= prompt_.vision_items.size() ||
         active->item_index >= prompt_.media_payloads.size()) {
@@ -104,33 +122,44 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     }
     const family::VisionGeometry& g = context_.geometry();
     const std::size_t output_bytes = VisionContext::output_transient_bytes(g, control.merged_count);
-    if (output_bytes > transient_.size) {
+    if (VisionContext::encoding_transient_bytes(g, control.merged_count) > transient_.size) {
         throw std::invalid_argument("Vision item output transient is too small");
     }
     Tensor output(transient_.data, DType::BF16,
                   {g.output_hidden, static_cast<std::int32_t>(control.merged_count), 1 + g.deepstack_layers});
 
-    if (!active_item_ || *active_item_ != active->item_index) {
+    if (!encoding_item_) {
         if (active_item_ && active->item_index <= *active_item_) {
             throw std::logic_error("Vision items are not consumed in strictly increasing order");
         }
-        const std::size_t patch_elements =
-            checked_mul(control.patch_count, static_cast<std::size_t>(g.patch_dim),
-                        "item patch elements");
-        const auto& payload = prompt_.media_payloads[active->item_index];
-        if (!payload || payload->patch_elements != patch_elements) {
-            throw std::invalid_argument("Vision item patch payload has an invalid shape");
-        }
-        timers_.emplace_back(device_);
-        timers_.back().start();
-        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
-        timers_.back().record_stop();
-        workspace_.reset();
+        encoding_item_ = active->item_index;
+        encoding_ = family::VisionEncodeState{};
+        encoding_.residual = Tensor(static_cast<std::byte*>(transient_.data) + output_bytes,
+                                    DType::BF16, {g.hidden, static_cast<std::int32_t>(control.patch_count)});
+    } else if (*encoding_item_ != active->item_index) {
+        throw std::logic_error("Vision encoding changed items before completion");
+    }
+    const auto patch_elements = checked_mul(control.patch_count, static_cast<std::size_t>(g.patch_dim),
+                                             "item patch elements");
+    const auto& payload = prompt_.media_payloads[active->item_index];
+    if (!payload || payload->patch_elements != patch_elements) {
+        throw std::invalid_argument("Vision item patch payload has an invalid shape");
+    }
+    timers_.emplace_back(device_);
+    timers_.back().start();
+    bool complete = false;
+    for (std::size_t step = 0; step < family::kVisionEncodeStepsPerSlice && !complete; ++step) {
+        complete = context_.encode_step(VisionItemView{payload->span(), &control}, output,
+                                        workspace_, encoding_);
+    }
+    timers_.back().record_stop();
+    workspace_.reset();
+    if (complete) {
         active_item_ = active->item_index;
+        encoding_item_.reset();
         encoded_payloads_pending_release_.push_back(active->item_index);
     }
-    return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output.slice(2, 0, 1),
-                       g.deepstack_layers ? output.slice(2, 1, g.deepstack_layers) : Tensor{}};
+    return complete;
 }
 
 void VisionPrefillSession::release_encoded_media_payloads() noexcept {

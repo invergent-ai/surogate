@@ -208,6 +208,25 @@ int main() {
     pipeline.wake_up();
     assert(generate(pipeline) == expected);
 
+    if (vision) {
+        // Submit just one cold image so sleep can catch its encoder, before
+        // preparing a batch gives the worker time to finish that image.
+        pipeline.shrink_kv();
+        auto partial = pipeline.prepare(request);
+        const auto deadline = std::chrono::steady_clock::now() + 60s;
+        while (pipeline.runtime_stats().prefilling_requests == 0) {
+            assert(std::chrono::steady_clock::now() < deadline);
+            std::this_thread::sleep_for(100us);
+        }
+        std::cerr << "partial image: requesting preemptive sleep\n";
+        pipeline.sleep(true);
+        assert(pipeline.is_sleeping());
+        assert(pipeline.runtime_stats().prefilling_requests == 1);
+        pipeline.wake_up();
+        assert(pipeline.run(partial, nullptr).completion_token_ids == expected);
+        std::cerr << "partial image: resumed with matching output\n";
+    }
+
     // An independent replica on the same test device must retain its own graphs and weights
     // when the pipeline sleeps. Real multi-GPU runs use the DEVICES override above.
     auto replica_options = options;

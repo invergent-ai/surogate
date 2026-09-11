@@ -189,6 +189,18 @@ std::size_t VisionContext::output_transient_bytes(const VisionGeometry& geometry
     return layout.finish(kWorkspaceAlignment, "Vision item output transient layout");
 }
 
+std::size_t VisionContext::encoding_transient_bytes(const VisionGeometry& geometry,
+                                                    std::size_t merged_tokens) {
+    const auto output = output_transient_bytes(geometry, merged_tokens);
+    const auto patches = checked_mul(merged_tokens, geometry.merge_unit(), "encoding patches");
+    const auto residual = checked_mul(checked_mul(patches, geometry.hidden, "encoding residual"),
+                                      sizeof(std::uint16_t), "encoding residual bytes");
+    if (output > std::numeric_limits<std::size_t>::max() - residual) {
+        throw std::overflow_error("Vision encoding transient overflows size_t");
+    }
+    return output + residual;
+}
+
 std::size_t VisionContext::workspace_capacity_bytes(const VisionGeometry& geometry,
                                                     std::uint32_t max_merged_tokens,
                                                     std::uint32_t max_segments) {
@@ -207,6 +219,12 @@ std::size_t VisionContext::workspace_capacity_bytes(const VisionGeometry& geomet
 
 void VisionContext::encode(const VisionItemView& item, Tensor& output,
                            WorkspaceArena& workspace) const {
+    VisionEncodeState state;
+    while (!encode_step(item, output, workspace, state)) {}
+}
+
+bool VisionContext::encode_step(const VisionItemView& item, Tensor& output,
+                                WorkspaceArena& workspace, VisionEncodeState& state) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const VisionItemControl& control = *item.control;
     const VisionGeometry& g          = cfg_;
@@ -221,7 +239,15 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {
         throw std::invalid_argument("Vision output must be contiguous BF16 [H,V,1+deepstack_layers]");
     }
-    if (g.gemma_version) { encode_gemma_vision(g,*weights_,item,output,workspace,ctx_.stream,probe_); return; }
+    if (state.phase == VisionEncodeState::Phase::Complete) { return true; }
+    if (state.residual.data && (state.residual.dtype != DType::BF16 ||
+        state.residual.ne[0] != g.hidden || state.residual.ne[1] != static_cast<int>(patches64) ||
+        state.residual.ne[2] != 1 || state.residual.ne[3] != 1 || !state.residual.is_contiguous())) {
+        throw std::invalid_argument("Vision encoding residual has an invalid shape");
+    }
+    if (g.gemma_version) {
+        return encode_gemma_vision_step(g, *weights_, item, output, workspace, ctx_.stream, probe_, state);
+    }
     const VisionWorkspaceLayout layout = build_workspace_layout(
         g, patches64, tokens64, static_cast<std::size_t>(control.segment_count));
     if (workspace.capacity() < layout.bytes) {
@@ -239,26 +265,31 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     Tensor pos_weights  = layout.pos_weights.bind(backing);
     copy_host(control.position_ids.data(), position_ids, stream);
     copy_host(control.cu_seqlens.data(), cu_seqlens, stream);
-    copy_host(control.position_table_indices.data(), pos_indices, stream);
-    copy_host(control.position_table_weights.data(), pos_weights, stream);
 
-    Tensor x          = layout.x.bind(backing);
-    Tensor patch_bf16 = layout.patch_bf16.bind(backing);
-    copy_host(item.patches.data(), patch_bf16, stream);
-    ops::linear(patch_bf16, *patch_embed_, x, stream);
-    ops::add_bias(*patch_embed_bias_, x, stream);
-    // The artifact records the source table shape [rows,hidden], while Tensor's
-    // contiguous matrix convention is [inner,columns]. The payload is already
-    // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
-    Tensor position_table = position_embed_->reshape({g.hidden, g.position_embeddings});
-    if (g.siglip2) {
-        ops::siglip2_pos_embed_add(position_table, control.grid.height, control.grid.width,
-                                   g.merge, x, stream);
-    } else {
-        ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+    Tensor x = state.residual.data ? state.residual : layout.x.bind(backing);
+    if (state.phase == VisionEncodeState::Phase::Embedding) {
+        copy_host(control.position_table_indices.data(), pos_indices, stream);
+        copy_host(control.position_table_weights.data(), pos_weights, stream);
+        Tensor patch_bf16 = layout.patch_bf16.bind(backing);
+        copy_host(item.patches.data(), patch_bf16, stream);
+        ops::linear(patch_bf16, *patch_embed_, x, stream);
+        ops::add_bias(*patch_embed_bias_, x, stream);
+        // The artifact records the source table shape [rows,hidden], while Tensor's
+        // contiguous matrix convention is [inner,columns]. The payload is already
+        // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
+        Tensor position_table = position_embed_->reshape({g.hidden, g.position_embeddings});
+        if (g.siglip2) {
+            ops::siglip2_pos_embed_add(position_table, control.grid.height, control.grid.width,
+                                       g.merge, x, stream);
+        } else {
+            ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
+        }
+        state.phase = blocks_.empty() ? VisionEncodeState::Phase::Projection : VisionEncodeState::Phase::Blocks;
+        return false;
     }
-    std::size_t deepstack_index = 0;
-    for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
+    if (state.phase == VisionEncodeState::Phase::Blocks) {
+        const std::size_t layer = state.layer;
+        auto& deepstack_index = state.deepstack;
         const BlockW& block = blocks_[layer];
         {
             Tensor attended = layout.attended.bind(backing);
@@ -324,6 +355,8 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
             ops::linear(hidden, *merger.fc2, features, stream);
             ops::add_bias(*merger.fc2_bias, features, stream);
         }
+        if (++state.layer == blocks_.size()) { state.phase = VisionEncodeState::Phase::Projection; }
+        return false;
     }
 
     Tensor normalized = layout.normalized.bind(backing);
@@ -345,6 +378,8 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     ops::add_bias(*merger_.fc2_bias, final_output, stream);
     if (probe_) { probe_("vision_projection", final_output.slice(1, 0, std::min(tokens, 64)),
                         g.layers, stream); }
+    state.phase = VisionEncodeState::Phase::Complete;
+    return true;
 }
 
 } // namespace sinfer::family

@@ -2230,6 +2230,21 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        if (staged.vision && staged.cursor < staged.prompt_tokens) {
+            const auto nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            if (!staged.vision->chunk_ready(staged.cursor, nominal)) {
+                mark_workspace_usage(workspace_plan.vision_encode);
+                const bool ready = schedule::advance_vision_encoding(*staged.vision, staged.cursor,
+                    nominal, request.lora_slot, device.stream);
+                device.synchronize();
+                staged.vision->release_encoded_media_payloads();
+                staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+                if (round_trace_enabled()) {
+                    std::fprintf(stderr, "round-trace: vision-step lane=%u complete=%d\n", sequence.lane, int(ready));
+                }
+                return runtime::PrefillStepResult{.summary = summary, .processed_prompt_tokens = 0};
+            }
+        }
         if (staged.cursor == staged.base && staged.base > 0 && staged.base < staged.prompt_tokens &&
             request.prompt_logprobs >= 0 && sequence.cached_scores.size() <= staged.base) {
             const auto& boundary = is_rewrite_checkpoint_restore(staged.reuse)
@@ -2800,6 +2815,9 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane, std::uin
         (speculative_backend == SpeculativeBackend::DFlash ? draft_window + 1 : 1);
     if (staged.vision && (prefill_chunk <= reserved_columns ||
         staged.vision->chunk_length(staged.cursor, prefill_chunk - reserved_columns) == 0)) {
+        return false;
+    }
+    if (staged.vision && !staged.vision->chunk_ready(staged.cursor, prefill_chunk - reserved_columns)) {
         return false;
     }
     if (staged.mtp_bridge != MtpBridgeMode::None ||

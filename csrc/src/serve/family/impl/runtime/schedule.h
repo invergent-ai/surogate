@@ -168,6 +168,8 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          std::uint32_t mtp_proposal_extent);
 [[nodiscard]] VisionChunk prepare_mixed_vision(VisionPrefillSession& vision,
     std::uint32_t begin, std::uint32_t count, std::int32_t lora_slot, cudaStream_t stream);
+[[nodiscard]] bool advance_vision_encoding(VisionPrefillSession& vision,
+    std::uint32_t begin, std::uint32_t count, std::int32_t lora_slot, cudaStream_t stream);
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
                           ops::GqaExecutionEnvelope envelope, const MixedTargetForward& mixed_target = {});

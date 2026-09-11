@@ -200,7 +200,7 @@ public:
         PrefillStepResult result{};
         for (std::size_t s = 0; s < stages_.size(); ++s) {
             select(s);
-            if (s > 0) {
+            if (s > 0 && result.processed_prompt_tokens > 0) {
                 std::memcpy(stages_[s]->program->stage_import_buffer(),
                             stages_[s - 1]->program->stage_export_buffer(), boundary_bytes_);
             }
@@ -536,6 +536,9 @@ private:
     // next stage or complete it.
     void finish_stage(std::uint32_t g, std::size_t s, std::vector<std::uint32_t>& finished) {
         Flight& f = flights_[g];
+        if (f.kind == FlightKind::Prefill && f.result.prefill.processed_prompt_tokens == 0) {
+            f.carry_bytes = 0; // An encoder step has no text residual to transfer.
+        }
         trace("finished-stage", s, g);
         if (f.verifying) { held_by_[s] = static_cast<int>(g); }
         if (s + 1 < stages_.size()) {
@@ -594,7 +597,7 @@ private:
             Flight& f           = flights_[static_cast<std::size_t>(pick)];
             const std::size_t s = f.stage;
             select(s);
-            if (s > 0) {
+            if (s > 0 && f.carry_bytes > 0) {
                 std::memcpy(stages_[s]->program->stage_import_buffer(), f.park.data(), f.carry_bytes);
             }
             f.between        = false;

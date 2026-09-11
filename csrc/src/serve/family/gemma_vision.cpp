@@ -78,9 +78,9 @@ std::size_t gemma_vision_workspace_bytes(const VisionGeometry& g, std::size_t to
     return Layout(g, tokens).bytes;
 }
 
-void encode_gemma_vision(const VisionGeometry& g, const VisionWeights& weights,
+bool encode_gemma_vision_step(const VisionGeometry& g, const VisionWeights& weights,
                          const VisionItemView& item, Tensor& output, WorkspaceArena& workspace,
-                         cudaStream_t stream, const VisionContext::Probe& probe) {
+                         cudaStream_t stream, const VisionContext::Probe& probe, VisionEncodeState& state) {
     const auto& control = *item.control;
     if (control.segment_count != 1 ||
         control.patch_count != control.merged_count * g.merge_unit()) {
@@ -94,7 +94,8 @@ void encode_gemma_vision(const VisionGeometry& g, const VisionWeights& weights,
     const auto tensor = [&](const std::string& name) -> const Tensor& {
         return weights.extra_tensors.at(name);
     };
-    Tensor x = layout.x.bind(storage), a = layout.a.bind(storage), b = layout.b.bind(storage);
+    Tensor x = state.residual.data ? state.residual : layout.x.bind(storage);
+    Tensor a = layout.a.bind(storage), b = layout.b.bind(storage);
     Tensor clip_storage = layout.clip.bind(storage);
     const auto linear   = [&](const std::string& name, const Tensor& input, Tensor& out) {
         const auto bounds = weights.extra_tensors.find(name + "/clip");
@@ -113,27 +114,100 @@ void encode_gemma_vision(const VisionGeometry& g, const VisionWeights& weights,
     const auto rms = [&](const std::string& name, const Tensor& input, Tensor& out) {
         ops::rmsnorm(input, tensor(name), g.norm_epsilon, false, out, stream);
     };
-    Tensor patches = layout.patches.bind(storage);
-    copy(item.patches.data(), patches, stream);
-    if (g.encoder_free) {
-        Tensor normalized(clip_storage.data, DType::BF16, {g.patch_dim, p});
-        ln("patch_norm1", patches, normalized, 1.e-5F);
-        linear("patch_embedding", normalized, a);
-        ops::add_bias(tensor("patch_embedding_bias"), a, stream);
-        ln("patch_norm2", a, x, 1.e-5F);
-    } else {
-        linear("patch_embedding", patches, x);
-        if (g.gemma_version == 3) { ops::add_bias(tensor("patch_embedding_bias"), x, stream); }
-    }
     Tensor positions = layout.positions.bind(storage);
     copy(control.position_ids.data(), positions, stream);
-    if (g.gemma_version == 3) {
-        Tensor indices = layout.indices.bind(storage), values = layout.weights.bind(storage);
-        copy(control.position_table_indices.data(), indices, stream);
-        copy(control.position_table_weights.data(), values, stream);
-        ops::vision_pos_embed_add(tensor("position_embedding"), indices, values, x, stream);
-    } else {
-        gemma_vision::position_add(tensor("position_embedding"), positions, x, stream);
+    if (state.phase == VisionEncodeState::Phase::Embedding) {
+        Tensor patches = layout.patches.bind(storage);
+        copy(item.patches.data(), patches, stream);
+        if (g.encoder_free) {
+            Tensor normalized(clip_storage.data, DType::BF16, {g.patch_dim, p});
+            ln("patch_norm1", patches, normalized, 1.e-5F);
+            linear("patch_embedding", normalized, a);
+            ops::add_bias(tensor("patch_embedding_bias"), a, stream);
+            ln("patch_norm2", a, x, 1.e-5F);
+        } else {
+            linear("patch_embedding", patches, x);
+            if (g.gemma_version == 3) { ops::add_bias(tensor("patch_embedding_bias"), x, stream); }
+        }
+        if (g.gemma_version == 3) {
+            Tensor indices = layout.indices.bind(storage), values = layout.weights.bind(storage);
+            copy(control.position_table_indices.data(), indices, stream);
+            copy(control.position_table_weights.data(), values, stream);
+            ops::vision_pos_embed_add(tensor("position_embedding"), indices, values, x, stream);
+        } else {
+            gemma_vision::position_add(tensor("position_embedding"), positions, x, stream);
+        }
+        state.phase = g.encoder_free ? VisionEncodeState::Phase::Projection : VisionEncodeState::Phase::Blocks;
+        return false;
+    }
+    if (state.phase == VisionEncodeState::Phase::Blocks) {
+        const int layer = static_cast<int>(state.layer);
+
+        const auto prefix = "layers/" + std::to_string(layer) + "/";
+        Tensor q = layout.q.bind(storage), k = layout.k.bind(storage),
+               v  = layout.v.bind(storage);
+        Tensor qh = q.view({g.head_dim(), g.heads, p}), kh = k.view({g.head_dim(), g.heads, p});
+        Tensor vh = v.view({g.head_dim(), g.heads, p});
+        if (g.gemma_version == 3) {
+            ln(prefix + "norm1", x, a, g.norm_epsilon);
+            Tensor qkv = layout.qkv.bind(storage);
+            linear(prefix + "attention/qkv", a, qkv);
+            ops::add_bias(tensor(prefix + "attention/qkv_bias"), qkv, stream);
+            qh       = Tensor(qkv.data, DType::BF16, {g.head_dim(), g.heads, p});
+            kh       = Tensor(static_cast<char*>(qkv.data) + h * 2, DType::BF16,
+                              {g.head_dim(), g.heads, p});
+            vh       = Tensor(static_cast<char*>(qkv.data) + h * 4, DType::BF16,
+                              {g.head_dim(), g.heads, p});
+            qh.nb[2] = kh.nb[2] = vh.nb[2] = qkv.nb[1];
+        } else {
+            rms(prefix + "input_norm", x, a);
+            linear(prefix + "attention/query", a, b);
+            Tensor bh = b.view({g.head_dim(), g.heads * p});
+            Tensor qn = q.view({g.head_dim(), g.heads * p});
+            rms(prefix + "attention/query_norm", bh, qn);
+            linear(prefix + "attention/key", a, b);
+            Tensor kn = k.view({g.head_dim(), g.heads * p});
+            rms(prefix + "attention/key_norm", bh, kn);
+            linear(prefix + "attention/value", a, b);
+            Tensor vn = v.view({g.head_dim(), g.heads * p});
+            ops::rmsnorm_unweighted(bh, g.norm_epsilon, vn, stream);
+            gemma_vision::spatial_rope(positions, g.rope_theta, qh, kh, stream);
+        }
+        Tensor attended = a.view({g.head_dim(), g.heads, p});
+        ops::vision_attention(qh, kh, vh, p, attended, stream,
+                              g.gemma_version == 4 ? 1.0F : 0.0F);
+        linear(prefix + "attention/output", a, b);
+        if (g.gemma_version == 3) {
+            ops::add_bias(tensor(prefix + "attention/output_bias"), b, stream);
+            ops::residual_add(b, x, stream);
+            ln(prefix + "norm2", x, a, g.norm_epsilon);
+        } else {
+            rms(prefix + "post_attention_norm", b, a);
+            ops::residual_add(a, x, stream);
+            rms(prefix + "pre_feedforward_norm", x, a);
+        }
+        Tensor gate = layout.gate.bind(storage), up = layout.up.bind(storage),
+               activated = layout.activated.bind(storage);
+        if (g.gemma_version == 3) {
+            linear(prefix + "mlp/fc1", a, gate);
+            ops::add_bias(tensor(prefix + "mlp/fc1_bias"), gate, stream);
+            ops::gelu(gate, ops::GeluMode::Tanh, stream);
+            linear(prefix + "mlp/fc2", gate, b);
+            ops::add_bias(tensor(prefix + "mlp/fc2_bias"), b, stream);
+            ops::residual_add(b, x, stream);
+        } else {
+            linear(prefix + "mlp/gate", a, gate);
+            linear(prefix + "mlp/up", a, up);
+            ops::gelu_mul(gate, up, ops::GeluMode::Tanh, activated, stream, true);
+            linear(prefix + "mlp/down", activated, b);
+            rms(prefix + "post_feedforward_norm", b, a);
+            ops::residual_add(a, x, stream);
+        }
+        if (probe) {
+            probe("gemma_vision_layer", x.slice(1, 0, std::min(p, 64)), layer, stream);
+        }
+        if (++state.layer == static_cast<std::size_t>(g.layers)) { state.phase = VisionEncodeState::Phase::Projection; }
+        return false;
     }
     if (g.encoder_free) {
         ln("position_norm", x, a, 1.e-5F);
@@ -141,71 +215,6 @@ void encode_gemma_vision(const VisionGeometry& g, const VisionWeights& weights,
         Tensor final = output.view({g.output_hidden, p});
         linear("projection", b, final);
     } else {
-        for (int layer = 0; layer < g.layers; ++layer) {
-            const auto prefix = "layers/" + std::to_string(layer) + "/";
-            Tensor q = layout.q.bind(storage), k = layout.k.bind(storage),
-                   v  = layout.v.bind(storage);
-            Tensor qh = q.view({g.head_dim(), g.heads, p}), kh = k.view({g.head_dim(), g.heads, p});
-            Tensor vh = v.view({g.head_dim(), g.heads, p});
-            if (g.gemma_version == 3) {
-                ln(prefix + "norm1", x, a, g.norm_epsilon);
-                Tensor qkv = layout.qkv.bind(storage);
-                linear(prefix + "attention/qkv", a, qkv);
-                ops::add_bias(tensor(prefix + "attention/qkv_bias"), qkv, stream);
-                qh       = Tensor(qkv.data, DType::BF16, {g.head_dim(), g.heads, p});
-                kh       = Tensor(static_cast<char*>(qkv.data) + h * 2, DType::BF16,
-                                  {g.head_dim(), g.heads, p});
-                vh       = Tensor(static_cast<char*>(qkv.data) + h * 4, DType::BF16,
-                                  {g.head_dim(), g.heads, p});
-                qh.nb[2] = kh.nb[2] = vh.nb[2] = qkv.nb[1];
-            } else {
-                rms(prefix + "input_norm", x, a);
-                linear(prefix + "attention/query", a, b);
-                Tensor bh = b.view({g.head_dim(), g.heads * p});
-                Tensor qn = q.view({g.head_dim(), g.heads * p});
-                rms(prefix + "attention/query_norm", bh, qn);
-                linear(prefix + "attention/key", a, b);
-                Tensor kn = k.view({g.head_dim(), g.heads * p});
-                rms(prefix + "attention/key_norm", bh, kn);
-                linear(prefix + "attention/value", a, b);
-                Tensor vn = v.view({g.head_dim(), g.heads * p});
-                ops::rmsnorm_unweighted(bh, g.norm_epsilon, vn, stream);
-                gemma_vision::spatial_rope(positions, g.rope_theta, qh, kh, stream);
-            }
-            Tensor attended = a.view({g.head_dim(), g.heads, p});
-            ops::vision_attention(qh, kh, vh, p, attended, stream,
-                                  g.gemma_version == 4 ? 1.0F : 0.0F);
-            linear(prefix + "attention/output", a, b);
-            if (g.gemma_version == 3) {
-                ops::add_bias(tensor(prefix + "attention/output_bias"), b, stream);
-                ops::residual_add(b, x, stream);
-                ln(prefix + "norm2", x, a, g.norm_epsilon);
-            } else {
-                rms(prefix + "post_attention_norm", b, a);
-                ops::residual_add(a, x, stream);
-                rms(prefix + "pre_feedforward_norm", x, a);
-            }
-            Tensor gate = layout.gate.bind(storage), up = layout.up.bind(storage),
-                   activated = layout.activated.bind(storage);
-            if (g.gemma_version == 3) {
-                linear(prefix + "mlp/fc1", a, gate);
-                ops::add_bias(tensor(prefix + "mlp/fc1_bias"), gate, stream);
-                ops::gelu(gate, ops::GeluMode::Tanh, stream);
-                linear(prefix + "mlp/fc2", gate, b);
-                ops::add_bias(tensor(prefix + "mlp/fc2_bias"), b, stream);
-                ops::residual_add(b, x, stream);
-            } else {
-                linear(prefix + "mlp/gate", a, gate);
-                linear(prefix + "mlp/up", a, up);
-                ops::gelu_mul(gate, up, ops::GeluMode::Tanh, activated, stream, true);
-                linear(prefix + "mlp/down", activated, b);
-                rms(prefix + "post_feedforward_norm", b, a);
-                ops::residual_add(a, x, stream);
-            }
-            if (probe) {
-                probe("gemma_vision_layer", x.slice(1, 0, std::min(p, 64)), layer, stream);
-            }
-        }
         Tensor pooled = layout.pooled.bind(storage), normalized = layout.normalized.bind(storage);
         if (g.gemma_version == 3) {
             ln("post_norm", x, a, g.norm_epsilon);
@@ -225,5 +234,7 @@ void encode_gemma_vision(const VisionGeometry& g, const VisionWeights& weights,
         probe("vision_projection", output.slice(1, 0, std::min(output.ne[1], 64)), g.layers,
               stream);
     }
+    state.phase = VisionEncodeState::Phase::Complete;
+    return true;
 }
 } // namespace sinfer::family

@@ -1148,6 +1148,7 @@ private:
         std::uint32_t deferred     = 0;
         std::uint32_t next_lane    = 0;
         bool prefill_flight        = false;
+        bool previous_prefill      = false;
     };
     std::vector<GroupMeta> group_meta_;
 
@@ -1220,13 +1221,16 @@ private:
             }
             meta.prefill_flight = false;
             if (meta.staged_count > 0 && !meta.membership.empty()) {
+                meta.previous_prefill = false;
                 last_round_ = LastRound{"mixed", static_cast<std::uint32_t>(meta.membership.size), meta.staged[0], last_round_.index + 1};
                 program.launch_group_mixed(g, std::span<const std::uint32_t>(meta.staged.data(), meta.staged_count),
                                            meta.membership.lane_span(), meta.membership.budget_span());
                 launched = true;
-            } else if (lone_lane != max_concurrency_) {
-                // No decode lanes in this group: a lone prefill step (a zero-lane mixed round
-                // needs the family's mixed body to accept batch 0 first — SUROGATE_SERVE_PIPELINE_ZERO_LANE_MIXED).
+            } else if (lone_lane != max_concurrency_ &&
+                       (meta.membership.empty() || !meta.previous_prefill)) {
+                meta.previous_prefill = true;
+                // Run a prompt separately when it cannot share a decode round.
+                // Alternate with ready decode lanes so image encoding cannot starve them.
                 static const bool zero_lane_mixed = std::getenv("SUROGATE_SERVE_PIPELINE_LONE_PREFILL") == nullptr;
                 if (zero_lane_mixed && meta.staged_count > 0) {
                     last_round_ = LastRound{"mixed", 0, meta.staged[0], last_round_.index + 1};
@@ -1242,6 +1246,7 @@ private:
                 program.launch_group_prefill(g, meta.prefill_lane);
                 launched = true;
             } else if (!meta.membership.empty()) {
+                meta.previous_prefill = false;
                 last_round_ = LastRound{"decode", static_cast<std::uint32_t>(meta.membership.size), 0, last_round_.index + 1};
                 program.launch_group_decode(g, meta.membership.lane_span(), meta.membership.budget_span());
                 launched = true;
@@ -1533,6 +1538,10 @@ private:
             }
             append_output(request, std::move(published));
             if (!cancelled[row]) append_scores(request);
+            static const bool trace_rounds = std::getenv("SUROGATE_SERVE_ROUND_TRACE") != nullptr;
+            if (trace_rounds && accepted[row] != 0) {
+                std::fprintf(stderr, "round-trace: decode-commit lane=%u tokens=%u\n", lane, accepted[row]);
+            }
             if (terminal[row]) {
                 complete_success(request, finish_reasons[row]);
                 remove_completed_slot(lane);

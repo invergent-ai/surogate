@@ -196,7 +196,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             max_merged   = std::max(max_merged, item.merged_count);
         }
         base->vision_transient_bytes =
-            schedule::VisionContext::output_transient_bytes(vision, max_merged);
+            schedule::VisionContext::encoding_transient_bytes(vision, max_merged);
         base->vision_control         = std::move(control);
     }
 
@@ -215,7 +215,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
              ? 1ULL
              : 0ULL);
     base->summary.service_work_quanta =
-        projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
+        projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits) +
+        (base->vision_control ? base->vision_control->items.size() *
+            ((std::uint64_t(model.vision_geometry.layers) + 1 + family::kVisionEncodeStepsPerSlice) /
+             family::kVisionEncodeStepsPerSlice) : 0);
     return RequestBasePlan(std::move(base));
 }
 
@@ -409,7 +412,10 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
              ? 1ULL
              : 0ULL);
     plan->summary.service_work_quanta =
-        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
+        projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits) +
+        (plan->vision ? plan->vision->uses.size() *
+            ((std::uint64_t(model.vision_geometry.layers) + 1 + family::kVisionEncodeStepsPerSlice) /
+             family::kVisionEncodeStepsPerSlice) : 0);
     return RequestPlan(std::move(plan));
 }
 

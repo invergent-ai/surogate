@@ -1,9 +1,11 @@
 #include "core/device.h"
+#include "core/sleep.h"
 #include "runtime/engine/request_memory.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <array>
 #include <iostream>
 #include <stdexcept>
 
@@ -83,6 +85,24 @@ int main() {
     empty.activate(0, 1);
     failures += expect(empty.region().data == nullptr && empty.summary().capacity_bytes == 0,
                        "zero-capacity request memory exposed a device allocation");
+
+    sinfer::set_sleepable_allocations(true);
+    {
+        sinfer::runtime::RequestMemory partial_image(device, 1024);
+        partial_image.activate(256, 256);
+        std::array<unsigned char, 256> expected{}, actual{};
+        for (std::size_t i = 0; i < expected.size(); ++i) { expected[i] = static_cast<unsigned char>(i); }
+        const auto region = partial_image.region();
+        CUDA_CHECK(cudaMemcpy(region.data, expected.data(), expected.size(), cudaMemcpyHostToDevice));
+        failures += expect(sinfer::sleep_device(0) > 0, "sleep did not release the request allocation");
+        failures += expect(sinfer::sleep_backup_bytes(0) >= expected.size(),
+                           "sleep discarded the active image instead of backing it up");
+        sinfer::wake_device(0);
+        CUDA_CHECK(cudaMemcpy(actual.data(), region.data, actual.size(), cudaMemcpyDeviceToHost));
+        failures += expect(actual == expected && partial_image.region().data == region.data,
+                           "wake changed the active image contents or its pointer");
+    }
+    sinfer::set_sleepable_allocations(false);
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

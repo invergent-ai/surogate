@@ -32,10 +32,23 @@ namespace sinfer::family {
 
 /// The alignment the tower's workspace and its output transient are carved at.
 inline constexpr std::size_t kVisionWorkspaceAlignment = 256;
+// Amortize scheduling without running a whole tower. A fixed number of steps
+// also keeps pipeline stages at the same encoder boundary on different GPUs.
+inline constexpr std::size_t kVisionEncodeStepsPerSlice = 4;
 
 struct VisionItemView {
     std::span<const std::uint16_t> patches;
     const VisionItemControl* control = nullptr;
+};
+
+struct VisionEncodeState {
+    enum class Phase { Embedding, Blocks, Projection, Complete };
+    Phase phase = Phase::Embedding;
+    std::size_t layer = 0;
+    std::size_t deepstack = 0;
+    // Serving keeps this outside the shared scratch arena across decode rounds.
+    // A standalone encode can leave it empty and reuse the arena's residual.
+    Tensor residual;
 };
 
 /// A tower's output must match the text model it was bound with.
@@ -58,6 +71,8 @@ public:
 
     [[nodiscard]] static std::size_t output_transient_bytes(const VisionGeometry& geometry,
                                                             std::size_t merged_tokens);
+    [[nodiscard]] static std::size_t encoding_transient_bytes(const VisionGeometry& geometry,
+                                                              std::size_t merged_tokens);
     [[nodiscard]] static std::size_t workspace_bytes(const VisionGeometry& geometry,
                                                      const VisionItemControl& item);
     [[nodiscard]] static std::size_t workspace_capacity_bytes(const VisionGeometry& geometry,
@@ -66,6 +81,8 @@ public:
     /// The tower this context encodes with.
     [[nodiscard]] const VisionGeometry& geometry() const noexcept { return cfg_; }
     void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
+    [[nodiscard]] bool encode_step(const VisionItemView& item, Tensor& output,
+                                    WorkspaceArena& workspace, VisionEncodeState& state) const;
 
 private:
     struct BlockW {

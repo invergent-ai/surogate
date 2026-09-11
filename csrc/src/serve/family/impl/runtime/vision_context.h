@@ -46,10 +46,13 @@ public:
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     [[nodiscard]] std::uint32_t chunk_length(std::uint32_t begin, std::uint32_t nominal_length) const;
+    [[nodiscard]] bool chunk_ready(std::uint32_t begin, std::uint32_t nominal_length) const;
+    [[nodiscard]] bool advance_encoding(std::uint32_t begin, std::uint32_t nominal_length);
     void release_encoded_media_payloads() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
 
 private:
+    [[nodiscard]] const VisionUseSpan* use_for_chunk(std::uint32_t begin, std::uint32_t nominal_length) const;
     DeviceContext& device_;
     WorkspaceArena& workspace_;
     family::PreparedPromptData& prompt_;
@@ -57,6 +60,8 @@ private:
     runtime::TransientRegion transient_;
     family::VisionContext context_;
     std::optional<std::uint32_t> active_item_;
+    std::optional<std::uint32_t> encoding_item_;
+    family::VisionEncodeState encoding_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
 };

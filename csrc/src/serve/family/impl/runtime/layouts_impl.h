@@ -928,7 +928,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         const std::uint32_t merged = std::min({impl->capacity, kFrontendMergedLimit, impl->vision_geometry.gemma_version ? static_cast<std::uint32_t>(impl->vision_geometry.max_image_tokens) : kFrontendMergedLimit});
         const family::VisionGeometry& vision = impl->vision_geometry;
         impl->request_transient_capacity_bytes =
-            schedule::VisionContext::output_transient_bytes(vision, merged);
+            schedule::VisionContext::encoding_transient_bytes(vision, merged);
     }
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
