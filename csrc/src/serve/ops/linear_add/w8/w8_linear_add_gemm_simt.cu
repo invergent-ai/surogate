@@ -88,7 +88,7 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& residual_out, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int ColsPerTile, bool Full>
+template <int ColsPerTile, bool Full, bool StageTail>
 void launch_tt(const __nv_bfloat16* x, const std::uint8_t* codes, const std::uint8_t* scales,
                __nv_bfloat16* residual_out, std::int32_t rows, std::int32_t k, std::int32_t cols,
                std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
@@ -97,7 +97,8 @@ void launch_tt(const __nv_bfloat16* x, const std::uint8_t* codes, const std::uin
                     static_cast<unsigned>(div_up(cols, ColsPerTile)), 1u);
     const W8ContiguousOutput output{residual_out, rows};
     w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, ColsPerTile, kRowsPerBlock, kStages, Full,
-                                 W8Epilogue::Residual><<<grid, kThreads, 0, stream>>>(
+                                 W8Epilogue::Residual, W8ContiguousOutput, StageTail>
+        <<<grid, kThreads, 0, stream>>>(
         x, codes, scales, output, rows, k, cols, padded_k, full_slabs);
 }
 
@@ -111,13 +112,19 @@ void launch_variant(bool full, const Tensor& x, const Weight& w, Tensor& residua
     const auto* scales            = static_cast<const std::uint8_t*>(w.scales);
     auto* out                     = static_cast<__nv_bfloat16*>(residual_out.data);
 
-    if (full) {
-        launch_tt<ColsPerTile, true>(xp, codes, scales, out, residual_out.ne[0], x.ne[0], x.ne[1],
-                                     w.padded_shape[1], full_slabs, stream);
-    } else {
-        launch_tt<ColsPerTile, false>(xp, codes, scales, out, residual_out.ne[0], x.ne[0], x.ne[1],
-                                      w.padded_shape[1], full_slabs, stream);
-    }
+    const auto launch = [&](auto stage_tail) {
+        if (full) {
+            launch_tt<ColsPerTile, true, decltype(stage_tail)::value>(
+                xp, codes, scales, out, residual_out.ne[0], x.ne[0], x.ne[1],
+                w.padded_shape[1], full_slabs, stream);
+        } else {
+            launch_tt<ColsPerTile, false, decltype(stage_tail)::value>(
+                xp, codes, scales, out, residual_out.ne[0], x.ne[0], x.ne[1],
+                w.padded_shape[1], full_slabs, stream);
+        }
+    };
+    if (full_slabs > 0 && x.ne[0] % 1024 != 0) { launch(std::true_type{}); }
+    else { launch(std::false_type{}); }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -140,12 +147,20 @@ void w8_linear_add_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& r
 
 void w8_linear_add_simt_r8_c4_launch(bool full, const Tensor& x, const Weight& w,
                                      Tensor& residual_out, cudaStream_t stream) {
-    launch_variant<4>(full, x, w, residual_out, stream);
+    if (x.ne[1] == 1) {
+        launch_variant<1>(residual_out.ne[0] % kRowsPerBlock == 0, x, w, residual_out, stream);
+    } else {
+        launch_variant<4>(full, x, w, residual_out, stream);
+    }
 }
 
 void w8_linear_add_simt_r8_c8_launch(bool full, const Tensor& x, const Weight& w,
                                      Tensor& residual_out, cudaStream_t stream) {
-    launch_variant<8>(full, x, w, residual_out, stream);
+    if (x.ne[1] == 1) {
+        launch_variant<1>(residual_out.ne[0] % kRowsPerBlock == 0, x, w, residual_out, stream);
+    } else {
+        launch_variant<8>(full, x, w, residual_out, stream);
+    }
 }
 
 } // namespace sinfer::ops::detail

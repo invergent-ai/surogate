@@ -16,7 +16,7 @@ namespace {
 constexpr int kRowsPerBlockDefault = 8;
 constexpr int kStages              = 2;
 
-template <int ColsPerTile, bool Full>
+template <int ColsPerTile, bool Full, bool StageTail>
 void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::uint8_t* scales,
                __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
                std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
@@ -25,7 +25,8 @@ void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::ui
                     static_cast<unsigned>(div_up(t, ColsPerTile)), 1u);
     const W8ContiguousOutput output{outp, n};
     w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, ColsPerTile, kRowsPerBlockDefault, kStages,
-                                 Full><<<grid, kBlockThreads, 0, stream>>>(
+                                 Full, W8Epilogue::Store, W8ContiguousOutput, StageTail>
+        <<<grid, kBlockThreads, 0, stream>>>(
         xp, codes, scales, output, n, k, t, padded_k, full_slabs);
 }
 
@@ -35,10 +36,15 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
     const bool aligned_x = (x.ne[0] % 8) == 0 && (reinterpret_cast<std::uintptr_t>(xp) & 0xfu) == 0;
     const std::int32_t full_slabs = aligned_x ? x.ne[0] / 1024 : 0;
 
-    launch_tt<ColsPerTile, Full>(xp, static_cast<const std::uint8_t*>(w.qdata),
-                                 static_cast<const std::uint8_t*>(w.scales),
-                                 static_cast<__nv_bfloat16*>(out.data), out.ne[0], x.ne[0], x.ne[1],
-                                 w.padded_shape[1], full_slabs, stream);
+    const auto launch = [&](auto stage_tail) {
+        launch_tt<ColsPerTile, Full, decltype(stage_tail)::value>(
+            xp, static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales),
+            static_cast<__nv_bfloat16*>(out.data), out.ne[0], x.ne[0], x.ne[1],
+            w.padded_shape[1], full_slabs, stream);
+    };
+    if (full_slabs > 0 && x.ne[0] % 1024 != 0) { launch(std::true_type{}); }
+    else { launch(std::false_type{}); }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -108,11 +114,13 @@ void launch_w8_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStr
             }
         }
     }
-    launch_route<4>(x, w, out, stream);
+    if (x.ne[1] == 1) { launch_route<1>(x, w, out, stream); }
+    else { launch_route<4>(x, w, out, stream); }
 }
 
 void launch_w8_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    launch_route<8>(x, w, out, stream);
+    if (x.ne[1] == 1) { launch_route<1>(x, w, out, stream); }
+    else { launch_route<8>(x, w, out, stream); }
 }
 
 } // namespace sinfer::ops::detail

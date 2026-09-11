@@ -18,16 +18,17 @@
 //     ownership.
 //   - W8 bytes are scaled per 32-value group and rounded to BF16.
 //     fp32 FMA into per-column accumulators; warp-shuffle reduction per column.
-//   - kTt is 4 or 8 only. Larger column tiles blow past the register budget
+//   - kTt is 1 for single-token decode, or 4/8 for batches. Larger column tiles
+//     blow past the register budget
 //     (kTt=16 needs ~98 regs -> 2 blocks/SM -> latency-bound at ~20% of DRAM),
 //     so T > 8 re-streams the weights once per 8-column tile instead; the mma
 //     tensor-core GEMM takes over where that stops winning.
 //
 // Correctness for arbitrary shapes: full 1024-value slabs require k % 8 == 0
-// (16-byte aligned x columns) and cover [0, k/1024*1024); every remaining group
-// (tail of odd k, or all groups when k % 8 != 0) uses the scalar per-pair path
-// reading global memory directly, masked at the k boundary. Weights in the
-// padded region [k, padded_k) are never used.
+// (16-byte aligned x columns) and cover [0, k/1024*1024). Remaining groups keep
+// the scalar per-pair accumulation order, masked at the k boundary. StageTail
+// reuses a shared slab for at most 32 remaining groups; the fallback reads them
+// directly. Weights in the padded region [k, padded_k) are never used.
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -39,6 +40,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace sinfer::ops::detail {
 
@@ -142,7 +144,8 @@ w8_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
 // aligned, else 0 (everything runs through the scalar tail).
 template <class Schedule, int ColsPerTile, int RowsPerCta, int PipelineStages, bool Full,
-          W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput>
+          W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput,
+          bool StageTail = false>
 __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
                                              const std::uint8_t* __restrict__ scales, Output output,
@@ -207,16 +210,41 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
         __syncwarp();
     }
 
-    // Scalar tail: remaining groups read global memory directly, masked at k.
+    // Preserve the scalar tail's lane ownership and FMA order. Its short,
+    // repeated weight reads can share the slab arena once all async copies
+    // from the full slabs have completed.
     const int g0      = (full_slabs * 1024) / Codec::kGroupK;
     const int kg_used = div_up(k, Codec::kGroupK);
+    if constexpr (StageTail) {
+        static_assert(std::is_same_v<Schedule, W8RowSplitSimtSchedule>);
+        const int groups = kg_used - g0; // Launcher guarantees 1..32.
+        pipe_wait<0>();
+        __syncwarp();
+        for (int chunk = lane; chunk < groups * 2; chunk += 32) {
+            pipe_copy<16>(&s_nib[warp][0][chunk],
+                          code_row + static_cast<std::int64_t>(g0) * 32 + chunk * 16);
+        }
+        if (lane < groups) {
+            reinterpret_cast<std::uint16_t*>(s_sc[warp][0])[lane] =
+                reinterpret_cast<const std::uint16_t*>(scale_row)[g0 + lane];
+        }
+        pipe_commit();
+        pipe_wait<0>();
+        __syncwarp();
+    }
     for (int g = g0; g < kg_used; ++g) {
         const int kk = g * Codec::kGroupK + lane * 2;
         if (kk >= k) { continue; }
         float w0 = 0.0f;
         float w1 = 0.0f;
-        Codec::load_pair(codes, nullptr, scales, static_cast<std::int64_t>(row) * kg_padded + g,
-                         lane, w0, w1);
+        if constexpr (StageTail) {
+            Codec::load_pair(reinterpret_cast<const std::uint8_t*>(s_nib[warp][0]), nullptr,
+                             reinterpret_cast<const std::uint8_t*>(s_sc[warp][0]), g - g0,
+                             lane, w0, w1);
+        } else {
+            Codec::load_pair(codes, nullptr, scales, static_cast<std::int64_t>(row) * kg_padded + g,
+                             lane, w0, w1);
+        }
 #pragma unroll
         for (int tt = 0; tt < ColsPerTile; ++tt) {
             if (tt < ncols) {
