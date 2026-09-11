@@ -1,4 +1,5 @@
 #include "api/ops/gated_delta_net.h"
+#include "api/ops/l2norm.h"
 
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
@@ -279,6 +280,108 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
                                                device.beta);
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// Normalization must have the same represented values whether it is fused into
+// decode or materialized by chunked prefill. Compare both public paths directly,
+// including their final state, independently of the FP64 recurrence oracle.
+int normalization_parity_case(int tokens, bool snapshot) {
+    const Case test_case{"normalization parity", 4, 8, tokens, true};
+    const auto in = make_inputs(test_case, 15000u + tokens);
+    DeviceInputs device(in);
+    Tensor q(device.q.p, DType::BF16, {kStateDim, 4, tokens});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, 4, tokens});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, 8, tokens});
+    Tensor g(device.g.p, DType::FP32, {8, tokens});
+    Tensor beta(device.beta.p, DType::FP32, {8, tokens});
+    DeviceBuffer normalized_q(q.bytes()), normalized_k(k.bytes());
+    Tensor nq(normalized_q.p, DType::BF16, {kStateDim, 4, tokens});
+    Tensor nk(normalized_k.p, DType::BF16, {kStateDim, 4, tokens});
+    ops::l2norm(q, 1.0e-6f, nq, nullptr);
+    ops::l2norm(k, 1.0e-6f, nk, nullptr);
+
+    const int slots = snapshot ? tokens + 1 : 1;
+    std::vector<float> initial(in.state.size() * slots, 0.0f);
+    std::copy(in.state.begin(), in.state.end(), initial.begin());
+    DeviceBuffer fused_state = to_device_bf16(initial), materialized_state = to_device_bf16(initial);
+    DeviceBuffer fused_out(v.bytes()), materialized_out(v.bytes());
+    Tensor fs(fused_state.p, DType::BF16, {kStateDim, kStateDim, 8, slots});
+    Tensor ms(materialized_state.p, DType::BF16, {kStateDim, kStateDim, 8, slots});
+    Tensor fo(fused_out.p, DType::BF16, {kStateDim, 8, tokens});
+    Tensor mo(materialized_out.p, DType::BF16, {kStateDim, 8, tokens});
+    const float scale = 1.0f / std::sqrt(float(kStateDim));
+    if (snapshot) {
+        auto initial_slot = to_device_i32({0});
+        auto destination_slot = to_device_i32({1});
+        Tensor source(initial_slot.p, DType::I32, {1});
+        Tensor destination(destination_slot.p, DType::I32, {1});
+        ops::gated_delta_net_snapshot(q, k, v, g, beta, scale, true, fs,
+                                      Tensor{}, source, destination, fo, nullptr);
+        ops::gated_delta_net_snapshot(nq, nk, v, g, beta, scale, false, ms,
+                                      Tensor{}, source, destination, mo, nullptr);
+        cuda_synchronize();
+    } else {
+        const auto bytes = ops::gated_delta_net_workspace_capacity_bytes(4, 8, true, tokens, tokens);
+        WorkspaceArena workspace(std::max<std::size_t>(bytes, 256));
+        ops::gated_delta_net(q, k, v, g, beta, scale, true, workspace, fs, fo, nullptr);
+        ops::gated_delta_net(nq, nk, v, g, beta, scale, false, workspace, ms, mo, nullptr);
+        cuda_synchronize();
+    }
+    const auto label = std::string(snapshot ? "snapshot" : "prefill") + " normalized T=" + std::to_string(tokens);
+    int failures = verify_exact(label + " output", from_device<std::uint16_t>(fused_out, in.v.size()),
+                                from_device<std::uint16_t>(materialized_out, in.v.size()));
+    failures += verify_exact(label + " state", from_device<std::uint16_t>(fused_state, initial.size()),
+                              from_device<std::uint16_t>(materialized_state, initial.size()));
+    return failures;
+}
+
+// Appending neutral tokens must not change a prefix's output or final state.
+// This catches a last partial block silently switching to recurrent arithmetic.
+int partial_chunk_parity_case(int tokens, bool normalize, bool split = false) {
+    const int padded = ((tokens + 63) / 64) * 64;
+    const Case test_case{"partial chunk parity", 4, 8, padded, normalize};
+    auto in = make_inputs(test_case, 16000u + tokens);
+    std::fill(in.g.begin() + tokens * 8, in.g.end(), 0.0f);
+    std::fill(in.beta.begin() + tokens * 8, in.beta.end(), 0.0f);
+    DeviceInputs device(in);
+    Tensor q(device.q.p, DType::BF16, {kStateDim, 4, padded});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, 4, padded});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, 8, padded});
+    Tensor g(device.g.p, DType::FP32, {8, padded});
+    Tensor beta(device.beta.p, DType::FP32, {8, padded});
+    auto prefix_state = to_device_bf16(in.state), padded_state = to_device_bf16(in.state);
+    GuardedDeviceBuffer prefix_out(std::size_t(kStateDim) * 8 * tokens * 2);
+    DeviceBuffer padded_out(v.bytes());
+    Tensor ps(prefix_state.p, DType::BF16, {kStateDim, kStateDim, 8});
+    Tensor fs(padded_state.p, DType::BF16, {kStateDim, kStateDim, 8});
+    Tensor po(prefix_out.data(), DType::BF16, {kStateDim, 8, tokens});
+    Tensor fo(padded_out.p, DType::BF16, {kStateDim, 8, padded});
+    const auto bytes = ops::gated_delta_net_workspace_capacity_bytes(4, 8, normalize, tokens, padded);
+    WorkspaceArena workspace(bytes);
+    const float scale = 1.0f / std::sqrt(float(kStateDim));
+    const int step = split ? 64 : tokens;
+    for (int begin = 0; begin < tokens; begin += step) {
+        const int count = std::min(step, tokens - begin);
+        Tensor part = po.slice(2, begin, count);
+        ops::gated_delta_net(q.slice(2, begin, count), k.slice(2, begin, count), v.slice(2, begin, count),
+                             g.slice(1, begin, count), beta.slice(1, begin, count), scale, normalize,
+                             workspace, ps, part, nullptr);
+    }
+    ops::gated_delta_net(q, k, v, g, beta, scale, normalize, workspace, fs, fo, nullptr);
+    cuda_synchronize();
+    const auto label = "partial chunk T=" + std::to_string(tokens) + " normalize=" + std::to_string(normalize) +
+                       " split=" + std::to_string(split);
+    const auto elements = po.numel();
+    int failures = verify_exact(label + " output", from_device<std::uint16_t>(prefix_out.data(), elements),
+                                from_device<std::uint16_t>(padded_out, elements));
+    failures += verify_exact(label + " state", from_device<std::uint16_t>(prefix_state, in.state.size()),
+                              from_device<std::uint16_t>(padded_state, in.state.size()));
+    failures += prefix_out.verify_guards(label.c_str());
+    if (workspace.used() != 0 || workspace.peak_used() > bytes) {
+        std::cerr << label << ": workspace interval missed a partial chunk\n";
         ++failures;
     }
     return failures;
@@ -595,6 +698,20 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     failures += contract_rejection_cases();
+    for (const int tokens : {1, 4, 16, 63, 64, 65, 127, 128, 254, 256}) {
+        failures += normalization_parity_case(tokens, false);
+        if (tokens <= 16) { failures += normalization_parity_case(tokens, true); }
+    }
+
+    for (const int tokens : {65, 127, 129, 191, 254, 257}) {
+        failures += partial_chunk_parity_case(tokens, false);
+        failures += partial_chunk_parity_case(tokens, true);
+    }
+
+    for (const int tokens : {128, 192, 256}) {
+        failures += partial_chunk_parity_case(tokens, false, true);
+        failures += partial_chunk_parity_case(tokens, true, true);
+    }
 
     // Registered 27B/35B-A3B geometries, public state forms, and the recurrent/chunk/tail route
     // boundary are all qualified directly against the same complete FP64 recurrence.

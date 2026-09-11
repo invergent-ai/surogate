@@ -498,6 +498,16 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
             }
         }
 
+        // Match the BF16 state boundary used when the next block arrives in a
+        // separate prefill call. Batching several blocks must not change the
+        // state precision passed from one block to the next.
+#pragma unroll
+        for (int m = 0; m < M_TILES_H_PW; ++m) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                h_frag[m][e] = __bfloat162float(__float2bfloat16_rn(h_frag[m][e]));
+            }
+        }
         __syncthreads(); // gates MM2 before the next chunk overwrites W/K/U
 
         // The next chunk repeats the W-then-K async group order used by the

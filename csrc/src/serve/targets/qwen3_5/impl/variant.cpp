@@ -45,10 +45,11 @@ ops::LinearPolicy text_policy(QType format) {
     case QType::FP8_E4M3FN_BLK128_F32S:
     case QType::FP8_E4M3FN_ROW_F32S:
         return kFp8TextPolicy; // informational: the route quantises per token per 128 regardless
-    // W8 opts into A8: the wrappers run the W8A8-int IMMA path at
-    // T >= kW8A8MinTokens and A16 below it.
+    // Keep activation precision independent of prompt/decode batch width.
+    // W8A8 prefill changes the target arithmetic at its token threshold while
+    // speculative verification and ordinary decode consume BF16 activations.
     case QType::W8G32_F16S:
-        return ops::LinearPolicy::AllowA8;
+        return ops::LinearPolicy::A16Only;
     default:
         return ops::LinearPolicy::A16Only;
     }

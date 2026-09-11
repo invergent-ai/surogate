@@ -206,7 +206,12 @@ __device__ __forceinline__ void normalize_qk_lane(float (&value)[kQkPerLane], in
         float inv = lane == 0 ? rsqrtf(sum + kQkL2NormEps) : 0.0f;
         inv       = __shfl_sync(kFullWarpMask, inv, 0);
 #pragma unroll
-        for (int i = 0; i < kQkPerLane; ++i) { value[i] *= inv; }
+        // Chunked prefill materializes l2norm into BF16 tensors. Keep the same
+        // rounding boundary when normalization is fused into a short recurrence,
+        // speculative verification, or replay of an accepted prefix.
+        for (int i = 0; i < kQkPerLane; ++i) {
+            value[i] = __bfloat162float(__float2bfloat16_rn(value[i] * inv));
+        }
     }
 }
 
