@@ -7,7 +7,7 @@
 // group merges through caller-owned workspace; unsupported finite geometries
 // use the semantically identical single-block fallback.
 
-#include "ops/kernel/sampling_device.cuh"
+#include "ops/kernel/sampling_exact.cuh"
 
 namespace sinfer::ops {
 
@@ -40,7 +40,7 @@ __global__ void sampling_update_greedy_targets_kernel(
     unsigned long long best = 0;
     const auto base = (static_cast<std::int64_t>(row) * width + col) * physical_rows;
     for (int v = threadIdx.x; v < domain; v += blockDim.x) {
-        if (sampling_suppressed(cfg, v)) { continue; }
+        if (sampling_suppressed(cfg, v, col)) { continue; }
         const float value = __bfloat162float(logits[base + v]) +
                             (cfg.logit_bias != nullptr ? cfg.logit_bias[v] : 0.0F);
         const auto key = sampling_sort_key(value, v);
@@ -164,7 +164,7 @@ __launch_bounds__(kSamplerBlock) __global__
 
     // Untruncated rows belong to sampling_full_vocab_kernel. Returning before the
     // draw is what keeps the token counts single-counted.
-    if (sampling_untruncated(cfg)) { return; }
+    if (sampling_wide(cfg)) { return; }
 
     const int partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
@@ -213,7 +213,7 @@ __launch_bounds__(kSamplerBlock) __global__
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = cfg_ptr[col];
     if (partial == 0 && threadIdx.x == 0) { workspace.group_done[col] = 0; }
-    if (sampling_untruncated(cfg)) { return; } // sampling_full_vocab_kernel owns this column
+    if (sampling_wide(cfg)) { return; } // sampling_full_vocab_kernel owns this column
 
     __shared__ typename SamplingPartialSort::TempStorage sort_storage;
     __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
@@ -279,7 +279,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     __shared__ unsigned long long greedy_warp_keys[kSamplerGroupBlock / 32];
     unsigned long long keys[kSamplerGroupItemsPerThread];
 
-    if (sampling_untruncated(cfg)) { return; } // sampling_full_vocab_kernel owns this column
+    if (sampling_wide(cfg)) { return; } // sampling_full_vocab_kernel owns this column
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes group_done[col], so caller-owned

@@ -151,19 +151,61 @@ Chat completions support `response_format: {"type":"json_object"}` for a JSON ob
 ```
 
 Supported schemas include nested objects and arrays, required properties, additional-property
-rules, enums and constants, integer/number bounds, array length limits, `anyOf`, and local
-`$ref` references. List every required field in `properties`. Unsupported keywords or combinations return `400`; they are not silently
-ignored. For example, `allOf`, `oneOf`, string patterns/length limits, formats, `multipleOf`,
-and conditional schemas are currently refused.
+rules, enums and constants, numeric bounds and `multipleOf`, array and string length limits,
+string patterns, recognized formats, `anyOf`, and local `$ref` references. `allOf` intersections
+and `oneOf` alternatives are supported when their constraints can be combined or proven
+mutually exclusive.
+
+JSON Schema support is partial. The following restrictions apply to both chat completions
+`response_format` and Responses `text.format`, including streaming requests. Unsupported
+constraints return HTTP `400` before generation; they are not silently ignored.
+
+| Limitation | Meaning and suggested alternative |
+|---|---|
+| Overlapping `oneOf` alternatives | `oneOf` requires exactly one alternative to match. Alternatives that could both match are unsupported. Use distinct required `const` values to distinguish alternatives, or use `anyOf` only if matching more than one alternative is acceptable. |
+| Some `allOf` intersections | Not every combination of constraints can be enforced together. Where possible, combine compatible requirements into a single schema. |
+| Conditional schemas and general negation | `if`/`then`/`else` and general `not` constraints are unsupported. Express allowed values or supported alternatives directly, or validate these rules in your application. |
+| `uniqueItems: true` | Array element uniqueness cannot be enforced during generation. Validate uniqueness in your application and retry if needed. |
+| Remote `$ref` references | References outside the submitted schema are unsupported. Include the referenced schemas under `$defs` and use local references such as `#/$defs/address`. |
+
+Removing an unsupported constraint also removes its generation guarantee. If you simplify a
+schema to make a request acceptable, validate the result against your original requirements
+before using it.
 
 The constraint applies while generating, including streaming. An answer stopped by a token or
 context limit can still be incomplete; check `finish_reason` before parsing it. Use sufficient
 `max_tokens`, keep `ignore_eos` false and `min_tokens` at zero, and omit custom `stop` strings and active tools. JSON is
 returned as answer content without a separate reasoning response.
 
-Structured requests work on single- and multi-GPU servers. On MTP/DFlash servers they currently
-generate one verified token per round, so they do not receive speculative acceleration.
-Responses API `text.format` remains text-only.
+Structured requests work on single- and multi-GPU servers, including MTP and DFlash speculative
+decoding. The speed benefit depends on how often the proposed tokens satisfy the requested
+format and are accepted by the target model.
+
+The Responses API supports the same constraints through `text.format`. Unlike chat completions,
+place `name`, `strict`, and `schema` directly inside the format object:
+
+```json
+{
+  "model": "my-model",
+  "input": "Is the task complete?",
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "name": "answer",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"complete": {"type": "boolean"}},
+        "required": ["complete"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+Use `"text": {"format": {"type": "json_object"}}` when any JSON object is sufficient.
+Both formats work with streaming and are preserved when retrieving a stored response.
 
 ### Streaming shape
 

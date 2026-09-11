@@ -1489,7 +1489,7 @@ if(SINFER_BUILD_APPS OR BUILD_TESTING)
   sinfer_internal_includes(sinfer_product_cuda_visibility)
 endif()
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/serve_xgrammar.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/serve_llguidance.cmake)
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
 # directories contribute their sources directly to this single compile owner below.
@@ -1532,7 +1532,7 @@ add_subdirectory(${SERVE_ROOT}/targets/qwen4exp serve_t_qwen4exp EXCLUDE_FROM_AL
 
 target_link_libraries(sinfer_engine
   PRIVATE
-    surogate_xgrammar
+    surogate_llguidance
     sinfer_artifact
     sinfer_core
     sinfer_ops

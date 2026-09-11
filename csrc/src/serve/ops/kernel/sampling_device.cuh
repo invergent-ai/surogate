@@ -2,8 +2,8 @@
 
 // Shared implementation primitives for include/sinfer/ops/sampling.h and
 // include/sinfer/ops/speculative_round.h. The ordering key is exact for finite BF16
-// logits (including numeric-zero ties); candidate storage is bounded by the
-// semantic top-20 cap and all global staging is supplied by the caller.
+// logits (including numeric-zero ties). Small top-k requests use bounded candidate
+// storage; larger filters use sampling_exact.cuh over the complete vocabulary.
 
 #include "ops/common/math.h"
 #include "ops/common/sampling_workspace.h"
@@ -88,13 +88,8 @@ __device__ __forceinline__ float sampling_uniform_open(unsigned long long seed, 
            (1.0f / 16777216.0f);
 }
 
-/// Whether this row asked for no truncation at all.
-///
-/// `top_k <= 0` is the caller saying "no limit of mine", and it is what a
-/// reinforcement-learning rollout sends (vLLM spells it -1). It used to select the
-/// pipeline's candidate cap, so "no limit" quietly meant the top twenty. A nucleus
-/// below 1 still needs an ordered prefix, which a single pass cannot produce, so
-/// that keeps the candidate route.
+/// Untruncated stochastic rows can use a single-pass full-vocabulary Gumbel draw.
+/// Nucleus filters use the complete-vocabulary selection path instead.
 __device__ __forceinline__ bool sampling_untruncated(const SamplingConfig& cfg) {
     return cfg.temperature > 0.0f && cfg.top_k <= 0 && cfg.top_p >= 1.0f;
 }
@@ -165,8 +160,7 @@ __device__ __forceinline__ int sampling_key_index(unsigned long long key) {
 
 __device__ __forceinline__ int sampling_candidate_cap(const SamplingConfig& cfg,
                                                       std::int32_t vocab) {
-    // top_k is clamped to the pipeline cap: top_k <= 0 (no explicit limit) or a
-    // top_k larger than the cap both select the full kSamplerCandidateCap set.
+    // Storage bound for the small-top-k path. Wider requests bypass this path.
     int cap = kSamplerCandidateCap;
     if (cfg.top_k > 0 && cfg.top_k < cap) { cap = cfg.top_k; }
     if (vocab < cap) { cap = vocab; }
@@ -192,9 +186,9 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // only runs when penalties are active, so it is free on the no-penalty path.
 /// Whether this row bars this token id outright. Zero cost when nothing is barred,
 /// which is every request that did not ask for a minimum length.
-__device__ __forceinline__ bool sampling_suppressed(const SamplingConfig& c, int v) {
+__device__ __forceinline__ bool sampling_suppressed(const SamplingConfig& c, int v, int column = 0) {
     if (c.token_bitmask != nullptr &&
-        !(static_cast<unsigned int>(c.token_bitmask[v / 32]) & (1U << (v % 32)))) { return true; }
+        !(static_cast<unsigned int>(c.token_bitmask[static_cast<int64_t>(column) * c.token_bitmask_stride + v / 32]) & (1U << (v % 32)))) { return true; }
     for (int j = 0; j < c.suppressed_count; ++j) {
         if (c.suppressed[j] == v) { return true; }
     }
@@ -205,7 +199,7 @@ __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
     float x = raw + (c.logit_bias != nullptr ? c.logit_bias[v] : 0.0F);
-    if (sampling_suppressed(c, v)) { return -CUDART_INF_F; }
+    if (sampling_suppressed(c, v, overlay_len)) { return -CUDART_INF_F; }
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f &&
         c.repetition_penalty == 1.0f) {
         return x;
@@ -274,7 +268,7 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
         for (int j = 0; j < n; ++j) {
             const float e = __expf(cand_val[j] * inv_temp - m);
             prob[j]       = e;
-            sum += e;
+            if (cfg.min_p <= 0.0F || e >= cfg.min_p) { sum += e; }
         }
         const float e0           = prob[0];
         const float min_p_thresh = (cfg.min_p > 0.0f) ? cfg.min_p * e0 : -1.0f;

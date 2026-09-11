@@ -510,6 +510,11 @@ foreach(test_target IN LISTS sinfer_qwen3_5_internal_tests)
 endforeach()
 
 
+sinfer_add_test(sinfer_json_constraint_test
+  SOURCES test_json_constraint.cpp
+  LIBRARIES sinfer_engine)
+target_compile_options(sinfer_json_constraint_test PRIVATE -UNDEBUG)
+
 # The aggregate: `cmake --build <dir> --target serve-tests` builds every registered test,
 # and `ctest` then has a binary for each of them.
 get_property(_sinfer_serve_test_targets GLOBAL PROPERTY SINFER_SERVE_TEST_TARGETS)
@@ -518,7 +523,3 @@ if(_sinfer_serve_test_targets)
   list(LENGTH _sinfer_serve_test_targets _sinfer_serve_test_count)
   message(STATUS "serve tests: ${_sinfer_serve_test_count} targets under `serve-tests`")
 endif()
-
-sinfer_add_test(sinfer_json_constraint_test
-  SOURCES test_json_constraint.cpp
-  LIBRARIES sinfer_engine)

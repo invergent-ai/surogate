@@ -277,9 +277,10 @@ and `--seed` override the model's defaults. Request fields override individual s
 `--greedy` always forces temperature zero, including when a request asks for another value.
 Requests also accept `repetition_penalty`.
 
-Filtered sampling currently considers at most 20 candidates: `top_k` values above 20 are
-capped, and `top_p < 1` operates within that candidate set. Use `top_k: 0` and `top_p: 1`
-for sampling across the whole vocabulary.
+Sampling honors the requested `top_k` without a fixed candidate cap; `top_k: 0` leaves the
+whole vocabulary available. `min_p` removes tokens with low probability relative to the most
+likely token, and `top_p` keeps the smallest remaining prefix reaching the requested probability
+mass. These filters also apply during speculative decoding.
 
 ### Thinking
 

@@ -394,6 +394,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     prefill_hidden                  = plan.persistent.prefill_hidden.bind(backing);
     token_counts                    = plan.persistent.token_counts.bind(backing);
     token_bitmask                   = plan.persistent.token_bitmask.bind(backing);
+    if (draft_window > 0) {
+        speculative_constraints = std::make_unique<family::detail::SpeculativeConstraintRound>(
+            plan.persistent.speculative_token_bitmask.bind(backing), draft_window + 1,
+            (cfg.token_domain + 31) / 32, batch_capacity);
+    }
     logit_bias                      = plan.persistent.logit_bias.bind(backing);
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
@@ -1620,6 +1625,7 @@ void ProgramImplCore::prepare_graphs() {
         schedule::MtpBatchContext mtp_state{
             execution_core(),  decoder->text_kv, *decoder->mtp_cache(), *io.mtp_decode,
             *mtp_host_ingress, *mtp_host_egress, tail_hidden_store, chain_one};
+        mtp_state.execution.constraints = speculative_constraints.get();
         const GraphExecutionProfile code_warm = planned_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
@@ -1682,6 +1688,7 @@ void ProgramImplCore::prepare_graphs() {
         schedule::DFlashBatchContext dflash_state{
             execution_core(),     decoder->text_kv,    *dflash,          *io.dflash_decode,
             *dflash_host_ingress, *dflash_host_egress, tail_hidden_store};
+        dflash_state.execution.constraints = speculative_constraints.get();
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::GqaExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -3268,6 +3275,7 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
             envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
         }
 
+        speculative_constraints->reset();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
             RequestControl& request           = requests[lanes[row]];
@@ -3276,7 +3284,7 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
             const std::uint32_t extent =
-                (narrow || request.constraint) ? 0U
+                narrow ? 0U
                        : std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                                    capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
@@ -3305,6 +3313,7 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
             mtp_host_ingress->sampling[row]           = staged_sampling(request, sequence);
+            if (!narrow) speculative_constraints->stage(row, request.constraint.get(), mtp_host_ingress->sampling[row]);
             materialize_sequence_kv(sequence, frontier + extent + 1,
                                     std::min(capacity, frontier + extent + draft_window));
         }
@@ -3320,6 +3329,7 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
                                                  *mtp_host_egress,
                                                  tail_hidden_store,
                                                  chain_one};
+        schedule_state.execution.constraints = speculative_constraints.get();
 
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -3357,6 +3367,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
     const std::uint32_t stride  = narrow ? 1U : width;
     try {
         device.synchronize();
+        speculative_constraints->check();
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
 
         if (!stage_holds_head()) {
@@ -3639,7 +3650,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
         const std::uint32_t extent =
-            request.constraint ? 0U : std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -3663,6 +3674,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                      draft_window + 1ULL))};
         }
 
+        speculative_constraints->reset();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
             RequestControl& request           = requests[lanes[row]];
@@ -3671,7 +3683,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
             const std::uint32_t extent =
-                request.constraint ? 0U : std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -3683,6 +3695,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = staged_sampling(request, sequence);
+            speculative_constraints->stage(row, request.constraint.get(), dflash_host_ingress->sampling[row]);
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }
 
@@ -3696,6 +3709,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                                     *dflash_host_ingress,
                                                     *dflash_host_egress,
                                                     tail_hidden_store};
+        schedule_state.execution.constraints = speculative_constraints.get();
 
         mark_workspace_usage(workspace_plan.dflash_round);
         schedule::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -3725,6 +3739,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
     const std::uint32_t width = draft_window + 1U;
     try {
         device.synchronize();
+        speculative_constraints->check();
         if (!stage_holds_head()) {
             outcome_export_.clear();
             for (const auto lane : lanes) {
@@ -3748,7 +3763,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
             const std::uint32_t base_S    = sequence.ledger_frontier;
             const std::int32_t count_i    = dflash_host_egress->licensed_counts[row];
             const std::int32_t accepted_i = dflash_host_egress->accepted_drafts[row];
-            const std::uint32_t extent = request.constraint ? 0U : std::min({draft_window,
+            const std::uint32_t extent = std::min({draft_window,
                 budgets[row].generated_tokens_remaining - 1U, capacity - base_E - 1U});
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || accepted_i > static_cast<std::int32_t>(extent) ||

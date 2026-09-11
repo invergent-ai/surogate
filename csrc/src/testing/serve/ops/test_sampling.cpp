@@ -95,12 +95,7 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
 
     // A row that asked for no limit and no nucleus is drawn from the whole
     // vocabulary; every other row keeps the pipeline's candidate cap.
-    int cap = 20;
-    if (config.top_k <= 0 && config.top_p >= 1.0f) {
-        cap = token_domain;
-    } else if (config.top_k > 0 && config.top_k < 20) {
-        cap = config.top_k;
-    }
+    int cap = config.top_k > 0 ? config.top_k : token_domain;
     cap = std::min(cap, token_domain);
     candidates.resize(static_cast<std::size_t>(cap));
 
@@ -111,7 +106,7 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
         const double weight = std::exp(
             candidates[static_cast<std::size_t>(rank)].adjusted / config.temperature - max_scaled);
         weights[static_cast<std::size_t>(rank)] = weight;
-        total_weight += weight;
+        if (config.min_p <= 0.0F || weight >= config.min_p) { total_weight += weight; }
     }
 
     const bool use_min_p     = config.min_p > 0.0f;
@@ -520,7 +515,35 @@ int filtered_distribution_contract() {
            verify_distribution("sample top-k/top-p/min-p", result.tokens, oracle);
 }
 
-int capped_distribution_contract() {
+int wide_nucleus_contract() {
+    const std::vector<float> column(128, 0.0F);
+    ops::SamplingConfig config;
+    config.temperature = 1;
+    config.top_p = 0.75F;
+    const auto oracle = distribution_oracle(column, 128, config);
+    if (oracle.tokens.size() != 96) { return 1; }
+    const auto result = run_repeated(column, 128, 8192, 32, config, 0, ops::kSamplePurposeDecode);
+    return result.integrity_failures + verify_distribution("full-vocabulary nucleus", result.tokens, oracle);
+}
+
+int large_vocabulary_filters_contract() {
+    constexpr int domain = 32768;
+    std::vector<float> column(domain, -20.0F);
+    // Spread the likely tokens across the vocabulary to exercise every scan tile.
+    for (int i = 0; i < 128; ++i) { column[i * 251] = -0.01F * i; }
+    round_to_bf16(column);
+    ops::SamplingConfig config;
+    config.temperature = 1;
+    config.top_k = 64;
+    config.top_p = 0.8F;
+    config.min_p = 0.5F;
+    const auto oracle = distribution_oracle(column, domain, config);
+    if (oracle.tokens.size() <= 20 || oracle.tokens.size() >= 64) { return 1; }
+    const auto result = run_repeated(column, domain, 4096, 32, config, 0, ops::kSamplePurposeDecode);
+    return result.integrity_failures + verify_distribution("large-vocabulary filters", result.tokens, oracle);
+}
+
+int wide_distribution_contract() {
     std::vector<float> column(24, 0.0f);
     for (int token = 0; token < 24; ++token) {
         column[static_cast<std::size_t>(token)] = 2.0f - 0.1f * token;
@@ -533,8 +556,8 @@ int capped_distribution_contract() {
 
     const Distribution oracle =
         distribution_oracle(column, static_cast<int>(column.size()), config);
-    if (oracle.tokens.size() != 20) {
-        std::cerr << "top-k cap oracle fixture has unexpected support\n";
+    if (oracle.tokens.size() != 24) {
+        std::cerr << "wide top-k oracle fixture has unexpected support\n";
         return 1;
     }
 
@@ -542,7 +565,7 @@ int capped_distribution_contract() {
     const RunResult result = run_repeated(column, static_cast<int>(column.size()), samples, 8,
                                           config, 900, ops::kSamplePurposePrefill);
     return result.integrity_failures +
-           verify_distribution("sample top-k public cap", result.tokens, oracle);
+           verify_distribution("sample top-k beyond twenty", result.tokens, oracle);
 }
 
 // A row with `top_k <= 0` and no nucleus is drawn from every token, not from the
@@ -757,7 +780,9 @@ int main() {
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();
     failures += filtered_distribution_contract();
-    failures += capped_distribution_contract();
+    failures += wide_distribution_contract();
+    failures += wide_nucleus_contract();
+    failures += large_vocabulary_filters_contract();
     failures += untruncated_distribution_contract();
     failures += untruncated_peaked_contract();
     failures += real_shape_distribution_contract();

@@ -40,8 +40,10 @@ source .venv/bin/activate
 ## Option B: Build from source (developers)
 
 Prerequisites:
+
 - CUDA toolkit (12.8+ or 13.x)
 - NCCL development libraries
+- Rust 1.87 or newer and Cargo (not needed when installing a wheel)
 
 From the repository root:
 

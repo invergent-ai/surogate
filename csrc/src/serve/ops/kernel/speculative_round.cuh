@@ -6,7 +6,7 @@
 // registered full-vocabulary stochastic route uses the sampling partial/group
 // pipeline and caller-owned workspace, while greedy commit remains one thread.
 
-#include "ops/kernel/sampling_device.cuh"
+#include "ops/kernel/sampling_exact.cuh"
 
 #include <cuda_bf16.h>
 
@@ -69,6 +69,46 @@ speculative_workspace_row(SamplingWorkspace workspace, std::size_t row_stride, s
 // collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
+__global__ void speculative_accept_wide_kernel(
+    const __nv_bfloat16* logits, const int32_t* drafts, const int32_t* extents,
+    int32_t* lengths, int32_t* anchors, int32_t* tokens, int32_t* counts, int32_t* accepted,
+    const SamplingConfig* configs, int domain, int physical_rows, int k) {
+    const int row = blockIdx.x, width = k + 1;
+    const SamplingConfig cfg = configs[row];
+    if (!sampling_wide(cfg)) { return; }
+    const int extent = min(k, max(0, extents[row]));
+    const int length = lengths[row];
+    const auto* row_drafts = drafts + row * k;
+    __shared__ ExactSamplingScratch scratch;
+    __shared__ int stop;
+    __shared__ int produced;
+    for (int col = 0; col <= extent; ++col) {
+        const int draft = col < extent ? row_drafts[col] : -1;
+        const int purpose = col < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
+        auto result = sampling_exact(logits + (int64_t(row) * width + col) * physical_rows,
+            domain, cfg, length + col + 1, purpose, scratch, draft, draft, row_drafts, col);
+        if (threadIdx.x == 0) {
+            const bool keep = col < extent && sampling_uniform(cfg.seed, length + col + 1,
+                kSamplePurposeSpeculativeAccept, 0) < result.candidate_probability;
+            tokens[row * width + col] = keep ? draft : result.token;
+            stop = !keep;
+            produced = col + 1;
+        }
+        __syncthreads();
+        if (stop) { break; }
+    }
+    if (threadIdx.x == 0) {
+        counts[row] = produced;
+        accepted[row] = produced - 1;
+        anchors[row] = tokens[row * width + produced - 1];
+        lengths[row] = length + produced;
+        for (int i = produced; i < width; ++i) { tokens[row * width + i] = 0; }
+        if (cfg.token_counts) {
+            for (int i = 0; i < produced; ++i) { atomicAdd(cfg.token_counts + tokens[row * width + i], 1); }
+        }
+    }
+}
+
 __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_drafts_kernel(
     const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
@@ -81,6 +121,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     int extent                      = current_extents[row];
     extent                          = extent < 0 ? 0 : (extent > k ? k : extent);
     const SamplingConfig cfg        = configs[row];
+    if (sampling_wide(cfg)) { return; }
     const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
@@ -209,7 +250,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     extent            = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
     const SamplingConfig cfg = configs[row];
-    if (!(cfg.temperature > 0.0f) || token_domain <= kSamplerTileItems) { return; }
+    if (!(cfg.temperature > 0.0f) || sampling_wide(cfg) || token_domain <= kSamplerTileItems) { return; }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
         workspace.group_done[col] = 0;
@@ -265,6 +306,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     extent          = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
     const SamplingConfig cfg        = configs[row];
+    if (sampling_wide(cfg)) { return; }
     const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;

@@ -1370,7 +1370,8 @@ std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint
             throw std::invalid_argument("JSON constraints require a tokenizer with an end-of-sequence token");
         }
         impl_->constraint_compiler = std::make_unique<JsonConstraintCompiler>(
-            std::move(vocab), tokenizer.default_stop_token_ids());
+            std::move(vocab), tokenizer.default_stop_token_ids(),
+            [tokenizer = impl_->tokenizer](std::string_view text) { return tokenizer->encode(text); });
     }
     return impl_->constraint_compiler->compile(schema);
 }

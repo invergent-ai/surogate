@@ -21,6 +21,10 @@ namespace sinfer::serve {
 
 // Parse an already-decoded JSON body into a GenerationRequest. Throws ApiException
 // on malformed or unsupported requests (n>1, tools, non-text response_format, ...).
+// Responses uses a flat json_schema format; Chat Completions nests its schema envelope.
+std::string parse_json_response_format(const nlohmann::json& format, const std::string& param,
+                                       bool flat_schema = false);
+
 GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 

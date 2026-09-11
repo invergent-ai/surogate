@@ -46,6 +46,7 @@ struct PersistentLayout {
     TensorLayout token_counts;
     TensorLayout logit_bias;
     TensorLayout token_bitmask;
+    TensorLayout speculative_token_bitmask;
     TensorLayout sampling_config;
     TensorLayout tail_hidden;
     TensorLayout rewrite_checkpoint_hidden;

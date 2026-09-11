@@ -275,6 +275,31 @@ int deterministic_sampling_case() {
                                token_counts, expected);
 }
 
+int constrained_sampling_columns_case() {
+    constexpr int domain = 257, k = 3, words = (domain + 31) / 32;
+    const std::vector<int32_t> drafts{71, 143, 199};
+    const std::vector<int32_t> winners{71, 143, 211, 255};
+    std::vector<int32_t> masks(words * (k + 1), 0);
+    for (int col = 0; col <= k; ++col) {
+        masks[col * words + winners[col] / 32] = static_cast<int32_t>(1U << (winners[col] % 32));
+    }
+    auto d_masks = to_device(masks);
+    const std::vector<uint16_t> logits(domain * (k + 1), f32_to_bf16(0.0F));
+    int failures = 0;
+    for (int top_k : {0, 1, 64}) {
+        ops::SamplingConfig config;
+        config.temperature = 1.0F;
+        config.top_k = top_k;
+        config.top_p = 0.8F;
+        config.token_bitmask = static_cast<const int32_t*>(d_masks.p);
+        config.token_bitmask_stride = words;
+        failures += execute_accept_case("speculative per-column mask k=" + std::to_string(top_k),
+            winners, logits, domain, drafts, 100, domain, config, std::vector<int32_t>(domain, 0),
+            accept_state_oracle(drafts, 2, 211, 100));
+    }
+    return failures;
+}
+
 int batched_sampling_workspace_stride_case() {
     constexpr int physical_rows = 257;
     constexpr int token_domain  = 257;
@@ -461,6 +486,7 @@ int main() {
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
     failures += deterministic_sampling_case();
+    failures += constrained_sampling_columns_case();
     failures += batched_sampling_workspace_stride_case();
     failures += select_hidden_case(5120, 6, 0);
     failures += select_hidden_case(5120, 6, 5);

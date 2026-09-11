@@ -1,5 +1,6 @@
 #pragma once
 #include "runtime/contract/constraint.h"
+#include "family/impl/runtime/speculative_constraint.h"
 #include <api/family/text_geometry.h>
 
 #include "runtime/contract/round_lifecycle.h"
@@ -450,6 +451,7 @@ public:
     Tensor token_counts;
     Tensor logit_bias;
     Tensor token_bitmask;
+    std::unique_ptr<family::detail::SpeculativeConstraintRound> speculative_constraints;
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
 

@@ -17,6 +17,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+class TestServer(str):
+    __test__ = False
+
+
 @pytest.fixture(scope="module")
 def server(tmp_path_factory):
     binary = _resolve_binary("server")
@@ -26,10 +30,12 @@ def server(tmp_path_factory):
         port = listener.getsockname()[1]
     base = f"http://127.0.0.1:{port}"
     log = tmp_path_factory.mktemp("sampling-server") / "server.log"
+    records = log.with_name("requests.jsonl")
     command = [
         binary, os.environ["SUROGATE_SAMPLING_TEST_ARTIFACT"], "--port", str(port),
         "--served-model-name", "test", "--max-model-len", "512", "--kv-capacity", "2048",
         "--max-num-seqs", "4", "--no-thinking", "--enable-sleep-mode",
+        "--request-log-jsonl", str(records),
     ]
     if devices := os.getenv("SUROGATE_SAMPLING_TEST_DEVICES"):
         command += ["--devices", devices]
@@ -48,7 +54,9 @@ def server(tmp_path_factory):
                     pass
                 assert time.monotonic() < deadline, log.read_text()
                 time.sleep(0.1)
-            yield base
+            handle = TestServer(base)
+            handle.records = records
+            yield handle
         finally:
             process.terminate()
             try:
@@ -155,8 +163,8 @@ def test_json_object_and_streaming(server):
 
 
 @pytest.mark.parametrize("schema", [
-    {"type": "integer", "multipleOf": 3}, {"not": {"type": "null"}},
-    {"allOf": [{"type": "string"}, {"const": "a"}]},
+    {"type": "array", "uniqueItems": True}, {"not": {"type": "null"}},
+    {"oneOf": [{"type": "integer"}, {"type": "number"}]},
     {"$ref": "https://example.com/schema"}, {"type": "nonsense"},
 ])
 def test_unsupported_schema_rejected(server, schema):
@@ -183,3 +191,62 @@ def test_mixed_constrained_and_biased_requests(server):
 def test_conflicting_structured_options_rejected(server, extra):
     response = chat(server, response_format=schema_format({"const": {"ok": True}}), **extra)
     assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("schema,expected", [
+    ({"allOf": [{"type": "integer", "minimum": 9}, {"maximum": 9}]}, 9),
+    ({"type": "integer", "minimum": 2, "maximum": 4, "multipleOf": 3}, 3),
+    ({"type": "string", "pattern": "^[A-Z]+$", "minLength": 3, "maxLength": 3}, None),
+    ({"type": "string", "format": "date"}, None),
+])
+def test_extended_schemas(server, schema, expected):
+    response = chat(server, response_format=schema_format(schema))
+    assert response.ok, response.text
+    value = json.loads(response.json()["choices"][0]["message"]["content"])
+    if expected is not None:
+        assert value == expected
+    elif "pattern" in schema:
+        assert len(value) == 3 and value.isascii() and value.isalpha() and value.isupper()
+    else:
+        import datetime
+        datetime.date.fromisoformat(value)
+
+
+def test_responses_structured_output(server):
+    expected = {"answer": "structured", "ok": True}
+    fmt = {"type": "json_schema", "name": "result", "strict": True, "schema": {"const": expected}}
+    payload = {"model": "test", "input": "Say hello.", "text": {"format": fmt}, "max_output_tokens": 128}
+    response = requests.post(server + "/v1/responses", json=payload, timeout=90)
+    assert response.ok, response.text
+    result = response.json()
+    assert result["text"]["format"] == fmt
+    text = "".join(part["text"] for item in result["output"] if item["type"] == "message" for part in item["content"])
+    assert json.loads(text) == expected
+    stored = requests.get(server + "/v1/responses/" + result["id"], timeout=10)
+    assert stored.ok and stored.json()["text"]["format"] == fmt
+    response = requests.post(server + "/v1/responses", json={**payload, "stream": True}, timeout=90)
+    assert response.ok, response.text
+    pieces = []
+    for line in response.text.splitlines():
+        if line.startswith("data: "):
+            event = json.loads(line[6:])
+            if event["type"] == "response.output_text.delta":
+                pieces.append(event["delta"])
+    assert json.loads("".join(pieces)) == expected
+
+
+@pytest.mark.skipif(not os.getenv("SUROGATE_SAMPLING_TEST_SPEC"), reason="requires speculative backend")
+def test_constrained_drafts_are_accepted(server):
+    expected = {"numbers": list(range(20))}
+    response = chat(server, messages=[{"role": "user", "content": "Return exactly this JSON: " + json.dumps(expected)}],
+                    response_format=schema_format({"const": expected}))
+    assert response.ok, response.text
+    assert json.loads(response.json()["choices"][0]["message"]["content"]) == expected
+    deadline = time.monotonic() + 5
+    while True:
+        done = [json.loads(line) for line in server.records.read_text().splitlines() if '"request_done"' in line]
+        if done and done[-1]["speculative"]["accepted_tokens"] > 0:
+            assert done[-1]["speculative"]["rounds"] > 0
+            break
+        assert time.monotonic() < deadline, done[-1] if done else "no request log"
+        time.sleep(0.05)

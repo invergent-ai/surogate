@@ -362,6 +362,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.token_bitmask = add_tensor(builder, DType::I32,
         {(plan.geometry.token_domain + 31) / 32, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling allowed tokens");
+    if (plan.draft_window > 0) {
+        out.speculative_token_bitmask = add_tensor(builder, DType::I32,
+            {(plan.geometry.token_domain + 31) / 32, static_cast<int32_t>(plan.draft_window + 1),
+             static_cast<int32_t>(decode_batch_capacity(plan.max_concurrency))}, "speculative allowed tokens");
+    }
     out.logit_bias = add_tensor(builder, DType::FP32,
         {plan.geometry.token_domain, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling logit bias");

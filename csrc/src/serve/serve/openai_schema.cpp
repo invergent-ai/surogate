@@ -510,30 +510,7 @@ void parse_output_features(const Json& body, GenerationRequest& out) {
         }
     }
     if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
-        std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
-                               ? fmt.at("type").get<std::string>()
-                               : std::string();
-        if (type == "json_object") {
-            out.json_schema = R"({"type":"object"})";
-        } else if (type == "json_schema") {
-            if (!fmt.contains("json_schema") || !fmt["json_schema"].is_object() ||
-                !fmt["json_schema"].contains("schema") ||
-                !(fmt["json_schema"]["schema"].is_object() || fmt["json_schema"]["schema"].is_boolean())) {
-                bad_request("response_format.json_schema.schema must be a JSON Schema object or boolean", "response_format");
-            }
-            const auto& spec = fmt["json_schema"];
-            if (spec.contains("strict") && !spec["strict"].is_boolean()) {
-                bad_request("response_format.json_schema.strict must be boolean", "response_format");
-            }
-            out.json_schema = spec["schema"].dump();
-        } else if (type != "text") {
-            ApiError error;
-            error.message = "response_format must be text, json_object, or json_schema";
-            error.param   = "response_format";
-            error.code    = "response_format_not_supported";
-            throw ApiException(std::move(error));
-        }
+        out.json_schema = parse_json_response_format(body.at("response_format"), "response_format");
     }
 }
 
@@ -663,6 +640,30 @@ void reject_unsupported_completion_features(const Json& body) {
             throw ApiException(std::move(error));
         }
     }
+}
+
+std::string parse_json_response_format(const Json& format, const std::string& param, bool flat_schema) {
+    if (!format.is_object() || !format.contains("type") || !format["type"].is_string()) {
+        bad_request(param + " must contain a string type", param);
+    }
+    const auto type = format["type"].get<std::string>();
+    if (type == "text") { return {}; }
+    if (type == "json_object") { return R"({"type":"object"})"; }
+    if (type != "json_schema") { bad_request(param + " type must be text, json_object, or json_schema", param); }
+    if (!flat_schema && (!format.contains("json_schema") || !format["json_schema"].is_object())) {
+        bad_request(param + ".json_schema must be an object", param);
+    }
+    const auto& spec = flat_schema ? format : format["json_schema"];
+    if (!spec.contains("schema") || !(spec["schema"].is_object() || spec["schema"].is_boolean())) {
+        bad_request(param + " schema must be an object or boolean", param);
+    }
+    if (spec.contains("strict") && !spec["strict"].is_boolean()) {
+        bad_request(param + " strict must be boolean", param);
+    }
+    if (spec.contains("name") && (!spec["name"].is_string() || spec["name"].get<std::string>().empty())) {
+        bad_request(param + " name must be a nonempty string", param);
+    }
+    return spec["schema"].dump();
 }
 
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {

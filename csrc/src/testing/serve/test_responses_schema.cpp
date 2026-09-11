@@ -326,11 +326,14 @@ int test_explicit_rejections() {
                           "tool_choice_not_supported",
                       "required tool choice rejected explicitly");
 
-    Json structured    = base;
-    structured["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse_responses_request(structured, limits()); }) ==
-                          "structured_outputs_not_supported",
-                      "structured output rejected");
+    Json structured = base;
+    structured["text"] = Json{{"format", Json{{"type", "json_schema"}, {"name", "result"},
+        {"strict", true}, {"schema", Json{{"type", "object"}}}}}};
+    const auto structured_request = parse_responses_request(structured, limits());
+    failures += check(structured_request.generation.json_schema == R"({"type":"object"})",
+                      "Responses schema uses the common constraint path");
+    failures += check(structured_request.text_format == structured["text"]["format"],
+                      "Responses format retained for response serialization");
 
     Json background          = base;
     background["background"] = true;

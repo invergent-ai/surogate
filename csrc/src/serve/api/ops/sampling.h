@@ -23,8 +23,7 @@ enum SamplePurpose : std::int32_t {
 // [token_domain] occurrence-count array used by both penalties.
 struct SamplingConfig {
     float temperature          = 0.0f; // <= 0 => greedy argmax after bias/masking
-    /// <=0 means no limit of the caller's own: with top_p>=1 that is the whole
-    /// vocabulary, otherwise the 20-candidate cap. A top_k above 20 is clamped to it.
+    /// <=0 disables top-k; positive values retain up to that many allowed tokens.
     std::int32_t top_k         = 0;
     float top_p                = 1.0f; // >= 1 => disabled
     float min_p                = 0.0f; // <= 0 => disabled
@@ -36,6 +35,7 @@ struct SamplingConfig {
     /// and applied before them.
     float repetition_penalty   = 1.0f;
     unsigned long long seed    = 0;
+    std::int32_t token_bitmask_stride = 0; // words between speculative verification-column masks
     const std::int32_t* token_bitmask = nullptr; // optional allowed-token bitmap [ceil(token_domain/32)]
     const float* logit_bias = nullptr; // optional device F32 [token_domain], added before temperature
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
@@ -92,14 +92,12 @@ void sampling_update_greedy_targets(const Tensor& logits, Tensor& targets,
  * probabilities are the ones a full-vocabulary log-softmax reports. It is realized by adding an
  * independent Gumbel(0,1) to each scaled logit and taking the argmax, which is that draw exactly.
  *
- * Every other row is drawn from a bounded candidate set. Candidates are sorted by adjusted_v
- * descending with lower token id breaking ties. Per-row top_k in [1,19] keeps that many
- * candidates; top_k>=20, or top_k<=0 alongside a top_p below 1, keeps min(20,token_domain) --
- * nucleus needs an ordered prefix, which the untruncated route does not produce. Candidate
- * weights are exp(adjusted_v/temperature-max). min_p removes the suffix below min_p*max_weight;
- * top_p keeps the shortest remaining prefix whose cumulative weight reaches top_p times the
- * pre-truncation candidate weight. At least the best candidate remains, the support is
- * renormalized, and one id is drawn for that row.
+ * Filtered rows consider the complete vocabulary. Candidates are sorted by adjusted_v
+ * descending with lower token id breaking ties. Positive top_k keeps at most that many
+ * candidates. Weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
+ * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
+ * top_p times the mass remaining after top-k and min-p. At least the best allowed candidate
+ * remains, the support is renormalized, and one id is drawn for that row.
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/ngram_ple_state.h"
+#include "family/impl/runtime/speculative_constraint.h"
 #include "family/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -46,6 +47,7 @@ struct ExecutionCore {
     ProposalHead proposal_head;
     NgramPleStatePool* ple = nullptr; ///< the layer prologue's per-slot state, when the target has one
     StageSpan stage{};                 ///< pipeline stage (whole model by default)
+    SpeculativeConstraintRound* constraints = nullptr;
 };
 
 struct PrefillContext {

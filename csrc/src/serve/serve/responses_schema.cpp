@@ -690,18 +690,7 @@ void reject_server_managed_features(const Json& body) {
             }
         }
         if (body.at("text").contains("format") && !body.at("text").at("format").is_null()) {
-            const Json& format = body.at("text").at("format");
-            if (!format.is_object() || !format.contains("type") || !format.at("type").is_string() ||
-                format.at("type").get<std::string>() != "text") {
-                bad_request("only text.format {type:'text'} is supported", "text",
-                            "structured_outputs_not_supported");
-            }
-            for (auto it = format.begin(); it != format.end(); ++it) {
-                if (it.key() != "type") {
-                    bad_request("only text.format {type:'text'} is supported", "text",
-                                "structured_outputs_not_supported");
-                }
-            }
+            (void)parse_json_response_format(body.at("text").at("format"), "text.format", true);
         }
     }
 }
@@ -717,6 +706,10 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         bad_request("missing required field: model", "model");
     }
     out.generation.model = body.at("model").get<std::string>();
+    if (body.contains("text") && body["text"].is_object() && body["text"].contains("format") && !body["text"]["format"].is_null()) {
+        out.text_format = body["text"]["format"];
+        out.generation.json_schema = parse_json_response_format(out.text_format, "text.format", true);
+    }
     if (!body.contains("input")) { bad_request("missing required field: input", "input"); }
     parse_input(body.at("input"), out);
 
@@ -830,7 +823,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"service_tier", "default"},
         {"store", request.store},
         {"temperature", runtime.temperature},
-        {"text", Json{{"format", Json{{"type", "text"}}}}},
+        {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
         {"top_logprobs", 0},
