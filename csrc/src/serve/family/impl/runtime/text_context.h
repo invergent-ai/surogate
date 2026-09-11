@@ -448,6 +448,8 @@ public:
     void observe_prompt_logits(const Tensor& hidden, int base, cudaStream_t stream);
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
+    void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
+
     void set_prefill_rewrite_checkpoint_frontier(std::int64_t position) noexcept {
         prefill_rewrite_checkpoint_frontier_ = position;
     }
@@ -570,6 +572,11 @@ public:
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const family::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(const family::PreparedPromptData& input,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   VisionPrefillSession& vision,
+                                                   bool finalize_at_end, DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_slots, ops::GqaExecutionEnvelope envelope,

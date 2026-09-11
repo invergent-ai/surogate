@@ -89,6 +89,10 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumBatchColumns> context_frontiers{};
     std::array<std::int32_t, kMaximumBatchColumns> proposal_extents{};
     std::array<std::int32_t, kMaximumBatchColumns> target_valid_columns{};
+    // Target positions include the visual prompt's RoPE offset; draft/cache positions
+    // remain absolute token indices. Packed [draft_window + 1, batch] like MTP.
+    std::array<std::int32_t, kMaximumBatchColumns * kDFlashDecodeMaximumWidth>
+        target_rope_positions{};
     std::array<std::int32_t, kMaximumBatchColumns> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumBatchColumns> dflash_kv_table_rows{};
     std::array<std::int32_t, kMaximumBatchColumns> lanes{};
@@ -290,6 +294,7 @@ struct DFlashDecodeState {
     Tensor context_frontiers;
     Tensor proposal_extents;
     Tensor target_valid_columns;
+    Tensor target_rope_positions;
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
     Tensor lanes;

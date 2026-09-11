@@ -84,12 +84,21 @@ int main() {
     failures += check(dflash.speculative.proposal_head == sinfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
 
-    bool dflash_vision_rejected = false;
-    try {
-        (void)parse({"sinfer-serve", "model.sinfer", "--spec", "dflash", "--draft-tokens", "15",
-                     "--vision"});
-    } catch (const std::invalid_argument&) { dflash_vision_rejected = true; }
-    failures += check(dflash_vision_rejected, "DFlash and Vision were accepted together");
+    const auto dflash_vision = parse({"sinfer-serve",
+                                      "model.sinfer",
+                                      "--spec",
+                                      "dflash",
+                                      "--draft-tokens",
+                                      "15",
+                                      "--vision",
+                                      "--kv-cache-dtype",
+                                      "fp8",
+                                      "--model",
+                                      "other=other.sinfer,spec=dflash"});
+    const auto extra_vision = sinfer::serve::extra_model_options(dflash_vision, dflash_vision.extra_models.front());
+    failures += check(dflash_vision.enable_vision && extra_vision.enable_vision &&
+                          extra_vision.speculative.backend == sinfer::SpeculativeBackend::DFlash,
+                      "DFlash vision options were not preserved for every model");
 
     bool implicit_backend_rejected = false;
     try {

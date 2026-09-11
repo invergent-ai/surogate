@@ -65,6 +65,21 @@ int main() {
         require(offload_gen.offload_vision && offload_gen.offload_embeddings && offload_gen.offload_output_head &&
                     offload_server.offload_vision && offload_server.offload_embeddings && offload_server.offload_output_head,
                 "component offload options lost");
+        const auto vision_dflash = parse(gen,
+                                         {"generate",
+                                          "model.sinfer",
+                                          "--prompt",
+                                          "x",
+                                          "--vision",
+                                          "--spec",
+                                          "dflash",
+                                          "--draft-tokens",
+                                          "15",
+                                          "--kv-dtype",
+                                          "fp8"});
+        require(vision_dflash.enable_vision && vision_dflash.speculative.backend == SpeculativeBackend::DFlash &&
+                    vision_dflash.speculative.draft_tokens == 15,
+                "DFlash vision generation options lost");
         const auto g = parse(gen, {"generate", "model.sinfer", "--prompt", "--embed",
             "--host-expert-bank", "q4", "--host-expert-bank", "auto", "--host-moe-layers", "0",
             "--expert-slots", "0", "--cpu-moe-min-tokens", "0", "--cpu-moe-share", "auto",

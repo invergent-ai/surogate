@@ -50,6 +50,13 @@ int main() {
     if (const auto* count = std::getenv("SUROGATE_MULTI_DEVICE_TEST_DRAFT_TOKENS")) {
         options.speculative.draft_tokens = std::stoul(count);
     }
+    if (const auto* dtype = std::getenv("SUROGATE_MULTI_DEVICE_TEST_KV_DTYPE")) {
+        assert(std::string(dtype) == "bf16" || std::string(dtype) == "fp8");
+        options.kv_cache =
+            std::string(dtype) == "fp8" ? sinfer::KvCacheStorage::Fp8E4M3 : sinfer::KvCacheStorage::BFloat16;
+    }
+    const bool vision = std::getenv("SUROGATE_MULTI_DEVICE_TEST_VISION") != nullptr;
+    options.enable_vision = vision;
     const bool cache_turn = std::getenv("SUROGATE_MULTI_DEVICE_TEST_CACHE") != nullptr;
     options.rewrite_checkpoints = cache_turn;
     if (std::getenv("SUROGATE_MULTI_DEVICE_TEST_LONG_PROMPT")) {
@@ -81,9 +88,28 @@ int main() {
         }
         *request.raw_prompt += "\nContinue: 1, 2, 3, 4,";
     }
-    request.max_tokens = 128;
+    request.max_tokens = vision ? 16 : 128;
+    if (vision) {
+        request.raw_prompt.reset();
+        request.enable_thinking = false;
+        ContentPart image;
+        image.kind = ContentKind::Image;
+        image.source.kind = sinfer::product::media_acquire::SourceKind::Bytes;
+        image.source.media_type = "image/x-portable-pixmap";
+        const std::string header = "P6\n512 512\n255\n";
+        image.source.bytes.assign(header.begin(), header.end());
+        for (int i = 0; i < 512 * 512; ++i) {
+            image.source.bytes.insert(image.source.bytes.end(), {255, 0, 0});
+        }
+        request.messages.push_back({.role = sinfer::ChatRole::User,
+                                    .content = {std::move(image),
+                                                {.kind = ContentKind::Text,
+                                                 .text = "What is the background color? Reply with one color only."}}});
+    }
     request.max_tokens_set = true;
-    request.ignore_eos = true;
+    // The image fixture asks for a color. Compare completed answers, rather than
+    // forcing arbitrary special-token continuations after the model has stopped.
+    request.ignore_eos = !vision;
     request.sampling.temperature = 0;
     request.return_token_ids = true;
     const bool score_tokens = std::getenv("SUROGATE_MULTI_DEVICE_TEST_LOGPROBS") != nullptr;
@@ -127,6 +153,9 @@ int main() {
             }
         }
         completed_text = result.text;
+        if (vision) {
+            assert(result.text.find("red") != std::string::npos || result.text.find("Red") != std::string::npos);
+        }
         return result.completion_token_ids;
     };
     GenerationRequest continued = request;
@@ -136,15 +165,24 @@ int main() {
         auto result = service.run(prepared, nullptr);
         std::cout << "continued turn cached tokens=" << result.metrics.prefix_cache_hit_tokens << '\n';
         assert(result.metrics.prefix_cache_hit_tokens > 0);
-        assert(result.completion_token_ids.size() == 128);
+        assert(!result.completion_token_ids.empty() && result.completion_token_ids.size() <= continued.max_tokens);
         return result.completion_token_ids;
     };
     {
         GenerationService baseline(options);
         expected = generate(baseline);
-        assert(expected.size() == 128);
+        assert(!expected.empty() && expected.size() <= request.max_tokens);
+        if (!vision) { assert(expected.size() == 128); }
         if (cache_turn) {
-            continued.raw_prompt = *request.raw_prompt + completed_text + "\nContinue.";
+            if (vision) {
+                continued.messages.push_back({.role = sinfer::ChatRole::Assistant,
+                                              .content = {{.kind = ContentKind::Text, .text = completed_text}}});
+                continued.messages.push_back(
+                    {.role = sinfer::ChatRole::User, .content = {{.kind = ContentKind::Text,
+                        .text = "Name the color again. Reply with one color only."}}});
+            } else {
+                continued.raw_prompt = *request.raw_prompt + completed_text + "\nContinue.";
+            }
             expected_turn = continue_turn(baseline);
         }
     }
@@ -206,9 +244,16 @@ int main() {
     std::size_t lane = 0;
     for (auto& prepared : pending) {
         const auto result = pipeline.run(*prepared, nullptr);
-        assert(result.completion_tokens == request.max_tokens);
+        assert(result.completion_tokens == expected.size());
         if (result.completion_token_ids != batched[lane]) {
             std::cerr << "preempted lane " << lane << " differs from its uninterrupted batch\n";
+            for (std::size_t i = 0; i < result.completion_token_ids.size(); ++i) {
+                if (result.completion_token_ids[i] != batched[lane][i]) {
+                    std::cerr << "first difference at " << i << ": " << result.completion_token_ids[i]
+                              << " vs " << batched[lane][i] << '\n';
+                    break;
+                }
+            }
         }
         assert(result.completion_token_ids == batched[lane++]);
     }

@@ -168,7 +168,7 @@ workload: more simultaneous requests or heavy CPU offload can reduce the benefit
 | Flag | Meaning |
 |---|---|
 | `--spec mtp` | Enable MTP on a supported model; supports one or multiple GPUs |
-| `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; supports BF16 or FP8 caches and requires no `--vision` |
+| `--spec dflash` | Use a compatible separate drafter on one or multiple GPUs; supports BF16 or FP8 caches and can be combined with `--vision` |
 | `--draft-tokens N` | Number of proposed tokens: 1–5 for MTP, 1–15 for DFlash; required with `--spec` |
 | `--spec-max-lanes N\|all` | MTP checks drafts only while at most N requests are decoding. Default (or `0`) is 1; `all` keeps checking at every concurrency level. Does not affect DFlash |
 | `--lm-head-draft` | Use a smaller draft vocabulary when the checkpoint provides one |
@@ -180,6 +180,10 @@ a startup error. See [Preparing a DFlash pair](serving-models.md#preparing-a-dfl
 With DFlash, `--kv-cache-dtype fp8` reduces cache memory for both the target and drafter.
 Use `--kv-cache-dtype bf16` for higher cache precision. FP8 can change generated output and
 draft acceptance, so compare memory use and generation speed on your workload.
+
+For image or video conversations, prepare the pair with the target's vision weights and
+start the server with `--vision --spec dflash`. Text-only requests can use the same server.
+Draft acceptance and speed depend on the prompt; compare with ordinary decoding for your workload.
 
 ### Serving several models from one process
 

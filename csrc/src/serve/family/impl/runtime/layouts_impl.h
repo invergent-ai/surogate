@@ -857,9 +857,6 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             options.speculative.draft_tokens > kMaximumDFlashDraftTokens) {
             throw std::invalid_argument("DFlash draft window must be in [1,15]");
         }
-        if (options.enable_vision) {
-            throw std::invalid_argument("DFlash and Vision cannot be enabled together");
-        }
         break;
     }
     if (device.sm() != 120) {

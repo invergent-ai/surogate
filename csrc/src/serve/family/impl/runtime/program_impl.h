@@ -338,9 +338,6 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (model.mtp.has_value() && model.dflash.has_value()) {
         throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
     }
-    if (model.dflash.has_value() && model.vision.has_value()) {
-        throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
-    }
     configure_stage(plan);
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     // SUROGATE_SERVE_ELASTIC_KV_RESERVE=N: granules kept mapped ahead of demand (0 maps on
@@ -1587,6 +1584,10 @@ void ProgramImplCore::prepare_graphs() {
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
+                for (std::uint32_t j = 0; j <= draft_window; ++j) {
+                    dflash_host_ingress->target_rope_positions[row * (draft_window + 1U) + j] =
+                        static_cast<std::int32_t>(frontier + std::min(j, extent));
+                }
                 dflash_host_ingress->text_kv_table_rows[row]   = static_cast<std::int32_t>(row);
                 dflash_host_ingress->dflash_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(row);
@@ -2225,6 +2226,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr,
             requests[sequence.lane].lora_slot};
         schedule_state.score_prompt = request.prompt_logprobs >= 0;
+        schedule_state.rope_delta         = staged.prompt.rope_delta;
         schedule_state.score_prompt_start = std::max<std::size_t>(1, sequence.cached_scores.size());
         schedule_state.score_prompt_end = staged.prompt_tokens;
         schedule_state.logprob_observer = score_observer(sequence.lane);
@@ -2237,6 +2239,17 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
         set_device_i32(io.backend_kv_table_row,
                        sequence.kv->backend ? sequence.kv->backend->bound_row() : 0);
+
+        if (dflash && io.dflash_decode) {
+            // Other admissions and decode rounds reuse this frame between chunks.
+            // Restore the current prompt's draft lane and table before feature capture.
+            dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
+            dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
+            Tensor lane                                  = io.dflash_decode->lanes.slice(0, 0, 1);
+            Tensor row = io.dflash_decode->dflash_kv_table_rows.slice(0, 0, 1);
+            set_device_i32(lane, static_cast<std::int32_t>(sequence.lane));
+            set_device_i32(row, sequence.kv->backend->bound_row());
+        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -3839,6 +3852,11 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
             dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
+            for (std::uint32_t j = 0; j <= draft_window; ++j) {
+                const auto position = frontier + std::min(j, extent);
+                dflash_host_ingress->target_rope_positions[row * (draft_window + 1U) + j] =
+                    checked_i32(position, "DFlash batch RoPE position") + sequence.rope_delta;
+            }
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);

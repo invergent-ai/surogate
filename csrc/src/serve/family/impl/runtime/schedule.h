@@ -73,6 +73,7 @@ struct PrefillContext {
     int score_prompt_start = 1;
     int score_prompt_end = 0;
     std::function<void(const Tensor&, int, bool)> logprob_observer;
+    std::int32_t rope_delta = 0;
 };
 
 struct OrdinaryBatchContext {

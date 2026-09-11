@@ -238,14 +238,17 @@ Download both checkpoints, then prepare them together:
 python -m surogate.serve.convert.qwen3_5.convert \
   --model /path/to/Qwen3.5-4B \
   --dflash-model /path/to/Qwen3.5-4B-DFlash \
-  --out /path/to/qwen35-4b-dflash.sinfer --no-vision
+  --out /path/to/qwen35-4b-dflash.sinfer
 
 surogate serve /path/to/qwen35-4b-dflash.sinfer \
-  --devices 0,1 --spec dflash --draft-tokens 3 --kv-cache-dtype bf16
+  --devices 0,1 --vision --spec dflash --draft-tokens 3 --kv-cache-dtype fp8
 ```
 
 Use `--device 0` for a single GPU. Each pipeline GPU needs room for its share of the target,
 the drafter, and cache. Sleep/wake and completed-turn cache reuse remain available.
+The example accepts text, images, and videos. For a smaller text-only artifact, add
+`--no-vision` during preparation and omit `--vision` when serving. Use `--kv-cache-dtype bf16`
+if you prefer higher cache precision.
 
 ## Several models on one GPU
 

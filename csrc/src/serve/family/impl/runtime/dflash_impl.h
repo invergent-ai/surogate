@@ -350,6 +350,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor drafts           = frame.draft_tokens.slice(1, 0, batch_size);
         Tensor verify_ids       = frame.verify_ids.slice(1, 0, batch_size);
         Tensor target_positions = frame.proposal_positions.slice(1, 0, batch_size);
+        Tensor target_rope      = frame.target_rope_positions.slice(1, 0, batch_size);
         Tensor target_tokens    = frame.target_argmax.slice(1, 0, batch_size);
         Tensor target_logits    = frame.target_logits.slice(2, 0, batch_size);
         Tensor target_hidden    = frame.target_hidden.slice(2, 0, batch_size);
@@ -407,7 +408,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                              TargetVerifyFrameView{
                                  .ids             = verify_ids,
                                  .cache_positions = target_positions,
-                                 .rope_positions  = target_positions,
+                                 .rope_positions  = target_rope,
                                  .valid_columns   = valid_columns,
                                  .kv_table_rows   = text_rows,
                                  .lanes           = lanes,
