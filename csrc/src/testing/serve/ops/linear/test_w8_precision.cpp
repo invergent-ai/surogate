@@ -43,7 +43,7 @@ int verify_batch_invariance() {
 
 int verify_gdn_batch_invariance() {
     int failures = 0;
-    constexpr int columns = 129;
+    constexpr int columns = 257;
     for (const auto [n, k] : {std::pair{8192, 1024}, std::pair{8192, 2048},
                               std::pair{12288, 2048}, std::pair{12288, 2560}}) {
         const int qkv_rows = n == 8192 ? 6144 : 8192;
@@ -60,7 +60,7 @@ int verify_gdn_batch_invariance() {
         for (std::size_t i = 0; i < input.size(); ++i) { bits[i] = f32_to_bf16(input[i]); }
         dx.copy_from_host(bits.data(), dx.bytes);
         std::vector<std::uint16_t> reference_qkv, reference_z;
-        for (const int t : {columns, 2, 4, 8, 16, 17, 32, 33, 49, 64, 65, 128}) {
+        for (const int t : {columns, 2, 4, 8, 16, 17, 32, 33, 49, 64, 65, 128, 129, 256}) {
             Tensor x(dx.p, DType::BF16, {k, t});
             Tensor qkv(dy.p, DType::BF16, {qkv_rows, t});
             Tensor z(static_cast<std::uint16_t*>(dy.p) + qkv_rows * t, DType::BF16, {z_rows, t});
