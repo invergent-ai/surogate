@@ -1,4 +1,5 @@
 #pragma once
+#include "family/impl/load/gemma_vision.h"
 
 #include "family/impl/load/host_bank.h"
 
@@ -111,7 +112,7 @@ struct TextLayerPlan {
     MlpPlan mlp;
 };
 
-struct BindingPlan {
+struct BindingPlan : family::GemmaVisionPlan {
     family::HostBankPlan host_bank;
     /// The dimensions bound against: the compiled config with the artifact's `geometry`
     /// member laid over it. For this target that member also carries the *second* head

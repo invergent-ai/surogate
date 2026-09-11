@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import torch
 from safetensors import safe_open
@@ -44,6 +44,14 @@ def name_spellings(name: str):
     elif name.startswith("model."):
         # and the other direction: a flat checkpoint answering a nested request
         seeds.append(prefix + name[len("model."):])
+    for seed in list(seeds):
+        for old, new in (("language_model.model.", "model.language_model."),
+                         ("vision_tower.", "model.vision_tower."),
+                         ("multi_modal_projector.", "model.multi_modal_projector.")):
+            if seed.startswith(old):
+                seeds.append(new + seed[len(old):])
+            elif seed.startswith(new):
+                seeds.append(old + seed[len(new):])
     for seed in list(seeds):
         for left, right in _SEGMENT_ALIASES:
             if left in seed:

@@ -731,6 +731,7 @@ private:
     const Tensor* active_valid_columns_                   = nullptr;
     const Tensor* active_backend_kv_table_rows_           = nullptr;
     const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
+    std::int32_t image_attention_begin_ = 0, image_attention_end_ = 0;
     std::int32_t active_sequence_batch_                   = 0;
     std::int32_t active_sequence_width_                   = 0;
     std::int32_t rope_delta_                              = 0;

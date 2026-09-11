@@ -1,4 +1,5 @@
 #include "family/vision_tower.h"
+#include "family/gemma_vision.h"
 
 #include "core/layout.h"
 #include "api/ops/add_bias.h"
@@ -127,8 +128,9 @@ void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
 VisionContext::VisionContext(DeviceContext& ctx, const VisionWeights& vision,
                              const VisionGeometry& tower, const TextGeometry& text,
                              Probe probe)
-    : ctx_(ctx), probe_(std::move(probe)) {
+    : weights_(&vision), ctx_(ctx), probe_(std::move(probe)) {
     cfg_               = bound_vision_geometry(tower, text);
+    if (cfg_.gemma_version) { return; }
     patch_embed_       = &vision.common.patch_embedding;
     patch_embed_bias_  = &vision.common.patch_embedding_bias;
     position_embed_    = &vision.common.position_embedding;
@@ -168,6 +170,7 @@ VisionContext::VisionContext(DeviceContext& ctx, const VisionWeights& vision,
 
 std::size_t VisionContext::workspace_bytes(const VisionGeometry& geometry,
                                            const VisionItemControl& item) {
+    if (geometry.gemma_version) { return gemma_vision_workspace_bytes(geometry,item.merged_count); }
     return build_workspace_layout(geometry, item.patch_count, item.merged_count,
                                   static_cast<std::size_t>(item.segment_count))
         .bytes;
@@ -192,6 +195,7 @@ std::size_t VisionContext::workspace_capacity_bytes(const VisionGeometry& geomet
     if (max_merged_tokens == 0 || max_segments == 0) {
         throw std::invalid_argument("Vision workspace capacity bounds must be positive");
     }
+    if (geometry.gemma_version) { return gemma_vision_workspace_bytes(geometry, std::min(max_merged_tokens, static_cast<std::uint32_t>(geometry.max_image_tokens))); }
     const std::uint32_t segments = std::min(max_merged_tokens, max_segments);
     return build_workspace_layout(geometry,
                                   checked_mul(max_merged_tokens,
@@ -217,6 +221,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {
         throw std::invalid_argument("Vision output must be contiguous BF16 [H,V,1+deepstack_layers]");
     }
+    if (g.gemma_version) { encode_gemma_vision(g,*weights_,item,output,workspace,ctx_.stream,probe_); return; }
     const VisionWorkspaceLayout layout = build_workspace_layout(
         g, patches64, tokens64, static_cast<std::size_t>(control.segment_count));
     if (workspace.capacity() < layout.bytes) {

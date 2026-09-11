@@ -23,7 +23,7 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     }
     const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
     if (!supported_problem) {
-        if ((n % 8) != 0 || (k % 8) != 0) {
+        if ((n % 8) != 0 || ((k % 8) != 0 && k != 588)) {
             throw std::invalid_argument("bf16 linear: unsupported shape or T");
         }
         return launch_bf16_cublaslt;

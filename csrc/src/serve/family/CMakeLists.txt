@@ -9,6 +9,7 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/media_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/processor.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/lfm2_processor.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/gemma_processor.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/resources.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/tokenizer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/prefix_identity.cpp
@@ -18,6 +19,8 @@ target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/visual_scatter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/bindings.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/control.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gemma_vision.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gemma_vision_ops.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/vision_tower.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vision_standalone.cpp)
 

@@ -31,9 +31,11 @@ struct VisionControl {
 /// it says where the merged tokens land in a text sequence, which the tower never reads.
 [[nodiscard]] VisionItemControl build_vision_item_control(const VisionGrid& grid,
                                                           PromptModality modality,
-                                                          std::int32_t position_embeddings = 48 * 48);
+                                                          std::int32_t position_embeddings = 48 * 48,
+                                                          std::int32_t merge = 2, bool factorized = false);
 
 [[nodiscard]] VisionControl build_vision_control(const PreparedPromptData& prompt,
-                                                  std::int32_t position_embeddings = 48 * 48);
+                                                  std::int32_t position_embeddings = 48 * 48,
+                                                          std::int32_t merge = 2, bool factorized = false);
 
 } // namespace sinfer::family

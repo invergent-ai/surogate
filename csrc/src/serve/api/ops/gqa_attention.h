@@ -19,6 +19,16 @@ struct GqaBlockMask {
     const std::uint32_t* words = nullptr;
     std::int32_t stride        = 0;
     std::int32_t block         = 0;
+    // One complete image block, in absolute token positions. Text remains causal.
+    // A query inside this block can read every image key; its left window is unchanged.
+    std::int32_t image_begin = 0;
+    std::int32_t image_end = 0;
+    __host__ __device__ std::int32_t last_key(std::int32_t query) const {
+        return query >= image_begin && query < image_end ? image_end - 1 : query;
+    }
+    __host__ __device__ std::int32_t tile_last_key(std::int32_t first, std::int32_t last) const {
+        return first < image_end && last >= image_begin && last < image_end ? image_end - 1 : last;
+    }
 };
 
 struct GqaExecutionEnvelope {

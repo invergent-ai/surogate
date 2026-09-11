@@ -16,7 +16,7 @@ std::int64_t stride_elements(const Tensor& tensor, int dim) {
 template <int D, int Br, int Bc>
 void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
                   const VisionAttentionTile* tiles, std::int32_t uniform_segment_length,
-                  std::int32_t query_tiles, Tensor& out, cudaStream_t stream) {
+                  std::int32_t query_tiles, Tensor& out, cudaStream_t stream, float scale) {
     constexpr int kThreads = Br * 2;
     constexpr int kSmemBytes =
         (Br + 2 * Bc) * kVisionAttentionPaddedD * static_cast<int>(sizeof(__nv_bfloat16));
@@ -27,7 +27,7 @@ void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
         static_cast<const __nv_bfloat16*>(v.data), tiles, q.ne[2], uniform_segment_length,
         static_cast<__nv_bfloat16*>(out.data), stride_elements(q, 0), stride_elements(q, 1),
         stride_elements(q, 2), stride_elements(k, 0), stride_elements(k, 1), stride_elements(k, 2),
-        stride_elements(v, 0), stride_elements(v, 1), stride_elements(v, 2));
+        stride_elements(v, 0), stride_elements(v, 1), stride_elements(v, 2), scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -36,7 +36,7 @@ void launch_flash(const Tensor& q, const Tensor& k, const Tensor& v,
 template <int D>
 void vision_attention_launch_for(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, float scale) {
     const bool packed_segments = tiles != nullptr;
     const int max_tiles =
         packed_segments ? tiles->ne[1] : (q.ne[2] + kVisionAttentionBr - 1) / kVisionAttentionBr;
@@ -49,7 +49,7 @@ void vision_attention_launch_for(const Tensor& q, const Tensor& k, const Tensor&
 
     launch_flash<D, kVisionAttentionBr, kVisionAttentionBc>(
         q, k, v, packed_segments ? static_cast<const VisionAttentionTile*>(tiles->data) : nullptr,
-        0, max_tiles, out, stream);
+        0, max_tiles, out, stream, scale);
 }
 
 // The tower's head dim is a property of the checkpoint (72 on the Qwen3.6 family
@@ -57,13 +57,13 @@ void vision_attention_launch_for(const Tensor& q, const Tensor& k, const Tensor&
 // dispatched here rather than compiled in.
 void vision_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& cu_seqlens, Tensor* tiles, Tensor& out,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, float scale) {
     switch (q.ne[0]) {
     case 72:
-        vision_attention_launch_for<72>(q, k, v, cu_seqlens, tiles, out, stream);
+        vision_attention_launch_for<72>(q, k, v, cu_seqlens, tiles, out, stream, scale);
         return;
     case 64:
-        vision_attention_launch_for<64>(q, k, v, cu_seqlens, tiles, out, stream);
+        vision_attention_launch_for<64>(q, k, v, cu_seqlens, tiles, out, stream, scale);
         return;
     default:
         throw std::invalid_argument("vision_attention: unsupported head dim (expected 64 or 72)");
@@ -95,18 +95,18 @@ template <int D>
 void vision_attention_uniform_launch_with_tile_for(const Tensor& q, const Tensor& k,
                                                    const Tensor& v, std::int32_t segment_length,
                                                    std::int32_t tile_size, Tensor& out,
-                                                   cudaStream_t stream) {
+                                                   cudaStream_t stream, float scale) {
     const std::int32_t segments    = q.ne[2] / segment_length;
     const std::int32_t query_tiles = segments * ((segment_length + tile_size - 1) / tile_size);
     switch (tile_size) {
     case 16:
-        launch_flash<D, 16, 16>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash<D, 16, 16>(q, k, v, nullptr, segment_length, query_tiles, out, stream, scale);
         return;
     case 32:
-        launch_flash<D, 32, 32>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash<D, 32, 32>(q, k, v, nullptr, segment_length, query_tiles, out, stream, scale);
         return;
     case 64:
-        launch_flash<D, 64, 64>(q, k, v, nullptr, segment_length, query_tiles, out, stream);
+        launch_flash<D, 64, 64>(q, k, v, nullptr, segment_length, query_tiles, out, stream, scale);
         return;
     default:
         throw std::invalid_argument("vision_attention: invalid uniform tile size");
@@ -115,15 +115,15 @@ void vision_attention_uniform_launch_with_tile_for(const Tensor& q, const Tensor
 
 void vision_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k, const Tensor& v,
                                                std::int32_t segment_length, std::int32_t tile_size,
-                                               Tensor& out, cudaStream_t stream) {
+                                               Tensor& out, cudaStream_t stream, float scale) {
     switch (q.ne[0]) {
     case 72:
         vision_attention_uniform_launch_with_tile_for<72>(q, k, v, segment_length, tile_size, out,
-                                                          stream);
+                                                          stream, scale);
         return;
     case 64:
         vision_attention_uniform_launch_with_tile_for<64>(q, k, v, segment_length, tile_size, out,
-                                                          stream);
+                                                          stream, scale);
         return;
     default:
         throw std::invalid_argument("vision_attention: unsupported head dim (expected 64 or 72)");
@@ -132,9 +132,9 @@ void vision_attention_uniform_launch_with_tile(const Tensor& q, const Tensor& k,
 
 void vision_attention_uniform_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                      std::int32_t segment_length, Tensor& out,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, float scale) {
     vision_attention_uniform_launch_with_tile(
-        q, k, v, segment_length, vision_attention_uniform_tile(segment_length), out, stream);
+        q, k, v, segment_length, vision_attention_uniform_tile(segment_length), out, stream, scale);
 }
 
 } // namespace sinfer::ops::detail

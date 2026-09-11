@@ -107,10 +107,14 @@ weights; that memory cannot be swapped out while the model is loaded.
 |---|---|---|
 | `--host-moe-layers N\|auto\|all` | off | Move experts from N MoE layers to RAM; `auto` chooses enough to fit on one GPU or each GPU in a multi-GPU run |
 | `--gpu-layers N\|all`, `-ngl N`, `--n-gpu-layers N` | all | Keep the first N decoder layers on the GPU; `0` offloads all decoder layers, and `all` keeps them resident |
+| `--offload-vision` | off | Store the image encoder and projector weights in system RAM |
+| `--offload-embeddings` | off | Store the token embeddings in system RAM |
+| `--offload-output-head` | off | Store the output-head weights in system RAM |
 
-Whole-layer offload works with every supported generation model. Embeddings, the output head,
-and any enabled image encoder still need GPU memory. MoE-specific options apply only to MoE
-models and only affect experts that are offloaded.
+Whole-layer and component offload work on one or multiple GPUs. Combine the flags as needed;
+GPU computation and the decode cache still need GPU memory. When a model shares its embeddings
+and output head, offloading either one moves their shared weights to RAM.
+MoE-specific options apply only to MoE models and only affect experts that are offloaded.
 
 For a mixture-of-experts (MoE) model, try `--host-moe-layers` first. It generally transfers
 less data than offloading whole layers.
@@ -241,6 +245,7 @@ LoRA and DoRA adapters support the following modules, where they exist in the ch
 | LFM2, LFM2-MoE and the text decoder of LFM2-VL | Attention projections, `conv.in_proj`, `conv.out_proj`, and dense `feed_forward.w1`, `w2`, `w3` |
 | Qwen vision towers | Patch projection, attention QKV/output, MLP projections, merger and deepstack projections |
 | LFM2-VL vision tower | Patch projection, attention Q/K/V/output, MLP projections and multimodal projector |
+| Gemma 3/4 vision | Patch, attention and MLP projections; Gemma 4 output projection |
 | Routed experts on supported MoE models | Each expert's `gate_proj`, `up_proj`, `down_proj`; LFM2 expert names `w1`, `w3`, `w2` are also accepted |
 | MoE router and shared expert | `mlp.gate` (or the checkpoint's `router.proj` / `feed_forward.gate`), `mlp.shared_expert_gate`, and the shared expert's `gate_proj`, `up_proj`, `down_proj`, where present |
 
@@ -303,18 +308,22 @@ sets how much processed media to retain for reuse; `0` disables retention. `--me
 (default 2048) limits memory for media currently being processed or used by requests.
 `--media-preprocess-threads N` chooses processing threads; `0` selects automatically, up to 16.
 
-Qwen3-VL dense and MoE checkpoints support text, images, and video. For example:
+Qwen3-VL dense and MoE, vision-enabled Gemma 3 and Gemma 4, and LFM2-VL/LFM2.5-VL
+checkpoints support image requests. Video requests sample frames; Gemma 3 and LFM2-VL
+receive those frames as a sequence of images. For example:
 
 ```bash
 surogate serve Qwen/Qwen3-VL-2B-Instruct --vision --port 8080
 surogate serve Qwen/Qwen3-VL-30B-A3B-Instruct --vision --devices 0,1 --port 8080
+surogate serve google/gemma-3-4b-it --vision --port 8080
+surogate serve google/gemma-4-E2B-it --vision --offload-vision --port 8080
 ```
 
 Choose one command and size the GPU group for the checkpoint. Send media through the
 [chat API](api.md#chat-completions) or Responses API. Without `--vision`, the same checkpoint
 serves text prompts.
 
-For a Qwen3-VL GGUF, supply the matching vision projector from the same model release:
+For a Qwen3-VL, Gemma 3/4, or LFM2-VL GGUF, supply the matching vision projector from the same model release:
 
 ```bash
 surogate serve /models/Qwen3-VL-2B-Instruct-Q4_K_M.gguf \
@@ -324,9 +333,11 @@ surogate serve /models/Qwen3-VL-2B-Instruct-Q4_K_M.gguf \
 Dense and MoE GGUFs are supported, including split text files; pass the first shard.
 If exactly one compatible `mmproj*.gguf` is beside the text model, it is selected automatically.
 Otherwise, use `--mmproj` explicitly. Keep all source GGUF files available after preparation.
-The text weights retain their GGUF quantization. The projector uses BF16 serving weights,
-so a quantized projector may require more memory after preparation.
-Image and video serving has been checked with the 2B and 30B-A3B GGUF checkpoints.
+Supported projector quantization is preserved during preparation. Use `--offload-vision`
+to reduce GPU memory further, and add `--offload-embeddings --offload-output-head` when needed.
+LFM2-VL text weights use the same 8-bit serving format as LFM2; the other families retain
+supported GGUF text quantization.
+Qwen3-VL image and video serving has been checked with the 2B and 30B-A3B GGUF checkpoints.
 The complete 235B-A22B checkpoint has not yet been tested.
 
 ### Responses state

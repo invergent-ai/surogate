@@ -119,7 +119,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     std::int32_t patches, std::int32_t uniform_segment_length, __nv_bfloat16* __restrict__ out,
     std::int64_t q_stride_d, std::int64_t q_stride_h, std::int64_t q_stride_t,
     std::int64_t k_stride_d, std::int64_t k_stride_h, std::int64_t k_stride_t,
-    std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t) {
+    std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t, float scale = 0.0F) {
     static_assert(Br == 16 || Br == 32 || Br == 64);
     static_assert(Bc == 16 || Bc == 32 || Bc == 64);
     static_assert(kVisionAttentionInvSqrtD<D> > 0.0f,
@@ -131,7 +131,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     constexpr int PVNt          = D / 8;
     constexpr int PVKs          = Bc / 16;
     constexpr int RowBytes      = Dp * static_cast<int>(sizeof(__nv_bfloat16));
-    constexpr float ScaleLog2E  = kVisionAttentionInvSqrtD<D> * 1.4426950408889634074f;
+    const float ScaleLog2E = (scale > 0 ? scale : kVisionAttentionInvSqrtD<D>) * 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
     VisionAttentionTile tile;

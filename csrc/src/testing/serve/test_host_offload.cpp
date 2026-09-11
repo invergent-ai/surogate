@@ -127,6 +127,18 @@ void test_placement_and_isolation() {
     require(first == family::HostBank::shared(first_plan), "same reader's stages did not share host weights");
     require(first != family::HostBank::shared(second_plan), "separate models shared host weights");
 
+    artifact::Binder components(reader);
+    components.set_offload(std::nullopt, 0, 0, true, true, true);
+    require(components.offloads("vision/layers/0/attention/qkv") &&
+                components.offloads("vision/patch_embedding") &&
+                components.offloads("text/token_embedding") &&
+                components.offloads("text/output_head") &&
+                !components.offloads("text/layers/0/input_norm"),
+            "component offload selected the wrong weights");
+    artifact::Binder tied(reader);
+    tied.set_offload(std::nullopt, 0, 0, false, false, true);
+    require(tied.offloads("text/token_embedding"), "tied output head did not offload its embedding storage");
+
     ops::EngineOpsContext first_context, second_context;
     const ops::SparseMoeGeometry geometry{128, 2, 1, 128};
     EngineOptions options; options.expert_slots = 2;

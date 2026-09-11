@@ -82,6 +82,7 @@ struct ChatTemplateVariables {
 };
 
 struct ChatRenderOptions {
+    ChatTemplateVariables template_variables;
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
     std::optional<ReasoningEffort> reasoning_effort;

@@ -167,7 +167,8 @@ bool banks_experts() {
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
-                       static_cast<std::uint32_t>(options.pipeline_stage_first));
+                       static_cast<std::uint32_t>(options.pipeline_stage_first),
+                       options.offload_vision, options.offload_embeddings, options.offload_output_head);
     // The banked experts become planes as the bank fills. By default each object keeps the
     // narrowest planes that lose nothing: Q4G32AM where the file stores it 4-bit affine (this
     // file's gate and up experts, Q4_K), Q5G32AM where it is 5-bit affine (its down experts in

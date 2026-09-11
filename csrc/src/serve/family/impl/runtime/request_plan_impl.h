@@ -171,7 +171,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         const family::VisionGeometry vision =
             schedule::bound_vision_geometry(model.vision_geometry, model.geometry);
         auto control = std::make_shared<family::VisionControl>(
-            family::build_vision_control(prompt, vision.position_embeddings));
+            family::build_vision_control(prompt, vision.position_embeddings, vision.merge, vision.gemma_version == 4));
         std::size_t max_merged     = 0;
         std::uint32_t previous_end = 0;
         for (const family::VisionItemControl& item : control->items) {

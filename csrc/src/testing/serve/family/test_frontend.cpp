@@ -1132,7 +1132,7 @@ int test_lfm2_image_preparation() {
     auto owned = resources("{% for message in messages %}{{ message.content }}{% endfor %}");
     auto tokenizer = nlohmann::json::parse(owned.tokenizer_json);
     auto config = nlohmann::json::parse(owned.tokenizer_config_json);
-    for (auto [id, text] : {std::pair{40, "<image>"}, {41, "<|image_start|>"}, {42, "<|image_end|>"}}) {
+    for (auto [id, text] : {std::pair{40, "<image>"}, {41, "<|image_start|>"}, {42, "<|image_end|>"}, {43, "Time 0.000s: "}}) {
         tokenizer["added_tokens"].push_back(added(id, text, true));
         config["added_tokens_decoder"][std::to_string(id)] = decoder_added(text, true);
     }
@@ -1170,6 +1170,71 @@ int test_lfm2_image_preparation() {
     const auto reused = frontend.prepare(image_input());
     failures += check(FrontendFactory::inspect(reused).prepare.media_cache_hits == 1,
         "LFM2 image preparation did not reuse the cached payload");
+    auto video = image_input();
+    for (auto& part : video.messages.front().parts) {
+        if (part.kind == sinfer::MessagePartKind::Media) { part.media.kind = sinfer::MediaKind::Video; }
+    }
+    const auto video_prompt = frontend.prepare(video);
+    failures += check(FrontendFactory::inspect(video_prompt).prepare.vision_tokens == 4 &&
+        frontend.count_tokens(video) == FrontendFactory::inspect(video_prompt).token_ids.size(),
+        "LFM2 sampled video frame counts are wrong");
+    return failures;
+}
+
+int test_gemma_media_preparation() {
+    int failures = 0;
+    for (const int version : {3,4,5}) { // 5 exercises Gemma 4's encoder-free input.
+        const bool unified = version == 5;
+        auto owned = resources("{% for message in messages %}{{ message.content }}{% endfor %}");
+        auto tokenizer_json = nlohmann::json::parse(owned.tokenizer_json);
+        auto tokenizer_config = nlohmann::json::parse(owned.tokenizer_config_json);
+        tokenizer_json["added_tokens"].push_back(added(40,"00:00 ",false));
+        tokenizer_config["added_tokens_decoder"]["40"] = decoder_added("00:00 ",false);
+        owned.tokenizer_json = tokenizer_json.dump();
+        owned.tokenizer_config_json = tokenizer_config.dump();
+        const int patch = unified ? 48 : 16;
+        const int merge = version == 3 ? 2 : unified ? 1 : 3;
+        owned.preprocessor_config_json = nlohmann::json{
+            {"gemma_version",version == 3 ? 3 : 4},{"encoder_free",int(unified)},
+            {"image_token_id",248056},{"video_token_id",248057},
+            {"image_token","<|image_pad|>"},{"video_token","<|video_pad|>"},
+            {"boi_token","<|vision_start|>"},{"eoi_token","<|vision_end|>"},
+            {"patch_size",patch},{"spatial_merge_size",merge},{"position_embeddings",32},
+            {"image_seq_length",4},{"resample",2},{"size",{{"height",64},{"width",64}}}
+        }.dump();
+        owned.video_preprocessor_config_json = R"({"max_soft_tokens":4,"num_frames":4})";
+        const auto frontend = FrontendFactory::create_component(owned);
+        for (const bool video : {false,true}) {
+            auto input = image_input();
+            for (auto& part : input.messages.front().parts) {
+                if (part.kind == sinfer::MessagePartKind::Media && video) { part.media.kind = sinfer::MediaKind::Video; }
+            }
+            const auto count = frontend.count_tokens(input);
+            const auto prepared = frontend.prepare(input);
+            const auto& data = FrontendFactory::inspect(prepared);
+            failures += check(data.token_ids.size() == count && data.prepare.vision_tokens == 4 && data.vision_items.size() == 1,
+                "Gemma media counts or timestamp expansion are wrong");
+            const auto patches = data.media_payloads.front()->span();
+            failures += check(patches.size() == std::size_t(4*merge*merge*3*patch*patch),
+                "Gemma patch payload does not match encoder geometry");
+            if (!video) {
+                failures += check(patches.front() == bf16_bits(unified ? 0.0F : -1.0F),
+                    "Gemma image normalization is wrong");
+            }
+            for (std::size_t i=0;i<data.token_ids.size();++i) {
+                failures += check(data.positions[i] == i && data.positions[data.token_ids.size()+i] == i,
+                    "Gemma must use ordinary decoder positions");
+            }
+            const auto repeated = frontend.prepare(input);
+            failures += check(FrontendFactory::inspect(repeated).prepare.media_cache_hits == 1,
+                "Gemma did not reuse the prepared image/frame");
+        }
+        auto invalid = nlohmann::json::parse(owned.preprocessor_config_json);
+        invalid["patch_size"] = 0;
+        owned.preprocessor_config_json = invalid.dump();
+        failures += check(throws_invalid_argument([&] { (void)FrontendFactory::create_component(owned); }),
+            "Gemma accepted a zero patch size");
+    }
     return failures;
 }
 
@@ -1633,6 +1698,7 @@ int main() {
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
     failures += test_lfm2_image_preparation();
+    failures += test_gemma_media_preparation();
     failures += test_checkpoint_vision_ids_and_jinja();
     failures += test_jinja_capability_probe();
     failures += test_official_tokenizer_merge();

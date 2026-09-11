@@ -276,6 +276,9 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.host_moe_layers = cli.host_moe_layers;
         engine_options.gpu_layers     = cli.gpu_layers;
+        engine_options.offload_vision = cli.offload_vision;
+        engine_options.offload_embeddings = cli.offload_embeddings;
+        engine_options.offload_output_head = cli.offload_output_head;
         engine_options.expert_slots   = cli.expert_slots;
         engine_options.host_expert_bank    = cli.host_expert_bank;
         engine_options.cpu_moe_share  = cli.cpu_moe_share;

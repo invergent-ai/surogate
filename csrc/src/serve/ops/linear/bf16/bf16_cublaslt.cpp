@@ -156,7 +156,7 @@ const Plan& plan_for(DeviceState& state, const PlanKey& key) {
 void require_operands(const Weight& weight, const Tensor& x, const Tensor& out) {
     if (weight.qtype != QType::BF16_CTRL || weight.layout != QuantLayout::Contiguous ||
         weight.qdata == nullptr || weight.ndim != 2 || weight.n <= 0 || weight.k <= 0 ||
-        (weight.k % 8) != 0 || (weight.n % 8) != 0 ||
+        ((weight.k % 8) != 0 && weight.k != 588) || (weight.n % 8) != 0 ||
         (reinterpret_cast<std::uintptr_t>(weight.qdata) & 15u) != 0) {
         throw std::invalid_argument("bf16 cuBLASLt: weight must be aligned contiguous BF16 [n,k] "
                                     "with n and k multiples of 8");
@@ -217,7 +217,7 @@ void bf16_cublaslt_gemm_raw(const void* weight, std::int32_t n, std::int32_t k, 
     const auto aligned = [](const void* pointer) {
         return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & 15u) == 0;
     };
-    if (n <= 0 || k <= 0 || tokens <= 0 || ldc < n || (n % 8) != 0 || (k % 8) != 0 ||
+    if (n <= 0 || k <= 0 || tokens <= 0 || ldc < n || (n % 8) != 0 || ((k % 8) != 0 && k != 588) ||
         (ldc % 8) != 0 || !aligned(weight) || !aligned(x) || !aligned(out)) {
         throw std::invalid_argument("bf16 cuBLASLt raw: n, k and ldc must be positive multiples "
                                     "of 8 with ldc >= n and every operand 16-byte aligned");

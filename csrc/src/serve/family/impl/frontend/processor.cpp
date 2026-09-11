@@ -561,7 +561,7 @@ void assign_positions(ProcessedInput& output) {
 }
 
 void validate_special_token(const Tokenizer& tokenizer, std::string_view text, int expected) {
-    const std::vector<int> ids = tokenizer.encode(text);
+    const std::vector<int> ids = tokenizer.encode(text, {.add_bos=false});
     if (ids.size() != 1 || ids.front() != expected) {
         throw std::invalid_argument(
             "tokenizer vision token ID does not match the processor configuration");
@@ -624,12 +624,17 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
         throw std::invalid_argument("processor budgets must be positive");
     }
     if (!media_cache_) { throw std::invalid_argument("processor media cache must not be null"); }
+    if (options_.gemma.version) {
+        validate_special_token(tokenizer_, options_.gemma.image_token, options_.image_token_id);
+        validate_special_token(tokenizer_, options_.gemma.video_token, options_.gemma.video_token_id);
+        return;
+    }
     if (options_.lfm2_vl) {
         validate_special_token(tokenizer_, "<image>", options_.image_token_id);
         return;
     }
     const auto media_token_id = [&](std::string_view token) {
-        const auto ids = tokenizer_.encode(token);
+        const auto ids = tokenizer_.encode(token, {.add_bos=false});
         if (ids.size() != 1 || !tokenizer_.is_special_token(ids.front())) {
             throw std::invalid_argument("vision marker must be one special token: " + std::string(token));
         }
@@ -646,6 +651,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   const PreparationControl& control,
                                   std::optional<RenderedChat> prepared_chat) const {
     check_preparation_control(control);
+    if (options_.gemma.version) {
+        return process_gemma_vl(tokenizer_, options_, *media_cache_, std::move(messages),render_options,control);
+    }
     if (options_.lfm2_vl) {
         return process_lfm2_vl(tokenizer_, options_, *media_cache_, std::move(messages),
                               std::move(render_options), control);

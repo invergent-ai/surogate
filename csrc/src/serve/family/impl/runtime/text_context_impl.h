@@ -1257,6 +1257,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = text_rope_positions<Variant>(
         active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions);
+    if (weights_.vision_geometry.gemma_version && rope_for_op.ne[1] == 3) {
+        rope_for_op = rope_for_op.slice(1, 0, 1).view({T});
+    }
     if constexpr (applies_rotary<Variant>()) {
         const auto& g = weights_.geometry;
         if (rope_for_op.ne[1] == 3 && g.mrope_temporal) {
@@ -1287,12 +1290,19 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, 
     // head skips it and attends densely -- see KvPlane.
     const std::int32_t indexer_columns_per_row =
         active_sequence_batch_ != 0 ? active_sequence_width_ : T;
-    const ops::GqaBlockMask selection =
+    ops::GqaBlockMask selection =
         mtp ? ops::GqaBlockMask{}
             : text_indexer_selection(
                   w, h, T, cache_positions, rope_positions, kv_table_rows, indexer_columns_per_row,
                   static_cast<std::int32_t>(active_gqa_envelope_->max_visible_keys),
                   batch_text_kv_->batch_layer_view(fidx));
+    if (!mtp && image_attention_end_ &&
+        (weights_.vision_geometry.attention_mode == 1 ||
+         (weights_.vision_geometry.attention_mode == 2 &&
+          layer_sliding_window(layer, weights_.geometry) > 0))) {
+        selection.image_begin = image_attention_begin_;
+        selection.image_end   = image_attention_end_;
+    }
     // The round binding says how many keys the launch must be sized for; the window
     // says how many of them this layer may look at. Stamp the layer's window onto a
     // copy -- widening the round binding could not express an alternating stack.
@@ -3360,7 +3370,16 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             const auto roots             = workspace_recipe::text_prefill_roots(
                 work_, cfg_geometry(), len, rope_axes, static_cast<std::int32_t>(local_scatter_indices.size()));
             Tensor ids_device = roots.ids;
-            copy_i32(ids.data() + t0, ids_device, s);
+            std::vector<std::int32_t> text_ids;
+            if (weights_.vision_geometry.gemma_version && !local_scatter_indices.empty()) {
+                text_ids.assign(ids.data() + t0, ids.data() + t0 + len);
+                for (const auto index : local_scatter_indices) {
+                    text_ids[index] = weights_.vision_geometry.gemma_pad_token;
+                }
+                copy_i32(text_ids.data(), ids_device, s);
+            } else {
+                copy_i32(ids.data() + t0, ids_device, s);
+            }
 
             Tensor positions = roots.positions;
             ops::fill_i32_positions(positions, base_i + t0, s);
@@ -3395,7 +3414,6 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             active_ids_ = ids_device;
     if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
-    capture_per_layer_source(x, s);
             window_laps.mark_pre();
             // Later pipeline stages already receive the preceding layers' residual.
             // Replacing its visual columns here would discard those layers' work.
@@ -3406,14 +3424,35 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
                 ops::scatter(embeddings, indices_device, x, s);
             }
+            capture_per_layer_source(x, s);
+            if constexpr (Hooks::per_layer_inputs) {
+                if (!local_scatter_indices.empty()) {
+                    Tensor indices_device = roots.scatter_indices;
+                    copy_i32(local_scatter_indices.data(), indices_device, s);
+                    Tensor embeddings = vision_chunk.embeddings.slice(
+                        1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
+                    ops::scatter(embeddings, indices_device, active_embedded_, s);
+                }
+            }
             if constexpr (Tap::enabled) { tap.begin(x); }
             Tensor deepstack;
             if (vision_chunk.deepstack.data != nullptr && !local_scatter_indices.empty()) {
                 deepstack = vision_chunk.deepstack.slice(1, visual_begin,
                     static_cast<std::int32_t>(local_scatter_indices.size()));
             }
-            run_layers(x, Phase::Prefill, tap, deepstack.data ? &deepstack : nullptr,
-                       local_scatter_indices);
+            image_attention_begin_ = image_attention_end_ = 0;
+            if (vision_chunk.control && weights_.vision_geometry.attention_mode) {
+                image_attention_begin_ = vision_chunk.control->scatter_indices.front();
+                image_attention_end_   = vision_chunk.control->scatter_indices.back() + 1;
+            }
+            try {
+                run_layers(x, Phase::Prefill, tap, deepstack.data ? &deepstack : nullptr,
+                           local_scatter_indices);
+            } catch (...) {
+                image_attention_begin_ = image_attention_end_ = 0;
+                throw;
+            }
+            image_attention_begin_ = image_attention_end_ = 0;
             window_laps.mark_layers();
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);

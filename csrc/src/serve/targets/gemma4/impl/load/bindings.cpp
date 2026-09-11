@@ -173,14 +173,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.geometry = family::TextGeometry::resolved_gemma4(
         binder.reader().geometry(), binder.reader().layer_types(), false, false);
     const family::TextGeometry& g = out.geometry;
-    out.frontend = family::bind_text_only_frontend_resources(binder);
+    out.frontend = (binder.has("vision/patch_embedding") ? family::bind_frontend_resources(binder) : family::bind_text_only_frontend_resources(binder));
     out.features = features;
 
-    if (features.vision) {
-        // The 12B runs its vision through the same decoder stack rather than a tower, and
-        // this target binds the text stack only.
-        throw std::runtime_error("gemma4 is a text-only target today: --vision is unsupported");
-    }
+    family::bind_gemma_vision(binder,out,g,features.vision);
     if (features.speculative_enabled()) {
         // Gemma 4 does publish a draft head -- every GGUF release ships an `mtp-*.gguf`
         // beside it -- but the safetensors checkpoint this target converts from carries
@@ -228,7 +224,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     // Every layer of a dense decoder attends; windowed and global are both attention.
     runtime.full_layers.resize(static_cast<std::size_t>(g.layers));
     runtime.gdn_layers.resize(kGdnLayers);
-    frontend = family::take_text_only_frontend_resources(backing, plan.frontend);
+    frontend = plan.vision_geometry.gemma_version ? family::take_frontend_resources(backing,plan.frontend)
+                                                  : family::take_text_only_frontend_resources(backing, plan.frontend);
+    runtime.vision_geometry = plan.vision_geometry;
+    if (plan.features.vision) { runtime.vision = family::materialize_gemma_vision(backing,plan); }
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;

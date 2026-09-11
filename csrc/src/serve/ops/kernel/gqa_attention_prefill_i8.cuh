@@ -106,7 +106,7 @@ __launch_bounds__(256) __global__
                                               Metadata metadata, std::int8_t* __restrict__ cache_k,
                                               std::int8_t* __restrict__ cache_v,
                                               __half* __restrict__ scale_k,
-                                              __half* __restrict__ scale_v, std::int32_t width) {
+                                              __half* __restrict__ scale_v, std::int32_t width, GqaBlockMask block_mask = {}) {
     constexpr int Warps         = 8;
     constexpr int Groups        = kGqaKvQuantGroups<Geometry>;
     constexpr unsigned FullMask = 0xffffffffu;
@@ -169,7 +169,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
     std::int8_t* __restrict__ cache_k, std::int8_t* __restrict__ cache_v,
-    __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t width) {
+    __half* __restrict__ scale_k, __half* __restrict__ scale_v, std::int32_t width, GqaBlockMask block_mask = {}) {
     constexpr int TokensPerTile = 8;
     constexpr unsigned FullMask = 0xffffffffu;
     const int tokens            = metadata.valid_tokens(width);
@@ -237,7 +237,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    std::int32_t width, GqaBlockMask block_mask = {}) {
     constexpr int D             = Geometry::HeadDim;
     constexpr int Br            = kGqaPrefillI8Br;
     constexpr int Bc            = kGqaPrefillI8Bc;
@@ -294,7 +294,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const std::int32_t* block_table = metadata.block_table();
 
     const int tile_rows     = min(Br, tokens - q0);
-    const int max_query_abs = base_pos + q0 + tile_rows - 1;
+    const int max_query_abs = block_mask.tile_last_key(base_pos + q0, base_pos + q0 + tile_rows - 1);
     const int key_blocks    = max_query_abs / Bc + 1;
     // A window makes the oldest keys invisible to every query in this tile, so
     // the loop need not start at zero. The tile's earliest query sits at
@@ -493,7 +493,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             // See the bf16 twin: a fully-causal tile is mask-free only when its
             // oldest key is still inside the window of its newest query.
             const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0 &&
-                                         gqa_within_window(max_query_abs, k0, metadata.window);
+                                         gqa_within_window(max_query_abs, k0, metadata.window) && block_mask.image_end == 0;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
@@ -502,16 +502,16 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int key1 = key0 + 1;
                 if (!full_score_tile) {
                     const int w  = metadata.window;
-                    score[nt][0] = (key0 <= qabs0 && gqa_within_window(qabs0, key0, w))
+                    score[nt][0] = (key0 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key0, w))
                                        ? score[nt][0]
                                        : -CUDART_INF_F;
-                    score[nt][1] = (key1 <= qabs0 && gqa_within_window(qabs0, key1, w))
+                    score[nt][1] = (key1 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key1, w))
                                        ? score[nt][1]
                                        : -CUDART_INF_F;
-                    score[nt][2] = (key0 <= qabs1 && gqa_within_window(qabs1, key0, w))
+                    score[nt][2] = (key0 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key0, w))
                                        ? score[nt][2]
                                        : -CUDART_INF_F;
-                    score[nt][3] = (key1 <= qabs1 && gqa_within_window(qabs1, key1, w))
+                    score[nt][3] = (key1 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key1, w))
                                        ? score[nt][3]
                                        : -CUDART_INF_F;
                 }

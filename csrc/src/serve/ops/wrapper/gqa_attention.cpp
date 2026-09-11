@@ -516,6 +516,9 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
                    GqaBlockMask selection) {
     constexpr const char* op = "gqa_attention";
+    if (selection.image_begin < 0 || selection.image_end < selection.image_begin ||
+        static_cast<std::uint32_t>(selection.image_end) > envelope.max_visible_keys ||
+        (selection.image_end && q.ne[3] != 1)) { throw std::invalid_argument("invalid image attention block"); }
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
@@ -531,7 +534,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
 
-    if (!gqa_shape_is_registered(head_dim, q.ne[1], kv_heads)) {
+    if (selection.image_end || !gqa_shape_is_registered(head_dim, q.ne[1], kv_heads)) {
         detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                             scale, cache, out, stream, envelope.sliding_window,
                                             selection);
@@ -592,13 +595,16 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
                           GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
                           cudaStream_t stream, GqaBlockMask selection) {
     constexpr const char* op = "gqa_attention_cached";
+    if (selection.image_begin < 0 || selection.image_end < selection.image_begin ||
+        static_cast<std::uint32_t>(selection.image_end) > envelope.max_visible_keys ||
+        (selection.image_end && q.ne[3] != 1)) { throw std::invalid_argument("invalid image attention block"); }
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
     const std::int32_t width = q.ne[2];
     const std::int32_t batch = q.ne[3];
     require_registered_shape(q.ne[0], q.ne[1], cache.num_kv_heads, op);
 
-    if (!gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
+    if (selection.image_end || !gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
         detail::gqa_attention_prompt_cached_launch(q, positions, valid_columns, kv_table_rows,
                                                    scale, cache, out, stream,
                                                    envelope.sliding_window, selection);
@@ -632,9 +638,12 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
                           GqaBlockMask selection) {
     constexpr const char* op = "gqa_attention_cached";
+    if (selection.image_begin < 0 || selection.image_end < selection.image_begin ||
+        static_cast<std::uint32_t>(selection.image_end) > envelope.max_visible_keys ||
+        (selection.image_end && q.ne[3] != 1)) { throw std::invalid_argument("invalid image attention block"); }
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
-    if (!gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
+    if (selection.image_end || !gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
         detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,
                                                       envelope.sliding_window, selection);
         return;

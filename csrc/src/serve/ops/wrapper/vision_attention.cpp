@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "ops/launcher/vision_attention.h"
+#include <cmath>
 
 #include <algorithm>
 #include <cstdint>
@@ -67,7 +68,8 @@ std::size_t vision_attention_workspace_capacity_bytes(std::int32_t min_patches,
 }
 
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& cu_seqlens,
-                      WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                      WorkspaceArena& workspace, Tensor& out, cudaStream_t stream, float scale) {
+    if (!std::isfinite(scale) || scale < 0) { throw std::invalid_argument("vision_attention: invalid scale"); }
     const std::int32_t patches  = q.ne[2];
     const std::int32_t segments = cu_seqlens.ne[0] - 1;
     if (patches <= 0) { throw std::invalid_argument("vision_attention: P must be positive"); }
@@ -90,11 +92,12 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
     auto scratch_scope = workspace.scope();
     Tensor tiles       = allocate_workspace(workspace, patches, segments);
     Tensor* tiles_ptr  = tiles.data == nullptr ? nullptr : &tiles;
-    detail::vision_attention_launch(q, k, v, cu_seqlens, tiles_ptr, out, stream);
+    detail::vision_attention_launch(q, k, v, cu_seqlens, tiles_ptr, out, stream, scale);
 }
 
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                      std::int32_t segment_length, Tensor& out, cudaStream_t stream) {
+                      std::int32_t segment_length, Tensor& out, cudaStream_t stream, float scale) {
+    if (!std::isfinite(scale) || scale < 0) { throw std::invalid_argument("vision_attention: invalid scale"); }
     const std::int32_t patches = q.ne[2];
     if (patches <= 0) { throw std::invalid_argument("vision_attention: P must be positive"); }
     require_qkv(q, patches, "q");
@@ -111,7 +114,7 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (segment_length <= 0 || patches % segment_length != 0) {
         throw std::invalid_argument("vision_attention: invalid uniform segment length");
     }
-    detail::vision_attention_uniform_launch(q, k, v, segment_length, out, stream);
+    detail::vision_attention_uniform_launch(q, k, v, segment_length, out, stream, scale);
 }
 
 } // namespace sinfer::ops

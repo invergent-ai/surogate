@@ -62,7 +62,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
-                       static_cast<std::uint32_t>(options.pipeline_stage_first));
+                       static_cast<std::uint32_t>(options.pipeline_stage_first),
+                       options.offload_vision, options.offload_embeddings, options.offload_output_head);
     const family::StartupFeatures features = family::startup_features(options);
     if (features.vision) {
         throw std::runtime_error("qwen3.8-flash-next: vision is not served by this target");

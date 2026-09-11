@@ -1,4 +1,5 @@
 """LFM GGUF metadata, tensor layout, tokenizer IDs and complete conversion."""
+# ruff: noqa: E402 -- optional GGUF dependency must be checked before converter imports.
 
 import json
 from pathlib import Path
@@ -10,17 +11,21 @@ import torch
 gguf = pytest.importorskip("gguf")
 
 from gguf.quants import dequantize, quantize
+
 from surogate.serve import ingest
 from surogate.serve.artifact.container import Artifact
 from surogate.serve.artifact.layouts import dequantize_row_split
 from surogate.serve.convert.lfm2 import convert
 from surogate.serve.gguf.bridge import (
-    build_hf_dir_from_gguf, gguf_target_key, open_gguf, synthesised_config,
+    build_hf_dir_from_gguf,
+    gguf_target_key,
+    open_gguf,
+    synthesised_config,
 )
 from surogate.serve.gguf.frontend import extract_tokenizer_json
 
 
-def checkpoint(path, *, hidden=256, tied=True, quantized=True, metadata=None, moe=False):
+def checkpoint(path, *, hidden=256, tied=True, quantized=True, metadata=None, moe=False, image_token=False):
     arch = "lfm2moe" if moe else "lfm2"
     writer = gguf.GGUFWriter(str(path), arch)
     fields = {
@@ -49,10 +54,12 @@ def checkpoint(path, *, hidden=256, tied=True, quantized=True, metadata=None, mo
         else:
             writer.add_uint32(key, value)
     tokens = ["<bos>", "a", "b", "ab", "<eos>"] + [f"t{i}" for i in range(5, 32)]
+    if image_token:
+        tokens[-1] = "<image>"
     writer.add_tokenizer_model("gpt2")
     writer.add_tokenizer_pre("lfm2")
     writer.add_token_list(tokens)
-    writer.add_token_types([3, 1, 1, 1, 3] + [1] * 27)
+    writer.add_token_types([3, 1, 1, 1, 3] + [1] * 26 + [3 if image_token else 1])
     writer.add_token_merges(["a b"])
     writer.add_bos_token_id(0)
     writer.add_eos_token_id(4)

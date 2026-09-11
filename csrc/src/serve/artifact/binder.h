@@ -59,7 +59,8 @@ public:
     /// Applies to decoder-layer tensors regardless of which target binds them.
     /// nullopt keeps every layer on the GPU; zero offloads every decoder layer.
     void set_offload(std::optional<std::uint32_t> gpu_layers,
-                     std::uint32_t host_moe_layers = 0, std::uint32_t stage_first = 0);
+                     std::uint32_t host_moe_layers = 0, std::uint32_t stage_first = 0,
+                     bool vision = false, bool embeddings = false, bool output_head = false);
     [[nodiscard]] bool offloads(std::string_view name) const;
 
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
@@ -112,6 +113,9 @@ private:
     std::vector<bool> planned_;
     MaterializationPlan materialization_;
     std::optional<std::uint32_t> gpu_layers_;
+    bool offload_vision_ = false;
+    bool offload_embeddings_ = false;
+    bool offload_output_head_ = false;
     std::vector<std::uint32_t> host_moe_layers_;
     int stage_first_ = 0;
     int stage_last_ = 0;

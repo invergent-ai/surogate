@@ -105,11 +105,11 @@ The family is detected automatically. Available formats and optional features va
 | Llama | Includes TinyLlama |
 | MiniCPM5 | Hugging Face safetensors and GGUF; thinking can be enabled or disabled |
 | Spark-X2.5 | Hugging Face safetensors; thinking can be enabled or disabled |
-| Gemma 3 | Text generation |
-| Gemma 4 | Text generation with dense, E-series, and mixture-of-experts models |
+| Gemma 3 | Text generation; images and sampled video frames on vision-enabled checkpoints |
+| Gemma 4 | Text, images and video with dense, E-series, and mixture-of-experts models |
 | LFM2 / LFM2.5 | Dense text models from Hugging Face safetensors or GGUF |
 | LFM2-MoE | Hugging Face safetensors and GGUF |
-| LFM2-VL / LFM2.5-VL | Text and images from Hugging Face safetensors; enable images with `--vision` |
+| LFM2-VL / LFM2.5-VL | Text, images and sampled video frames from safetensors or paired GGUF files; use `--vision` |
 | Qwen3.5/3.6/3.8 | Includes BF16 and NVFP4 exports |
 | Qwen3.5/3.6 MoE | Includes 35B-A3B; optional speculative decoding |
 | Qwen3.8 Flash-Next | GGUF; supports CPU offload |

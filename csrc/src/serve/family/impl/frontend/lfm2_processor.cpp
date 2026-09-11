@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <iomanip>
+#include <sstream>
 #include <numeric>
 #include <string>
 
@@ -116,8 +118,8 @@ ProcessedInput process_lfm2_vl(const Tokenizer& tokenizer, const ProcessorOption
                 content += part.text;
                 continue;
             }
-            if (part.kind != ChatPartKind::Image) {
-                throw std::invalid_argument("LFM2-VL supports images; video input is unsupported");
+            if (part.kind != ChatPartKind::Image && part.kind != ChatPartKind::Video) {
+                throw std::invalid_argument("LFM2-VL expects images or video");
             }
             if (part.media.bytes.size() > options.max_encoded_media_bytes - stats.media_bytes) {
                 throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
@@ -126,112 +128,142 @@ ProcessedInput process_lfm2_vl(const Tokenizer& tokenizer, const ProcessorOption
             stats.media_bytes += part.media.bytes.size();
             ++stats.media_items;
             const media::decode::Policy policy{
-                .max_bytes          = options.max_encoded_media_bytes,
-                .max_decoded_pixels = options.max_decoded_pixels,
-                .checkpoint         = [&control] { check_preparation_control(control); },
+                .max_bytes                  = options.max_encoded_media_bytes,
+                .max_decoded_pixels         = options.max_decoded_pixels,
+                .max_decoded_video_pixels   = options.max_decoded_video_pixels,
+                .max_video_source_frames    = options.max_video_source_frames,
+                .max_video_duration_seconds = options.max_video_duration_seconds,
+                .checkpoint                 = [&control] { check_preparation_control(control); },
             };
-            auto image                 = media::decode::decode_image(part.media.bytes, policy);
-            const auto digest          = sha256(part.media.bytes);
-            const auto [height, width] = image_size(image.height, image.width, options);
-            const auto [rows, cols]    = tile_grid(image.height, image.width, options);
-            const bool split           = rows > 1 || cols > 1;
-            const bool bilinear        = options.lfm_resample == 2;
-            Image grid;
-            if (split) {
-                const auto resized_pixels = static_cast<std::uint64_t>(rows) * cols *
-                                            options.lfm_tile_size * options.lfm_tile_size;
-                if (resized_pixels > options.max_decoded_pixels) {
-                    throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                                         "LFM2-VL tile grid exceeds pixel budget");
-                }
-                grid = resize_processor_image(image, rows * options.lfm_tile_size,
-                                              cols * options.lfm_tile_size, bilinear, control);
+            const bool is_video = part.kind == ChatPartKind::Video;
+            std::vector<Image> frames;
+            std::vector<double> timestamps;
+            if (is_video) {
+                auto video =
+                    media::decode::decode_video(part.media.bytes, policy, options.video_fps,
+                                                options.video_min_frames, options.video_max_frames);
+                for (int index : video.indices) { timestamps.push_back(index / video.fps); }
+                frames = std::move(video.frames);
+            } else {
+                frames.push_back(media::decode::decode_image(part.media.bytes, policy));
             }
-            if (options.lfm_special_tokens) { content += "<|image_start|>"; }
-            const auto append = [&](const Image& source, int top, int left, int h, int w,
-                                    const std::string& label) {
-                const auto patches = static_cast<std::uint64_t>(h / kPatch) * (w / kPatch);
-                const auto tokens  = patches / (kMerge * kMerge);
-                if (patches > options.max_raw_patches - stats.raw_patches ||
-                    tokens > options.max_vision_tokens - stats.vision_tokens) {
-                    throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                                         "LFM2-VL images exceed prompt budget");
+            const auto source_digest = sha256(part.media.bytes);
+            for (std::size_t frame = 0; frame < frames.size(); ++frame) {
+                const auto& image = frames[frame];
+                auto digest       = source_digest;
+                if (is_video) {
+                    std::ostringstream timestamp;
+                    timestamp << "Time " << std::fixed << std::setprecision(3) << timestamps[frame]
+                              << "s: ";
+                    content += timestamp.str();
+                    std::vector<std::uint8_t> frame_identity(digest.begin(), digest.end());
+                    const auto suffix = "video-frame:" + std::to_string(frame);
+                    frame_identity.insert(frame_identity.end(), suffix.begin(), suffix.end());
+                    digest = sha256(frame_identity);
                 }
-                std::vector<std::uint8_t> identity(digest.begin(), digest.end());
-                const std::string suffix =
-                    label + ":" + std::to_string(h) + ":" + std::to_string(w);
-                identity.insert(identity.end(), suffix.begin(), suffix.end());
-                const auto tile_digest = sha256(identity);
-                const MediaCacheKey key{.digest = tile_digest, .modality = Modality::Image};
-                auto media = cache.get_or_prepare(
-                    key, control,
-                    [&] {
-                        auto payload       = cache.allocate_payload(patches * kFeatures, control);
-                        std::size_t cursor = 0;
-                        for (int by = 0; by < h / 32; ++by) {
-                            check_preparation_control(control);
-                            for (int bx = 0; bx < w / 32; ++bx) {
-                                for (int iy = 0; iy < kMerge; ++iy)
-                                    for (int ix = 0; ix < kMerge; ++ix) {
-                                        for (int py = 0; py < kPatch; ++py)
-                                            for (int px = 0; px < kPatch; ++px) {
-                                                const auto offset =
-                                                    (static_cast<std::size_t>(top + by * 32 +
-                                                                              iy * kPatch + py) *
-                                                         source.width +
-                                                     left + bx * 32 + ix * kPatch + px) *
-                                                    3;
-                                                for (int channel = 0; channel < 3; ++channel) {
-                                                    const float value =
-                                                        (source.rgb[offset + channel] *
-                                                             (1.0F / 255.0F) -
-                                                         0.5F) /
-                                                        0.5F;
-                                                    payload->patches[cursor++] = bf16(value);
-                                                }
-                                            }
-                                    }
-                            }
-                        }
-                        VisionItem item;
-                        item.grid           = {1, h / kPatch, w / kPatch};
-                        item.content_digest = tile_digest;
-                        item.patch_count    = patches;
-                        return PreparedMedia{std::move(item), std::move(payload)};
-                    },
-                    cache_stats);
-                media.item.patch_begin = stats.raw_patches;
-                stats.raw_patches += patches;
-                stats.vision_tokens += tokens;
-                stats.attention_pairs += patches * patches;
-                stats.patch_bytes += patches * kFeatures * sizeof(std::uint16_t);
-                out.vision_items.push_back(std::move(media.item));
-                out.media_payloads.push_back(std::move(media.payload));
-                for (std::uint64_t i = 0; i < tokens; ++i) { content += "<image>"; }
-            };
-            if (split) {
-                for (int row = 0; row < rows; ++row)
-                    for (int col = 0; col < cols; ++col) {
-                        const auto label = "<|img_row_" + std::to_string(row + 1) + "_col_" +
-                                           std::to_string(col + 1) + "|>";
-                        if (options.lfm_special_tokens) { content += label; }
-                        append(grid, row * options.lfm_tile_size, col * options.lfm_tile_size,
-                               options.lfm_tile_size, options.lfm_tile_size, label);
+                const auto [height, width] = image_size(image.height, image.width, options);
+                const auto [rows, cols]    = tile_grid(image.height, image.width, options);
+                const bool split           = rows > 1 || cols > 1;
+                const bool bilinear        = options.lfm_resample == 2;
+                Image grid;
+                if (split) {
+                    const auto resized_pixels = static_cast<std::uint64_t>(rows) * cols *
+                                                options.lfm_tile_size * options.lfm_tile_size;
+                    if (resized_pixels > options.max_decoded_pixels) {
+                        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                             "LFM2-VL tile grid exceeds pixel budget");
                     }
-            }
-            if (!split || options.lfm_thumbnail) {
-                if (split && options.lfm_special_tokens) { content += "<|img_thumbnail|>"; }
-                const auto pixels = static_cast<std::uint64_t>(height) * width;
-                if (pixels > options.max_decoded_pixels ||
-                    pixels / (kPatch * kPatch) > options.max_raw_patches - stats.raw_patches ||
-                    pixels / 1024 > options.max_vision_tokens - stats.vision_tokens) {
-                    throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                                         "LFM2-VL resized image exceeds processor budget");
+                    grid = resize_processor_image(image, rows * options.lfm_tile_size,
+                                                  cols * options.lfm_tile_size, bilinear, control);
                 }
-                auto thumbnail = resize_processor_image(image, height, width, bilinear, control);
-                append(thumbnail, 0, 0, height, width, "thumbnail");
+                if (options.lfm_special_tokens) { content += "<|image_start|>"; }
+                const auto append = [&](const Image& source, int top, int left, int h, int w,
+                                        const std::string& label) {
+                    const auto patches = static_cast<std::uint64_t>(h / kPatch) * (w / kPatch);
+                    const auto tokens  = patches / (kMerge * kMerge);
+                    if (patches > options.max_raw_patches - stats.raw_patches ||
+                        tokens > options.max_vision_tokens - stats.vision_tokens) {
+                        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                             "LFM2-VL images exceed prompt budget");
+                    }
+                    std::vector<std::uint8_t> identity(digest.begin(), digest.end());
+                    const std::string suffix =
+                        label + ":" + std::to_string(h) + ":" + std::to_string(w);
+                    identity.insert(identity.end(), suffix.begin(), suffix.end());
+                    const auto tile_digest = sha256(identity);
+                    const MediaCacheKey key{.digest = tile_digest, .modality = Modality::Image};
+                    auto media = cache.get_or_prepare(
+                        key, control,
+                        [&] {
+                            auto payload = cache.allocate_payload(patches * kFeatures, control);
+                            std::size_t cursor = 0;
+                            for (int by = 0; by < h / 32; ++by) {
+                                check_preparation_control(control);
+                                for (int bx = 0; bx < w / 32; ++bx) {
+                                    for (int iy = 0; iy < kMerge; ++iy)
+                                        for (int ix = 0; ix < kMerge; ++ix) {
+                                            for (int py = 0; py < kPatch; ++py)
+                                                for (int px = 0; px < kPatch; ++px) {
+                                                    const auto offset =
+                                                        (static_cast<std::size_t>(
+                                                             top + by * 32 + iy * kPatch + py) *
+                                                             source.width +
+                                                         left + bx * 32 + ix * kPatch + px) *
+                                                        3;
+                                                    for (int channel = 0; channel < 3; ++channel) {
+                                                        const float value =
+                                                            (source.rgb[offset + channel] *
+                                                                 (1.0F / 255.0F) -
+                                                             0.5F) /
+                                                            0.5F;
+                                                        payload->patches[cursor++] = bf16(value);
+                                                    }
+                                                }
+                                        }
+                                }
+                            }
+                            VisionItem item;
+                            item.grid           = {1, h / kPatch, w / kPatch};
+                            item.content_digest = tile_digest;
+                            item.patch_count    = patches;
+                            return PreparedMedia{std::move(item), std::move(payload)};
+                        },
+                        cache_stats);
+                    media.item.patch_begin = stats.raw_patches;
+                    stats.raw_patches += patches;
+                    stats.vision_tokens += tokens;
+                    stats.attention_pairs += patches * patches;
+                    stats.patch_bytes += patches * kFeatures * sizeof(std::uint16_t);
+                    out.vision_items.push_back(std::move(media.item));
+                    out.media_payloads.push_back(std::move(media.payload));
+                    for (std::uint64_t i = 0; i < tokens; ++i) { content += "<image>"; }
+                };
+                if (split) {
+                    for (int row = 0; row < rows; ++row)
+                        for (int col = 0; col < cols; ++col) {
+                            const auto label = "<|img_row_" + std::to_string(row + 1) + "_col_" +
+                                               std::to_string(col + 1) + "|>";
+                            if (options.lfm_special_tokens) { content += label; }
+                            append(grid, row * options.lfm_tile_size, col * options.lfm_tile_size,
+                                   options.lfm_tile_size, options.lfm_tile_size, label);
+                        }
+                }
+                if (!split || options.lfm_thumbnail) {
+                    if (split && options.lfm_special_tokens) { content += "<|img_thumbnail|>"; }
+                    const auto pixels = static_cast<std::uint64_t>(height) * width;
+                    if (pixels > options.max_decoded_pixels ||
+                        pixels / (kPatch * kPatch) > options.max_raw_patches - stats.raw_patches ||
+                        pixels / 1024 > options.max_vision_tokens - stats.vision_tokens) {
+                        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                                             "LFM2-VL resized image exceeds processor budget");
+                    }
+                    auto thumbnail =
+                        resize_processor_image(image, height, width, bilinear, control);
+                    append(thumbnail, 0, 0, height, width, "thumbnail");
+                }
+                if (options.lfm_special_tokens) { content += "<|image_end|>"; }
+                if (is_video) { content += "\n"; }
             }
-            if (options.lfm_special_tokens) { content += "<|image_end|>"; }
             std::vector<std::uint8_t>().swap(part.media.bytes);
         }
         nlohmann::ordered_json item{{"role", role_name(message.role)}, {"content", content}};

@@ -1,10 +1,21 @@
 #pragma once
 #include "api/ops/lora_store.h"
+#include "api/types.h"
+#include <algorithm>
 #include "api/family/vision.h"
 #include <type_traits>
 #include <variant>
 
 namespace sinfer::family {
+inline std::uint32_t lora_prefill_columns(const VisionGeometry& vision,
+                                          const EngineOptions& options) {
+    const auto image =
+        options.enable_vision && vision.attention_mode
+            ? ((static_cast<std::uint32_t>(vision.max_image_tokens) + 127U) / 128U) * 128U
+            : 0U;
+    return std::min(options.max_context, std::max(options.prefill_chunk, image));
+}
+
 // Collect represented weights before adapters load, including offloaded views.
 template <class T>
 void collect_lora_bases(ops::LoraStore& store, const T& value) {
@@ -27,25 +38,23 @@ void collect_lora_bases(ops::LoraStore& store, const T& value) {
     } else {
 #define COLLECT(member)                                                                            \
     if constexpr (requires { value.member; }) { collect_lora_bases(store, value.member); }
-        COLLECT(full_layers)
-        COLLECT(gdn_layers) COLLECT(token_embedding) COLLECT(output_head) COLLECT(projection)
-            COLLECT(output) COLLECT(post_mixer) COLLECT(per_layer_input) COLLECT(query) COLLECT(key)
-                COLLECT(value) COLLECT(output_gate) COLLECT(query_gate) COLLECT(query_key_value)
-                    COLLECT(query_key_gate_value) COLLECT(query_key) COLLECT(gate_value)
-                        COLLECT(gate) COLLECT(up) COLLECT(down) COLLECT(gate_up)
-                            COLLECT(in_projection) COLLECT(input_projection)
-                                COLLECT(control_projection) COLLECT(query_key_value_z)
-                                    COLLECT(value_z) COLLECT(z) COLLECT(a_projection)
-                                        COLLECT(b_projection) COLLECT(a_b_projection) COLLECT(split)
-                                            COLLECT(op) COLLECT(moe) COLLECT(router_shared_gate)
-                                                COLLECT(routed_gate_up) COLLECT(routed_down)
-                                                    COLLECT(shared_gate_up) COLLECT(shared_down)
-                                                        COLLECT(vision) COLLECT(common)
-                                                            COLLECT(layers) COLLECT(patch_embedding)
-                                                                COLLECT(merger_fc1)
-                                                                    COLLECT(merger_fc2) COLLECT(fc1)
-                                                                        COLLECT(fc2) COLLECT(qkv)
-                                                                            COLLECT(deepstack)
+        COLLECT(extra_linears)
+        COLLECT(second) COLLECT(full_layers) COLLECT(gdn_layers) COLLECT(token_embedding)
+            COLLECT(output_head) COLLECT(projection) COLLECT(output) COLLECT(post_mixer) COLLECT(
+                per_layer_input) COLLECT(query) COLLECT(key) COLLECT(value) COLLECT(output_gate)
+                COLLECT(query_gate) COLLECT(query_key_value) COLLECT(query_key_gate_value)
+                    COLLECT(query_key) COLLECT(gate_value) COLLECT(gate) COLLECT(up) COLLECT(down)
+                        COLLECT(gate_up) COLLECT(in_projection) COLLECT(input_projection)
+                            COLLECT(control_projection) COLLECT(query_key_value_z) COLLECT(value_z)
+                                COLLECT(z) COLLECT(a_projection) COLLECT(b_projection)
+                                    COLLECT(a_b_projection) COLLECT(split) COLLECT(op) COLLECT(moe)
+                                        COLLECT(router_shared_gate) COLLECT(routed_gate_up)
+                                            COLLECT(routed_down) COLLECT(shared_gate_up)
+                                                COLLECT(shared_down) COLLECT(vision) COLLECT(common)
+                                                    COLLECT(layers) COLLECT(patch_embedding)
+                                                        COLLECT(merger_fc1) COLLECT(merger_fc2)
+                                                            COLLECT(fc1) COLLECT(fc2) COLLECT(qkv)
+                                                                COLLECT(deepstack)
 #undef COLLECT
     }
 }
@@ -83,6 +92,74 @@ inline void bind_lora_auto(ops::LoraStore& store, int layer, const std::string& 
 }
 
 inline void bind_lora_vision(ops::LoraStore& store, const VisionWeights& vision) {
+    if (!vision.extra_linears.empty()) {
+        const auto bias = [&](const std::string& name) {
+            const auto found = vision.extra_tensors.find(name);
+            return found == vision.extra_tensors.end() ? Tensor{} : found->second;
+        };
+        const bool gemma3  = vision.extra_tensors.contains("projection_norm");
+        const bool unified = vision.extra_tensors.contains("patch_norm1/weight");
+        for (const auto& [name, weight] : vision.extra_linears) {
+            if (name == "patch_embedding") {
+                bind_lora_auto(store, -2,
+                               gemma3    ? "vision.embeddings.patch_embedding"
+                               : unified ? "vision.embed_vision.patch_dense"
+                                         : "vision.patch_embedder.input_proj",
+                               weight, bias("patch_embedding_bias"));
+                continue;
+            }
+            if (name == "projection") {
+                if (!gemma3) {
+                    bind_lora_auto(
+                        store, -2,
+                        unified ? "vision.embed_vision.multimodal_embedder.embedding_projection"
+                                : "vision.embed_vision.embedding_projection",
+                        weight);
+                }
+                continue;
+            }
+            const auto slash  = name.find('/', 7);
+            const auto layer  = name.substr(7, slash - 7);
+            const auto role   = name.substr(slash + 1);
+            const auto prefix = "vision.encoder.layers." + layer + ".";
+            if (role == "attention/qkv") {
+                for (int part = 0; part < 3; ++part) {
+                    bind_lora_auto(store, -2,
+                                   prefix + "self_attn." +
+                                       (part == 0   ? "q_proj"
+                                        : part == 1 ? "k_proj"
+                                                    : "v_proj"),
+                                   weight, bias(name + "_bias"), part * weight.n / 3, weight.n / 3,
+                                   ops::kLoraAutomaticPort + part);
+                }
+                continue;
+            }
+            std::string module;
+            if (role == "attention/query") {
+                module = "self_attn.q_proj.linear";
+            } else if (role == "attention/key") {
+                module = "self_attn.k_proj.linear";
+            } else if (role == "attention/value") {
+                module = "self_attn.v_proj.linear";
+            } else if (role == "attention/output") {
+                module = gemma3 ? "self_attn.out_proj" : "self_attn.o_proj.linear";
+            } else if (role == "mlp/gate") {
+                module = "mlp.gate_proj.linear";
+            } else if (role == "mlp/up") {
+                module = "mlp.up_proj.linear";
+            } else if (role == "mlp/down") {
+                module = "mlp.down_proj.linear";
+            } else if (role == "mlp/fc1") {
+                module = "mlp.fc1";
+            } else if (role == "mlp/fc2") {
+                module = "mlp.fc2";
+            } else {
+                throw std::logic_error("unknown Gemma vision adapter projection");
+            }
+            bind_lora_auto(store, -2, prefix + module, weight, bias(name + "_bias"));
+        }
+        return;
+    }
     const auto& common = vision.common;
     for (const std::string name :
          {"vision.patch_embed.proj", "vision.embeddings.patch_embedding"}) {

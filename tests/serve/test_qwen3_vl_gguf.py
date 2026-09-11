@@ -17,7 +17,7 @@ from surogate.serve.gguf.bridge import gguf_target_key
 from tests.serve.test_qwen3_vl import config_for, moe_config_for
 
 
-def checkpoint_pair(root, *, moe=False, vision_overrides=None, text_overrides=None):
+def checkpoint_pair(root, *, moe=False, vision_overrides=None, text_overrides=None, quantized_vision=False):
     root.mkdir(parents=True, exist_ok=True)
     config = moe_config_for() if moe else config_for()
     g = inventory.geometry_from_config(config)
@@ -96,7 +96,8 @@ def checkpoint_pair(root, *, moe=False, vision_overrides=None, text_overrides=No
             data.fill(0.25)
         kind = (
             GGMLQuantizationType.Q8_0
-            if not visual and len(source.shape) > 1 and "gate_inp" not in name
+            if len(source.shape) > 1 and ((not visual and "gate_inp" not in name) or
+                (quantized_vision and visual and len(source.shape) == 2 and name != "v.position_embd.weight"))
             else GGMLQuantizationType.F32
         )
         encoded = quantize(data, kind)
@@ -201,3 +202,15 @@ def test_unsupported_text_settings_are_not_silently_ignored(tmp_path, metadata):
     with pytest.raises(ValueError, match="requires"):
         convert(text, vision, tmp_path / "invalid.sinfer")
     assert not (tmp_path / "invalid.sinfer").exists()
+
+
+def test_quantized_vision_weights_remain_quantized(tmp_path):
+    text, vision, stored = checkpoint_pair(tmp_path, quantized_vision=True)
+    output = tmp_path / "native-vision.sinfer"
+    convert(text, vision, output)
+    with Artifact(output) as artifact:
+        for name in ("vision/layers/0/attention/qkv", "vision/layers/0/mlp/fc1", "vision/merger/fc2",
+                     "vision/layers/2/deepstack/fc1"):
+            obj = artifact.find(name)
+            assert obj.format == "Q8_0" and obj.runs, name
+        assert artifact.find("vision/position_embedding").format == "BF16"

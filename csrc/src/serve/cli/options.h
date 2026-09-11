@@ -25,6 +25,9 @@ struct Options {
     std::uint32_t host_moe_layers = 0;
     // --gpu-layers N: layers kept on the card; every later layer is read from host memory.
     std::uint32_t gpu_layers      = 0;
+    bool offload_vision = false;
+    bool offload_embeddings = false;
+    bool offload_output_head = false;
     std::uint32_t expert_slots = 0; // --expert-slots N
     EngineOptions::HostExpertBank host_expert_bank   = EngineOptions::HostExpertBank::Auto; // --host-expert-bank w8|q4 (default: q4 when the slot cache is on)
     float cpu_moe_share = 0.0F; // --cpu-moe-share F

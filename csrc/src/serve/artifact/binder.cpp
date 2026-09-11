@@ -40,8 +40,12 @@ Binder::Binder(const Reader& reader)
 }
 
 void Binder::set_offload(std::optional<std::uint32_t> gpu_layers,
-                         std::uint32_t host_moe_layers, std::uint32_t stage_first) {
+                         std::uint32_t host_moe_layers, std::uint32_t stage_first,
+                         bool vision, bool embeddings, bool output_head) {
     gpu_layers_ = gpu_layers;
+    offload_vision_ = vision;
+    offload_embeddings_ = embeddings;
+    offload_output_head_ = output_head;
     host_moe_layers_.clear();
     for (const auto& object : reader_.objects()) {
         const auto name = object_name(object);
@@ -55,6 +59,10 @@ void Binder::set_offload(std::optional<std::uint32_t> gpu_layers,
 }
 
 bool Binder::offloads(std::string_view name) const {
+    if (offload_vision_ && name.starts_with("vision/")) { return true; }
+    if (name == "text/token_embedding" &&
+        (offload_embeddings_ || (offload_output_head_ && !has("text/output_head")))) { return true; }
+    if (offload_output_head_ && name == "text/output_head") { return true; }
     const auto layer = decoder_layer(name);
     if (!layer) { return false; }
     if (gpu_layers_ && *layer >= *gpu_layers_) { return true; }

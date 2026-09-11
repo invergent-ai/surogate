@@ -81,7 +81,17 @@ struct PreprocessStats {
     [[nodiscard]] std::string summary() const;
 };
 
+struct GemmaProcessorOptions {
+    int version = 0, patch = 0, merge = 0, image_tokens = 0, video_tokens = 70;
+    int image_size = 896, position_embeddings = 0, video_token_id = 0, resample = 2;
+    bool encoder_free = false, pan_and_scan = false;
+    int min_crop_size = 256, max_crops = 4;
+    double crop_ratio = 1.2;
+    std::string image_token, video_token, boi_token, eoi_token;
+};
+
 struct ProcessorOptions {
+    GemmaProcessorOptions gemma;
     bool lfm2_vl = false;
     int image_token_id = 0;
     int lfm_min_tokens = 64;
@@ -131,6 +141,10 @@ struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
 };
+
+ProcessedInput process_gemma_vl(const Tokenizer& tokenizer, const ProcessorOptions& options,
+    MediaPreprocessCache& cache, std::vector<ChatMessage> messages, ChatRenderOptions render_options,
+    const PreparationControl& control);
 
 ProcessedInput process_lfm2_vl(const Tokenizer& tokenizer, const ProcessorOptions& options,
     MediaPreprocessCache& cache, std::vector<ChatMessage> messages, ChatRenderOptions render_options,

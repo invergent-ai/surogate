@@ -11,7 +11,6 @@
 namespace sinfer::family {
 namespace {
 
-constexpr std::int32_t kMerge        = 2;
 
 std::int32_t checked_i32(std::size_t value, const char* label) {
     if (value > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -36,16 +35,16 @@ float coordinate(std::int32_t index, std::int32_t size, std::int32_t position_si
 // features into a sequence it is building itself -- run the same tower as serving,
 // against the same control arithmetic, rather than a second implementation of it.
 VisionItemControl build_vision_item_control(const VisionGrid& grid, PromptModality modality,
-                                            std::int32_t position_embeddings) {
-    const auto position_side = position_embeddings > 0
+                                            std::int32_t position_embeddings, std::int32_t merge, bool factorized) {
+    const auto position_side = factorized ? position_embeddings : position_embeddings > 0
         ? static_cast<std::int32_t>(std::sqrt(static_cast<double>(position_embeddings))) : 0;
-    if (position_side <= 0 || static_cast<std::int64_t>(position_side) * position_side != position_embeddings) {
+    if (position_side <= 0 || (!factorized && static_cast<std::int64_t>(position_side) * position_side != position_embeddings)) {
         throw std::invalid_argument("vision position table must have a positive square row count");
     }
     const std::int32_t t = grid.temporal;
     const std::int32_t h = grid.height;
     const std::int32_t w = grid.width;
-    if (t <= 0 || h <= 0 || w <= 0 || h % kMerge != 0 || w % kMerge != 0) {
+    if (merge <= 0 || merge > 8 || t <= 0 || h <= 0 || w <= 0 || (factorized && (h > position_embeddings || w > position_embeddings)) || h % merge != 0 || w % merge != 0) {
         throw std::invalid_argument(
             "vision control grid must be positive and merge-aligned: " + std::to_string(t) + "x" +
             std::to_string(h) + "x" + std::to_string(w));
@@ -57,7 +56,7 @@ VisionItemControl build_vision_item_control(const VisionGrid& grid, PromptModali
     control.modality       = modality;
     control.grid           = grid;
     control.patch_count    = item_patches;
-    control.merged_count   = item_patches / static_cast<std::size_t>(kMerge * kMerge);
+    control.merged_count   = item_patches / static_cast<std::size_t>(merge * merge);
     control.segment_length = h * w;
     control.segment_count  = t;
     control.position_ids.resize(item_patches * 2);
@@ -73,18 +72,18 @@ VisionItemControl build_vision_item_control(const VisionGrid& grid, PromptModali
             throw std::overflow_error("vision control cu_seqlens exceeds int32");
         }
         control.cu_seqlens.push_back(static_cast<std::int32_t>(next));
-        for (std::int32_t block_y = 0; block_y < h / kMerge; ++block_y) {
-            for (std::int32_t block_x = 0; block_x < w / kMerge; ++block_x) {
-                for (std::int32_t inner_y = 0; inner_y < kMerge; ++inner_y) {
-                    for (std::int32_t inner_x = 0; inner_x < kMerge; ++inner_x) {
-                        const std::int32_t y                  = block_y * kMerge + inner_y;
-                        const std::int32_t x                  = block_x * kMerge + inner_x;
+        for (std::int32_t block_y = 0; block_y < h / merge; ++block_y) {
+            for (std::int32_t block_x = 0; block_x < w / merge; ++block_x) {
+                for (std::int32_t inner_y = 0; inner_y < merge; ++inner_y) {
+                    for (std::int32_t inner_x = 0; inner_x < merge; ++inner_x) {
+                        const std::int32_t y                  = block_y * merge + inner_y;
+                        const std::int32_t x                  = block_x * merge + inner_x;
                         control.position_ids[position_cursor] = y;
                         control.position_ids[item_patches + position_cursor] = x;
                         ++position_cursor;
 
-                        const float yf        = coordinate(y, h, position_side);
-                        const float xf        = coordinate(x, w, position_side);
+                        const float yf        = factorized ? 0.0F : coordinate(y, h, position_side);
+                        const float xf        = factorized ? 0.0F : coordinate(x, w, position_side);
                         const auto y0         = static_cast<std::int32_t>(yf);
                         const auto x0         = static_cast<std::int32_t>(xf);
                         const std::int32_t y1 = std::min(y0 + 1, position_side - 1);
@@ -114,7 +113,7 @@ VisionItemControl build_vision_item_control(const VisionGrid& grid, PromptModali
     return control;
 }
 
-VisionControl build_vision_control(const PreparedPromptData& prompt, std::int32_t position_embeddings) {
+VisionControl build_vision_control(const PreparedPromptData& prompt, std::int32_t position_embeddings, std::int32_t merge, bool factorized) {
     if (prompt.token_ids.size() != prompt.token_types.size()) {
         throw std::invalid_argument("vision control token types must cover the prompt");
     }
@@ -136,7 +135,7 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, std::int32_
             throw std::invalid_argument("vision control token spans do not match modality grid");
         }
 
-        VisionItemControl control = build_vision_item_control(item.grid, item.modality, position_embeddings);
+        VisionItemControl control = build_vision_item_control(item.grid, item.modality, position_embeddings, merge, factorized);
         control.patch_begin       = item.patch_begin;
 
         std::size_t item_tokens = 0;

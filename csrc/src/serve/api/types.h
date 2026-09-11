@@ -206,6 +206,9 @@ struct EngineOptions {
     // a model has one.
     static constexpr std::uint32_t kGpuLayersNone = 0xFFFFFFFEU;
     std::uint32_t gpu_layers           = 0;
+    bool offload_vision = false;
+    bool offload_embeddings = false;
+    bool offload_output_head = false;
 
     [[nodiscard]] std::optional<std::uint32_t> resident_layer_limit() const noexcept {
         if (gpu_layers == 0 || gpu_layers == 0xFFFFFFFFU) { return std::nullopt; }

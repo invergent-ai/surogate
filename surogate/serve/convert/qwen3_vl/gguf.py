@@ -2,27 +2,18 @@
 
 import json
 import math
-import tempfile
 from pathlib import Path
 
-from surogate.serve.artifact.container import ArtifactIdentity, ArtifactWriter
-from surogate.serve.convert.common import conversion
-from surogate.serve.convert.common.checkpoint import tokenizer_domain
-from surogate.serve.convert.common.gguf_repack import GgufRepackSource
-from surogate.serve.convert.common.gguf_source import GgufRecipeReader, GgufSource, candidate_sources
-from surogate.serve.convert.common.quantize import pick_device
+from surogate.serve.artifact.container import ArtifactIdentity
+from surogate.serve.convert.common import vision_gguf
+from surogate.serve.convert.common.gguf_source import GgufSource
 from surogate.serve.convert.common.recipe import (
     Concat,
     Reshape,
     SourceTensor,
     TensorRecipe,
-    expression_sources,
-    materialize_recipe,
-    validate_recipe_coverage,
 )
 from surogate.serve.gguf.bridge import synthesised_config
-from surogate.serve.gguf.frontend import extract_generation_config, write_frontend
-from surogate.serve.gguf.lean import LeanGguf
 
 from . import inventory
 
@@ -101,27 +92,8 @@ def config_from_gguf(text, vision):
 
 
 def find_projector(text_path, explicit=None):
-    """Select only an unambiguous compatible local projector; never guess by model name."""
-    text_path = Path(text_path)
-    with LeanGguf(text_path) as text:
-        candidates = (
-            [Path(explicit).expanduser().resolve()] if explicit else sorted(text_path.parent.glob("*mmproj*.gguf"))
-        )
-        compatible = []
-        for path in candidates:
-            try:
-                with LeanGguf(path) as vision:
-                    inventory.geometry_from_config(config_from_gguf(text, vision))
-                compatible.append(path)
-            except (ValueError, OSError, KeyError, TypeError) as error:
-                if explicit:
-                    raise ValueError(f"incompatible --mmproj {path}: {error}") from error
-        if len(compatible) != 1:
-            raise ValueError(
-                "Qwen3-VL GGUF requires a matching vision projector; pass --mmproj PATH "
-                f"({len(compatible)} compatible projectors found beside the text GGUF)"
-            )
-        return compatible[0].resolve()
+    return vision_gguf.find_projector(text_path, explicit,
+        lambda text, vision: inventory.geometry_from_config(config_from_gguf(text, vision)))
 
 
 def build_recipes(g, tied):
@@ -239,83 +211,26 @@ def convert(text_path, projector_path, output, *, device="cpu"):
             for s in inventory.build_tensor_specs(g)
         )
         recipes = build_recipes(g, config["tie_word_embeddings"])
-        validate_recipe_coverage(recipes, specs)
-        for recipe in recipes:
-            for requirement in expression_sources(recipe.expression):
-                actual = source.tensor(requirement.name)
-                if actual.shape != requirement.shape:
-                    raise ValueError(f"{requirement.name}: shape {actual.shape} != {requirement.shape}")
-        recipe_map = {r.object_name: r for r in recipes}
-        repack = GgufRepackSource.from_sources(source.shards, candidate_sources(source))
-        native = repack.plan_native(recipe_map, specs)
-        native_specs = GgufRepackSource.native_specs(specs, native)
-        runs = {s.name: repack.runs_for_native(s, recipe_map[s.name], None) for s in native_specs if s.name in native}
-        specs = GgufRepackSource.native_specs(specs, native, runs)
-        with tempfile.TemporaryDirectory(prefix="surogate-vl-frontend-") as temp:
-            frontend = Path(temp)
-            write_frontend(source.readers[0], source.kv("general.architecture"), frontend)
-            (frontend / "generation_config.json").write_text(json.dumps(extract_generation_config(source.readers[0])))
-            resources = {r.name: r.data for r in conversion.load_resources(frontend, inventory.RESOURCE_SPECS)}
-            image = {
-                "image_processor_type": "Qwen3VLImageProcessor",
-                "processor_class": "Qwen3VLProcessor",
-                "patch_size": 16,
-                "temporal_patch_size": 2,
-                "merge_size": 2,
-                "image_mean": source.kv("clip.vision.image_mean"),
-                "image_std": source.kv("clip.vision.image_std"),
-                "size": {
-                    "shortest_edge": source.kv("clip.vision.image_min_pixels", 65536),
-                    "longest_edge": source.kv("clip.vision.image_max_pixels", 16777216),
-                },
-            }
-            if not image["image_mean"] or not image["image_std"]:
-                raise ValueError("vision GGUF is missing image normalization metadata")
-            resources["frontend/preprocessor_config.json"] = json.dumps(image).encode()
-            resources["frontend/video_preprocessor_config.json"] = json.dumps(
-                {
-                    **image,
-                    "video_processor_type": "Qwen3VLVideoProcessor",
-                    "fps": 2.0,
-                    "min_frames": 4,
-                    "max_frames": 768,
-                }
-            ).encode()
-            plan = conversion.build_object_plan((*specs, *inventory.RESOURCE_SPECS), resources)
-            reader = GgufRecipeReader(source)
-            Path(output).parent.mkdir(parents=True, exist_ok=True)
-            with ArtifactWriter(
-                output,
-                ArtifactIdentity(g.architecture, inventory.WEIGHTS_ID, architecture=g.architecture),
-                plan.specs,
-                external=tuple((str(p.resolve()), p.stat().st_size) for p in source.shards),
-                geometry=inventory.geometry_block(g, token_domain=tokenizer_domain(frontend)),
-                layer_types=["full_attention"] * g.layers,
-                vision_geometry=g.vision,
-            ) as writer:
-                for spec in plan.specs:
-                    if getattr(spec, "runs", ()):
-                        continue
-                    payload = resources.get(spec.name)
-                    if payload is None:
-                        tensor = materialize_recipe(recipe_map[spec.name], reader)
-                        if spec.format == inventory.BF16:
-                            tensor = tensor.bfloat16()
-                        payload = conversion.encode_tensor_payload(tensor, spec, pick_device(device))
-                    writer.write(spec.name, payload)
-        Path(str(output) + ".conversion.json").write_text(
-            json.dumps(
-                {
-                    "architecture": g.architecture,
-                    "sources": [str(p) for p in source.shards],
-                    "native_objects": len(native),
-                    "objects": len(plan.specs),
-                },
-                indent=2,
-            )
-            + "\n"
-        )
-        return Path(output)
+        resources, domain = vision_gguf.frontend_resources(source.readers[0], inventory.RESOURCE_SPECS)
+        image = {
+            "image_processor_type": "Qwen3VLImageProcessor", "processor_class": "Qwen3VLProcessor",
+            "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+            "image_mean": source.kv("clip.vision.image_mean"), "image_std": source.kv("clip.vision.image_std"),
+            "size": {"shortest_edge": source.kv("clip.vision.image_min_pixels", 65536),
+                     "longest_edge": source.kv("clip.vision.image_max_pixels", 16777216)},
+        }
+        if not image["image_mean"] or not image["image_std"]:
+            raise ValueError("vision GGUF is missing image normalization metadata")
+        resources["frontend/preprocessor_config.json"] = json.dumps(image).encode()
+        resources["frontend/video_preprocessor_config.json"] = json.dumps({
+            **image, "video_processor_type": "Qwen3VLVideoProcessor", "fps": 2.0,
+            "min_frames": 4, "max_frames": 768}).encode()
+        return vision_gguf.write_artifact(source, output,
+            identity=ArtifactIdentity(g.architecture, inventory.WEIGHTS_ID, architecture=g.architecture),
+            geometry=inventory.geometry_block(g, token_domain=domain), vision_geometry=g.vision,
+            layer_types=["full_attention"] * g.layers, specs=specs, recipes=recipes, resources=resources,
+            device=device)
+
     finally:
         source.close()
 

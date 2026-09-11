@@ -16,6 +16,7 @@ namespace sinfer::family::frontend_internal {
 
 struct EncodeOptions {
     bool parse_added_tokens = true;
+    bool add_bos = true;
 };
 
 struct DecodeOptions {

@@ -55,6 +55,13 @@ int main() {
             require(parse(gen, {"generate", "model.sinfer", "--prompt", "x", flag, "all"}).gpu_layers == 0,
                     "all GPU layers did not restore default residency");
         }
+        const auto offload_gen = parse(gen, {"generate", "model.sinfer", "--prompt", "x",
+            "--offload-vision", "--offload-embeddings", "--offload-output-head"});
+        const auto offload_server = parse(server, {"serve", "model.sinfer",
+            "--offload-vision", "--offload-embeddings", "--offload-output-head"});
+        require(offload_gen.offload_vision && offload_gen.offload_embeddings && offload_gen.offload_output_head &&
+                    offload_server.offload_vision && offload_server.offload_embeddings && offload_server.offload_output_head,
+                "component offload options lost");
         const auto g = parse(gen, {"generate", "model.sinfer", "--prompt", "--embed",
             "--host-expert-bank", "q4", "--host-expert-bank", "auto", "--host-moe-layers", "0",
             "--expert-slots", "0", "--cpu-moe-min-tokens", "0", "--cpu-moe-share", "auto",
@@ -86,7 +93,7 @@ int main() {
                 "sampling overrides lost");
 
         for (const auto value : {"other=m.sinfer,kv-tokens=-1", "other=m.sinfer,kv-tokens=1junk",
-                "other=m.sinfer,max-num-seqs=4294967297", "other=m.sinfer,max-num-seqs=129",
+                "other=m.sinfer,max-num-seqs=4294967297",
                 "other=m.sinfer,max-model-len=0", "other=m.sinfer,draft-tokens=2",
                 "other=m.sinfer,spec=mtp,draft-tokens=6", "other=m.sinfer,spec-max-lanes=all",
                 "other=m.sinfer,kv-tokens=128,max-model-len=256"}) {

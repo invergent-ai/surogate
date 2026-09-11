@@ -72,7 +72,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         // so a decode round is one column per lane.
         const std::uint32_t widest =
             std::max<std::uint32_t>(std::max<std::uint32_t>(decode_batch_capacity(options.max_concurrency), 1),
-                                    std::max<std::uint32_t>(options.prefill_chunk, 1));
+                                    std::max<std::uint32_t>(family::lora_prefill_columns(runtime.vision_geometry, options), 1));
         store.configure(static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_slots, 1)),
                         static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_max_rank, 1)),
                         static_cast<std::int32_t>(widest));
@@ -145,7 +145,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile weights_profile) {
     binder.set_layer_range(options.pipeline_stage_first, options.pipeline_stage_last);
     binder.set_offload(options.resident_layer_limit(), options.host_moe_layers,
-                       static_cast<std::uint32_t>(options.pipeline_stage_first));
+                       static_cast<std::uint32_t>(options.pipeline_stage_first),
+                       options.offload_vision, options.offload_embeddings, options.offload_output_head);
     auto plan = detail::bind_artifact(binder, weights_profile, family::startup_features(options),
                               options.host_moe_layers, options.gpu_layers,
                               options.load_progress);
@@ -164,7 +165,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
     return family::make_frontend(
         model.impl_->data.frontend,
         family::FrontendOptions{
-            .vision_enabled = false,
+            .vision_enabled = model.impl_->data.runtime.features.vision,
             .max_context    = options.max_context,
             .media_cache_bytes        = options.media_cache_bytes,
             .media_live_bytes         = options.media_live_bytes,

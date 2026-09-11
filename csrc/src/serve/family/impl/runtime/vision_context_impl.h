@@ -67,6 +67,10 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         if (use.end <= begin) { continue; }
         if (use.begin >= end) { break; }
         if (active == nullptr) {
+            if (context_.geometry().attention_mode && begin < use.begin) { end = use.begin; break; }
+            if (context_.geometry().attention_mode && end < use.end) {
+                throw std::logic_error("image attention block exceeds prefill workspace");
+            }
             active = &use;
         } else {
             end = std::min(end, use.begin);

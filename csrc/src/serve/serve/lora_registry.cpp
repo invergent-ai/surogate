@@ -375,6 +375,9 @@ bool split_module(const std::string& module, std::int32_t& layer, std::string& k
         "model.vision_model.", "vision_model.", "model.visual.", "visual.", "model.vision_tower.", "vision_tower."}) {
         if (module.starts_with(prefix)) { layer = -2; kind = "vision." + module.substr(prefix.size()); return true; }
     }
+    for (const std::string_view prefix : {"model.embed_vision.", "embed_vision."}) {
+        if (module.starts_with(prefix)) { layer = -2; kind = "vision.embed_vision." + module.substr(prefix.size()); return true; }
+    }
     for (const std::string_view prefix : {"model.multi_modal_projector.", "multi_modal_projector."}) {
         if (module.starts_with(prefix)) { layer = -2; kind = "vision.projector." + module.substr(prefix.size()); return true; }
     }

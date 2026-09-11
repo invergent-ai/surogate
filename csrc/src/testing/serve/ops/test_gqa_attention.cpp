@@ -1,4 +1,5 @@
 #include "core/arena.h"
+#include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "api/ops/gqa_attention.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
@@ -89,6 +90,7 @@ struct AttentionCase {
     /// Causal sliding window in keys, 0 for unbounded. A query at absolute
     /// position i admits keys j with `i - j < sliding_window`.
     std::int32_t sliding_window = 0;
+    std::int32_t image_begin = 0, image_end = 0;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -462,7 +464,7 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
 
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
                                     const std::vector<std::int32_t>& positions,
-                                    std::int32_t sliding_window = 0) {
+                                    std::int32_t sliding_window = 0, std::int32_t image_begin = 0, std::int32_t image_end = 0) {
     const Geometry& geometry  = cache.geometry;
     const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
     std::vector<double> output(static_cast<std::size_t>(geometry.head_dim) *
@@ -472,10 +474,11 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
     std::vector<double> scores(static_cast<std::size_t>(positions.back()) + 1);
     std::vector<double> probabilities(scores.size());
     for (std::int32_t token = 0; token < tokens; ++token) {
-        const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
+        const std::int32_t query = positions[static_cast<std::size_t>(token)];
+        const std::int32_t visible = query >= image_begin && query < image_end ? image_end : query + 1;
         // A window drops the oldest keys, so the sum runs over [first, visible).
         const std::int32_t first =
-            sliding_window > 0 ? std::max(0, visible - sliding_window) : 0;
+            sliding_window > 0 ? std::max(0, query + 1 - sliding_window) : 0;
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
             double max_score           = -std::numeric_limits<double>::infinity();
@@ -978,7 +981,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference =
-        ideal_attention(q, expected, positions, test_case.sliding_window);
+        ideal_attention(q, expected, positions, test_case.sliding_window, test_case.image_begin, test_case.image_end);
     DeviceCache cache(initial, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1020,7 +1023,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, attention_scale(geometry), cache.batch_view(),
-                       envelope, workspace, tout, nullptr);
+                       envelope, workspace, tout, nullptr, {.image_begin=test_case.image_begin,.image_end=test_case.image_end});
     cuda_synchronize();
 
     const std::string label = case_label("gqa_attention", geometry, dtype, test_case, mapping);
@@ -1036,7 +1039,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     failures += verify_positions(label + " table row unchanged", dtable_row, {table_row});
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (workspace.used() != 0 || workspace.peak_used() != (test_case.image_end ? 0 : workspace_bytes)) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -1060,7 +1063,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
 
     const HostCache cache_host = make_cache(geometry, dtype, max_context, test_case.seed + 10u);
     const std::vector<double> reference =
-        ideal_attention(q, cache_host, positions, test_case.sliding_window);
+        ideal_attention(q, cache_host, positions, test_case.sliding_window, test_case.image_begin, test_case.image_end);
     DeviceCache cache(cache_host, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1090,7 +1093,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     ops::gqa_attention_cached(tq, tp, attention_scale(geometry), cache.view(), envelope, workspace, tout,
-                              nullptr);
+                              nullptr, {.image_begin=test_case.image_begin,.image_end=test_case.image_end});
     cuda_synchronize();
 
     const std::string label =
@@ -1104,7 +1107,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (workspace.used() != 0 || workspace.peak_used() != (test_case.image_end ? 0 : workspace_bytes)) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -1414,16 +1417,88 @@ int run_geometry(const Geometry& geometry) {
 // the head counts into its addressing, so the wrong one reads the wrong strides.
 // Driven off the registry macro, so registering a shape extends this coverage by
 // itself.
+int verify_fp8_image_attention() {
+    int failures = 0;
+    constexpr int dim = 256, tokens = 130;
+    for (const auto [heads, kv_heads] : {std::pair{8, 1}, std::pair{12, 4}}) {
+        DeviceArena arena(16U << 20);
+        Tensor q = arena.alloc(DType::BF16, {dim, heads, tokens});
+        Tensor k = arena.alloc(DType::BF16, {dim, kv_heads, tokens});
+        Tensor v = arena.alloc(DType::BF16, {dim, kv_heads, tokens});
+        Tensor positions = arena.alloc(DType::I32, {tokens});
+        Tensor output = arena.alloc(DType::BF16, {dim, heads, tokens});
+        CUDA_CHECK(cudaMemset(q.data, 0, q.bytes()));
+        CUDA_CHECK(cudaMemset(k.data, 0, k.bytes()));
+        std::vector<std::uint16_t> values(std::size_t(dim) * kv_heads * tokens);
+        std::vector<int> pos(tokens);
+        for (int t = 0; t < tokens; ++t) {
+            pos[t] = t;
+            const auto value = f32_to_bf16(t < 60 ? -1.0F : t < 100 ? 3.0F : 7.0F);
+            std::fill_n(values.begin() + std::size_t(t) * dim * kv_heads, dim * kv_heads, value);
+        }
+        CUDA_CHECK(cudaMemcpy(v.data, values.data(), v.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(positions.data, pos.data(), positions.bytes(), cudaMemcpyHostToDevice));
+        PagedKVLayerView cache;
+        cache.head_dim = dim;
+        cache.num_kv_heads = kv_heads;
+        cache.dtype = DType::FP8_E4M3FN;
+        cache.k_pages = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, 4});
+        cache.v_pages = arena.alloc(cache.dtype, {dim, kPagedKVPageSize, kv_heads, 4});
+        cache.block_table = arena.alloc(DType::I32, {3});
+        const int table[3] = {2, 0, 3};
+        CUDA_CHECK(cudaMemcpy(cache.block_table.data, table, sizeof(table), cudaMemcpyHostToDevice));
+        ops::gqa_kv_append(k, v, positions, cache, nullptr);
+        for (const int window : {0, 32}) {
+            for (const int width : {1, tokens}) {
+                const int begin = width == 1 ? 60 : 0;
+                Tensor queries = q.slice(2, begin, width), query_positions = positions.slice(0, begin, width);
+                Tensor result = output.slice(2, 0, width);
+                WorkspaceArena scratch(DeviceSpan{});
+                ops::gqa_attention_cached(queries,
+                                          query_positions,
+                                          1.0F / 16.0F,
+                                          cache,
+                                          {static_cast<std::uint32_t>(begin + width), tokens, window},
+                                          scratch,
+                                          result,
+                                          nullptr,
+                                          {.image_begin = 40, .image_end = 100});
+                cuda_synchronize();
+                std::vector<std::uint16_t> actual(result.bytes() / 2);
+                CUDA_CHECK(cudaMemcpy(actual.data(), result.data, result.bytes(), cudaMemcpyDeviceToHost));
+                for (int t = 0; t < width; ++t) {
+                    const int query = begin + t, last = query >= 40 && query < 100 ? 100 : query + 1;
+                    const int first = window ? std::max(0, query - window + 1) : 0;
+                    float expected = 0;
+                    for (int j = first; j < last; ++j) {
+                        expected += j < 60 ? -1.0F : j < 100 ? 3.0F : 7.0F;
+                    }
+                    expected /= last - first;
+                    for (int d = 0; d < dim * heads; ++d) {
+                        if (std::abs(bf16_to_f32(actual[std::size_t(t) * dim * heads + d]) - expected) > .025F) {
+                            std::cerr << "FP8 image attention mask mismatch at query " << query << "\n";
+                            ++failures;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 int verify_geometry_registration_contract() {
     int failures = 0;
     constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
-    const auto accepted = [&](std::int32_t head_dim, std::int32_t q_heads,
-                              std::int32_t kv_heads) {
+    const auto accepted = [&](std::int32_t head_dim, std::int32_t q_heads, std::int32_t kv_heads) {
         try {
             (void)ops::gqa_attention_workspace_capacity_bytes(head_dim, q_heads, kv_heads,
                                                               DType::BF16, envelope, 1, 1, 8);
             return true;
-        } catch (const std::invalid_argument&) { return false; }
+        } catch (const std::invalid_argument&) {
+            return false;
+        }
     };
 
 #define SINFER_GQA_REGISTERED_CASE(Name)                                                           \
@@ -1508,6 +1583,7 @@ int main() {
     int failures = 0;
     failures += verify_geometry_registration_contract();
     failures += verify_workspace_capacity_contract();
+    failures += verify_fp8_image_attention();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     for (const Geometry geometry : {Geometry{"fallback_16q8_d64", 16, 8, 64},
                                     Geometry{"fallback_12q4_d256", 12, 4, 256}}) {
@@ -1521,6 +1597,20 @@ int main() {
         if (geometry.head_dim >= 128) {
             failures += run_batch_case(geometry, DType::I8,
                 {3, {61, 127}, {3, 2}, {1, 0}, MappingPattern::Fragmented, 2201U});
+        }
+    }
+    for (const Geometry geometry : {Geometry{"gemma3_image",8,4,256}, Geometry{"gemma4_image",8,1,256}}) {
+        for (const auto dtype : {DType::BF16,DType::I8}) {
+            for (const int window : {0,32}) {
+                for (const int tokens : {1,3,17,130}) {
+                    // Includes queries before, within and after the image, across page/tile boundaries.
+                    const int begin = tokens > 3 ? 65 : 61;
+                    const int end = tokens > 3 ? 61+tokens-2 : 61+tokens;
+                    const AttentionCase image_case{tokens,61,256,2600U+tokens,window,begin,end};
+                    failures += run_a1_case(geometry,dtype,image_case,MappingPattern::Fragmented);
+                    failures += run_a3_case(geometry,dtype,image_case,MappingPattern::Fragmented);
+                }
+            }
         }
     }
     failures += run_batch_cases();

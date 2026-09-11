@@ -1,4 +1,5 @@
 #include "family/vision_standalone.h"
+#include "family/impl/load/gemma_vision.h"
 
 #include "artifact/binder.h"
 #include "artifact/typed_binding.h"
@@ -115,12 +116,19 @@ StandaloneVisionTower::StandaloneVisionTower(const std::filesystem::path& artifa
         throw std::runtime_error(artifact.string() + " declares no vision tower");
     }
     state_->geometry = VisionGeometry::resolved(state_->reader.vision_geometry());
-    const TowerPlan plan = bind_tower(binder, state_->geometry);
-    // The text model, the frontend resources and everything else this checkpoint ships are
-    // deliberately not read: the caller asked for a tower.
-    binder.discard_unconsumed();
-    state_->backing = artifact::materialize(state_->reader, binder.finish(), state_->device);
-    state_->weights = take_tower(state_->backing, plan, state_->geometry);
+    if (state_->geometry.gemma_version) {
+        GemmaVisionPlan plan;
+        TextGeometry text{}; text.hidden = state_->geometry.output_hidden;
+        bind_gemma_vision(binder,plan,text,true);
+        binder.discard_unconsumed();
+        state_->backing = artifact::materialize(state_->reader,binder.finish(),state_->device);
+        state_->weights = materialize_gemma_vision(state_->backing,plan);
+    } else {
+        const TowerPlan plan = bind_tower(binder, state_->geometry);
+        binder.discard_unconsumed();
+        state_->backing = artifact::materialize(state_->reader, binder.finish(), state_->device);
+        state_->weights = take_tower(state_->backing, plan, state_->geometry);
+    }
 
     // The tower's own output width is the contract the merger was trained against, so it
     // stands in for the text model this loader does not have.
@@ -149,7 +157,7 @@ std::size_t StandaloneVisionTower::output_bytes(const VisionGrid& grid) const {
 void StandaloneVisionTower::encode(std::span<const std::uint16_t> patches, const VisionGrid& grid,
                                    PromptModality modality, Tensor& output) {
     const VisionItemControl control = build_vision_item_control(
-        grid, modality, state_->geometry.position_embeddings);
+        grid, modality, state_->geometry.position_embeddings, state_->geometry.merge, state_->geometry.gemma_version == 4);
     const std::size_t needed = VisionContext::workspace_bytes(state_->geometry, control);
     if (!state_->workspace || state_->workspace->capacity() < needed) {
         state_->workspace.emplace(needed);

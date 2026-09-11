@@ -53,7 +53,7 @@ __global__ void gqa_attention_generic_kernel(
     const auto* table = metadata.block_table();
     float result[16] = {};
     float maximum = -CUDART_INF_F, denominator = 0.0F;
-    for (int key = first; key <= last; ++key) {
+    for (int key = first; key <= selection.last_key(last); ++key) {
         if (selection.words != nullptr) {
             const int block = key / selection.block;
             if (((selection.words[static_cast<std::int64_t>(token) * selection.stride +
@@ -200,7 +200,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const __half*>(cache_k_scale.data),
                 static_cast<const __half*>(cache_v_scale.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+                static_cast<__nv_bfloat16*>(out.data), tokens, selection);
     } else if (cache.dtype == DType::FP8_E4M3FN) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
@@ -225,7 +225,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                     static_cast<const std::uint8_t*>(cache_k.data),
                     static_cast<const std::uint8_t*>(cache_v.data), metadata,
                     static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+                    static_cast<__nv_bfloat16*>(out.data), tokens, selection);
         }
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
@@ -248,7 +248,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                     static_cast<const __nv_bfloat16*>(cache_k.data),
                     static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
                     static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+                    static_cast<__nv_bfloat16*>(out.data), tokens, selection);
         }
     }
     CUDA_CHECK(cudaGetLastError());

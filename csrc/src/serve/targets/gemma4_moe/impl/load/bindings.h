@@ -1,4 +1,5 @@
 #pragma once
+#include "family/impl/load/gemma_vision.h"
 
 #include "family/impl/moe/banked_experts.h"
 
@@ -142,7 +143,7 @@ struct TextLayerPlan {
     MlpPlan mlp;
 };
 
-struct BindingPlan {
+struct BindingPlan : family::GemmaVisionPlan {
     /// The dimensions bound against: the compiled config with the artifact's `geometry`
     /// member laid over it. For this target that member also carries the *second* head
     /// geometry and the window schedule, because neither can be compiled for two sizes.

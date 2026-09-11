@@ -12,6 +12,13 @@ namespace sinfer::family {
 
 /// Tower dimensions and execution settings resolved from the checkpoint.
 struct VisionGeometry {
+    std::int32_t gemma_version = 0;
+    std::int32_t gemma_pad_token = 0;
+    std::int32_t encoder_free = 0;
+    std::int32_t clipped_linears = 0;
+    std::int32_t standardize = 0;
+    std::int32_t attention_mode = 0;
+    std::int32_t max_image_tokens = 0;
     std::int32_t deepstack_layers = 0;
     std::int32_t siglip2 = 0;
     std::int32_t projector_hidden = 0;
@@ -50,9 +57,13 @@ struct VisionGeometry {
         VisionGeometry g;
         g.override_from(values);
 #define SINFER_GEOMETRY_INT(name) \
-        if (std::string_view(#name) != "siglip2" && std::string_view(#name) != "projector_hidden" && \
+        if (std::string_view(#name) != "gemma_pad_token" && std::string_view(#name) != "gemma_version" && std::string_view(#name) != "encoder_free" && \
+            std::string_view(#name) != "clipped_linears" && std::string_view(#name) != "standardize" && \
+            std::string_view(#name) != "attention_mode" && std::string_view(#name) != "max_image_tokens" && \
+            !(g.encoder_free && std::string_view(#name) == "layers") && \
+            std::string_view(#name) != "siglip2" && std::string_view(#name) != "projector_hidden" && \
             std::string_view(#name) != "projector_norm" && std::string_view(#name) != "deepstack_layers" && \
-            !(g.siglip2 && (std::string_view(#name) == "rotary_dim" || std::string_view(#name) == "rope_theta")) && \
+             !((g.siglip2 || g.gemma_version == 3 || g.encoder_free) && (std::string_view(#name) == "rotary_dim" || std::string_view(#name) == "rope_theta")) && \
             (!values.contains(#name) || g.name <= 0)) { \
             throw std::invalid_argument("missing or invalid vision_geometry." #name); \
         }
@@ -60,6 +71,11 @@ struct VisionGeometry {
 #include "vision_geometry_fields.inc"
 #undef SINFER_GEOMETRY_INT
 #undef SINFER_GEOMETRY_FLOAT
+        if ((g.gemma_version != 0 && g.gemma_version != 3 && g.gemma_version != 4) ||
+            g.encoder_free > 1 || g.clipped_linears > 1 || g.standardize > 1 || g.attention_mode > 2 ||
+            (g.gemma_version && (g.siglip2 || g.deepstack_layers || g.max_image_tokens <= 0))) {
+            throw std::invalid_argument("invalid Gemma vision geometry");
+        }
         if (g.siglip2 && (g.siglip2 != 1 || g.projector_hidden <= 0 || g.projector_norm > 1 ||
                          g.rotary_dim != 0 || g.merge != 2)) {
             throw std::invalid_argument("invalid SigLIP2 projector geometry");

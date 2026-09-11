@@ -129,7 +129,7 @@ surogate serve LiquidAI/LFM2-8B-A1B --port 8080
 A local LFM2-MoE GGUF also works. GGUFs are prepared as 8-bit serving weights, so a
 lower-bit download needs more disk space and GPU memory after preparation.
 
-For images, use an LFM2-VL or LFM2.5-VL safetensors checkpoint with `--vision`:
+For images or video, use an LFM2-VL or LFM2.5-VL checkpoint with `--vision`:
 
 ```bash
 surogate serve LiquidAI/LFM2-VL-450M --vision --port 8080
@@ -137,11 +137,31 @@ surogate serve LiquidAI/LFM2-VL-450M --vision --port 8080
 
 Send images through the chat API using `image_url` content parts, as shown in the
 [API guide](api.md). Large images are resized or split automatically using the checkpoint's
-processor settings. Multiple images and text-only requests are supported. Video input and
-VL GGUF files are not supported yet.
+processor settings. Multiple images and text-only requests are supported. Videos are sampled
+into timestamped image frames. For GGUF releases, pass the text GGUF and its matching projector
+with `--mmproj`; see the [vision options](cli.md#vision).
 
 Use `--devices` to split the text decoder across GPUs. LFM2-MoE and LFM2-VL support
 loading adapters separately; see [supported adapter modules](cli.md#lora-adapters).
+
+## Gemma images and video
+
+Enable `--vision` for a Gemma 3 or Gemma 4 checkpoint that includes image support:
+
+```bash
+surogate serve google/gemma-3-4b-it --vision --port 8080
+surogate serve google/gemma-4-E2B-it --vision --devices 0,1 --port 8080
+```
+
+Use `image_url` or `video_url` content parts in chat requests, or the equivalent Responses
+inputs. Gemma 3 receives sampled video frames as separate images. Its configured image crops
+are applied automatically. Gemma 4 supports dense, E-series, and MoE checkpoints, including
+the 12B unified release. Text-only Gemma checkpoints require a vision-enabled checkpoint
+for media requests.
+
+For a GGUF, supply the matching projector with `--mmproj`. To save GPU memory, add
+`--offload-vision`, `--offload-embeddings`, or `--offload-output-head`. These options also
+work when the decoder spans multiple GPUs.
 
 ## A model larger than the card
 
@@ -159,9 +179,10 @@ surogate serve models/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf \
 fewer MoE layers. `--host-moe-layers auto` chooses enough offload to fit, on one GPU or across
 several GPUs. Every supported generation model also accepts `--gpu-layers N`: it keeps the
 first N decoder layers on the GPU and uses RAM for the rest. `--gpu-layers 0` offloads every
-decoder layer; `--gpu-layers all` keeps them on the GPU. Other model weights and the request
-cache still need GPU memory. For MoE models, offloading just the experts usually gives a better
-speed tradeoff.
+decoder layer; `--gpu-layers all` keeps them on the GPU. Add `--offload-vision`,
+`--offload-embeddings`, or `--offload-output-head` to move those components to RAM too.
+The request cache and computation still need GPU memory. For MoE models, offloading just
+the experts usually gives a better speed tradeoff.
 
 Offloaded weight memory cannot be swapped out, so leave enough RAM for the operating system
 and other applications. Loading large offloaded models also takes time on every start, even

@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <map>
 
 namespace sinfer::family {
 
@@ -115,6 +116,8 @@ struct VisionWeights {
         Weight fc1, fc2;
         Tensor fc1_bias, fc2_bias, norm_weight, norm_bias;
     };
+    std::map<std::string, Weight> extra_linears;
+    std::map<std::string, Tensor> extra_tensors;
     VisionCommonWeights common;
     Weight merger_fc2;
     Tensor merger_fc2_bias;

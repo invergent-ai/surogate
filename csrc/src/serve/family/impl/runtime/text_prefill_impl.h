@@ -28,7 +28,7 @@ struct LoraPrefillScope {
         ops::LoraRound round;
         round.uniform = true;
         round.scratch = ops::lora_store_for_current_device().scratch(columns);
-        if (round.scratch.data == nullptr) { return; }
+        if (round.scratch.data == nullptr) { throw std::logic_error("adapter prefill exceeds configured scratch capacity"); }
         ops::lora_store_for_current_device().write_uniform_slot(slot, stream);
         round.uniform_cell = ops::lora_store_for_current_device().uniform_cell();
         ops::lora_set_round(round);

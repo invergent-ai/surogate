@@ -249,7 +249,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
     const int tile_rows     = min(Br, tokens - q0);
-    const int max_query_abs = base_pos + q0 + tile_rows - 1;
+    const int max_query_abs = block_mask.tile_last_key(base_pos + q0, base_pos + q0 + tile_rows - 1);
     const int n_block_max   = (max_query_abs / Bc) + 1;
     // A window makes the oldest keys invisible to every query in this tile, so
     // the loop need not start at zero. The tile's earliest query sits at
@@ -352,7 +352,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // still within the window of its newest query.
         const bool full_score_tile = !Sparse && (q0 + Br <= tokens) &&
                                      ((k0 + Bc - 1) <= (base_pos + q0)) &&
-                                     gqa_within_window(max_query_abs, k0, metadata.window);
+                                     gqa_within_window(max_query_abs, k0, metadata.window) && block_mask.image_end == 0;
         const std::uint32_t* mask0 =
             Sparse && qrow0 < tokens
                 ? block_mask.words + static_cast<std::int64_t>(qrow0) * block_mask.stride
@@ -375,19 +375,19 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0] = (qrow0 < tokens && key0 <= qabs0 && gqa_within_window(qabs0, key0, metadata.window) &&
+                score[nt][0] = (qrow0 < tokens && key0 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key0, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
                                    ? score[nt][0]
                                    : -CUDART_INF_F;
-                score[nt][1] = (qrow0 < tokens && key1 <= qabs0 && gqa_within_window(qabs0, key1, metadata.window) &&
+                score[nt][1] = (qrow0 < tokens && key1 <= block_mask.last_key(qabs0) && gqa_within_window(qabs0, key1, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
                                    ? score[nt][1]
                                    : -CUDART_INF_F;
-                score[nt][2] = (qrow1 < tokens && key0 <= qabs1 && gqa_within_window(qabs1, key0, metadata.window) &&
+                score[nt][2] = (qrow1 < tokens && key0 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key0, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
                                    ? score[nt][2]
                                    : -CUDART_INF_F;
-                score[nt][3] = (qrow1 < tokens && key1 <= qabs1 && gqa_within_window(qabs1, key1, metadata.window) &&
+                score[nt][3] = (qrow1 < tokens && key1 <= block_mask.last_key(qabs1) && gqa_within_window(qabs1, key1, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
                                    ? score[nt][3]
                                    : -CUDART_INF_F;

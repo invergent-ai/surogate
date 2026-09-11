@@ -1,4 +1,11 @@
 // Generated from surogate/serve/artifact/geometry.py. Do not edit.
+SINFER_GEOMETRY_INT(gemma_version)
+SINFER_GEOMETRY_INT(gemma_pad_token)
+SINFER_GEOMETRY_INT(encoder_free)
+SINFER_GEOMETRY_INT(clipped_linears)
+SINFER_GEOMETRY_INT(standardize)
+SINFER_GEOMETRY_INT(attention_mode)
+SINFER_GEOMETRY_INT(max_image_tokens)
 SINFER_GEOMETRY_INT(deepstack_layers)
 SINFER_GEOMETRY_INT(siglip2)
 SINFER_GEOMETRY_INT(projector_hidden)

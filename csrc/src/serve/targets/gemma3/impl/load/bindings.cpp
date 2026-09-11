@@ -142,15 +142,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // exactly as it did.
     out.geometry = family::TextGeometry::resolved_gemma3(binder.reader().geometry(), binder.reader().layer_types());
     const family::TextGeometry& g = out.geometry;
-    out.frontend     = family::bind_text_only_frontend_resources(binder);
+    out.frontend     = (binder.has("vision/patch_embedding") ? family::bind_frontend_resources(binder) : family::bind_text_only_frontend_resources(binder));
     out.features     = features;
 
-    if (features.vision) {
-        // Gemma 3 has vision-capable sizes; 270M is not one of them. The
-        // checkpoint is `Gemma3ForCausalLM`, not `Gemma3ForConditionalGeneration`,
-        // and the artifact carries no tower.
-        throw std::runtime_error("gemma3-270m is a text-only target: --vision is unsupported");
-    }
+    family::bind_gemma_vision(binder,out,g,features.vision);
     if (features.speculative_enabled()) {
         // Gemma 3 ships no MTP block and the target declares no DFlash tower, so
         // there is nothing to draft with. Refusing here beats a missing-object
@@ -203,7 +198,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     // Every layer of a dense decoder attends.
     runtime.full_layers.resize(static_cast<std::size_t>(g.layers));
     runtime.gdn_layers.resize(kGdnLayers);
-    frontend = family::take_text_only_frontend_resources(backing, plan.frontend);
+    frontend = plan.vision_geometry.gemma_version ? family::take_frontend_resources(backing,plan.frontend)
+                                                  : family::take_text_only_frontend_resources(backing, plan.frontend);
+    runtime.vision_geometry = plan.vision_geometry;
+    if (plan.features.vision) { runtime.vision = family::materialize_gemma_vision(backing,plan); }
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;

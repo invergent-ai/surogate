@@ -680,6 +680,14 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
     const std::vector<int> bounds =
         balanced_stage_bounds<Target>(options, reader, layers, stage_count);
     std::vector<std::uint32_t> stage_host_moe;
+    const auto vision_metadata = reader.vision_geometry();
+    const auto image_tokens =
+        options.enable_vision && vision_metadata.contains("attention_mode") &&
+                vision_metadata.at("attention_mode") > 0
+            ? static_cast<std::uint32_t>(vision_metadata.at("max_image_tokens"))
+            : 0U;
+    const auto pipeline_prefill =
+        std::max(options.prefill_chunk, ((image_tokens + 127U) / 128U) * 128U);
     const auto stage_options_for = [&](int s) {
         EngineOptions stage_options             = options;
         stage_options.device                    = options.devices[static_cast<std::size_t>(s)];
@@ -690,14 +698,16 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
         // The widest residual a stage exports: a prefill chunk beside the decode lanes, or a
         // verify's draft window plus one per lane.
         stage_options.pipeline_boundary_columns =
-            std::max(options.prefill_chunk + decode_batch_capacity(options.max_concurrency) + 128,
-                     decode_batch_capacity(options.max_concurrency) * (options.speculative.draft_tokens + 1) + 128);
+            std::max(pipeline_prefill + decode_batch_capacity(options.max_concurrency) + 128,
+                     decode_batch_capacity(options.max_concurrency) *
+                             (options.speculative.draft_tokens + 1) +
+                         128);
         // Zero until the preflight below has run, and then the shared values every stage --
         // stage 0 included -- is built with.
         if (resolved_kv != 0) {
             stage_options.kv_capacity   = KvCapacityPolicy::explicit_capacity(resolved_kv);
             stage_options.max_context   = resolved_context;
-            stage_options.prefill_chunk = context_prefill(options.prefill_chunk, resolved_context);
+            stage_options.prefill_chunk   = context_prefill(pipeline_prefill, resolved_context);
             stage_options.host_moe_layers = stage_host_moe.empty()
                                                 ? stage_options.host_moe_layers
                                                 : stage_host_moe[static_cast<std::size_t>(s)];

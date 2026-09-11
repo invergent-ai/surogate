@@ -883,7 +883,8 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
         // Llama opens every sequence with its BOS. It comes from the
         // post-processor rather than the chat template, so nothing upstream has
         // added it, and a prompt without one is a prompt the model never saw.
-        if (options.parse_added_tokens && delegate_->inner.adds_bos()) {
+        if (options.parse_added_tokens && options.add_bos && delegate_->inner.adds_bos() &&
+            (ids.empty() || ids.front() != delegate_->inner.bos_token_id())) {
             ids.insert(ids.begin(), delegate_->inner.bos_token_id());
         }
         return ids;

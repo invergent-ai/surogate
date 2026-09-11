@@ -20,9 +20,10 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from surogate.serve.cache_version import SERVING_CACHE_VERSION
-from pathlib import Path
+
 
 # Registered converter targets in the vendored engine, keyed by facts read
 # from the source config.json. Model breadth beyond this set is the plan's
@@ -64,9 +65,8 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     model_type = str(config.get("model_type", ""))
     hidden = int(config.get("hidden_size", 0) or 0)
     layers = int(config.get("num_hidden_layers", 0) or 0)
-    quant = config.get("quantization_config") or {}
-    quant_method = str(quant.get("quant_method", "")) if isinstance(quant, dict) else ""
-    nvfp4 = quant_method in ("modelopt", "nvfp4") or "NVFP4" in json.dumps(quant)[:2000]
+    if model_type in ("gemma3", "gemma4", "gemma4_unified") and config.get("vision_config"):
+        return ConverterTarget("gemma_vl", "surogate.serve.convert.gemma_vl.convert", "Gemma vision")
 
     # Registered geometries (vendored targets). Text-config nesting (VL-style
     # configs) is flattened by callers before this point.
@@ -246,7 +246,7 @@ def _find_mtp_gguf(gguf_path: Path) -> Path | None:
     return None
 
 
-def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, mmproj=None) -> Path:
+def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, mmproj=None, include_vision=True) -> Path:
     """GGUF → temp HF dir (dequant BF16) → vendored converter → cached weights.
 
     v0 bridge (surogate/serve/gguf/bridge.py): correctness inherits the converter's
@@ -257,9 +257,37 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
     from surogate.serve.gguf import bridge as serve_gguf
 
     with serve_gguf.open_gguf(gguf_path) as source:
-        vl = source.kv("general.architecture") in ("qwen3vl", "qwen3vlmoe")
-    if vl:
-        from surogate.serve.convert.qwen3_vl.gguf import find_projector
+        architecture = source.kv("general.architecture")
+    vl = "qwen3_vl" if architecture in ("qwen3vl", "qwen3vlmoe") else None
+    if architecture == "lfm2":
+        if mmproj is not None:
+            vl = "lfm2_vl"
+        else:
+            for candidate in gguf_path.parent.glob("*mmproj*.gguf"):
+                try:
+                    with serve_gguf.open_gguf(candidate) as projector:
+                        if projector.kv("clip.projector_type") == "lfm2":
+                            vl = "lfm2_vl"
+                            break
+                except (ValueError, OSError):
+                    continue
+    if architecture in ("gemma3", "gemma4") and include_vision:
+        if mmproj is not None:
+            vl = "gemma_vl"
+        else:
+            for candidate in gguf_path.parent.glob("*mmproj*.gguf"):
+                try:
+                    with serve_gguf.open_gguf(candidate) as projector:
+                        kind = projector.kv("clip.vision.projector_type", projector.kv("clip.projector_type"))
+                        if kind in ("gemma3", "gemma4v", "gemma4uv"):
+                            vl = "gemma_vl"
+                            break
+                except (ValueError, OSError):
+                    continue
+    if vl and include_vision:
+        import importlib
+        converter_module = "surogate.serve.convert." + vl + ".gguf"
+        find_projector = importlib.import_module(converter_module).find_projector
         from surogate.serve.convert.common.gguf_source import GgufSource
         try:
             projector = find_projector(gguf_path, mmproj)
@@ -271,19 +299,19 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
                 fp = hashlib.sha256((fp + repr([str(p.resolve()) for p in sources.shards])).encode()).hexdigest()[:24]
             finally:
                 sources.close()
-            out = cache_dir() / f"qwen3-vl-gguf-{fp}.sinfer"
+            out = cache_dir() / f"{vl.replace('_', '-')}-gguf-{fp}.sinfer"
             if reuse_cache and out.is_file() and out.stat().st_size > 0:
                 echo(f"surogate serve: using cached engine weights ({out.name})")
                 return out
-            echo(f"surogate serve: preparing Qwen3-VL GGUF with {projector.name}")
+            echo(f"surogate serve: preparing {vl} GGUF with {projector.name}")
             tmp = out.with_suffix(".sinfer.partial")
             try:
-                command = [sys.executable, "-m", "surogate.serve.convert.qwen3_vl.gguf",
+                command = [sys.executable, "-m", converter_module,
                            "--gguf", str(gguf_path), "--mmproj", str(projector), "--out", str(tmp),
                            "--device", os.getenv("SUROGATE_CONVERT_DEVICE", "cpu")]
                 result = subprocess.run(command, cwd=_sinfer_root(), stdout=sys.stderr)
                 if result.returncode:
-                    raise SystemExit(f"surogate serve: Qwen3-VL GGUF conversion failed (exit {result.returncode})")
+                    raise SystemExit(f"surogate serve: {vl} GGUF conversion failed (exit {result.returncode})")
                 tmp.replace(out)
                 Path(str(tmp) + ".conversion.json").replace(Path(str(out) + ".conversion.json"))
             finally:
@@ -292,7 +320,7 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, 
         except (ValueError, KeyError, OSError) as error:
             raise SystemExit(f"surogate serve: {error}") from error
     if mmproj is not None:
-        raise SystemExit("surogate serve: --mmproj is supported for Qwen3-VL GGUF models")
+        raise SystemExit("surogate serve: --mmproj requires a supported vision GGUF model")
 
     root = _sinfer_root()
     if root is None:
@@ -466,6 +494,7 @@ def _repack_planner(root: Path, target_key: str):
             REPACKABLE_TYPES,
             GgufRepackSource,
         )
+
         # The one definition, rather than whichever converters happen to re-export it: a
         # recipe module that reads its sources without naming this helper is not thereby
         # un-plannable.
@@ -734,7 +763,7 @@ def ensure_engine_weights(spec: str, *, reuse_cache: bool = True, echo=print, mm
     cache when needed. Raises SystemExit with a clear message on refusal."""
     kind = classify_input(spec)
     if mmproj is not None and kind != "gguf":
-        raise SystemExit("surogate serve: --mmproj requires a Qwen3-VL text GGUF as the model")
+        raise SystemExit("surogate serve: --mmproj requires a text GGUF as the model")
 
     if kind == "artifact":
         # Internal/dev passthrough (not a supported product input).

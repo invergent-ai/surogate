@@ -911,7 +911,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
         constexpr std::uint32_t kFrontendMergedLimit = 32768;
-        const std::uint32_t merged = std::min(impl->capacity, kFrontendMergedLimit);
+        const std::uint32_t merged = std::min({impl->capacity, kFrontendMergedLimit, impl->vision_geometry.gemma_version ? static_cast<std::uint32_t>(impl->vision_geometry.max_image_tokens) : kFrontendMergedLimit});
         const family::VisionGeometry& vision = impl->vision_geometry;
         impl->request_transient_capacity_bytes =
             schedule::VisionContext::output_transient_bytes(vision, merged);
@@ -979,7 +979,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile,
                            const family::TextGeometry& geometry, const family::VisionGeometry& vision_geometry) {
     validate_target_options(device, options, geometry);
-    if (options.enable_vision && (vision_geometry.layers <= 0 || vision_geometry.output_hidden != geometry.hidden)) {
+    if (options.enable_vision && ((vision_geometry.layers <= 0 && !vision_geometry.encoder_free) || vision_geometry.output_hidden != geometry.hidden)) {
         throw std::invalid_argument("vision planning requires the checkpoint's vision geometry");
     }
     const KvCacheStorage kv_storage = resolve_kv_storage(options.kv_cache, geometry);
@@ -999,7 +999,9 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .vision_geometry     = vision_geometry,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
-        .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
+        .prefill_chunk       = std::min(std::max(options.prefill_chunk,
+            options.enable_vision && vision_geometry.attention_mode
+                ? ((static_cast<std::uint32_t>(vision_geometry.max_image_tokens)+127U)/128U)*128U : 0U), options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_max_lanes = options.speculative.max_lanes == 0 ? kDefaultSpeculationLanes
                                                                      : options.speculative.max_lanes,

@@ -41,7 +41,7 @@ struct VisionItemView {
 /// A tower's output must match the text model it was bound with.
 [[nodiscard]] inline VisionGeometry
 bound_vision_geometry(const VisionGeometry& tower, const TextGeometry& text) {
-    if (tower.layers <= 0 || tower.output_hidden != text.hidden) {
+    if ((!tower.encoder_free && tower.layers <= 0) || tower.output_hidden != text.hidden) {
         throw std::invalid_argument("vision geometry is missing or disagrees with the text width");
     }
     return tower;
@@ -92,6 +92,7 @@ private:
         const Tensor* fc2_bias    = nullptr;
     };
 
+    const VisionWeights* weights_ = nullptr;
     DeviceContext& ctx_;
     VisionGeometry cfg_{};
     Probe probe_;

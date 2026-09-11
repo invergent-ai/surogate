@@ -8,11 +8,10 @@
 # Python (and no Python CUDA context) stays in the serving process. It must run
 # BEFORE any CUDA-touching import in surogate.cli.main, mirroring jackalope.
 
-from contextlib import redirect_stdout
-
 import os
 import shutil
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
 _USAGE = """\
@@ -42,7 +41,10 @@ Common server options (full list: surogate serve --engine-help):
                                  model, fp8 where linear-attention layers carry the stack)
   --no-cache                     rebuild the conversion cache instead of reusing it
   --spec mtp --draft-tokens 3    speculative decoding
-  --mmproj PATH                 matching vision projector for a Qwen3-VL GGUF
+  --mmproj PATH                 matching vision projector for a supported vision GGUF
+  --offload-vision               store image encoder/projector weights in system RAM
+  --offload-embeddings           store token embeddings in system RAM
+  --offload-output-head          store output-head weights in system RAM
 
 --generate runs one shot and has its own spellings for a few options
 (--max-context, --kv-dtype, --max-new): surogate serve --generate --engine-help.
@@ -78,7 +80,10 @@ _COMMON_VALUES = frozenset("""
     --devices --kv-capacity --spec --draft-tokens --spec-max-lanes
     --temperature --top-p --top-k --min-p --presence-penalty --frequency-penalty --seed
 """.split())
-_COMMON_SWITCHES = frozenset("--vision --lm-head-draft --no-thinking --greedy".split())
+_COMMON_SWITCHES = frozenset("""
+    --vision --lm-head-draft --no-thinking --greedy
+    --offload-vision --offload-embeddings --offload-output-head
+""".split())
 _VALUE_OPTIONS = {
     "server": _COMMON_VALUES | frozenset("""
         --host --port --api-key --served-model-name --max-model-len --max-num-seqs

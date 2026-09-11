@@ -155,6 +155,52 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     }
     const Json image =
         parse_resource_json(resources.preprocessor_config_json, "preprocessor_config.json");
+    if (image.value("gemma_version", 0)) {
+        fi::ProcessorOptions options;
+        auto& g = options.gemma;
+        g.version = image.at("gemma_version").get<int>();
+        g.encoder_free = image.value("encoder_free", 0) != 0;
+        options.image_token_id = image.at("image_token_id").get<int>();
+        g.video_token_id = image.at("video_token_id").get<int>();
+        g.patch = image.at("patch_size").get<int>();
+        g.merge = image.at("spatial_merge_size").get<int>();
+        g.position_embeddings = image.at("position_embeddings").get<int>();
+        g.image_tokens = image.value("max_soft_tokens", image.value("image_seq_length", 280));
+        g.image_token = image.at("image_token").get<std::string>();
+        g.video_token = image.at("video_token").get<std::string>();
+        g.boi_token = image.at("boi_token").get<std::string>();
+        g.eoi_token = image.at("eoi_token").get<std::string>();
+        g.resample = image.value("resample", g.version == 3 ? 2 : 3);
+        g.pan_and_scan = image.value("do_pan_and_scan", false);
+        g.min_crop_size = image.value("pan_and_scan_min_crop_size", 256);
+        g.max_crops = image.value("pan_and_scan_max_num_crops", 4);
+        g.crop_ratio = image.value("pan_and_scan_min_ratio_to_activate", 1.2);
+        if (g.patch <= 0 || g.patch > 64 || g.merge <= 0 || g.merge > 8) {
+            throw std::invalid_argument("invalid Gemma patch or pooling size");
+        }
+        if (g.version == 3) {
+            const auto& size = image.at("size");
+            g.image_size = size.at("height").get<int>();
+            if (size.at("width").get<int>() != g.image_size ||
+                g.image_size % (g.patch * g.merge) ||
+                g.image_size / (g.patch * g.merge) * (g.image_size / (g.patch * g.merge)) != g.image_tokens) {
+                throw std::invalid_argument("Gemma 3 processor image and pooling sizes disagree");
+            }
+        } else if (!resources.video_preprocessor_config_json.empty()) {
+            const auto video = parse_resource_json(resources.video_preprocessor_config_json,"video_preprocessor_config.json");
+            g.video_tokens = video.value("max_soft_tokens",70);
+            options.video_min_frames = options.video_max_frames = video.value("num_frames",32);
+        }
+        if ((g.version != 3 && g.version != 4) || g.patch <= 0 || g.patch > 64 ||
+            g.merge <= 0 || g.merge > 8 || g.position_embeddings <= 0 ||
+            g.image_tokens <= 0 || g.image_tokens > 1120 || g.video_tokens <= 0 || g.video_tokens > 1120 ||
+            g.resample < 2 || g.resample > 3 || g.min_crop_size <= 0 || g.max_crops < 2 || g.max_crops > 64 ||
+            !std::isfinite(g.crop_ratio) || g.crop_ratio < 1 || g.image_size <= 0 || g.image_size > 4096 ||
+            !image.value("do_rescale",true) || !image.value("do_resize",true)) {
+            throw std::invalid_argument("unsupported Gemma image processor configuration");
+        }
+        return options;
+    }
     if (image.value("image_processor_type", "").starts_with("Lfm2Vl")) {
         fi::ProcessorOptions options;
         options.lfm2_vl = true;
@@ -1273,13 +1319,19 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         fi::ProcessedInput processed;
         try {
             std::optional<fi::RenderedChat> rendered;
-            if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl) {
+            if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl && !impl_->processor.gemma.version) {
                 rendered = impl_->render_chat(messages, options);
                 opens_reasoning = options.add_generation_prompt &&
                     fi::prompt_opens_reasoning(rendered->text, impl_->reasoning.open);
             }
-            processed = processor.process(std::move(messages), render_options(options), control,
+            auto media_options = render_options(options);
+            media_options.template_variables = impl_->template_variables(options);
+            processed = processor.process(std::move(messages), media_options, control,
                                           std::move(rendered));
+            if (impl_->tokenizer->renders_chat_template() && (impl_->processor.lfm2_vl || impl_->processor.gemma.version)) {
+                opens_reasoning = options.add_generation_prompt && fi::prompt_opens_reasoning(
+                    impl_->tokenizer->decode(processed.input_ids),impl_->reasoning.open);
+            }
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.token_types    = std::move(processed.token_types);
@@ -1424,11 +1476,11 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
                             impl_->media_cache);
     try {
         std::optional<fi::RenderedChat> rendered;
-        if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl) {
+        if (impl_->tokenizer->renders_chat_template() && !impl_->processor.lfm2_vl && !impl_->processor.gemma.version) {
             rendered = impl_->render_chat(messages, options);
         }
         return checked_token_count(
-            processor.process(std::move(messages), render_options(options), control, std::move(rendered))
+            processor.process(std::move(messages), [&] { auto r = render_options(options); r.template_variables = impl_->template_variables(options); return r; }(), control, std::move(rendered))
                 .input_ids.size());
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }
