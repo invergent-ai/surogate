@@ -203,6 +203,8 @@ struct GenerationRequest {
     /// completion token ids beside them (`return_token_ids`, vLLM's extension). An
     /// RL trainer needs all three: it scores the exact ids it was given against the
     /// probabilities they were drawn with.
+    int top_logprobs = 0;
+    int prompt_logprobs = -1;
     bool want_logprobs    = false;
     bool return_token_ids = false;
     /// The prompt as token ids, replacing whatever `messages` would have rendered

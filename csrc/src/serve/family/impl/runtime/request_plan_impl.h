@@ -121,7 +121,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->sampling                       = translate_sampling(options.sampling);
     base->logit_bias                     = options.sampling.logit_bias;
     base->constraint                     = options.constraint;
-    base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->prompt_logprobs = options.prompt_logprobs;
+    base->top_logprobs = options.top_logprobs;
+    base->allow_prefix_reuse = options.allow_prefix_reuse && options.prompt_logprobs < 0;
     base->lora_slot                      = options.lora_slot;
     base->min_tokens                     = options.min_tokens;
     base->stop_barrier_count =
@@ -231,6 +233,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     auto plan                         = std::make_unique<RequestPlanImpl>();
     plan->summary                     = base.summary;
+    plan->prompt_logprobs = base.prompt_logprobs;
+    plan->top_logprobs = base.top_logprobs;
     plan->sampling                    = base.sampling;
     plan->logit_bias                   = base.logit_bias;
     plan->constraint                   = base.constraint;

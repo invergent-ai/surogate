@@ -55,6 +55,9 @@ struct GenerationOutcome {
     /// empty or exactly as long as `completion_token_ids`.
     std::vector<sinfer::TokenId> prompt_token_ids;
     std::vector<sinfer::TokenId> completion_token_ids;
+    std::vector<TokenScore> prompt_scores;
+    std::vector<TokenScore> completion_scores;
+    std::map<TokenId, std::string> score_texts;
     std::vector<float> token_logprobs;
     /// The text of each completion token, so a probability names the token it
     /// belongs to. Filled only alongside `token_logprobs`.
@@ -94,6 +97,8 @@ struct PreparedRequest {
     bool preserve_thinking_semantic_change = false;
     /// What the client asked to be given back, and the prompt ids to give it.
     /// Snapshotted before the prompt is submitted, because submitting consumes it.
+    int top_logprobs = 0;
+    int prompt_logprobs = -1;
     bool want_logprobs    = false;
     bool return_token_ids = false;
     std::vector<sinfer::TokenId> prompt_token_ids;

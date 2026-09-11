@@ -298,6 +298,9 @@ public:
             stages_[s]->program->evict_retained_lane(lane);
         }
     }
+    void collect_logprobs(std::uint32_t lane, GenerationResult& result) const {
+        stages_.back()->program->collect_logprobs(lane, result);
+    }
     /// A request's compute time is the sum of its stages'. Every stage runs its layers in turn
     /// for every round, so the last stage's clock alone is a fraction of the round: on eight
     /// stages it reported a decode rate eight times the wall clock's. The request-level fields

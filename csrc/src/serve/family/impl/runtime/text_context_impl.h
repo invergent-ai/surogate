@@ -3156,6 +3156,15 @@ void TextContext::precapture_prefill_graphs(std::int32_t effective_chunk) {
     }
 }
 
+void TextContext::observe_prompt_logits(const Tensor& hidden, int base, cudaStream_t stream) {
+    for (int col = 0; col < hidden.ne[1]; ++col) {
+        Tensor logits = matrix_window(io_.logits, 1);
+        ops::linear(lm_head_view(hidden.slice(1, col, 1), stream), *lm_head_, logits, stream);
+        apply_logit_softcap(cfg_, logits, stream);
+        logprob_observer(logits, base + col + 1, false);
+    }
+}
+
 // Stages one real chunk into the family, captures the bucket on first use, and
 // replays it; then runs the eager epilogues the graph excludes (the final
 // sample and the rewrite-checkpoint hidden copy — both need the real length,
@@ -3190,6 +3199,9 @@ bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int 
 
     cudaStream_t s = ctx_.stream;
     const int T    = static_cast<int>(ids.size());
+    if (score_prompt && logprob_observer && stage_finishes()) {
+        observe_prompt_logits(matrix_window(prefill_hidden_, len), base_i + t0, s);
+    }
     if (is_last) {
         Tensor xf      = matrix_window(prefill_hidden_, len);
         Tensor last_xf = xf.slice(1, len - 1, 1);
@@ -3204,6 +3216,7 @@ bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int 
                         ops::kSamplePurposePrefill, work_, s);
             if (io_.logprob.data != nullptr) {
                 ops::sampled_logprob(logits, io_.token, io_.logprob, cfg_.token_domain, sampling_config_, s);
+                if (logprob_observer) logprob_observer(logits, base_i + T, true);
             }
         } else {
             ops::argmax(logits, io_.token, cfg_.token_domain, s);
@@ -3405,6 +3418,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 stage_export(x, s);
             }
 
+            if (score_prompt && logprob_observer && stage_finishes()) observe_prompt_logits(xf, base_i + t0, s);
             if (is_last && stage_finishes()) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
@@ -3420,6 +3434,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                 ops::kSamplePurposePrefill, work_, s);
                     if (io_.logprob.data != nullptr) {
                         ops::sampled_logprob(logits, io_.token, io_.logprob, cfg_.token_domain, sampling_config_, s);
+                        if (logprob_observer) logprob_observer(logits, base_i + T, true);
                     }
                 } else {
                     ops::argmax(logits, io_.token, cfg_.token_domain, s);

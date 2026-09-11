@@ -378,6 +378,8 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     // A minimum length is honoured by barring the stop ids until it is reached, and
     // the round only knows numbers -- so resolve which ids those are here, where
     // the model's own stops and the request's are both in reach.
+    request_options.execution.prompt_logprobs = request.prompt_logprobs;
+    request_options.execution.top_logprobs = request.want_logprobs ? request.top_logprobs : -1;
     request_options.execution.min_tokens = static_cast<std::uint32_t>(request.min_tokens);
     if (request.min_tokens > 0) {
         std::vector<sinfer::TokenId> barrier = engine_->default_stop_tokens();
@@ -466,6 +468,8 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
+        prepared.prompt_logprobs = request.prompt_logprobs;
+        prepared.top_logprobs = request.top_logprobs;
         prepared.want_logprobs    = request.want_logprobs;
         prepared.return_token_ids = request.return_token_ids;
         // Read before the submit takes the prompt: these are the ids the model
@@ -544,8 +548,23 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         outcome.prompt_token_ids     = std::move(prepared.prompt_token_ids);
         outcome.completion_token_ids = result.generated_token_ids;
     }
+    outcome.prompt_scores = std::move(result.prompt_logprobs);
+    outcome.completion_scores = std::move(result.completion_logprobs);
+    std::vector<TokenId> score_ids;
+    for (const auto* scores : {&outcome.prompt_scores, &outcome.completion_scores}) {
+        for (const auto& score : *scores) {
+            if (score.selected.token_id >= 0) score_ids.push_back(score.selected.token_id);
+            for (const auto& candidate : score.top) score_ids.push_back(candidate.token_id);
+        }
+    }
+    std::sort(score_ids.begin(), score_ids.end());
+    score_ids.erase(std::unique(score_ids.begin(), score_ids.end()), score_ids.end());
+    if (!score_ids.empty()) {
+        auto texts = engine_->token_texts(score_ids);
+        for (std::size_t i = 0; i < score_ids.size(); ++i) outcome.score_texts.emplace(score_ids[i], std::move(texts[i]));
+    }
     if (prepared.want_logprobs) {
-        outcome.token_logprobs = std::move(result.token_logprobs);
+        for (const auto& score : outcome.completion_scores) outcome.token_logprobs.push_back(score.selected.logprob);
         if (!result.generated_token_ids.empty()) {
             outcome.token_texts = engine_->token_texts(std::span<const sinfer::TokenId>(
                 result.generated_token_ids.data(), result.generated_token_ids.size()));

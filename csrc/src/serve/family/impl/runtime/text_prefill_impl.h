@@ -98,6 +98,8 @@ PrefillChunkResult prefill_text_chunk(
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+    card.logprob_observer = state.logprob_observer;
+    card.score_prompt = state.score_prompt;
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
@@ -129,6 +131,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
+    card.logprob_observer = state.logprob_observer;
+    card.score_prompt = state.score_prompt;
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
@@ -199,6 +203,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     ops::sampled_logprob(logits, state.execution.io.token, state.execution.io.logprob,
                          state.execution.model.geometry.token_domain, state.sampling,
                          state.execution.device.stream);
+    if (state.logprob_observer) state.logprob_observer(logits, absolute_position, true);
     state.execution.work.reset();
 }
 

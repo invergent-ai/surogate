@@ -423,6 +423,28 @@ int test_response_object() {
     return failures;
 }
 
+int test_logprob_token_bytes() {
+    auto request = parse_responses_request(Json{{"model", "test"}, {"input", "hello"},
+        {"include", Json::array({"message.output_text.logprobs"})}, {"top_logprobs", 1}}, limits());
+    GenerationOutcome outcome = sample_outcome();
+    outcome.completion_scores.push_back({{100, -2.0f, 2}, {{101, -1.0f, 1}}});
+    outcome.score_texts[100] = std::string("\xf0\x9f", 2);
+    outcome.score_texts[101] = std::string("\x98", 1);
+    auto built = make_response_object("resp_scores", 123, request, {}, outcome);
+    // Strict dumping must work before any HTTP-specific lossy serialization.
+    Json response = Json::parse(built.body.dump());
+    const Json& entry = response["output"][1]["content"][0]["logprobs"][0];
+    int failures = check(entry["bytes"] == Json::array({240, 159}) &&
+        entry["top_logprobs"][0]["bytes"] == Json::array({152}), "exact partial UTF-8 token bytes");
+    failures += check(entry["token"] == "\xef\xbf\xbd", "partial token display replacement");
+    ResponsesEventStream encoder("resp_scores_stream", 123, request, {});
+    (void)encoder.start();
+    auto finish = encoder.finish(outcome);
+    failures += check(!finish.events_before_terminal.empty(), "score SSE serializes partial UTF-8");
+    (void)encoder.terminal(finish.response);
+    return failures;
+}
+
 int test_sse_sequence() {
     ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
                                                             {"input", "hello"},
@@ -531,6 +553,7 @@ int main() {
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();
     failures += test_response_object();
+    failures += test_logprob_token_bytes();
     failures += test_sse_sequence();
     failures += test_sse_function_call();
     failures += test_input_tokens_schema();

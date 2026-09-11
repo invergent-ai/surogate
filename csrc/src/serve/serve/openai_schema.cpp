@@ -404,25 +404,20 @@ void parse_stop(const Json& body, GenerationRequest& out) {
         if (*minimum < 0) { bad_request("min_tokens must be nonnegative", "min_tokens"); }
         out.min_tokens = *minimum;
     }
-    // `logprobs` is OpenAI's own; `return_token_ids` is vLLM's extension, and an
-    // RL client sends both. They were accepted and ignored before, which is worse
-    // than refusing them: the rollout came back looking complete and carried
-    // nothing to train on.
-    if (body.contains("logprobs") && body.at("logprobs").is_boolean()) {
-        out.want_logprobs = body.at("logprobs").get<bool>();
+    if (body.contains("logprobs") && !body.at("logprobs").is_null()) {
+        out.want_logprobs = get_bool(body, "logprobs", false);
     }
-    if (body.contains("return_token_ids") && body.at("return_token_ids").is_boolean()) {
-        out.return_token_ids = body.at("return_token_ids").get<bool>();
+    if (body.contains("return_token_ids") && !body.at("return_token_ids").is_null()) {
+        out.return_token_ids = get_bool(body, "return_token_ids", false);
     }
-    // Fields this engine does not implement. Accepting them and generating anyway
-    // is the failure this whole endpoint has been bitten by twice: the caller gets
-    // a response that looks complete and is not what it asked for. A value that
-    // asks for nothing -- the defaults every client sends -- is still accepted.
-    if (body.contains("prompt_logprobs") && !body.at("prompt_logprobs").is_null() &&
-        !(body.at("prompt_logprobs").is_boolean() && !body.at("prompt_logprobs").get<bool>())) {
-        bad_request("prompt_logprobs is not implemented: scoring every prompt position needs the "
-                    "logits of a whole prefill, which this engine does not retain",
-                    "prompt_logprobs");
+    for (const auto* name : {"top_logprobs", "prompt_logprobs"}) {
+        if (auto count = get_int(body, name)) {
+            if (*count < 0 || *count > 20) bad_request(std::string(name) + " must be between 0 and 20", name);
+            if (std::string_view(name) == "top_logprobs") {
+                if (!out.want_logprobs && *count > 0) bad_request("top_logprobs requires logprobs: true", name);
+                out.top_logprobs = *count;
+            } else out.prompt_logprobs = *count;
+        }
     }
     if (body.contains("add_generation_prompt") &&
         body.at("add_generation_prompt").is_boolean()) {
@@ -627,7 +622,7 @@ std::string parse_completion_prompt(const Json& body) {
 void reject_unsupported_completion_features(const Json& body) {
     // Each of these changes what the response means, so answering without them would be
     // answering a different question than the one asked.
-    for (const char* key : {"echo", "logprobs", "suffix", "best_of"}) {
+    for (const char* key : {"echo", "suffix", "best_of"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             const Json& value = body.at(key);
             const bool inert  = (value.is_boolean() && !value.get<bool>()) ||
@@ -729,9 +724,6 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
     Json choice = {{"index", 0}, {"message", std::move(message)},
                    {"finish_reason", finish_reason}};
     if (detail.include_logprobs) {
-        // OpenAI's shape: one entry per generated token, in order. `top_logprobs`
-        // stays empty -- nothing asks this engine for alternatives, and an empty
-        // array is what the schema says when none were requested.
         Json entries = Json::array();
         for (std::size_t i = 0; i < detail.logprobs.size(); ++i) {
             const std::string& text = i < detail.texts.size() ? detail.texts[i] : std::string{};
@@ -741,10 +733,19 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
             // substitutes U+FFFD there while these stay exact.
             Json raw = Json::array();
             for (const unsigned char byte : text) { raw.push_back(static_cast<int>(byte)); }
+            Json top = Json::array();
+            if (i < detail.completion_scores.size()) {
+                for (const auto& candidate : detail.completion_scores[i].top) {
+                    const auto& candidate_text = detail.score_texts.at(candidate.token_id);
+                    Json bytes = Json::array();
+                    for (unsigned char byte : candidate_text) bytes.push_back(static_cast<int>(byte));
+                    top.push_back({{"token", candidate_text}, {"logprob", candidate.logprob}, {"bytes", std::move(bytes)}});
+                }
+            }
             entries.push_back(Json{{"token", text},
                                    {"logprob", detail.logprobs[i]},
                                    {"bytes", std::move(raw)},
-                                   {"top_logprobs", Json::array()}});
+                                   {"top_logprobs", std::move(top)}});
         }
         choice["logprobs"] = Json{{"content", std::move(entries)}};
     }
@@ -761,6 +762,22 @@ static Json chat_completion_payload(const std::string& id, const std::string& mo
     // The prompt's ids sit at the top level, where vLLM puts them, because they
     // belong to the request rather than to any one choice.
     if (detail.include_token_ids) { payload["prompt_token_ids"] = detail.prompt_token_ids; }
+    if (!detail.prompt_scores.empty()) {
+        Json scores = Json::array();
+        for (const auto& score : detail.prompt_scores) {
+            if (score.selected.token_id < 0) { scores.push_back(nullptr); continue; }
+            Json candidates = Json::object();
+            auto add = [&](const TokenLogprob& candidate) {
+                candidates[std::to_string(candidate.token_id)] = {
+                    {"logprob", candidate.logprob}, {"rank", candidate.rank},
+                    {"decoded_token", detail.score_texts.at(candidate.token_id)}};
+            };
+            add(score.selected);
+            for (const auto& candidate : score.top) add(candidate);
+            scores.push_back(std::move(candidates));
+        }
+        payload["prompt_logprobs"] = std::move(scores);
+    }
     return payload;
 }
 
@@ -907,7 +924,13 @@ GenerationRequest parse_completion_request(const Json& body, const RequestLimits
     out.model      = body.at("model").get<std::string>();
     out.raw_prompt = parse_completion_prompt(body);
 
-    parse_stop(body, out);
+    Json options = body;
+    if (auto count = get_int(body, "logprobs")) {
+        if (*count < 0 || *count > 20) bad_request("logprobs must be between 0 and 20", "logprobs");
+        options["logprobs"] = true;
+        options["top_logprobs"] = *count;
+    }
+    parse_stop(options, out);
     parse_sampling(body, out);
 
     out.stream = get_bool(body, "stream", false);
@@ -929,8 +952,8 @@ GenerationRequest parse_completion_request(const Json& body, const RequestLimits
 
 std::string make_completion_response(const std::string& id, const std::string& model,
                                      std::int64_t created, const std::string& text,
-                                     const char* finish_reason, const CompletionUsage& usage) {
-    const Json payload = {
+                                     const char* finish_reason, const CompletionUsage& usage, const TokenDetail& detail) {
+    Json payload = {
         {"id", id},
         {"object", "text_completion"},
         {"created", created},
@@ -942,7 +965,38 @@ std::string make_completion_response(const std::string& id, const std::string& m
         {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
                        {"completion_tokens", usage.completion_tokens},
                        {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+    const Json chat = chat_completion_payload(id, model, created, "", "", "", {}, detail);
+    if (chat.contains("prompt_logprobs")) payload["prompt_logprobs"] = chat["prompt_logprobs"];
+    if (detail.include_token_ids) {
+        payload["prompt_token_ids"] = detail.prompt_token_ids;
+        payload["choices"][0]["token_ids"] = detail.completion_token_ids;
+    }
+    if (detail.include_logprobs) {
+        Json tokens = Json::array(), probabilities = Json::array(), top = Json::array(), offsets = Json::array();
+        std::size_t offset = 0;
+        for (const auto& entry : chat["choices"][0]["logprobs"]["content"]) {
+            tokens.push_back(entry["token"]);
+            probabilities.push_back(entry["logprob"]);
+            offsets.push_back(offset);
+            const auto text = entry["token"].get<std::string>();
+            for (unsigned char byte : text) offset += (byte & 0xc0) != 0x80;
+            Json alternatives = Json::object();
+            for (const auto& candidate : entry["top_logprobs"]) alternatives[candidate["token"].get<std::string>()] = candidate["logprob"];
+            top.push_back(std::move(alternatives));
+        }
+        payload["choices"][0]["logprobs"] = {{"tokens", std::move(tokens)},
+            {"token_logprobs", std::move(probabilities)}, {"top_logprobs", std::move(top)}, {"text_offset", std::move(offsets)}};
+    }
     return dump_lossy(payload);
+}
+
+std::string make_completion_chunk_token_detail(const std::string& id, const std::string& model,
+    std::int64_t created, const TokenDetail& detail, bool include_usage) {
+    Json payload = Json::parse(make_completion_response(id, model, created, "", "", {}, detail));
+    payload["choices"][0]["finish_reason"] = nullptr;
+    payload.erase("usage");
+    if (include_usage) payload["usage"] = nullptr;
+    return sse_event(payload);
 }
 
 std::string make_completion_chunk_text(const std::string& id, const std::string& model,

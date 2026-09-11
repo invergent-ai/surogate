@@ -69,6 +69,8 @@ struct PrefillContext {
     /// column of a prefill chunk belongs to this one request, so the adapter is a
     /// scalar here rather than the per-lane vector a decode round carries.
     std::int32_t lora_slot = -1;
+    bool score_prompt = false;
+    std::function<void(const Tensor&, int, bool)> logprob_observer;
 };
 
 struct OrdinaryBatchContext {

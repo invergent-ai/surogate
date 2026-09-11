@@ -765,6 +765,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+        request.prompt_logprobs = request_plan.prompt_logprobs;
+        request.top_logprobs = request_plan.top_logprobs;
+        request.prompt_scores.clear();
+        request.completion_scores.clear();
+        if (request.prompt_logprobs >= 0) request.prompt_scores.resize(prompt_tokens);
         request.constraint = request_plan.constraint ? request_plan.constraint->create_state() : nullptr;
         request.constraint_frontier = prompt_tokens;
         request.token_bitmask_host.clear();
@@ -1136,6 +1141,21 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
+}
+
+void ProgramImplCore::collect_logprobs(std::uint32_t lane, GenerationResult& result) const {
+    if (lane >= max_concurrency) return;
+    result.prompt_logprobs = requests[lane].prompt_scores;
+    result.completion_logprobs = requests[lane].completion_scores;
+    result.completion_logprobs.resize(std::min(result.completion_logprobs.size(), result.generated_token_ids.size()));
+}
+
+void ProgramImplCore::score_completion(std::uint32_t lane, const Tensor& logits, TokenId token) {
+    auto& request = requests[lane];
+    if (stage_holds_head() && request.top_logprobs >= 0) {
+        request.completion_scores.push_back(ops::score_logprobs(
+            logits, token, cfg.token_domain, request.top_logprobs, device.stream));
+    }
 }
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -2106,6 +2126,20 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             dflash_host_ingress,
             staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr,
             requests[sequence.lane].lora_slot};
+        if (stage_holds_head() && (request.prompt_logprobs >= 0 || request.top_logprobs >= 0)) {
+            schedule_state.score_prompt = request.prompt_logprobs >= 0;
+            schedule_state.logprob_observer = [&](const Tensor& logits, int position, bool generated) {
+                if (generated && request.top_logprobs >= 0) {
+                    TokenId token;
+                    CUDA_CHECK(cudaMemcpyAsync(&token, io.token.data, sizeof(token), cudaMemcpyDeviceToHost, device.stream));
+                    device.synchronize();
+                    score_completion(sequence.lane, logits, token);
+                } else if (!generated && request.prompt_logprobs >= 0 && position < staged.prompt_tokens) {
+                    request.prompt_scores[position] = ops::score_logprobs(logits,
+                        staged.prompt.token_ids[position], cfg.token_domain, request.prompt_logprobs, device.stream);
+                }
+            };
+        }
 
         // The single-sequence table-row scalars are staged when a lane binds its KV, but an
         // admission between that bind and this launch binds another lane and restages them —
@@ -2415,7 +2449,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
         }
         burst = std::min(burst, capacity - maximum_frontier);
         if (burst == 0 || pipeline_stage() || std::any_of(lanes.begin(), lanes.end(),
-            [&](auto lane) { return requests[lane].constraint != nullptr; })) { burst = 1; }
+            [&](auto lane) { return requests[lane].constraint != nullptr || requests[lane].top_logprobs >= 0; })) { burst = 1; }
 
         DecodeGraphExecutable* executable = nullptr;
         DecodeGraphExecutable* chained    = nullptr;
@@ -2555,6 +2589,9 @@ ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
                 row_logprobs[round] = burst_rounds_logprobs[round * kMaximumBatchColumns + row];
             }
             validate_licensed_tokens(std::span<const TokenId>(row_tokens, burst));
+            if (request.top_logprobs >= 0) {
+                score_completion(lanes[row], io.ordinary->logits.slice(1, row, 1), row_tokens[0]);
+            }
             sequence.text_kv_valid     = base_E + burst;
             sequence.tail_hidden_valid = true;
             for (std::uint32_t round = 0; round < burst; ++round) {
@@ -2611,6 +2648,11 @@ std::string ProgramImplCore::last_mixed_round_description(std::size_t row) const
 }
 
 bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
+    for (const auto& request : requests) {
+        if ((request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Pending ||
+             request.lifecycle == Lifecycle::Active) &&
+            (request.top_logprobs >= 0 || request.prompt_logprobs >= 0)) return false;
+    }
     // Mixed rounds do not yet publish adapter selections for every prefill and
     // decode column. Keep adapter requests on the ordinary paths, which install
     // the LoRA round for both phases and are safe under graph replay.
@@ -3418,6 +3460,15 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
                                                           row * stride,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            if (request.top_logprobs >= 0) {
+                Tensor logits = io.mtp_decode->target_logits;
+                logits.ne[1] = 1; logits.ne[2] = 1;
+                for (int col = 0; col < count_i; ++col) {
+                    logits.data = static_cast<std::byte*>(io.mtp_decode->target_logits.data) +
+                        (row * stride + col) * logits.ne[0] * sizeof(std::uint16_t);
+                    score_completion(lanes[row], logits, row_tokens[col]);
+                }
+            }
             // The lane's own copy of the decision (see SpeculativeOutcome): the egress is
             // the next round's the moment that round launches.
             SpeculativeOutcome& outcome = request.outcome;
@@ -3778,6 +3829,15 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            if (request.top_logprobs >= 0) {
+                Tensor logits = io.dflash_decode->target_logits;
+                logits.ne[1] = 1; logits.ne[2] = 1;
+                for (int col = 0; col < count_i; ++col) {
+                    logits.data = static_cast<std::byte*>(io.dflash_decode->target_logits.data) +
+                        (row * width + col) * logits.ne[0] * sizeof(std::uint16_t);
+                    score_completion(lanes[row], logits, row_tokens[col]);
+                }
+            }
             request.outcome = SpeculativeOutcome{.licensed_count = count_i, .accepted_drafts = accepted_i};
             std::copy(row_tokens.begin(), row_tokens.end(), request.outcome.licensed_tokens.begin());
             std::memcpy(outcome_export_.data() + row * sizeof(SpeculativeOutcome),

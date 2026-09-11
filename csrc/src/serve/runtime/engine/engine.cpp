@@ -33,8 +33,14 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
+    if (options.execution.prompt_logprobs < -1 || options.execution.prompt_logprobs > 20 ||
+        options.execution.top_logprobs < -1 || options.execution.top_logprobs > 20) {
+        throw std::invalid_argument("log-probability counts must be between 0 and 20");
+    }
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.prompt_logprobs = options.execution.prompt_logprobs;
+    resolved.execution.top_logprobs = options.execution.top_logprobs;
     resolved.execution.lora_slot               = options.execution.lora_slot;
     resolved.execution.min_tokens              = options.execution.min_tokens;
     resolved.execution.stop_barrier            = options.execution.stop_barrier;

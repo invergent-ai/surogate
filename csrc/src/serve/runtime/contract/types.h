@@ -24,6 +24,8 @@ struct ResolvedExecutionOptions {
     std::shared_ptr<const CompiledTokenConstraint> constraint;
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
+    int prompt_logprobs = -1;
+    int top_logprobs = -1;
     bool allow_prefix_reuse               = true;
     /// Bank slot of the LoRA adapter this request selected, -1 for the base model.
     std::int32_t lora_slot = -1;

@@ -72,6 +72,8 @@ namespace sinfer::family::detail {
 template <>
 struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     runtime::RequestPlanSummary summary;
+    int prompt_logprobs = -1;
+    int top_logprobs = -1;
     ops::SamplingConfig sampling;
     std::unordered_map<TokenId, float> logit_bias;
     std::shared_ptr<const CompiledTokenConstraint> constraint;
@@ -101,6 +103,8 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<family::RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    int prompt_logprobs = -1;
+    int top_logprobs = -1;
     ops::SamplingConfig sampling;
     std::unordered_map<TokenId, float> logit_bias;
     std::shared_ptr<const CompiledTokenConstraint> constraint;
@@ -229,6 +233,10 @@ struct RequestControl {
     PendingCandidate pending;
     /// Valid while `pending.kind == Speculative`: the round's decision for this lane.
     SpeculativeOutcome outcome;
+    int prompt_logprobs = -1;
+    int top_logprobs = -1;
+    std::vector<TokenScore> prompt_scores;
+    std::vector<TokenScore> completion_scores;
     ops::SamplingConfig sampling_host;
     std::vector<float> logit_bias_host;
     std::unique_ptr<TokenConstraintState> constraint;
@@ -310,6 +318,8 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    void collect_logprobs(std::uint32_t lane, GenerationResult& result) const;
+    void score_completion(std::uint32_t lane, const Tensor& logits, TokenId token);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

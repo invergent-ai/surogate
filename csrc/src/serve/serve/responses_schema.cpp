@@ -640,9 +640,10 @@ void reject_server_managed_features(const Json& body) {
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("additional response fields are not supported", "include",
-                        "include_not_supported");
+        for (const auto& field : body.at("include")) {
+            if (!field.is_string() || field != "message.output_text.logprobs") {
+                bad_request("only message.output_text.logprobs is supported in include", "include", "include_not_supported");
+            }
         }
     }
     if (body.contains("parallel_tool_calls") && !body.at("parallel_tool_calls").is_null()) {
@@ -652,8 +653,8 @@ void reject_server_managed_features(const Json& body) {
     }
     if (body.contains("top_logprobs") && !body.at("top_logprobs").is_null()) {
         const std::optional<int> value = optional_int(body, "top_logprobs");
-        if (!value || *value != 0) {
-            bad_request("top_logprobs is not supported", "top_logprobs", "logprobs_not_supported");
+        if (!value || *value < 0 || *value > 20) {
+            bad_request("top_logprobs must be between 0 and 20", "top_logprobs");
         }
     }
     if (body.contains("truncation") && !body.at("truncation").is_null()) {
@@ -735,6 +736,12 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     out.store             = optional_bool(body, "store", true);
     out.stream            = optional_bool(body, "stream", false);
     out.generation.stream = out.stream;
+    out.generation.top_logprobs = optional_int(body, "top_logprobs").value_or(0);
+    if (body.contains("include") && body.at("include").is_array()) {
+        for (const auto& field : body.at("include")) {
+            if (field == "message.output_text.logprobs") out.generation.want_logprobs = true;
+        }
+    }
     out.generation.parallel_tool_calls = optional_bool(body, "parallel_tool_calls", true);
     validate_metadata(body, out);
     parse_tools(body, out);
@@ -832,9 +839,30 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
-        {"top_logprobs", 0},
+        {"top_logprobs", request.generation.top_logprobs},
         {"top_p", runtime.top_p},
         {"truncation", "disabled"}};
+}
+
+Json response_logprobs(const GenerationOutcome& outcome) {
+    Json entries = Json::array();
+    const auto token_json = [&](const TokenLogprob& token) {
+        const auto& text = outcome.score_texts.at(token.token_id);
+        Json bytes = Json::array();
+        for (unsigned char byte : text) bytes.push_back(static_cast<int>(byte));
+        // Token pieces can end inside a UTF-8 character. Keep their exact bytes,
+        // but normalize the display string before it enters stored/SSE JSON.
+        const Json display = Json::parse(Json(text).dump(-1, ' ', false, Json::error_handler_t::replace));
+        return Json{{"token", display}, {"logprob", token.logprob}, {"bytes", std::move(bytes)}};
+    };
+    for (const auto& score : outcome.completion_scores) {
+        Json entry = token_json(score.selected);
+        Json top = Json::array();
+        for (const auto& candidate : score.top) top.push_back(token_json(candidate));
+        entry["top_logprobs"] = std::move(top);
+        entries.push_back(std::move(entry));
+    }
+    return entries;
 }
 
 BuiltResponse build_response(const std::string& id, std::int64_t created_at,
@@ -868,6 +896,9 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
                  {"content", Json::array({Json{{"type", "output_text"},
                                                {"annotations", Json::array()},
                                                {"text", outcome.text}}})}});
+        if (request.generation.want_logprobs) {
+            built.output_items.back()["content"][0]["logprobs"] = response_logprobs(outcome);
+        }
     }
 
     ids.function_calls.resize(outcome.tool_calls.size());
@@ -1071,12 +1102,14 @@ public:
     }
 
     std::vector<std::string> close_message(const std::string& final_text,
-                                           const char* item_status = "completed") {
+                                           const char* item_status = "completed",
+                                           const Json& logprobs = Json::array()) {
         if (!message_started || message_done) { return {}; }
         message_done    = true;
         content_text    = final_text;
-        const Json part = {
+        Json part = {
             {"type", "output_text"}, {"annotations", Json::array()}, {"text", content_text}};
+        if (request.generation.want_logprobs) part["logprobs"] = logprobs;
         const Json item = {{"id", ids.message},
                            {"type", "message"},
                            {"status", item_status},
@@ -1086,7 +1119,7 @@ public:
                                                             {"output_index", message_index},
                                                             {"content_index", 0},
                                                             {"text", content_text},
-                                                            {"logprobs", Json::array()}})),
+                                                            {"logprobs", logprobs}})),
                 sse(event("response.content_part.done", Json{{"item_id", ids.message},
                                                              {"output_index", message_index},
                                                              {"content_index", 0},
@@ -1212,7 +1245,7 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
                                                        {"logprobs", Json::array()}})));
             }
         }
-        append(impl_->close_message(outcome.text, item_status));
+        append(impl_->close_message(outcome.text, item_status, response_logprobs(outcome)));
     }
 
     impl_->ids.function_calls.reserve(outcome.tool_calls.size());

@@ -3,6 +3,7 @@
 #include "serve/generation_service.h"
 
 #include <cassert>
+#include <cmath>
 #include <chrono>
 #include <cstdlib>
 #include <future>
@@ -85,6 +86,14 @@ int main() {
     request.ignore_eos = true;
     request.sampling.temperature = 0;
     request.return_token_ids = true;
+    const bool score_tokens = std::getenv("SUROGATE_MULTI_DEVICE_TEST_LOGPROBS") != nullptr;
+    if (score_tokens) {
+        request.want_logprobs = true;
+        request.top_logprobs = 5;
+        request.prompt_logprobs = cache_turn ? -1 : 0;
+    }
+    std::vector<float> expected_scores;
+
     std::string completed_text;
     const auto generate = [&](GenerationService& service) {
         auto prepared = service.prepare(request);
@@ -93,6 +102,29 @@ int main() {
             std::cout << "DFlash rounds=" << result.metrics.speculative_rounds
                       << " accepted=" << result.metrics.speculative_accepted_tokens << '\n';
             assert(result.metrics.speculative_rounds > 0);
+        }
+        if (score_tokens) {
+            assert(result.token_logprobs.size() == result.completion_token_ids.size());
+            assert(result.completion_scores.size() == result.completion_token_ids.size());
+            for (const auto& score : result.completion_scores) {
+                assert(score.top.size() == 5);
+                assert(std::isfinite(score.selected.logprob));
+            }
+            if (request.prompt_logprobs >= 0) {
+                assert(result.prompt_scores.size() == result.prompt_tokens);
+                assert(result.prompt_scores.front().selected.token_id == -1);
+                for (std::size_t i = 1; i < result.prompt_scores.size(); ++i) {
+                    assert(std::isfinite(result.prompt_scores[i].selected.logprob));
+                    assert(result.prompt_scores[i].selected.token_id == result.prompt_token_ids[i]);
+                }
+            }
+            if (expected_scores.empty()) expected_scores = result.token_logprobs;
+            else {
+                assert(expected_scores.size() == result.token_logprobs.size());
+                for (std::size_t i = 0; i < expected_scores.size(); ++i) {
+                    assert(std::abs(expected_scores[i] - result.token_logprobs[i]) < 0.02f);
+                }
+            }
         }
         completed_text = result.text;
         return result.completion_token_ids;

@@ -441,6 +441,9 @@ public:
         proposal_head_n_   = count;
     }
 
+    bool score_prompt = false;
+    std::function<void(const Tensor&, int, bool)> logprob_observer;
+    void observe_prompt_logits(const Tensor& hidden, int base, cudaStream_t stream);
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
     void set_prefill_rewrite_checkpoint_frontier(std::int64_t position) noexcept {

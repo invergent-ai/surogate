@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -347,6 +348,9 @@ struct ExecutionOptions {
     std::string structural_tag;
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
+    /// Number of raw full-vocabulary alternatives to return, 0..20; -1 disables scoring.
+    int prompt_logprobs = -1;
+    int top_logprobs = -1;
     bool allow_prefix_reuse               = true;
     /// Bank slot of the LoRA adapter this request selected, -1 for the base
     /// model. A slot rather than a name: the round stages an integer per lane,
@@ -663,7 +667,20 @@ enum class PrefixReusePath : std::uint8_t {
     RestoreResponseCheckpoint,
 };
 
+struct TokenLogprob {
+    TokenId token_id = -1;
+    float logprob = std::numeric_limits<float>::quiet_NaN();
+    std::int32_t rank = 0;
+};
+
+struct TokenScore {
+    TokenLogprob selected;
+    std::vector<TokenLogprob> top;
+};
+
 struct GenerationResult {
+    std::vector<TokenScore> prompt_logprobs;
+    std::vector<TokenScore> completion_logprobs;
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
     /// The log-probability of each generated token under the full vocabulary at

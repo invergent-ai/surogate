@@ -76,7 +76,7 @@ management requests to select the model.
 | `min_tokens` | Suppress stop tokens until this many tokens have been generated; stop strings remain active |
 | `tokens` | Nonempty array of exact prompt token ids to use instead of the formatted messages; `messages` is still required |
 | `add_generation_prompt` | Whether the template appends the assistant-generation prefix; defaults to `true` |
-| `logprobs`, `return_token_ids` | Raw token details for text and tool-call Chat Completion responses, including SSE; see below |
+| `logprobs`, `top_logprobs`, `prompt_logprobs`, `return_token_ids` | Raw token details for text and tool-call Chat Completion responses, including SSE; see below |
 
 If the server was started with `--greedy`, temperature is always zero even when a request
 specifies another value.
@@ -121,12 +121,27 @@ When tool-derived constraints are active, they take precedence over `response_fo
 (or Responses `text.format`), matching vLLM. With unconstrained automatic tools, a JSON answer
 format still applies to the generated answer.
 
-`logprobs: true` returns each generated token's log-probability and text in `choices[].logprobs.content`;
-`top_logprobs` entries are empty. `return_token_ids: true` adds the exact prompt and completion
-ids. These details cover the raw generated sequence, including reasoning and tool-call syntax,
-for both text and tool-call responses. With `stream: true`, the server sends the token details
-together in a chunk with an empty `delta` after generation and before the finish chunk.
-Unavailable log-probabilities are returned as `null`.
+`logprobs: true` returns each generated token's log-probability, text, and bytes in
+`choices[].logprobs.content`. Add `top_logprobs: 5` for the five most likely alternatives at
+each position; counts from 0 through 20 are supported. The selected token is always scored,
+even when it is outside those alternatives.
+
+`prompt_logprobs: 5` returns a top-level `prompt_logprobs` array aligned with the prompt
+tokens. Its first entry is `null`, because the first token has no preceding context. Each
+remaining entry maps token ids to `logprob`, `rank`, and `decoded_token`, including the actual
+prompt token and up to five alternatives. Use `prompt_logprobs: 0` to score only the actual
+prompt tokens. `return_token_ids: true` includes the exact prompt and completion ids.
+
+Probabilities use the full model distribution before temperature, penalties, logit bias, or
+sampling constraints, matching vLLM's default raw log-probabilities. They are not probabilities
+renormalized over the tokens allowed by a schema or sampling filter. Generated scores include
+reasoning and tool-call syntax. Ordinary, MTP, and DFlash generation support these fields,
+including pipeline serving.
+
+Requesting scores adds latency. Prompt scoring evaluates the full prompt and does not reuse
+cached prefixes; generated-token scoring still permits prefix reuse. With `stream: true`,
+the server sends all token details together in a chunk with an empty `delta` after generation
+and before the finish chunk.
 
 ### Reasoning models
 
@@ -150,7 +165,6 @@ These are refused with a `400` and a specific error code rather than silently ig
 | `n` > 1 | One completion per request (`n_not_supported`) |
 | `functions`, `function_call` | Legacy pre-`tools` API (`tools_not_supported`) |
 | Message role `function` | Use role `tool` (`unsupported_role`) |
-| `prompt_logprobs` requesting prompt scoring | Prompt token scoring is unsupported |
 | Unsupported content parts, including `input_audio` | `modality_not_supported` |
 
 Models without a chat template use `/v1/completions`; chat generation endpoints return
@@ -259,8 +273,11 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 
 `POST /v1/completions` tokenizes `prompt` exactly as written, with no chat template. It accepts
 a string or a one-element string array and supports streaming, sampling, stops, and adapter
-selection. Batched prompts and token arrays in `prompt` are refused. Requests for `echo`,
-`logprobs`, `suffix`, or `best_of > 1` are unsupported on this endpoint.
+selection. Set `logprobs` to an integer from 0 through 20 to receive token probabilities and
+that many alternatives in `choices[].logprobs`. `prompt_logprobs` and `return_token_ids` work
+as described above. Streaming delivers the scores together before the finish chunk. Batched
+prompts and token arrays in `prompt` are refused. Requests for `echo`, `suffix`, or
+`best_of > 1` are unsupported on this endpoint.
 
 `POST /tokenize` accepts either `messages` or a raw `prompt` and returns `count`,
 `max_model_len`, and `tokens`. Set `with_token_strings: true` to include `token_strs`, or
@@ -356,6 +373,11 @@ Responses accepts `tool_choice: "auto"`, `"none"`, `"required"`, or a named func
 `{"type":"function","name":"weather"}`. Define function tools with `name`, `parameters`, and
 optional `strict` directly on the tool object. Both strict tools and `parallel_tool_calls: false`
 work with streaming and stored responses; the tool-choice rules above apply unchanged.
+
+For generated-token probabilities, set `include: ["message.output_text.logprobs"]` and
+optionally `top_logprobs` (0–20). Scores appear on the output-text content part and in the
+`response.output_text.done` event when streaming. They cover the raw generated tokens,
+including reasoning and tool syntax, using the same probabilities as Chat Completions.
 
 Background execution and compaction are unsupported. `/v1/responses/compact` returns
 `400 compaction_not_supported`. `/v1/responses/{id}/cancel` returns

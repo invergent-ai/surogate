@@ -1,4 +1,5 @@
 #pragma once
+#include "api/types.h"
 
 #include "api/ops/sampling.h"
 #include "core/tensor.h"
@@ -8,6 +9,10 @@
 #include <cuda_runtime.h>
 
 namespace sinfer::ops {
+/// Raw full-vocabulary probabilities; retains only the selected token and top K.
+TokenScore score_logprobs(const Tensor& logits, TokenId token, int domain, int top_k,
+                         cudaStream_t stream);
+
 
 /**
  * The log-probability of one chosen token per column, under that column's

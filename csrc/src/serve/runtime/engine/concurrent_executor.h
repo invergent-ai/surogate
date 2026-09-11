@@ -525,6 +525,9 @@ private:
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            if constexpr (requires { instance_.program->collect_logprobs(*request->lane, result); }) {
+                instance_.program->collect_logprobs(*request->lane, result);
+            }
         }
         if (request->first_token) {
             result.timings.first_token_seconds =

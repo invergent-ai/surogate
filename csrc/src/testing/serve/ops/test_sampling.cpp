@@ -6,6 +6,7 @@
 // input.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
 #include "api/ops/sampling.h"
+#include "api/ops/sampled_logprob.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/op_tester.h"
 
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -751,6 +753,39 @@ int workspace_route_boundary_contract() {
     return failures;
 }
 
+int test_logprob_scores() {
+    int failures = 0;
+    for (int domain : {7, 1031, 151936}) {
+        std::vector<float> input(domain + 17, 1000.0f);
+        for (int i = 0; i < domain; ++i) input[i] = float((i * 73) % 127 - 63) / 8;
+        auto device = to_device_bf16(input);
+        Tensor logits(device.p, DType::BF16, {domain + 17, 1});
+        std::vector<int> order(domain);
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return input[a] > input[b]; });
+        double sum = 0;
+        const double maximum = input[order[0]];
+        for (int i = 0; i < domain; ++i) sum += std::exp(input[i] - maximum);
+        const double normalizer = maximum + std::log(sum);
+        for (int count : {0, 1, 20}) {
+            for (int token : {0, domain / 2, order[0]}) {
+                const auto score = ops::score_logprobs(logits, token, domain, count, nullptr);
+                const auto rank = std::count_if(input.begin(), input.begin() + domain,
+                    [&](float value) { return value >= input[token]; });
+                failures += score.selected.token_id != token || score.selected.rank != rank ||
+                    std::abs(score.selected.logprob - (input[token] - normalizer)) > 2e-5;
+                failures += score.top.size() != std::min(count, domain);
+                for (std::size_t k = 0; k < score.top.size(); ++k) {
+                    failures += score.top[k].token_id != order[k] || score.top[k].rank != k + 1 ||
+                        std::abs(score.top[k].logprob - (input[order[k]] - normalizer)) > 2e-5;
+                }
+            }
+        }
+    }
+    if (failures) std::cerr << "log-probability oracle failures: " << failures << '\n';
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -759,7 +794,7 @@ int main() {
         return 77;
     }
 
-    int failures = 0;
+    int failures = test_logprob_scores();
     // The multi-block column cap is read from kSamplerMaxColumns, not restated.
     // It has moved twice -- 16, then 32, then tied to the ops batch bound -- and
     // the literal 16 these boundaries used to carry went stale silently both
