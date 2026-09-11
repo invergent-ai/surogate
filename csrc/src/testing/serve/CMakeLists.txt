@@ -401,8 +401,11 @@ sinfer_add_op_test(sinfer_manifold_hyper_connection_test
   SOURCES ops/test_manifold_hyper_connection.cpp
   LIBRARIES sinfer_ops)
 sinfer_add_op_test(sinfer_sparse_moe_test
-  SOURCES ops/test_sparse_moe.cpp
-  LIBRARIES sinfer_ops)
+    SOURCES ops/test_sparse_moe.cpp
+    LIBRARIES sinfer_ops)
+add_test(NAME sinfer_sparse_moe_qwen3_vl_235b_test
+    COMMAND sinfer_sparse_moe_test --qwen3-vl-235b)
+set_tests_properties(sinfer_sparse_moe_qwen3_vl_235b_test PROPERTIES SKIP_RETURN_CODE 77)
 sinfer_add_op_test(sinfer_mtp_pack_test
   SOURCES ops/test_mtp_pack.cpp
   LIBRARIES sinfer_ops)

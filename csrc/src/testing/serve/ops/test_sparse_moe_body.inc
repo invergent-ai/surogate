@@ -916,8 +916,10 @@ public:
         failures +=
             verify_exact((label + " input preservation").c_str(),
                          from_device<std::uint16_t>(device_input, input_bits.size()), input_bits);
-        if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-            std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        // Capacity also reserves the batched expert-adapter path. A base-only
+        // small-T round can use less, but must release its scope and stay in bounds.
+        if (workspace.used() != 0 || workspace.peak_used() == 0 || workspace.peak_used() > workspace_bytes) {
+            std::cerr << label << ": workspace usage exceeds capacity or was not released\n";
             ++failures;
         }
         return failures;

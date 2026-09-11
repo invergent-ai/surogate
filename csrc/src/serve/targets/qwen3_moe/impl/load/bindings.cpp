@@ -137,12 +137,11 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.
     out.geometry = family::TextGeometry::resolved_moe(binder.reader().geometry(), binder.reader().layer_types());
-    out.frontend     = family::bind_text_only_frontend_resources(binder);
+    out.frontend     = family::bind_frontend_resources(binder);
     out.features     = features;
 
-    if (features.vision) {
-        throw std::runtime_error("qwen3_moe is a text-only target: --vision is unsupported");
-    }
+    family::bind_qwen3_vl_vision(binder, out, out.geometry, features.vision,
+                                 binder.reader().identity().architecture == "qwen3_vl_moe");
     if (features.speculative_enabled()) {
         // Qwen3-MoE ships no MTP block and the target declares no DFlash tower, so there is
         // nothing to draft with. Refusing here beats a missing-object failure twenty objects
@@ -180,10 +179,14 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     const family::TextGeometry& g = runtime.geometry;
     runtime.full_layers.resize(static_cast<std::size_t>(g.layers));
     runtime.gdn_layers.resize(kGdnLayers);
-    frontend = family::take_text_only_frontend_resources(backing, plan.frontend);
+    frontend = family::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
+    runtime.vision_geometry = plan.vision_geometry;
+    if (plan.features.vision) {
+        runtime.vision = family::materialize_qwen3_vl_vision(backing, plan);
+    }
 
     runtime.token_embedding =
         materialized_weight(backing, plan.token_embedding, g.output_rows, g.hidden);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/load/qwen3_vl.h"
+
 #include "family/impl/moe/banked_experts.h"
 
 #include <api/targets/qwen3_moe/package.h>
@@ -67,13 +69,11 @@ struct TextLayerPlan {
     MoePlan moe;
 };
 
-struct BindingPlan {
+struct BindingPlan : family::Qwen3VlVisionPlan {
     /// The dimensions bound against: the compiled config with the artifact's
     /// `geometry` member laid over it.
     family::TextGeometry geometry = {};
-    /// Only four of the family plan's six slots are filled: a text-only checkpoint publishes
-    /// no image or video preprocessor config, and the loader refuses an artifact carrying an
-    /// object no binder consumed.
+    /// Text resources plus image/video processor settings for Qwen3-VL-MoE.
     family::FrontendResourcePlan frontend;
     family::StartupFeatures features;
 

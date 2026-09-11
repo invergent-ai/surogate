@@ -56,6 +56,11 @@ SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen3MoeGeometry)
 #include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
 } // namespace geometry_qwen3_moe
 
+namespace geometry_qwen3_moe_235b {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen3Moe235BGeometry)
+#include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
+} // namespace geometry_qwen3_moe_235b
+
 namespace geometry_glm53 {
 SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeGlm53Geometry)
 #include "ops/sparse_moe/decode/sparse_moe_decode_body.inc"
@@ -94,6 +99,12 @@ void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, cons
     }
     if (geometry == kSparseMoeQwen3MoeGeometry) {
         geometry_qwen3_moe::decode_launch_d3_small_t(x, weights, token_ids, token_activations,
+                                                     tokens, schedule, stream,
+                                                     adaptive_route_jobs);
+        return;
+    }
+    if (geometry == kSparseMoeQwen3Moe235BGeometry) {
+        geometry_qwen3_moe_235b::decode_launch_d3_small_t(x, weights, token_ids, token_activations,
                                                      tokens, schedule, stream,
                                                      adaptive_route_jobs);
         return;
@@ -150,6 +161,12 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
                                                      schedule, stream, adaptive_route_jobs);
         return;
     }
+    if (geometry == kSparseMoeQwen3Moe235BGeometry) {
+        geometry_qwen3_moe_235b::decode_launch_d4_small_t(weights, destination, token_ids, token_alpha,
+                                                     shared_scale, token_activations, tokens,
+                                                     schedule, stream, adaptive_route_jobs);
+        return;
+    }
     if (geometry == kSparseMoeGlm53Geometry) {
         geometry_glm53::decode_launch_d4_small_t(weights, destination, token_ids, token_alpha,
                                                      shared_scale, token_activations, tokens,
@@ -192,6 +209,10 @@ void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x
     }
     if (geometry == kSparseMoeQwen3MoeGeometry) {
         geometry_qwen3_moe::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
+        return;
+    }
+    if (geometry == kSparseMoeQwen3Moe235BGeometry) {
+        geometry_qwen3_moe_235b::decode_launch(x, router_x, weights, destination, workspace, stream, hook, adapters, adapter_slot);
         return;
     }
     if (geometry == kSparseMoeGlm53Geometry) {

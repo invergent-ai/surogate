@@ -167,11 +167,11 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         .backend_kv_pages = base->backend_kv_page_entitlement,
     };
     if (prompt.has_media()) {
-        auto control =
-            std::make_shared<family::VisionControl>(family::build_vision_control(prompt));
         // The tower these weights carry, which is what the encode will actually run.
         const family::VisionGeometry vision =
             schedule::bound_vision_geometry(model.vision_geometry, model.geometry);
+        auto control = std::make_shared<family::VisionControl>(
+            family::build_vision_control(prompt, vision.position_embeddings));
         std::size_t max_merged     = 0;
         std::uint32_t previous_end = 0;
         for (const family::VisionItemControl& item : control->items) {

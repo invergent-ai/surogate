@@ -87,6 +87,18 @@ def load_resources(
         path = root / filename
         if not path.exists() and filename == "generation_config.json":
             data = _synthesize_generation_config(root)
+        elif (not path.exists() and filename in ("preprocessor_config.json", "video_preprocessor_config.json")
+              and (root / "processor_config.json").is_file()):
+            # Recent Transformers exports bundle both processors in one resource.
+            processor = load_json(root / "processor_config.json")
+            key = "image_processor" if filename == "preprocessor_config.json" else "video_processor"
+            nested = processor.get(key)
+            if nested is None:
+                continue
+            if not isinstance(nested, dict):
+                raise ValueError(f"processor_config.json.{key} must be an object")
+            data = json.dumps({**nested, **({"processor_class": processor["processor_class"]}
+                                          if "processor_class" in processor else {})}).encode()
         elif not path.exists() and (filename == "chat_template.jinja" or filename.endswith("preprocessor_config.json")):
             # A text-only release of a vision family ships no image processor. The artifact
             # then carries no such resource, and the engine's frontend reads its absence as

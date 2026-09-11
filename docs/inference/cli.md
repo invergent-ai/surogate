@@ -303,14 +303,31 @@ sets how much processed media to retain for reuse; `0` disables retention. `--me
 (default 2048) limits memory for media currently being processed or used by requests.
 `--media-preprocess-threads N` chooses processing threads; `0` selects automatically, up to 16.
 
-For example, serve a dense Qwen3-VL checkpoint with image and video inputs:
+Qwen3-VL dense and MoE checkpoints support text, images, and video. For example:
 
 ```bash
 surogate serve Qwen/Qwen3-VL-2B-Instruct --vision --port 8080
+surogate serve Qwen/Qwen3-VL-30B-A3B-Instruct --vision --devices 0,1 --port 8080
 ```
 
-Send media through the [chat API](api.md#chat-completions). Without `--vision`, the same
-checkpoint serves text prompts. Qwen3-VL-MoE and Qwen3-VL GGUF files are not supported yet.
+Choose one command and size the GPU group for the checkpoint. Send media through the
+[chat API](api.md#chat-completions) or Responses API. Without `--vision`, the same checkpoint
+serves text prompts.
+
+For a Qwen3-VL GGUF, supply the matching vision projector from the same model release:
+
+```bash
+surogate serve /models/Qwen3-VL-2B-Instruct-Q4_K_M.gguf \
+  --mmproj /models/mmproj-BF16.gguf --vision --port 8080
+```
+
+Dense and MoE GGUFs are supported, including split text files; pass the first shard.
+If exactly one compatible `mmproj*.gguf` is beside the text model, it is selected automatically.
+Otherwise, use `--mmproj` explicitly. Keep all source GGUF files available after preparation.
+The text weights retain their GGUF quantization. The projector uses BF16 serving weights,
+so a quantized projector may require more memory after preparation.
+Image and video serving has been checked with the 2B and 30B-A3B GGUF checkpoints.
+The complete 235B-A22B checkpoint has not yet been tested.
 
 ### Responses state
 

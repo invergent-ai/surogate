@@ -78,7 +78,7 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
                                "Qwen3.5/3.6/3.8", gguf_repack=True)
     # Any size of the plain dense Qwen3: the artifact states its dimensions and the engine
     # binds against those, so the architecture is the gate.
-    if model_type == "qwen3_vl" and hidden > 0 and layers > 0:
+    if model_type in ("qwen3_vl", "qwen3_vl_moe") and hidden > 0 and layers > 0:
         return ConverterTarget("qwen3_vl", "surogate.serve.convert.qwen3_vl.convert", "Qwen3-VL")
     if model_type == "qwen3" and hidden > 0 and layers > 0:
         return ConverterTarget("qwen3", "surogate.serve.convert.qwen3.convert", "Qwen3",
@@ -246,7 +246,7 @@ def _find_mtp_gguf(gguf_path: Path) -> Path | None:
     return None
 
 
-def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) -> Path:
+def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print, mmproj=None) -> Path:
     """GGUF → temp HF dir (dequant BF16) → vendored converter → cached weights.
 
     v0 bridge (surogate/serve/gguf/bridge.py): correctness inherits the converter's
@@ -255,6 +255,44 @@ def _ensure_from_gguf(gguf_path: Path, *, reuse_cache: bool = True, echo=print) 
     (~2 bytes/param) are deleted after conversion.
     """
     from surogate.serve.gguf import bridge as serve_gguf
+
+    with serve_gguf.open_gguf(gguf_path) as source:
+        vl = source.kv("general.architecture") in ("qwen3vl", "qwen3vlmoe")
+    if vl:
+        from surogate.serve.convert.qwen3_vl.gguf import find_projector
+        from surogate.serve.convert.common.gguf_source import GgufSource
+        try:
+            projector = find_projector(gguf_path, mmproj)
+            sources = GgufSource(gguf_path, extra=[projector])
+            try:
+                fp = _gguf_fingerprint(sources.shards[0], *sources.shards[1:])
+                # GGUF-backed objects reference their source paths, so equal file stamps
+                # in different directories must never resolve to the same artifact.
+                fp = hashlib.sha256((fp + repr([str(p.resolve()) for p in sources.shards])).encode()).hexdigest()[:24]
+            finally:
+                sources.close()
+            out = cache_dir() / f"qwen3-vl-gguf-{fp}.sinfer"
+            if reuse_cache and out.is_file() and out.stat().st_size > 0:
+                echo(f"surogate serve: using cached engine weights ({out.name})")
+                return out
+            echo(f"surogate serve: preparing Qwen3-VL GGUF with {projector.name}")
+            tmp = out.with_suffix(".sinfer.partial")
+            try:
+                command = [sys.executable, "-m", "surogate.serve.convert.qwen3_vl.gguf",
+                           "--gguf", str(gguf_path), "--mmproj", str(projector), "--out", str(tmp),
+                           "--device", os.getenv("SUROGATE_CONVERT_DEVICE", "cpu")]
+                result = subprocess.run(command, cwd=_sinfer_root(), stdout=sys.stderr)
+                if result.returncode:
+                    raise SystemExit(f"surogate serve: Qwen3-VL GGUF conversion failed (exit {result.returncode})")
+                tmp.replace(out)
+                Path(str(tmp) + ".conversion.json").replace(Path(str(out) + ".conversion.json"))
+            finally:
+                tmp.unlink(missing_ok=True)
+            return out
+        except (ValueError, KeyError, OSError) as error:
+            raise SystemExit(f"surogate serve: {error}") from error
+    if mmproj is not None:
+        raise SystemExit("surogate serve: --mmproj is supported for Qwen3-VL GGUF models")
 
     root = _sinfer_root()
     if root is None:
@@ -690,18 +728,20 @@ def ensure_encoder_weights(spec: str, *, frontend: str | None = None,
     return out
 
 
-def ensure_engine_weights(spec: str, *, reuse_cache: bool = True, echo=print) -> Path:
+def ensure_engine_weights(spec: str, *, reuse_cache: bool = True, echo=print, mmproj=None) -> Path:
     """Resolve `spec` (safetensors dir | HF repo id | GGUF | internal artifact)
     to an engine-loadable weights file, converting through the transparent
     cache when needed. Raises SystemExit with a clear message on refusal."""
     kind = classify_input(spec)
+    if mmproj is not None and kind != "gguf":
+        raise SystemExit("surogate serve: --mmproj requires a Qwen3-VL text GGUF as the model")
 
     if kind == "artifact":
         # Internal/dev passthrough (not a supported product input).
         return Path(spec)
 
     if kind == "gguf":
-        return _ensure_from_gguf(Path(spec).resolve(), reuse_cache=reuse_cache, echo=echo)
+        return _ensure_from_gguf(Path(spec).resolve(), reuse_cache=reuse_cache, echo=echo, mmproj=mmproj)
 
     if kind == "hf_repo_id":
         echo(f"surogate serve: resolving Hugging Face repo '{spec}'...")

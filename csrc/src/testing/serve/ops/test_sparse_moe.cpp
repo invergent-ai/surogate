@@ -74,6 +74,11 @@ SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeQwen3MoeGeometry)
 #include "ops/test_sparse_moe_body.inc"
 } // namespace qwen3_moe
 
+namespace qwen3_moe_235b {
+SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeQwen3Moe235BGeometry)
+#include "ops/test_sparse_moe_body.inc"
+} // namespace qwen3_moe_235b
+
 namespace glm53 {
 SINFER_MOE_TEST_GEOMETRY(ops::kSparseMoeGlm53Geometry)
 #include "ops/test_sparse_moe_body.inc"
@@ -105,6 +110,13 @@ int main(int argc, char** argv) {
     }
 
     if (argc == 2 && std::string(argv[1]) == "--lfm2") { return run_lfm2() ? 1 : 0; }
+    if (argc == 2 && std::string(argv[1]) == "--qwen3-vl-235b") {
+        constexpr std::array<std::int32_t, 5> tokens{{1, 4, 19, 20, 128}};
+        const CodecProfile profile{"qwen3_vl_235b w8+w8", QType::W8G32_F16S,
+                                   QType::W8G32_F16S, tokens, true};
+        return qwen3_moe_235b::run_profile(profile) ? 1 : 0;
+    }
+
 
     // These are public-behavior cases, not route assertions. They exercise decode (T=1), the
     // Small-T supported-domain edges, each profile's first prefill T, the wide-prefill boundary,

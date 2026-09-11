@@ -1,1 +1,1 @@
-"""Serving conversion for dense Qwen3-VL checkpoints."""
+"""Serving conversion for Qwen3-VL dense and MoE checkpoints."""

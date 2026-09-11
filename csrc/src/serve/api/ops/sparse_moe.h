@@ -106,6 +106,9 @@ inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{
 /// first registered mixture that routes every token entirely.
 inline constexpr SparseMoeGeometry kSparseMoeQwen3MoeGeometry{
     2048, 128, 8, 768, SparseMoeGating::SoftmaxTopK, 1.0F, true, 0};
+/// Qwen3/Qwen3-VL-235B-A22B use wider routed-only experts with the same routing rule.
+inline constexpr SparseMoeGeometry kSparseMoeQwen3Moe235BGeometry{
+    4096, 128, 8, 1536, SparseMoeGating::SoftmaxTopK, 1.0F, true, 0};
 /// GLM-5.3-Flash: 288 experts, top-8, FFN 2048 with an always-on expert of the same width, and
 /// the sigmoid-plus-bias router its checkpoint declares (`expert_gating_func` 2,
 /// `expert_weights_scale` 2.5).
@@ -133,8 +136,9 @@ inline constexpr SparseMoeGeometry kSparseMoeLfm2Moe64Geometry{
 
 /// Every mixture this op serves. One list, so registering a geometry is one line here and one
 /// kernel-body instantiation per route rather than a predicate repeated in five places.
-inline constexpr std::array<SparseMoeGeometry, 7> kSparseMoeGeometries{
+inline constexpr std::array<SparseMoeGeometry, 8> kSparseMoeGeometries{
     kSparseMoeQwen36Geometry, kSparseMoeFlashNextGeometry, kSparseMoeQwen3MoeGeometry,
+    kSparseMoeQwen3Moe235BGeometry,
     kSparseMoeGlm53Geometry, kSparseMoeGemma4Geometry,
     kSparseMoeLfm2Moe32Geometry, kSparseMoeLfm2Moe64Geometry};
 

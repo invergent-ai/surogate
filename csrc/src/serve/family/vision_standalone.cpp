@@ -148,7 +148,8 @@ std::size_t StandaloneVisionTower::output_bytes(const VisionGrid& grid) const {
 
 void StandaloneVisionTower::encode(std::span<const std::uint16_t> patches, const VisionGrid& grid,
                                    PromptModality modality, Tensor& output) {
-    const VisionItemControl control = build_vision_item_control(grid, modality);
+    const VisionItemControl control = build_vision_item_control(
+        grid, modality, state_->geometry.position_embeddings);
     const std::size_t needed = VisionContext::workspace_bytes(state_->geometry, control);
     if (!state_->workspace || state_->workspace->capacity() < needed) {
         state_->workspace.emplace(needed);

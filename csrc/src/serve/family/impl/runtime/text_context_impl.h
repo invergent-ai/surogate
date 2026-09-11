@@ -3397,7 +3397,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
     capture_per_layer_source(x, s);
             window_laps.mark_pre();
-            if (!local_scatter_indices.empty()) {
+            // Later pipeline stages already receive the preceding layers' residual.
+            // Replacing its visual columns here would discard those layers' work.
+            if (stage_embeds() && !local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
                 Tensor embeddings = vision_chunk.embeddings.slice(

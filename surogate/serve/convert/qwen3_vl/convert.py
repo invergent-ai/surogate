@@ -1,16 +1,17 @@
-"""Convert a dense Qwen3-VL safetensors checkpoint for text, image, and video serving."""
+"""Convert a Qwen3-VL dense or MoE checkpoint for text, image, and video serving."""
 
 import argparse
 import json
-from pathlib import Path
 import time
+from pathlib import Path
 
 from surogate.serve.artifact.container import ArtifactIdentity, ArtifactWriter
 from surogate.serve.convert.common import conversion
-from surogate.serve.convert.common.official_resources import chat_template_bytes, tokenizer_config_with_template
 from surogate.serve.convert.common.checkpoint import tokenizer_domain
+from surogate.serve.convert.common.official_resources import chat_template_bytes, tokenizer_config_with_template
 from surogate.serve.convert.common.quantize import pick_device
 from surogate.serve.convert.common.recipe import materialize_recipe, validate_recipe_coverage
+
 from . import inventory, recipe
 
 validate_config = inventory.geometry_from_config
@@ -24,7 +25,8 @@ def convert(model_dir, out_path, *, device="cuda", vision_storage=inventory.VISI
     geometry = validate_config(config)
     conversion.honour_declared_scope(config, geometry, model, what=conversion.checkpoint_label(model))
     tensors = inventory.build_tensor_specs(geometry, vision_storage=vision_storage)
-    recipes = recipe.build_recipes(geometry)
+    with recipe.open_reader(model) as reader:
+        recipes = recipe.build_recipes(geometry, reader=reader)
     validate_recipe_coverage(recipes, tensors)
     source = recipe.preflight_sources(model, recipes)
     resources = {r.name: r.data for r in conversion.load_resources(model, inventory.RESOURCE_SPECS)}
@@ -39,7 +41,7 @@ def convert(model_dir, out_path, *, device="cuda", vision_storage=inventory.VISI
     plan = conversion.build_object_plan(
         inventory.build_object_specs(geometry, vision_storage=vision_storage), resources)
     recipes = {r.object_name: r for r in recipes}
-    identity = ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID, architecture=inventory.TARGET_KEY)
+    identity = ArtifactIdentity(geometry.architecture, inventory.WEIGHTS_ID, architecture=geometry.architecture)
     print(f"preflight complete: {len(plan.objects)} objects, {source.source_tensor_count} source tensors", flush=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     with recipe.open_reader(model) as reader, ArtifactWriter(

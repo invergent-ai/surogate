@@ -1,5 +1,7 @@
 #pragma once
 
+#include "family/impl/load/qwen3_vl.h"
+
 #include "family/impl/load/host_bank.h"
 
 #include <api/targets/qwen3/package.h>
@@ -57,20 +59,8 @@ struct TextLayerPlan {
     MlpPlan mlp;
 };
 
-struct BindingPlan {
+struct BindingPlan : family::Qwen3VlVisionPlan {
     family::HostBankPlan host_bank;
-    struct DeepstackPlan {
-        std::int32_t layer;
-        artifact::LinearBinding fc1, fc2;
-        artifact::ObjectHandle fc1_bias, fc2_bias, norm_weight, norm_bias;
-    };
-    family::VisionGeometry vision_geometry;
-    family::VisionBackbonePlan vision_backbone;
-    family::VisionMergerInputPlan vision_merger_input;
-    family::VisionMergerNormPlan vision_merger_norm;
-    artifact::LinearBinding vision_merger_output;
-    artifact::ObjectHandle vision_merger_output_bias;
-    std::vector<DeepstackPlan> deepstack;
     /// The dimensions declared by the checkpoint.
     family::TextGeometry geometry = {};
     /// Text resources and, for Qwen3-VL, image/video processor settings.

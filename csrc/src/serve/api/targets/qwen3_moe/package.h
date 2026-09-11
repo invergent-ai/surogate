@@ -54,9 +54,12 @@ struct Package {
     /// Every checkpoint this architecture serves. One graph at every size -- classic Qwen3
     /// attention over a routed mixture with no always-on expert -- and the artifact states its
     /// dimensions, so the target is the architecture rather than one of its sizes.
-    static constexpr std::array<std::string_view, 1> model_ids{"qwen3-moe"};
+    static constexpr std::array<std::string_view, 2> model_ids{"qwen3-moe", "qwen3_vl_moe"};
     static constexpr std::string_view model_id = model_ids[0];
     static constexpr std::string_view target_key = "qwen3_moe";
+    [[nodiscard]] static constexpr bool accepts_architecture(std::string_view architecture) {
+        return architecture == "qwen3_moe" || architecture == "qwen3_vl_moe";
+    }
     /// Longest context the weights were trained for; `max_context = 0` asks the engine to
     /// fit the largest context the device's free memory allows, up to this. A function, not a
     /// constant: `detail::Variant` is only forward-declared here.

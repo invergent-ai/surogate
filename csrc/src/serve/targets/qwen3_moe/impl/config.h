@@ -75,7 +75,7 @@ static_assert(TextConfig::router_rows == TextConfig::experts,
               "be read one row past its end");
 static_assert(!kMoeGeometry.has_shared());
 
-/// No vision tower. Declared because the shared ModelView names one; never bound.
+/// Text-only defaults; Qwen3-VL-MoE artifacts provide their own vision geometry.
 struct VisionConfig {
     static constexpr int layers              = 0;
     static constexpr int hidden              = 0;

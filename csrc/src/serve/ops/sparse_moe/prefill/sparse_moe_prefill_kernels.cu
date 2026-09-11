@@ -65,6 +65,11 @@ SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen3MoeGeometry)
 #include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
 } // namespace geometry_qwen3_moe
 
+namespace geometry_qwen3_moe_235b {
+SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeQwen3Moe235BGeometry)
+#include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
+} // namespace geometry_qwen3_moe_235b
+
 namespace geometry_glm53 {
 SINFER_SPARSE_MOE_GEOMETRY_CONSTANTS(kSparseMoeGlm53Geometry)
 #include "ops/sparse_moe/prefill/sparse_moe_prefill_body.inc"
@@ -100,6 +105,10 @@ void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& 
     }
     if (geometry == kSparseMoeQwen3MoeGeometry) {
         geometry_qwen3_moe::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
+        return;
+    }
+    if (geometry == kSparseMoeQwen3Moe235BGeometry) {
+        geometry_qwen3_moe_235b::prefill_launch(x, router_x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     if (geometry == kSparseMoeGlm53Geometry) {

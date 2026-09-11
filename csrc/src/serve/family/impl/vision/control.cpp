@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -11,7 +12,6 @@ namespace sinfer::family {
 namespace {
 
 constexpr std::int32_t kMerge        = 2;
-constexpr std::int32_t kPositionSide = 48;
 
 std::int32_t checked_i32(std::size_t value, const char* label) {
     if (value > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -20,22 +20,28 @@ std::int32_t checked_i32(std::size_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
-float coordinate(std::int32_t index, std::int32_t size) {
+float coordinate(std::int32_t index, std::int32_t size, std::int32_t position_side) {
     return size <= 1 ? 0.0F
-                     : static_cast<float>(index) * static_cast<float>(kPositionSide - 1) /
+                     : static_cast<float>(index) * static_cast<float>(position_side - 1) /
                            static_cast<float>(size - 1);
 }
 
 } // namespace
 
-// Everything the tower reads about an item, derived from its grid alone.
+// Everything the tower reads about an item, derived from its grid and the encoder's position table.
 //
 // `encode` never looks at `scatter_indices`: that field says where the merged tokens
 // land in the text stream, which is the caller's business, not the tower's. Splitting
 // it out is what lets a caller that has only a grid -- the trainer, feeding image
 // features into a sequence it is building itself -- run the same tower as serving,
 // against the same control arithmetic, rather than a second implementation of it.
-VisionItemControl build_vision_item_control(const VisionGrid& grid, PromptModality modality) {
+VisionItemControl build_vision_item_control(const VisionGrid& grid, PromptModality modality,
+                                            std::int32_t position_embeddings) {
+    const auto position_side = position_embeddings > 0
+        ? static_cast<std::int32_t>(std::sqrt(static_cast<double>(position_embeddings))) : 0;
+    if (position_side <= 0 || static_cast<std::int64_t>(position_side) * position_side != position_embeddings) {
+        throw std::invalid_argument("vision position table must have a positive square row count");
+    }
     const std::int32_t t = grid.temporal;
     const std::int32_t h = grid.height;
     const std::int32_t w = grid.width;
@@ -77,18 +83,18 @@ VisionItemControl build_vision_item_control(const VisionGrid& grid, PromptModali
                         control.position_ids[item_patches + position_cursor] = x;
                         ++position_cursor;
 
-                        const float yf        = coordinate(y, h);
-                        const float xf        = coordinate(x, w);
+                        const float yf        = coordinate(y, h, position_side);
+                        const float xf        = coordinate(x, w, position_side);
                         const auto y0         = static_cast<std::int32_t>(yf);
                         const auto x0         = static_cast<std::int32_t>(xf);
-                        const std::int32_t y1 = std::min(y0 + 1, kPositionSide - 1);
-                        const std::int32_t x1 = std::min(x0 + 1, kPositionSide - 1);
+                        const std::int32_t y1 = std::min(y0 + 1, position_side - 1);
+                        const std::int32_t x1 = std::min(x0 + 1, position_side - 1);
                         const float wy        = yf - static_cast<float>(y0);
                         const float wx        = xf - static_cast<float>(x0);
                         control.position_table_indices.insert(
                             control.position_table_indices.end(),
-                            {y0 * kPositionSide + x0, y0 * kPositionSide + x1,
-                             y1 * kPositionSide + x0, y1 * kPositionSide + x1});
+                            {y0 * position_side + x0, y0 * position_side + x1,
+                             y1 * position_side + x0, y1 * position_side + x1});
                         control.position_table_weights.insert(
                             control.position_table_weights.end(),
                             {(1.0F - wy) * (1.0F - wx), (1.0F - wy) * wx, wy * (1.0F - wx),
@@ -108,7 +114,7 @@ VisionItemControl build_vision_item_control(const VisionGrid& grid, PromptModali
     return control;
 }
 
-VisionControl build_vision_control(const PreparedPromptData& prompt) {
+VisionControl build_vision_control(const PreparedPromptData& prompt, std::int32_t position_embeddings) {
     if (prompt.token_ids.size() != prompt.token_types.size()) {
         throw std::invalid_argument("vision control token types must cover the prompt");
     }
@@ -130,7 +136,7 @@ VisionControl build_vision_control(const PreparedPromptData& prompt) {
             throw std::invalid_argument("vision control token spans do not match modality grid");
         }
 
-        VisionItemControl control = build_vision_item_control(item.grid, item.modality);
+        VisionItemControl control = build_vision_item_control(item.grid, item.modality, position_embeddings);
         control.patch_begin       = item.patch_begin;
 
         std::size_t item_tokens = 0;

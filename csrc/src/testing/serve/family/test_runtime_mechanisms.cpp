@@ -190,6 +190,18 @@ void test_vision_control() {
     };
 
     const q36::VisionControl control = q36::build_vision_control(prompt);
+    const q36::VisionControl small_table = q36::build_vision_control(prompt, 16);
+    for (const auto& item : small_table.items) {
+        expect(std::all_of(item.position_table_indices.begin(), item.position_table_indices.end(),
+                           [](int index) { return index >= 0 && index < 16; }),
+               "vision interpolation stays within the checkpoint's position table");
+        for (int patch = 0; patch < static_cast<int>(item.patch_count); ++patch) {
+            const std::array<int, 4> corners{0, 3, 12, 15};
+            expect(item.position_table_indices[4 * patch] == corners[patch % 4] &&
+                       item.position_table_weights[4 * patch] == 1.0F,
+                   "2x2 patches select the configured position-table corners");
+        }
+    }
     expect(control.items.size() == 2, "Vision per-item control count");
     expect(control.items[0].patch_begin == 0 && control.items[0].patch_count == 4 &&
                control.items[0].merged_count == 1 && control.items[0].segment_length == 4 &&

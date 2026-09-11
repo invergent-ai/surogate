@@ -122,46 +122,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.frontend     = family::bind_frontend_resources(binder);
     out.features     = features;
 
-    const bool has_vision = binder.has("vision/patch_embedding");
-    const bool vl = binder.reader().identity().architecture == "qwen3_vl";
-    if (has_vision != vl || (features.vision && !has_vision)) {
-        throw std::runtime_error("Qwen3-VL requires its vision encoder; Qwen3 is text-only");
-    }
-    if (vl) {
-        out.vision_geometry = family::VisionGeometry::resolved(binder.reader().vision_geometry());
-        const auto& v = out.vision_geometry;
-        if (v.siglip2 || v.output_hidden != out.geometry.hidden ||
-            v.deepstack_layers > out.geometry.layers || !out.geometry.mrope_temporal) {
-            throw std::runtime_error("Qwen3-VL vision or MRoPE geometry disagrees with the text model");
-        }
-        const auto placement = features.vision ? artifact::TensorPlacement::Device
-                                              : artifact::TensorPlacement::ValidateOnly;
-        out.vision_backbone = family::bind_vision_backbone(binder, placement, v);
-        out.vision_merger_input = family::bind_vision_merger_input(binder, placement, v);
-        out.vision_merger_norm = family::bind_vision_merger_norm(binder, placement, v);
-        out.vision_merger_output = artifact::bind_linear(
-            binder, "vision/merger/fc2", v.output_hidden, v.merger_hidden(), placement);
-        const auto tensor = [&](const std::string& name, int width) {
-            return artifact::bind_tensor(binder, name, NumericFormat::BF16, {width}, placement);
-        };
-        out.vision_merger_output_bias = tensor("vision/merger/fc2_bias", v.output_hidden);
-        for (int layer = 0; layer < v.layers; ++layer) {
-            const auto prefix = "vision/layers/" + std::to_string(layer) + "/deepstack/";
-            if (!binder.has(prefix + "fc1")) { continue; }
-            out.deepstack.push_back(BindingPlan::DeepstackPlan{
-                .layer = layer,
-                .fc1 = artifact::bind_linear(binder, prefix + "fc1", v.merger_hidden(), v.merger_hidden(), placement),
-                .fc2 = artifact::bind_linear(binder, prefix + "fc2", v.output_hidden, v.merger_hidden(), placement),
-                .fc1_bias = tensor(prefix + "fc1_bias", v.merger_hidden()),
-                .fc2_bias = tensor(prefix + "fc2_bias", v.output_hidden),
-                .norm_weight = tensor(prefix + "norm/weight", v.merger_hidden()),
-                .norm_bias = tensor(prefix + "norm/bias", v.merger_hidden()),
-            });
-        }
-        if (out.deepstack.size() != static_cast<std::size_t>(v.deepstack_layers)) {
-            throw std::runtime_error("Qwen3-VL deepstack objects disagree with the declared count");
-        }
-    }
+    family::bind_qwen3_vl_vision(binder, out, out.geometry, features.vision,
+                                 binder.reader().identity().architecture == "qwen3_vl");
     if (features.speculative_enabled()) {
         // Qwen3 ships no MTP block and the target declares no DFlash tower, so
         // there is nothing to draft with. Refusing here beats a missing-object
@@ -203,28 +165,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     runtime.features      = plan.features;
     runtime.vision_geometry = plan.vision_geometry;
     if (plan.features.vision) {
-        const auto& v = plan.vision_geometry;
-        family::VisionWeights vision;
-        vision.common = family::materialize_vision_common(backing, plan.vision_backbone,
-            plan.vision_merger_input, plan.vision_merger_norm, v);
-        const auto tensor = [&](artifact::ObjectHandle handle, int width) {
-            return artifact::materialized_tensor(backing, handle, NumericFormat::BF16, {width});
-        };
-        vision.merger_fc2 = artifact::materialized_linear(backing, plan.vision_merger_output,
-                                                         v.output_hidden, v.merger_hidden());
-        vision.merger_fc2_bias = tensor(plan.vision_merger_output_bias, v.output_hidden);
-        for (const auto& merger : plan.deepstack) {
-            vision.deepstack.push_back(family::VisionWeights::DeepstackMerger{
-                .layer = merger.layer,
-                .fc1 = artifact::materialized_linear(backing, merger.fc1, v.merger_hidden(), v.merger_hidden()),
-                .fc2 = artifact::materialized_linear(backing, merger.fc2, v.output_hidden, v.merger_hidden()),
-                .fc1_bias = tensor(merger.fc1_bias, v.merger_hidden()),
-                .fc2_bias = tensor(merger.fc2_bias, v.output_hidden),
-                .norm_weight = tensor(merger.norm_weight, v.merger_hidden()),
-                .norm_bias = tensor(merger.norm_bias, v.merger_hidden()),
-            });
-        }
-        runtime.vision = std::move(vision);
+        runtime.vision = family::materialize_qwen3_vl_vision(backing, plan);
     }
 
     runtime.token_embedding =

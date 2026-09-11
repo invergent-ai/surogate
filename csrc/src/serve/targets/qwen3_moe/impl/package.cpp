@@ -102,7 +102,7 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
 } // namespace
 
 ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
-    if (model == model_id) { return kQwen3MoeDefaults; }
+    if (std::find(model_ids.begin(), model_ids.end(), model) != model_ids.end()) { return kQwen3MoeDefaults; }
     throw std::runtime_error("model '" + std::string(model) +
                              "' has no sampling defaults in target package '" +
                              std::string(target_key) + "'");
@@ -111,7 +111,7 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
-    if (identity.architecture == target_key && identity.weights_id == "groupwise-int") {
+    if (accepts_architecture(identity.architecture) && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
@@ -141,7 +141,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
     return family::make_frontend(
         model.impl_->data.frontend,
         family::FrontendOptions{
-            .vision_enabled = false,
+            .vision_enabled = model.impl_->data.runtime.features.vision,
             .max_context    = options.max_context,
             .media_cache_bytes        = options.media_cache_bytes,
             .media_live_bytes         = options.media_live_bytes,

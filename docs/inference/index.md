@@ -100,7 +100,7 @@ The family is detected automatically. Available formats and optional features va
 | Family | Notes |
 |---|---|
 | Qwen3 | Dense models |
-| Qwen3-VL | Dense Hugging Face safetensors checkpoints; text, images, and video (`--vision`) |
+| Qwen3-VL | Dense and MoE safetensors or GGUF checkpoints; text, images, and video (`--vision`). GGUFs need a matching `--mmproj` file. |
 | Qwen3 MoE | Mixture-of-experts models |
 | Llama | Includes TinyLlama |
 | MiniCPM5 | Hugging Face safetensors and GGUF; thinking can be enabled or disabled |

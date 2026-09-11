@@ -306,11 +306,11 @@ def synthesised_config(reader, arch: str) -> dict | None:
         "initializer_range": 0.02,
         "use_cache": True,
     }
-    if arch == "qwen3":
+    if arch in ("qwen3", "qwen3vl"):
         return {**common, "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
                 "hidden_act": "silu", "sliding_window": None, "use_sliding_window": False,
                 "max_window_layers": layers}
-    if arch == "qwen3moe":
+    if arch in ("qwen3moe", "qwen3vlmoe"):
         # Qwen3-30B-A3B and its siblings: the same attention as the dense Qwen3 over a routed
         # mixture. Everything the converter reads is in the file -- the expert count, how many
         # a token uses, and their FFN width, which is `expert_feed_forward_length` and not the
@@ -791,6 +791,8 @@ def gguf_target_key(gguf_path: Path, reader=None):
     # Qwen3-30B-A3B and its siblings: plain attention over a routed mixture with no always-on
     # expert. llama.cpp spells it `qwen3moe`, which is one character from the interleaved
     # gated-delta family's `qwen35moe` and was once folded into it.
+    if arch in ("qwen3vl", "qwen3vlmoe") and hidden > 0 and layers > 0:
+        return "qwen3_vl"
     if arch == "qwen3moe" and hidden > 0 and layers > 0:
         return "qwen3_moe"
     # `qwen3moe` is deliberately not in the list below. It is llama.cpp's name for Qwen3-30B-A3B --

@@ -122,3 +122,24 @@ def test_preparation_uses_runtime_device(selector, flags, expected, monkeypatch)
     monkeypatch.setattr(serve.os, "execv", Mock())
     serve.maybe_exec_serve()
     assert "SUROGATE_CONVERT_DEVICE" not in serve.os.environ
+
+
+@pytest.mark.parametrize("selector", [[], ["--generate"]])
+def test_projector_is_consumed_before_native_execution(selector, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["surogate", "serve", *selector,
+                                    "--mmproj=projector.gguf", "model.gguf", "--vision"])
+    monkeypatch.setattr(serve, "_resolve_binary", lambda mode: "/engine")
+    ingest = Mock()
+    ingest.ensure_engine_weights.return_value = Path("/prepared.sinfer")
+    monkeypatch.setitem(sys.modules, "surogate.serve.ingest", ingest)
+    execute = Mock()
+    monkeypatch.setattr(serve.os, "execv", execute)
+    serve.maybe_exec_serve()
+    assert ingest.ensure_engine_weights.call_args.kwargs["mmproj"] == "projector.gguf"
+    execute.assert_called_once_with("/engine", ["/engine", "/prepared.sinfer", "--vision"])
+
+
+@pytest.mark.parametrize("args", [["model.gguf", "--mmproj="], ["--embed", "model.gguf", "--mmproj", "p.gguf"]])
+def test_invalid_projector_invocation(args):
+    with pytest.raises(ValueError):
+        serve._parse_invocation(args)

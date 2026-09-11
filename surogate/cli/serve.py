@@ -42,6 +42,7 @@ Common server options (full list: surogate serve --engine-help):
                                  model, fp8 where linear-attention layers carry the stack)
   --no-cache                     rebuild the conversion cache instead of reusing it
   --spec mtp --draft-tokens 3    speculative decoding
+  --mmproj PATH                 matching vision projector for a Qwen3-VL GGUF
 
 --generate runs one shot and has its own spellings for a few options
 (--max-context, --kv-dtype, --max-new): surogate serve --generate --engine-help.
@@ -109,8 +110,8 @@ _SWITCH_OPTIONS = {
 
 
 def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool, str | None]:
-    """Return mode, model, native options, cache policy and encoder frontend."""
-    values = frozenset().union(*_VALUE_OPTIONS.values(), {"--frontend"})
+    """Return mode, model, native options, cache policy and preparation resource."""
+    values = frozenset().union(*_VALUE_OPTIONS.values(), {"--frontend", "--mmproj"})
     switches = frozenset().union(*_SWITCH_OPTIONS.values(), {
         "--generate", "--embed", "--no-cache", "--engine-help", "--help", "-h",
     })
@@ -157,6 +158,11 @@ def _parse_invocation(args: list[str]) -> tuple[str, str | None, list[str], bool
         if flag == "--frontend" and mode == "embed":
             if not value:
                 raise ValueError("--frontend needs a directory")
+            frontend = value
+            continue
+        if flag == "--mmproj" and mode != "embed":
+            if not value:
+                raise ValueError("--mmproj needs a GGUF file")
             frontend = value
             continue
         if flag not in _VALUE_OPTIONS[mode] | _SWITCH_OPTIONS[mode]:
@@ -241,6 +247,8 @@ def maybe_exec_serve() -> None:
                 if mode == "embed":
                     resolved = ensure_encoder_weights(model, frontend=frontend, **kwargs)
                 else:
+                    if frontend is not None:
+                        kwargs["mmproj"] = frontend
                     resolved = ensure_engine_weights(model, **kwargs)
         finally:
             if previous_conversion_device is None:

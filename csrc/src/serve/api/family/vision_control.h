@@ -27,11 +27,13 @@ struct VisionControl {
     std::vector<VisionItemControl> items;
 };
 
-/// The tower's view of one item, from its grid alone. `scatter_indices` is left empty:
+/// The tower's view of one item, from its grid and the encoder's position-table size. `scatter_indices` is left empty:
 /// it says where the merged tokens land in a text sequence, which the tower never reads.
 [[nodiscard]] VisionItemControl build_vision_item_control(const VisionGrid& grid,
-                                                          PromptModality modality);
+                                                          PromptModality modality,
+                                                          std::int32_t position_embeddings = 48 * 48);
 
-[[nodiscard]] VisionControl build_vision_control(const PreparedPromptData& prompt);
+[[nodiscard]] VisionControl build_vision_control(const PreparedPromptData& prompt,
+                                                  std::int32_t position_embeddings = 48 * 48);
 
 } // namespace sinfer::family

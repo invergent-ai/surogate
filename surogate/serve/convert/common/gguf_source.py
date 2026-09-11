@@ -201,7 +201,10 @@ class GgufRecipeReader:
         return name in self._source.tensors
 
     def get(self, name: str) -> torch.Tensor:
-        return torch.from_numpy(self._source.float32(name))
+        values = self._source.float32(name)
+        # F32 sources can still alias a read-only mapping; torch tensors have no
+        # read-only flag and must not expose that storage as writable.
+        return torch.from_numpy(values if values.flags.writeable else values.copy())
 
 
 def candidate_sources(source: GgufSource,

@@ -1,14 +1,21 @@
 """Qwen3-VL serving objects, derived from the checkpoint and training declaration."""
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 from surogate.serve.artifact.geometry import validate_resolved_geometry
 from surogate.serve.convert.common import declaration
-from surogate.serve.convert.common.checkpoint import positive_int, dense_geometry
+from surogate.serve.convert.common.checkpoint import dense_geometry, positive_int
 from surogate.serve.convert.common.inventory import (
-    RESOURCE_SPECS, BF16, W8, tensor_spec, build_vision_specs,
-    VISION_BF16, VISION_STORAGE,
+    BF16,
+    RESOURCE_SPECS,
+    VISION_BF16,
+    W8,
+    build_vision_specs,
+    tensor_spec,
+)
+from surogate.serve.convert.common.inventory import (
+    VISION_STORAGE as VISION_STORAGE,
 )
 from surogate.serve.convert.common.qwen3_5 import vision_geometry_block, vision_tower
 from surogate.serve.convert.qwen3.inventory import Geometry as TextGeometry
@@ -23,12 +30,25 @@ class Geometry(TextGeometry):
     vision: dict
     deepstack_indexes: tuple[int, ...]
     mrope_sections: tuple[int, int, int]
+    experts: int = 0
+    experts_per_token: int = 0
+
+    @property
+    def architecture(self):
+        return "qwen3_vl_moe" if self.experts else "qwen3_vl"
 
 
 def geometry_from_config(config):
-    if config.get("architectures") != [ARCHITECTURE] or config.get("model_type") != TARGET_KEY:
-        raise ValueError("expected a dense Qwen3-VL checkpoint")
-    text = config["text_config"]
+    moe = config.get("model_type") == "qwen3_vl_moe"
+    architecture = "Qwen3VLMoeForConditionalGeneration" if moe else ARCHITECTURE
+    if config.get("architectures") != [architecture] or config.get("model_type") not in (TARGET_KEY, "qwen3_vl_moe"):
+        raise ValueError("expected a Qwen3-VL dense or MoE checkpoint")
+    text = dict(config["text_config"])
+    if moe:
+        if ("num_experts" in text and "num_local_experts" in text and
+                text["num_experts"] != text["num_local_experts"]):
+            raise ValueError("num_experts and num_local_experts disagree")
+        text["num_experts"] = text.get("num_experts", text.get("num_local_experts"))
     for name in ("hidden_size", "num_hidden_layers", "intermediate_size", "vocab_size",
                  "num_attention_heads", "num_key_value_heads", "head_dim", "max_position_embeddings"):
         positive_int(text, name)
@@ -47,8 +67,16 @@ def geometry_from_config(config):
         sections[2] > text["head_dim"] // 6):
         raise ValueError("mrope_section must partition the rotary pairs into temporal/height/width")
     source = {**text, **config}
+    source["text_config"] = text
     source["rope_theta"] = rope.get("rope_theta", text.get("rope_theta"))
-    declared = declaration.declare(ARCHITECTURE, source)
+    if moe:
+        from surogate.serve.convert.qwen3_moe.inventory import geometry_from_config as moe_geometry
+        if text.get("mlp_only_layers") or text.get("decoder_sparse_step", 1) != 1:
+            raise ValueError("Qwen3-VL-MoE requires routed experts on every decoder layer")
+        text_geometry = moe_geometry(source)
+        declared = text_geometry.declared
+    else:
+        declared = declaration.declare(ARCHITECTURE, source)
     vc = config["vision_config"]
     vision = vision_geometry_block(config, text_hidden=text["hidden_size"])
     if (vc.get("hidden_act") != "gelu_pytorch_tanh" or
@@ -65,10 +93,12 @@ def geometry_from_config(config):
     vision["deepstack_layers"] = len(indexes)
     g = Geometry(
         layers=text["num_hidden_layers"], hidden=text["hidden_size"],
-        intermediate=text["intermediate_size"], vocab=text["vocab_size"],
+        intermediate=text["moe_intermediate_size"] if moe else text["intermediate_size"], vocab=text["vocab_size"],
         query_heads=text["num_attention_heads"], kv_heads=text["num_key_value_heads"],
         head_dim=text["head_dim"], declared=declared, vision=vision,
         deepstack_indexes=tuple(indexes), mrope_sections=tuple(sections),
+        experts=text["num_experts"] if moe else 0,
+        experts_per_token=text["num_experts_per_tok"] if moe else 0,
     )
     geometry_block(g, token_domain=g.vocab)
     return g
@@ -77,6 +107,8 @@ def geometry_from_config(config):
 def geometry_block(g, *, token_domain):
     values = dense_geometry(g, token_domain=token_domain)
     values.update(zip(("mrope_temporal", "mrope_height", "mrope_width"), g.mrope_sections))
+    if g.experts:
+        values.update(experts=g.experts, experts_per_token=g.experts_per_token)
     return validate_resolved_geometry(values)
 
 

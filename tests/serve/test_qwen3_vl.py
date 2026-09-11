@@ -8,8 +8,8 @@ from safetensors.torch import save_file
 
 from surogate.serve.artifact.container import Artifact
 from surogate.serve.convert.common.recipe import source_requirements, validate_recipe_coverage
-from surogate.serve.convert.qwen3_vl import inventory, recipe, convert
-from surogate.serve.ingest import converter_for_config, _flatten_text_config
+from surogate.serve.convert.qwen3_vl import convert, inventory, recipe
+from surogate.serve.ingest import _flatten_text_config, converter_for_config
 
 
 def config_for():
@@ -119,3 +119,111 @@ def test_complete_vl_checkpoint_conversion(tmp_path):
         assert artifact.vision_geometry["deepstack_layers"] == 2
         assert artifact.find("frontend/chat_template.jinja") is not None
         assert artifact.find("vision/layers/2/deepstack/norm/weight").shape == (512,)
+
+
+def moe_config_for():
+    config = config_for()
+    config.update(model_type="qwen3_vl_moe", architectures=["Qwen3VLMoeForConditionalGeneration"])
+    config["text_config"].update(num_experts=4, num_experts_per_tok=2, moe_intermediate_size=128,
+                                 decoder_sparse_step=1, mlp_only_layers=[], norm_topk_prob=True)
+    return config
+
+
+@pytest.mark.parametrize("layout", ["input_major", "output_major", "separate"])
+def test_moe_expert_layout_matches_output_major_banks(layout):
+    from surogate.serve.convert.common.recipe import materialize_recipe
+    g = inventory.geometry_from_config(moe_config_for())
+    assert converter_for_config(_flatten_text_config(moe_config_for())).key == "qwen3_vl"
+    metadata = inventory.geometry_block(g, token_domain=200)
+    assert (metadata["experts"], metadata["experts_per_token"], metadata["intermediate"]) == (4, 2, 128)
+    gate = torch.arange(g.experts * g.intermediate * g.hidden).reshape(g.experts, g.intermediate, g.hidden)
+    up = -gate
+    down = gate.transpose(1, 2).contiguous()
+    prefix = "model.layers.0.mlp.experts."
+    if layout == "input_major":
+        tensors = {prefix + "gate_up_proj": torch.cat((gate, up), 1).transpose(1, 2).contiguous(),
+                   prefix + "down_proj": down.transpose(1, 2).contiguous()}
+    elif layout == "output_major":
+        tensors = {prefix + "gate_up_proj": torch.cat((gate, up), 1), prefix + "down_proj": down}
+    else:
+        tensors = {prefix + "gate_proj.weight": gate, prefix + "up_proj.weight": up,
+                   prefix + "down_proj.weight": down}
+    class Reader:
+        def has(self, name): return name in tensors
+        def get(self, name): return tensors[name]
+        def metadata(self, names):
+            from types import SimpleNamespace
+            return {name: SimpleNamespace(shape=tuple(tensors[name].shape)) for name in names}
+    recipes = {r.object_name: r for r in recipe.build_recipes(g, reader=Reader())}
+    for suffix, expected in (("routed_gate_up", torch.cat((gate, up), 1)), ("routed_down", down)):
+        result = materialize_recipe(recipes["text/layers/0/moe/" + suffix], Reader())
+        torch.testing.assert_close(result, expected.reshape(result.shape))
+
+
+@pytest.mark.parametrize("change,match", [
+    ({"num_experts_per_tok": 5}, "exceeds"), ({"norm_topk_prob": False}, "normalized"),
+    ({"mlp_only_layers": [0]}, "every decoder layer"), ({"decoder_sparse_step": 2}, "every decoder layer"),
+])
+def test_moe_invalid_routing_is_rejected(change, match):
+    config = moe_config_for()
+    config["text_config"].update(change)
+    with pytest.raises(ValueError, match=match):
+        inventory.geometry_from_config(config)
+
+
+@pytest.mark.parametrize("layout", ["input_major", "output_major"])
+def test_complete_packed_moe_checkpoint_conversion(tmp_path, layout):
+    from dataclasses import replace
+
+    from surogate.serve.convert.common.recipe import resolve_options
+    config = moe_config_for()
+    if layout == "output_major":
+        config["text_config"]["num_local_experts"] = config["text_config"].pop("num_experts")
+    g = inventory.geometry_from_config(config)
+    recipes = recipe.build_recipes(g)
+    # Select the packed, transposed names used by the released HF checkpoint.
+    def available(name):
+        return ".experts." not in name or name.endswith(("experts.gate_up_proj", "experts.down_proj"))
+    resolved = [replace(r, expression=resolve_options(r.expression, available)) for r in recipes]
+    sources = source_requirements(resolved)
+    tensors = {name.replace("model.layers.", "model.language_model.layers.")
+                   .replace("model.embed_tokens.", "model.language_model.embed_tokens.")
+                   .replace("model.norm.", "model.language_model.norm."):
+               torch.full(source.shape, 0.125, dtype=torch.bfloat16) for name, source in sources.items()}
+    if layout == "output_major":
+        tensors = {name: value.transpose(1, 2).contiguous() if name.endswith(("experts.gate_up_proj", "experts.down_proj")) else value
+                   for name, value in tensors.items()}
+    save_file(tensors, tmp_path / "model.safetensors")
+    for name, data in {"config.json": config, "tokenizer.json": {"model": {"vocab": {"a": 0, "b": 1}}},
+                       "tokenizer_config.json": {"chat_template": "{{ messages }}"},
+                       "preprocessor_config.json": {"patch_size": 16}}.items():
+        (tmp_path / name).write_text(json.dumps(data))
+    if layout == "output_major":
+        (tmp_path / "preprocessor_config.json").unlink()
+        (tmp_path / "processor_config.json").write_text(json.dumps({
+            "processor_class": "Qwen3VLProcessor", "image_processor": {"patch_size": 16},
+            "video_processor": {"patch_size": 16, "fps": 2}}))
+    out = tmp_path / "moe.sinfer"
+    convert.convert(tmp_path, out, device="cpu")
+    with Artifact(out) as artifact:
+        assert artifact.identity.architecture == "qwen3_vl_moe"
+        assert artifact.geometry["experts"] == 4
+        assert json.loads(bytes(artifact.payload("frontend/preprocessor_config.json")))["patch_size"] == 16
+        if layout == "output_major":
+            assert json.loads(bytes(artifact.payload("frontend/video_preprocessor_config.json")))["fps"] == 2
+        assert artifact.find("text/layers/0/moe/routed_gate_up").shape == (1024, 256)
+        assert artifact.vision_geometry["deepstack_layers"] == 2
+
+
+def test_235b_moe_geometry_uses_its_wider_experts():
+    config = moe_config_for()
+    config["text_config"].update(hidden_size=4096, num_hidden_layers=94,
+                                 num_attention_heads=64, num_key_value_heads=8, head_dim=128,
+                                 num_experts=128, num_experts_per_tok=8, moe_intermediate_size=1536)
+    config["text_config"]["rope_scaling"]["mrope_section"] = [24, 20, 20]
+    config["vision_config"]["out_hidden_size"] = 4096
+    g = inventory.geometry_from_config(config)
+    specs = {s.name: s for s in inventory.build_tensor_specs(g)}
+    assert specs["text/layers/93/moe/routed_gate_up"].shape == (393216, 4096)
+    assert specs["text/layers/93/moe/routed_down"].shape == (524288, 1536)
+    assert inventory.geometry_block(g, token_domain=256)["experts_per_token"] == 8
