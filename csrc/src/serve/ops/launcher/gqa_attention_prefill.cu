@@ -404,6 +404,50 @@ void gqa_attention_prompt_cached_launch(const Tensor& q, const Tensor& positions
     }
 }
 
+void gqa_kv_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                const Tensor& valid_columns, const Tensor& table_rows,
+                                PagedKVBatchLayerView cache, cudaStream_t stream) {
+    for (int batch = 0; batch < k.ne[3]; ++batch) {
+        const Tensor kr = batch_tensor(k, batch), vr = batch_tensor(v, batch);
+        const Tensor pos = row_tensor(positions, batch, k.ne[2]);
+        const Tensor valid = row_tensor(valid_columns, batch, 1);
+        const Tensor table = row_tensor(table_rows, batch, 1);
+        const auto launch = [&]<bool Masked>() {
+            const GqaPrefillBatchMetadata<Masked> metadata{
+                .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
+                .valid_columns = static_cast<const std::int32_t*>(valid.data),
+                .table_rows = static_cast<const std::int32_t*>(table.data),
+                .table_stride = cache.block_tables.ne[0],
+            };
+            gqa_dispatch_kv_geometry(k.ne[0], k.ne[1], [&]<typename Geometry>() {
+                gqa_kv_append_launch_for<Geometry>(kr, vr, pos, cache, metadata, stream);
+            });
+        };
+        if (valid.data) { launch.template operator()<true>(); }
+        else { launch.template operator()<false>(); }
+    }
+}
+
+__global__ void gqa_query_tile_metadata_kernel(const int* parent_valid, const int* parent_row,
+                                               int parent_width, int begin, int width,
+                                               int lanes, int* valid, int* rows) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lane >= lanes) { return; }
+    const int count = parent_valid ? parent_valid[0] : parent_width;
+    valid[lane] = max(0, min(width, count - begin - lane * width));
+    rows[lane] = parent_row ? parent_row[0] : 0;
+}
+
+void gqa_query_tile_metadata(const Tensor& parent_valid, const Tensor& parent_row,
+                             int parent_width, int begin, int tile_width,
+                             Tensor& valid, Tensor& rows, cudaStream_t stream) {
+    gqa_query_tile_metadata_kernel<<<div_up(valid.ne[0], 128), 128, 0, stream>>>(
+        static_cast<const int*>(parent_valid.data), static_cast<const int*>(parent_row.data),
+        parent_width, begin, tile_width, valid.ne[0], static_cast<int*>(valid.data),
+        static_cast<int*>(rows.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,

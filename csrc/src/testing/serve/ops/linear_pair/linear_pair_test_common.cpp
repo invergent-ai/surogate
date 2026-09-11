@@ -246,10 +246,12 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
         physical_rows(oracle_rows, fixture.first_row);
     const std::vector<std::int32_t> second_physical_rows =
         physical_rows(oracle_rows, fixture.second_row);
-    const std::vector<float> first_oracle =
+    std::vector<float> first_oracle =
         quantized_weight::materialize_rows_fp32(fixture.first_storage, first_physical_rows);
-    const std::vector<float> second_oracle =
+    std::vector<float> second_oracle =
         quantized_weight::materialize_rows_fp32(second_storage, second_physical_rows);
+    test::round_to_bf16(first_oracle);
+    test::round_to_bf16(second_oracle);
     const std::vector<std::uint16_t> activation =
         make_activation(shape.k, maximum_t, shape.seed + 2U);
 

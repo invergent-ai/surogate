@@ -36,7 +36,8 @@ std::int32_t gqa_attention_small_t_max_width(std::int32_t q_heads, std::int32_t 
 std::int32_t gqa_attention_split_capacity(std::int32_t head_dim, std::int32_t q_heads,
                                           std::int32_t kv_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
+    if (tokens < 1 || (tokens > 6 && (cache_dtype == DType::I8 ||
+        (tokens != 8 && tokens != 16 && tokens != 32))) || (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
          cache_dtype != DType::FP8_E4M3FN) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");

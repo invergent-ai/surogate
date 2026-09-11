@@ -88,6 +88,15 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                                  Tensor& out, cudaStream_t stream, std::int32_t sliding_window,
                                  GqaBlockMask selection = {});
 
+// Prepare query tiles that share one sequence's paged history without host metadata reads.
+void gqa_query_tile_metadata(const Tensor& parent_valid, const Tensor& parent_row,
+                             int parent_width, int begin, int tile_width,
+                             Tensor& valid, Tensor& rows, cudaStream_t stream);
+
+void gqa_kv_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                const Tensor& valid_columns, const Tensor& table_rows,
+                                PagedKVBatchLayerView cache, cudaStream_t stream);
+
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);
 

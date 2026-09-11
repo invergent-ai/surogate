@@ -18,18 +18,8 @@ namespace {
 
 // This criterion belongs to the complete A16 GDN-input-projection Op.
 constexpr ReductionCriterion kGdnInputProjA16Tolerance{3.0e-3, 4.0e-3, 3.5e-3};
-// surogate vendor patch (PATCHES.md #13): the qwen3.5-0.8b W8 comparisons admit
-// exactly one BF16 output ULP at the batch maximum (gross_relative 2^-7). The
-// op's defined semantics dequantize W8 weights to BF16 before the MMA; under
-// heavy cancellation (measured T=2 sample: sum|terms| 275.6 -> value 8.0) that
-// weight rounding legitimately moves the FP32 sum across an output rounding
-// boundary (kernel-semantics oracle 8.03449 -> 8.0625 == GPU, exact-weight
-// oracle 8.00212 -> 8.0), which the family criterion (3.5e-3 < 2^-7) only
-// covers when the flipped sample is far below the batch maximum. The
-// relative_l2 bound must also admit the flip when the flipped sample
-// dominates a small batch's norm (T=2 is 14 samples): worst case
-// ||err||/||ref|| -> ULP/value = 2^-7, plus family quantization noise.
-constexpr ReductionCriterion kGdnInputProjW8UlpTolerance{1.0e-2, 4.0e-3, 7.8125e-3};
+// The oracle now includes W8 weight materialization, so the family bound applies.
+constexpr auto kGdnInputProjW8UlpTolerance = kGdnInputProjA16Tolerance;
 constexpr ReductionCriterion kFp8GdnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr ReductionCriterion kGdnInputProjA4Tolerance{0.16, 4.0e-3, 0.16};

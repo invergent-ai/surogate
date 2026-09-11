@@ -262,6 +262,13 @@ struct RequestControl {
         std::unique_ptr<schedule::VisionPrefillSession> vision;
         runtime::TransientRegion transient;
         std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture;
+        // Recurrent prefill keeps its chunk boundaries when snapshot storage is unavailable.
+        std::optional<std::uint32_t> recurrent_boundary;
+        [[nodiscard]] std::optional<std::uint32_t> chunk_boundary() const noexcept {
+            if (recurrent_boundary) { return recurrent_boundary; }
+            if (rewrite_checkpoint_capture) { return rewrite_checkpoint_capture->frontier; }
+            return std::nullopt;
+        }
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;

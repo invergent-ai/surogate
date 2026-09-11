@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "ops/common/token_slices.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 #include "ops/linear/w8/w8_launch.h"
@@ -72,6 +73,29 @@ void launch_medium(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 }
 
 } // namespace
+
+void launch_w8_consistent(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    if (w.k % 256 != 0 || w.n % 16 != 0 || w.padded_shape[1] != w.k) {
+        throw std::invalid_argument("W8 consistent GEMM requires aligned, unpadded rows");
+    }
+    for_each_token_slice(x.ne[1], 64, [&](int begin, int count) {
+        const Tensor input = x.slice(1, begin, count);
+        Tensor result = out.slice(1, begin, count);
+        const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(result.data), w.n};
+        const auto launch = [&]<int Columns>() {
+            w8_rowsplit_medium_t_splitk_kernel<0, Columns, 4, 1, 2>
+                <<<dim3(w.n / 16, (count + Columns - 1) / Columns), 128, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(input.data),
+                    static_cast<const std::uint8_t*>(w.qdata),
+                    static_cast<const std::uint8_t*>(w.scales), output, count, w.k);
+        };
+        if (count <= 8) { launch.template operator()<8>(); }
+        else if (count <= 16) { launch.template operator()<16>(); }
+        else if (count <= 32) { launch.template operator()<32>(); }
+        else { launch.template operator()<64>(); }
+    });
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void launch_w8_exact_t_splitk(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     require_problem(x, w, out);

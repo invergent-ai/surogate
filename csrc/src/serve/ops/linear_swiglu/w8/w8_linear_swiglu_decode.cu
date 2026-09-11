@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 
 #include "core/device.h"
+#include "ops/linear/w8/w8_rowsplit_storage.cuh"
 
 #include <algorithm>
 #include <stdexcept>
@@ -35,10 +36,10 @@ __global__ void w8_swiglu_generic_kernel(
         float gate = 0.0F, up = 0.0F;
         for (int column = lane; column < k; column += 32) {
             const float activation = __bfloat162float(x[token * k + column]);
-            const float gate_weight = static_cast<float>(codes[gate_row + column]) *
-                                      __half2float(scales[(gate_row + column) / 32]);
-            const float up_weight = static_cast<float>(codes[up_row + column]) *
-                                    __half2float(scales[(up_row + column) / 32]);
+            const float gate_weight = w8_a16_weight(codes[gate_row + column],
+                                      __half2float(scales[(gate_row + column) / 32]));
+            const float up_weight = w8_a16_weight(codes[up_row + column],
+                                    __half2float(scales[(up_row + column) / 32]));
             gate = fmaf(gate_weight, activation, gate);
             up = fmaf(up_weight, activation, up);
         }
@@ -109,9 +110,9 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_linear_swiglu_decode_pa
                 const float2 activation_pair = xv[word_index * 2 + (byte >> 1)];
                 const float activation = (byte & 1) == 0 ? activation_pair.x : activation_pair.y;
                 const float gate_value =
-                    static_cast<float>(static_cast<std::int8_t>(gate_word >> shift)) * gate_scale;
+                    w8_a16_weight(static_cast<std::int8_t>(gate_word >> shift), gate_scale);
                 const float up_value =
-                    static_cast<float>(static_cast<std::int8_t>(up_word >> shift)) * up_scale;
+                    w8_a16_weight(static_cast<std::int8_t>(up_word >> shift), up_scale);
                 gate_acc = fmaf(gate_value, activation, gate_acc);
                 up_acc   = fmaf(up_value, activation, up_acc);
             }

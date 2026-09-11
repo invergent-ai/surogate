@@ -5,6 +5,8 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 
+#include "ops/linear/w8/w8_rowsplit_storage.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -63,7 +65,7 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_rowsplit_k16384_decode_
                 const float2 activation_pair = xv[word_index * 2 + (byte >> 1)];
                 const float activation = (byte & 1) == 0 ? activation_pair.x : activation_pair.y;
                 const float weight_value =
-                    static_cast<float>(static_cast<std::int8_t>(word >> (byte * 8))) * scale;
+                    w8_a16_weight(static_cast<std::int8_t>(word >> (byte * 8)), scale);
                 acc = fmaf(weight_value, activation, acc);
             }
         }

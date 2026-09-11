@@ -1418,6 +1418,178 @@ int run_geometry(const Geometry& geometry) {
 // the head counts into its addressing, so the wrong one reads the wrong strides.
 // Driven off the registry macro, so registering a shape extends this coverage by
 // itself.
+// Zero Q makes every visible probability exactly one before normalization.
+// All values are exactly representable in either cache. This isolates rounding
+// of the split numerator from cache quantization and softmax approximation.
+int verify_split_numerator_precision() {
+    int failures = 0;
+    constexpr int dim = 256, heads = 8, kv_heads = 4, tokens = 131;
+    constexpr float pattern[] = {1.0F, .5F, .25F, .125F, .0625F, -.25F, 2.0F};
+    for (const auto dtype : {DType::BF16, DType::FP8_E4M3FN}) {
+        DeviceArena arena(64U << 20);
+        Tensor q = arena.alloc(DType::BF16, {dim, heads, tokens});
+        Tensor k = arena.alloc(DType::BF16, {dim, kv_heads, tokens});
+        Tensor v = arena.alloc(DType::BF16, {dim, kv_heads, tokens});
+        Tensor positions = arena.alloc(DType::I32, {tokens});
+        Tensor out = arena.alloc(DType::BF16, {dim, heads, tokens});
+        CUDA_CHECK(cudaMemset(q.data, 0, q.bytes()));
+        CUDA_CHECK(cudaMemset(k.data, 0, k.bytes()));
+        std::vector<std::uint16_t> values(v.numel());
+        std::vector<int> pos(tokens);
+        for (int t = 0; t < tokens; ++t) {
+            pos[t] = t;
+            for (int h = 0; h < kv_heads; ++h) {
+                for (int d = 0; d < dim; ++d) {
+                    values[(t * kv_heads + h) * dim + d] = f32_to_bf16(pattern[(t * 3 + d + h) % 7]);
+                }
+            }
+        }
+        CUDA_CHECK(cudaMemcpy(v.data, values.data(), v.bytes(), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(positions.data, pos.data(), positions.bytes(), cudaMemcpyHostToDevice));
+        PagedKVLayerView cache;
+        cache.head_dim = dim;
+        cache.num_kv_heads = kv_heads;
+        cache.dtype = dtype;
+        cache.k_pages = arena.alloc(dtype, {dim, kPagedKVPageSize, kv_heads, 128});
+        cache.v_pages = arena.alloc(dtype, {dim, kPagedKVPageSize, kv_heads, 128});
+        cache.block_table = arena.alloc(DType::I32, {128});
+        std::vector<int> table(128);
+        for (int i = 0; i < 128; ++i) { table[i] = (i * 17 + 3) % 128; }
+        CUDA_CHECK(cudaMemcpy(cache.block_table.data, table.data(), cache.block_table.bytes(), cudaMemcpyHostToDevice));
+        ops::gqa_kv_append(k, v, positions, cache, nullptr);
+        constexpr int mask_stride = 64;
+        Tensor mask = arena.alloc(DType::I32, {mask_stride, tokens});
+        std::vector<std::uint32_t> mask_words(mask.numel(), 0);
+        for (int col = 0; col < tokens; ++col) {
+            for (int block = 0; block * 4 < tokens; block += 3) {
+                mask_words[col * mask_stride + block / 32] |= 1U << (block % 32);
+            }
+        }
+        CUDA_CHECK(cudaMemcpy(mask.data, mask_words.data(), mask.bytes(), cudaMemcpyHostToDevice));
+        for (const bool sparse : {false, true}) {
+          for (const int width : {1, 4, 16, tokens}) {
+            for (const int window : {0, 47}) {
+                const int begin = tokens - width;
+                Tensor queries = q.slice(2, begin, width);
+                Tensor query_pos = positions.slice(0, begin, width);
+                Tensor result = out.slice(2, 0, width);
+                const ops::GqaExecutionEnvelope envelope{1, 8192, window};
+                WorkspaceArena scratch(std::max<std::size_t>(256,
+                    ops::gqa_attention_workspace_capacity_bytes(dim, heads, kv_heads,
+                        dtype, envelope, 1, width, width)));
+                ops::GqaBlockMask selection;
+                if (sparse) {
+                    selection.words = static_cast<const std::uint32_t*>(mask.data) + begin * mask_stride;
+                    selection.stride = mask_stride;
+                    selection.block = 4;
+                }
+                ops::gqa_attention_cached(queries, query_pos, 1.0F / 16.0F,
+                                          cache, envelope, scratch, result, nullptr, selection);
+                cuda_synchronize();
+                const auto actual = from_device<std::uint16_t>(result.data, result.numel());
+                int mismatches = 0;
+                for (int col = 0; col < width; ++col) {
+                    const int last = begin + col;
+                    const int first = window ? std::max(0, last + 1 - window) : 0;
+                    for (int h = 0; h < heads; ++h) {
+                        for (int d = 0; d < dim; ++d) {
+                            float sum = 0;
+                            int selected = 0;
+                            for (int t = first; t <= last; ++t) {
+                                if (sparse && (t / 4) % 3 != 0) { continue; }
+                                sum += bf16_to_f32(values[(t * kv_heads + h / 2) * dim + d]);
+                                ++selected;
+                            }
+                            const auto expected = f32_to_bf16(selected ? sum / float(selected) : 0.0F);
+                            mismatches += actual[(col * heads + h) * dim + d] != expected;
+                        }
+                    }
+                }
+                if (mismatches) {
+                    std::cerr << "Split numerator precision dtype=" << int(dtype) << " width=" << width
+                              << " sparse=" << sparse << " window=" << window << ": " << mismatches << " mismatches\n";
+                    ++failures;
+                }
+            }
+          }
+        }
+    }
+    return failures;
+}
+
+// A cached query must give identical results whether it is decoded alone, verified
+// with other tokens, or included in a full prefill. Nonzero Q/K exercises softmax
+// and contexts/windows cross both key-partition and query-tile boundaries.
+int verify_query_batch_invariance() {
+    int failures = 0;
+    constexpr int tokens = 385, pages = 264, context = pages * kPagedKVPageSize;
+    for (const Geometry geometry : {Geometry{"gemma", 8, 4}, Geometry{"qwen", 8, 2},
+                                    Geometry{"mha", 16, 8, 128}, Geometry{"mla", 64, 1, 512}}) {
+      const int dim = geometry.head_dim, heads = geometry.q_heads, kv_heads = geometry.kv_heads;
+      for (const auto dtype : {DType::BF16, DType::FP8_E4M3FN}) {
+        DeviceArena arena(256U << 20);
+        Tensor q = arena.alloc(DType::BF16, {dim, heads, tokens});
+        Tensor k = arena.alloc(DType::BF16, {dim, kv_heads, context});
+        Tensor v = arena.alloc(DType::BF16, {dim, kv_heads, context});
+        Tensor positions = arena.alloc(DType::I32, {context});
+        Tensor out = arena.alloc(DType::BF16, {dim, heads, tokens});
+        unsigned seed = 1977;
+        for (Tensor tensor : {q, k, v}) {
+            std::vector<std::uint16_t> values(tensor.numel());
+            for (auto& value : values) {
+                seed = seed * 1664525U + 1013904223U;
+                value = f32_to_bf16((int(seed >> 16) - 32768) / 8192.0F);
+            }
+            CUDA_CHECK(cudaMemcpy(tensor.data, values.data(), tensor.bytes(), cudaMemcpyHostToDevice));
+        }
+        std::vector<int> pos(context);
+        for (int i = 0; i < context; ++i) { pos[i] = i; }
+        CUDA_CHECK(cudaMemcpy(positions.data, pos.data(), positions.bytes(), cudaMemcpyHostToDevice));
+        PagedKVLayerView cache;
+        cache.head_dim = dim;
+        cache.num_kv_heads = kv_heads;
+        cache.dtype = dtype;
+        cache.k_pages = arena.alloc(dtype, {dim, kPagedKVPageSize, kv_heads, pages});
+        cache.v_pages = arena.alloc(dtype, {dim, kPagedKVPageSize, kv_heads, pages});
+        cache.block_table = arena.alloc(DType::I32, {pages});
+        std::vector<int> table(pages);
+        for (int i = 0; i < pages; ++i) { table[i] = (i * 5 + 1) % pages; }
+        CUDA_CHECK(cudaMemcpy(cache.block_table.data, table.data(), cache.block_table.bytes(), cudaMemcpyHostToDevice));
+        ops::gqa_kv_append(k, v, positions, cache, nullptr);
+        for (const int base : {0, 3967, 16319}) {
+          for (const int window : {0, 127, 129, 257}) {
+            const ops::GqaExecutionEnvelope envelope{1, pages * kPagedKVPageSize, window};
+            WorkspaceArena scratch(ops::gqa_attention_workspace_capacity_bytes(dim, heads,
+                kv_heads, dtype, envelope, 1, 1, tokens));
+            Tensor full_pos = positions.slice(0, base, tokens);
+            ops::gqa_attention_cached(q, full_pos, attention_scale(geometry), cache,
+                                      envelope, scratch, out, nullptr);
+            cuda_synchronize();
+            const auto reference = from_device<std::uint16_t>(out.data, out.numel());
+            for (const int width : {1, 4, 6, 8, 16, 31, 129}) {
+                const int begin = tokens - width;
+                Tensor queries = q.slice(2, begin, width);
+                Tensor query_pos = positions.slice(0, base + begin, width);
+                Tensor result = out.slice(2, 0, width);
+                ops::gqa_attention_cached(queries, query_pos, attention_scale(geometry), cache,
+                                          envelope, scratch, result, nullptr);
+                cuda_synchronize();
+                const auto actual = from_device<std::uint16_t>(result.data, result.numel());
+                if (!std::equal(actual.begin(), actual.end(),
+                                reference.begin() + static_cast<std::size_t>(begin) * dim * heads)) {
+                    std::cerr << "Query batch invariance " << geometry.name << " dtype=" << int(dtype)
+                              << " width=" << width << " window=" << window
+                              << " base=" << base << " failed\n";
+                    ++failures;
+                }
+            }
+          }
+        }
+      }
+    }
+    return failures;
+}
+
 int verify_fp8_current_tokens_match_cached(int dim, int heads, int kv_heads) {
     int failures = 0;
     for (bool weighted : {false, true}) {
@@ -1644,6 +1816,8 @@ int main() {
     int failures = 0;
     failures += verify_geometry_registration_contract();
     failures += verify_workspace_capacity_contract();
+    failures += verify_split_numerator_precision();
+    failures += verify_query_batch_invariance();
     failures += verify_fp8_current_tokens_match_cached(256, 8, 1);
     failures += verify_fp8_current_tokens_match_cached(256, 8, 4);
     failures += verify_fp8_current_tokens_match_cached(256, 16, 4);

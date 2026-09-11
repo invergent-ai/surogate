@@ -12,7 +12,7 @@ namespace sinfer::ops::detail {
 enum class W8GdnInputScheduleId {
     DecodeR8Direct,
     SplitKMmaDirect,
-    MmaR64C128,
+    SplitKMmaWide,
 };
 
 enum class W8GdnInputConvScheduleId {

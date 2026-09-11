@@ -2,7 +2,7 @@
 
 // Derived Marlin residency for W8G32 weights: the artifact stays W8G32 and
 // at first decode-band use the engine repacks a weight into the Marlin B
-// tile format plus permuted BF16 scales (see marlin_repack.h). Registry
+// tile format plus permuted FP16 scales (see marlin_repack.h). Registry
 // discipline mirrors w8fp8_plane.h: process-global, keyed by the device
 // codes pointer, derive-on-first-use with a VRAM guard; a capturing stream
 // may look up a finished plane (the pre-capture batch-band warmup derives
@@ -21,7 +21,7 @@ namespace sinfer::ops::detail {
 
 struct MarlinPlane {
     const void* b_packed = nullptr;  // marlin B tiles (u32)
-    const void* scales   = nullptr;  // bf16, [k/32, n] permuted
+    const void* scales   = nullptr;  // FP16 for W8; BF16 for channel-scaled FP8
 };
 
 void marlin_plane_set_enabled(bool enabled) noexcept;

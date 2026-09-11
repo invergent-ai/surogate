@@ -5,6 +5,8 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
+#include "ops/linear/w8/w8_rowsplit_storage.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -63,13 +65,13 @@ __global__ __launch_bounds__(RowsPerCta * 32,
         for (int word_index = 0; word_index < 2; ++word_index) {
             const std::uint32_t word = (&packed.x)[word_index];
             weights[word_index * 4 + 0] =
-                static_cast<float>(static_cast<std::int8_t>(word & 0xffu)) * scale;
+                w8_a16_weight(static_cast<std::int8_t>(word & 0xffu), scale);
             weights[word_index * 4 + 1] =
-                static_cast<float>(static_cast<std::int8_t>((word >> 8) & 0xffu)) * scale;
+                w8_a16_weight(static_cast<std::int8_t>((word >> 8) & 0xffu), scale);
             weights[word_index * 4 + 2] =
-                static_cast<float>(static_cast<std::int8_t>((word >> 16) & 0xffu)) * scale;
+                w8_a16_weight(static_cast<std::int8_t>((word >> 16) & 0xffu), scale);
             weights[word_index * 4 + 3] =
-                static_cast<float>(static_cast<std::int8_t>((word >> 24) & 0xffu)) * scale;
+                w8_a16_weight(static_cast<std::int8_t>((word >> 24) & 0xffu), scale);
         }
 
         const uint4 values = load_vec<uint4>(x + phase_k);

@@ -296,13 +296,13 @@ __global__ void pack_w8_to_gptq_kernel(const std::uint8_t* __restrict__ codes,
     qweight[static_cast<std::size_t>(krow) * n + col] = packed;
 }
 
-// scales [N, K/32] FP16 to the Marlin layout: transpose to [K/32, N] BF16,
+// scales [N, K/32] FP16 to the Marlin layout: transpose to [K/32, N] FP16,
 // then permute each 64-wide chunk with the grouped-scale interleave
 // (vLLM marlin_permute_scales, group_size < K path).
 __constant__ int kScalePerm64[64];
 
 __global__ void permute_scales_kernel(const __half* __restrict__ scales_f16,
-                                      __nv_bfloat16* __restrict__ out, int n, int groups) {
+                                      __half* __restrict__ out, int n, int groups) {
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t total = static_cast<std::size_t>(groups) * n;
     if (idx >= total) { return; }
@@ -311,8 +311,7 @@ __global__ void permute_scales_kernel(const __half* __restrict__ scales_f16,
     const std::size_t source = base + kScalePerm64[lane];
     const int g              = static_cast<int>(source / n);
     const int col            = static_cast<int>(source % n);
-    const float value = __half2float(scales_f16[static_cast<std::size_t>(col) * groups + g]);
-    out[idx] = __float2bfloat16(value);
+    out[idx] = scales_f16[static_cast<std::size_t>(col) * groups + g];
 }
 
 // FP8 codes carry no bias: the dequant reads the raw e4m3 byte, so packing
@@ -414,7 +413,7 @@ void marlin_repack_w8g32(const void* codes, const void* scales_f16, int n, int k
         const int threads       = 256;
         const int blocks        = static_cast<int>((total + threads - 1) / threads);
         permute_scales_kernel<<<blocks, threads, 0, stream>>>(
-            static_cast<const __half*>(scales_f16), static_cast<__nv_bfloat16*>(scales_out), n,
+            static_cast<const __half*>(scales_f16), static_cast<__half*>(scales_out), n,
             groups);
     }
     {

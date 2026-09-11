@@ -19,6 +19,7 @@
 #include "core/device.h" // CUDA_CHECK
 #include "api/ops/gqa_attention.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <cstdlib>
@@ -92,6 +93,14 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
 template <typename Geometry>
 std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int32_t tokens,
                                          DType dtype) {
+    if (dtype != DType::I8) {
+        const auto span = envelope.sliding_window > 0
+            ? std::min(envelope.max_visible_keys,
+                       static_cast<std::uint32_t>(envelope.sliding_window + tokens - 1 + 127))
+            : envelope.max_visible_keys;
+        return std::min(gqa_key_partition(envelope.max_visible_keys - 1) + 1,
+                        div_up(static_cast<std::int32_t>(span), 128));
+    }
     std::int32_t capacity = 0;
     const auto include    = [&](std::uint32_t window) {
         if (window < envelope.min_visible_keys || window > envelope.max_visible_keys) { return; }
@@ -148,7 +157,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.width, invocation.full_width,
                 invocation.column_begin, logical_capacity, invocation.sliding_window, scale,
-                static_cast<__nv_bfloat16*>(partial_acc.data),
+                static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                 invocation.selection);
         CUDA_CHECK(cudaGetLastError());
@@ -173,7 +182,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             : static_cast<const std::int32_t*>(invocation.table_rows->data),
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
         logical_capacity, invocation.sliding_window, scale,
-        static_cast<__nv_bfloat16*>(partial_acc.data),
+        static_cast<float*>(partial_acc.data),
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -215,7 +224,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                 logical_capacity, invocation.sliding_window, scale,
-        static_cast<__nv_bfloat16*>(partial_acc.data),
+        static_cast<float*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
     // The dynamic-arena tier stages 4 * 64 * HeadDim bytes: 64 KiB at 256, 128 KiB at 512,
@@ -324,7 +333,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     // splits and 15 waves of CTAs. Keep enough CTAs to fill the device twice
     // over and no more. The value stays constant per (envelope, batch), which
     // is what a captured decode graph requires.
-    if (invocation.batch_size > 0) {
+    if (cache.dtype == DType::I8 && invocation.batch_size > 0) {
         // Target CTA count for the split policy, in units of a 170-SM wave.
         // Tunable so the wave count can be swept against a real load rather
         // than argued about.
@@ -360,7 +369,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.dtype == DType::I8) {                                                        \
-                if constexpr (!kGqaI8DecodeRegistered<Geometry>) {                                 \
+                if constexpr (!kGqaI8DecodeRegistered<Geometry> || (TOKENS) > 6) {                                 \
                     throw std::invalid_argument(                                                   \
                         "gqa_attention: int8 KV is not served for head dim " +                     \
                         std::to_string(Geometry::HeadDim) + " with " +                             \
@@ -429,6 +438,24 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     case 6:
         SINFER_GQA_SMALL_T_DISPATCH(6, 4);
         break;
+    case 8:
+        if constexpr (!CacheInput::writes_cache && Geometry::GroupSize <= 8) {
+            SINFER_GQA_SMALL_T_DISPATCH(8, 4);
+            break;
+        }
+        throw std::invalid_argument("gqa_attention: unsupported query tile");
+    case 16:
+        if constexpr (!CacheInput::writes_cache && Geometry::GroupSize <= 4) {
+            SINFER_GQA_SMALL_T_DISPATCH(16, 4);
+            break;
+        }
+        throw std::invalid_argument("gqa_attention: unsupported query tile");
+    case 32:
+        if constexpr (!CacheInput::writes_cache && Geometry::GroupSize <= 2) {
+            SINFER_GQA_SMALL_T_DISPATCH(32, 4);
+            break;
+        }
+        throw std::invalid_argument("gqa_attention: unsupported query tile");
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }
@@ -442,7 +469,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
                                                    Offset>
             <<<reduce_grid, kReduceBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
+                static_cast<const float*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(pos.data),

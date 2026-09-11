@@ -23,7 +23,7 @@ void w8_gdn_input_splitk_conv_record_launch(const Tensor& x, const Weight& weigh
                                             const Tensor& valid_columns, const Tensor& initial_slot,
                                             Tensor& conv_record, Tensor& query, Tensor& key,
                                             Tensor& value, Tensor& z, cudaStream_t stream);
-void w8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+void w8_gdn_input_wide_splitk_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                       cudaStream_t stream);
 
 } // namespace sinfer::ops::detail

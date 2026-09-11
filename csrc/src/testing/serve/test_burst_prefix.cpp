@@ -1,7 +1,9 @@
-// Opt-in: SUROGATE_BURST_CACHE_TEST_ARTIFACT. REWRITE additionally checks a
-// conversation continuation (e.g. Qwen3.5); FP8 selects FP8 KV.
+// Opt-in: SUROGATE_BURST_CACHE_TEST_ARTIFACT. REWRITE additionally checks
+// recurrent snapshot memory and queued conversations; FP8 selects FP8 KV.
+// BACKGROUND adds repeated context to cross attention and prefill boundaries.
 #include "serve/generation_service.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -20,6 +22,7 @@ int main() {
     options.max_concurrency = 4;
     options.max_pending_requests = 64;
     options.enable_sleep_mode = true;
+    options.use_cuda_graph = !std::getenv("SUROGATE_BURST_CACHE_TEST_EAGER");
     options.kv_cache = std::getenv("SUROGATE_BURST_CACHE_TEST_FP8")
         ? sinfer::KvCacheStorage::Fp8E4M3 : sinfer::KvCacheStorage::BFloat16;
     GenerationService cached(options);
@@ -34,6 +37,13 @@ int main() {
     GenerationRequest initial;
     initial.messages = {{.role = sinfer::ChatRole::User, .content = {
         {.kind = ContentKind::Text, .text = "Reply with exactly these three words: red blue green"}}}};
+    if (const auto* background = std::getenv("SUROGATE_BURST_CACHE_TEST_BACKGROUND")) {
+        std::string prefix;
+        for (int i = 0; i < std::clamp(std::atoi(background), 0, 64); ++i) {
+            prefix += "Here is some background context. ";
+        }
+        initial.messages[0].content[0].text.insert(0, prefix);
+    }
     initial.enable_thinking = false;
     initial.sampling.temperature = 0;
     initial.max_tokens_set = true;
@@ -50,11 +60,13 @@ int main() {
     initial.max_tokens = 16;
     initial.stop_strings = {seed.token_texts[0] + seed.token_texts[1] + seed.token_texts[2]};
 
-    for (int scenario = 0; scenario < 5; ++scenario) {
-        if (scenario == 3 && !std::getenv("SUROGATE_BURST_CACHE_TEST_REWRITE")) { continue; }
+    for (int scenario = 0; scenario < 6; ++scenario) {
         cached.shrink_kv();
         assert(cached.memory_summary().sequence.capacity_bytes == cached_sequence_bytes);
-        auto stopped = run(cached, initial);
+        // Also cover an ordinary completed frontier, without a truncated burst.
+        auto first_turn = initial;
+        if (scenario == 5) { first_turn.max_tokens = 3; }
+        auto stopped = run(cached, first_turn);
         assert(stopped.finish_reason == sinfer::FinishReason::StopString);
         assert(stopped.completion_token_ids.size() == 3);
         if (std::getenv("SUROGATE_BURST_CACHE_TEST_REWRITE")) {
@@ -74,7 +86,7 @@ int main() {
             cached.sleep();
             cached.wake_up();
         }
-        if (scenario == 3) {
+        if (scenario == 3 || scenario == 5) {
             followup.messages.push_back({.role = sinfer::ChatRole::Assistant,
                 .content = {{.kind = ContentKind::Text, .text = initial.stop_strings.front()}}});
             followup.messages.push_back({.role = sinfer::ChatRole::User,
@@ -89,13 +101,18 @@ int main() {
         assert(actual.prompt_token_ids == expected.prompt_token_ids);
         assert(actual.token_logprobs.size() == expected.token_logprobs.size());
         assert(actual.prompt_scores.size() == expected.prompt_scores.size());
+        float max_completion_delta = 0, max_prompt_delta = 0;
         for (std::size_t i = 0; i < actual.token_logprobs.size(); ++i) {
+            max_completion_delta = std::max(max_completion_delta,
+                std::abs(actual.token_logprobs[i] - expected.token_logprobs[i]));
             if (std::abs(actual.token_logprobs[i] - expected.token_logprobs[i]) > .12F) {
                 std::cerr << "completion " << i << ": " << actual.token_logprobs[i] << " vs " << expected.token_logprobs[i] << '\n';
             }
             assert(std::abs(actual.token_logprobs[i] - expected.token_logprobs[i]) <= .12F);
         }
         for (std::size_t i = 1; i < actual.prompt_scores.size(); ++i) {
+            max_prompt_delta = std::max(max_prompt_delta,
+                std::abs(actual.prompt_scores[i].selected.logprob - expected.prompt_scores[i].selected.logprob));
             if (std::abs(actual.prompt_scores[i].selected.logprob - expected.prompt_scores[i].selected.logprob) > .12F) {
                 std::cerr << "prompt " << i << ": " << actual.prompt_scores[i].selected.logprob << " vs " << expected.prompt_scores[i].selected.logprob << '\n';
             }
@@ -103,6 +120,8 @@ int main() {
             assert(std::abs(actual.prompt_scores[i].selected.logprob -
                             expected.prompt_scores[i].selected.logprob) <= .12F);
         }
+        std::cerr << "maximum score deltas: completion=" << max_completion_delta
+                  << " prompt=" << max_prompt_delta << '\n';
         if (scenario == 4) { assert(actual.metrics.prefix_cache_hit_tokens == 0); }
         else { assert(actual.metrics.prefix_cache_hit_tokens > 0); }
     }

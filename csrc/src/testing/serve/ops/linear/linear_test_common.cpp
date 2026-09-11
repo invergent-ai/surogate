@@ -362,8 +362,11 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     const std::vector<std::int32_t> oracle_rows =
         shape.comparison == Comparison::Full ? all_indices(shape.n) : sampled_indices(shape.n);
     quantized_weight::PackedWeight host_weight = generator(shape.n, shape.k, shape.seed);
-    const std::vector<float> oracle_weight =
+    std::vector<float> oracle_weight =
         quantized_weight::materialize_rows_fp32(host_weight, oracle_rows);
+    if (host_weight.weight.qtype == QType::W8G32_F16S && activation_compute == ActivationCompute::A16) {
+        test::round_to_bf16(oracle_weight);
+    }
     const std::vector<std::uint16_t> activation_bits =
         make_activation(shape.k, maximum->t, shape.seed + 1U, activation_compute);
 

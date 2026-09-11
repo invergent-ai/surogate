@@ -1,59 +1,38 @@
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 
 #include "core/device.h"
-#include "ops/common/math.h"
-#include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
+#include "ops/common/token_slices.h"
+#include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
 namespace sinfer::ops::detail {
 namespace {
 
-constexpr int kRows   = 12288;
-constexpr int kHidden = 2048;
-using Output          = W8SplitOutput2<8192, 4096>;
-using Schedule        = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
-
-// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkvz.
-using Output08 = W8SplitOutput2<6144, 2048>;
-
-template <bool Full>
-void launch_variant(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                    cudaStream_t stream) {
-    static_assert((8192 % Schedule::BM) == 0 && (4096 % Schedule::BM) == 0);
-    if (weight.n == 8192) {
-        // surogate vendor patch (PATCHES.md #13/#16): 0.8b (k=1024) and 2b
-        // (k=2048) share the fused row structure; the kernel is runtime-K.
-        static_assert((6144 % Schedule::BM) == 0 && (2048 % Schedule::BM) == 0);
-        const Output08 output{static_cast<__nv_bfloat16*>(qkv.data),
-                              static_cast<__nv_bfloat16*>(z.data)};
-        const dim3 grid(8192 / Schedule::BM, static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)),
-                        1u);
-        w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output08>
-            <<<grid, Schedule::THREADS, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
+template <int QkvRows, int ZRows>
+void launch_wide(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                  cudaStream_t stream) {
+    // Match the eight-way K reduction used by small batches. A mixed round
+    // must not change a prompt's projected values when decode columns join it.
+    // 32 columns keep the shared tiles within the SM89 static-memory limit.
+    constexpr int columns = 32;
+    for_each_token_slice(x.ne[1], columns, [&](int begin, int count) {
+        const Tensor input = x.slice(1, begin, count);
+        Tensor first = qkv.slice(1, begin, count), second = z.slice(1, begin, count);
+        const W8SplitOutput2<QkvRows, ZRows> output{
+            static_cast<__nv_bfloat16*>(first.data), static_cast<__nv_bfloat16*>(second.data)};
+        w8_rowsplit_medium_t_splitk_kernel<0, columns, 8, 1, 1>
+            <<<dim3((QkvRows + ZRows) / 16, (count + columns - 1) / columns), 256, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(input.data),
                 static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), output, 8192, weight.k, x.ne[1],
-                weight.k);
-        return;
-    }
-    const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
-    const dim3 grid(kRows / Schedule::BM, static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
-    // surogate vendor patch (PATCHES.md #18): runtime K (35B 2048, 4b 2560).
-    w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output>
-        <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                                 static_cast<const std::uint8_t*>(weight.qdata),
-                                                 static_cast<const std::uint8_t*>(weight.scales),
-                                                 output, kRows, weight.k, x.ne[1], weight.k);
+                static_cast<const std::uint8_t*>(weight.scales), output, count, weight.k);
+    });
 }
 
 } // namespace
 
-void w8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                                      cudaStream_t stream) {
-    if ((x.ne[1] % Schedule::BN) == 0) {
-        launch_variant<true>(x, weight, qkv, z, stream);
-    } else {
-        launch_variant<false>(x, weight, qkv, z, stream);
-    }
+void w8_gdn_input_wide_splitk_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                     cudaStream_t stream) {
+    if (weight.n == 8192) { launch_wide<6144, 2048>(x, weight, qkv, z, stream); }
+    else { launch_wide<8192, 4096>(x, weight, qkv, z, stream); }
     CUDA_CHECK(cudaGetLastError());
 }
 

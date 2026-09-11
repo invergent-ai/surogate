@@ -17,31 +17,24 @@
 namespace sinfer::ops {
 
 inline constexpr int kGqaPrefillBr      = 64;
-// Keys per tile. 64 up to a 256-wide head, which is the tile the warp schedule was
-// tuned against. A 512-wide head -- a latent attention served absorbed, where the
-// query attends over the latent itself -- doubles every row of the arena, and the
-// arena is already at the card's opt-in limit at 256; sixteen keys per tile is
-// what keeps it there. Every constant the kernel derives from the tile (score
-// n-tiles, PV contraction steps) divides at 16, and the head dimension stays the
-// template parameter it always was.
+// Use the decode kernel's 32-key tiles for ordinary heads. A 512-wide
+// absorbed head uses 16 keys to stay within the shared-memory limit.
 template <int HeadDim>
-inline constexpr int kGqaPrefillBcFor = HeadDim > 256 ? 16 : 64;
+inline constexpr int kGqaPrefillBcFor = HeadDim > 256 ? 16 : 32;
 inline constexpr int kGqaPrefillBc       = kGqaPrefillBcFor<256>;
 inline constexpr int kGqaPrefillThreads  = 128;
 
 // Dynamic shared-memory arena of the BF16 prompt kernel: one Q tile plus the K
 // and V tiles it streams over, all bf16. The head dimension is a template
 // parameter rather than a file constant, so a launcher asks for the arena of the
-// geometry it is about to launch: 96 KiB at head dim 256, 48 KiB at 128.
+// geometry it is about to launch: 64 KiB at head dim 256, 32 KiB at 128.
 template <int HeadDim>
 inline constexpr int kGqaPrefillSmemBytes =
     (kGqaPrefillBr + 2 * kGqaPrefillBcFor<HeadDim>) * HeadDim *
     static_cast<int>(sizeof(__nv_bfloat16));
 
-// The 256-wide arena is the one every shipped geometry runs in and the one the
-// warp schedule was tuned against; it must stay at 96 KiB, which is above the
-// 48 KiB default ceiling and below the 100 KiB SM120 opt-in limit.
-static_assert(kGqaPrefillSmemBytes<256> == 98304);
+// Both arenas stay within the device opt-in shared-memory limit.
+static_assert(kGqaPrefillSmemBytes<256> == 65536);
 // The 512-wide arena may not exceed it either: 101,376 bytes is what the card opts in to.
 static_assert(kGqaPrefillSmemBytes<512> == 98304);
 

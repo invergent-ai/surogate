@@ -412,28 +412,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         detail::w8a8_gemm_split2(x, weight, qkv, z, *workspace, stream);
         return;
     }
-    // Marlin band (PATCHES.md #33): one GEMM into scratch, then two strided
-    // copies for the [qkv | z] row split (kilobytes next to the GEMM's
-    // tens of megabytes).
-    if (cols >= detail::marlin_min_band_tokens() && cols <= detail::marlin_fixed_m()) {
-        const detail::MarlinScratch scratch = detail::marlin_scratch_for(weight, stream);
-        if (scratch.gemm_out != nullptr) {
-            Tensor fused(scratch.gemm_out, DType::BF16, {weight.n, cols});
-            if (detail::marlin_w8_run(x, weight, fused, stream)) {
-                const std::size_t parent_pitch = static_cast<std::size_t>(weight.n) * 2;
-                const auto* base = static_cast<const unsigned char*>(scratch.gemm_out);
-                CUDA_CHECK(cudaMemcpy2DAsync(qkv.data, static_cast<std::size_t>(kQkvRows) * 2,
-                                             base, parent_pitch,
-                                             static_cast<std::size_t>(kQkvRows) * 2, cols,
-                                             cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaMemcpy2DAsync(z.data, static_cast<std::size_t>(kZRows) * 2,
-                                             base + static_cast<std::size_t>(kQkvRows) * 2,
-                                             parent_pitch, static_cast<std::size_t>(kZRows) * 2,
-                                             cols, cudaMemcpyDeviceToDevice, stream));
-                return;
-            }
-        }
-    }
+    // Preserve the same K reduction across narrow and wide A16 batches.
     detail::w8_gdn_input_dispatch(x, weight, qkv, z, stream);
 }
 
@@ -1061,7 +1040,7 @@ void project_split(const Tensor& x, const Weight& qkv_weight, const Weight& z_we
 
 /// The convolution plane and z from a query|key + value|z pair, for any row-addressable format.
 /// A row range of a column-major plane is not contiguous, so the plane's two pieces are projected
-/// into scratch and placed with strided copies -- the same shape the Marlin band above uses to
+/// into scratch and placed with strided copies -- the same split output layout used to
 /// cut one product into [qkv | z]. Only z, being its parent's tail and a plane of its own, is
 /// projected straight into place. The registered Q4/Q5 pair never reaches here: it has fused
 /// kernels, and the public entry delegates to them.

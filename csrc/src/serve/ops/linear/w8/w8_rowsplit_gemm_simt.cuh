@@ -16,7 +16,7 @@
 //     stride lanes 64B apart and burn 4x the L1 throughput on the same bytes).
 //     The weight planes index out conflict-free or broadcast under the same
 //     ownership.
-//   - W8 bytes are converted to FP32 and scaled per 32-value group.
+//   - W8 bytes are scaled per 32-value group and rounded to BF16.
 //     fp32 FMA into per-column accumulators; warp-shuffle reduction per column.
 //   - kTt is 4 or 8 only. Larger column tiles blow past the register budget
 //     (kTt=16 needs ~98 regs -> 2 blocks/SM -> latency-bound at ~20% of DRAM),
@@ -68,13 +68,10 @@ struct W8RowSplitSimtSchedule {
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             const std::uint32_t word = (&words.x)[j];
-            w[4 * j + 0] = static_cast<float>(static_cast<std::int8_t>(word & 0xffu)) * scale;
-            w[4 * j + 1] =
-                static_cast<float>(static_cast<std::int8_t>((word >> 8) & 0xffu)) * scale;
-            w[4 * j + 2] =
-                static_cast<float>(static_cast<std::int8_t>((word >> 16) & 0xffu)) * scale;
-            w[4 * j + 3] =
-                static_cast<float>(static_cast<std::int8_t>((word >> 24) & 0xffu)) * scale;
+            w[4 * j + 0] = w8_a16_weight(static_cast<std::int8_t>(word), scale);
+            w[4 * j + 1] = w8_a16_weight(static_cast<std::int8_t>(word >> 8), scale);
+            w[4 * j + 2] = w8_a16_weight(static_cast<std::int8_t>(word >> 16), scale);
+            w[4 * j + 3] = w8_a16_weight(static_cast<std::int8_t>(word >> 24), scale);
         }
     }
 };

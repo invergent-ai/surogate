@@ -52,6 +52,15 @@ __device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values
     return result.bits;
 }
 
+// Match the large-T GEMM: scale in FP32, then round each weight once to BF16.
+__device__ __forceinline__ unsigned w8_small_t_bf16_pair_from_s8(unsigned values, float scale) {
+    W8SmallTBf16PairBits result;
+    result.pair = __floats2bfloat162_rn(
+        static_cast<float>(static_cast<std::int8_t>(values)) * scale,
+        static_cast<float>(static_cast<std::int8_t>(values >> 8)) * scale);
+    return result.bits;
+}
+
 template <class Geometry, int ActiveCols, class Schedule, class Output,
           class Epilogue = W8SmallTMmaStoreEpilogue, class RowPolicy = W8SmallTMmaIdentityRows,
           bool DirectPairEpilogue = false>
@@ -208,14 +217,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
 
 #pragma unroll
         for (int group = 0; group < 2; ++group) {
-            float group_acc[kNt][4];
-#pragma unroll
-            for (int ni = 0; ni < kNt; ++ni) {
-                group_acc[ni][0] = 0.0f;
-                group_acc[ni][1] = 0.0f;
-                group_acc[ni][2] = 0.0f;
-                group_acc[ni][3] = 0.0f;
-            }
+            const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
+            const unsigned bot_bits = group == 0 ? bot_scale_pair & 0xffffu : bot_scale_pair >> 16;
+            const float top_scale   = __half2float(__ushort_as_half(top_bits));
+            const float bot_scale   = __half2float(__ushort_as_half(bot_bits));
 #pragma unroll
             for (int ki = 0; ki < 2; ++ki) {
                 const int ks              = group * 2 + ki;
@@ -226,13 +231,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-                const unsigned af0 = w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col));
+                const unsigned af0 = w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col), top_scale);
                 const unsigned af1 =
-                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col), bot_scale);
                 const unsigned af2 =
-                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col + 8), top_scale);
                 const unsigned af3 =
-                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8), bot_scale);
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
@@ -241,20 +246,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
                         bf0, bf1,
                         smem_addr(&b_shared[k_split][br * kTileK +
                                                      w8_small_t_swizzle_64(br, ks * 16 + b_koff)]));
-                    mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
+                    mma_bf16(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3],
                              af0, af1, af2, af3, bf0, bf1);
                 }
-            }
-            const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
-            const unsigned bot_bits = group == 0 ? bot_scale_pair & 0xffffu : bot_scale_pair >> 16;
-            const float top_scale   = __half2float(__ushort_as_half(top_bits));
-            const float bot_scale   = __half2float(__ushort_as_half(bot_bits));
-#pragma unroll
-            for (int ni = 0; ni < kNt; ++ni) {
-                acc[ni][0] = fmaf(group_acc[ni][0], top_scale, acc[ni][0]);
-                acc[ni][1] = fmaf(group_acc[ni][1], top_scale, acc[ni][1]);
-                acc[ni][2] = fmaf(group_acc[ni][2], bot_scale, acc[ni][2]);
-                acc[ni][3] = fmaf(group_acc[ni][3], bot_scale, acc[ni][3]);
             }
         }
 

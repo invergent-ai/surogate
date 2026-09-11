@@ -19,13 +19,19 @@ template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks, cla
 __global__
 __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_splitk_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, Output output, int active_cols) {
+    const std::uint8_t* __restrict__ scales, Output output, int active_cols, int runtime_hidden = 0) {
     constexpr int kTileK       = 64;
     constexpr int kMmaRows     = 16;
     constexpr int kRowsPerCta  = 16;
     constexpr int kKernelWarps = KSplits * NGroups;
     constexpr int kGroupK      = KSplits * kTileK;
-    constexpr int kGroups      = Hidden / kGroupK;
+    const int hidden          = Hidden == 0 ? runtime_hidden : Hidden;
+    const int kGroups         = hidden / kGroupK;
+    const int column_begin    = Hidden == 0 ? static_cast<int>(blockIdx.y) * TileCols : 0;
+    if constexpr (Hidden == 0) {
+        x += static_cast<std::int64_t>(column_begin) * hidden;
+        active_cols = min(TileCols, active_cols - column_begin);
+    }
     constexpr int kWarpCols    = TileCols / NGroups;
     constexpr int kNt          = kWarpCols / 8;
     constexpr unsigned kMask   = 0xffffffffu;
@@ -73,7 +79,7 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
             const int k8  = item - col * (kTileK / 8);
             auto* dst     = &b_shared[warp][col * kTileK + w8_small_t_swizzle_64(col, k8 * 8)];
             cp_async<16, Cache::cg>(
-                dst, &x[static_cast<std::int64_t>(n_base + col) * Hidden + k0 + k8 * 8]);
+                dst, &x[static_cast<std::int64_t>(n_base + col) * hidden + k0 + k8 * 8]);
         }
         cp_commit();
     };
@@ -85,7 +91,7 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
             const int chunk          = item - row * kChunks;
             const int swizzled_chunk = chunk ^ (row & 7);
             cp_async<16, Cache::cg>(&code_shared[row][swizzled_chunk * 16],
-                                    codes + static_cast<std::int64_t>(cta_row0 + row) * Hidden +
+                                    codes + static_cast<std::int64_t>(cta_row0 + row) * hidden +
                                         group_k0 + chunk * 16);
         }
         cp_commit();
@@ -117,21 +123,17 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
         if (lid < 2) {
             const int scale_row = cta_row0 + gid + lid * 8;
             lane_scale_pair     = *reinterpret_cast<const unsigned*>(
-                scales + (static_cast<std::int64_t>(scale_row) * (Hidden / 32) + k0 / 32) * 2);
+                scales + (static_cast<std::int64_t>(scale_row) * (hidden / 32) + k0 / 32) * 2);
         }
         const unsigned top_scale_pair = __shfl_sync(kMask, lane_scale_pair, lane & ~3);
         const unsigned bot_scale_pair = __shfl_sync(kMask, lane_scale_pair, (lane & ~3) + 1);
 
 #pragma unroll
         for (int group = 0; group < 2; ++group) {
-            float group_acc[kNt][4];
-#pragma unroll
-            for (int ni = 0; ni < kNt; ++ni) {
-                group_acc[ni][0] = 0.0f;
-                group_acc[ni][1] = 0.0f;
-                group_acc[ni][2] = 0.0f;
-                group_acc[ni][3] = 0.0f;
-            }
+            const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
+            const unsigned bot_bits = group == 0 ? bot_scale_pair & 0xffffu : bot_scale_pair >> 16;
+            const float top_scale   = __half2float(__ushort_as_half(top_bits));
+            const float bot_scale   = __half2float(__ushort_as_half(bot_bits));
 #pragma unroll
             for (int ki = 0; ki < 2; ++ki) {
                 const int ks              = group * 2 + ki;
@@ -142,13 +144,13 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-                const unsigned af0 = w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col));
+                const unsigned af0 = w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col), top_scale);
                 const unsigned af1 =
-                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col), bot_scale);
                 const unsigned af2 =
-                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid, code_col + 8), top_scale);
                 const unsigned af3 =
-                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+                    w8_small_t_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8), bot_scale);
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
@@ -157,20 +159,9 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
                         bf0, bf1,
                         smem_addr(&b_shared[warp][br * kTileK +
                                                   w8_small_t_swizzle_64(br, ks * 16 + b_koff)]));
-                    mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
+                    mma_bf16(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3],
                              af0, af1, af2, af3, bf0, bf1);
                 }
-            }
-            const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
-            const unsigned bot_bits = group == 0 ? bot_scale_pair & 0xffffu : bot_scale_pair >> 16;
-            const float top_scale   = __half2float(__ushort_as_half(top_bits));
-            const float bot_scale   = __half2float(__ushort_as_half(bot_bits));
-#pragma unroll
-            for (int ni = 0; ni < kNt; ++ni) {
-                acc[ni][0] = fmaf(group_acc[ni][0], top_scale, acc[ni][0]);
-                acc[ni][1] = fmaf(group_acc[ni][1], top_scale, acc[ni][1]);
-                acc[ni][2] = fmaf(group_acc[ni][2], bot_scale, acc[ni][2]);
-                acc[ni][3] = fmaf(group_acc[ni][3], bot_scale, acc[ni][3]);
             }
         }
 
@@ -232,7 +223,7 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
     if (k_split == 0) {
         const W8OutputTile output_tile = output.tile(cta_row0);
         const auto store               = [&](int row, int col, float value) {
-            __nv_bfloat16* destination = output_tile.at(row, col);
+            __nv_bfloat16* destination = output_tile.at(row, col + column_begin);
             if constexpr (AddResidual) { value += __bfloat162float(*destination); }
             *destination = __float2bfloat16_rn(value);
         };

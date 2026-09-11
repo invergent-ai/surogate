@@ -341,12 +341,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                               ? RewriteCheckpointAction::KeepExisting
                                               : RewriteCheckpointAction::ReclassifyExisting;
     } else if (desired->frontier > plan->reuse_base) {
-        // surogate vendor patch (PATCHES.md #24): capturing the rewrite
-        // checkpoint splits the final prefill chunk at frontier (prompt - 4)
-        // and pays a second full-model pass for the tail (~12 ms at 4B, 15%
-        // of a 1.9k prefill). With deferral the checkpoint is captured only
-        // when a rewrite actually replays that prefix — rewind-heavy flows
-        // pay the same cost later; everything else keeps the 12 ms.
+        // Deferral skips snapshot retention. Recurrent prefill still preserves
+        // the boundary so cache policy cannot change its arithmetic.
         static const bool defer_capture = [] {
             const char* env = std::getenv("SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT");
             return env != nullptr && env[0] == '1';

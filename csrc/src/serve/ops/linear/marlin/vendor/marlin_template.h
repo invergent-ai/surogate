@@ -103,10 +103,23 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
 
 // Multiply dequantized values by the corresponding quantization scale; used
 // only for grouped quantization.
-template <vllm::ScalarTypeId type_id>
+template <vllm::ScalarTypeId type_id, vllm::ScalarTypeId scale_type_id = type_id>
 __device__ inline void scale(typename MarlinScalarType<type_id>::FragB& frag_b,
                              typename MarlinScalarType<type_id>::FragS& frag_s,
                              int i) {
+  if constexpr (type_id == vllm::kBFloat16.id() &&
+                scale_type_id == vllm::kFloat16.id()) {
+    // W8G32 stores FP16 scales. Preserve them until the scaled weight is
+    // rounded to BF16, as in the prefill GEMM; rounding the scale first
+    // changes the matrix when a request crosses the Marlin batch band.
+    const float s = __half2float(reinterpret_cast<const half*>(&frag_s)[i]);
+    #pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const float2 v = __bfloat1622float2(frag_b[j]);
+      frag_b[j] = __floats2bfloat162_rn(v.x * s, v.y * s);
+    }
+    return;
+  }
   using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
   using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
   scalar_t2 s = MarlinScalarType<type_id>::num2num2(
@@ -331,7 +344,9 @@ __global__ void Marlin(
     // MXFP8: FP8 weights with e8m0 microscaling block scales
     static_assert(b_type == vllm::kFE4M3fn && group_blocks == 2);
   } else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
-    static_assert(s_type == vllm::kBFloat16);
+    static_assert(s_type == vllm::kBFloat16 ||
+                  (s_type == vllm::kFloat16 && b_type == vllm::kU8B128 &&
+                   group_blocks == 2));
   } else if constexpr (std::is_same<scalar_t, half>::value) {
     static_assert(s_type == vllm::kFloat16);
   }
@@ -1273,8 +1288,8 @@ __global__ void Marlin(
         scale_and_sub<a_type_id>(frag_b0, frag_s[k2][j][0].x, frag_zp[j].x);
         scale_and_sub<a_type_id>(frag_b1, frag_s[k2][j][0].y, frag_zp[j].y);
       } else if constexpr (group_blocks != -1 && !is_a_8bit) {
-        scale<a_type_id>(frag_b0, frag_s[k2][j], 0);
-        scale<a_type_id>(frag_b1, frag_s[k2][j], 1);
+        scale<a_type_id, s_type_id>(frag_b0, frag_s[k2][j], 0);
+        scale<a_type_id, s_type_id>(frag_b1, frag_s[k2][j], 1);
       }
 
   #pragma unroll

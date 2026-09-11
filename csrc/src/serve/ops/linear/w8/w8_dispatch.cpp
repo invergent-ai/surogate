@@ -5,6 +5,8 @@
 
 namespace sinfer::ops::detail {
 
+void launch_w8_consistent(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
 W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("w8 linear: unsupported shape or T"); }
 
@@ -341,9 +343,15 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     // A shape that lands here works but is not tuned. Measure it and give it an entry above.
     if ((k % kW8MmaScaleRowAlignmentK) != 0) { return launch_w8_simt_r8_c4; }
     if ((n % kW8MmaRowAlignmentN) != 0) { return launch_w8_simt_r8_c4; }
-    if (t <= 16) { return launch_w8_simt_r8_c4; }
-    if (t <= 128) { return launch_w8_mma_r32_c128; }
-    return launch_w8_mma_r64_c128;
+    return launch_w8_consistent;
+}
+
+bool w8_uses_stable_accumulation(std::int32_t n, std::int32_t k) {
+    // Generic shapes use the same K reduction at every width. Small changes
+    // at a BF16 boundary can otherwise flip FP8 cache codes and accumulate
+    // across layers. Shapes that require SIMT keep that route at every width.
+    return k % kW8MmaScaleRowAlignmentK != 0 || n % kW8MmaRowAlignmentN != 0 ||
+           select_w8_a16_launch(n, k, 1) == launch_w8_consistent;
 }
 
 W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
@@ -359,7 +367,10 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 
 void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
-    const W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
+    W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
+    if (launch == launch_w8_consistent && w.padded_shape[1] != w.k) {
+        launch = launch_w8_simt_r8_c4;
+    }
     launch(x, w, out, stream);
 }
 

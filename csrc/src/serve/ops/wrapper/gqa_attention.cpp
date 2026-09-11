@@ -351,10 +351,81 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t he
                                            std::int32_t q_heads, std::int32_t tokens,
                                            std::int32_t splits, std::int32_t batch_size = 1) {
     return {
-        workspace.alloc(DType::BF16, {head_dim, q_heads, tokens, splits * batch_size}),
+        workspace.alloc(DType::FP32, {head_dim, q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
     };
+}
+
+// Query tiles use the same fixed key partitions and FP32 reducer as decode.
+// Bound transient memory at long contexts instead of scaling it with prompt length.
+int prompt_query_capacity(int dim, int heads, int kv_heads, DType dtype,
+                           GqaExecutionEnvelope envelope) {
+    const int splits = detail::gqa_attention_split_capacity(dim, heads, kv_heads, 32, dtype, envelope);
+    const std::size_t per_query = static_cast<std::size_t>(dim + 2) * heads * splits * sizeof(float);
+    const int count = static_cast<int>(std::clamp<std::size_t>((32U << 20) / per_query, 1, 128));
+    int tile = 1;
+    const int limit = std::min({32, 64 / (heads / kv_heads), count});
+    while (tile * 2 <= limit) { tile *= 2; }
+    return (count / tile) * tile;
+}
+
+int prompt_query_tile_width(int heads, int kv_heads, int queries) {
+    const int limit = std::min({32, 64 / (heads / kv_heads), queries});
+    int width = 1;
+    while (width * 2 <= limit) { width *= 2; }
+    return width;
+}
+
+template <typename Visit>
+void for_each_prompt_tile(int heads, int kv_heads, int tokens, int capacity, Visit&& visit) {
+    for (int begin = 0; begin < tokens;) {
+        const int remaining = std::min(capacity, tokens - begin);
+        const int width = prompt_query_tile_width(heads, kv_heads, remaining);
+        const int lanes = remaining / width;
+        visit(begin, width, lanes);
+        begin += width * lanes;
+    }
+}
+
+struct PromptTileWorkspace {
+    Tensor valid;
+    Tensor rows;
+    SmallTWorkspace partial;
+};
+
+template <typename Allocator>
+PromptTileWorkspace allocate_prompt_tile_workspace(Allocator& workspace, int dim, int heads,
+                                                    int width, int splits, int lanes) {
+    return {workspace.alloc(DType::I32, {lanes}), workspace.alloc(DType::I32, {lanes}),
+            allocate_small_t_workspace(workspace, dim, heads, width, splits, lanes)};
+}
+
+void launch_cached_prompt_tiles(const Tensor& q, const Tensor& positions,
+                                 const Tensor& parent_valid, const Tensor& parent_row,
+                                 float scale, PagedKVBatchLayerView cache,
+                                 GqaExecutionEnvelope envelope, WorkspaceArena& workspace,
+                                 Tensor& out, cudaStream_t stream) {
+    // Public prompt invocations have one sequence; only the private launcher sees the
+    // independent query tiles as lanes, all selecting that sequence's table row.
+    const int capacity = prompt_query_capacity(q.ne[0], q.ne[1], cache.num_kv_heads,
+                                               cache.dtype, envelope);
+    for_each_prompt_tile(q.ne[1], cache.num_kv_heads, q.ne[2], capacity,
+                          [&](int begin, int width, int lanes) {
+        auto scope = workspace.scope();
+        const int count = lanes * width;
+        const int splits = detail::gqa_attention_split_capacity(q.ne[0], q.ne[1],
+            cache.num_kv_heads, width, cache.dtype, envelope);
+        auto [valid, rows, partial] = allocate_prompt_tile_workspace(workspace,
+            q.ne[0], q.ne[1], width, splits, lanes);
+        detail::gqa_query_tile_metadata(parent_valid, parent_row, q.ne[2], begin,
+                                         width, valid, rows, stream);
+        Tensor queries = q.slice(2, begin, count).view({q.ne[0], q.ne[1], width, lanes});
+        Tensor pos = positions.slice(0, begin, count).view({width, lanes});
+        Tensor result = out.slice(2, begin, count).view({q.ne[0], q.ne[1], width, lanes});
+        detail::gqa_attention_cached_batch_small_t_launch(queries, pos, valid, rows, scale,
+            cache, envelope, 0, width, partial.acc, partial.m, partial.l, result, stream);
+    });
 }
 
 template <typename Launch>
@@ -494,10 +565,28 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
         (void)allocate_small_t_workspace(layout, head_dim, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
     };
+    const int prompt_capacity = cache_dtype == DType::I8 ? 0 :
+        prompt_query_capacity(head_dim, q_heads, kv_heads, cache_dtype, envelope);
+    const auto exact_prompt_capacity = [&](int width) {
+        WorkspaceLayoutBuilder layout;
+        // Complete stripes repeat the same allocation; visit one plus the tail.
+        const int representative = width > prompt_capacity
+            ? prompt_capacity + width % prompt_capacity : width;
+        for_each_prompt_tile(q_heads, kv_heads, representative, prompt_capacity,
+                              [&](int, int tile, int lanes) {
+            auto scope = layout.scope();
+            const int splits = detail::gqa_attention_split_capacity(head_dim, q_heads,
+                kv_heads, tile, cache_dtype, envelope);
+            (void)allocate_prompt_tile_workspace(layout, head_dim, q_heads, tile, splits, lanes);
+        });
+        return layout.peak_bytes(1);
+    };
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
             detail::gqa_attention_resolve_route(q_heads, kv_heads, width, batch_size, envelope);
-        if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
+        if (route == detail::GqaAttentionRoute::Prompt) {
+            return cache_dtype == DType::I8 ? std::size_t{0} : exact_prompt_capacity(width);
+        }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         const std::int32_t step = detail::gqa_attention_small_t_max_width(q_heads, kv_heads);
         std::size_t maximum     = 0;
@@ -508,12 +597,11 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
     };
 
     std::size_t maximum = 0;
-    if (min_width <= kMaximumVerifyTokens) {
-        const std::int32_t last = std::min(max_width, kMaximumVerifyTokens);
-        for (std::int32_t width = min_width; width <= last; ++width) {
-            maximum = std::max(maximum, exact_capacity(width));
-        }
+    const int last = std::min(max_width, std::max(kMaximumVerifyTokens, prompt_capacity));
+    for (int width = min_width; width <= last; ++width) {
+        maximum = std::max(maximum, exact_capacity(width));
     }
+    if (max_width > last) { maximum = std::max(maximum, exact_capacity(max_width)); }
     return maximum;
 }
 
@@ -564,6 +652,12 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
                                              partial.m, partial.l, out, stream, selection);
+        return;
+    }
+    if (cache.dtype != DType::I8 && !selection.words) {
+        detail::gqa_kv_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache, stream);
+        launch_cached_prompt_tiles(q, positions, valid_columns, kv_table_rows, scale, cache,
+                                     envelope, workspace, out, stream);
         return;
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
@@ -635,6 +729,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
             partial.acc, partial.m, partial.l, out, stream, selection);
         return;
     }
+    if (cache.dtype != DType::I8 && !selection.words) {
+        launch_cached_prompt_tiles(q, positions, valid_columns, kv_table_rows, scale, cache,
+                                     envelope, workspace, out, stream);
+        return;
+    }
     detail::gqa_attention_prompt_cached_launch(q, positions, valid_columns, kv_table_rows, scale,
                                                cache, out, stream, envelope.sliding_window,
                                                selection);
@@ -672,6 +771,18 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
                                                     partial.acc, partial.m, partial.l, out, stream,
                                                     selection);
+        return;
+    }
+    if (cache.dtype != DType::I8 && !selection.words) {
+        const PagedKVBatchLayerView batch_cache{
+            .k_pages = cache.k_pages, .v_pages = cache.v_pages,
+            .k_scale_pages = cache.k_scale_pages, .v_scale_pages = cache.v_scale_pages,
+            .indexer_pages = cache.indexer_pages, .block_tables = cache.block_table,
+            .head_dim = cache.head_dim, .num_kv_heads = cache.num_kv_heads,
+            .dtype = cache.dtype, .quant_group = cache.quant_group,
+        };
+        launch_cached_prompt_tiles(q, positions, {}, {}, scale, batch_cache,
+                                     envelope, workspace, out, stream);
         return;
     }
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,

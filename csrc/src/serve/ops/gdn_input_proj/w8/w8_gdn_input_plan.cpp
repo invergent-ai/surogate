@@ -20,8 +20,8 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 3> kRoutes{{
     {1, 1, W8GdnInputScheduleId::DecodeR8Direct},
-    {2, 96, W8GdnInputScheduleId::SplitKMmaDirect},
-    {97, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
+    {2, 32, W8GdnInputScheduleId::SplitKMmaDirect},
+    {33, kAnyCols, W8GdnInputScheduleId::SplitKMmaWide},
 }};
 
 constexpr bool catalog_is_closed() {
@@ -35,14 +35,11 @@ constexpr bool catalog_is_closed() {
 
 static_assert(catalog_is_closed(), "W8 GDN input routes must be exact and closed");
 
-// surogate vendor patch (PATCHES.md #13/#16/#28): qwen3.5-0.8b/-2b/-4b. The
-// exact-T split-K tables are instantiated for all three now (T=2..16, the
-// batch-decode band); the medium band still bakes the 35B geometry, so
-// T>=17 keeps the runtime-dim MMA schedule.
+// The small targets use the same K reduction for narrow and wide batches.
 constexpr std::array<RouteSpec, 3> kRoutes08{{
     {1, 1, W8GdnInputScheduleId::DecodeR8Direct},
     {2, 32, W8GdnInputScheduleId::SplitKMmaDirect},
-    {33, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
+    {33, kAnyCols, W8GdnInputScheduleId::SplitKMmaWide},
 }};
 
 bool supported_shape(const W8GdnInputProblem& problem) noexcept {
@@ -74,8 +71,8 @@ const char* w8_gdn_input_schedule_name(W8GdnInputScheduleId schedule) noexcept {
         return "gdn_input_proj.w8.decode.r8.direct.k2048.split2";
     case W8GdnInputScheduleId::SplitKMmaDirect:
         return "gdn_input_proj.w8.mma.splitk.direct.k2048";
-    case W8GdnInputScheduleId::MmaR64C128:
-        return "gdn_input_proj.w8.mma.r64.c128.split2";
+    case W8GdnInputScheduleId::SplitKMmaWide:
+        return "gdn_input_proj.w8.mma.splitk.wide.split2";
     }
     return "gdn_input_proj.w8.unknown";
 }
@@ -138,8 +135,8 @@ void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
     case W8GdnInputScheduleId::SplitKMmaDirect:
         w8_gdn_input_splitk_mma_launch(x, weight, qkv, z, stream);
         return;
-    case W8GdnInputScheduleId::MmaR64C128:
-        w8_gdn_input_mma_r64_c128_launch(x, weight, qkv, z, stream);
+    case W8GdnInputScheduleId::SplitKMmaWide:
+        w8_gdn_input_wide_splitk_launch(x, weight, qkv, z, stream);
         return;
     }
     throw std::logic_error("W8 GDN input: unknown schedule");

@@ -23,13 +23,8 @@ namespace {
 
 // This criterion belongs to the complete A16 attention-input-projection Op.
 constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
-// surogate vendor patches (PATCHES.md #13/#16): the small-target W8 fused
-// comparisons admit exactly one BF16 output ULP at the batch maximum, and a
-// relative-L2 that tolerates one flipped sample dominating a small (T<=2)
-// batch's norm — same defined-semantics argument as the GDN W8 criterion
-// (weights dequantize to BF16 before the MMA; under cancellation that
-// rounding legitimately crosses an output rounding boundary).
-constexpr ReductionCriterion kAttnInputProjW8UlpTolerance{1.0e-2, 4.0e-3, 7.8125e-3};
+// The oracle now includes W8 weight materialization, so the family bound applies.
+constexpr auto kAttnInputProjW8UlpTolerance = kAttnInputProjA16Tolerance;
 // FP8 A16 reuses the qualified Linear decode arithmetic profile rather than the other A16
 // attention-input implementations' reduction profile.
 constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};

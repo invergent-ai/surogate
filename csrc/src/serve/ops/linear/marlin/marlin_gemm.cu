@@ -454,7 +454,8 @@ void marlin_gemm_bf16(const void* a, const void* b_packed, const void* b_scales,
     const vllm::ScalarType a_type = vllm::kBFloat16;
     const vllm::ScalarType b_type = b_is_fp8 ? vllm::kFE4M3fn : vllm::kU8B128;
     const vllm::ScalarType c_type = vllm::kBFloat16;
-    const vllm::ScalarType s_type = vllm::kBFloat16;
+    const vllm::ScalarType s_type = !b_is_fp8 && group_size == 32
+        ? vllm::kFloat16 : vllm::kBFloat16;
     const int num_groups = group_size == -1 ? 1 : prob_k / group_size;
     int dev = 0;
     cudaGetDevice(&dev);

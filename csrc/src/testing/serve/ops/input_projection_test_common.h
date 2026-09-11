@@ -153,8 +153,12 @@ projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t wei
     // summation order -- the weight is simply not re-derived per token.
     sinfer::test::parallel_rows(static_cast<std::int32_t>(selected.size()),
                                 [&](std::int32_t index) {
-        const std::vector<double> row = quantized_weight::materialize_row_fp64(
+        std::vector<double> row = quantized_weight::materialize_row_fp64(
             weight, weight_row_offset + selected[static_cast<std::size_t>(index)]);
+        if (weight.weight.qtype == QType::W8G32_F16S) {
+            // A16 W8 materializes each scaled weight in BF16 before the dot.
+            for (double& value : row) { value = bf16_to_f32(f32_to_bf16(static_cast<float>(value))); }
+        }
         for (std::int32_t token = 0; token < tokens; ++token) {
             const float* column = activation.data() + static_cast<std::size_t>(token) * hidden;
             double accumulated  = 0.0;

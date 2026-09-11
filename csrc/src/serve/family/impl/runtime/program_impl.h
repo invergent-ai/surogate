@@ -850,12 +850,24 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         }
         if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
 
+        // Snapshot admission and prefix-cache settings must not select different
+        // recurrent arithmetic. Use the global layer schedule so pipeline stages
+        // choose identical boundaries, including a stage holding only attention.
+        bool recurrent = cfg.ple_ngram > 0;
+        for (int layer = 0; layer < cfg.layers; ++layer) {
+            recurrent = recurrent || !cfg.layer_attends(layer);
+        }
+        const std::optional<std::uint32_t> recurrent_boundary =
+            recurrent && prompt.identity.rewrite_checkpoint
+                ? std::optional<std::uint32_t>(prompt.identity.rewrite_checkpoint->frontier)
+                : std::nullopt;
         RequestControl::Prefill prefill{
             .prompt                     = std::move(prompt),
             .vision_plan                = std::move(request_plan.vision),
             .vision                     = nullptr,
             .transient                  = transient,
             .rewrite_checkpoint_capture = request_plan.rewrite_checkpoint_capture,
+            .recurrent_boundary         = recurrent_boundary,
             .base                       = base,
             .cursor                     = base,
             .prompt_tokens              = prompt_tokens,
@@ -2343,8 +2355,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            if (const auto boundary = staged.chunk_boundary(); boundary && staged.cursor < *boundary) {
+                nominal = std::min(nominal, *boundary - staged.cursor);
+            }
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
@@ -3010,8 +3024,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
             const std::uint32_t want = entry.prompt_tokens - entry.cursor;
             nominals[i]              = std::min(window_left, want);
-            if (entry.rewrite_checkpoint_capture && entry.cursor < entry.rewrite_checkpoint_capture->frontier) {
-                nominals[i] = std::min(nominals[i], entry.rewrite_checkpoint_capture->frontier - entry.cursor);
+            if (const auto boundary = entry.chunk_boundary(); boundary && entry.cursor < *boundary) {
+                nominals[i] = std::min(nominals[i], *boundary - entry.cursor);
             }
             if (entry.vision) {
                 nominals[i] = entry.vision->chunk_length(entry.cursor, nominals[i]);
@@ -3042,12 +3056,12 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 : 0U;
         const std::uint32_t graph_nominal =
             std::min(graph_cap, staged.prompt_tokens - staged.cursor);
+        const auto boundary = staged.chunk_boundary();
         const bool graph_planned = !kNoMixedGraph && !head && !flash && staged_count == 1 &&
                                    staged.use_graph && prefill_graphs.has_value() &&
                                    batch_bucket == rows && graph_nominal > 0 &&
-                                   (!staged.rewrite_checkpoint_capture ||
-                                    staged.cursor >= staged.rewrite_checkpoint_capture->frontier ||
-                                    staged.cursor + graph_nominal <= staged.rewrite_checkpoint_capture->frontier);
+                                   (!boundary || staged.cursor >= *boundary ||
+                                    staged.cursor + graph_nominal <= *boundary);
         if (graph_planned) {
             nominals[0]  = graph_nominal; // the graph's chunk, eager fallback included
             staged_count = 1;

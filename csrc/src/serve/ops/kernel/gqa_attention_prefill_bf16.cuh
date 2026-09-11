@@ -8,10 +8,10 @@
 // BF16-only GQA prompt kernel. INT8 has an independent kernel body and resource
 // policy in gqa_attention_prefill_i8.cuh.
 //
-//   * Br = 64 query rows and Bc = 64 key columns per CTA tile.
+//   * Br = 64 query rows and Bc = 32 key columns per CTA tile.
 //   * 4 warps / 128 threads; each warp owns 16 query rows of the tile.
 //   * Q, K, V staged in (Br + 2*Bc) * head_dim bf16 of dynamic shared memory
-//     (96 KiB at head dim 256, 48 KiB at 128), single-buffered, with
+//     (64 KiB at head dim 256, 32 KiB at 128), single-buffered, with
 //     the cp.async of the next K/V tile overlapped against the current
 //     QK / PV tensor-core work (exactly FA's single-buffer overlap pattern).
 //   * m16n8k16 bf16 MMA for both S = Q Kᵀ and O += P V, online softmax in exp2.
@@ -263,9 +263,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         metadata.window > 0 ? (base_pos + q0) - metadata.window + 1 : 0;
     const int n_block_min = first_visible_key > 0 ? (first_visible_key / Bc) : 0;
 
-    // Fold softmax_scale into the exp2 (FA-style): scores stay raw, so the
-    // per-element "* scale" multiply drops out of the QK epilogue entirely.
-    const float scale_l2 = scale * Log2E;
+
     // A key block and a KV page were the same thing while a block was 64 keys; at 16 they are
     // not, and the page is the one the block's first key lives in. The INT8 prompt kernel
     // always indexed it this way.
@@ -337,6 +335,12 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             }
         }
 
+#pragma unroll
+        for (int nt = 0; nt < QKNt; ++nt) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { score[nt][i] *= scale; }
+        }
+
         const int row0             = warp_row0 + gid;
         const int row1             = warp_row0 + gid + 8;
         const int qrow0            = q0 + row0;
@@ -362,7 +366,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 ? block_mask.words + static_cast<std::int64_t>(qrow1) * block_mask.stride
                 : nullptr;
 
-        // block row-max on raw (unscaled) scores; scale is folded into exp2 below
+        // Block row-max on scaled scores, matching decode.
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
         if (full_score_tile) {
 #pragma unroll
@@ -400,28 +404,28 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
         const float nm0        = fmaxf(m0, bm0);
         const float nm1        = fmaxf(m1, bm1);
-        const float nm0_scaled = nm0 * scale_l2;
-        const float nm1_scaled = nm1 * scale_l2;
         // A window can mask a whole tile, leaving both maxima at -inf; the rescale
         // would then be exp2(-inf + inf) = NaN and would poison the row's accumulator
         // for every later tile. The running sums are zero there, so alpha is too.
         // (The decode kernels have carried this guard since they were written.)
         const float alpha0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx(__fmaf_rn(m0, scale_l2, -nm0_scaled));
+            (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx(((m0 - nm0) * Log2E));
         const float alpha1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx(__fmaf_rn(m1, scale_l2, -nm1_scaled));
+            (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx(((m1 - nm1) * Log2E));
 
         // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
-        // The row-sum allreduce is deferred to the epilogue; only row max must be reduced per tile.
+        // Reduce each tile before accumulating the denominator, matching decode.
+        const float beta0 = (bm0 == -CUDART_INF_F) ? 0.0f : exp2_approx((bm0 - nm0) * Log2E);
+        const float beta1 = (bm1 == -CUDART_INF_F) ? 0.0f : exp2_approx((bm1 - nm1) * Log2E);
         float bl0 = 0.0f, bl1 = 0.0f;
         unsigned p_frag[PVKs][4];
         if (full_score_tile) {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const float p00 = exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
-                const float p01 = exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
-                const float p10 = exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
-                const float p11 = exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
+                const float p00 = exp2_approx(((score[nt][0] - bm0) * Log2E));
+                const float p01 = exp2_approx(((score[nt][1] - bm0) * Log2E));
+                const float p10 = exp2_approx(((score[nt][2] - bm1) * Log2E));
+                const float p11 = exp2_approx(((score[nt][3] - bm1) * Log2E));
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
@@ -437,16 +441,16 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const float p00 = (score[nt][0] > -CUDART_INF_F)
-                                      ? exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
+                                      ? exp2_approx(((score[nt][0] - bm0) * Log2E))
                                       : 0.0f;
                 const float p01 = (score[nt][1] > -CUDART_INF_F)
-                                      ? exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
+                                      ? exp2_approx(((score[nt][1] - bm0) * Log2E))
                                       : 0.0f;
                 const float p10 = (score[nt][2] > -CUDART_INF_F)
-                                      ? exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
+                                      ? exp2_approx(((score[nt][2] - bm1) * Log2E))
                                       : 0.0f;
                 const float p11 = (score[nt][3] > -CUDART_INF_F)
-                                      ? exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
+                                      ? exp2_approx(((score[nt][3] - bm1) * Log2E))
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
@@ -461,17 +465,12 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             }
         }
 
-        l0 = __fmaf_rn(l0, alpha0, bl0);
-        l1 = __fmaf_rn(l1, alpha1, bl1);
+        bl0 = warp_sum<4>(bl0, FullMask);
+        bl1 = warp_sum<4>(bl1, FullMask);
+        l0 = __fmaf_rn(l0, alpha0, bl0 * beta0);
+        l1 = __fmaf_rn(l1, alpha1, bl1 * beta1);
         m0 = nm0;
         m1 = nm1;
-#pragma unroll
-        for (int n = 0; n < PVNt; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
-        }
 
         sinfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
         __syncthreads();
@@ -484,47 +483,35 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             sinfer::ops::cp_commit();
         }
 
-        // O += P V, contracting over the Bc keys. The (k, n) iteration space is
-        // flattened and software-pipelined: the transposed ldmatrix for the next
-        // V fragment is issued while the current MMA runs.
-        // Each x4.trans load covers 2 output n-tiles (16 dims); pipeline the next
-        // load against the current pair of MMAs.
-        constexpr int PVHalf  = PVNt / 2;      // n-tile pairs (16 at D=256)
-        constexpr int PVLoads = PVKs * PVHalf; // x4.trans loads (64 at D=256)
-        // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
-        unsigned vf[2][4];
-        {
-            ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
-                          gqa_prefill_swz_addr(v_lane_base, 0u, v_as, v_r));
-        }
+        // Form each tile output before rescaling it. P is rounded against
+        // this tile's maximum, independent of earlier tiles or split boundaries.
 #pragma unroll
-        for (int li = 0; li < PVLoads; ++li) {
-            const int k   = li / PVHalf;
-            const int n2  = (li % PVHalf) * 2;
-            const int cur = li & 1;
-            const int nxt = cur ^ 1;
-            if (li + 1 < PVLoads) {
-                const int k2       = (li + 1) / PVHalf;
-                const int n2b      = ((li + 1) % PVHalf) * 2;
-                const unsigned ckv = static_cast<unsigned>(n2b << 4);
-                ldmatrix_x4_t(
-                    vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
-                    gqa_prefill_swz_addr(v_lane_base + static_cast<unsigned>(k2) * SixteenRows, ckv,
-                                         v_as, v_r));
+        for (int n2 = 0; n2 < PVNt; n2 += 2) {
+            float tile_acc[2][4] = {};
+#pragma unroll
+            for (int k = 0; k < PVKs; ++k) {
+                unsigned vf[4];
+                const unsigned col = static_cast<unsigned>(n2 << 4);
+                ldmatrix_x4_t(vf[0], vf[1], vf[2], vf[3],
+                    gqa_prefill_swz_addr(v_lane_base + static_cast<unsigned>(k) * SixteenRows,
+                                         col, v_as, v_r));
+                mma_bf16(tile_acc[0][0], tile_acc[0][1], tile_acc[0][2], tile_acc[0][3],
+                         p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[0], vf[1]);
+                mma_bf16(tile_acc[1][0], tile_acc[1][1], tile_acc[1][2], tile_acc[1][3],
+                         p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[2], vf[3]);
             }
-            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
-                     p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
-            mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
-                     p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    acc[n2 + j][i] = __fmaf_rn(acc[n2 + j][i], i < 2 ? alpha0 : alpha1,
+                                               tile_acc[j][i] * (i < 2 ? beta0 : beta1));
+                }
+            }
         }
     }
 
-    l0 = warp_sum<4>(l0, FullMask);
-    l1 = warp_sum<4>(l1, FullMask);
-
-    // Normalize once per row via reciprocal-multiply instead of 128 IEEE divides.
-    const float inv_l0 = (l0 > 0.0f) ? __frcp_rn(l0) : 0.0f;
-    const float inv_l1 = (l1 > 0.0f) ? __frcp_rn(l1) : 0.0f;
+    // Use the same final division as decode before rounding the output to BF16.
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
         const int d0    = n * 8 + 2 * lid;
@@ -532,11 +519,11 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const int qrow1 = q0 + warp_row0 + gid + 8;
         if (qrow0 < tokens) {
             *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow0)]) =
-                pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+                pack_bf16x2(l0 > 0.0f ? acc[n][0] / l0 : 0.0f, l0 > 0.0f ? acc[n][1] / l0 : 0.0f);
         }
         if (qrow1 < tokens) {
             *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow1)]) =
-                pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+                pack_bf16x2(l1 > 0.0f ? acc[n][2] / l1 : 0.0f, l1 > 0.0f ? acc[n][3] / l1 : 0.0f);
         }
     }
     gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);

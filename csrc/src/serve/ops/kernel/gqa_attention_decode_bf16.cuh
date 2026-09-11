@@ -66,9 +66,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
     std::int32_t sliding_window, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
+    float* partial_acc, float* partial_m, float* partial_l,
     GqaBlockMask block_mask = GqaBlockMask{}) {
-    static_assert(TokenTile >= 1 && TokenTile <= 6);
+    static_assert(TokenTile >= 1 && TokenTile <= 32);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
     constexpr bool kFp8Cache = GqaKvIsFp8<CacheT>::value;
@@ -173,7 +173,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
             if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
                 partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
-                    __float2bfloat16(0.0f);
+                    0.0f;
             }
         }
     };
@@ -202,20 +202,15 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     // Partition the keys this tile can actually see, not every key ever written.
     // Below `key_lo` the window excludes every token in the tile, so those keys
     // were staged and scored only to be masked away.
-    const int key_lo = gqa_small_t_key_lo(first_pos, sliding_window);
+    // Absolute partitions keep each query's arithmetic independent of its batch or tile.
+    const int first_partition = gqa_key_partition(gqa_small_t_key_lo(first_pos, sliding_window));
     const int key_hi = last_pos + 1;
-    const int window = key_hi - key_lo;
     const int active_split_count =
-        gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+        min(split_count, gqa_key_partition(last_pos) + 1 - first_partition);
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = key_lo + split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < key_hi) ? split_limit : key_hi;
+    const int split_start = gqa_key_partition_begin(first_partition + split);
+    const int split_end = min(gqa_key_partition_begin(first_partition + split + 1), key_hi);
     if (split_start >= split_end) {
         write_neutral();
         return;
@@ -424,22 +419,25 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
         const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
 
+        const float beta0 = (bm0 == -CUDART_INF_F) ? 0.0f : exp2_approx((bm0 - nm0) * Log2E);
+        const float beta1 = (bm1 == -CUDART_INF_F) ? 0.0f : exp2_approx((bm1 - nm1) * Log2E);
+
         float bl0 = 0.0f, bl1 = 0.0f;
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
             const int col0  = nt * 8 + 2 * lid;
             const int col1  = col0 + 1;
-            const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][0] - nm0) * Log2E)
+            const float p00 = (bm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
+                                  ? exp2_approx((score[nt][0] - bm0) * Log2E)
                                   : 0.0f;
-            const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][1] - nm0) * Log2E)
+            const float p01 = (bm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
+                                  ? exp2_approx((score[nt][1] - bm0) * Log2E)
                                   : 0.0f;
-            const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][2] - nm1) * Log2E)
+            const float p10 = (bm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
+                                  ? exp2_approx((score[nt][2] - bm1) * Log2E)
                                   : 0.0f;
-            const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][3] - nm1) * Log2E)
+            const float p11 = (bm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
+                                  ? exp2_approx((score[nt][3] - bm1) * Log2E)
                                   : 0.0f;
             bl0 += p00 + p01;
             bl1 += p10 + p11;
@@ -451,21 +449,15 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         bl0 = warp_sum<4>(bl0, FullMask);
         bl1 = warp_sum<4>(bl1, FullMask);
 
-        l0 = l0 * alpha0 + bl0;
-        l1 = l1 * alpha1 + bl1;
+        l0 = __fmaf_rn(l0, alpha0, bl0 * beta0);
+        l1 = __fmaf_rn(l1, alpha1, bl1 * beta1);
         m0 = nm0;
         m1 = nm1;
-#pragma unroll
-        for (int n = 0; n < PVNt; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
-        }
         __syncwarp();
 
 #pragma unroll
         for (int n = 0; n < PVNt; ++n) {
+            float tile_acc[4] = {};
 #pragma unroll
             for (int k = 0; k < PVKs; ++k) {
                 unsigned pf[4];
@@ -477,8 +469,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 const int vcol = n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_s[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
+                mma_bf16(tile_acc[0], tile_acc[1], tile_acc[2], tile_acc[3], pf[0], pf[1], pf[2], pf[3],
                          vf[0], vf[1]);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[n][i] = __fmaf_rn(acc[n][i], i < 2 ? alpha0 : alpha1,
+                                      tile_acc[i] * (i < 2 ? beta0 : beta1));
             }
         }
         __syncthreads();
@@ -503,35 +500,28 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         }
     }
 
-    // MMA fragments hold each row in four-lane groups. Stage the final split-local
-    // accumulator through shared memory so partial_acc is written as contiguous d-vector stores.
+    // Preserve split numerators until normalization. Rounding the unnormalized
+    // sum to BF16 here adds a second rounding absent from prompt attention.
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
-        const int d0   = n * 8 + 2 * lid;
-        const int d1   = d0 + 1;
+        const int d = n * 8 + 2 * lid;
         const int row0 = warp_row0 + gid;
         const int row1 = row0 + 8;
         if (row0 < row_count) {
-            qkv_s[row0 * D + d0] = __float2bfloat16(acc[n][0]);
-            qkv_s[row0 * D + d1] = __float2bfloat16(acc[n][1]);
+            int q_head = 0, token = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head, token);
+            if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+                const auto dst = gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
+                store_vec(&partial_acc[dst], make_float2(acc[n][0], acc[n][1]));
+            }
         }
         if (row1 < row_count) {
-            qkv_s[row1 * D + d0] = __float2bfloat16(acc[n][2]);
-            qkv_s[row1 * D + d1] = __float2bfloat16(acc[n][3]);
-        }
-    }
-    __syncthreads();
-
-    for (int chunk = tid; chunk < row_count * (D / 8); chunk += Threads) {
-        const int row = chunk / (D / 8);
-        const int d   = (chunk - row * (D / 8)) * 8;
-        int q_head    = 0;
-        int token     = 0;
-        gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-        if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
-            const std::int64_t dst =
-                gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
-            store_vec(&partial_acc[dst], load_vec<int4>(&qkv_s[row * D + d]));
+            int q_head = 0, token = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head, token);
+            if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+                const auto dst = gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
+                store_vec(&partial_acc[dst], make_float2(acc[n][2], acc[n][3]));
+            }
         }
     }
 }

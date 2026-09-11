@@ -93,6 +93,21 @@ __device__ __forceinline__ int gqa_small_t_key_lo(int first_pos, int sliding_win
     return lo > 0 ? lo : 0;
 }
 
+// Partitions are anchored to absolute key positions, never to the current
+// sequence length or batch. Wider partitions in the tail bound temporary
+// storage at long contexts without regrouping a query when the context grows.
+__host__ __device__ inline int gqa_key_partition(int key) {
+    if (key < 4096) { return key / 128; }
+    if (key < 16384) { return 32 + (key - 4096) / 512; }
+    return 56 + (key - 16384) / 2048;
+}
+
+__host__ __device__ inline int gqa_key_partition_begin(int partition) {
+    if (partition < 32) { return partition * 128; }
+    if (partition < 56) { return 4096 + (partition - 32) * 512; }
+    return 16384 + (partition - 56) * 2048;
+}
+
 template <typename Geometry>
 __device__ __forceinline__ int gqa_small_t_default_splits(int window) {
     int target_keys_per_split = 480 / Geometry::DecodeSplitScale;
@@ -113,6 +128,7 @@ template <typename Geometry, bool Int8>
 __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_capacity,
                                                          int tokens) {
     if (window <= 0) { return launch_capacity; }
+    if constexpr (!Int8) { return min(launch_capacity, div_up(window, 128)); }
     int splits = 0;
     if constexpr (Int8) {
         if (tokens == 5 && window > 128 && window <= 512) {
@@ -160,7 +176,7 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
 
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
-    const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
+    const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t split_count, std::int32_t sliding_window, __nv_bfloat16* out) {
@@ -202,8 +218,9 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     // The same range the split kernels partitioned, derived the same way.
     const int key_lo = gqa_small_t_key_lo(first_pos, sliding_window);
     const int window = (last_pos + 1) - key_lo;
-    const int active_split_count =
-        gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
+    const int active_split_count = Int8
+        ? gqa_small_t_active_splits<Geometry, true>(window, split_count, tokens)
+        : min(split_count, gqa_key_partition(last_pos) + 1 - gqa_key_partition(key_lo));
 
     __shared__ float reduce[256];
 
@@ -230,23 +247,39 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         return;
     }
 
-    float local_l = 0.0f;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
-        const float tile_l =
-            partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
-        if (tile_l > 0.0f) {
-            local_l +=
-                tile_l *
-                expf(partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
-                     head_m);
+    // Keep the normalization sum in absolute key order. A sliding-window query
+    // tile may add leading empty splits, which must not regroup the nonzero terms.
+    if constexpr (!Int8) {
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (int split = 0; split < active_split_count; ++split) {
+                const auto index = gqa_partial_stat_index<Geometry>(q_head, token, split, tokens);
+                if (partial_l[index] > 0.0f) {
+                    sum += partial_l[index] * expf(partial_m[index] - head_m);
+                }
+            }
+            reduce[0] = sum;
         }
-    }
-    reduce[tid] = local_l;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
         __syncthreads();
+    } else {
+        float local_l = 0.0f;
+        for (int split = tid; split < active_split_count; split += blockDim.x) {
+            const float tile_l =
+                partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)];
+            if (tile_l > 0.0f) {
+                local_l +=
+                    tile_l *
+                    expf(partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
+                         head_m);
+            }
+        }
+        reduce[tid] = local_l;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
+            __syncthreads();
+        }
     }
     const float head_l = reduce[0];
 
@@ -262,8 +295,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
             const float weight = expf(
                 partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] - head_m);
             numerator +=
-                __bfloat162float(
-                    partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]) *
+                partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] *
                 weight;
         }
     }

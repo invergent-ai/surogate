@@ -266,7 +266,9 @@ std::vector<float> materialize_weight_rows(const HostWeight& weight,
         [&](const auto& value) {
             using Value = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<Value, quantized_weight::PackedWeight>) {
-                return quantized_weight::materialize_rows_fp32(value, rows);
+                auto result = quantized_weight::materialize_rows_fp32(value, rows);
+                if (value.weight.qtype == QType::W8G32_F16S) { test::round_to_bf16(result); }
+                return result;
             } else {
                 std::vector<float> result(checked_elements(static_cast<std::int32_t>(rows.size()),
                                                            value.k, "oracle weight"));

@@ -1,10 +1,17 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cstdint>
 
 namespace sinfer::ops::detail {
+
+// A16 W8 GEMMs multiply the same BF16-rounded weights at every batch width.
+// Keep the FP16 scale exact until after multiplication by the signed code.
+__device__ __forceinline__ float w8_a16_weight(std::int8_t code, float scale) {
+    return __bfloat162float(__float2bfloat16_rn(static_cast<float>(code) * scale));
+}
 
 struct W8RowSplitStorage {
     static constexpr int kGroupK             = 32;
@@ -28,8 +35,8 @@ struct W8ScalarDecodeAtom {
             __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + group_index * 2)));
         const std::uint8_t* packed = codes + group_index * W8RowSplitStorage::kCodeBytesPerGroup +
                                      static_cast<std::int64_t>(lane) * 2;
-        w0 = static_cast<float>(static_cast<std::int8_t>(packed[0])) * scale;
-        w1 = static_cast<float>(static_cast<std::int8_t>(packed[1])) * scale;
+        w0 = w8_a16_weight(static_cast<std::int8_t>(packed[0]), scale);
+        w1 = w8_a16_weight(static_cast<std::int8_t>(packed[1]), scale);
     }
 };
 

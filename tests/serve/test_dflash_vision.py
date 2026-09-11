@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -129,6 +130,53 @@ def test_mixed_batch_preserves_visual_positions(server):
             actual = list(pool.map(lambda p: ask(server, p, max_tokens=16), prompts))
         for result, reference in zip(actual, expected):
             same_policy(result, reference)
+
+
+@pytest.mark.skipif(os.getenv("SUROGATE_DFLASH_VISION_TEST_KV_DTYPE") != "fp8",
+                    reason="FP8 configuration exercises the small conversation snapshot budget")
+def test_checkpoint_pressure_preserves_prefill_scores(server):
+    messages = [{"role": "user", "content": [
+        image_part("red", 128), image_part("blue", 256),
+        {"type": "text", "text": "Name the colors of the first and second images, in order. Reply with two color words only."},
+    ]}]
+    expected = ask(server, messages, "base", max_tokens=16)
+
+    def occupy(index, started):
+        payload = {
+            "model": "draft", "messages": [{"role": "user", "content":
+                f"Task {index}: count from 1 to 1000 in order, separated by commas."}],
+            "max_tokens": 1024, "ignore_eos": True, "temperature": 0,
+            "stream": True, "return_token_ids": True, "logprobs": True, "top_logprobs": 0,
+        }
+        count = 0
+        with requests.post(server[0] + "/v1/chat/completions", json=payload,
+                           stream=True, timeout=120) as response:
+            assert response.ok, response.text
+            for line in response.iter_lines(chunk_size=1):
+                if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                    continue
+                chunk = json.loads(line[6:])
+                assert "error" not in chunk, chunk
+                for choice in chunk["choices"]:
+                    tokens = choice.get("token_ids", [])
+                    count += len(tokens)
+                    if (choice.get("logprobs") or {}).get("content"):
+                        started.set()
+        assert count == 1024
+
+    # Keep the snapshot owners active while another conversation is admitted.
+    # Its first-token score must agree even when it cannot retain a snapshot.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        running = []
+        for index in range(2):
+            started = threading.Event()
+            running.append(pool.submit(occupy, index, started))
+            assert started.wait(60)
+        assert all(not future.done() for future in running)
+        actual = ask(server, messages, max_tokens=16)
+        same_policy(actual, expected)
+        for future in running:
+            future.result()
 
 
 @pytest.mark.parametrize("color,size", [("red", 64), ("blue", 512)])

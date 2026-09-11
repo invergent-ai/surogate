@@ -147,10 +147,14 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                 std::fill(up.begin(), up.end(), 0.0);
                 const std::int32_t up_row = profile.output_rows + row;
                 for (std::int32_t column = 0; column < profile.input_rows; ++column) {
-                    const double gate_weight =
+                    double gate_weight =
                         quantized_weight::logical_weight_fp64(weight, row, column);
-                    const double up_weight =
+                    double up_weight =
                         quantized_weight::logical_weight_fp64(weight, up_row, column);
+                    if (profile.qtype == QType::W8G32_F16S && profile.activation_compute == ActivationCompute::A16) {
+                        gate_weight = test::bf16_to_f32(test::f32_to_bf16(static_cast<float>(gate_weight)));
+                        up_weight = test::bf16_to_f32(test::f32_to_bf16(static_cast<float>(up_weight)));
+                    }
                     for (const ActiveValue active :
                          active_by_column[static_cast<std::size_t>(column)]) {
                         gate[static_cast<std::size_t>(active.token)] += gate_weight * active.value;
