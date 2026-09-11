@@ -51,6 +51,7 @@ struct OrdinaryDecodeEgress {
     /// number for every token it was given -- there is no request that wants the
     /// token but not its probability.
     std::array<float, kMaximumBatchColumns> sampled_logprobs{};
+    std::array<RawTokenScores, kMaximumBatchColumns * 1> scores{};
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
@@ -77,6 +78,7 @@ struct MtpDecodeEgress {
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
     std::array<TokenId, kMaximumBatchColumns * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumBatchColumns> next_extents{};
+    std::array<RawTokenScores, kMaximumBatchColumns * kMtpDecodeMaximumWidth> scores{};
 };
 
 // Stable pinned/device transfer formats for one exact-B DFlash transaction. The proposal is
@@ -97,6 +99,7 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumBatchColumns * kDFlashDecodeMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumBatchColumns> licensed_counts{};
     std::array<std::int32_t, kMaximumBatchColumns> accepted_drafts{};
+    std::array<RawTokenScores, kMaximumBatchColumns * kDFlashDecodeMaximumWidth> scores{};
 };
 
 struct OrdinaryDecodeStateLayout {

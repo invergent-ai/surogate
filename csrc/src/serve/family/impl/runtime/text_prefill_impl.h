@@ -100,6 +100,8 @@ PrefillChunkResult prefill_text_chunk(
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.logprob_observer = state.logprob_observer;
     card.score_prompt = state.score_prompt;
+    card.score_prompt_start = state.score_prompt_start;
+    card.score_prompt_end = state.score_prompt_end;
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier
@@ -133,6 +135,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.logprob_observer = state.logprob_observer;
     card.score_prompt = state.score_prompt;
+    card.score_prompt_start = state.score_prompt_start;
+    card.score_prompt_end = state.score_prompt_end;
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_rewrite_checkpoint_frontier(
         rewrite_checkpoint_capture_frontier

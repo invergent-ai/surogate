@@ -138,10 +138,18 @@ renormalized over the tokens allowed by a schema or sampling filter. Generated s
 reasoning and tool-call syntax. Ordinary, MTP, and DFlash generation support these fields,
 including pipeline serving.
 
-Requesting scores adds latency. Prompt scoring evaluates the full prompt and does not reuse
-cached prefixes; generated-token scoring still permits prefix reuse. With `stream: true`,
-the server sends all token details together in a chunk with an empty `delta` after generation
-and before the finish chunk.
+Freshly rescoring quantized speculative output as a prompt can produce different values
+from those returned during generation. Use the generated-token scores when you need the
+probabilities from the original rollout.
+
+Requesting and retaining scores adds work and uses system memory. Repeated or extended
+prompts can reuse cached scores when the model, adapter, and prefix match and the cached entries contain enough alternatives for the
+new request. Missing scores are computed as needed; an unscored prefix may require a fresh
+prefill. Cached scores are discarded when their prefix is evicted or the adapter is replaced.
+
+With `stream: true`, generated-token scores arrive incrementally in chunks with an empty
+`delta`. Concatenate `choices[].logprobs.content` across those chunks. Prompt scores accompany
+the first score chunk; requested token-id arrays are sent once before the finish chunk.
 
 ### Reasoning models
 
@@ -275,9 +283,10 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 a string or a one-element string array and supports streaming, sampling, stops, and adapter
 selection. Set `logprobs` to an integer from 0 through 20 to receive token probabilities and
 that many alternatives in `choices[].logprobs`. `prompt_logprobs` and `return_token_ids` work
-as described above. Streaming delivers the scores together before the finish chunk. Batched
-prompts and token arrays in `prompt` are refused. Requests for `echo`, `suffix`, or
-`best_of > 1` are unsupported on this endpoint.
+as described above. Streaming delivers score chunks incrementally; concatenate their token
+and probability arrays. Text offsets continue across chunks. Batched prompts and token arrays
+in `prompt` are refused. Requests for `echo`, `suffix`, or `best_of > 1` are unsupported on
+this endpoint.
 
 `POST /tokenize` accepts either `messages` or a raw `prompt` and returns `count`,
 `max_model_len`, and `tokens`. Set `with_token_strings: true` to include `token_strs`, or
@@ -376,8 +385,10 @@ work with streaming and stored responses; the tool-choice rules above apply unch
 
 For generated-token probabilities, set `include: ["message.output_text.logprobs"]` and
 optionally `top_logprobs` (0–20). Scores appear on the output-text content part and in the
-`response.output_text.done` event when streaming. They cover the raw generated tokens,
-including reasoning and tool syntax, using the same probabilities as Chat Completions.
+`response.output_text.done` event when streaming. Incremental scores also arrive in
+`response.output_text.delta` events, sometimes with an empty text delta; concatenate their
+`logprobs` arrays. The done event contains the complete array. Scores cover the raw generated
+tokens, including reasoning and tool syntax, using the same probabilities as Chat Completions.
 
 Background execution and compaction are unsupported. `/v1/responses/compact` returns
 `400 compaction_not_supported`. `/v1/responses/{id}/cancel` returns

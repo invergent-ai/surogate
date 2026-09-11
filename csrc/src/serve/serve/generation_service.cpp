@@ -195,10 +195,30 @@ void check_preparation_control(Clock::time_point deadline,
     }
 }
 
+void populate_score_texts(Engine& engine, GenerationOutcome& outcome) {
+    std::vector<TokenId> ids;
+    for (const auto* scores : {&outcome.prompt_scores, &outcome.completion_scores}) {
+        for (const auto& score : *scores) {
+            if (score.selected.token_id >= 0) ids.push_back(score.selected.token_id);
+            for (const auto& candidate : score.top) ids.push_back(candidate.token_id);
+        }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    if (!ids.empty()) {
+        auto texts = engine.token_texts(ids);
+        for (std::size_t i = 0; i < ids.size(); ++i) outcome.score_texts.emplace(ids[i], std::move(texts[i]));
+    }
+    for (const auto& score : outcome.completion_scores) {
+        outcome.token_logprobs.push_back(score.selected.logprob);
+        outcome.token_texts.push_back(outcome.score_texts.at(score.selected.token_id));
+    }
+}
+
 class ServiceOutputSink final : public sinfer::OutputSink {
 public:
-    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls, bool json_tools)
-        : sink_(&sink), filter_tool_calls_(filter_tool_calls), tool_filter_(json_tools) {}
+    ServiceOutputSink(Engine& engine, const StreamSink& sink, bool filter_tool_calls, bool json_tools)
+        : engine_(&engine), sink_(&sink), filter_tool_calls_(filter_tool_calls), tool_filter_(json_tools) {}
 
     void publish(sinfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
@@ -209,6 +229,15 @@ public:
                 filter_tool_calls_ ? tool_filter_.feed(delta.text) : std::move(delta.text);
             publish_content(visible);
         }
+    }
+
+    void publish_scores(TokenScoreDelta delta) override {
+        if (!sink_->on_scores) return;
+        GenerationOutcome outcome;
+        outcome.prompt_scores = std::move(delta.prompt);
+        outcome.completion_scores = std::move(delta.completion);
+        populate_score_texts(*engine_, outcome);
+        sink_->on_scores(outcome);
     }
 
     std::size_t finish(bool is_tool_call_response) {
@@ -223,6 +252,7 @@ private:
         content_bytes_ += text.size();
     }
 
+    Engine* engine_ = nullptr;
     const StreamSink* sink_ = nullptr;
     bool filter_tool_calls_ = false;
     ToolCallStreamFilter tool_filter_;
@@ -521,7 +551,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) {
-        output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared.tool_capable,
+        output_sink = std::make_unique<ServiceOutputSink>(*engine_, *sink, prepared.tool_capable,
             options_.tool_call_format == ToolCallFormat::Llama3Json);
     }
     sinfer::OutputSink* public_sink = output_sink.get();
@@ -550,26 +580,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
     outcome.prompt_scores = std::move(result.prompt_logprobs);
     outcome.completion_scores = std::move(result.completion_logprobs);
-    std::vector<TokenId> score_ids;
-    for (const auto* scores : {&outcome.prompt_scores, &outcome.completion_scores}) {
-        for (const auto& score : *scores) {
-            if (score.selected.token_id >= 0) score_ids.push_back(score.selected.token_id);
-            for (const auto& candidate : score.top) score_ids.push_back(candidate.token_id);
-        }
-    }
-    std::sort(score_ids.begin(), score_ids.end());
-    score_ids.erase(std::unique(score_ids.begin(), score_ids.end()), score_ids.end());
-    if (!score_ids.empty()) {
-        auto texts = engine_->token_texts(score_ids);
-        for (std::size_t i = 0; i < score_ids.size(); ++i) outcome.score_texts.emplace(score_ids[i], std::move(texts[i]));
-    }
-    if (prepared.want_logprobs) {
-        for (const auto& score : outcome.completion_scores) outcome.token_logprobs.push_back(score.selected.logprob);
-        if (!result.generated_token_ids.empty()) {
-            outcome.token_texts = engine_->token_texts(std::span<const sinfer::TokenId>(
-                result.generated_token_ids.data(), result.generated_token_ids.size()));
-        }
-    }
+    populate_score_texts(*engine_, outcome);
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

@@ -103,6 +103,7 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
     SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<family::RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    std::uint32_t reusable_scores = 0;
     int prompt_logprobs = -1;
     int top_logprobs = -1;
     ops::SamplingConfig sampling;
@@ -214,6 +215,7 @@ struct SequenceState {
     std::uint32_t execution_frontier = 0;
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
+    std::vector<TokenScore> cached_scores;
     family::detail::ResidentPrefixIdentity prefix_identity;
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;
@@ -318,7 +320,12 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
-    void collect_logprobs(std::uint32_t lane, GenerationResult& result) const;
+    TokenScoreDelta logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const;
+    void cache_logprobs(std::uint32_t lane, const GenerationResult& result);
+    void collect_logprobs(std::uint32_t lane, GenerationResult& result);
+    std::function<void(const Tensor&, int, bool)> score_observer(std::uint32_t lane);
+    void score_prefill_hidden(std::uint32_t lane, const Tensor& hidden, int base);
+    void append_completion_score(std::uint32_t lane, const RawTokenScores& score);
     void score_completion(std::uint32_t lane, const Tensor& logits, TokenId token);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
@@ -482,6 +489,8 @@ public:
         const TokenId* source          = nullptr;
         float* logprob_destination     = nullptr;
         const float* logprob_source    = nullptr;
+        RawTokenScores* score_destination = nullptr;
+        const RawTokenScores* score_source = nullptr;
         std::int32_t count             = 0;
     };
         // Round lifecycle state (runtime/contract/round_lifecycle.h): what the
@@ -530,6 +539,7 @@ public:
     std::array<TokenId, kMaximumBatchColumns * kChainBurstLimit> burst_tokens{};
     std::array<float, kMaximumBatchColumns * kChainBurstLimit> burst_logprobs{};
     std::array<float, kMaximumBatchColumns * kChainBurstLimit> burst_rounds_logprobs{};
+    std::array<RawTokenScores, kMaximumBatchColumns * kChainBurstLimit> burst_rounds_scores{};
     std::array<std::int32_t, kMaximumBatchColumns> burst_counts{};
     std::array<BurstEgressCopy, kChainBurstLimit> burst_copy_ctx{};
     std::uint32_t round_burst_limit = 1;

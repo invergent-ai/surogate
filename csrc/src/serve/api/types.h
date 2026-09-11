@@ -611,15 +611,40 @@ enum class FinishReason : std::uint8_t {
     Cancelled,
 };
 
+struct TokenLogprob {
+    TokenId token_id = -1;
+    float logprob = std::numeric_limits<float>::quiet_NaN();
+    std::int32_t rank = 0;
+};
+
+struct RawTokenScores {
+    TokenLogprob selected;
+    std::array<TokenLogprob, 20> top;
+    std::int32_t count = 0;
+};
+
+struct TokenScore {
+    TokenLogprob selected;
+    std::vector<TokenLogprob> top;
+};
+
+struct TokenScoreDelta {
+    std::size_t first_completion_token = 0;
+    std::vector<TokenScore> prompt;
+    std::vector<TokenScore> completion;
+};
+
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
+    std::optional<TokenScoreDelta> scores;
 };
 
 class OutputSink {
 public:
     virtual ~OutputSink()                   = default;
     virtual void publish(OutputDelta delta) = 0;
+    virtual void publish_scores(TokenScoreDelta delta) {}
 };
 
 class CancellationView {
@@ -665,17 +690,6 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
-};
-
-struct TokenLogprob {
-    TokenId token_id = -1;
-    float logprob = std::numeric_limits<float>::quiet_NaN();
-    std::int32_t rank = 0;
-};
-
-struct TokenScore {
-    TokenLogprob selected;
-    std::vector<TokenLogprob> top;
 };
 
 struct GenerationResult {

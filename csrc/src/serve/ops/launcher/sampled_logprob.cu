@@ -81,8 +81,19 @@ void sampled_logprob_launch(const Tensor& logits, const Tensor& tokens, Tensor& 
 
 namespace sinfer::ops {
 namespace {
-__global__ void score_kernel(const __nv_bfloat16* logits, TokenLogprob* out,
-                             int token, int domain, int count) {
+__global__ void score_kernel(const __nv_bfloat16* all_logits, const int* tokens,
+                             RawTokenScores* output, int vocab, int domain,
+                             const SamplingConfig* configs, int uniform_count,
+                             int width, const int* counts) {
+    const int column = blockIdx.x;
+    const int lane = column / width;
+    const int count = configs ? configs[lane].top_logprobs : uniform_count;
+    if (count < 0 || (counts && column % width >= counts[lane])) return;
+    const auto* logits = all_logits + std::size_t(column) * vocab;
+    const int token = tokens[column];
+    if (token < 0 || token >= domain) return;
+    RawTokenScores& out = output[column];
+    auto* top = reinterpret_cast<TokenLogprob*>(&out.top);
     __shared__ float values[512];
     __shared__ int indices[512];
     __shared__ float normalizer;
@@ -114,15 +125,16 @@ __global__ void score_kernel(const __nv_bfloat16* logits, TokenLogprob* out,
     }
     if (tid == 0) {
         normalizer = maximum + logf(values[0]);
-        out[0] = {token, selected - normalizer, indices[0]};
+        out.selected = {token, selected - normalizer, indices[0]};
+        out.count = min(min(count, domain), 20);
     }
     __syncthreads();
-    for (int k = 0; k < count; ++k) {
+    for (int k = 0; k < out.count; ++k) {
         float value = -INFINITY;
         int index = domain;
         for (int i = tid; i < domain; i += 512) {
             bool used = false;
-            for (int j = 1; j <= k; ++j) used |= out[j].token_id == i;
+            for (int j = 0; j < k; ++j) used |= top[j].token_id == i;
             float v = __bfloat162float(logits[i]);
             if (!used && (v > value || (v == value && i < index))) { value = v; index = i; }
         }
@@ -135,30 +147,56 @@ __global__ void score_kernel(const __nv_bfloat16* logits, TokenLogprob* out,
             }
             __syncthreads();
         }
-        if (tid == 0) out[k + 1] = {indices[0], values[0] - normalizer, k + 1};
+        if (tid == 0) top[k] = {indices[0], values[0] - normalizer, k + 1};
         __syncthreads();
     }
 }
 }
-TokenScore score_logprobs(const Tensor& logits, TokenId token, int domain, int top_k,
-                         cudaStream_t stream) {
+void score_logprobs_device(const Tensor& logits, const Tensor& tokens, int domain,
+                          const SamplingConfig* configs, RawTokenScores* output,
+                          cudaStream_t stream, int width, const int* counts) {
+    const int columns = logits.ne[1] * logits.ne[2];
+    if (!output || !configs || width <= 0 || columns <= 0 || columns % width ||
+        logits.dtype != DType::BF16 || !logits.data || domain <= 0 || domain > logits.ne[0] ||
+        tokens.dtype != DType::I32 || !tokens.data || tokens.ne[0] * tokens.ne[1] < columns) {
+        throw std::invalid_argument("invalid batched log-probability scoring arguments");
+    }
+    score_kernel<<<columns, 512, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
+        static_cast<const int*>(tokens.data), output, logits.ne[0], domain, configs, -1, width, counts);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+std::vector<TokenScore> score_logprobs_batch(const Tensor& logits, std::span<const TokenId> tokens,
+                                            int domain, int top_k, cudaStream_t stream) {
+    const auto columns = tokens.size();
     if (logits.dtype != DType::BF16 || !logits.data || domain <= 0 || domain > logits.ne[0] ||
-        token < 0 || token >= domain || top_k < 0 || top_k > 20) {
+        columns == 0 || columns > std::size_t(logits.ne[1]) || top_k < 0 || top_k > 20 ||
+        std::any_of(tokens.begin(), tokens.end(), [domain](auto token) { return token < 0 || token >= domain; })) {
         throw std::invalid_argument("invalid log-probability scoring arguments");
     }
-    top_k = std::min(top_k, domain);
-    TokenLogprob* device_out = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&device_out, 21 * sizeof(TokenLogprob), stream));
-    std::array<TokenLogprob, 21> host;
+    void* storage = nullptr;
+    CUDA_CHECK(cudaMallocAsync(&storage, columns * (sizeof(RawTokenScores) + sizeof(TokenId)), stream));
+    auto* device_out = static_cast<RawTokenScores*>(storage);
+    auto* device_tokens = reinterpret_cast<TokenId*>(device_out + columns);
+    std::vector<RawTokenScores> host(columns);
     try {
-        score_kernel<<<1, 512, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
-                                          device_out, token, domain, top_k);
+        CUDA_CHECK(cudaMemcpyAsync(device_tokens, tokens.data(), tokens.size_bytes(), cudaMemcpyHostToDevice, stream));
+        score_kernel<<<columns, 512, 0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
+            device_tokens, device_out, logits.ne[0], domain, nullptr, top_k, 1, nullptr);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpyAsync(host.data(), device_out, (top_k + 1) * sizeof(TokenLogprob),
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), device_out, columns * sizeof(RawTokenScores),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-    } catch (...) { cudaFreeAsync(device_out, stream); throw; }
-    CUDA_CHECK(cudaFreeAsync(device_out, stream));
-    return {host[0], {host.begin() + 1, host.begin() + top_k + 1}};
+    } catch (...) { cudaFreeAsync(storage, stream); throw; }
+    CUDA_CHECK(cudaFreeAsync(storage, stream));
+    std::vector<TokenScore> result;
+    result.reserve(columns);
+    for (const auto& row : host) result.push_back({row.selected, {row.top.begin(), row.top.begin() + row.count}});
+    return result;
+}
+
+TokenScore score_logprobs(const Tensor& logits, TokenId token, int domain, int top_k,
+                         cudaStream_t stream) {
+    return score_logprobs_batch(logits, std::span<const TokenId>(&token, 1), domain, top_k, stream).front();
 }
 } // namespace sinfer::ops

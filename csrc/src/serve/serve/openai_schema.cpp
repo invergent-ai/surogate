@@ -973,7 +973,7 @@ std::string make_completion_response(const std::string& id, const std::string& m
     }
     if (detail.include_logprobs) {
         Json tokens = Json::array(), probabilities = Json::array(), top = Json::array(), offsets = Json::array();
-        std::size_t offset = 0;
+        std::size_t offset = detail.text_offset;
         for (const auto& entry : chat["choices"][0]["logprobs"]["content"]) {
             tokens.push_back(entry["token"]);
             probabilities.push_back(entry["logprob"]);

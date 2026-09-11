@@ -314,7 +314,10 @@ private:
 
             if (caller_error == nullptr && sink != nullptr) {
                 try {
-                    for (OutputDelta& event : events) { sink->publish(std::move(event)); }
+                    for (OutputDelta& event : events) {
+                        if (event.scores) sink->publish_scores(std::move(*event.scores));
+                        else sink->publish(std::move(event));
+                    }
                 } catch (...) {
                     caller_error = std::current_exception();
                     request->cancelled.store(true, std::memory_order_release);
@@ -371,6 +374,8 @@ private:
         /// or exactly as long as `generated` -- never partly filled, which would
         /// silently misalign a client reading the two together.
         std::vector<float> generated_logprobs;
+        std::size_t scores_published = 0;
+        bool prompt_scores_published = false;
         std::string content;
         std::string reasoning;
         std::optional<std::uint32_t> lane;
@@ -444,6 +449,23 @@ private:
             }
         }
         request->cv.notify_one();
+    }
+
+    void append_scores(const std::shared_ptr<Request>& request) {
+        if (!request->lane || (request->options.execution.top_logprobs < 0 &&
+                              request->options.execution.prompt_logprobs < 0)) return;
+        if constexpr (requires { instance_.program->logprob_delta(*request->lane, 0, 0, false); }) {
+            auto scores = instance_.program->logprob_delta(*request->lane, request->scores_published,
+                request->generated.size(), !request->prompt_scores_published);
+            request->scores_published = request->generated.size();
+            request->prompt_scores_published = true;
+            if (scores.prompt.empty() && scores.completion.empty()) return;
+            {
+                std::lock_guard lock(request->mutex);
+                request->events.push_back(OutputDelta{.scores = std::move(scores)});
+            }
+            request->cv.notify_one();
+        }
     }
 
     void release_reserved_capacity() noexcept {
@@ -577,6 +599,7 @@ private:
         auto published = request->output.commit_preview();
         if (!request->first_token) { request->first_token = Clock::now(); }
         append_output(request, std::move(published));
+        append_scores(request);
         if (decision.finished()) {
             complete_success(request, decision.finish_reason);
             return true;
@@ -1508,6 +1531,7 @@ private:
                 request->first_token = Clock::now();
             }
             append_output(request, std::move(published));
+            if (!cancelled[row]) append_scores(request);
             if (terminal[row]) {
                 complete_success(request, finish_reasons[row]);
                 remove_completed_slot(lane);

@@ -78,8 +78,12 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         ops::sampled_logprob(logits, sampled, sampled_logprobs,
                              state.execution.model.geometry.token_domain, ordinary.sampling,
                              state.execution.device.stream);
+        auto* scores = reinterpret_cast<RawTokenScores*>(static_cast<std::byte*>(ordinary.egress.data) +
+            offsetof(family::OrdinaryDecodeEgress, scores));
+        ops::score_logprobs_device(logits, sampled, state.execution.model.geometry.token_domain,
+            ordinary.sampling, scores, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
-                                   sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+                                   offsetof(family::OrdinaryDecodeEgress, scores) + batch_size * sizeof(RawTokenScores), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
     };
 }
@@ -149,8 +153,12 @@ auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch
         ops::sampled_logprob(logits, sampled, sampled_logprobs,
                              state.execution.model.geometry.token_domain, ordinary.sampling,
                              state.execution.device.stream);
+        auto* scores = reinterpret_cast<RawTokenScores*>(static_cast<std::byte*>(ordinary.egress.data) +
+            offsetof(family::OrdinaryDecodeEgress, scores));
+        ops::score_logprobs_device(logits, sampled, state.execution.model.geometry.token_domain,
+            ordinary.sampling, scores, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
-                                   sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+                                   offsetof(family::OrdinaryDecodeEgress, scores) + batch_size * sizeof(RawTokenScores), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
         CUDA_CHECK(cudaMemcpyAsync(tokens.data, sampled.data,
                                    static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),

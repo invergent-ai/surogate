@@ -93,6 +93,7 @@ public:
 
     std::vector<std::string> start();
     std::vector<std::string> reasoning_delta(const std::string& text);
+    std::vector<std::string> scores_delta(const GenerationOutcome& outcome);
     std::vector<std::string> content_delta(const std::string& text);
     ResponsesStreamFinish finish(const GenerationOutcome& outcome);
     std::string terminal(const BuiltResponse& response);

@@ -25,6 +25,7 @@ struct SamplingConfig {
     float temperature          = 0.0f; // <= 0 => greedy argmax after bias/masking
     /// <=0 disables top-k; positive values retain up to that many allowed tokens.
     std::int32_t top_k         = 0;
+    std::int32_t top_logprobs   = -1; // optional raw score output, -1 disables
     float top_p                = 1.0f; // >= 1 => disabled
     float min_p                = 0.0f; // <= 0 => disabled
     float presence_penalty     = 0.0f;

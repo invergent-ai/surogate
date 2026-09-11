@@ -886,6 +886,17 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         sink, *stream,
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
                 };
+                output.on_scores = [&](const GenerationOutcome& scored) {
+                    ensure_role();
+                    TokenDetail detail;
+                    detail.include_logprobs = stream->prepared.want_logprobs;
+                    detail.logprobs = scored.token_logprobs;
+                    detail.texts = scored.token_texts;
+                    detail.prompt_scores = scored.prompt_scores;
+                    detail.completion_scores = scored.completion_scores;
+                    detail.score_texts = scored.score_texts;
+                    write_stream_item(sink, *stream, make_chat_chunk_token_detail(id, model, created, detail, include_usage));
+                };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
@@ -894,15 +905,15 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
                 ensure_role();
-                if (stream->prepared.want_logprobs || stream->prepared.return_token_ids || stream->prepared.prompt_logprobs >= 0) {
+                if (stream->prepared.return_token_ids) {
                     TokenDetail detail;
                     detail.include_token_ids = stream->prepared.return_token_ids;
-                    detail.include_logprobs = stream->prepared.want_logprobs;
+                    detail.include_logprobs = false;
                     detail.prompt_token_ids = outcome.prompt_token_ids;
                     detail.completion_token_ids = outcome.completion_token_ids;
                     detail.logprobs = outcome.token_logprobs;
                     detail.texts = outcome.token_texts;
-                    detail.prompt_scores = outcome.prompt_scores;
+
                     detail.completion_scores = outcome.completion_scores;
                     detail.score_texts = outcome.score_texts;
                     write_stream_item(sink, *stream,
@@ -1085,6 +1096,16 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
                         sink, *stream,
                         make_completion_chunk_text(id, model, created, text, include_usage));
                 };
+                std::size_t score_text_offset = 0;
+                output.on_scores = [&](const GenerationOutcome& scored) {
+                    auto detail = completion_detail(scored, stream->prepared);
+                    detail.include_token_ids = false;
+                    detail.text_offset = score_text_offset;
+                    write_stream_item(sink, *stream, make_completion_chunk_token_detail(id, model, created, detail, include_usage));
+                    for (const auto& text : scored.token_texts) {
+                        for (unsigned char byte : text) score_text_offset += (byte & 0xc0) != 0x80;
+                    }
+                };
                 output.is_cancelled = [&] {
                     return stream->cancelled.load(std::memory_order_acquire) ||
                            (sink.is_writable && !sink.is_writable());
@@ -1092,9 +1113,11 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
 
                 const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
-                if (stream->prepared.want_logprobs || stream->prepared.return_token_ids || stream->prepared.prompt_logprobs >= 0) {
-                    write_stream_item(sink, *stream, make_completion_chunk_token_detail(id, model, created,
-                        completion_detail(outcome, stream->prepared), include_usage));
+                if (stream->prepared.return_token_ids) {
+                    auto detail = completion_detail(outcome, stream->prepared);
+                    detail.include_logprobs = false;
+                    detail.prompt_scores.clear();
+                    write_stream_item(sink, *stream, make_completion_chunk_token_detail(id, model, created, detail, include_usage));
                 }
                 write_stream_item(sink, *stream,
                                   make_completion_chunk_final(

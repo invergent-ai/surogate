@@ -119,11 +119,12 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_alignment    = 1;
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
+    base->sampling.top_logprobs = options.top_logprobs;
     base->logit_bias                     = options.sampling.logit_bias;
     base->constraint                     = options.constraint;
     base->prompt_logprobs = options.prompt_logprobs;
     base->top_logprobs = options.top_logprobs;
-    base->allow_prefix_reuse = options.allow_prefix_reuse && options.prompt_logprobs < 0;
+    base->allow_prefix_reuse = options.allow_prefix_reuse;
     base->lora_slot                      = options.lora_slot;
     base->min_tokens                     = options.min_tokens;
     base->stop_barrier_count =
@@ -244,6 +245,17 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->min_tokens                  = base.min_tokens;
     plan->stop_barrier_count          = base.stop_barrier_count;
 
+    if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained && !sequence.cached_scores.empty()) {
+        const auto limit = std::min({prompt.token_ids.size(), sequence.ledger.size(), sequence.cached_scores.size()});
+        const auto needed = std::min(cfg.token_domain, std::max(0, base.prompt_logprobs));
+        std::uint32_t count = 1;
+        while (count < limit && sequence.cached_scores[count].selected.token_id == prompt.token_ids[count] &&
+               sequence.cached_scores[count].top.size() >= std::size_t(needed)) ++count;
+        if (limit >= 1 && family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity, count, base.lora_slot)) {
+            plan->reusable_scores = count;
+        }
+    }
+
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
@@ -283,6 +295,14 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         (!dflash || !sequence.kv || !sequence.kv->backend ||
          sequence.dflash_context_frontier < plan->reuse_base)) {
         plan->reuse      = ReusePath::FullReset;
+        plan->reuse_base = 0;
+    }
+
+    // Missing scores before the retained frontier require prefill replay. Its
+    // boundary token can be scored from the retained final hidden state.
+    if (base.prompt_logprobs >= 0 && plan->reuse_base > 0 &&
+        plan->reusable_scores < plan->reuse_base) {
+        plan->reuse = ReusePath::FullReset;
         plan->reuse_base = 0;
     }
 

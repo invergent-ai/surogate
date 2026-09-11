@@ -226,6 +226,16 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+TokenScoreDelta Program<Variant>::logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const {
+    return impl_->logprob_delta(lane, first, end, prompt);
+}
+
+template <>
+void Program<Variant>::cache_logprobs(std::uint32_t lane, const GenerationResult& result) {
+    impl_->cache_logprobs(lane, result);
+}
+
+template <>
 void Program<Variant>::collect_logprobs(std::uint32_t lane, GenerationResult& result) const {
     impl_->collect_logprobs(lane, result);
 }

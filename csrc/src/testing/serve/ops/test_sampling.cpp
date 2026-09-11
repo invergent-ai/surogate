@@ -43,7 +43,7 @@ struct RunResult {
 };
 
 bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
-    return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
+    return a.temperature == b.temperature && a.top_k == b.top_k && a.top_logprobs == b.top_logprobs && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
            a.token_counts == b.token_counts && a.logit_bias == b.logit_bias &&
@@ -786,6 +786,50 @@ int test_logprob_scores() {
     return failures;
 }
 
+int test_batched_logprob_scores() {
+    constexpr int domain = 1031, vocab = 1048, width = 4, lanes = 3, columns = width * lanes;
+    std::vector<float> input(vocab * columns, 1000.0f);
+    std::vector<int> tokens(columns);
+    for (int col = 0; col < columns; ++col) {
+        tokens[col] = (col * 83) % domain;
+        for (int i = 0; i < domain; ++i) input[col * vocab + i] = float((i * 73 + col * 19) % 127 - 63) / 8;
+    }
+    auto device = to_device_bf16(input);
+    auto chosen = to_device(tokens);
+    auto counts = to_device(std::vector<int>{2, 4, 3});
+    std::vector<ops::SamplingConfig> configs(lanes);
+    configs[0].top_logprobs = 5; configs[1].top_logprobs = 0; configs[2].top_logprobs = -1;
+    auto controls = to_device(configs);
+    std::vector<RawTokenScores> output(columns);
+    for (auto& row : output) row.count = -17;
+    GuardedDeviceBuffer scored(columns * sizeof(RawTokenScores));
+    scored.copy_from_host(output.data(), scored.bytes());
+    Tensor logits(device.p, DType::BF16, {vocab, width, lanes});
+    Tensor ids(chosen.p, DType::I32, {width, lanes});
+    ops::score_logprobs_device(logits, ids, domain, static_cast<const ops::SamplingConfig*>(controls.p),
+        static_cast<RawTokenScores*>(scored.data()), nullptr, width, static_cast<const int*>(counts.p));
+    cuda_synchronize(nullptr);
+    scored.copy_to_host(output.data(), scored.bytes());
+    int failures = scored.verify_guards("batched logprobs");
+    const auto uniform = ops::score_logprobs_batch(logits.view({vocab, columns}), tokens, domain, 5, nullptr);
+    for (int col = 0; col < columns; ++col) {
+        const bool active = col < 2 || (col >= width && col < 2 * width);
+        const float* row = input.data() + col * vocab;
+        const double maximum = *std::max_element(row, row + domain);
+        double sum = 0;
+        for (int i = 0; i < domain; ++i) sum += std::exp(row[i] - maximum);
+        const double expected = row[tokens[col]] - maximum - std::log(sum);
+        failures += std::abs(uniform[col].selected.logprob - expected) > 2e-5;
+        if (active) {
+            failures += output[col].selected.token_id != tokens[col] ||
+                std::abs(output[col].selected.logprob - expected) > 2e-5;
+            failures += output[col].count != configs[col / width].top_logprobs;
+        } else failures += output[col].count != -17;
+    }
+    if (failures) std::cerr << "batched log-probability oracle failures: " << failures << '\n';
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -794,7 +838,7 @@ int main() {
         return 77;
     }
 
-    int failures = test_logprob_scores();
+    int failures = test_logprob_scores() + test_batched_logprob_scores();
     // The multi-block column cap is read from kSamplerMaxColumns, not restated.
     // It has moved twice -- 16, then 32, then tied to the ops batch bound -- and
     // the literal 16 these boundaries used to carry went stale silently both

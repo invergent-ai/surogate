@@ -9,6 +9,14 @@
 #include <cuda_runtime.h>
 
 namespace sinfer::ops {
+/// Asynchronous batched scoring into caller-owned device output. Columns are
+/// lane-major, with `width` verification positions per lane; counts can mask
+/// unlicensed speculative positions. All pointers remain valid through stream completion.
+void score_logprobs_device(const Tensor& logits, const Tensor& tokens, int domain,
+                          const SamplingConfig* configs, RawTokenScores* output,
+                          cudaStream_t stream, int width = 1, const int* counts = nullptr);
+std::vector<TokenScore> score_logprobs_batch(const Tensor& logits, std::span<const TokenId> tokens,
+                                            int domain, int top_k, cudaStream_t stream);
 /// Raw full-vocabulary probabilities; retains only the selected token and top K.
 TokenScore score_logprobs(const Tensor& logits, TokenId token, int domain, int top_k,
                          cudaStream_t stream);

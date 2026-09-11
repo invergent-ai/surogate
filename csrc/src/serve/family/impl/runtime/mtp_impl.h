@@ -1,5 +1,6 @@
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/schedule.h"
+#include "api/ops/sampled_logprob.h"
 
 #include "api/ops/mtp_round.h"
 #include "api/ops/scatter.h"
@@ -210,8 +211,12 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                        cudaMemcpyDeviceToDevice, state.execution.device.stream));
         }
 
+        auto* scores = reinterpret_cast<RawTokenScores*>(static_cast<std::byte*>(frame.egress.data) +
+            offsetof(family::MtpDecodeEgress, scores));
+        ops::score_logprobs_device(target_logits, licensed_tokens, state.execution.model.geometry.token_domain,
+            frame.sampling, scores, state.execution.device.stream, k + 1, static_cast<const int*>(licensed_counts.data));
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
-                                   sizeof(family::MtpDecodeEgress), cudaMemcpyDeviceToHost,
+                                   offsetof(family::MtpDecodeEgress, scores) + batch_size * (k + 1) * sizeof(RawTokenScores), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
     };
 }
@@ -311,8 +316,12 @@ auto mtp_narrow_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                       target_valid, mtp_rows, envelopes.batch, alignment_hidden);
 
         narrow_step = "egress";
+        auto* scores = reinterpret_cast<RawTokenScores*>(static_cast<std::byte*>(frame.egress.data) +
+            offsetof(family::MtpDecodeEgress, scores));
+        ops::score_logprobs_device(logits_flat, licensed_tokens, state.execution.model.geometry.token_domain,
+            frame.sampling, scores, stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
-                                   sizeof(family::MtpDecodeEgress), cudaMemcpyDeviceToHost,
+                                   offsetof(family::MtpDecodeEgress, scores) + batch_size * sizeof(RawTokenScores), cudaMemcpyDeviceToHost,
                                    stream));
         } catch (const std::exception& error) {
             throw std::runtime_error(std::string("narrow MTP round, step ") + narrow_step + ": " +

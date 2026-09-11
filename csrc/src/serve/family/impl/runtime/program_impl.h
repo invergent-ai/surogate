@@ -483,6 +483,9 @@ void ProgramImplCore::burst_egress_copy_host(void* user) noexcept {
     const auto* ctx = static_cast<const BurstEgressCopy*>(user);
     std::memcpy(ctx->destination, ctx->source,
                 static_cast<std::size_t>(ctx->count) * sizeof(TokenId));
+    if (ctx->score_destination && ctx->score_source) {
+        std::memcpy(ctx->score_destination, ctx->score_source, ctx->count * sizeof(RawTokenScores));
+    }
     if (ctx->logprob_destination != nullptr && ctx->logprob_source != nullptr) {
         std::memcpy(ctx->logprob_destination, ctx->logprob_source,
                     static_cast<std::size_t>(ctx->count) * sizeof(float));
@@ -684,6 +687,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                             : 0U,
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
+    request.prompt_scores.clear();
+    if (request_plan.prompt_logprobs >= 0) {
+        request.prompt_scores.assign(sequence.cached_scores.begin(), sequence.cached_scores.begin() + request_plan.reusable_scores);
+        for (auto& score : request.prompt_scores) {
+            if (score.top.size() > std::size_t(request_plan.prompt_logprobs)) score.top.resize(request_plan.prompt_logprobs);
+        }
+        request.prompt_scores.resize(prompt_tokens);
+    }
+    sequence.cached_scores.resize(request_plan.reusable_scores);
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
     try {
@@ -767,9 +779,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         request.prompt_logprobs = request_plan.prompt_logprobs;
         request.top_logprobs = request_plan.top_logprobs;
-        request.prompt_scores.clear();
         request.completion_scores.clear();
-        if (request.prompt_logprobs >= 0) request.prompt_scores.resize(prompt_tokens);
         request.constraint = request_plan.constraint ? request_plan.constraint->create_state() : nullptr;
         request.constraint_frontier = prompt_tokens;
         request.token_bitmask_host.clear();
@@ -1143,11 +1153,92 @@ void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     clear_lane(sequences[lane], requests[lane]);
 }
 
-void ProgramImplCore::collect_logprobs(std::uint32_t lane, GenerationResult& result) const {
+TokenScoreDelta ProgramImplCore::logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const {
+    const auto& request = requests.at(lane);
+    TokenScoreDelta delta;
+    delta.first_completion_token = first;
+    if (prompt && request.prompt_logprobs >= 0) delta.prompt = request.prompt_scores;
+    if (request.top_logprobs >= 0) {
+        if (first > end || end > request.completion_scores.size()) throw std::logic_error("score stream is not aligned with committed tokens");
+        delta.completion.assign(request.completion_scores.begin() + first, request.completion_scores.begin() + end);
+    }
+    return delta;
+}
+
+void ProgramImplCore::collect_logprobs(std::uint32_t lane, GenerationResult& result) {
     if (lane >= max_concurrency) return;
     result.prompt_logprobs = requests[lane].prompt_scores;
     result.completion_logprobs = requests[lane].completion_scores;
     result.completion_logprobs.resize(std::min(result.completion_logprobs.size(), result.generated_token_ids.size()));
+    cache_logprobs(lane, result);
+}
+
+void ProgramImplCore::cache_logprobs(std::uint32_t lane, const GenerationResult& result) {
+    auto& sequence = sequences[lane];
+    if (result.prompt_logprobs.empty() && result.completion_logprobs.empty()) return;
+    if (sequence.retained) {
+        sequence.cached_scores.resize(sequence.ledger.size());
+        for (std::size_t i = 1; i < result.prompt_logprobs.size() && i < sequence.cached_scores.size(); ++i) {
+            const auto& score = result.prompt_logprobs[i];
+            auto& cached = sequence.cached_scores[i];
+            if (cached.selected.token_id != score.selected.token_id || cached.top.size() <= score.top.size()) cached = score;
+        }
+        for (std::size_t i = 0; i < result.completion_logprobs.size(); ++i) {
+            const auto position = requests[lane].prompt_tokens + i;
+            if (position < sequence.cached_scores.size()) sequence.cached_scores[position] = result.completion_logprobs[i];
+        }
+    }
+}
+
+std::function<void(const Tensor&, int, bool)> ProgramImplCore::score_observer(std::uint32_t lane) {
+    auto& request = requests[lane];
+    if (!stage_holds_head() || (request.prompt_logprobs < 0 && request.top_logprobs < 0)) return {};
+    return [this, lane](const Tensor& logits, int position, bool generated) {
+        auto& request = requests[lane];
+        if (generated && request.top_logprobs >= 0) {
+            TokenId token;
+            CUDA_CHECK(cudaMemcpyAsync(&token, io.token.data, sizeof(token), cudaMemcpyDeviceToHost, device.stream));
+            device.synchronize();
+            score_completion(lane, logits, token);
+        } else if (!generated && request.prompt_logprobs >= 0 && request.prefill) {
+            const auto& prompt = request.prefill->prompt.token_ids;
+            const int count = std::min(logits.ne[1], int(prompt.size()) - position);
+            if (count <= 0) return;
+            auto scores = ops::score_logprobs_batch(logits, std::span<const TokenId>(prompt).subspan(position, count),
+                cfg.token_domain, request.prompt_logprobs, device.stream);
+            std::move(scores.begin(), scores.end(), request.prompt_scores.begin() + position);
+        }
+    };
+}
+
+void ProgramImplCore::score_prefill_hidden(std::uint32_t lane, const Tensor& hidden, int base) {
+    if (!stage_holds_head() || requests[lane].prompt_logprobs < 0) return;
+    work.reset();
+    schedule::TextContext card(device, model, work, {}, decoder->linear_attention, io, prefill_hidden, prefill_chunk, 0);
+    card.set_stage(stage);
+    card.score_prompt_start = std::max<std::size_t>(1, sequences[lane].cached_scores.size());
+    card.score_prompt_end = requests[lane].prefill->prompt_tokens;
+    card.logprob_observer = score_observer(lane);
+    const auto previous = ops::lora_current_round();
+    const bool adapter = ops::lora_active();
+    if (adapter) {
+        auto& store = ops::lora_store_for_current_device();
+        ops::LoraRound round;
+        round.uniform = true;
+        round.scratch = store.scratch(hidden.ne[1]);
+        store.write_uniform_slot(requests[lane].lora_slot, device.stream);
+        round.uniform_cell = store.uniform_cell();
+        ops::lora_set_round(round);
+    }
+    try { card.observe_prompt_logits(hidden, base, device.stream); }
+    catch (...) { if (adapter) ops::lora_set_round(previous); throw; }
+    if (adapter) ops::lora_set_round(previous);
+}
+
+void ProgramImplCore::append_completion_score(std::uint32_t lane, const RawTokenScores& score) {
+    if (stage_holds_head() && requests[lane].top_logprobs >= 0) {
+        requests[lane].completion_scores.push_back({score.selected, {score.top.begin(), score.top.begin() + score.count}});
+    }
 }
 
 void ProgramImplCore::score_completion(std::uint32_t lane, const Tensor& logits, TokenId token) {
@@ -1173,6 +1264,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.execution_frontier = 0;
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
+    sequence.cached_scores.clear();
     sequence.prefix_identity.clear();
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
@@ -2101,6 +2193,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        if (staged.cursor == staged.base && staged.base > 0 && staged.base < staged.prompt_tokens &&
+            request.prompt_logprobs >= 0 && sequence.cached_scores.size() <= staged.base) {
+            const auto& boundary = is_rewrite_checkpoint_restore(staged.reuse)
+                ? sequence.rewrite_checkpoint_hidden : sequence.tail_hidden;
+            score_prefill_hidden(sequence.lane, boundary, staged.base - 1);
+        }
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -2126,20 +2224,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             dflash_host_ingress,
             staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr,
             requests[sequence.lane].lora_slot};
-        if (stage_holds_head() && (request.prompt_logprobs >= 0 || request.top_logprobs >= 0)) {
-            schedule_state.score_prompt = request.prompt_logprobs >= 0;
-            schedule_state.logprob_observer = [&](const Tensor& logits, int position, bool generated) {
-                if (generated && request.top_logprobs >= 0) {
-                    TokenId token;
-                    CUDA_CHECK(cudaMemcpyAsync(&token, io.token.data, sizeof(token), cudaMemcpyDeviceToHost, device.stream));
-                    device.synchronize();
-                    score_completion(sequence.lane, logits, token);
-                } else if (!generated && request.prompt_logprobs >= 0 && position < staged.prompt_tokens) {
-                    request.prompt_scores[position] = ops::score_logprobs(logits,
-                        staged.prompt.token_ids[position], cfg.token_domain, request.prompt_logprobs, device.stream);
-                }
-            };
-        }
+        schedule_state.score_prompt = request.prompt_logprobs >= 0;
+        schedule_state.score_prompt_start = std::max<std::size_t>(1, sequence.cached_scores.size());
+        schedule_state.score_prompt_end = staged.prompt_tokens;
+        schedule_state.logprob_observer = score_observer(sequence.lane);
 
         // The single-sequence table-row scalars are staged when a lane binds its KV, but an
         // admission between that bind and this launch binds another lane and restages them —
@@ -2449,7 +2537,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
         }
         burst = std::min(burst, capacity - maximum_frontier);
         if (burst == 0 || pipeline_stage() || std::any_of(lanes.begin(), lanes.end(),
-            [&](auto lane) { return requests[lane].constraint != nullptr || requests[lane].top_logprobs >= 0; })) { burst = 1; }
+            [&](auto lane) { return requests[lane].constraint != nullptr; })) { burst = 1; }
 
         DecodeGraphExecutable* executable = nullptr;
         DecodeGraphExecutable* chained    = nullptr;
@@ -2539,6 +2627,8 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
                 .source              = ordinary_host_egress->sampled_tokens.data(),
                 .logprob_destination = burst_rounds_logprobs.data() + round * kMaximumBatchColumns,
                 .logprob_source      = ordinary_host_egress->sampled_logprobs.data(),
+                .score_destination   = burst_rounds_scores.data() + round * kMaximumBatchColumns,
+                .score_source        = ordinary_host_egress->scores.data(),
                 .count               = static_cast<std::int32_t>(lanes.size())};
             CUDA_CHECK(cudaLaunchHostFunc(device.stream, &ProgramImplCore::burst_egress_copy_host,
                                           &burst_copy_ctx[round]));
@@ -2589,8 +2679,8 @@ ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
                 row_logprobs[round] = burst_rounds_logprobs[round * kMaximumBatchColumns + row];
             }
             validate_licensed_tokens(std::span<const TokenId>(row_tokens, burst));
-            if (request.top_logprobs >= 0) {
-                score_completion(lanes[row], io.ordinary->logits.slice(1, row, 1), row_tokens[0]);
+            for (std::uint32_t round = 0; round < burst; ++round) {
+                append_completion_score(lanes[row], burst_rounds_scores[round * kMaximumBatchColumns + row]);
             }
             sequence.text_kv_valid     = base_E + burst;
             sequence.tail_hidden_valid = true;
@@ -2648,11 +2738,6 @@ std::string ProgramImplCore::last_mixed_round_description(std::size_t row) const
 }
 
 bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
-    for (const auto& request : requests) {
-        if ((request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Pending ||
-             request.lifecycle == Lifecycle::Active) &&
-            (request.top_logprobs >= 0 || request.prompt_logprobs >= 0)) return false;
-    }
     // Mixed rounds do not yet publish adapter selections for every prefill and
     // decode column. Keep adapter requests on the ordinary paths, which install
     // the LoRA round for both phases and are safe under graph replay.
@@ -2751,6 +2836,17 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         last_mixed_round.row_frontiers[row] = sequences[lanes[row]].execution_frontier;
     }
     try {
+        for (const auto lane : prefill_lanes) {
+            const auto& entry = *requests[lane].prefill;
+            const auto& sequence = sequences[lane];
+            if (entry.cursor == entry.base && entry.base > 0 && requests[lane].prompt_logprobs >= 0 &&
+                sequence.cached_scores.size() <= entry.base) {
+                const auto& boundary = is_rewrite_checkpoint_restore(entry.reuse)
+                    ? sequence.rewrite_checkpoint_hidden : sequence.tail_hidden;
+                score_prefill_hidden(lane, boundary, entry.base - 1);
+            }
+        }
+
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = sequences[lanes[row]];
             RequestControl& request            = requests[lanes[row]];
@@ -3037,8 +3133,11 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             Tensor sampled_logprobs = ordinary.sampled_logprobs.slice(0, 0, rows);
             ops::sampled_logprob(slice.logits, sampled, sampled_logprobs, cfg.token_domain,
                                  ordinary.sampling, device.stream);
+            auto* scores = reinterpret_cast<RawTokenScores*>(static_cast<std::byte*>(ordinary.egress.data) +
+                offsetof(family::OrdinaryDecodeEgress, scores));
+            ops::score_logprobs_device(slice.logits, sampled, cfg.token_domain, ordinary.sampling, scores, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(ordinary_host_egress, ordinary.egress.data,
-                                       sizeof(family::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+                                       offsetof(family::OrdinaryDecodeEgress, scores) + rows * sizeof(RawTokenScores), cudaMemcpyDeviceToHost,
                                        device.stream));
             if (head && stage_holds_head()) {
                 // The head, aligned on every decode column with the token just sampled from
@@ -3120,6 +3219,9 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         round_trace_state(decoder->linear_attention, device.stream, "post-round");
         const bool head = speculative_backend == SpeculativeBackend::Mtp;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            append_completion_score(lanes[row], ordinary_host_egress->scores[row]);
+        }
         if (head) {
             // Under the draft head the decode rows resolve as a narrow round's do: one token
             // licensed per lane, nothing proposed, the recurrent state updated in place with
@@ -3205,6 +3307,7 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             const runtime::BeginSummary summary{.prompt_tokens        = entry.prompt_tokens,
                                                 .reused_prompt_tokens = entry.base,
                                                 .prefix_reuse_path    = entry.reuse};
+            score_prefill_hidden(lane_id, prefill_hidden.slice(1, column, processed), entry.cursor);
             entry.cursor += processed;
             sequence.text_kv_valid = entry.cursor;
             // The head's KV followed the trunk's through the segment (on the stage that
@@ -3460,14 +3563,8 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_mtp_round(runtime::Round
                                                           row * stride,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
-            if (request.top_logprobs >= 0) {
-                Tensor logits = io.mtp_decode->target_logits;
-                logits.ne[1] = 1; logits.ne[2] = 1;
-                for (int col = 0; col < count_i; ++col) {
-                    logits.data = static_cast<std::byte*>(io.mtp_decode->target_logits.data) +
-                        (row * stride + col) * logits.ne[0] * sizeof(std::uint16_t);
-                    score_completion(lanes[row], logits, row_tokens[col]);
-                }
+            for (int col = 0; col < count_i; ++col) {
+                append_completion_score(lanes[row], mtp_host_egress->scores[row * stride + col]);
             }
             // The lane's own copy of the decision (see SpeculativeOutcome): the egress is
             // the next round's the moment that round launches.
@@ -3829,14 +3926,8 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
-            if (request.top_logprobs >= 0) {
-                Tensor logits = io.dflash_decode->target_logits;
-                logits.ne[1] = 1; logits.ne[2] = 1;
-                for (int col = 0; col < count_i; ++col) {
-                    logits.data = static_cast<std::byte*>(io.dflash_decode->target_logits.data) +
-                        (row * width + col) * logits.ne[0] * sizeof(std::uint16_t);
-                    score_completion(lanes[row], logits, row_tokens[col]);
-                }
+            for (int col = 0; col < count_i; ++col) {
+                append_completion_score(lanes[row], dflash_host_egress->scores[row * width + col]);
             }
             request.outcome = SpeculativeOutcome{.licensed_count = count_i, .accepted_drafts = accepted_i};
             std::copy(row_tokens.begin(), row_tokens.end(), request.outcome.licensed_tokens.begin());

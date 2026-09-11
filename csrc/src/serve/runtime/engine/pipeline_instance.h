@@ -298,8 +298,14 @@ public:
             stages_[s]->program->evict_retained_lane(lane);
         }
     }
+    TokenScoreDelta logprob_delta(std::uint32_t lane, std::size_t first, std::size_t end, bool prompt) const {
+        return stages_.back()->program->logprob_delta(lane, first, end, prompt);
+    }
     void collect_logprobs(std::uint32_t lane, GenerationResult& result) const {
         stages_.back()->program->collect_logprobs(lane, result);
+        for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
+            stages_[s]->program->cache_logprobs(lane, result);
+        }
     }
     /// A request's compute time is the sum of its stages'. Every stage runs its layers in turn
     /// for every round, so the last stage's clock alone is a fraction of the round: on eight

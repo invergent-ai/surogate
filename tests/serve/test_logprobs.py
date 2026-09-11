@@ -80,14 +80,18 @@ def test_scores_ignore_sampling_transformations(server):
 
 
 def test_streaming_scores(server):
-    response = chat(server, max_tokens=4, stream=True, logprobs=True, top_logprobs=3,
+    response = chat(server, max_tokens=32, stream=True, logprobs=True, top_logprobs=3,
                     prompt_logprobs=0, ignore_eos=True)
     assert response.ok, response.text
     chunks = [json.loads(line[6:]) for line in response.content.decode("utf-8").splitlines()
               if line.startswith("data: ") and line != "data: [DONE]"]
     details = [chunk for chunk in chunks if "prompt_logprobs" in chunk]
     assert len(details) == 1
-    assert len(details[0]["choices"][0]["logprobs"]["content"]) == 4
+    scored = [chunk for chunk in chunks if chunk["choices"] and chunk["choices"][0].get("logprobs")]
+    assert len(scored) > 1
+    assert sum(len(chunk["choices"][0]["logprobs"]["content"]) for chunk in scored) == 32
+    first = chunks.index(scored[0])
+    assert any(chunk["choices"] and chunk["choices"][0].get("delta", {}).get("content") for chunk in chunks[first+1:])
     assert details[0]["prompt_logprobs"][0] is None
 
 
@@ -114,6 +118,12 @@ def test_completion_scores(server, stream):
     else:
         body = response.json()
     details = body["choices"][0]["logprobs"]
+    if stream:
+        parts = [chunk["choices"][0]["logprobs"] for chunk in chunks
+                 if chunk["choices"] and chunk["choices"][0].get("logprobs")]
+        assert len(parts) > 1
+        details = {key: [value for part in parts for value in part[key]] for key in parts[0]}
+        assert details["text_offset"] == sorted(details["text_offset"])
     assert len(details["tokens"]) == len(details["token_logprobs"]) == 4
     assert all(len(top) == 3 for top in details["top_logprobs"])
     assert body["prompt_logprobs"][0] is None
@@ -150,6 +160,9 @@ def test_responses_scores(server, stream):
     assert all(len(entry["top_logprobs"]) == 3 for entry in entries)
     if stream:
         assert done["logprobs"] == entries
+        deltas = [event for event in events if event["type"] == "response.output_text.delta" and event["logprobs"]]
+        assert len(deltas) > 1
+        assert [entry for event in deltas for entry in event["logprobs"]] == entries
     stored = requests.get(server + "/v1/responses/" + body["id"], timeout=30)
     assert stored.ok, stored.text
     assert stored.json()["output"] == body["output"]
@@ -162,3 +175,42 @@ def test_constrained_scores(server):
     entries = scores(response)
     assert entries and all(math.isfinite(entry["logprob"]) for entry in entries)
     assert json.loads(response.json()["choices"][0]["message"]["content"]) == {"answer": "yes"}
+
+
+@pytest.mark.parametrize("length", [1, 64])
+def test_cached_scores_extend_and_upgrade(server, length):
+    prompt = [2000] + [100 + i % 20 for i in range(length - 1)]
+    first = chat(server, tokens=prompt, max_tokens=1, prompt_logprobs=5, logprobs=True, top_logprobs=5).json()
+    for count in (0, 5, 20):
+        response = chat(server, tokens=prompt, max_tokens=1, prompt_logprobs=count)
+        assert response.ok, response.text
+        data = response.json()["prompt_logprobs"]
+        records = [json.loads(line) for line in server.records.read_text().splitlines()]
+        done = [record for record in records if "result" in record][-1]
+        if count <= 5 or length == 1:
+            assert done["result"]["prefix_cache_hit_tokens"] == len(prompt)
+        else:
+            assert done["result"]["prefix_cache_hit_tokens"] == 0
+        for i, token in enumerate(prompt[1:], 1):
+            assert data[i][str(token)]["logprob"] == pytest.approx(first["prompt_logprobs"][i][str(token)]["logprob"], abs=0.02)
+            assert max(1, count) <= len(data[i]) <= count + 1
+    extended = prompt + first["choices"][0]["token_ids"] + [123]
+    response = chat(server, tokens=extended, prompt_logprobs=5, max_tokens=1)
+    assert response.ok, response.text
+    data = response.json()["prompt_logprobs"]
+    assert len(data) == len(extended)
+    boundary = str(first["choices"][0]["token_ids"][0])
+    assert data[len(prompt)][boundary]["logprob"] == pytest.approx(
+        first["choices"][0]["logprobs"]["content"][0]["logprob"], abs=0.02)
+    records = [json.loads(line) for line in server.records.read_text().splitlines()]
+    done = [record for record in records if "result" in record][-1]
+    assert done["result"]["prefix_cache_hit_tokens"] == len(prompt)
+    if length < 3:
+        return
+    # A divergent prefix must not receive the cached values from the old input.
+    changed = prompt.copy()
+    changed[2] = 2500
+    response = chat(server, tokens=changed, prompt_logprobs=0, max_tokens=1)
+    assert response.ok, response.text
+    assert "2500" in response.json()["prompt_logprobs"][2]
+    assert str(prompt[2]) not in response.json()["prompt_logprobs"][2]

@@ -39,6 +39,7 @@ GenerationRequest parse_completion_request(const nlohmann::json& body,
 
 /// Requested raw token probabilities and token strings for response serialization.
 struct TokenDetail {
+    std::size_t text_offset = 0;
     std::vector<sinfer::TokenId> prompt_token_ids;
     std::vector<sinfer::TokenId> completion_token_ids;
     std::vector<TokenScore> prompt_scores;

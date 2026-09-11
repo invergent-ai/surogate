@@ -1128,6 +1128,7 @@ public:
                           Json{{"output_index", message_index}, {"item", item}}))};
     }
 
+    Json pending_logprobs = Json::array();
     std::string id;
     std::int64_t created_at = 0;
     ResponsesRequest request;
@@ -1181,6 +1182,16 @@ std::vector<std::string> ResponsesEventStream::reasoning_delta(const std::string
     return events;
 }
 
+std::vector<std::string> ResponsesEventStream::scores_delta(const GenerationOutcome& outcome) {
+    auto entries = response_logprobs(outcome);
+    for (auto& entry : entries) impl_->pending_logprobs.push_back(std::move(entry));
+    if (!impl_->message_started || impl_->pending_logprobs.empty()) return {};
+    Json pending = std::move(impl_->pending_logprobs);
+    impl_->pending_logprobs = Json::array();
+    return {sse(impl_->event("response.output_text.delta", Json{{"item_id", impl_->ids.message},
+        {"output_index", impl_->message_index}, {"content_index", 0}, {"delta", ""}, {"logprobs", std::move(pending)}}))};
+}
+
 std::vector<std::string> ResponsesEventStream::content_delta(const std::string& text) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid content delta event state");
@@ -1197,6 +1208,8 @@ std::vector<std::string> ResponsesEventStream::content_delta(const std::string& 
                                                             {"content_index", 0},
                                                             {"delta", text},
                                                             {"logprobs", Json::array()}})));
+    auto scores = scores_delta({});
+    events.insert(events.end(), std::make_move_iterator(scores.begin()), std::make_move_iterator(scores.end()));
     return events;
 }
 
@@ -1245,6 +1258,7 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
                                                        {"logprobs", Json::array()}})));
             }
         }
+        append(scores_delta({}));
         append(impl_->close_message(outcome.text, item_status, response_logprobs(outcome)));
     }
 

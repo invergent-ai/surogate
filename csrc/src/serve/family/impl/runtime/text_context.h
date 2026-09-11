@@ -442,6 +442,8 @@ public:
     }
 
     bool score_prompt = false;
+    int score_prompt_start = 1;
+    int score_prompt_end = 0;
     std::function<void(const Tensor&, int, bool)> logprob_observer;
     void observe_prompt_logits(const Tensor& hidden, int base, cudaStream_t stream);
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }

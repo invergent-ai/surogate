@@ -3157,9 +3157,22 @@ void TextContext::precapture_prefill_graphs(std::int32_t effective_chunk) {
 }
 
 void TextContext::observe_prompt_logits(const Tensor& hidden, int base, cudaStream_t stream) {
-    for (int col = 0; col < hidden.ne[1]; ++col) {
-        Tensor logits = matrix_window(io_.logits, 1);
-        ops::linear(lm_head_view(hidden.slice(1, col, 1), stream), *lm_head_, logits, stream);
+    const int first = std::max(0, score_prompt_start - base - 1);
+    const int end = std::min(hidden.ne[1], score_prompt_end - base - 1);
+    if (first >= end) return;
+    auto scope = work_.scope();
+    const std::size_t spare = work_.capacity() - work_.used();
+    // Leave room for the head's normalization and projection scratch. Fall back
+    // to the persistent one-column logits when a small model has no spare arena.
+    const std::size_t bytes_per_column = std::size_t(cfg_.vocab) * 2 + std::size_t(cfg_.hidden) * 16;
+    const int fits = spare > 16384 ? int((spare - 16384) / bytes_per_column) : 0;
+    const int stripe = std::max(1, std::min({32, fits, end - first}));
+    Tensor storage = stripe > 1 ? work_.alloc(DType::BF16, {cfg_.vocab, stripe}) : matrix_window(io_.logits, 1);
+    for (int col = first; col < end; col += stripe) {
+        auto scratch = work_.scope();
+        const int count = std::min(stripe, end - col);
+        Tensor logits = storage.slice(1, 0, count);
+        ops::linear(lm_head_view(hidden.slice(1, col, count), stream), *lm_head_, logits, stream);
         apply_logit_softcap(cfg_, logits, stream);
         logprob_observer(logits, base + col + 1, false);
     }

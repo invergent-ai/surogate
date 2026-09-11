@@ -67,6 +67,7 @@ struct GenerationOutcome {
 };
 
 struct StreamSink {
+    std::function<void(const GenerationOutcome&)> on_scores;
     std::function<void(const std::string& delta_text)> on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;

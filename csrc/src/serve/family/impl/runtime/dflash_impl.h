@@ -1,5 +1,6 @@
 #include "family/impl/runtime/instance.h"
 #include "family/impl/runtime/schedule.h"
+#include "api/ops/sampled_logprob.h"
 #include "family/impl/runtime/workspace_recipe.h"
 
 #include "api/ops/argmax.h"
@@ -426,8 +427,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                  .feature_sink    = &sink,
                              },
                              target_envelope);
+        auto* scores = reinterpret_cast<RawTokenScores*>(static_cast<std::byte*>(frame.egress.data) +
+            offsetof(family::DFlashDecodeEgress, scores));
+        ops::score_logprobs_device(target_logits, licensed_tokens, state.execution.model.geometry.token_domain,
+            frame.sampling, scores, state.execution.device.stream, width, static_cast<const int*>(licensed_counts.data));
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
-                                   sizeof(family::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
+                                   offsetof(family::DFlashDecodeEgress, scores) + batch_size * width * sizeof(RawTokenScores), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
     };
 }
