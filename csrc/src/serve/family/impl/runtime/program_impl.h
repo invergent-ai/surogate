@@ -393,6 +393,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     prefill_hidden                  = plan.persistent.prefill_hidden.bind(backing);
     token_counts                    = plan.persistent.token_counts.bind(backing);
+    token_bitmask                   = plan.persistent.token_bitmask.bind(backing);
+    logit_bias                      = plan.persistent.logit_bias.bind(backing);
     sampling_config                 = plan.persistent.sampling_config.bind(backing);
     tail_hidden_store               = plan.persistent.tail_hidden.bind(backing);
     rewrite_checkpoint_hidden_store = plan.persistent.rewrite_checkpoint_hidden.bind(backing);
@@ -671,7 +673,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     const std::uint32_t base = request_plan.reuse_base;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp
-            ? std::min({draft_window,
+            && !request_plan.constraint ? std::min({draft_window,
                         request_plan.summary.effective_output_tokens > 1
                             ? request_plan.summary.effective_output_tokens - 2
                             : 0U,
@@ -758,6 +760,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
+        request.constraint = request_plan.constraint ? request_plan.constraint->create_state() : nullptr;
+        request.constraint_frontier = prompt_tokens;
+        request.token_bitmask_host.clear();
+        request.logit_bias_host.clear();
+        if (!request_plan.logit_bias.empty()) {
+            request.logit_bias_host.resize(cfg.token_domain, 0.0F);
+            for (const auto& [token, bias] : request_plan.logit_bias) {
+                request.logit_bias_host[token] = bias;
+            }
+            Tensor bias = logit_bias.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
+            CUDA_CHECK(cudaMemcpyAsync(bias.data, request.logit_bias_host.data(), bias.bytes(),
+                                       cudaMemcpyHostToDevice, device.stream));
+            request_plan.sampling.logit_bias = static_cast<const float*>(bias.data);
+        }
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -1896,8 +1912,9 @@ void ProgramImplCore::prepare_graphs() {
 /// produced that many tokens, and this is where "how many so far" is known: the
 /// ledger holds the prompt and everything generated after it. A request that asked
 /// for no minimum has nothing barred and this returns its config untouched.
-ops::SamplingConfig ProgramImplCore::staged_sampling(const RequestControl& request,
+ops::SamplingConfig ProgramImplCore::staged_sampling(RequestControl& request,
                                                      const SequenceState& sequence) const {
+    update_constraint(sequence, request);
     ops::SamplingConfig staged = request.sampling_host;
     if (request.stop_barrier_count == 0) { return staged; }
     const std::size_t ledger   = sequence.ledger.size();
@@ -1907,12 +1924,26 @@ ops::SamplingConfig ProgramImplCore::staged_sampling(const RequestControl& reque
     return staged;
 }
 
+void ProgramImplCore::update_constraint(const SequenceState& sequence, RequestControl& request) const {
+    if (!request.constraint) { return; }
+    while (request.constraint_frontier < sequence.ledger.size()) {
+        request.constraint->accept(sequence.ledger[request.constraint_frontier++]);
+    }
+    request.token_bitmask_host.resize((cfg.token_domain + 31) / 32);
+    request.constraint->fill(request.token_bitmask_host);
+    Tensor mask = token_bitmask.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(mask.data, request.token_bitmask_host.data(), mask.bytes(),
+                               cudaMemcpyHostToDevice, device.stream));
+    request.sampling_host.token_bitmask = static_cast<const std::int32_t*>(mask.data);
+}
+
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({cfg.token_domain});
     CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
     request.sampling_host     = config;
+    update_constraint(sequence, request);
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -2376,7 +2407,8 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
             burst = std::min(burst, budget.generated_tokens_remaining);
         }
         burst = std::min(burst, capacity - maximum_frontier);
-        if (burst == 0 || pipeline_stage()) { burst = 1; }
+        if (burst == 0 || pipeline_stage() || std::any_of(lanes.begin(), lanes.end(),
+            [&](auto lane) { return requests[lane].constraint != nullptr; })) { burst = 1; }
 
         DecodeGraphExecutable* executable = nullptr;
         DecodeGraphExecutable* chained    = nullptr;
@@ -2400,7 +2432,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = sequences[lanes[row]];
-            const RequestControl& request      = requests[lanes[row]];
+            RequestControl& request            = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             if (round_trace_enabled()) {
@@ -2672,7 +2704,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = sequences[lanes[row]];
-            const RequestControl& request      = requests[lanes[row]];
+            RequestControl& request            = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             if (round_trace_enabled()) {
@@ -3238,13 +3270,13 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
-            const RequestControl& request     = requests[lanes[row]];
+            RequestControl& request           = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
             const std::uint32_t extent =
-                narrow ? 0U
+                (narrow || request.constraint) ? 0U
                        : std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                                    capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
@@ -3272,7 +3304,7 @@ ProgramImplCore::launch_mtp_round(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->mtp_kv_table_rows[row]  = sequence.kv->backend->bound_row();
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
-            mtp_host_ingress->sampling[row]           = request.sampling_host;
+            mtp_host_ingress->sampling[row]           = staged_sampling(request, sequence);
             materialize_sequence_kv(sequence, frontier + extent + 1,
                                     std::min(capacity, frontier + extent + draft_window));
         }
@@ -3607,7 +3639,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
                                                 ? budgets[row].generated_tokens_remaining - 1U
                                                 : 0U;
         const std::uint32_t extent =
-            std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
+            request.constraint ? 0U : std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -3633,13 +3665,13 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = sequences[lanes[row]];
-            const RequestControl& request     = requests[lanes[row]];
+            RequestControl& request           = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1U
                                                     : 0U;
             const std::uint32_t extent =
-                std::min({draft_window, max_by_budget, capacity - frontier - 1U});
+                request.constraint ? 0U : std::min({draft_window, max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -3650,7 +3682,7 @@ ProgramImplCore::launch_dflash_round(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
             dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->sampling[row] = request.sampling_host;
+            dflash_host_ingress->sampling[row] = staged_sampling(request, sequence);
             materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
         }
 
@@ -3716,7 +3748,7 @@ runtime::BatchedGeneratedRound ProgramImplCore::consume_dflash_round(runtime::Ro
             const std::uint32_t base_S    = sequence.ledger_frontier;
             const std::int32_t count_i    = dflash_host_egress->licensed_counts[row];
             const std::int32_t accepted_i = dflash_host_egress->accepted_drafts[row];
-            const std::uint32_t extent = std::min({draft_window,
+            const std::uint32_t extent = request.constraint ? 0U : std::min({draft_window,
                 budgets[row].generated_tokens_remaining - 1U, capacity - base_E - 1U});
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || accepted_i > static_cast<std::int32_t>(extent) ||

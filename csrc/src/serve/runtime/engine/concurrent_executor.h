@@ -934,7 +934,10 @@ private:
                 lane, std::move(request->prompt), std::move(selected_plan), transient,
                 /*defer_first_chunk=*/true);
             if (!first.complete && !prefill_lanes_.contains(lane)) {
-                throw std::logic_error("partial prefill did not retain its execution owner");
+                // A fully cached prompt can still defer its first-token step (DFlash
+                // pipeline stages do this to preserve execution order). Register it
+                // even though there were no suffix tokens to reserve above.
+                prefill_lanes_.add(lane);
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             if (first.processed_prompt_tokens != 0 || first.complete || cancel_at_boundary) {

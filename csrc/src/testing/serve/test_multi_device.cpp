@@ -8,6 +8,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -20,7 +21,6 @@ int main() {
     if (!artifact) {
         return 77;
     }
-    setenv("SUROGATE_SERVE_PIPELINE_SERIAL_CONSTRUCT", "1", 1);
     const auto* groups = std::getenv("SUROGATE_MULTI_DEVICE_TEST_GROUPS");
     setenv("SUROGATE_SERVE_PIPELINE_GROUPS", groups ? groups : "1", 1);
     if (groups) {
@@ -61,6 +61,13 @@ int main() {
         devices.push_back(std::stoi(item));
     }
     assert(devices.size() >= 2);
+    const bool shared_device = std::set<int>(devices.begin(), devices.end()).size() != devices.size();
+    setenv("SUROGATE_SERVE_PIPELINE_SERIAL_CONSTRUCT", shared_device ? "1" : "0", 0);
+    std::cout << "pipeline devices:";
+    for (int device : devices) {
+        std::cout << ' ' << device;
+    }
+    std::cout << "; serial construction=" << std::getenv("SUROGATE_SERVE_PIPELINE_SERIAL_CONSTRUCT") << std::endl;
     options.device = devices.front();
     GenerationRequest request;
     if (options.enable_lora) {

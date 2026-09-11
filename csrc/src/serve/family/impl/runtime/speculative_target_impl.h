@@ -24,6 +24,9 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  frame.target_hidden, frame.target_logits, frame.target_tokens);
     }
     if (execution.stage.last >= 0 && execution.stage.last < execution.model.geometry.layers) { return; }
+    ops::sampling_update_greedy_targets(frame.target_logits, frame.target_tokens,
+                                       execution.model.geometry.token_domain, frame.sampling,
+                                       execution.device.stream);
     ops::speculative_accept_greedy_drafts(frame.target_tokens, frame.target_logits, frame.drafts,
                                           frame.current_extents, frame.frontiers, frame.anchors,
                                           frame.licensed_tokens, frame.licensed_counts,

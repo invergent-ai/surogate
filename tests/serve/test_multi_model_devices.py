@@ -16,6 +16,9 @@ from surogate.cli.serve import _resolve_binary
 @pytest.mark.skipif(not os.getenv("SUROGATE_MULTI_MODEL_TEST_ARTIFACT"), reason="requires a prepared GPU artifact")
 def test_named_replicas_route_and_sleep_independently(tmp_path):
     artifact = os.environ["SUROGATE_MULTI_MODEL_TEST_ARTIFACT"]
+    primary_devices = os.getenv("SUROGATE_MULTI_MODEL_TEST_PRIMARY_DEVICES", "0")
+    replica_devices = os.getenv("SUROGATE_MULTI_MODEL_TEST_REPLICA_DEVICES", "0")
+    replica_placement = f"devices={replica_devices}" if ":" in replica_devices else f"device={replica_devices}"
     binary = _resolve_binary("server")
     assert binary
     with socket.socket() as listener:
@@ -30,12 +33,12 @@ def test_named_replicas_route_and_sleep_independently(tmp_path):
                 artifact,
                 "--port",
                 str(port),
-                "--device",
-                "0",
+                "--devices" if ":" in primary_devices else "--device",
+                primary_devices.replace(":", ","),
                 "--served-model-name",
                 "primary",
                 "--model",
-                f"replica={artifact},device=0",
+                f"replica={artifact},{replica_placement}",
                 "--enable-sleep-mode",
                 "--max-model-len",
                 "512",

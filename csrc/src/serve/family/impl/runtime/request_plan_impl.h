@@ -100,6 +100,11 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     validate_sampling(options.sampling);
+    for (const auto& [token, bias] : options.sampling.logit_bias) {
+        if (token < 0 || token >= cfg.token_domain || !std::isfinite(bias) || bias < -100.0F || bias > 100.0F) {
+            throw std::invalid_argument("logit_bias token is outside the model vocabulary or value is outside [-100,100]");
+        }
+    }
 
     auto base                             = std::make_unique<RequestBasePlanImpl>();
     base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -114,6 +119,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_alignment    = 1;
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
+    base->logit_bias                     = options.sampling.logit_bias;
+    base->constraint                     = options.constraint;
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->lora_slot                      = options.lora_slot;
     base->min_tokens                     = options.min_tokens;
@@ -225,6 +232,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     auto plan                         = std::make_unique<RequestPlanImpl>();
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
+    plan->logit_bias                   = base.logit_bias;
+    plan->constraint                   = base.constraint;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->lora_slot                   = base.lora_slot;

@@ -9,6 +9,8 @@
 #include "family/impl/frontend/test_access.h"
 #include "family/impl/frontend/tokenizer.h"
 #include "text/unicode.h"
+#include "runtime/contract/constraint.h"
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -843,6 +845,8 @@ DecoderState terminal_state(DecoderState state) {
 
 class Frontend::Impl {
 public:
+    mutable std::mutex constraint_mutex;
+    mutable std::unique_ptr<JsonConstraintCompiler> constraint_compiler;
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
         : chat_template(compile_chat_template(resources, options.chat_template_override)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
@@ -991,10 +995,10 @@ public:
          bool starts_in_reasoning, fi::ReasoningSyntax reasoning)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           preserve_special(output.raw || output.preserve_special_tokens) {
-        state.in_reasoning = starts_in_reasoning && !output.raw;
+        state.in_reasoning = starts_in_reasoning && !output.raw && !output.structured;
         // The raw path publishes the stream as the model wrote it, markers included, so it
         // is given no pair to act on.
-        if (!output.raw) { state.reasoning = std::move(reasoning); }
+        if (!output.raw && !output.structured) { state.reasoning = std::move(reasoning); }
         // `preview_state` is assigned from `state` wholesale before it is fed, so it inherits
         // both the pair and the channel without being told.
     }
@@ -1342,6 +1346,33 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.starts_in_reasoning = opens_reasoning;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
+}
+
+void Frontend::validate_sampling_tokens(const ResolvedSamplingParameters& sampling) const {
+    for (const auto& [token, bias] : sampling.logit_bias) {
+        if (!impl_->tokenizer->is_valid_token(token)) {
+            throw std::invalid_argument("logit_bias contains a token outside this model's vocabulary");
+        }
+    }
+}
+
+std::shared_ptr<const CompiledTokenConstraint> Frontend::compile_json_constraint(const std::string& schema) const {
+    std::lock_guard lock(impl_->constraint_mutex);
+    if (!impl_->constraint_compiler) {
+        const auto& tokenizer = *impl_->tokenizer;
+        std::vector<std::string> vocab(tokenizer.vocabulary_size());
+        for (std::size_t i = 0; i < vocab.size(); ++i) {
+            if (tokenizer.is_valid_token(static_cast<int>(i)) && !tokenizer.is_special_token(static_cast<int>(i))) {
+                vocab[i] = tokenizer.decode_token_bytes(static_cast<int>(i));
+            }
+        }
+        if (tokenizer.default_stop_token_ids().empty()) {
+            throw std::invalid_argument("JSON constraints require a tokenizer with an end-of-sequence token");
+        }
+        impl_->constraint_compiler = std::make_unique<JsonConstraintCompiler>(
+            std::move(vocab), tokenizer.default_stop_token_ids());
+    }
+    return impl_->constraint_compiler->compile(schema);
 }
 
 std::vector<std::string> Frontend::token_texts(std::span<const TokenId> ids) const {

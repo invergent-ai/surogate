@@ -518,3 +518,7 @@ if(_sinfer_serve_test_targets)
   list(LENGTH _sinfer_serve_test_targets _sinfer_serve_test_count)
   message(STATUS "serve tests: ${_sinfer_serve_test_count} targets under `serve-tests`")
 endif()
+
+sinfer_add_test(sinfer_json_constraint_test
+  SOURCES test_json_constraint.cpp
+  LIBRARIES sinfer_engine)

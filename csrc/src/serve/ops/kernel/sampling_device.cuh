@@ -193,6 +193,8 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 /// Whether this row bars this token id outright. Zero cost when nothing is barred,
 /// which is every request that did not ask for a minimum length.
 __device__ __forceinline__ bool sampling_suppressed(const SamplingConfig& c, int v) {
+    if (c.token_bitmask != nullptr &&
+        !(static_cast<unsigned int>(c.token_bitmask[v / 32]) & (1U << (v % 32)))) { return true; }
     for (int j = 0; j < c.suppressed_count; ++j) {
         if (c.suppressed[j] == v) { return true; }
     }
@@ -202,7 +204,7 @@ __device__ __forceinline__ bool sampling_suppressed(const SamplingConfig& c, int
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
-    float x = raw;
+    float x = raw + (c.logit_bias != nullptr ? c.logit_bias[v] : 0.0F);
     if (sampling_suppressed(c, v)) { return -CUDART_INF_F; }
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f &&
         c.repetition_penalty == 1.0f) {

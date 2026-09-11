@@ -52,6 +52,12 @@ sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (request.frequency_penalty) {
         sampling.frequency_penalty = static_cast<float>(*request.frequency_penalty);
     }
+    for (const auto& [token, bias] : request.logit_bias) {
+        if (token < 0 || !std::isfinite(bias) || bias < -100.0 || bias > 100.0) {
+            invalid_sampling("logit_bias requires nonnegative token ids and finite values in [-100,100]", "logit_bias");
+        }
+        sampling.logit_bias[token] = static_cast<float>(bias);
+    }
     if (request.seed) {
         sampling.seed = *request.seed;
     } else if (server.sampling_overrides.seed) {
@@ -261,6 +267,10 @@ sinfer::RequestOptions to_request_options(const GenerationRequest& request,
     sinfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
+    options.execution.json_schema = request.json_schema;
+    if (!request.json_schema.empty() && (request.ignore_eos || request.min_tokens != 0 || request.uses_tools() || !request.stop_strings.empty())) {
+        invalid_sampling("JSON response formats require ignore_eos=false, min_tokens=0, no custom stops, and no active tools", "response_format");
+    }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();

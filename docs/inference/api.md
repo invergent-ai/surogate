@@ -65,9 +65,9 @@ management requests to select the model.
 | `presence_penalty`, `frequency_penalty` | Adjust repetition penalties for previously used tokens |
 | `seed` | Sets the sampler seed; an omitted seed uses the server seed or a fresh per-request seed |
 | `stop` | String or array of strings |
-| `logit_bias` | Accepted, but **does not affect generation** |
+| `logit_bias` | Map token-id strings to biases in `[-100,100]`; applies to greedy and sampled generation |
 | `tools`, `tool_choice` | Function tools only; `none`, `auto`, `required`, or a named function object. Automatic choice requires `--enable-auto-tool-choice` |
-| `response_format` | Only `{"type": "text"}` |
+| `response_format` | `text`, `json_object`, or `json_schema`; see [Structured output](#structured-output) |
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; the loaded template must support the requested value |
 | `chat_template_kwargs.enable_thinking` | Per-request thinking toggle; also accepted as top-level `enable_thinking` |
 | `chat_template_kwargs.preserve_thinking` | Keep earlier assistant reasoning in later prompts; also accepted as top-level `preserve_thinking` |
@@ -118,13 +118,52 @@ These are refused with a `400` and a specific error code rather than silently ig
 |---|---|
 | `n` > 1 | One completion per request (`n_not_supported`) |
 | `functions`, `function_call` | Legacy pre-`tools` API (`tools_not_supported`) |
-| `response_format` other than `{"type":"text"}` | No constrained decoding (`response_format_not_supported`) |
 | Message role `function` | Use role `tool` (`unsupported_role`) |
 | `prompt_logprobs` requesting prompt scoring | Prompt token scoring is unsupported |
 | Unsupported content parts, including `input_audio` | `modality_not_supported` |
 
 Models without a chat template use `/v1/completions`; chat generation endpoints return
 `chat_not_supported`.
+
+### Structured output
+
+Chat completions support `response_format: {"type":"json_object"}` for a JSON object, or
+`json_schema` to specify its contents:
+
+```json
+{
+  "model": "my-model",
+  "messages": [{"role": "user", "content": "Is the task complete?"}],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "answer",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"complete": {"type": "boolean"}},
+        "required": ["complete"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+Supported schemas include nested objects and arrays, required properties, additional-property
+rules, enums and constants, integer/number bounds, array length limits, `anyOf`, and local
+`$ref` references. List every required field in `properties`. Unsupported keywords or combinations return `400`; they are not silently
+ignored. For example, `allOf`, `oneOf`, string patterns/length limits, formats, `multipleOf`,
+and conditional schemas are currently refused.
+
+The constraint applies while generating, including streaming. An answer stopped by a token or
+context limit can still be incomplete; check `finish_reason` before parsing it. Use sufficient
+`max_tokens`, keep `ignore_eos` false and `min_tokens` at zero, and omit custom `stop` strings and active tools. JSON is
+returned as answer content without a separate reasoning response.
+
+Structured requests work on single- and multi-GPU servers. On MTP/DFlash servers they currently
+generate one verified token per round, so they do not receive speculative acceleration.
+Responses API `text.format` remains text-only.
 
 ### Streaming shape
 

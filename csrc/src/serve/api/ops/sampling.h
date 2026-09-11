@@ -22,7 +22,7 @@ enum SamplePurpose : std::int32_t {
 // Device-resident sampling parameters. token_counts is an optional device I32
 // [token_domain] occurrence-count array used by both penalties.
 struct SamplingConfig {
-    float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
+    float temperature          = 0.0f; // <= 0 => greedy argmax after bias/masking
     /// <=0 means no limit of the caller's own: with top_p>=1 that is the whole
     /// vocabulary, otherwise the 20-candidate cap. A top_k above 20 is clamped to it.
     std::int32_t top_k         = 0;
@@ -36,6 +36,8 @@ struct SamplingConfig {
     /// and applied before them.
     float repetition_penalty   = 1.0f;
     unsigned long long seed    = 0;
+    const std::int32_t* token_bitmask = nullptr; // optional allowed-token bitmap [ceil(token_domain/32)]
+    const float* logit_bias = nullptr; // optional device F32 [token_domain], added before temperature
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
     /// Token ids barred from being drawn at all, and how many of the four slots
     /// are in use. This is how a minimum length is honoured: the stop tokens are
@@ -50,6 +52,13 @@ struct SamplingConfig {
     std::int32_t suppressed[kMaxSuppressed] = {-1, -1, -1, -1};
     std::int32_t suppressed_count           = 0;
 };
+
+// Recompute greedy verification tokens when a request has logit overrides.
+// logits: BF16 [physical_rows,width,batch], targets: I32 [width,batch].
+// Rows without overrides and stochastic rows are left unchanged.
+void sampling_update_greedy_targets(const Tensor& logits, Tensor& targets,
+                                    std::int32_t token_domain, const SamplingConfig* configs,
+                                    cudaStream_t stream);
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
 // interval. For sample(), one lane is one batch row; speculative acceptance uses the same
@@ -67,12 +76,12 @@ struct SamplingConfig {
  *
  * For row b with configs[b].temperature<=0:
  *
- *   out[b] = min argmax_v float(logits[v,b]).
+ *   out[b] = min argmax_allowed_v (float(logits[v,b]) + bias_v).
  *
  * Penalties, filters, RNG, and token_counts updates are skipped for that row. With positive
  * temperature, let c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
- *   adjusted_v = float(logits[v,b])
+ *   adjusted_v = float(logits[v,b]) + bias_v
  *                - configs[b].presence_penalty * (c_v > 0)
  *                - configs[b].frequency_penalty * c_v.
  *

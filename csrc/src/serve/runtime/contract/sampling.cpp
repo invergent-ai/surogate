@@ -45,6 +45,12 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
         .repetition_penalty = overrides.repetition_penalty.value_or(1.0F),
         .seed              = overrides.seed.value_or(0),
     };
+    resolved.logit_bias = overrides.logit_bias;
+    for (const auto& [token, bias] : resolved.logit_bias) {
+        if (token < 0 || !std::isfinite(bias) || bias < -100.0F || bias > 100.0F) {
+            throw std::invalid_argument("logit_bias requires nonnegative token ids and finite values in [-100,100]");
+        }
+    }
     validate(resolved);
     return resolved;
 }

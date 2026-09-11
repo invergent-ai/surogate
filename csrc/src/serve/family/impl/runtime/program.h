@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/contract/constraint.h"
 #include <api/family/text_geometry.h>
 
 #include "runtime/contract/round_lifecycle.h"
@@ -71,6 +72,8 @@ template <>
 struct RequestBasePlanImpl<SINFER_FAMILY_VARIANT> {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
+    std::unordered_map<TokenId, float> logit_bias;
+    std::shared_ptr<const CompiledTokenConstraint> constraint;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const family::VisionControl> vision_control;
@@ -98,6 +101,8 @@ struct RequestPlanImpl<SINFER_FAMILY_VARIANT> {
         SINFER_FAMILY_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<family::RewriteCheckpointSpec> rewrite_checkpoint_capture;
     ops::SamplingConfig sampling;
+    std::unordered_map<TokenId, float> logit_bias;
+    std::shared_ptr<const CompiledTokenConstraint> constraint;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     /// The adapter slot the request selected; read once at admission.
@@ -224,6 +229,10 @@ struct RequestControl {
     /// Valid while `pending.kind == Speculative`: the round's decision for this lane.
     SpeculativeOutcome outcome;
     ops::SamplingConfig sampling_host;
+    std::vector<float> logit_bias_host;
+    std::unique_ptr<TokenConstraintState> constraint;
+    std::vector<std::int32_t> token_bitmask_host;
+    std::size_t constraint_frontier = 0;
     /// The adapter slot this request selected; staged per lane every round.
     std::int32_t lora_slot = -1;
     /// A minimum length, and what it takes to honour it: the stop ids stay barred
@@ -439,6 +448,8 @@ public:
     Tensor prefill_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    Tensor logit_bias;
+    Tensor token_bitmask;
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
 
@@ -538,8 +549,9 @@ private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
-    [[nodiscard]] ops::SamplingConfig staged_sampling(const RequestControl& request,
+    [[nodiscard]] ops::SamplingConfig staged_sampling(RequestControl& request,
                                                       const SequenceState& sequence) const;
+    void update_constraint(const SequenceState& sequence, RequestControl& request) const;
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);

@@ -58,11 +58,31 @@ int main(int argc, char** argv) {
     }
     try {
         // Before the first CUDA call: the process sees only the cards it was given.
+        // Include every explicit model placement in one plan so narrowing and
+        // renumbering preserve independent replicas and overlapping pipelines.
+        std::vector<int*> placements;
+        if (options.devices.empty()) {
+            placements.push_back(&options.device);
+        } else {
+            for (int& device : options.devices) { placements.push_back(&device); }
+        }
+        for (auto& extra : options.extra_models) {
+            if (extra.device) {
+                placements.push_back(&*extra.device);
+            } else {
+                for (int& device : extra.devices) { placements.push_back(&device); }
+            }
+        }
+        std::vector<int> requested;
+        for (const int* device : placements) { requested.push_back(*device); }
+        int first_device = options.device;
         if (const std::string narrowed = sinfer::product::narrow_cuda_visible_devices(
-                options.device, options.devices);
+                first_device, requested);
             !narrowed.empty()) {
             sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, narrowed);
         }
+        for (std::size_t i = 0; i < placements.size(); ++i) { *placements[i] = requested[i]; }
+        if (!options.devices.empty()) { options.device = options.devices.front(); }
 
         using Clock = std::chrono::steady_clock;
         sinfer::serve::HttpServer server(options);

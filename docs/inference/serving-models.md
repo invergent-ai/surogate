@@ -108,8 +108,8 @@ surogate serve XHToken/Spark-X2.5-1.7B --port 8080 --enable-auto-tool-choice --t
 surogate serve XHToken/Spark-X2.5-4B --port 8080 --enable-auto-tool-choice --tool-call-parser spark25
 ```
 
-The `spark25` parser enables tool calling through the chat API. LoRA adapters are not yet
-supported for these models.
+The `spark25` parser enables tool calling through the chat API. Serve LoRA adapters with
+`--enable-lora --lora-modules name=/path/to/adapter`.
 
 Choose one command. The first start downloads the checkpoint and prepares its serving cache;
 subsequent starts reuse that cache. A local checkpoint directory also works.
@@ -140,8 +140,8 @@ Send images through the chat API using `image_url` content parts, as shown in th
 processor settings. Multiple images and text-only requests are supported. Video input and
 VL GGUF files are not supported yet.
 
-These models run on one GPU. Merge trained LoRA adapters into the checkpoint before serving
-them; loading adapters separately is not supported for LFM2-MoE or LFM2-VL.
+Use `--devices` to split the text decoder across GPUs. LFM2-MoE and LFM2-VL support
+loading adapters separately; see [supported adapter modules](cli.md#lora-adapters).
 
 ## A model larger than the card
 

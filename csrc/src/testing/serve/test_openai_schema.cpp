@@ -427,8 +427,8 @@ int test_reject_unsupported() {
     Json rf               = base;
     rf["response_format"] = Json{{"type", "json_object"}};
     failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+        check(parse_chat_completion_request(rf, default_limits()).json_schema == R"({"type":"object"})",
+              "json response_format accepted");
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};

@@ -29,6 +29,27 @@ namespace sinfer::ops {
 /// and are served by the candidate routes, which skip these rows in turn. Exactly
 /// one route writes each column, so neither the token counts nor the output is
 /// touched twice.
+__global__ void sampling_update_greedy_targets_kernel(
+    const __nv_bfloat16* logits, std::int32_t* targets, const SamplingConfig* configs,
+    int domain, int physical_rows, int width) {
+    const int col = blockIdx.x;
+    const int row = blockIdx.y;
+    const SamplingConfig cfg = configs[row];
+    if (cfg.temperature > 0.0F || (cfg.logit_bias == nullptr && cfg.token_bitmask == nullptr && cfg.suppressed_count == 0)) { return; }
+    __shared__ unsigned long long warp_keys[kSamplerBlock / 32];
+    unsigned long long best = 0;
+    const auto base = (static_cast<std::int64_t>(row) * width + col) * physical_rows;
+    for (int v = threadIdx.x; v < domain; v += blockDim.x) {
+        if (sampling_suppressed(cfg, v)) { continue; }
+        const float value = __bfloat162float(logits[base + v]) +
+                            (cfg.logit_bias != nullptr ? cfg.logit_bias[v] : 0.0F);
+        const auto key = sampling_sort_key(value, v);
+        if (key > best) { best = key; }
+    }
+    best = sampling_block_max_key(best, warp_keys);
+    if (threadIdx.x == 0) { targets[row * width + col] = sampling_key_index(best); }
+}
+
 __launch_bounds__(kSamplerBlock) __global__
     void sampling_full_vocab_kernel(const __nv_bfloat16* logits, std::int32_t* out,
                                     const SamplingConfig* configs,
@@ -119,7 +140,8 @@ __launch_bounds__(kSamplerBlock) __global__
         int bi   = INT_MAX;
         for (int v = tid; v < token_domain; v += blockDim.x) {
             if (sampling_suppressed(cfg, v)) { continue; }
-            const float x = __bfloat162float(logits[base + v]);
+            const float x = __bfloat162float(logits[base + v]) +
+                            (cfg.logit_bias != nullptr ? cfg.logit_bias[v] : 0.0F);
             if (sampling_better(x, v, bv, bi)) {
                 bv = x;
                 bi = v;
@@ -208,7 +230,8 @@ __launch_bounds__(kSamplerBlock) __global__
             const float raw = __bfloat162float(logits[base + v]);
             // The stochastic path bars a token inside sampling_adjusted_logit; the
             // greedy one reads the raw logit, so it is barred here instead.
-            const float x   = greedy ? raw : sampling_adjusted_logit(raw, v, cfg);
+            const float x = greedy ? raw + (cfg.logit_bias != nullptr ? cfg.logit_bias[v] : 0.0F)
+                                   : sampling_adjusted_logit(raw, v, cfg);
             keys[item]      = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;

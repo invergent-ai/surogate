@@ -387,8 +387,23 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
 
+    const std::string json_schema = options.execution.json_schema;
+    if (!json_schema.empty() && (!options.stop.include_model_defaults || options.execution.min_tokens != 0 ||
+        !options.stop.strings.empty() || !options.stop.token_ids.empty())) {
+        throw std::invalid_argument("JSON constraints require model stop tokens, min_tokens=0, and no custom stops");
+    }
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
+    std::visit([&](const auto& target) {
+        target->loaded->frontend.validate_sampling_tokens(resolved_options.execution.sampling);
+    }, impl_->active);
+    if (!json_schema.empty()) {
+        resolved_options.execution.constraint = std::visit([&](const auto& target) {
+            return target->loaded->frontend.compile_json_constraint(json_schema);
+        }, impl_->active);
+        // JSON is answer text even for a template that opens a reasoning region.
+        resolved_options.output.structured = true;
+    }
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
 
     const PromptSummary prompt_summary = prompt.impl_->summary;

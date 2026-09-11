@@ -9,6 +9,20 @@
 
 namespace sinfer::ops {
 
+void sampling_update_greedy_targets(const Tensor& logits, Tensor& targets,
+                                    std::int32_t token_domain, const SamplingConfig* configs,
+                                    cudaStream_t stream) {
+    if (logits.dtype != DType::BF16 || targets.dtype != DType::I32 ||
+        !logits.is_contiguous() || !targets.is_contiguous() || !logits.data || !targets.data ||
+        !configs || token_domain <= 0 || token_domain > logits.ne[0] ||
+        logits.ne[1] <= 0 || logits.ne[2] <= 0 || logits.ne[3] != 1 ||
+        targets.ne[0] != logits.ne[1] || targets.ne[1] != logits.ne[2] ||
+        targets.ne[2] != 1 || targets.ne[3] != 1) {
+        throw std::invalid_argument("sampling_update_greedy_targets: invalid inputs");
+    }
+    detail::sampling_update_greedy_targets_launch(logits, targets, token_domain, configs, stream);
+}
+
 std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
                                               std::int32_t max_lanes) {
     if (token_domain <= 0 || min_lanes <= 0 || max_lanes < min_lanes) {

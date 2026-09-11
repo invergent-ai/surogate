@@ -162,6 +162,9 @@ public:
     /// given one number per token and needs the token each belongs to. Decoding the
     /// ids together instead would merge them into one string, which is the right
     /// answer to a different question.
+    void validate_sampling_tokens(const ResolvedSamplingParameters& sampling) const;
+    [[nodiscard]] std::shared_ptr<const CompiledTokenConstraint> compile_json_constraint(
+        const std::string& schema) const;
     [[nodiscard]] std::vector<std::string> token_texts(std::span<const TokenId> ids) const;
 
 private:

@@ -303,6 +303,7 @@ struct SamplingOverrides {
     std::optional<float> presence_penalty;
     std::optional<float> frequency_penalty;
     std::optional<std::uint64_t> seed;
+    std::unordered_map<TokenId, float> logit_bias;
 };
 
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
@@ -316,6 +317,7 @@ struct ResolvedSamplingParameters {
     /// Multiplicative penalty on already-seen tokens; 1 disables it.
     float repetition_penalty = 1.0F;
     std::uint64_t seed      = 0;
+    std::unordered_map<TokenId, float> logit_bias;
 };
 
 enum class OutputChannel : std::uint8_t {
@@ -336,7 +338,11 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+class CompiledTokenConstraint;
+
 struct ExecutionOptions {
+    /// Empty means unconstrained output; otherwise a JSON Schema for the generated text.
+    std::string json_schema;
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
@@ -354,6 +360,7 @@ struct ExecutionOptions {
 };
 
 struct OutputOptions {
+    bool structured = false; // generated JSON stays in content; stop tokens are still hidden
     bool raw                     = false;
     bool preserve_special_tokens = false;
 };

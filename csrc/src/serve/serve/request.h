@@ -104,9 +104,7 @@ struct ChatTurn {
                                    // template)
 };
 
-// OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains
-// parsed for wire compatibility; the current public engine sampler has no bias
-// input, so it does not affect generation.
+// OpenAI sampling fields carried by the protocol adapter.
 struct SamplingParams {
     std::optional<double> temperature;
     std::optional<double> top_p;
@@ -171,6 +169,7 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 }
 
 struct GenerationRequest {
+    std::string json_schema;
     std::string model;
     /// A `/v1/completions` prompt, served exactly as written with no chat template. Set for a
     /// completion request and empty for a chat one; the two are the same request otherwise, so

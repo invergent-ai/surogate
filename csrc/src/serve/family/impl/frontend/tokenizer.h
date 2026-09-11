@@ -90,6 +90,7 @@ public:
         const std::string& messages_json, const std::vector<std::string>& tool_jsons,
         bool add_generation_prompt, const ChatTemplateVariables& variables = {}) const;
 
+    [[nodiscard]] std::size_t vocabulary_size() const noexcept { return id_to_token_.size(); }
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;

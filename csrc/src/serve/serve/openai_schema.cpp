@@ -475,7 +475,13 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
                 bad_request("logit_bias values must be numbers", "logit_bias");
             }
             try {
-                s.logit_bias.emplace(std::stoi(it.key()), it.value().get<double>());
+                std::size_t consumed = 0;
+                const int token = std::stoi(it.key(), &consumed);
+                if (consumed != it.key().size() || token < 0 ||
+                    it.key().find_first_not_of("0123456789") != std::string::npos) {
+                    throw std::invalid_argument("invalid token id");
+                }
+                s.logit_bias.emplace(token, it.value().get<double>());
             } catch (const std::exception&) {
                 bad_request("logit_bias keys must be integer token ids", "logit_bias");
             }
@@ -493,7 +499,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     }
 }
 
-void reject_unsupported_features(const Json& body) {
+void parse_output_features(const Json& body, GenerationRequest& out) {
     for (const char* key : {"functions", "function_call"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             ApiError error;
@@ -508,9 +514,22 @@ void reject_unsupported_features(const Json& body) {
         std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
                                ? fmt.at("type").get<std::string>()
                                : std::string();
-        if (type != "text") {
+        if (type == "json_object") {
+            out.json_schema = R"({"type":"object"})";
+        } else if (type == "json_schema") {
+            if (!fmt.contains("json_schema") || !fmt["json_schema"].is_object() ||
+                !fmt["json_schema"].contains("schema") ||
+                !(fmt["json_schema"]["schema"].is_object() || fmt["json_schema"]["schema"].is_boolean())) {
+                bad_request("response_format.json_schema.schema must be a JSON Schema object or boolean", "response_format");
+            }
+            const auto& spec = fmt["json_schema"];
+            if (spec.contains("strict") && !spec["strict"].is_boolean()) {
+                bad_request("response_format.json_schema.strict must be boolean", "response_format");
+            }
+            out.json_schema = spec["schema"].dump();
+        } else if (type != "text") {
             ApiError error;
-            error.message = "only response_format {type:text} is supported";
+            error.message = "response_format must be text, json_object, or json_schema";
             error.param   = "response_format";
             error.code    = "response_format_not_supported";
             throw ApiException(std::move(error));
@@ -648,9 +667,8 @@ void reject_unsupported_completion_features(const Json& body) {
 
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
-    reject_unsupported_features(body);
-
     GenerationRequest out;
+    parse_output_features(body, out);
     if (!body.contains("model") || !body.at("model").is_string() ||
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");

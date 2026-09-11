@@ -10,6 +10,15 @@
 
 namespace sinfer::ops::detail {
 
+void sampling_update_greedy_targets_launch(const Tensor& logits, Tensor& targets,
+                                           std::int32_t token_domain, const SamplingConfig* configs,
+                                           cudaStream_t stream) {
+    sampling_update_greedy_targets_kernel<<<dim3(logits.ne[1], logits.ne[2]), kSamplerBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(targets.data),
+        configs, token_domain, logits.ne[0], logits.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
     return make_sampling_workspace_layout(token_domain, columns).bytes;
 }

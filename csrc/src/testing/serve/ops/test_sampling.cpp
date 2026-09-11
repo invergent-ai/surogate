@@ -44,7 +44,8 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
     return a.temperature == b.temperature && a.top_k == b.top_k && a.top_p == b.top_p &&
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
-           a.token_counts == b.token_counts;
+           a.token_counts == b.token_counts && a.logit_bias == b.logit_bias &&
+           a.token_bitmask == b.token_bitmask;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -323,6 +324,46 @@ int verify_distribution(const char* label, const std::vector<int>& samples,
     std::cout << "    " << label << " FP64 distribution match (max z=" << max_standardized_gap
               << ")\n";
     return 0;
+}
+
+int bias_and_mask_contract() {
+    int failures = 0;
+    for (const int domain : {32, 257, 32000}) {
+        std::vector<float> column(domain + 1, 0.0F), bias(domain, 0.0F);
+        column[0] = 10.0F;
+        column[domain] = 1000.0F; // padding must never participate
+        bias[5] = 25.0F;
+        std::vector<std::int32_t> mask((domain + 31) / 32, 0);
+        mask[0] = 1 << 7;
+        auto device_bias = to_device(bias);
+        auto device_mask = to_device(mask);
+        std::vector<ops::SamplingConfig> configs(5);
+        configs[1].logit_bias = static_cast<const float*>(device_bias.p);
+        configs[2] = configs[1];
+        configs[2].token_bitmask = static_cast<const std::int32_t*>(device_mask.p);
+        configs[3] = configs[2];
+        configs[3].temperature = 1.0F; // untruncated stochastic mask
+        configs[4] = configs[3];
+        configs[4].top_k = 10; // bounded stochastic mask
+        const auto result = run_batch(repeat_column(column, 5), domain + 1, domain, configs,
+                                      {0, 1, 2, 3, 4}, ops::kSamplePurposeDecode);
+        failures += result.integrity_failures;
+        failures += verify_exact("bias and mask across sampler routes", result.tokens, {0, 5, 7, 7, 7});
+
+        // The speculative verifier updates greedy rows across every verification column;
+        // stochastic rows retain their unused argmax values for the acceptance sampler.
+        auto logits = to_device(bf16_bits(repeat_column(column, 10)));
+        auto targets = to_device(std::vector<int>(10, 0));
+        auto params = to_device(configs);
+        Tensor scores(logits.p, DType::BF16, {domain + 1, 2, 5});
+        Tensor output(targets.p, DType::I32, {2, 5});
+        ops::sampling_update_greedy_targets(scores, output, domain,
+            static_cast<const ops::SamplingConfig*>(params.p), nullptr);
+        cuda_synchronize();
+        failures += verify_exact("biased speculative targets", from_device<int>(targets, 10),
+                                 {0, 0, 5, 5, 7, 7, 0, 0, 0, 0});
+    }
+    return failures;
 }
 
 int greedy_contract() {
@@ -711,6 +752,7 @@ int main() {
         std::cerr << "sampling workspace accepted an invalid lane interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+    failures += bias_and_mask_contract();
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();

@@ -21,6 +21,7 @@ using ::sinfer::TokenId;
 // Engine has already selected the registered model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
+    std::shared_ptr<const CompiledTokenConstraint> constraint;
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
