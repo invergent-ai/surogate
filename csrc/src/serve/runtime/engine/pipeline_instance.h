@@ -152,6 +152,11 @@ public:
         }
         return true;
     }
+    [[nodiscard]] std::uint64_t prefix_cache_revision(std::uint32_t lane) const noexcept {
+        std::uint64_t revision = 0;
+        for (Stage* stage : stages_) { revision += stage->program->prefix_cache_revision(lane); }
+        return revision;
+    }
     [[nodiscard]] bool can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                                               const RequestPlan& plan) const noexcept {
         for (std::size_t s = 0; s < stages_.size(); ++s) {

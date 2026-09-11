@@ -104,20 +104,29 @@ CyclicKVCacheLayerView CyclicKVCache::layer_view(std::uint32_t layer) const {
 
 void CyclicKVCache::copy_lane_from(const CyclicKVCache& source, std::int32_t lane,
                                    cudaStream_t stream) {
+    if (source.lane_capacity_ != lane_capacity_) {
+        throw std::invalid_argument("Cyclic KV copy requires identical lane capacities");
+    }
+    copy_lane_from(source, lane, lane, stream);
+}
+
+void CyclicKVCache::copy_lane_from(const CyclicKVCache& source, std::int32_t source_lane,
+                                   std::int32_t destination_lane, cudaStream_t stream) {
     if (source.layer_count() != layer_count() || source.capacity_ != capacity_ ||
         source.padded_capacity_ != padded_capacity_ || source.num_kv_heads_ != num_kv_heads_ ||
-        source.head_dim_ != head_dim_ || source.lane_capacity_ != lane_capacity_ ||
+        source.head_dim_ != head_dim_ ||
         source.dtype() != dtype()) {
         throw std::invalid_argument("Cyclic KV copy requires identical layouts");
     }
-    if (lane < 0 || lane >= lane_capacity_) {
+    if (source_lane < 0 || source_lane >= source.lane_capacity_ ||
+        destination_lane < 0 || destination_lane >= lane_capacity_) {
         throw std::out_of_range("Cyclic KV lane is out of range");
     }
     for (std::size_t layer = 0; layer < k_.size(); ++layer) {
-        Tensor destination_k = k_[layer].slice(3, lane, 1);
-        Tensor destination_v = v_[layer].slice(3, lane, 1);
-        Tensor source_k      = source.k_[layer].slice(3, lane, 1);
-        Tensor source_v      = source.v_[layer].slice(3, lane, 1);
+        Tensor destination_k = k_[layer].slice(3, destination_lane, 1);
+        Tensor destination_v = v_[layer].slice(3, destination_lane, 1);
+        Tensor source_k      = source.k_[layer].slice(3, source_lane, 1);
+        Tensor source_v      = source.v_[layer].slice(3, source_lane, 1);
         CUDA_CHECK(cudaMemcpyAsync(destination_k.data, source_k.data, destination_k.bytes(),
                                    cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(destination_v.data, source_v.data, destination_v.bytes(),

@@ -823,14 +823,20 @@ private:
             request->lane_plans.resize(max_concurrency_);
             request->lane_plan_versions.resize(max_concurrency_);
         }
-        if (request->lane_plan_versions[lane] == lane_plan_versions_[lane] &&
+        auto version = lane_plan_versions_[lane];
+        if constexpr (requires { instance_.program->prefix_cache_revision(lane); }) {
+            // Both counters only increase. A bounded snapshot cache can evict
+            // another idle lane without changing its current KV allocation.
+            version += instance_.program->prefix_cache_revision(lane);
+        }
+        if (request->lane_plan_versions[lane] == version &&
             request->lane_plans[lane]) {
             return;
         }
         request->lane_plans[lane].reset();
         request->lane_plans[lane].emplace(
             instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
-        request->lane_plan_versions[lane] = lane_plan_versions_[lane];
+        request->lane_plan_versions[lane] = version;
     }
 
     [[nodiscard]] std::optional<LaneChoice>

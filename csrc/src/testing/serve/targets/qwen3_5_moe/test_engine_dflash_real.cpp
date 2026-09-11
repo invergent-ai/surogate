@@ -43,7 +43,6 @@ dflash_engine_options(const TestConfig& config, sinfer::ProposalHead proposal, s
     options.speculative.adaptive = std::getenv("SINFER_DFLASH_TEST_ADAPTIVE") != nullptr;
     options.speculative.proposal_head = proposal;
     options.use_cuda_graph            = true;
-    options.rewrite_checkpoints       = true;
     // Compare payload sizes without the demand-mapped pool's allocation rounding.
     options.elastic_kv                = false;
     return options;

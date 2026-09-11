@@ -10,23 +10,15 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 inline constexpr std::int32_t kNoRewriteCheckpointSlot = -1;
 
 struct LinearStateSlots {
-    // Layout: [0, N) the lanes' current state, N the shared prefill-graph
-    // scratch slot (PATCHES.md #27), then — only when rewrite checkpoints are
-    // enabled — [N+1, 2N+1) one checkpoint per lane. Checkpoints come last so
-    // that disabling them truncates the pool: at 72 MiB per slot per lane on
-    // the 27B they are what keeps the lane count off the memory cliff, and a
-    // workload without prefix reuse never touches them. Any path that reaches
-    // for a checkpoint slot while they are disabled indexes past the pool and
-    // fails loudly in validate_layer_slot rather than silently aliasing.
-    [[nodiscard]] static std::int32_t state_slot_count(std::uint32_t max_concurrency,
-                                                       bool rewrite_checkpoints) {
+    // Resident slots: [0, N) current state and N shared prefill scratch.
+    // Logical slots [N+1, 2N+1) are bound to budgeted snapshots on demand.
+    [[nodiscard]] static std::int32_t state_slot_count(std::uint32_t max_concurrency) {
         if (max_concurrency == 0 ||
             max_concurrency >
                 static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max() / 2)) {
             throw std::invalid_argument("Qwen3.6 Linear Attention concurrency is invalid");
         }
-        return static_cast<std::int32_t>(rewrite_checkpoints ? 2U * max_concurrency + 1U
-                                                             : max_concurrency + 1U);
+        return static_cast<std::int32_t>(max_concurrency + 1U);
     }
 
     [[nodiscard]] static std::int32_t prefill_scratch_state_slot(std::uint32_t max_concurrency) {

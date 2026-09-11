@@ -204,7 +204,7 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::int32_t linear_state_slots =
-        LinearStateSlots::state_slot_count(plan.max_concurrency, plan.rewrite_checkpoints);
+        LinearStateSlots::state_slot_count(plan.max_concurrency);
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -269,6 +269,16 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          },
                      .ple = ResidualHooks<Variant>::ple_state_spec(plan.geometry, linear_state_slots),
                  });
+    LayoutBuilder checkpoint_builder;
+    auto checkpoint_linear = out.decoder.linear_attention.spec;
+    checkpoint_linear.slot_count = 1;
+    out.checkpoints.linear_attention =
+        plan_linear_attention_state_pool(checkpoint_builder, checkpoint_linear);
+    if (out.decoder.ple) {
+        auto checkpoint_ple = out.decoder.ple->spec;
+        checkpoint_ple.slot_count = 1;
+        out.checkpoints.ple = plan_ngram_ple_state_pool(checkpoint_builder, checkpoint_ple);
+    }
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
@@ -297,10 +307,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 builder, plan.geometry.dflash.local_layers, plan.geometry.dflash.local_capacity,
                 plan.geometry.dflash.kv_heads, plan.geometry.dflash.head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency), draft_kv_dtype);
-            dflash.rewrite_checkpoint_local = plan_cyclic_kv_cache(
-                builder, plan.geometry.dflash.local_layers, plan.geometry.dflash.local_capacity,
+            out.checkpoints.dflash = plan_cyclic_kv_cache(
+                checkpoint_builder, plan.geometry.dflash.local_layers, plan.geometry.dflash.local_capacity,
                 plan.geometry.dflash.kv_heads, plan.geometry.dflash.head_dim,
-                static_cast<std::int32_t>(plan.max_concurrency), draft_kv_dtype);
+                1, draft_kv_dtype);
             PagedKVPoolSpec full_pool{
                 .page_group_count      = plan.main_page_groups,
                 .logical_page_capacity = logical_pages,
@@ -392,6 +402,19 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         builder, DType::BF16, {persistent_hidden, static_cast<std::int32_t>(plan.max_concurrency)},
         "rewrite checkpoint hidden");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
+    out.checkpoints.slot_bytes = checkpoint_builder.finish(kElasticKvGranuleBytes, "conversation snapshot");
+    out.checkpoints.lanes = plan.max_concurrency;
+    out.checkpoints.capacity = plan.max_concurrency;
+    if (out.checkpoints.slot_bytes) {
+        const auto& pool = out.decoder.text_kv.pool;
+        const auto context_bytes = checked_mul(pool.payload_bytes() / pool.spec.page_group_count,
+                                                page_count(plan.capacity), "context KV bytes");
+        // Reserve up to one eighth of a context's KV footprint (at least one
+        // snapshot), independent of physical KV capacity so its curve remains
+        // affine. Physical snapshot pages are mapped only when requested.
+        out.checkpoints.capacity = static_cast<std::uint32_t>(std::clamp<std::size_t>(
+            context_bytes / 8 / out.checkpoints.slot_bytes, 1, plan.max_concurrency));
+    }
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
     // The reservation charges the planes' exact bytes, which grow linearly with the page
@@ -918,7 +941,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->kv_skip_layers      = inputs.kv_skip_layers;
-    impl->rewrite_checkpoints = inputs.rewrite_checkpoints;
     impl->elastic_kv          = inputs.elastic_kv;
     impl->elastic_kv_overcommit = inputs.elastic_kv_overcommit;
     impl->persistent          = persistent_layout(*impl);
@@ -985,7 +1007,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                     "sequence memory plan"),
                         impl->workspace.capacity, "sequence memory plan"),
             impl->request_transient_capacity_bytes, "request transient reservation"),
-        impl->graph_allowance_bytes, "sequence graph allowance");
+        checked_add(impl->graph_allowance_bytes, impl->persistent.checkpoints.reservation_bytes(),
+                    "conversation snapshot allowance"), "sequence graph allowance");
     return impl;
 }
 
@@ -1022,7 +1045,6 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_dtype              = kv_storage_dtype(kv_storage),
         .kv_quant_group = kv_storage == KvCacheStorage::Int8Group64 ? family::kKvQuantGroup : 0,
         .kv_skip_layers = options.kv_cache_skip_layers,
-        .rewrite_checkpoints       = options.rewrite_checkpoints,
         .elastic_kv                = options.elastic_kv,
         .elastic_kv_overcommit     = options.elastic_kv_overcommit,
         .proposal_head             = options.speculative.proposal_head,

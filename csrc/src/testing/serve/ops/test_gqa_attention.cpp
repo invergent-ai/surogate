@@ -65,6 +65,7 @@ constexpr Geometry kGeometries[] = {
     {"qwen3_6_35b_a3b", 16, 2},
     // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b.
     {"qwen3_5_0_8b", 8, 2},
+    {"gemma3_4b", 8, 4},
     // 24 query heads over 2 KV heads: a group of twelve, which the small-T
     // lane step (64 rows) serves 5 tokens at a time rather than 6.
     {"qwen3_8_flash_next", 24, 2},
@@ -1644,12 +1645,14 @@ int main() {
     failures += verify_geometry_registration_contract();
     failures += verify_workspace_capacity_contract();
     failures += verify_fp8_current_tokens_match_cached(256, 8, 1);
+    failures += verify_fp8_current_tokens_match_cached(256, 8, 4);
     failures += verify_fp8_current_tokens_match_cached(256, 16, 4);
     failures += verify_fp8_current_tokens_match_cached(128, 32, 4);
     failures += verify_fp8_image_attention();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     for (const Geometry geometry : {Geometry{"fallback_16q8_d64", 16, 8, 64},
-                                    Geometry{"fallback_12q4_d256", 12, 4, 256}}) {
+                                    Geometry{"fallback_12q4_d256", 12, 4, 256},
+                                    Geometry{"gemma3_4b", 8, 4, 256}}) {
         for (const int tokens : {1, 3, 17}) {
             const AttentionCase test_case{tokens, 61, 128, 2100U + tokens, 32};
             failures += run_a1_case(geometry, DType::BF16, test_case, MappingPattern::Fragmented);

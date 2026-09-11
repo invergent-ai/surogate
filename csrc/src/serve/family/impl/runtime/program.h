@@ -312,6 +312,11 @@ public:
     [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane, std::uint32_t decode_rows) const noexcept;
     [[nodiscard]] std::string last_mixed_round_description(std::size_t row) const;
     void set_round_burst_limit(std::uint32_t limit) noexcept { round_burst_limit = limit; }
+    [[nodiscard]] std::uint32_t reusable_append_frontier(const SequenceState& sequence) const noexcept;
+    [[nodiscard]] bool acquire_rewrite_checkpoint(SequenceState& sequence);
+    [[nodiscard]] std::uint64_t prefix_cache_revision(std::uint32_t lane) const noexcept {
+        return lane < checkpoint_revisions.size() ? checkpoint_revisions[lane] : 0;
+    }
     static void burst_egress_copy_host(void* user) noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
@@ -448,7 +453,9 @@ public:
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
-    const bool rewrite_checkpoints;
+    std::uint64_t checkpoint_clock = 0;
+    std::vector<std::uint64_t> checkpoint_last_use;
+    std::vector<std::uint64_t> checkpoint_revisions;
     // Shape of the most recent mixed round, kept for the corruption
     // attribution line: which band the graph was captured for, the batch's
     // maximum frontier, and each row's own frontier.

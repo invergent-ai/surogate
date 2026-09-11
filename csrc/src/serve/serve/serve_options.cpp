@@ -133,7 +133,6 @@ std::string serve_usage_text(const char* argv0) {
            "[--vision] [--offload-vision] [--offload-embeddings] [--offload-output-head] "
            "[--enforce-eager] [--no-prefix-reuse] "
            "[--enable-sleep-mode] [--elastic-kv|--no-elastic-kv] [--elastic-kv-overcommit] "
-           "[--rewrite-checkpoints|--no-rewrite-checkpoints] "
            "[--model name=path[,key=value...]] [--model-priority high|normal|low] "
            "[--enable-lora] [--lora-modules name=path,...] [--max-loras N] [--max-lora-rank N] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -158,7 +157,6 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-cache-dtype defaults to auto: BF16 for attention-only models, FP8 for "
            "hybrids.\n"
            "         fp8 and fp8_e4m3 select the same format. Skip-layer indices keep BF16.\n"
-           "       --rewrite-checkpoints uses extra memory to speed up editing the last turn.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --no-elastic-kv reserves the full cache; --elastic-kv grows it with demand.\n"
            "       --elastic-kv-overcommit guarantees each model only its\n"
@@ -360,10 +358,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = options.devices.front();
         } else if (arg == "--kv-cache-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-cache-dtype"));
-        } else if (arg == "--rewrite-checkpoints") {
-            options.rewrite_checkpoints = true;
-        } else if (arg == "--no-rewrite-checkpoints") {
-            options.rewrite_checkpoints = false;
         } else if (arg == "--kv-cache-dtype-skip-layers") {
             options.kv_cache_skip_layers =
                 parse_kv_skip_layers(require_value("--kv-cache-dtype-skip-layers"));

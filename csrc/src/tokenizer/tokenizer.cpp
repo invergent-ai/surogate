@@ -114,6 +114,31 @@ struct Tokenizer::Impl {
     // Added tokens (ALL added tokens — matched before pre-tokenization during encode)
     std::unordered_map<std::string, Rank> added_tokens_encoder;  // text -> id
     std::unordered_map<Rank, std::string> added_tokens_decoder;  // id -> text (plain-text decode, no byte-level)
+    struct AddedTokenNode {
+        std::unordered_map<unsigned char, std::size_t> next;
+        std::optional<Rank> id;
+    };
+    std::vector<AddedTokenNode> added_token_trie;
+
+    void build_added_token_trie() {
+        added_token_trie.emplace_back();
+        for (const auto& [token, id] : added_tokens_encoder) {
+            if (token.empty()) { throw std::runtime_error("Tokenizer: added tokens must not be empty"); }
+            std::size_t node = 0;
+            for (unsigned char byte : token) {
+                const auto found = added_token_trie[node].next.find(byte);
+                if (found != added_token_trie[node].next.end()) {
+                    node = found->second;
+                } else {
+                    const auto child = added_token_trie.size();
+                    added_token_trie[node].next.emplace(byte, child);
+                    added_token_trie.emplace_back();
+                    node = child;
+                }
+            }
+            added_token_trie[node].id = id;
+        }
+    }
 
     // Special tokens (subset of added tokens with special=true)
     std::unordered_set<Rank> special_token_ids;
@@ -484,41 +509,34 @@ struct Tokenizer::Impl {
 
         std::vector<int32_t> result;
 
-        // Find all added token occurrences and split around them.
-        // Use a simple linear scan (added tokens are few and this is not the hot path).
+        // Leftmost match wins; at that position take the longest token. Walk
+        // the immutable trie instead of searching the remaining prompt once
+        // for every added token after each image placeholder.
         size_t pos = 0;
+        size_t ordinary_begin = 0;
         while (pos < text.size()) {
-            // Find the earliest added token from current position.
-            size_t best_pos = std::string::npos;
-            std::string best_token;
-            Rank best_id = 0;
-
-            for (const auto& [token, id] : added_tokens_encoder) {
-                size_t found = text.find(token, pos);
-                if (found != std::string::npos &&
-                    (found < best_pos || (found == best_pos && token.size() > best_token.size()))) {
-                    best_pos = found;
-                    best_token = token;
-                    best_id = id;
+            std::size_t node = 0, best_end = pos;
+            std::optional<Rank> best_id;
+            for (std::size_t end = pos; end < text.size(); ++end) {
+                const auto found = added_token_trie[node].next.find(static_cast<unsigned char>(text[end]));
+                if (found == added_token_trie[node].next.end()) { break; }
+                node = found->second;
+                if (added_token_trie[node].id) {
+                    best_id = added_token_trie[node].id;
+                    best_end = end + 1;
                 }
             }
-
-            if (best_pos == std::string::npos) {
-                // No more added tokens; encode the rest as ordinary.
-                auto tail = encode_ordinary_impl(text.substr(pos));
-                result.insert(result.end(), tail.begin(), tail.end());
-                break;
-            }
-
-            // Encode text before the added token.
-            if (best_pos > pos) {
-                auto prefix = encode_ordinary_impl(text.substr(pos, best_pos - pos));
+            if (!best_id) { ++pos; continue; }
+            if (pos > ordinary_begin) {
+                auto prefix = encode_ordinary_impl(text.substr(ordinary_begin, pos - ordinary_begin));
                 result.insert(result.end(), prefix.begin(), prefix.end());
             }
-
-            // Add the added token as a single ID.
-            result.push_back(static_cast<int32_t>(best_id));
-            pos = best_pos + best_token.size();
+            result.push_back(static_cast<int32_t>(*best_id));
+            pos = ordinary_begin = best_end;
+        }
+        if (ordinary_begin < text.size()) {
+            auto tail = encode_ordinary_impl(text.substr(ordinary_begin));
+            result.insert(result.end(), tail.begin(), tail.end());
         }
 
         return result;
@@ -950,6 +968,7 @@ Tokenizer Tokenizer::from_sources(const Sources& sources) {
 
     // Build fast lookup table
     impl.build_lookup();
+    impl.build_added_token_trie();
 
     return tok;
 }

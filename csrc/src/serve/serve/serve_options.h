@@ -90,7 +90,6 @@ struct ServeOptions {
     std::vector<int> devices;                    // --devices a,b,c (pipeline stages, in order)
     KvCacheStorage kv_cache                = KvCacheStorage::Auto;
     std::vector<std::uint32_t> kv_cache_skip_layers;
-    bool rewrite_checkpoints = false;
     bool elastic_kv          = true;  // default; --no-elastic-kv puts the Main KV planes in the arena
     bool elastic_kv_overcommit = false; // --elastic-kv-overcommit: floor + device gate
     SpeculativeOptions speculative;

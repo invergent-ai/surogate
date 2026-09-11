@@ -1,6 +1,8 @@
 #include <api/family/decoder_state.h>
+#include "core/elastic_kv_region.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -127,6 +129,44 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
 } // namespace
 
+class DecoderCheckpointStore {
+public:
+    struct Slot {
+        std::uint32_t page;
+        LinearAttentionStatePool linear;
+        NgramPleStatePool ple;
+        std::unique_ptr<CyclicKVCache> dflash;
+
+        Slot(std::uint32_t page_id, DeviceSpan backing, const DecoderCheckpointLayout& layout)
+            : page(page_id), linear(backing, layout.linear_attention) {
+            if (layout.ple) { ple = NgramPleStatePool(backing, *layout.ple); }
+            if (layout.dflash) { dflash = std::make_unique<CyclicKVCache>(backing, *layout.dflash); }
+        }
+    };
+
+    DecoderCheckpointLayout layout;
+    std::unique_ptr<ElasticKvRegion> region;
+    std::vector<std::unique_ptr<Slot>> slots;
+    std::vector<std::uint32_t> free;
+    std::size_t peak_bytes = 0;
+
+    DecoderCheckpointStore(const DecoderCheckpointLayout& plan, const PagedKVElasticOptions& options)
+        : layout(plan), slots(plan.lanes) {
+        if (plan.capacity == 0 || plan.capacity > plan.lanes) {
+            throw std::invalid_argument("Invalid conversation checkpoint capacity");
+        }
+        if (plan.slot_bytes) {
+            region = std::make_unique<ElasticKvRegion>(ElasticKvRegionSpec{
+                .device = options.device, .fence_stream = options.fence_stream,
+                .bytes = plan.reservation_bytes(), .page_count = plan.capacity,
+                .granule_pages = 1, .reserve_granules = 0, .cap_pages = plan.capacity,
+                .free_bytes_probe = options.free_bytes_probe,
+                .planes = {{.offset = 0, .page_bytes = plan.slot_bytes}}});
+        }
+        for (auto page = plan.capacity; page > 0; --page) { free.push_back(page - 1); }
+    }
+};
+
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
@@ -229,6 +269,88 @@ DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
     : text_kv(backing, layout.text_kv, elastic), linear_attention(backing, layout.linear_attention) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
     if (layout.ple) { ple = NgramPleStatePool(backing, *layout.ple); }
+}
+
+DecoderState::~DecoderState() = default;
+
+void DecoderState::configure_checkpoints(const DecoderCheckpointLayout& layout,
+                                         const PagedKVElasticOptions& options) {
+    if (checkpoints_) { throw std::logic_error("Conversation checkpoints already configured"); }
+    checkpoints_ = std::make_unique<DecoderCheckpointStore>(layout, options);
+    linear_attention.checkpoint_slots.resize(layout.lanes);
+    if (!ple.empty()) { ple.checkpoint_slots.resize(layout.lanes); }
+}
+
+bool DecoderState::has_checkpoint(std::uint32_t lane) const noexcept {
+    return checkpoints_ && lane < checkpoints_->slots.size() && checkpoints_->slots[lane];
+}
+
+bool DecoderState::try_acquire_checkpoint(std::uint32_t lane) {
+    if (!checkpoints_ || lane >= checkpoints_->slots.size()) {
+        throw std::out_of_range("Conversation checkpoint lane is out of range");
+    }
+    auto& store = *checkpoints_;
+    if (store.slots[lane]) { return true; }
+    if (store.free.empty()) { return false; }
+    const auto page = store.free.back();
+    DeviceSpan backing{};
+    if (store.region) {
+        store.region->acquire_page(static_cast<std::int32_t>(page));
+        store.peak_bytes = std::max(store.peak_bytes, store.region->mapped_bytes());
+        backing = {static_cast<std::byte*>(store.region->base()) + page * store.layout.slot_bytes,
+                   store.layout.slot_bytes};
+    }
+    try {
+        store.slots[lane] = std::make_unique<DecoderCheckpointStore::Slot>(page, backing, store.layout);
+    } catch (...) {
+        if (store.region) { store.region->release_page(static_cast<std::int32_t>(page)); }
+        throw;
+    }
+    store.free.pop_back();
+    linear_attention.checkpoint_slots[lane] = &store.slots[lane]->linear;
+    if (!ple.empty()) { ple.checkpoint_slots[lane] = &store.slots[lane]->ple; }
+    return true;
+}
+
+void DecoderState::release_checkpoint(std::uint32_t lane) noexcept {
+    if (!has_checkpoint(lane)) { return; }
+    auto& store = *checkpoints_;
+    const auto page = store.slots[lane]->page;
+    linear_attention.checkpoint_slots[lane] = nullptr;
+    if (!ple.empty()) { ple.checkpoint_slots[lane] = nullptr; }
+    store.slots[lane].reset();
+    if (store.region) { store.region->release_page(static_cast<std::int32_t>(page)); }
+    store.free.push_back(page);
+}
+
+CyclicKVCache& DecoderState::checkpoint_dflash(std::uint32_t lane) {
+    if (!has_checkpoint(lane) || !checkpoints_->slots[lane]->dflash) {
+        throw std::logic_error("DFlash conversation checkpoint is not allocated");
+    }
+    return *checkpoints_->slots[lane]->dflash;
+}
+
+std::size_t DecoderState::checkpoint_mapped_bytes() const noexcept {
+    return checkpoints_ && checkpoints_->region ? checkpoints_->region->mapped_bytes() : 0;
+}
+
+std::size_t DecoderState::checkpoint_reservation_bytes() const noexcept {
+    return checkpoints_ ? checkpoints_->layout.reservation_bytes() : 0;
+}
+
+std::size_t DecoderState::checkpoint_peak_bytes() const noexcept {
+    return checkpoints_ ? std::max(checkpoints_->peak_bytes, checkpoint_mapped_bytes()) : 0;
+}
+
+void DecoderState::reset_checkpoint_peak() noexcept {
+    if (checkpoints_) { checkpoints_->peak_bytes = checkpoint_mapped_bytes(); }
+}
+
+void DecoderState::flush_checkpoint_releases() {
+    if (checkpoints_ && checkpoints_->region) {
+        checkpoints_->region->flush_reserve_release();
+        checkpoints_->region->wait_idle();
+    }
 }
 
 void DecoderState::copy_state_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream) {

@@ -266,6 +266,11 @@ void Program<Variant>::kv_settle() noexcept {
 }
 
 template <>
+std::uint64_t Program<Variant>::prefix_cache_revision(std::uint32_t lane) const noexcept {
+    return impl_->prefix_cache_revision(lane);
+}
+
+template <>
 bool Program<Variant>::kv_under_pressure() const noexcept {
     return impl_->kv_under_pressure();
 }

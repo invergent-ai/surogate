@@ -23,7 +23,7 @@ case "$scenario" in
       --max-model-len 4096 --kv-capacity auto --kv-cache-dtype fp8 \
       --max-num-seqs 16 --max-num-batched-tokens 2048 \
       --max-pending-requests 64 --pending-timeout-ms 60000 \
-      --enable-prefix-caching --rewrite-checkpoints \
+      --enable-prefix-caching \
       --request-log-jsonl outputs/serve/requests.jsonl "$@" ;;
   lora)
     adapter=${ADAPTER:-./outputs/training/runtime-lora}

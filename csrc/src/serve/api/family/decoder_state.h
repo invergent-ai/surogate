@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/ngram_ple_state.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/linear_attention_state.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
@@ -8,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <vector>
 
 namespace sinfer::family {
@@ -161,6 +163,21 @@ struct DecoderStateLayout {
 [[nodiscard]] DecoderStateLayout plan_decoder_state(LayoutBuilder& builder,
                                                     const DecoderStateSpec& spec);
 
+struct DecoderCheckpointLayout {
+    LinearAttentionStatePoolLayout linear_attention;
+    std::optional<NgramPleStatePoolLayout> ple;
+    std::optional<CyclicKVCacheLayout> dflash;
+    std::size_t slot_bytes = 0;
+    std::uint32_t lanes = 0;
+    std::uint32_t capacity = 0;
+
+    [[nodiscard]] std::size_t reservation_bytes() const noexcept {
+        return slot_bytes * capacity;
+    }
+};
+
+class DecoderCheckpointStore;
+
 struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
@@ -171,6 +188,19 @@ struct DecoderState {
     /// ignored by layouts that keep their planes in the arena.
     DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
                  const PagedKVElasticOptions* elastic = nullptr);
+    ~DecoderState();
+
+    void configure_checkpoints(const DecoderCheckpointLayout& layout,
+                               const PagedKVElasticOptions& options);
+    [[nodiscard]] bool has_checkpoint(std::uint32_t lane) const noexcept;
+    [[nodiscard]] bool try_acquire_checkpoint(std::uint32_t lane);
+    void release_checkpoint(std::uint32_t lane) noexcept;
+    [[nodiscard]] CyclicKVCache& checkpoint_dflash(std::uint32_t lane);
+    [[nodiscard]] std::size_t checkpoint_mapped_bytes() const noexcept;
+    [[nodiscard]] std::size_t checkpoint_peak_bytes() const noexcept;
+    void reset_checkpoint_peak() noexcept;
+    [[nodiscard]] std::size_t checkpoint_reservation_bytes() const noexcept;
+    void flush_checkpoint_releases();
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;
@@ -178,6 +208,9 @@ struct DecoderState {
     /// Slot lifecycle across every per-slot pool (linear attention and, when present, PLE).
     void copy_state_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream);
     void reset_state_slot(std::int32_t slot, cudaStream_t stream);
+
+private:
+    std::unique_ptr<DecoderCheckpointStore> checkpoints_;
 };
 
 } // namespace sinfer::family

@@ -38,7 +38,7 @@ def server(tmp_path_factory):
     url = f"http://127.0.0.1:{port}"
     command = [
         _resolve_binary("server"), artifact, "--port", str(port), "--served-model-name", "base",
-        "--vision", "--no-thinking", "--rewrite-checkpoints", "--enable-sleep-mode",
+        "--vision", "--no-thinking", "--enable-sleep-mode",
         "--max-model-len", "4096", "--kv-capacity", "8192", "--max-num-seqs", "4",
         "--max-num-batched-tokens", "128", "--media-cache-mib", "16", "--media-live-mib", "64",
         "--kv-cache-dtype", os.getenv("SUROGATE_DFLASH_VISION_TEST_KV_DTYPE", "bf16"),

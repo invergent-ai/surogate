@@ -71,6 +71,8 @@ public:
 
     // Copies one lane's complete fixed state. Source and destination must have identical layouts.
     void copy_lane_from(const CyclicKVCache& source, std::int32_t lane, cudaStream_t stream);
+    void copy_lane_from(const CyclicKVCache& source, std::int32_t source_lane,
+                        std::int32_t destination_lane, cudaStream_t stream);
 
 private:
     std::vector<Tensor> k_;

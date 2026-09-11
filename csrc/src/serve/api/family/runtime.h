@@ -220,6 +220,7 @@ public:
     [[nodiscard]] PagedKVOccupancy kv_occupancy() const noexcept;
     /// Blocks until an elastic Main pool has no map or unmap work pending (no-op otherwise).
     void kv_settle() noexcept;
+    [[nodiscard]] std::uint64_t prefix_cache_revision(std::uint32_t lane) const noexcept;
     /// True while the device this program's elastic pool lives on is short of KV memory:
     /// the executor gives up its retained (prefix-cache) lanes until it clears.
     [[nodiscard]] bool kv_under_pressure() const noexcept;

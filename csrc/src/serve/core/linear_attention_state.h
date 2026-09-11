@@ -29,6 +29,7 @@ struct LinearAttentionStatePoolSpec {
 
 struct LinearAttentionStatePoolLayout {
     LinearAttentionStatePoolSpec spec;
+
     std::vector<LayoutRegion> conv;
     std::vector<LayoutRegion> recurrent;
 };
@@ -55,6 +56,9 @@ struct LinearAttentionStatePool {
     std::vector<Tensor> conv;
     std::vector<Tensor> recurrent;
     LinearAttentionStatePoolSpec spec;
+    // Optional single-slot views outside the resident pool. Capture/restore uses
+    // these host accessors; batched kernels only address the resident slots.
+    std::vector<const LinearAttentionStatePool*> checkpoint_slots;
 
     LinearAttentionStatePool() = default;
     LinearAttentionStatePool(DeviceSpan backing, const LinearAttentionStatePoolLayout& layout);

@@ -41,6 +41,9 @@ void round_trace_state(const Pool& pool, cudaStream_t stream, const char* when) 
     if (!round_trace_enabled() || pool.layer_count() == 0) { return; }
     std::string line = std::string("round-trace: state ") + when;
     for (std::int32_t slot = 0; slot < pool.slot_count(); ++slot) {
+        if (slot >= pool.spec.slot_count && !pool.checkpoint_slots[slot - pool.spec.slot_count]) {
+            continue;
+        }
         const Tensor t = pool.spec.has_recurrent() ? pool.recurrent_slot(0, slot) : pool.conv_slot(0, slot);
         std::vector<unsigned char> host(t.bytes());
         CUDA_CHECK(cudaMemcpyAsync(host.data(), t.data, t.bytes(), cudaMemcpyDeviceToHost, stream));
@@ -288,7 +291,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                            : std::nullopt),
       active_dflash_window(plan.draft_window), speculative_max_lanes(plan.speculative_max_lanes),
       speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
-      kv_quant_group(plan.kv_quant_group), rewrite_checkpoints(plan.rewrite_checkpoints),
+      kv_quant_group(plan.kv_quant_group), checkpoint_last_use(plan.max_concurrency),
+      checkpoint_revisions(plan.max_concurrency),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -359,6 +363,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         }(),
     };
     decoder = std::make_unique<family::DecoderState>(backing, plan.persistent.decoder, &elastic_kv);
+    decoder->configure_checkpoints(plan.persistent.checkpoints, elastic_kv);
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         if (speculative_backend == SpeculativeBackend::DFlash) {
@@ -369,7 +374,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
     if (plan.persistent.dflash) {
-        dflash.emplace(backing, *plan.persistent.dflash);
+        dflash.emplace(backing, *plan.persistent.dflash, *decoder);
         if (pipeline_stage()) { stage.features = &dflash->prefill_features; }
     }
     if (dflash.has_value() != plan.features.dflash()) {
@@ -655,13 +660,6 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          request_plan.rewrite_checkpoint_capture->frontier > prompt_tokens)) {
         throw std::logic_error("planned rewrite checkpoint capture is invalid");
     }
-    // With rewrite checkpoints disabled the plan drops every checkpoint the
-    // prompt describes: the pool has no slot to keep it in, and a later
-    // rewrite of that turn simply replays its prefix.
-    if (rewrite_checkpoints && request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop &&
-        prompt.identity.rewrite_checkpoint) {
-        throw std::logic_error("planned rewrite checkpoint drop does not describe the prompt");
-    }
     // surogate vendor patch (PATCHES.md #24): with opt-in deferral the
     // frontier legitimately lies AHEAD of the reuse base (the capture is
     // skipped, not already-held); the invariant relaxes to "the prompt
@@ -812,6 +810,16 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                         !request_plan.prepare_mtp && !prompt.has_media() &&
                                         base < prompt_tokens;
 
+        if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
+            !acquire_rewrite_checkpoint(sequence)) {
+            request_plan.rewrite_checkpoint_capture.reset();
+            request_plan.rewrite_checkpoint_action = RewriteCheckpointAction::DeferCapture;
+        }
+        if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop) {
+            decoder->release_checkpoint(sequence.lane);
+        } else if (decoder->has_checkpoint(sequence.lane)) {
+            checkpoint_last_use[sequence.lane] = ++checkpoint_clock;
+        }
         if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
             request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
             sequence.rewrite_checkpoint = {};
@@ -1278,6 +1286,7 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    decoder->release_checkpoint(sequence.lane);
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -1918,7 +1927,6 @@ void ProgramImplCore::prepare_graphs() {
             }
         };
         zero_cyclic_cache(dflash->local);
-        zero_cyclic_cache(dflash->rewrite_checkpoint_local);
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_features.data, 0,
                                    dflash->prefill_features.bytes(), device.stream));
         CUDA_CHECK(cudaMemsetAsync(dflash->prefill_positions.data, 0,
@@ -1996,8 +2004,7 @@ void ProgramImplCore::prepare_graphs() {
         capture_card.set_stage(stage);
         capture_card.set_linear_state_slots(
             prefill_graphs->scratch_state_slot(),
-            rewrite_checkpoints ? LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency)
-                                : kNoRewriteCheckpointSlot);
+            kNoRewriteCheckpointSlot);
         capture_card.set_gdn_state_action(schedule::GdnStateAction::UpdateInPlace, nullptr);
         prepare_representative(1, 1);
         set_device_i32(io.text_kv_table_row, 0); // the bound dummy row
@@ -2269,7 +2276,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.use_graph
                 ? LinearStateSlots::prefill_scratch_state_slot(max_concurrency)
                 : LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            rewrite_checkpoints
+            staged.rewrite_checkpoint_capture
                 ? LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency)
                 : kNoRewriteCheckpointSlot,
             staged.initial_mtp_extent,
@@ -3073,7 +3080,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             staged.use_graph
                 ? LinearStateSlots::prefill_scratch_state_slot(max_concurrency)
                 : LinearStateSlots::current_state_slot(prefill_sequence.lane, max_concurrency),
-            rewrite_checkpoints
+            staged.rewrite_checkpoint_capture
                 ? LinearStateSlots::rewrite_checkpoint_state_slot(prefill_sequence.lane,
                                                                   max_concurrency)
                 : kNoRewriteCheckpointSlot);
@@ -4236,6 +4243,36 @@ ProgramImplCore::decode_batch(std::span<const std::uint32_t> lanes,
     return decode_dflash_batch(lanes, budgets);
 }
 
+std::uint32_t ProgramImplCore::reusable_append_frontier(const SequenceState& sequence) const noexcept {
+    if (sequence.tail_hidden_valid) { return sequence.execution_frontier; }
+    // A truncated burst leaves attention KV valid through the accepted prefix,
+    // but its final hidden vector belongs to a later token. Replay the last
+    // input to recover it. Recurrent mixers/ngram inputs require a checkpoint.
+    if (speculative_backend == SpeculativeBackend::None &&
+        decoder->linear_attention.layer_count() == 0 && decoder->ple.empty() &&
+        sequence.execution_frontier > 1) {
+        return sequence.execution_frontier - 1;
+    }
+    return 0;
+}
+
+bool ProgramImplCore::acquire_rewrite_checkpoint(SequenceState& sequence) {
+    if (decoder->try_acquire_checkpoint(sequence.lane)) { return true; }
+    SequenceState* oldest = nullptr;
+    for (auto& candidate : sequences) {
+        if (candidate.lane == sequence.lane || !candidate.retained ||
+            !decoder->has_checkpoint(candidate.lane)) { continue; }
+        if (!oldest || checkpoint_last_use[candidate.lane] < checkpoint_last_use[oldest->lane]) {
+            oldest = &candidate;
+        }
+    }
+    if (!oldest) { return false; } // All snapshot pages belong to active requests.
+    decoder->release_checkpoint(oldest->lane);
+    oldest->rewrite_checkpoint = {};
+    ++checkpoint_revisions[oldest->lane];
+    return decoder->try_acquire_checkpoint(sequence.lane);
+}
+
 void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
                                                       RequestControl& request,
                                                       std::uint32_t accepted_tokens,
@@ -4252,7 +4289,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         throw std::logic_error("non-speculative pending round must commit a licensed prefix");
     }
 
-    bool retain_prefix = true;
+    bool truncated = false;
     switch (request.pending.kind) {
     case PendingKind::Begin:
         sequence.execution_frontier = request.pending.prompt_tokens;
@@ -4260,15 +4297,15 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         break;
     case PendingKind::Ordinary:
         if (accepted_tokens < produced) {
-            // Chained-burst truncation (PATCHES.md #32, terminal-only): trim
-            // the ledger and identity to the licensed prefix. The lane's
-            // resident GDN state ran the full burst, so the prefix must not
-            // be retained for reuse.
+            // The current recurrent state and tail hidden ran past the stop.
+            // Keep the accepted KV and any earlier checkpoint, while preventing
+            // reuse of the state belonging to the discarded continuation.
             sequence.ledger.resize(request.pending.base_S + accepted_tokens);
             sequence.prefix_identity.truncate(request.pending.base_S + accepted_tokens);
             sequence.text_kv_valid =
                 std::min(sequence.text_kv_valid, request.pending.base_E + accepted_tokens);
-            retain_prefix = false;
+            sequence.tail_hidden_valid = false;
+            truncated = true;
         }
         sequence.execution_frontier = request.pending.base_E + accepted_tokens;
         sequence.ledger_frontier    = request.pending.base_S + accepted_tokens;
@@ -4287,9 +4324,10 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         sequence.mtp_draft_count = 0;
         release_sequence_growth_entitlement(sequence);
         unbind_sequence_kv(sequence);
-        sequence.retained = retain_prefix;
+        sequence.retained = !truncated || reusable_append_frontier(sequence) != 0 ||
+                            sequence.rewrite_checkpoint.valid;
         static const bool reuse_trace = std::getenv("SUROGATE_SERVE_REUSE_TRACE") != nullptr;
-        if (reuse_trace && retain_prefix) {
+        if (reuse_trace && sequence.retained) {
             std::fprintf(stderr, "reuse-trace: retain lane %u frontier %u ledger %zu\n",
                          sequence.lane, sequence.execution_frontier, sequence.ledger.size());
         }
@@ -4310,6 +4348,10 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
+    const auto snapshot_bytes = decoder->checkpoint_mapped_bytes();
+    out.sequence.capacity_bytes += snapshot_bytes;
+    out.sequence.used_bytes += snapshot_bytes;
+    out.sequence.peak_used_bytes += decoder->checkpoint_peak_bytes();
     out.workspace = ArenaMemorySummary{workspace_storage.capacity(), work.used(), work.peak_used()};
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
@@ -4335,6 +4377,7 @@ bool ProgramImplCore::kv_under_pressure() const noexcept {
 }
 
 void ProgramImplCore::kv_settle() noexcept {
+    try { decoder->flush_checkpoint_releases(); } catch (...) {}
     if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
         try {
             region->wait_idle();
@@ -4343,6 +4386,7 @@ void ProgramImplCore::kv_settle() noexcept {
 }
 
 void ProgramImplCore::reset_memory_peaks() noexcept {
+    decoder->reset_checkpoint_peak();
     model.weights_arena->reset_peak();
     persistent.reset_peak();
     work.reset_peak();

@@ -62,7 +62,6 @@ int main() {
     const bool vision = std::getenv("SUROGATE_MULTI_DEVICE_TEST_VISION") != nullptr;
     options.enable_vision = vision;
     const bool cache_turn = std::getenv("SUROGATE_MULTI_DEVICE_TEST_CACHE") != nullptr;
-    options.rewrite_checkpoints = cache_turn;
     if (std::getenv("SUROGATE_MULTI_DEVICE_TEST_LONG_PROMPT")) {
         options.prefill_chunk = 128;
     }

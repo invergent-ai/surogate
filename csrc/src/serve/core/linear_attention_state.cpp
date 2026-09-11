@@ -181,7 +181,9 @@ std::uint32_t LinearAttentionStatePool::layer_count() const noexcept {
     return static_cast<std::uint32_t>(conv.size());
 }
 
-std::int32_t LinearAttentionStatePool::slot_count() const noexcept { return spec.slot_count; }
+std::int32_t LinearAttentionStatePool::slot_count() const noexcept {
+    return spec.slot_count + static_cast<std::int32_t>(checkpoint_slots.size());
+}
 
 std::int64_t LinearAttentionStatePool::conv_slot_stride_elements() const noexcept {
     return static_cast<std::int64_t>(spec.conv_channels) *
@@ -223,6 +225,11 @@ LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() co
 
 Tensor LinearAttentionStatePool::conv_slot(std::uint32_t layer, std::int32_t slot) const {
     validate_layer_slot(*this, layer, slot, "LinearAttentionStatePool conv_slot");
+    if (slot >= spec.slot_count) {
+        const auto* checkpoint = checkpoint_slots.at(slot - spec.slot_count);
+        if (!checkpoint) { throw std::logic_error("Linear attention checkpoint is not allocated"); }
+        return checkpoint->conv_slot(layer, 0);
+    }
     return conv.at(layer).slice(2, slot, 1).view({spec.conv_channels, spec.conv_width});
 }
 
@@ -231,6 +238,11 @@ Tensor LinearAttentionStatePool::recurrent_slot(std::uint32_t layer, std::int32_
         throw std::logic_error("LinearAttentionStatePool has no recurrent state to slot into");
     }
     validate_layer_slot(*this, layer, slot, "LinearAttentionStatePool recurrent_slot");
+    if (slot >= spec.slot_count) {
+        const auto* checkpoint = checkpoint_slots.at(slot - spec.slot_count);
+        if (!checkpoint) { throw std::logic_error("Linear attention checkpoint is not allocated"); }
+        return checkpoint->recurrent_slot(layer, 0);
+    }
     return recurrent.at(layer)
         .slice(3, slot, 1)
         .view({spec.key_head_dim, spec.value_head_dim, spec.value_heads});

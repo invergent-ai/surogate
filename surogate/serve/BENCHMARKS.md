@@ -454,9 +454,8 @@ moves only the second.
 
 One asymmetry in that client, in llama.cpp's favour and worth naming: on the repeat of an
 identical request its slot cache found 26 of the 30 prompt tokens, while we re-prefilled all
-thirty. Our prefix reuse appends to a conversation that grows; re-asking a turn the lane has
-already answered past is a reset unless `--rewrite-checkpoints` keeps the checkpoint to restore.
-The cold-request figures above are unaffected.
+thirty. That measurement predates automatic conversation snapshots, which now retain
+compatible earlier context within a bounded cache. The cold-request figures above are unaffected.
 
 The board's own client says the same thing about the draft head on a 512-token prompt, where
 prefill dominates and both engines' gains shrink toward it:

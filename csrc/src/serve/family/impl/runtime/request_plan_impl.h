@@ -270,14 +270,18 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
+        auto append_frontier = reusable_append_frontier(sequence);
+        if (!sequence.tail_hidden_valid && append_frontier >= prompt.token_ids.size()) {
+            append_frontier = static_cast<std::uint32_t>(prompt.token_ids.size() - 1);
+        }
         const bool dflash_append_ready =
             speculative_backend != SpeculativeBackend::DFlash ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
-        if (sequence.execution_frontier != 0 && dflash_append_ready &&
+        if (append_frontier != 0 && dflash_append_ready &&
             family::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            sequence.execution_frontier, base.lora_slot)) {
+                                            append_frontier, base.lora_slot)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
-            plan->reuse_base = sequence.execution_frontier;
+            plan->reuse_base = append_frontier;
         } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
                    sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
                    family::detail::prefix_matches(prompt, sequence.ledger,
@@ -314,16 +318,17 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     // Missing scores before the retained frontier require prefill replay. Its
     // boundary token can be scored from the retained final hidden state.
     if (base.prompt_logprobs >= 0 && plan->reuse_base > 0 &&
-        plan->reusable_scores < plan->reuse_base) {
+        (plan->reusable_scores < plan->reuse_base ||
+         (plan->reuse == ReusePath::AppendAtFrontier && !sequence.tail_hidden_valid &&
+          plan->reusable_scores == plan->reuse_base))) {
         plan->reuse = ReusePath::FullReset;
         plan->reuse_base = 0;
     }
 
-    // With rewrite checkpoints disabled the state pool holds no checkpoint
-    // slots, so nothing may be desired, captured or deferred: the plan drops.
+    // Snapshot storage follows the request's existing prefix-cache policy.
     static const std::optional<RewriteCheckpointSpec> kNoCheckpoint;
     const std::optional<RewriteCheckpointSpec>& desired =
-        rewrite_checkpoints ? base.rewrite_checkpoint : kNoCheckpoint;
+        base.allow_prefix_reuse ? base.rewrite_checkpoint : kNoCheckpoint;
     const bool existing_checkpoint_matches =
         desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&

@@ -12,13 +12,14 @@ namespace sinfer::family::detail::SINFER_FAMILY_RUNTIME_NS {
 
 struct DFlashPersistentState {
     CyclicKVCache local;
-    CyclicKVCache rewrite_checkpoint_local;
+    family::DecoderState& decoder;
     family::PagedKVCache full;
     Tensor prefill_features;
     Tensor prefill_positions;
     Tensor pending_features;
 
-    DFlashPersistentState(DeviceSpan backing, const DFlashPersistentLayout& layout);
+    DFlashPersistentState(DeviceSpan backing, const DFlashPersistentLayout& layout,
+                          family::DecoderState& decoder_state);
 
     [[nodiscard]] CyclicKVCacheLayerView local_layer(std::uint32_t layer) const;
     [[nodiscard]] PagedKVBatchLayerView full_batch_layer(std::uint32_t layer) const;

@@ -6,6 +6,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace sinfer {
 
@@ -35,12 +36,17 @@ struct NgramPleStatePool {
     Tensor history;    ///< I32 [history_tokens, slots]
     Tensor conv_state; ///< BF16 [conv_history, channels, slots]
     NgramPleStatePoolSpec spec;
+    std::vector<const NgramPleStatePool*> checkpoint_slots;
 
     NgramPleStatePool() = default;
     NgramPleStatePool(DeviceSpan backing, const NgramPleStatePoolLayout& layout);
 
     [[nodiscard]] bool empty() const noexcept { return history.data == nullptr; }
-    [[nodiscard]] std::int32_t slot_count() const noexcept { return spec.slot_count; }
+    [[nodiscard]] std::int32_t slot_count() const noexcept {
+        return spec.slot_count + static_cast<std::int32_t>(checkpoint_slots.size());
+    }
+    [[nodiscard]] Tensor history_slot(std::int32_t slot) const;
+    [[nodiscard]] Tensor conv_slot(std::int32_t slot) const;
 
     void copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream = nullptr);
     /// Token history becomes EOS, the convolution history zero.

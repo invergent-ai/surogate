@@ -368,7 +368,9 @@ void gqa_attention_prompt_cached_launch(const Tensor& q, const Tensor& positions
                                         float scale, PagedKVBatchLayerView cache, Tensor& out,
                                         cudaStream_t stream, std::int32_t sliding_window,
                                         GqaBlockMask selection) {
-    if (q.ne[3] > 1 && !gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
+    // Prompt kernels consume one sequence, including when a registered shape
+    // falls back here for a cache format without an optimized decode kernel.
+    if (q.ne[3] > 1) {
         for (int batch = 0; batch < q.ne[3]; ++batch) {
             Tensor q_row = batch_tensor(q, batch), out_row = batch_tensor(out, batch);
             const Tensor pos = row_tensor(positions, batch, q.ne[2]);
@@ -407,7 +409,7 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                                  Tensor& out, cudaStream_t stream, std::int32_t sliding_window,
                                  GqaBlockMask selection) {
-    if (q.ne[3] > 1 && !gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
+    if (q.ne[3] > 1) {
         for (int batch = 0; batch < q.ne[3]; ++batch) {
             Tensor q_row = batch_tensor(q, batch), out_row = batch_tensor(out, batch);
             const Tensor pos = row_tensor(positions, batch, q.ne[2]);

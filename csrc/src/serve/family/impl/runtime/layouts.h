@@ -25,20 +25,19 @@ using TensorLayout = TensorRegion;
 struct DFlashPersistentLayout {
     family::DFlashGeometry geometry;
     CyclicKVCacheLayout local;
-    CyclicKVCacheLayout rewrite_checkpoint_local;
     family::PagedKVCacheLayout full;
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
-        return local.payload_bytes() + rewrite_checkpoint_local.payload_bytes() +
-               full.payload_bytes();
+        return local.payload_bytes() + full.payload_bytes();
     }
 };
 
 struct PersistentLayout {
     family::DecoderStateLayout decoder;
+    family::DecoderCheckpointLayout checkpoints;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     family::RoundStateLayout round;
@@ -84,7 +83,6 @@ struct SequencePlanningInputs {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     std::vector<std::uint32_t> kv_skip_layers;
-    bool rewrite_checkpoints               = false;
     bool elastic_kv                        = false;
     bool elastic_kv_overcommit             = false;
     ProposalHead proposal_head             = ProposalHead::Full;
@@ -126,7 +124,6 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     std::vector<std::uint32_t> kv_skip_layers;
-    bool rewrite_checkpoints               = false;
     bool elastic_kv                        = false;
     bool elastic_kv_overcommit             = false;
     ProposalHead proposal_head             = ProposalHead::Full;

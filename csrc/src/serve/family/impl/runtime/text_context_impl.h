@@ -300,9 +300,8 @@ namespace {
 
 void TextContext::set_linear_state_slots(std::int32_t current_slot,
                                          std::int32_t rewrite_checkpoint_slot) {
-    // kNoRewriteCheckpointSlot (-1) means the pool holds no checkpoint slots
-    // (EngineOptions::rewrite_checkpoints off); a capture request against it
-    // is refused where the capture would happen.
+    // kNoRewriteCheckpointSlot means this prefill does not capture a snapshot.
+    // Checkpoint slots are bound on demand before a capture is scheduled.
     const bool checkpoint_ok = rewrite_checkpoint_slot == kNoRewriteCheckpointSlot ||
                                (rewrite_checkpoint_slot >= 0 &&
                                 rewrite_checkpoint_slot < state_.slot_count() &&

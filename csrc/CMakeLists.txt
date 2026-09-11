@@ -1087,6 +1087,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa512_8q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa128_16q8.cu

@@ -30,6 +30,12 @@ int main() {
 
     const ServeOptions defaults = parse({"sinfer-serve", "model.sinfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
+    for (const auto* removed : {"--rewrite-checkpoints", "--no-rewrite-checkpoints"}) {
+        bool rejected = false;
+        try { (void)parse({"sinfer-serve", "model.sinfer", removed}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "removed checkpoint option was accepted");
+    }
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");

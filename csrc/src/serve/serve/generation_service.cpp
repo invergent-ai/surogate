@@ -286,7 +286,6 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.kv_cache_skip_layers     = options_.kv_cache_skip_layers;
-    engine_options.rewrite_checkpoints      = options_.rewrite_checkpoints;
     engine_options.elastic_kv               = options_.elastic_kv;
     engine_options.elastic_kv_overcommit    = options_.elastic_kv_overcommit;
     engine_options.enable_vision            = options_.enable_vision;

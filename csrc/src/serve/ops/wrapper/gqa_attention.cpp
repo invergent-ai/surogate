@@ -29,6 +29,13 @@ bool supported_attention_shape(std::int32_t dim, std::int32_t queries, std::int3
            gqa_kv_shape_is_registered(dim, kv);
 }
 
+bool optimized_decode_shape(std::int32_t dim, std::int32_t queries, std::int32_t kv, DType dtype) {
+    // Keep the new 8q4 shape's existing INT8 support through the prompt kernel:
+    // the INT8 decode schedule cannot distribute a query group of two.
+    return gqa_shape_is_registered(dim, queries, kv) &&
+           !(dtype == DType::I8 && dim == 256 && queries == 8 && kv == 4);
+}
+
 // Resolves the served shape against the geometry registry. A query count can be registered
 // against more than one KV count (16 queries over 2 or 4; 24 over 4 or 2), which is why the
 // caller's KV source picks between them; an unregistered shape throws naming all three numbers.
@@ -477,7 +484,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t head_dim, std::i
         throw std::invalid_argument("gqa_attention workspace: invalid profile or interval");
     }
 
-    if (!gqa_shape_is_registered(head_dim, q_heads, kv_heads)) { return 0; }
+    if (!optimized_decode_shape(head_dim, q_heads, kv_heads, cache_dtype)) { return 0; }
 
     const auto chunk_capacity = [&](std::int32_t width) {
         const std::int32_t splits =
@@ -534,7 +541,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
 
-    if (selection.image_end || !gqa_shape_is_registered(head_dim, q.ne[1], kv_heads)) {
+    if (selection.image_end || !optimized_decode_shape(head_dim, q.ne[1], kv_heads, cache.dtype)) {
         detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                             scale, cache, out, stream, envelope.sliding_window,
                                             selection);
@@ -604,7 +611,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
     const std::int32_t batch = q.ne[3];
     require_registered_shape(q.ne[0], q.ne[1], cache.num_kv_heads, op);
 
-    if (selection.image_end || !gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
+    if (selection.image_end || !optimized_decode_shape(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype)) {
         detail::gqa_attention_prompt_cached_launch(q, positions, valid_columns, kv_table_rows,
                                                    scale, cache, out, stream,
                                                    envelope.sliding_window, selection);
@@ -643,7 +650,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         (selection.image_end && q.ne[3] != 1)) { throw std::invalid_argument("invalid image attention block"); }
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
-    if (selection.image_end || !gqa_shape_is_registered(q.ne[0], q.ne[1], cache.num_kv_heads)) {
+    if (selection.image_end || !optimized_decode_shape(q.ne[0], q.ne[1], cache.num_kv_heads, cache.dtype)) {
         detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,
                                                       envelope.sliding_window, selection);
         return;

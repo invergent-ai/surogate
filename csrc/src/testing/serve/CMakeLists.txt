@@ -199,6 +199,11 @@ target_include_directories(sinfer_family_pretokenizer_digits_test PRIVATE
 sinfer_add_test(sinfer_family_tokenizer_config_test
   SOURCES family/test_tokenizer_config.cpp
   LIBRARIES sinfer_engine sinfer_core)
+sinfer_add_test(sinfer_added_token_matching_test
+  SOURCES family/test_added_token_matching.cpp
+  LIBRARIES sinfer_engine sinfer_core)
+target_include_directories(sinfer_added_token_matching_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+target_compile_options(sinfer_added_token_matching_test PRIVATE -UNDEBUG)
 target_include_directories(sinfer_family_tokenizer_config_test PRIVATE
   ${SERVE_ROOT}/family/export
   ${SERVE_ROOT}/family/impl)
@@ -223,6 +228,11 @@ sinfer_add_test(sinfer_lora_lifecycle_test
   LIBRARIES sinfer_serve)
 target_compile_options(sinfer_lora_lifecycle_test PRIVATE -UNDEBUG)
 set_tests_properties(sinfer_lora_lifecycle_test PROPERTIES SKIP_RETURN_CODE 77)
+sinfer_add_test(sinfer_burst_prefix_test SOURCES test_burst_prefix.cpp LIBRARIES sinfer_serve)
+target_compile_options(sinfer_burst_prefix_test PRIVATE -UNDEBUG -fno-fast-math)
+sinfer_add_test(sinfer_conversation_checkpoints_test SOURCES test_conversation_checkpoints.cpp
+  LIBRARIES sinfer_engine CUDA::cudart)
+target_compile_options(sinfer_conversation_checkpoints_test PRIVATE -UNDEBUG)
 sinfer_add_test(sinfer_lora_coverage_test
   SOURCES test_lora_coverage.cpp
   LIBRARIES sinfer_serve)

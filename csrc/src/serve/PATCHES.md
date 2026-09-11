@@ -2623,7 +2623,9 @@ once per 25,000 requests under 100-user load.
 
 ## 73
 
-Rewrite checkpoints are off by default; `--rewrite-checkpoints` opts in.
+Historical change: rewrite checkpoints became opt-in to reduce startup memory.
+Superseded by automatic, budgeted conversation snapshots allocated on demand; the
+separate command-line setting has been removed.
 
 The GDN state pool held two slots per lane plus the prefill scratch slot:
 the lane's live state and a rewrite checkpoint from which an edited last

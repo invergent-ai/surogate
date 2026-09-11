@@ -101,7 +101,7 @@ _VALUE_OPTIONS = {
 }
 _SWITCH_OPTIONS = {
     "server": _COMMON_SWITCHES | frozenset("""
-        --rewrite-checkpoints --no-rewrite-checkpoints --elastic-kv --no-elastic-kv
+        --elastic-kv --no-elastic-kv
         --elastic-kv-overcommit --enforce-eager --no-prefix-reuse
         --enable-prefix-caching --no-enable-prefix-caching --enable-auto-tool-choice
         --enable-sleep-mode --enable-lora --preserve-thinking --cors

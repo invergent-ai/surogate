@@ -53,12 +53,17 @@ from earlier tokens; its capacity affects how many requests can run together.
 | `--no-cache` | off | Rebuild the prepared model cache on disk |
 | `--no-prefix-reuse` | off | Disable reuse of compatible earlier prompts |
 | `--enable-prefix-caching`, `--no-enable-prefix-caching` | enabled | Alternative spellings for enabling or disabling prompt reuse |
-| `--rewrite-checkpoints`, `--no-rewrite-checkpoints` | off | Enable or disable extra memory for faster editing and resending of the last turn |
 | `--enforce-eager` | off | Disable CUDA graphs for debugging |
 
 When `--max-model-len` is automatic, omitted `--kv-capacity` also defaults to `auto`. When
 context is explicit, omitted cache capacity defaults to that same token count. Use
 `--kv-capacity auto` explicitly to make more cache available for simultaneous requests.
+
+Compatible conversation context is cached automatically, including after a response
+ends on EOS or a stop string. Cache memory is bounded; older entries can be released
+as new requests arrive. Changing earlier messages, requesting additional prompt
+logprobs, or a cache miss can require some or all of the prompt to be processed again.
+Use `--no-prefix-reuse` to disable reuse.
 
 Cache precision `auto` selects BF16 for models such as Qwen3 and Llama, and FP8 for hybrid
 models such as Qwen3.5/3.6/3.8, including with DFlash. FP8 uses half the cache storage of BF16.
