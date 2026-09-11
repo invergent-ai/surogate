@@ -718,11 +718,9 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
             snapshot_base_slots, query, key, value, z, stream);
         return;
     }
-    if (plan.schedule == detail::W8GdnInputConvScheduleId::SplitKMmaFused && !small_fused &&
-        weight.k == 2048) {
-        // surogate vendor patch (PATCHES.md #13/#16/#18): the fused split-K
-        // conv kernel bakes the 35B geometry (port tracked); the 0.8b/2b/4b
-        // take the generic project-then-conv path below instead.
+    if (plan.schedule == detail::W8GdnInputConvScheduleId::SplitKMmaFused) {
+        // The launcher covers every admitted W8 geometry, including 0.8B/2B/4B.
+        // Keep execution on the fused route whose workspace requirement is zero.
         detail::w8_gdn_input_splitk_conv_snapshot_launch(
             x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
             snapshot_base_slots, query, key, value, z, stream);

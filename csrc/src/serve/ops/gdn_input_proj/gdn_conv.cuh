@@ -41,9 +41,9 @@ struct NoHistoryPublish {
                                             float) const {}
 };
 
-// Device-side implementation detail shared by exact packed projection kernels. Projection
-// accumulators stay in the route's existing private precision; Publish changes only the side
-// effect after the convolution has consumed that accumulator.
+// Match the BF16 projections used by prefill and retained across rounds. Without this
+// rounding boundary, live rounds convolve different values than later rounds restore
+// from their saved history.
 template <class Publish>
 struct GdnConvEpilogue {
     const __nv_bfloat16* conv_weight;
@@ -96,7 +96,7 @@ struct GdnConvEpilogue {
                 continue;
             }
 
-            const float p              = projected[token];
+            const float p = __bfloat162float(__float2bfloat16_rn(projected[token]));
             float conv                 = fmaf(w0, s0, 0.0F);
             conv                       = fmaf(w1, s1, conv);
             conv                       = fmaf(w2, s2, conv);

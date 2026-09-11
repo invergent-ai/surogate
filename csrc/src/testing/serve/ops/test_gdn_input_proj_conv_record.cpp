@@ -1,5 +1,6 @@
 #include "api/ops/gdn_input_proj.h"
 
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/input_projection_test_common.h"
 
 #include <cuda_runtime.h>
@@ -44,6 +45,30 @@ int verify_equal(std::string_view label, const std::vector<std::uint16_t>& lhs,
     if (lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin())) { return 0; }
     std::cerr << label << ": BF16 bits differ\n";
     return 1;
+}
+
+int verify_materialized_convolution(std::string_view label, const Tensor& record,
+                                    const Tensor& conv_weight, const Tensor& state,
+                                    const Tensor& valid, const Tensor& initial,
+                                    const GuardedBf16Tensor& query,
+                                    const GuardedBf16Tensor& key,
+                                    const GuardedBf16Tensor& value) {
+    const int width = record.ne[1], batch = record.ne[2];
+    const int value_rows = record.ne[0] - kQueryRows - kKeyRows;
+    GuardedBf16Tensor expected_query(kQueryRows, width * batch);
+    GuardedBf16Tensor expected_key(kKeyRows, width * batch);
+    GuardedBf16Tensor expected_value(value_rows, width * batch);
+    Tensor q(expected_query.data(), DType::BF16, {kQueryRows, width, batch});
+    Tensor k(expected_key.data(), DType::BF16, {kKeyRows, width, batch});
+    Tensor v(expected_value.data(), DType::BF16, {value_rows, width, batch});
+    // Replay the saved BF16 projections through the unfused convolution. The live
+    // round must consume precisely the same values that a later round restores.
+    ops::detail::gdn_projected_conv_record_launch(record, conv_weight, state, valid,
+                                                  initial, q, k, v, nullptr);
+    cuda_synchronize();
+    return verify_equal(std::string(label) + " materialized query", expected_query.bits(), query.bits()) +
+           verify_equal(std::string(label) + " materialized key", expected_key.bits(), key.bits()) +
+           verify_equal(std::string(label) + " materialized value", expected_value.bits(), value.bits());
 }
 
 int verify_zero_tail(std::string_view label, const std::vector<std::uint16_t>& values,
@@ -181,6 +206,9 @@ int run_case(std::string_view label, std::int32_t hidden, std::int32_t value_row
     cuda_synchronize();
 
     int failures = 0;
+    failures += verify_materialized_convolution(label, conv_record_view, conv_weight,
+                                                record_state_view, valid, initial,
+                                                record_query, record_key, record_value);
     failures +=
         verify_equal(std::string(label) + " query", snapshot_query.bits(), record_query.bits());
     failures += verify_equal(std::string(label) + " key", snapshot_key.bits(), record_key.bits());
@@ -270,24 +298,23 @@ int run_q4_q5() {
     return failures;
 }
 
-int run_w8() {
-    constexpr std::int32_t kHidden    = 2048;
-    constexpr std::int32_t kValueRows = 4096;
-    constexpr std::int32_t kZRows     = 4096;
+int run_w8(std::int32_t hidden, std::int32_t value_rows) {
+    const std::int32_t parent_rows = kQueryRows + kKeyRows + 2 * value_rows;
     DevicePackedWeight parent(
-        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 12288, kHidden, 1501U));
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, parent_rows, hidden, 1501U));
 
     int failures   = 0;
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
                          std::uint32_t seed) {
         const std::size_t snapshot_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                kQueryRows, kKeyRows, kValueRows, batch, width, width);
+                QType::W8G32_F16S, parent_rows, hidden, ops::LinearPolicy::A16Only, batch, width, width);
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            kQueryRows, kKeyRows, kValueRows, batch, width, width);
+            QType::W8G32_F16S, parent_rows, hidden, ops::LinearPolicy::A16Only, batch, width, width);
         return run_case(
-            "W8 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
-            kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
+            "W8 K=" + std::to_string(hidden) + " V=" + std::to_string(value_rows) +
+                " B=" + std::to_string(batch) + " T=" + std::to_string(width),
+            hidden, value_rows, value_rows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
                 Tensor& z, WorkspaceArena& workspace) {
@@ -485,6 +512,8 @@ int run_fp8_oracle_case(DevicePackedWeight& parent, std::int32_t width, std::int
     const std::string label = std::string("FP8 ") + (uses_a8 ? "A8" : "A16") +
                               " B=" + std::to_string(batch) + " W=" + std::to_string(width);
     int failures = compare(label + " record", record_actual, record_expected, criterion);
+    failures += verify_materialized_convolution(label, record_view, conv_weight, state,
+                                                valid, initial, query, key, value);
     failures += compare(label + " query/key/value", output_actual, output_expected, criterion);
     failures += compare(label + " z", z_actual, z_expected, criterion);
     failures +=
@@ -564,7 +593,10 @@ int main() {
         ++failures;
     }
     failures += run_q4_q5();
-    failures += run_w8();
+    failures += run_w8(1024, 2048);
+    failures += run_w8(2048, 2048);
+    failures += run_w8(2048, 4096);
+    failures += run_w8(2560, 4096);
     failures += run_nvfp4();
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";

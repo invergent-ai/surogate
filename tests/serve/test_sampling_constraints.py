@@ -41,7 +41,9 @@ def server(tmp_path_factory):
     if devices := os.getenv("SUROGATE_SAMPLING_TEST_DEVICES"):
         command += ["--devices", devices]
     if backend := os.getenv("SUROGATE_SAMPLING_TEST_SPEC"):
-        command += ["--spec", backend, "--draft-tokens", "3", "--kv-cache-dtype", "bf16"]
+        command += ["--spec", backend, "--draft-tokens",
+                    os.getenv("SUROGATE_SAMPLING_TEST_DRAFT_TOKENS", "3"),
+                    "--kv-cache-dtype", "bf16"]
     with log.open("w") as output:
         process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
         try:

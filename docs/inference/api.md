@@ -138,9 +138,9 @@ renormalized over the tokens allowed by a schema or sampling filter. Generated s
 reasoning and tool-call syntax. Ordinary, MTP, and DFlash generation support these fields,
 including pipeline serving.
 
-Freshly rescoring quantized speculative output as a prompt can produce different values
-from those returned during generation. Use the generated-token scores when you need the
-probabilities from the original rollout.
+Numerical rounding can cause small differences between scores returned during generation
+and scores from a separate prompt-scoring request. Use the generated-token scores when
+you need the probabilities from the original rollout.
 
 Requesting and retaining scores adds work and uses system memory. Repeated or extended
 prompts can reuse cached scores when the model, adapter, and prefix match and the cached entries contain enough alternatives for the
