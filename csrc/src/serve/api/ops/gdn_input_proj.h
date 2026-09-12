@@ -56,7 +56,9 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * selects A16 through T=7 and private activation quantization followed by A8 Tensor Core
  * contraction at every T>=8. Every route writes the two independent final allocations directly.
  * The complete projection is evaluated against the same exact-decode/naive-FP64 oracle;
- * activation quantization and the production reduction profile are private effects covered by the
+ * for W8, each decoded weight is rounded to BF16 before the oracle's FP64 contraction,
+ * matching the weight materialization shared by decode and prefill.
+ * Activation quantization and the production reduction profile are private effects covered by the
  * selected criterion. x, both persistent weight planes, qkv, z, and the live workspace must be
  * mutually non-overlapping.
  *
@@ -208,12 +210,11 @@ void gdn_input_proj_conv_record_split(
  *   A mixed-width invocation has B>=1 and every valid extent lies in [1,W].
  *
  * Numeric:
- *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, z, and
- *   every snapshot value naively in FP64 from represented inputs. BF16 query/key/value/z and
- *   snapshots are promoted and compared directly with those ideal values; their final storage
- *   rounding belongs to the Op's named A16 criterion, not the oracle. Former unfused projection
- *   tensors are not observable cast boundaries; production routes use their natural private
- *   accumulator and staging precision. This two-parent Q4/Q5 form does not quantize activation;
+ *   The oracle exact-decodes packed weights and evaluates projection in FP64, then rounds p
+ *   to BF16 before convolution and history updates. Fused and materialized routes consume the
+ *   same represented projection that subsequent rounds restore from snapshots. Convolution,
+ *   SiLU, and z are evaluated in FP64; final query/key/value/z storage rounding belongs to the
+ *   Op's named A16 criterion. This two-parent Q4/Q5 form does not quantize activation;
  *   the single-parent policy-bearing form below defines its own permitted compute profiles.
  *
  * Effects:
@@ -236,7 +237,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  * Single-parent form of gdn_input_proj_conv_snapshot. Registered parents are W8G32_F16S RowSplit
  * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16S RowScale
  * [16384,5120], all in q/k/value/z row order. W8 admits A16Only, NVFP4 admits A16Only/AllowA4,
- * and FP8 admits A16Only/AllowA8. B=1 accepts every positive W for FP8; the batched domain is
+ * and FP8 admits A16Only/AllowA8. The W8 oracle rounds decoded weights to BF16 before its FP64
+ * projection, as in gdn_input_proj. B=1 accepts every positive W for FP8; the batched domain is
  * B=2..8 and W=1..16. For FP8 B=1, A16 is fused at W=1..3 and W=7..10 and materialized
  * otherwise; AllowA8 uses the same winners through W=9 and A8 from W=10. Batched AllowA8 uses A8
  * when B*W>=9. Tensor operands, the complete FP8 parent, and live workspace must be mutually

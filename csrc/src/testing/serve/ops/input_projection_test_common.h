@@ -142,6 +142,32 @@ inline std::vector<double> gather_rows(const std::vector<double>& full, std::int
     return gathered;
 }
 
+inline std::vector<double> projection_weight_row_fp64(
+    const quantized_weight::PackedWeight& weight, std::int32_t row) {
+    std::vector<double> decoded = quantized_weight::materialize_row_fp64(weight, row);
+    if (weight.weight.qtype == QType::W8G32_F16S) {
+        // A16 W8 materializes each scaled weight in BF16 before the dot.
+        for (double& value : decoded) {
+            value = bf16_to_f32(f32_to_bf16(static_cast<float>(value)));
+        }
+    }
+    return decoded;
+}
+
+inline double projection_dot_fp64(const quantized_weight::PackedWeight& weight, std::int32_t row,
+                                   const float* activation, std::int32_t hidden) {
+    if (activation == nullptr || hidden != weight.weight.shape[1]) {
+        throw std::invalid_argument("projection oracle: invalid activation or logical K");
+    }
+    const std::vector<double> decoded = projection_weight_row_fp64(weight, row);
+    double accumulated = 0.0;
+    for (std::int32_t column = 0; column < hidden; ++column) {
+        accumulated += decoded[static_cast<std::size_t>(column)] *
+                       static_cast<double>(activation[column]);
+    }
+    return accumulated;
+}
+
 inline std::vector<double>
 projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
                   std::int32_t output_rows, const std::vector<float>& activation,
@@ -153,12 +179,8 @@ projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t wei
     // summation order -- the weight is simply not re-derived per token.
     sinfer::test::parallel_rows(static_cast<std::int32_t>(selected.size()),
                                 [&](std::int32_t index) {
-        std::vector<double> row = quantized_weight::materialize_row_fp64(
+        const std::vector<double> row = projection_weight_row_fp64(
             weight, weight_row_offset + selected[static_cast<std::size_t>(index)]);
-        if (weight.weight.qtype == QType::W8G32_F16S) {
-            // A16 W8 materializes each scaled weight in BF16 before the dot.
-            for (double& value : row) { value = bf16_to_f32(f32_to_bf16(static_cast<float>(value))); }
-        }
         for (std::int32_t token = 0; token < tokens; ++token) {
             const float* column = activation.data() + static_cast<std::size_t>(token) * hidden;
             double accumulated  = 0.0;
