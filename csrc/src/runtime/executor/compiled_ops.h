@@ -1144,6 +1144,14 @@ private:
     // Populated once per key (forward: in permute/ep_dispatch; backward: on first access).
     // Avoids redundant D2H synchronization in grouped GEMM ops within the same layer.
     std::unordered_map<int, std::vector<int>> mMoEHostOffsetsCache;
+    // Which forward filled mMoEHostOffsetsCache. A saving (training) forward of
+    // the same micro-step lets backward reuse it: routing is a pure function of
+    // the saved forward and recompute re-derives the same offsets, so the read
+    // back once per MoE layer per backward pass is redundant.
+    int mMoEHostOffsetsMicroStep = -1;
+    bool mMoEHostOffsetsFromSavedForward = false;
+    bool mMoEHostOffsetsReusable = false;
+    int mMoEExpertOffsetsGPUElems = 0;  // Elements saved into mMoEExpertOffsetsGPU (0 = none)
 
     // Persistent saved-tensor cache: gated-delta states, rope/qk-norm caches, MoE expert
     // bookkeeping, and the SaveForBwd persist fallback. Single owner of the buffers +

@@ -84,6 +84,9 @@ void CompiledExecutor::initialize_forward_execution(const CompiledGraph& graph, 
     mCurrentGraph = &graph;
     mTemps.clear();
     mMoEHostOffsetsCache.clear();
+    mMoEHostOffsetsMicroStep = mMicroStep;
+    mMoEHostOffsetsFromSavedForward = false;
+    mMoEHostOffsetsReusable = false;
     // cudaFree and cudaMemPoolTrimTo are prohibited during CUDA stream capture —
     // they invalidate the capture. Skip all cleanup when capturing; it will run
     // on the next eager (non-captured) step instead.

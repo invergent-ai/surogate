@@ -138,17 +138,10 @@ void moe_grouped_gemm_gate_up_impl(
     const int gemm_count = static_cast<int>(m_vec.size());
 
     // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
-    const T** d_A_array = nullptr;
-    const T** d_B_array = nullptr;
-    T** d_C_array = nullptr;
-
-    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
-    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
-    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
-
-    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    const auto ptr_arrays = stage_moe_grouped_ptr_arrays<T>(A_vec, B_vec, C_vec, stream);
+    const T** d_A_array = ptr_arrays.A;
+    const T** d_B_array = ptr_arrays.B;
+    T** d_C_array = ptr_arrays.C;
 
     std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_T);
     std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
@@ -177,10 +170,6 @@ void moe_grouped_gemm_gate_up_impl(
                                             group_size_vec.data(),
                                             CUBLAS_COMPUTE_32F));
 
-    // Free device pointer arrays
-    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
-    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
-    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
 template <typename T>
@@ -309,17 +298,10 @@ void moe_grouped_gemm_down_impl(
     const int gemm_count = static_cast<int>(m_vec.size());
 
     // cublasGemmGroupedBatchedEx requires pointer arrays to be in device memory
-    const T** d_A_array = nullptr;
-    const T** d_B_array = nullptr;
-    T** d_C_array = nullptr;
-
-    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_A_array), sizeof(T*) * gemm_count, stream));
-    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_B_array), sizeof(T*) * gemm_count, stream));
-    CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&d_C_array), sizeof(T*) * gemm_count, stream));
-
-    CUDA_CHECK(cudaMemcpyAsync(d_A_array, A_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_B_array, B_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_C_array, C_vec.data(), sizeof(T*) * gemm_count, cudaMemcpyHostToDevice, stream));
+    const auto ptr_arrays = stage_moe_grouped_ptr_arrays<T>(A_vec, B_vec, C_vec, stream);
+    const T** d_A_array = ptr_arrays.A;
+    const T** d_B_array = ptr_arrays.B;
+    T** d_C_array = ptr_arrays.C;
 
     std::vector<cublasOperation_t> transa_vec(gemm_count, CUBLAS_OP_T);
     std::vector<cublasOperation_t> transb_vec(gemm_count, CUBLAS_OP_N);
@@ -348,10 +330,6 @@ void moe_grouped_gemm_down_impl(
                                             group_size_vec.data(),
                                             CUBLAS_COMPUTE_32F));
 
-    // Free device pointer arrays
-    CUDA_CHECK(cudaFreeAsync(d_A_array, stream));
-    CUDA_CHECK(cudaFreeAsync(d_B_array, stream));
-    CUDA_CHECK(cudaFreeAsync(d_C_array, stream));
 }
 
 void moe_grouped_gemm_gate_up(nv_bfloat16* output,

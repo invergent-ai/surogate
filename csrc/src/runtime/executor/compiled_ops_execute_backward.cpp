@@ -130,8 +130,16 @@ void CompiledExecutor::initialize_backward_execution(const CompiledGraph& graph,
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
     // communication op), so the GPU persistent buffers may be stale. The forward
     // cache has the correct merged expert offsets for each layer.
+    // Without EP the cache is kept too when it came from the saving forward of
+    // this same micro-step: routing is a pure function of that forward, so the
+    // per-layer read back (one device sync each) would return the same values.
+    // Anything else in between (an eval forward, another micro-step) clears it.
     if (mConfig.EPSize <= 1) {
-        mMoEHostOffsetsCache.clear();
+        mMoEHostOffsetsReusable = mMoEHostOffsetsFromSavedForward && mMoEHostOffsetsMicroStep == micro_step &&
+                                  !mMoEHostOffsetsCache.empty();
+        if (!mMoEHostOffsetsReusable) {
+            mMoEHostOffsetsCache.clear();
+        }
     }
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
     mNamedTensors.clear();
@@ -436,36 +444,13 @@ void CompiledExecutor::bind_backward_entry_gradient_tensors() {
 }
 
 void CompiledExecutor::restore_moe_expert_offsets_for_backward() {
-    // Restore MoE expert_offsets from persistent CPU storage
-    // This is needed by grouped GEMM backward ops for proper token routing
-    if (mConfig.NumExperts > 0 && !mMoEExpertOffsetsData.empty()) {
-        // Allocate PERSISTENT GPU buffer for expert_offsets (not stack-allocated)
-        // This ensures the memory won't be invalidated by stack restores or temp_free calls
-        const int num_elements = static_cast<int>(mMoEExpertOffsetsData.size());
-        const size_t needed_bytes = num_elements * sizeof(int);
-
-        // Allocate or resize GPU buffer if needed
-        if (mMoEExpertOffsetsGPU == nullptr || mMoEExpertOffsetsGPUSize < needed_bytes) {
-            if (mMoEExpertOffsetsGPU) {
-                CUDA_CHECK(cudaFree(mMoEExpertOffsetsGPU));
-            }
-            CUDA_CHECK(cudaMalloc(&mMoEExpertOffsetsGPU, needed_bytes));
-            mMoEExpertOffsetsGPUSize = needed_bytes;
-        }
-
-        // Copy data from CPU to GPU
-        CUDA_CHECK(cudaMemcpyAsync(mMoEExpertOffsetsGPU,
-                                   mMoEExpertOffsetsData.data(),
-                                   needed_bytes,
-                                   cudaMemcpyHostToDevice,
-                                   mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-
-        // Create tensor wrapper pointing to persistent buffer
+    // The forward's save_tensors copied the graph-level expert_offsets into the
+    // persistent device buffer in stream order; backward only needs the binding.
+    if (mConfig.NumExperts > 0 && mMoEExpertOffsetsGPU != nullptr && mMoEExpertOffsetsGPUElems > 0) {
         Tensor expert_offsets;
         expert_offsets.DType = ETensorDType::INT32;
         expert_offsets.Rank = 1;
-        expert_offsets.Sizes[0] = num_elements;
+        expert_offsets.Sizes[0] = mMoEExpertOffsetsGPUElems;
         expert_offsets.Data = static_cast<std::byte*>(mMoEExpertOffsetsGPU);
 
         bind_tensor("moe_expert_offsets", expert_offsets);

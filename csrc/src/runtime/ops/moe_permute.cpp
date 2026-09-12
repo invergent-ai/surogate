@@ -90,7 +90,12 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     // PINNED memory + a poll wait: a pageable async D2H can block inside the
     // driver's staging pool when all worker threads copy at once, convoying
     // with in-stream NCCL kernels into a cross-rank deadlock.
-    if (num_experts > 0) {
+    // Backward recompute re-derives exactly the offsets the forward of this
+    // micro-step already read back; skip the round trip while that copy is valid.
+    const int offsets_key = layer_idx_any >= 0 ? ep_state_key(layer_idx_any) : -1;
+    const bool reuse_forward_copy = mInBackwardPass && mMoEHostOffsetsReusable && offsets_key >= 0 &&
+                                    mMoEHostOffsetsCache.count(offsets_key) > 0;
+    if (num_experts > 0 && !reuse_forward_copy) {
         const std::size_t off_bytes = static_cast<std::size_t>(num_experts + 1) * sizeof(int);
         if (mMoEOffsetsPinnedBytes < off_bytes) {
             if (mMoEOffsetsPinned) {
@@ -117,8 +122,7 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
         std::memcpy(mMoEExpertOffsetsData.data(), mMoEOffsetsPinned, off_bytes);
 
         // Populate per-layer cache so downstream gate_up/down ops skip redundant D2H syncs.
-        if (layer_idx_any >= 0) {
-            const int offsets_key = ep_state_key(layer_idx_any);
+        if (offsets_key >= 0) {
             mMoEHostOffsetsCache[offsets_key] = mMoEExpertOffsetsData;
         }
     }

@@ -926,9 +926,12 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
     }
 
-    // For MoE models, copy expert_offsets data to persistent storage for backward pass
-    // The original tensor is stack-allocated and will be freed before backward runs
+    // For MoE models, keep the graph-level expert_offsets for the backward pass:
+    // the original tensor is stack-allocated and gone by then. A device-to-device
+    // copy in stream order into a persistent buffer, no host round trip (the
+    // per-layer host copies live in mMoEHostOffsetsCache, filled by permute).
     if (mConfig.NumExperts > 0) {
+        mMoEHostOffsetsFromSavedForward = true;
         Tensor* moe_offsets = nullptr;
         if (mCurrentGraph) {
             int tid = mCurrentGraph->find_tensor_id("moe_expert_offsets");
@@ -939,12 +942,25 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (moe_offsets) {
             const Tensor& src = *moe_offsets;
             const int num_elements = static_cast<int>(src.nelem());
-            mMoEExpertOffsetsData.resize(num_elements);
-            CUDA_CHECK(
-                cudaMemcpy(mMoEExpertOffsetsData.data(), src.Data, num_elements * sizeof(int), cudaMemcpyDeviceToHost));
+            const std::size_t needed_bytes = static_cast<std::size_t>(num_elements) * sizeof(int);
+            if (mMoEExpertOffsetsGPU == nullptr || mMoEExpertOffsetsGPUSize < needed_bytes) {
+                cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+                if (cudaStreamIsCapturing(mRunState.MainStream, &capture_status) == cudaSuccess &&
+                    capture_status != cudaStreamCaptureStatusNone) {
+                    throw std::runtime_error("save_tensors: MoE expert offsets buffer cannot grow during capture");
+                }
+                if (mMoEExpertOffsetsGPU) {
+                    CUDA_CHECK(cudaFree(mMoEExpertOffsetsGPU));
+                }
+                CUDA_CHECK(cudaMalloc(&mMoEExpertOffsetsGPU, needed_bytes));
+                mMoEExpertOffsetsGPUSize = needed_bytes;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                mMoEExpertOffsetsGPU, src.Data, needed_bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            mMoEExpertOffsetsGPUElems = num_elements;
             // Store metadata for reconstruction in backward
             mMoEExpertOffsets = src;           // Copy the tensor metadata (shape, dtype, etc.)
-            mMoEExpertOffsets.Data = nullptr;  // Data will be restored from CPU storage
+            mMoEExpertOffsets.Data = nullptr;  // Bound to the persistent buffer in backward
         }
     }
 }
