@@ -10,6 +10,18 @@ pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(),
 TILES = dict(TM=64, TN=16, TK=32)
 
 
+def _no_bias():
+    """The kernel's optional bf16 and fp32 biases, absent.
+
+    An empty tensor has a null data pointer, which is exactly what the C++
+    launcher passes when a projection has no bias; the kernel tests the pointer.
+    """
+    return (
+        torch.empty(0, device="cuda", dtype=torch.bfloat16),
+        torch.empty(0, device="cuda", dtype=torch.float32),
+    )
+
+
 @pytest.mark.parametrize(
     "weight_dtype,input_dtype,out_dtype",
     [
@@ -26,6 +38,8 @@ def test_projection_is_invariant_to_batch_size_and_row_position(weight_dtype, in
     x = torch.randn(rows, width, device="cuda", dtype=input_dtype)
     w = torch.randn(features, width, device="cuda", dtype=weight_dtype)
     original = torch.randn(rows, features + 5, device="cuda", dtype=out_dtype)
+    bias_bf16 = torch.randn(features, device="cuda", dtype=torch.bfloat16)
+    bias_fp32 = torch.randn(features, device="cuda", dtype=torch.float32)
     out = original.clone()
     matmul[(triton.cdiv(rows, 16), triton.cdiv(features, 64))](
         w,
@@ -41,9 +55,16 @@ def test_projection_is_invariant_to_batch_size_and_row_position(weight_dtype, in
         features + 5,
         0.7,
         0.3,
+        bias_bf16,
+        bias_fp32,
         **TILES,
     )
-    expected = 0.7 * (x.double() @ w.double().T) + 0.3 * original[:, :features].double()
+    expected = (
+        0.7 * (x.double() @ w.double().T)
+        + 0.3 * original[:, :features].double()
+        + bias_bf16.double()
+        + bias_fp32.double()
+    )
     torch.testing.assert_close(
         out[:, :features].double(), expected, atol=2e-5, rtol=0.004 if out_dtype == torch.bfloat16 else 2e-5
     )
@@ -64,6 +85,8 @@ def test_projection_is_invariant_to_batch_size_and_row_position(weight_dtype, in
             features + 5,
             0.7,
             0.3,
+            bias_bf16,
+            bias_fp32,
             **TILES,
         )
         assert torch.equal(out[row], single)
@@ -119,6 +142,7 @@ def test_grouped_projection_replays_with_empty_experts_and_changed_routing():
                 features,
                 1.0,
                 0.0,
+                *_no_bias(),
                 **TILES,
             )
             assert torch.equal(out[end - 1], single)
