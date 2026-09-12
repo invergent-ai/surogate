@@ -476,7 +476,7 @@ int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
         run(columns, false);
         reference = got;
         for (bool capture : {false, true}) {
-            for (int tokens : {1, 2, 3, 4, 5, 8, 9, 17, 32, 33, 64, 65, 128}) {
+            for (int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 32, 33, 64, 65, 128}) {
                 run(tokens, capture);
                 const auto count = std::size_t(f.n) * tokens;
                 const bool equal = std::memcmp(reference.data(), got.data(), count * sizeof(__nv_bfloat16)) == 0;
@@ -610,7 +610,7 @@ int main() {
 #undef SINFER_TEST_TYPE
     };
     for (const gg::GgmlType type : types) {
-        for (const char* label : {"synthetic", "odd", "tail", "real", "big"}) {
+        for (const char* label : {"synthetic", "odd", "tail", "decode_rows", "real", "big"}) {
             Fixture f;
             if (!load_fixture(dir, type, label, f)) { continue; }
             const bool big = f.label == "big";
@@ -658,7 +658,7 @@ int main() {
                 }
             }
             failures += run_consistent_columns(f, d_blocks, d_scratch, scratch_bytes);
-            cases += 52;
+            cases += 60;
             CHECK_CUDA(cudaFree(d_scratch));
             CHECK_CUDA(cudaFree(d_blocks));
         }

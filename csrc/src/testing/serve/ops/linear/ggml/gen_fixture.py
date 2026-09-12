@@ -112,6 +112,9 @@ for i, t in enumerate(TYPES):
     # Odd block counts include K=96/192 for formats without 256-value blocks.
     tail_k = 3 * BLOCK_VALUES.get(t, 256)
     write(t, synthetic(t, 17, tail_k, 300 + i), 17, tail_k, "tail")
+    if t in (T.Q8_0, T.IQ4_NL):
+        # Cross the narrow-kernel row threshold with partial K and row tiles.
+        write(t, synthetic(t, 8193, 96, 400 + i), 8193, 96, "decode_rows")
 #: Real tensors of every type, from whichever files on this machine carry them: the K_M
 #: file for the K-quants, unsloth's UD mixtures for the IQ family. Comma-separated.
 def _hub(name: str) -> list[pathlib.Path]:

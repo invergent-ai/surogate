@@ -3,7 +3,7 @@
 #include "core/device.h"
 
 #include "ops/linear/ggml/ggml_dense_decode.cuh"
-#include "ops/linear/ggml/ggml_dense_generic.cuh"
+#include "ops/linear/ggml/ggml_dense_block32.cuh"
 #include "ops/linear/ggml/ggml_i8_tile.cuh"
 #include "ops/linear/ggml/ggml_q8_1.h"
 
@@ -109,6 +109,24 @@ void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_
         if constexpr (Type == GgmlType::Q4_K || Type == GgmlType::Q5_K || Type == GgmlType::Q6_K) {
             // These formats use the specialized tile above.
         } else {
+            if constexpr (Type == GgmlType::Q8_0 || Type == GgmlType::IQ4_NL) {
+                if (tokens == 1) {
+                    dense_block32_decode_kernel<Type, 2, 4, 1>
+                        <<<dim3((rows + 3) / 4, tokens), 128, 0, stream>>>(
+                            bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                    return;
+                }
+                // Large two-column projections still favor the row kernel;
+                // the tensor-core tile wins as more columns share its work.
+                const bool tensor_decode = rows <= 4096 ||
+                    (Type == GgmlType::IQ4_NL && tokens >= 3) ||
+                    (tokens >= 5 && rows <= 8192) || (tokens >= 7 && rows <= 16384);
+                if (tokens <= 8 && tensor_decode) {
+                    dense_block32_decode_mma_kernel<Type, 16><<<(rows + 15) / 16, 256, 0, stream>>>(
+                        bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                    return;
+                }
+            }
             if constexpr (Type == GgmlType::F16) {
                 if (tokens <= 8) {
                     const auto narrow = [&]<int Rows>() {
