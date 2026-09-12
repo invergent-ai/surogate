@@ -2,35 +2,51 @@
 
 #include "ops/common/math.cuh"
 #include "ops/linear/ggml/ggml_dense_block32.cuh"
+#include "ops/linear/ggml/ggml_dense_decode.cuh"
 
 namespace sinfer::ops::detail::ggml {
 
+template <GgmlType Type>
+__device__ __forceinline__ float swiglu_row_dot(const uint8_t* weights, const int8_t* x,
+                                                const __half2* scales, int k) {
+    if constexpr (Type == GgmlType::Q8_0 || Type == GgmlType::IQ4_NL) {
+        return dense_block32_dot<Type, 2, 1>(weights, x, scales, k);
+    } else {
+        using Codec = typename PrefillCodecFor<Type>::Codec;
+        static_assert(PrefillCodecFor<Type>::kInt8Route);
+        return dense_k_dot<Codec>(reinterpret_cast<const typename Codec::Block*>(weights),
+                                  x, scales, k);
+    }
+}
+
 // Adjacent warps compute matching gate/up rows. Round both projections exactly
 // as linear_launch does, then apply the same activation as the unfused path.
-template <GgmlType Gate, GgmlType Up>
-__global__ __launch_bounds__(128) void swiglu_decode_kernel(const uint8_t* gate, const uint8_t* up,
+template <GgmlType Gate, GgmlType Up, int Warps = 4>
+__global__ __launch_bounds__(Warps * 32) void swiglu_decode_kernel(const uint8_t* gate, const uint8_t* up,
                                                             const int8_t* codes, const __half2* ds,
                                                             int rows, int k, int tokens,
                                                             __nv_bfloat16* out) {
-    __shared__ __nv_bfloat16 halves[4];
+    static_assert(Warps == 2 || Warps == 4);
+    constexpr int tile_rows = Warps / 2;
+    __shared__ __nv_bfloat16 halves[Warps];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const int row = blockIdx.x * 2 + warp / 2, token = blockIdx.y;
+    const int row = blockIdx.x * tile_rows + warp / 2, token = blockIdx.y;
     float value = 0;
     if (row < rows) {
         const auto* x      = codes + int64_t(token) * k;
         const auto* scales = ds + int64_t(token) * (k / 32);
         if ((warp & 1) == 0) {
-            value = dense_block32_dot<Gate, 2, 1>(
-                gate + int64_t(row) * (k / 32) * block_bytes(Gate), x, scales, k);
+            value = swiglu_row_dot<Gate>(
+                gate + int64_t(row) * (k / block_values(Gate)) * block_bytes(Gate), x, scales, k);
         } else {
-            value = dense_block32_dot<Up, 2, 1>(up + int64_t(row) * (k / 32) * block_bytes(Up), x,
-                                                scales, k);
+            value = swiglu_row_dot<Up>(
+                up + int64_t(row) * (k / block_values(Up)) * block_bytes(Up), x, scales, k);
         }
     }
     if (lane == 0) { halves[warp] = __float2bfloat16_rn(value + 0.0f); }
     __syncthreads();
-    const int output_row = blockIdx.x * 2 + threadIdx.x;
-    if (threadIdx.x < 2 && output_row < rows) {
+    const int output_row = blockIdx.x * tile_rows + threadIdx.x;
+    if (threadIdx.x < tile_rows && output_row < rows) {
         out[int64_t(token) * rows + output_row] = __float2bfloat16_rn(
             swiglu_clamped(__bfloat162float(halves[2 * threadIdx.x]),
                            __bfloat162float(halves[2 * threadIdx.x + 1]), 0.0f));

@@ -606,29 +606,52 @@ int run_swiglu(const Fixture& gate_f, const Fixture& up_f, bool mapped, bool seg
 // Exercise large matrices on both sides of the bandwidth fallback, including
 // switching between scalar fusion, batched decode and prefill for one weight.
 int run_large_swiglu(const std::string& dir, int& cases) {
-    Fixture q8, iq4;
-    if (!load_fixture(dir, gg::GgmlType::Q8_0, "synthetic", q8) ||
-        !load_fixture(dir, gg::GgmlType::IQ4_NL, "synthetic", iq4)) {
-        return 0;
-    }
-    for (auto* f : {&q8, &iq4}) {
-        const auto original = f->blocks;
-        f->n = f->k = 8192;
-        f->label = "large_swiglu";
-        f->dequant.clear();
-        f->blocks.resize(std::size_t(f->n) * (f->k / 32) * gg::block_bytes(f->type));
-        for (std::size_t offset = 0; offset < f->blocks.size(); offset += original.size()) {
-            std::memcpy(f->blocks.data() + offset, original.data(),
-                        std::min(original.size(), f->blocks.size() - offset));
+    std::vector<Fixture> weights;
+    for (auto type : {gg::GgmlType::Q8_0, gg::GgmlType::IQ4_NL, gg::GgmlType::Q4_K,
+                      gg::GgmlType::Q5_K, gg::GgmlType::Q6_K}) {
+        Fixture f;
+        if (!load_fixture(dir, type, "synthetic", f)) { continue; }
+        const auto original = f.blocks;
+        f.n = f.k = 8192;
+        f.label = "large_swiglu";
+        f.dequant.clear();
+        f.blocks.resize(std::size_t(f.n) * (f.k / gg::block_values(type)) * gg::block_bytes(type));
+        for (std::size_t offset = 0; offset < f.blocks.size(); offset += original.size()) {
+            std::memcpy(f.blocks.data() + offset, original.data(),
+                        std::min(original.size(), f.blocks.size() - offset));
         }
+        weights.push_back(std::move(f));
     }
     int failures = 0;
-    for (const auto* gate : {&q8, &iq4}) {
-        for (const auto* up : {&q8, &iq4}) {
-            failures += run_swiglu(*gate, *up, false, true, cases);
+    for (const auto& gate : weights) {
+        for (const auto& up : weights) {
+            failures += run_swiglu(gate, up, false, true, cases);
         }
     }
     return failures;
+}
+
+// A zero gate must stay zero after affine cancellation, even with nonzero up
+// weights and activation scales whose sum is not exactly representable in FP16.
+template <class Block>
+int run_zero_swiglu(const Fixture& up, int& cases) {
+    Fixture gate = up;
+    gate.label = "zero_gate";
+    Block b{};
+    if constexpr (std::is_same_v<Block, gg::block_q6_K>) {
+        b.d = __float2half(1.0f);
+        std::fill_n(b.scales, gg::QK_K / 16, 1);
+        std::fill_n(b.qh, gg::QK_K / 4, 0xaa);
+    } else {
+        b.dm = __floats2half2_rn(1.0f, 1.0f);
+        std::fill_n(b.scales, 8, 1);
+        std::fill_n(b.scales + 8, 4, 0x11);
+        std::fill_n(b.qs, gg::QK_K / 2, 0x11);
+    }
+    for (std::size_t offset = 0; offset < gate.blocks.size(); offset += sizeof(Block)) {
+        std::memcpy(gate.blocks.data() + offset, &b, sizeof(Block));
+    }
+    return run_swiglu(gate, up, false, true, cases);
 }
 
 // Every stored value is d*1 - dmin*1 == 0. An affine projection must stay zero
@@ -791,16 +814,24 @@ int main() {
             }
             failures += run_consistent_columns(f, d_blocks, d_scratch, scratch_bytes);
             cases += 60;
-            if ((type == gg::GgmlType::Q8_0 || type == gg::GgmlType::IQ4_NL) &&
-                (f.label == "synthetic" || f.label == "tail" || f.label == "decode_rows")) {
-                for (auto up_type : {gg::GgmlType::Q8_0, gg::GgmlType::IQ4_NL, gg::GgmlType::F16}) {
+            if ((type == gg::GgmlType::Q8_0 || type == gg::GgmlType::IQ4_NL ||
+                 type == gg::GgmlType::Q4_K || type == gg::GgmlType::Q5_K || type == gg::GgmlType::Q6_K) &&
+                (f.label == "synthetic" || f.label == "odd" || f.label == "tail" || f.label == "decode_rows")) {
+                for (auto up_type : {gg::GgmlType::Q8_0, gg::GgmlType::IQ4_NL, gg::GgmlType::Q4_K,
+                                     gg::GgmlType::Q5_K, gg::GgmlType::Q6_K, gg::GgmlType::F16}) {
                     Fixture up;
                     if (!load_fixture(dir, up_type, f.label, up)) { continue; }
+                    if (up.n != f.n || up.k != f.k) { continue; }
                     for (bool mapped : {false, true}) {
                         failures += run_swiglu(f, up, mapped, true, cases);
                         if (type == up_type) { failures += run_swiglu(f, up, mapped, false, cases); }
                     }
                 }
+            }
+            if (f.label == "tail") {
+                if (type == gg::GgmlType::Q4_K) { failures += run_zero_swiglu<gg::block_q4_K>(f, cases); }
+                if (type == gg::GgmlType::Q5_K) { failures += run_zero_swiglu<gg::block_q5_K>(f, cases); }
+                if (type == gg::GgmlType::Q6_K) { failures += run_zero_swiglu<gg::block_q6_K>(f, cases); }
             }
             CHECK_CUDA(cudaFree(d_scratch));
             CHECK_CUDA(cudaFree(d_blocks));
