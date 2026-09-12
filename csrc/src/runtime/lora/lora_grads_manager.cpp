@@ -99,10 +99,13 @@ void ModularLoRAGradsManager::allocate_gradients() {
                              ? mConfig.model_config->moe_config->shared_expert_size
                              : D_moe;
 
+    // Full grads are shape-only here; their storage is carved from the two
+    // gradient arenas once every layer has been visited (carve_gradient_arenas).
     auto alloc_full = [&](int in_f, int out_f, const std::string& name) -> LoRALayerWeights<Tensor> {
+        (void)name;
         LoRALayerWeights<Tensor> w;
-        w.A = mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {r, in_f});
-        w.B = mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {out_f, r});
+        w.A = Tensor::empty(mConfig.grad_dtype, {r, in_f});
+        w.B = Tensor::empty(mConfig.grad_dtype, {out_f, r});
         return w;
     };
     auto alloc_shard = [&](int in_f, int out_f, const std::string& name) -> LoRALayerWeights<TensorShard> {
@@ -121,10 +124,10 @@ void ModularLoRAGradsManager::allocate_gradients() {
     };
 
     auto alloc_grouped_full = [&](int in_f, int out_f, const std::string& name) -> LoRAGroupedLayerWeights<Tensor> {
+        (void)name;
         LoRAGroupedLayerWeights<Tensor> w;
-        w.A = mAllocator->allocate(mConfig.grad_dtype, (name + "_A").c_str(), EAllocationType::ON_DEVICE, {E, r, in_f});
-        w.B =
-            mAllocator->allocate(mConfig.grad_dtype, (name + "_B").c_str(), EAllocationType::ON_DEVICE, {E, out_f, r});
+        w.A = Tensor::empty(mConfig.grad_dtype, {E, r, in_f});
+        w.B = Tensor::empty(mConfig.grad_dtype, {E, out_f, r});
         return w;
     };
     auto alloc_grouped_shard =
@@ -286,18 +289,58 @@ void ModularLoRAGradsManager::allocate_gradients() {
         }
         // Non-Qwen3 Mamba/SSM blocks still do not have dedicated LoRA gradient coverage here.
     }
+
+    carve_gradient_arenas();
+}
+
+void ModularLoRAGradsManager::carve_gradient_arenas() {
+    constexpr std::size_t kAlign = 256;
+    auto aligned = [](std::size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; };
+    // Visits every allocated full-grad tensor in layer-major, target-major order;
+    // the same order both times, so the offsets of the sizing pass are the
+    // offsets of the carving pass.
+    auto for_each_grad = [&](auto&& fn) {
+        for (auto& block : mFullGrads.blocks) {
+            for_each_lora_layer_weight(block, [&](LoRATargetId id, auto& layer) {
+                fn(id, layer.A);
+                fn(id, layer.B);
+            });
+        }
+    };
+
+    std::size_t dense_bytes = 0;
+    std::size_t expert_bytes = 0;
+    for_each_grad([&](LoRATargetId id, Tensor& t) {
+        if (t.Rank <= 0 || t.nelem() == 0) return;
+        (lora_target_is_expert(id) ? expert_bytes : dense_bytes) += aligned(t.bytes());
+    });
+
+    const std::size_t elem_bytes = get_dtype_size(mConfig.grad_dtype);
+    auto allocate_arena = [&](std::size_t bytes, const char* name) -> Tensor {
+        if (bytes == 0) return Tensor{};
+        return mAllocator->allocate(
+            mConfig.grad_dtype, name, EAllocationType::ON_DEVICE, {static_cast<long>(bytes / elem_bytes)});
+    };
+    mDenseArena = allocate_arena(dense_bytes, "lora_grad_arena_dense");
+    mExpertArena = allocate_arena(expert_bytes, "lora_grad_arena_expert");
+
+    std::size_t dense_off = 0;
+    std::size_t expert_off = 0;
+    for_each_grad([&](LoRATargetId id, Tensor& t) {
+        if (t.Rank <= 0 || t.nelem() == 0) return;
+        const bool expert = lora_target_is_expert(id);
+        const Tensor& arena = expert ? mExpertArena : mDenseArena;
+        std::size_t& off = expert ? expert_off : dense_off;
+        t.Data = arena.Data + off;
+        t.Device = arena.Device;
+        off += aligned(t.bytes());
+    });
 }
 
 void ModularLoRAGradsManager::zero_all(cudaStream_t stream) {
     if (!mConfig.lora_config.enabled()) return;
-
-    for (auto& block : mFullGrads.blocks) {
-        auto zero_layer = [stream](auto, auto& layer) {
-            if (layer.A.Data) fill_zero(layer.A, stream);
-            if (layer.B.Data) fill_zero(layer.B, stream);
-        };
-        for_each_lora_layer_weight(block, zero_layer);
-    }
+    if (mDenseArena.Data) fill_zero(mDenseArena, stream);
+    if (mExpertArena.Data) fill_zero(mExpertArena, stream);
 }
 
 void ModularLoRAGradsManager::start_micro_step(cudaStream_t stream, int micro_step, int total_steps) {
@@ -345,26 +388,19 @@ void ModularLoRAGradsManager::set_schema_hook_registry(const dsl::HookRegistry* 
 void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm) {
     if (comm.world_size() == 1) return;
 
-    // In pure EP runs (dp_size == 1), expert LoRA grads are local by
-    // construction while replicated adapter grads still use the global
-    // communicator. Keep those collectives in the direct layer/target order
-    // here; dispatching through schema callbacks can make the reduction order
-    // depend on structural slot metadata and is not buying us overlap for this
-    // mode.
-    const bool use_schema_hooks = mSchemaHookDispatchEnabled && !(comm.ep_enabled() && comm.dp_size() == 1);
-
-    for (int layer = 0; layer < static_cast<int>(mFullGrads.blocks.size()); ++layer) {
-        dsl::GradientOffloadHookPayload payload;
-        payload.lora_grads = this;
-        payload.comm = &comm;
-        payload.compute_stream = stream;
-        payload.copy_stream = stream;
-        payload.lora_gradients = true;
-        if (use_schema_hooks) {
-            dispatch_schema_layer_hooks(layer, stream, &payload);
-        }
-        if (!payload.lora_reduced) {
-            reduce_layer_gradients(layer, stream, comm);
+    // One collective per arena rather than one per adapter tensor (two per
+    // target per layer before). Expert adapters are EP-sharded: under EP they
+    // average over the DP group only, since reducing them over the full world
+    // would mix experts; in pure EP runs (dp_size == 1) that call is a no-op
+    // and the expert grads stay local by construction.
+    if (mDenseArena.Data) {
+        comm.all_reduce_avg(mDenseArena, stream);
+    }
+    if (mExpertArena.Data) {
+        if (comm.ep_enabled()) {
+            comm.all_reduce_avg_dp(mExpertArena, stream);
+        } else {
+            comm.all_reduce_avg(mExpertArena, stream);
         }
     }
 }

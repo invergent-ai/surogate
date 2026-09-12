@@ -141,7 +141,16 @@ private:
     std::vector<std::string> mHookSchemaIdsByLayer;
     bool mSchemaHookDispatchEnabled = false;
 
+    // Every LoRA gradient tensor is a view into one of two contiguous arenas,
+    // so zeroing is one fill and the data-parallel reduction is one collective
+    // per communicator instead of one per adapter tensor: expert-LoRA grads
+    // average over the DP group under EP, everything else over the world.
+    // Layout is layer-major, so a per-layer sub-range is contiguous as well.
+    Tensor mDenseArena{};
+    Tensor mExpertArena{};
+
     void allocate_gradients();
+    void carve_gradient_arenas();
     void reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm);
     int dispatch_schema_layer_hooks(int layer_idx, cudaStream_t stream, void* payload = nullptr);
 };
