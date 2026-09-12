@@ -14,8 +14,8 @@ namespace sinfer::ops::detail::ggml {
 bool is_ggml_qtype(QType qtype) noexcept;
 GgmlType ggml_type_for(QType qtype);
 
-/// Throws unless `w` is a K-quant weight in QuantLayout::GgmlBlocks with k % 256 == 0 and
-/// n >= `min_rows`.
+/// Throws unless `w` is a GGML weight in QuantLayout::GgmlBlocks with complete
+/// blocks along each row and positive dimensions.
 void require_ggml_weight(const Weight& w, const char* op);
 
 /// Scratch for the int8 activation planes when the caller has no arena to offer: an
@@ -26,7 +26,7 @@ void* scratch_for(std::size_t bytes, cudaStream_t stream);
 /// Bytes the engine-slot scratch currently holds, for the graph allowance to exclude.
 std::size_t scratch_bytes() noexcept;
 
-/// y = W · x for a K-quant weight. `workspace` may be null (see scratch_for).
+/// y = W · x for a GGML weight. `workspace` may be null (see scratch_for).
 void ggml_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena* workspace,
                  cudaStream_t stream);
 /// residual += W · x.

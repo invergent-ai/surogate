@@ -109,6 +109,9 @@ def write(t: T, blocks: np.ndarray, n: int, k: int, label: str) -> None:
 for i, t in enumerate(TYPES):
     write(t, synthetic(t, 256, 2048, 100 + i), 256, 2048, "synthetic")
     write(t, synthetic(t, 63, 512, 200 + i), 63, 512, "odd")   # odd row count: the 2-row CTA's guard
+    # Odd block counts include K=96/192 for formats without 256-value blocks.
+    tail_k = 3 * BLOCK_VALUES.get(t, 256)
+    write(t, synthetic(t, 17, tail_k, 300 + i), 17, tail_k, "tail")
 #: Real tensors of every type, from whichever files on this machine carry them: the K_M
 #: file for the K-quants, unsloth's UD mixtures for the IQ family. Comma-separated.
 def _hub(name: str) -> list[pathlib.Path]:

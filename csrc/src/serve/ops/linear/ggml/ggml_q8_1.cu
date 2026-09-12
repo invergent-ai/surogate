@@ -7,6 +7,7 @@
 
 #include "ops/common/warp.cuh"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace sinfer::ops::detail::ggml {
@@ -73,15 +74,20 @@ void quantize_q8_1_launch(const __nv_bfloat16* x, std::int32_t k, std::int32_t t
 void quantize_q8_1_planes_launch(const __nv_bfloat16* x, std::int32_t k, std::int32_t tokens,
                                  std::int8_t* codes, __half2* ds, cudaStream_t stream) {
     if (x == nullptr || codes == nullptr || ds == nullptr || k <= 0 || (k % QK8_1) != 0 ||
-        tokens <= 0 || tokens > 65535) {
-        throw std::invalid_argument("q8_1 planes: k a multiple of 32, 1..65535 tokens");
+        tokens <= 0) {
+        throw std::invalid_argument("q8_1 planes: k a multiple of 32, positive tokens");
     }
     constexpr int kThreads = 256; // eight whole warps, so no warp straddles the k boundary
     const dim3 block(kThreads);
-    const dim3 grid(static_cast<unsigned>((k + kThreads - 1) / kThreads),
-                    static_cast<unsigned>(tokens));
-    quantize_q8_1_planes_kernel<<<grid, block, 0, stream>>>(x, codes, ds, k);
-    CUDA_CHECK(cudaGetLastError());
+    // CUDA's grid.y is limited to 65535. Chunk columns without changing the
+    // activation planes or imposing that limit on a wide dense projection.
+    for (std::int64_t first = 0; first < tokens; first += 65535) {
+        const unsigned count = static_cast<unsigned>(std::min<std::int64_t>(65535, tokens - first));
+        const dim3 grid(static_cast<unsigned>((k + kThreads - 1) / kThreads), count);
+        quantize_q8_1_planes_kernel<<<grid, block, 0, stream>>>(
+            x + first * k, codes + first * k, ds + first * (k / QK8_1), k);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 } // namespace sinfer::ops::detail::ggml

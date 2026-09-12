@@ -2,9 +2,8 @@
 
 #include "core/device.h"
 
-#include "ops/linear/bf16/bf16_cublaslt.h"
-#include "ops/linear/ggml/ggml_dequant.h"
 #include "ops/linear/ggml/ggml_dense_decode.cuh"
+#include "ops/linear/ggml/ggml_dense_generic.cuh"
 #include "ops/linear/ggml/ggml_i8_tile.cuh"
 #include "ops/linear/ggml/ggml_q8_1.h"
 
@@ -14,25 +13,6 @@
 
 namespace sinfer::ops::detail::ggml {
 namespace {
-
-// The dequantisation tile's budget. A row tile is expanded to BF16 once and consumed by one
-// cuBLASLt call, so the weight is read from memory a single time however wide the batch is --
-// the chunked GEMV re-reads it every eight columns, which is what made prefill the slow half.
-// 32 MiB covers whole weights at every geometry the tree serves (the widest, a 27B gate_up at
-// [34816, 5120], tiles in eleven passes).
-constexpr std::size_t kDequantTileBytes = 32u << 20;
-
-std::int32_t rows_per_tile(std::int32_t rows, std::int32_t k) noexcept {
-    const std::size_t row_bytes = static_cast<std::size_t>(k) * sizeof(__nv_bfloat16);
-    std::size_t fit             = kDequantTileBytes / std::max<std::size_t>(row_bytes, 1);
-    fit                         = std::max<std::size_t>(fit & ~std::size_t{7}, 8); // whole 8-row groups
-    return static_cast<std::int32_t>(std::min<std::size_t>(fit, static_cast<std::size_t>(rows)));
-}
-
-// A wide batch runs the tensor-core route only when the shapes are ones cuBLASLt accepts.
-bool wide_route_admits(std::int32_t rows, std::int32_t k, std::int32_t tokens) noexcept {
-    return tokens >= wide_min_tokens() && (rows % 8) == 0 && (k % 8) == 0;
-}
 
 template <typename DstT, bool Accumulate>
 void run_gemv(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
@@ -84,7 +64,7 @@ __global__ __launch_bounds__((TileCols / 8) * 32) void dense_i8_kernel(
     }
 }
 
-void run_wide(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
+void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
               const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out, void* scratch,
               float beta, cudaStream_t stream) {
     if (type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K) {
@@ -121,16 +101,72 @@ void run_wide(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const std::int32_t tile   = rows_per_tile(rows, k);
-    const std::size_t row_bytes = static_cast<std::size_t>(k / block_values(type)) * block_bytes(type);
-    auto* staging             = static_cast<__nv_bfloat16*>(scratch);
-    for (std::int32_t first = 0; first < rows; first += tile) {
-        const std::int32_t height = std::min(tile, rows - first);
-        const auto* tile_blocks =
-            static_cast<const std::byte*>(blocks) + static_cast<std::size_t>(first) * row_bytes;
-        dequantize_rows_launch(type, tile_blocks, height, k, staging, stream);
-        bf16_cublaslt_gemm_raw(staging, height, k, x, tokens, out + first, rows, beta, stream);
+    const auto* bytes = static_cast<const std::uint8_t*>(blocks);
+    auto* codes = static_cast<std::int8_t*>(scratch);
+    auto* ds = reinterpret_cast<__half2*>(codes + static_cast<std::size_t>(tokens) * k);
+    if (type != GgmlType::F16) { quantize_q8_1_planes_launch(x, k, tokens, codes, ds, stream); }
+    const auto launch = [&]<GgmlType Type>() {
+        if constexpr (Type == GgmlType::Q4_K || Type == GgmlType::Q5_K || Type == GgmlType::Q6_K) {
+            // These formats use the specialized tile above.
+        } else {
+            if constexpr (Type == GgmlType::F16) {
+                if (tokens <= 8) {
+                    const auto narrow = [&]<int Rows>() {
+                        dense_f16_decode_kernel<Rows><<<(rows + Rows - 1) / Rows, 256, 0, stream>>>(
+                            static_cast<const __half*>(blocks), x, rows, k, tokens, out, beta != 0);
+                    };
+                    if (rows <= 4096) { narrow.template operator()<8>(); }
+                    else { narrow.template operator()<16>(); }
+                    return;
+                }
+            } else {
+                if (tokens <= 4 || (tokens <= 8 && (rows >= 4096 || Type == GgmlType::TQ1_0))) {
+                    const auto narrow = [&]<int Columns>() {
+                        const auto grouped = [&]<int Lanes, bool FullChunks>() {
+                            constexpr int row_tile = 4 / Lanes;
+                            dense_affine_decode_kernel<Type, Columns, Lanes, FullChunks>
+                                <<<dim3((rows + row_tile - 1) / row_tile,
+                                         (tokens + Columns - 1) / Columns), 32, 0, stream>>>(
+                                    bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                        };
+                        if constexpr (Type == GgmlType::TQ1_0) {
+                            grouped.template operator()<4, true>();
+                        } else if (k % (8 * DenseFormat<Type>::kWidth) != 0) {
+                            grouped.template operator()<1, false>();
+                        } else if (rows < 4096 && tokens <= 2) {
+                            grouped.template operator()<2, true>();
+                        } else { grouped.template operator()<1, true>(); }
+                    };
+                    if (tokens == 1) { narrow.template operator()<1>(); }
+                    else if (tokens <= 2) { narrow.template operator()<2>(); }
+                    else if (tokens <= 4) { narrow.template operator()<4>(); }
+                    else { narrow.template operator()<8>(); }
+                    return;
+                }
+            }
+            const auto tile = [&]<int Cols>() {
+                const dim3 grid((rows + 15) / 16, (tokens + Cols - 1) / Cols);
+                if constexpr (Type == GgmlType::F16) {
+                    dense_f16_mma_kernel<Cols><<<grid, (Cols / 8) * 32, 0, stream>>>(
+                        static_cast<const __half*>(blocks), x, rows, k, tokens, out, beta != 0);
+                } else {
+                    dense_affine_mma_kernel<Type, Cols><<<grid, (Cols / 8) * 32, 0, stream>>>(
+                        bytes, codes, ds, rows, k, tokens, out, beta != 0);
+                }
+            };
+            if (tokens <= 8 && Type == GgmlType::Q8_0) { tile.template operator()<16>(); }
+            else if (tokens < wide_min_tokens()) { tile.template operator()<32>(); }
+            else if (rows >= 4096 && (Type == GgmlType::TQ1_0 || Type == GgmlType::F16)) {
+                tile.template operator()<128>();
+            } else { tile.template operator()<64>(); }
+        }
+    };
+    switch (type) {
+#define SINFER_DENSE_LAUNCH(Type) case GgmlType::Type: launch.template operator()<GgmlType::Type>(); break;
+        SINFER_GGML_FOR_EACH_TYPE(SINFER_DENSE_LAUNCH)
+#undef SINFER_DENSE_LAUNCH
     }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 template <bool Accumulate>
@@ -138,26 +174,21 @@ void run_bf16(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
               const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out, void* scratch,
               std::size_t scratch_bytes, cudaStream_t stream) {
     if (tokens <= 0 || k <= 0 || (k % block_values(type)) != 0 || rows <= 0) {
-        throw std::invalid_argument("ggml linear: W[rows, k] with k a multiple of 256");
+        throw std::invalid_argument("ggml linear: W[rows, k] with k a multiple of the stored block width");
     }
     if (scratch == nullptr || scratch_bytes < linear_workspace_bytes(rows, k, tokens) ||
         (reinterpret_cast<std::uintptr_t>(scratch) & 15u) != 0) {
         throw std::invalid_argument("ggml linear: scratch too small or misaligned");
     }
-    if (type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K ||
-        wide_route_admits(rows, k, tokens)) {
-        run_wide(type, blocks, rows, k, x, tokens, out, scratch, Accumulate ? 1.0F : 0.0F, stream);
-        return;
-    }
-    run_gemv<__nv_bfloat16, Accumulate>(type, blocks, rows, k, x, tokens, out, scratch, stream);
+    run_dense(type, blocks, rows, k, x, tokens, out, scratch, Accumulate ? 1.0F : 0.0F, stream);
 }
 
 } // namespace
 
 std::int32_t wide_min_tokens() noexcept {
     static const std::int32_t value = [] {
-        // Keep the existing crossover while Q4_K/Q5_K/Q6_K switch to the integer
-        // tensor-core tile. Other formats still expand a bounded BF16 weight tile.
+        // Token-tile crossover for the generic formats; arithmetic is independent
+        // of this threshold and the specialized K-quant routes keep their own tiles.
         const char* env = std::getenv("SUROGATE_GGML_WIDE_MIN_TOKENS");
         if (env == nullptr) { return std::int32_t{65}; }
         const int parsed = std::atoi(env);
@@ -168,10 +199,9 @@ std::int32_t wide_min_tokens() noexcept {
 
 std::size_t linear_workspace_bytes(std::int32_t rows, std::int32_t k, std::int32_t tokens) noexcept {
     if (rows <= 0 || k <= 0 || tokens <= 0) { return 0; }
-    // Both quantisers write every column before the projection consumes it.
-    const std::size_t gemv = q8_1_bytes(k, tokens);
-    if (!wide_route_admits(rows, k, tokens)) { return gemv; }
-    return std::max(gemv, static_cast<std::size_t>(rows_per_tile(rows, k)) * k * sizeof(__nv_bfloat16));
+    // Dense quantized projections consume only the int8 activation planes.
+    // F16 does not need them, but this type-independent API covers both routes.
+    return q8_1_bytes(k, tokens);
 }
 
 void linear_launch(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
@@ -190,7 +220,7 @@ void linear_launch_f32(GgmlType type, const void* blocks, std::int32_t rows, std
                        const __nv_bfloat16* x, std::int32_t tokens, float* out, void* scratch,
                        std::size_t scratch_bytes, cudaStream_t stream) {
     if (tokens <= 0 || k <= 0 || (k % block_values(type)) != 0 || rows <= 0) {
-        throw std::invalid_argument("ggml linear: W[rows, k] with k a multiple of 256");
+        throw std::invalid_argument("ggml linear: W[rows, k] with k a multiple of the stored block width");
     }
     if (scratch == nullptr || scratch_bytes < q8_1_bytes(k, tokens) ||
         (reinterpret_cast<std::uintptr_t>(scratch) & 15u) != 0) {

@@ -10,13 +10,13 @@
 
 namespace sinfer::ops::detail::ggml {
 
-/// Token count from which formats without an integer tile expand a BF16 row tile
-/// instead of using chunked GEMVs. Overridable with SUROGATE_GGML_WIDE_MIN_TOKENS.
-/// Q4_K/Q5_K/Q6_K use integer dot products with consistent arithmetic at every width.
+/// Token count from which generic formats use wider token tiles. Overridable with
+/// SUROGATE_GGML_WIDE_MIN_TOKENS; changing it does not change projection arithmetic.
+/// Q4_K/Q5_K/Q6_K select their specialized tiles independently.
 std::int32_t wide_min_tokens() noexcept;
 
-/// Workspace bytes for `tokens` columns of a [rows, k] K-quant weight: the int8 activation
-/// planes, or a BF16 dequantisation tile for formats without an integer tensor-core route.
+/// Workspace bytes for `tokens` columns of a [rows, k] GGML weight: int8 activation
+/// codes and scales. F16 uses the original activation and leaves this scratch unused.
 std::size_t linear_workspace_bytes(std::int32_t rows, std::int32_t k, std::int32_t tokens) noexcept;
 
 /// out[rows, tokens] = W · x. x BF16 [k, tokens], out BF16 [rows, tokens], both contiguous.
