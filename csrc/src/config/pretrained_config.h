@@ -67,8 +67,11 @@ struct PretrainedConfig {
     // Normalization
     float RmsNormEps = 1e-5f;
 
-    // Weight tying
+    // Weight tying. HF resolves a missing config.json key from the config
+    // class default, which the DSL declaration carries; Specified records
+    // whether the file (or the caller) actually said so.
     bool TiedWordEmbeddings = false;
+    bool TiedWordEmbeddingsSpecified = false;
 
     // Attention configuration
     bool UseQKVBias = false;

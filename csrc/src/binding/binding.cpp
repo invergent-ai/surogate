@@ -378,6 +378,7 @@ NB_MODULE(_surogate, m) {
                 t->RopeTheta = rope_theta.value();
                 t->RmsNormEps = rms_norm_eps;
                 t->TiedWordEmbeddings = tie_word_embeddings;
+                t->TiedWordEmbeddingsSpecified = true;
                 t->UseQKVBias = use_qkv_bias.value();
                 t->DType = dtype_from_str(dtype);
             },
@@ -427,9 +428,14 @@ NB_MODULE(_surogate, m) {
                 "Maximum supported sequence length.")
         .def_rw("rope_theta", &PretrainedConfig::RopeTheta, "RoPE base parameter (theta).")
         .def_rw("rms_norm_eps", &PretrainedConfig::RmsNormEps, "Epsilon used in RMSNorm.")
-        .def_rw("tie_word_embeddings",
-                &PretrainedConfig::TiedWordEmbeddings,
-                "Whether input/output embeddings are tied.")
+        .def_prop_rw(
+            "tie_word_embeddings",
+            [](const PretrainedConfig& c) { return c.TiedWordEmbeddings; },
+            [](PretrainedConfig& c, bool tied) {
+                c.TiedWordEmbeddings = tied;
+                c.TiedWordEmbeddingsSpecified = true;
+            },
+            "Whether input/output embeddings are tied.")
         .def_rw("use_qkv_bias", &PretrainedConfig::UseQKVBias, "Whether QKV projections use bias.")
         .def_prop_rw(
             "dtype",

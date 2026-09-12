@@ -316,7 +316,10 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
     if (cfg->ModelTypeName == "lfm2" || cfg->ArchitectureName == "Lfm2ForCausalLM") {
         cfg->TiedWordEmbeddings = true;
     }
-    if (auto v = get_opt<bool>(config_json, "tie_word_embeddings")) cfg->TiedWordEmbeddings = *v;
+    if (auto v = get_opt<bool>(config_json, "tie_word_embeddings")) {
+        cfg->TiedWordEmbeddings = *v;
+        cfg->TiedWordEmbeddingsSpecified = true;
+    }
     if (auto v = get_opt<bool>(config_json, "tie_embeddings")) cfg->TiedWordEmbeddings = *v;
 
     // Attention flags

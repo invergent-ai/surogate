@@ -506,6 +506,20 @@ std::optional<PretrainedConfig::ArchitectureId> arch_from_string(std::string_vie
     return std::nullopt;
 }
 
+/// HF resolves a missing tie_word_embeddings from the config class default,
+/// which is the value the declaration carries; take it when config.json is
+/// silent (LFM2-8B-A1B has no key and no lm_head.weight: tied). Must run
+/// before the declaration is validated against the config.
+void apply_declared_config_defaults(PretrainedConfig& cfg, const Module& module) {
+    if (!cfg.TiedWordEmbeddingsSpecified) {
+        if (const auto* value = internal::find_key(&module.config, "tie_word_embeddings")) {
+            if (auto tied = internal::as_bool(*value)) {
+                cfg.TiedWordEmbeddings = *tied;
+            }
+        }
+    }
+}
+
 void apply_arch_from_hf_config(PretrainedConfig& cfg, const Module& module) {
     if (const auto* value = internal::find_key(&module.hf_config, "architecture")) {
         if (auto arch = internal::as_string(*value)) {
@@ -1246,6 +1260,7 @@ DslModel::DslModel(const PretrainedConfig& config,
             });
         }
     }
+    apply_declared_config_defaults(*mConfig, *mModule);
     validate_ir();
     apply_arch_from_hf_config(*mConfig, *mModule);
     mRuntimeConfig = build_runtime_config(*mModule, *mConfig);
