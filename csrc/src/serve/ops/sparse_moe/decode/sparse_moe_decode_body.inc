@@ -287,7 +287,7 @@ struct W8Codec {
         for (int item = 0; item < 8; ++item) {
             // Arithmetic shift out of the word sign-extends the byte.
             const int code = static_cast<int>(words[item >> 2] << (24 - 8 * (item & 3))) >> 24;
-            weights[item]  = static_cast<float>(code) * scale;
+            weights[item]  = w8_a16_weight(static_cast<std::int8_t>(code), scale);
         }
     }
 };

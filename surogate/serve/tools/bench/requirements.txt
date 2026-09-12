@@ -1,4 +1,5 @@
-# Corpus-baker dependencies (tools/bench/make_bench_corpus.py). Loads a local Hugging Face
+# Corpus baker and HTTP benchmark dependencies. Loads a local Hugging Face
 # tokenizer only: run with --tokenizer-path or SINFER_TOKENIZER_PATH; never downloads from the network.
 transformers>=4.40
 tokenizers>=0.19
+aiohttp

@@ -1,4 +1,121 @@
-# Serving benchmarks — surogate serve vs vLLM vs llama.cpp
+# Serving benchmarks
+
+## Local models — 2026-09-11
+
+Fresh **surogate** measurements of the models currently present in `models/`. The older
+vLLM and llama.cpp comparisons below retain their original dates; those engines were not
+re-benchmarked in this run. Source identities, launch commands, request counts, and full
+measurements are in the [JSON report](tools/bench/results/2026-09-11-local-models.json).
+
+**Hardware:** RTX 5090 32 GB cards, driver 590.44.01, **400 W power limit**, two EPYC 9124
+CPUs (32 physical cores total), and 503 GiB RAM. The earlier uncapped measurements are not
+direct performance comparisons. GPUs 1 and 2 reported 100% utilization and were excluded.
+
+**Workload:** exact 512-token prose inputs sent as token IDs and 128 generated tokens over
+streaming Chat Completions. Tokenization happens before timing. Sampling is greedy, EOS
+is ignored, and prefix reuse is disabled. Measurements cover throughput and latency with
+fixed token counts. Small models use 60-second windows after an initial warmup and
+15 seconds of settling. One-GPU MoE runs
+use 180-second windows and 30 seconds of settling. Both sixteen-client GLM rows use
+180-second windows, 60 seconds of settling, and client starts spread over 30 seconds.
+Other pipeline runs use 90-second windows and 20 seconds of settling. Clients send another
+request after their previous response finishes. Loading and
+conversion are excluded.
+
+**Reading the tables:** generated tokens/s is aggregate output throughput, including time
+spent processing prompts. Prompt throughput is four times that number for this 512/128
+workload. TTFT measures the first nonempty reasoning or answer output. Latency is the full
+request duration. Throughput counts requests completed inside each fixed window; outstanding
+requests drain afterward. Request counts are shown because slow configurations have fewer
+samples. All successful rows completed without request errors.
+
+### Generation
+
+| Model | Placement / decoding | GPUs | Clients | Generated tokens/s | TTFT p50 | Latency p50 | Requests |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.5-9B Q5_K_M | Resident | 1 | 1 | 162.1 | 0.076 s | 0.798 s | 76 |
+| Qwen3.5-9B Q5_K_M | Resident | 1 | 8 | 349.9 | 0.163 s | 2.950 s | 164 |
+| Qwen3.5-9B Q5_K_M | Resident | 1 | 32 | 409.6 | 0.183 s | 9.558 s | 192 |
+| Qwen3.5-9B Q5_K_M | Resident, MTP 1 | 1 | 1 | 221.9 | 0.080 s | 0.574 s | 104 |
+| TinyLlama-1.1B Q5_K_M | Resident | 1 | 1 | 708.3 | 0.042 s | 0.181 s | 332 |
+| TinyLlama-1.1B Q5_K_M | Resident | 1 | 8 | 2,474.7 | 0.041 s | 0.414 s | 1,160 |
+| TinyLlama-1.1B Q5_K_M | Resident | 1 | 32 | 3,357.9 | 0.041 s | 1.220 s | 1,574 |
+| Qwen3.8-Flash-Next UD-Q4_K_XL | Expert offload to RAM | 1 | 1 | 29.2 | 1.043 s | 4.421 s | 41 |
+| Qwen3.8-Flash-Next UD-Q4_K_XL | Expert offload to RAM | 1 | 16 | 65.4 | 2.132 s | 31.240 s | 92 |
+| Qwen3.8-Flash-Next UD-Q4_K_XL | Pipeline | 6 | 1 | 49.8 | 0.660 s | 2.571 s | 35 |
+| Qwen3.8-Flash-Next UD-Q4_K_XL | Pipeline | 6 | 16 | 204.8 | 2.374 s | 9.644 s | 144 |
+| GLM-5.3-Flash UD-Q4_K_XL | Expert offload to RAM | 1 | 1 | 11.4 | 3.968 s | 11.466 s | 16 |
+| GLM-5.3-Flash UD-Q4_K_XL | Expert offload to RAM | 1 | 16 | 19.9 | 7.947 s | 109.932 s | 28 |
+| GLM-5.3-Flash UD-Q4_K_XL | Pipeline + expert offload | 6 | 1 | 17.1 | 2.903 s | 7.446 s | 12 |
+| GLM-5.3-Flash UD-Q4_K_XL | Pipeline + expert offload | 6 | 16 | 47.6 | 8.163 s | 42.396 s | 67 |
+
+Qwen3.5-9B and TinyLlama baseline rows use `--max-num-seqs 32`, `--max-model-len 2048`,
+`--max-num-batched-tokens 2048`, and `--kv-capacity auto`. Qwen3.5-9B ran on GPU 7;
+TinyLlama ran on GPU 5. The MTP row uses one active sequence and
+`--spec mtp --draft-tokens 1`, also on GPU 7. Cache precision is `auto`: FP8 for Qwen
+and GLM, and BF16 for TinyLlama. The small resident models were measured on separate GPUs in parallel.
+
+One-GPU offloaded MoEs ran separately on GPU 0 with
+`--host-moe-layers all --cpu-moe-share auto --max-num-seqs 16` and a 2,048-token prompt
+chunk. Their context limit is 2,048 tokens.
+Flash-Next uses `--kv-capacity auto`; GLM uses `--kv-capacity 11264`. The expert bank
+precision is `auto`. See the report for the resolved GPU cache and host memory allocations.
+Six-GPU pipelines use physical devices `0,3,4,5,6,7`, capacity for sixteen active requests,
+and the same context and prompt-chunk limits. Flash-Next is GPU-resident;
+GLM also uses `--host-moe-layers auto --cpu-moe-share auto` to fit. Its six-GPU run
+offloads 20 layers and allocates about **92.0 GiB** of host expert memory. The one-GPU
+host expert allocations are **103.2 GiB** for Flash-Next and **191.7 GiB** for GLM.
+
+### EmbeddingGemma-300M Q8_0
+
+GPU 6; 512 synthetic token IDs per input, 768 output dimensions. The GGUF was prepared
+with the existing cached EmbeddingGemma tokenizer. Each returned vector was checked for
+the expected dimension and finite values.
+
+| Clients | Inputs/request | Vectors/s | Input tokens/s | Request latency p50 | Requests |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 20.8 | 10,641 | 48.9 ms | 1,247 |
+| 1 | 8 | 225.6 | 115,507 | 35.4 ms | 1,692 |
+| 4 | 1 | 83.5 | 42,752 | 48.8 ms | 5,010 |
+| 4 | 8 | 245.9 | 125,884 | 99.2 ms | 1,844 |
+
+### Other files in `models/`
+
+| Input | Result |
+|---|---|
+| `harrier-oss-v1-0.6B-Q8_0.gguf` | No embedding measurement: `--embed` rejects its Qwen3 architecture. |
+| `embeddinggemma-300m/` | No safetensors measurement: encoder preparation currently accepts GGUF. This local directory also lacks its tokenizer and configuration files. The GGUF variant is measured above. |
+| `dummy-glm-5.3-flash/` | Test fixture; the native generation CLI rejects this configuration. |
+| `Qwen3.8-Flash-Next-frontend/`, `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | Supporting resources for Flash-Next. |
+| Numbered GGUF shards | Measured together as one checkpoint per model. |
+
+### Reproduce a measurement
+
+From the repository root, start the server and run the client in another terminal:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 surogate serve models/Qwen_Qwen3.5-9B-Q5_K_M.gguf \
+  --served-model-name bench --no-thinking --no-prefix-reuse \
+  --max-model-len 2048 --kv-capacity auto --kv-cache-dtype auto \
+  --max-num-seqs 32 --max-num-batched-tokens 2048 \
+  --max-pending-requests 512 --pending-timeout-ms 600000
+
+python -m surogate.serve.tools.bench.serve_http_bench \
+  --url http://127.0.0.1:8080 --model bench --concurrency 8 \
+  --prompt-tokens 512 --output-tokens 128 --warmup 15 --seconds 60
+```
+
+See the [HTTP benchmark guide](tools/bench/README.md#http-measurements-for-local-models)
+for embedding batches and report definitions.
+
+---
+
+## Earlier comparisons — 2026-08-30 through 2026-09-08
+
+The following tables and notes preserve earlier runs, including checkpoints no longer in
+`models/`. Their hardware settings, formats, workloads, and comparison engines differ from
+the fresh local-model measurements above. References to “current” below apply to those
+historical dates.
 
 Board of record, one table per model with the same columns. The narrative behind every row (superseded rows,
 rejected levers, kernel profiles, the reasoning behind each lever, and the
@@ -12,7 +129,7 @@ build (0.3.0-dev @ f1357e4; Flash-Next rows use upstream master with
 `qwen4exp`, GLM-5.3 rows a build of ggml-org PR 27754 because no released llama.cpp knows that
 architecture, plus `ik_llama.cpp` 7cff686d for the CPU-MoE bar).
 
-## Method
+### Method
 
 Closed-loop HTTP clients against each engine's OpenAI endpoint (streaming
 `/v1/chat/completions`, salted prompts so nothing shares a prefix, the engine's own
@@ -71,7 +188,7 @@ decode figure is completions per second × 16, not a decode speed. On that shape
 prefill and TTFT; per-stream decode speed is what 512/128 and decode-heavy 128/512
 measure, where the pinned ratio runs the other way.
 
-## Board of record (2026-08-30)
+### Board of record (2026-08-30)
 
 One table per model, the same columns throughout; **every cell is measured** — the derived
 figures the board used to carry are gone. **The first row of each model's table is the
@@ -83,7 +200,7 @@ superseded passes were removed on 2026-08-30 rather than kept for provenance, be
 carrying three readings of one premise is read as three results. `BENCHMARKS_HISTORY.md` keeps
 them.
 
-### Qwen3.5-0.8B
+#### Qwen3.5-0.8B
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -144,7 +261,7 @@ engine's own accounting: prefill **97,062** vs 39,511 (pp512) and **107,604** vs
 (pp2048); decode **864** vs 809 (tg128). The concurrency gap is wider than the single-stream
 gap because llama.cpp's server does not batch these as well as its kernels run.
 
-### Qwen3.5-4B
+#### Qwen3.5-4B
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -156,7 +273,7 @@ gap because llama.cpp's server does not batch these as well as its kernels run.
 | llama.cpp | 1 | 1 | **7,000 †** | **182** | — | **270 ms** | 2026-08-30 12:05, uncapped GPU 5, CUDA build, `unsloth/Qwen3.5-4B-GGUF` Q4_K_M (fetched for this row; our side is NVFP4). Its own prompt-eval timing is 13,000 tok/s |
 | vLLM | 1 | 1 | 31,700 † | 249 | — | 60 ms | same checkpoint (`surogate/Qwen3.5-4B-NVFP4`, ModelOpt); 2026-08-30 13:27, uncapped GPU 5. Led decode by 22 % for four hours — that was our routing gap, not their kernels |
 
-### Qwen3.8-27B
+#### Qwen3.8-27B
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -179,7 +296,7 @@ gap because llama.cpp's server does not batch these as well as its kernels run.
 | **surogate** | 1 | 1 | 371 | **83.3** | — | **0.24 s** | 2026-09-04 22:03, GPU 0, `unsloth/Qwen3.8-27B-GGUF` UD-Q4_K_M served natively **with MTP** (`--spec mtp --draft-tokens 1`; drafts 2 / 3: 76.9 / 69.9), every object but two Q8_0 projections read from the file: the UD mixture's mixed-type fused parents as typed segments, the V-head-permuted GDN out_proj with the permutation on the activation, and the IQ4_XS GEMV on a byte-permute table lookup (it had been a per-lane constant read: 232 us/call, 12x Q4_K's). The 46.5 row of 22:00 that morning had 33 % of the bytes requantised to Q4G64/Q5G64 and the slow IQ4_XS kernel on the rest; PPL 5.1699 -> 5.0477 against llama.cpp's 5.0166. |
 | llama.cpp | 1 | 1 | **1,610 †** | **44.8** | — | **1.18 s** | 2026-08-30 12:07, uncapped GPU 5, CUDA build, `unsloth/Qwen3.8-27B-GGUF` UD-Q4_K_M (fetched for this row; our side is all-NVFP4). Its own prompt-eval timing is 2,734 tok/s |
 
-### Qwen3.6-35B-A3B
+#### Qwen3.6-35B-A3B
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -193,7 +310,7 @@ gap because llama.cpp's server does not batch these as well as its kernels run.
 | surogate | 8 | 100 | 8,785 | 2,123 | 10,908 | 0.58 s | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:25, uncapped. **On the groupwise-int artifact**, where it beat the one card (1,984). It now sits 19 % *below* the one-card routed-NVFP4 row above; whether eight stages still gain on the new artifact is unmeasured — see Open items |
 | **surogate** | 8 | 1 | **965** | **233.4** | **1,198** | **0.09 s** | same, one user: 3 B active split eight ways puts a token at ~0.9 ms |
 
-### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
+#### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
 
 All surogate one-card rows: 2026-09-06, the native GGUF read in place (no artifact repack — the
 Q4G32AM host bank is decoded from the file's blocks at load), **engine defaults**: no
@@ -265,7 +382,7 @@ hundredth of the error bar from llama.cpp, for 7 % more pinned bytes than the fo
 (the Q8_0 halves are already exactly W8 and cost nothing). The four-bit bank remains one flag
 away for a run that wants its rate and can spend the quality.
 
-### GLM-5.3-Flash (200 GB MoE; 181.65 GiB of weights against 256 GiB of cards)
+#### GLM-5.3-Flash (200 GB MoE; 181.65 GiB of weights against 256 GiB of cards)
 
 `models/GLM-5.3-Flash-UD-Q4_K_XL-*.gguf` read in place, 2026-09-06, idle host, 512/128, one
 engine at a time; the eight-card rows were re-measured after the draft head landed, on the
@@ -362,7 +479,7 @@ Q4G32AM through a W8 row and an affine refit, and an int8 grid is not where a Q4
 sixteen levels sit. The repack that replaced it is exact to FP16 rounding of the endpoints
 (0.035 % of the range on random blocks, tested). The gate script is `scratchpad/ppl_gate_glm.sh`.
 
-### The NextN draft head, against llama.cpp's own (2026-09-06)
+#### The NextN draft head, against llama.cpp's own (2026-09-06)
 
 Both engines serve the checkpoint's NextN block as a draft head: ours under `--spec mtp`,
 llama.cpp's under `--spec-type draft-mtp` (ggml-org PR 27917, built at `study/llama.cpp-mtp`;
@@ -478,7 +595,7 @@ the experts and the round is bytes-bound again once the base round is fast; on t
 bank it still gained 14 %. The head is worth keeping for short-prompt, long-generation
 requests, where the single-request table above shows it ahead.
 
-## Prefill on the 27B GGUF, and where it goes (2026-09-04)
+### Prefill on the 27B GGUF, and where it goes (2026-09-04)
 
 Same file, same probe, one card, one user, a 2,048-token prompt:
 
@@ -532,7 +649,7 @@ llama.cpp's MMQ computes on. Two consequences worth writing down:
   scale and min terms -- the raw sum lands 2.5x further from the exact product (1.3e-2 against
   5.3e-3 relative). The planes now carry d·Σq; the routed-expert prefill inherits it.
 
-## Accuracy gates (2026-09-04)
+### Accuracy gates (2026-09-04)
 
 **The KV cache default is `auto` (2026-09-04).** The `qwen3` target's 1-3 % offset against
 llama.cpp was the FP8 KV cache: e4m3's three mantissa bits are ~2 % of noise on every K and V,
@@ -572,7 +689,7 @@ scale exactly where llama.cpp's integer form truncates. The two Qwen3-0.6B rows 
 reference are the `qwen3` target, not the formats: its Q4_K_M control shows the same offset on
 old types only, and the same IQ4_XS codec matches on the 0.8B (TODOv2 item 5).
 
-## Reading the table
+### Reading the table
 
 - **Weight format beats every scheduling lever on this hardware**: NVFP4 gave
   the 4B +54 % and the 27B +37 % over our own W8/mixed artifacts, and now the
@@ -670,7 +787,7 @@ old types only, and the same IQ4_XS codec matches on the 0.8B (TODOv2 item 5).
   the converter refuses anything that is not `compressed-tensors` /
   `nvfp4-pack-quantized` (a ModelOpt export inverts the global-scale convention).
 
-## Open items
+### Open items
 
 - **The 27B's prompt round, 3 % behind vLLM at equal clocks (2026-09-07 evening).** The
   10 % was the wide-N GEMM kernel spilling under `-rdc=true` (fixed: whole-program

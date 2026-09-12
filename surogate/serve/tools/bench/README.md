@@ -165,3 +165,32 @@ python3 tools/bench/run_serve_concurrency.py \
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
 pool. A point is intentionally not resumable: combining fragments from separate server processes
 would not preserve either a steady interval or one continuous makespan.
+
+## HTTP measurements for local models
+
+`serve_http_bench.py` measures a running generation or embedding server. It requires
+`aiohttp`. Start a generation server with `--no-prefix-reuse` and enough active requests
+and cache capacity for the selected concurrency, then run:
+
+```bash
+python -m surogate.serve.tools.bench.serve_http_bench \
+  --url http://127.0.0.1:8080 --model bench --concurrency 8 \
+  --prompt-tokens 512 --output-tokens 128 --warmup 15 --seconds 60
+
+python -m surogate.serve.tools.bench.serve_http_bench \
+  --url http://127.0.0.1:8413 --model embeddinggemma --embedding \
+  --prompt-tokens 512 --batch 8 --concurrency 4 --warmup 15 --seconds 60
+```
+
+Generation uses tokenized prose at the exact requested length, greedy sampling, and a
+fixed output length. Embedding requests use synthetic token IDs. Each client completes
+an initial warmup, then clients are staggered over three seconds by default before the timed
+settling period ends. Increase `--stagger`, `--warmup`, and `--seconds` for slow offloaded
+models; keep the settling period longer than the spread of client starts.
+
+The JSON report counts complete requests finishing inside the measurement window.
+Requests still running at its end drain afterward and do not contribute to its totals.
+Prompt and generated throughput both divide by the full window, including prompt work.
+TTFT includes either reasoning or answer text. The runner checks response lengths, stream
+completion, token accounting, and embedding dimensions and finiteness. Any request error
+makes it exit unsuccessfully.

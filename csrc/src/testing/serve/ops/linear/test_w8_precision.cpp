@@ -1,4 +1,6 @@
 #include "api/ops/linear.h"
+#include "api/ops/linear_add.h"
+#include "api/ops/linear_pair.h"
 #include "api/ops/gdn_input_proj.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/op_tester.h"
@@ -91,12 +93,14 @@ int main() {
     for (const auto [n, k, padding] : {std::array{1024, 2560, 0}, std::array{768, 1152, 0},
                                       std::array{2048, 16384, 0}, std::array{5120, 10240, 0},
                                       std::array{2560, 5120, 0}, std::array{1024, 2560, 256},
-                                      std::array{12288, 2048, 0}}) {
+                                      std::array{12288, 2048, 0}, std::array{2048, 6144, 0},
+                                      std::array{6144, 2048, 0}}) {
         const int padded_k = k + padding;
         auto packed = quantized_weight::make_patterned_weight(QType::W8G32_F16S, n, padded_k, 91);
         const int groups = padded_k / 32;
         std::fill_n(packed.payload.begin(), packed.code_plane_bytes, 0);
         std::vector<std::uint16_t> reference(n);
+        std::vector<std::uint16_t> residual_reference(n);
         for (int row = 0; row < n; ++row) {
             const auto scale0 = std::uint16_t(0x2c41 + row % 31);
             const auto scale1 = std::uint16_t(0x2c83 + row % 29);
@@ -111,6 +115,7 @@ int main() {
             const float w0 = bf16_to_f32(f32_to_bf16(float(code0) * quantized_weight::detail::f16_to_f32(scale0)));
             const float w1 = bf16_to_f32(f32_to_bf16(float(code1) * quantized_weight::detail::f16_to_f32(scale1)));
             reference[row] = f32_to_bf16(w0 - w1);
+            residual_reference[row] = f32_to_bf16(w0 - w1 + 0.25F);
         }
         // The derived-plane registry keys weights by address; retain allocations
         // until every case has finished so a different matrix cannot reuse one.
@@ -150,6 +155,33 @@ int main() {
                         }
                         for (int row = 0; row < 4096; ++row) {
                             mismatches += projected[8192 * t + col * 4096 + row] != reference[8192 + row];
+                        }
+                    }
+                }
+                if (n == 2048 && k == 6144) {
+                    std::vector<std::uint16_t> residual(std::size_t(n) * t, f32_to_bf16(0.25F));
+                    dy.copy_from_host(residual.data(), residual.size() * 2);
+                    WorkspaceArena workspace(256);
+                    ops::linear_add(x, weight, y, workspace, nullptr);
+                    cuda_synchronize();
+                    const auto updated = from_device<std::uint16_t>(y.data, y.numel());
+                    for (std::size_t i = 0; i < updated.size(); ++i) {
+                        mismatches += updated[i] != residual_reference[i % n];
+                    }
+                }
+                if (n == 6144 && k == 2048) {
+                    const Weight key = packed.device_row_view(dw.p, 4096, 1024);
+                    const Weight value = packed.device_row_view(dw.p, 5120, 1024);
+                    Tensor keys(dy.p, DType::BF16, {1024, t});
+                    Tensor values(static_cast<std::uint16_t*>(dy.p) + 1024 * t,
+                                  DType::BF16, {1024, t});
+                    ops::linear_pair(x, key, value, keys, values, nullptr);
+                    cuda_synchronize();
+                    const auto projected = from_device<std::uint16_t>(dy.p, std::size_t(2048) * t);
+                    for (int col = 0; col < t; ++col) {
+                        for (int row = 0; row < 1024; ++row) {
+                            mismatches += projected[col * 1024 + row] != reference[4096 + row];
+                            mismatches += projected[1024 * t + col * 1024 + row] != reference[5120 + row];
                         }
                     }
                 }
