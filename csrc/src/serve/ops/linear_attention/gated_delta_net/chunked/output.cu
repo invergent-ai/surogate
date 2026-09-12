@@ -22,7 +22,7 @@ cudaError_t launch_fixed(const chunk_output_config& cfg, dim3 grid, head_map qk_
 
     kernel::output_kernel<MULTI_JOB><<<grid, block, smem_bytes, cfg.stream>>>(
         cfg.q, cfg.k, cfg.v_new, cfg.g_cumsum, cfg.h_chunk, cfg.attn_out, qk_map, cfg.scale,
-        chunks);
+        chunks, cfg.valid_tokens ? cfg.valid_tokens : cfg.L);
     return cudaGetLastError();
 }
 
@@ -32,6 +32,7 @@ cudaError_t launch_output(const chunk_output_config& cfg) {
     stage_validator v{"launch_output", cfg.H_qk, cfg.H_v, cfg.L};
     SINFER_GATED_DELTA_NET_PROPAGATE(v.check_shape());
     SINFER_GATED_DELTA_NET_PROPAGATE(v.check_full_chunks());
+    if (cfg.valid_tokens < 0 || cfg.valid_tokens > cfg.L) { return cudaErrorInvalidValue; }
     if (cfg.q == nullptr || cfg.k == nullptr || cfg.v_new == nullptr || cfg.g_cumsum == nullptr ||
         cfg.h_chunk == nullptr || cfg.attn_out == nullptr) {
         return cudaErrorInvalidValue;

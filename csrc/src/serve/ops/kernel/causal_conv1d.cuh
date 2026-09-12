@@ -20,8 +20,33 @@ __device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bf
 
 inline constexpr int kCausalConvChannelTile = 32;
 
+struct CausalConvSplitOutput {
+    __nv_bfloat16 *query, *key, *value;
+    int query_rows, key_rows, value_rows;
+
+    __device__ __forceinline__ __nv_bfloat16& operator[](std::int64_t index) const {
+        const int channels = query_rows + key_rows + value_rows;
+        const std::int64_t column = index / channels;
+        const int row = index - column * channels;
+        if (row < query_rows) { return query[column * query_rows + row]; }
+        if (row < query_rows + key_rows) { return key[column * key_rows + row - query_rows]; }
+        return value[column * value_rows + row - query_rows - key_rows];
+    }
+};
+
+__device__ __forceinline__ void causal_conv_store_pair(__nv_bfloat16* out, std::int64_t index,
+                                                       __nv_bfloat162 value) {
+    reinterpret_cast<__nv_bfloat162*>(out)[index] = value;
+}
+__device__ __forceinline__ void causal_conv_store_pair(CausalConvSplitOutput out,
+                                                       std::int64_t index, __nv_bfloat162 value) {
+    // The pair route requires every split width and destination to be pair aligned.
+    *reinterpret_cast<__nv_bfloat162*>(&out[2 * index]) = value;
+}
+
+template <class Output>
 __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                             const __nv_bfloat16* conv_state, __nv_bfloat16* out,
+                                             const __nv_bfloat16* conv_state, Output out,
                                              std::int32_t C, std::int32_t T) {
     const std::int64_t C64      = static_cast<std::int64_t>(C);
     const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
@@ -49,10 +74,11 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
     out[out_idx] = __float2bfloat16_rn(silu(acc));
 }
 
+template <class Output>
 __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
                                                    const __nv_bfloat16* weight,
                                                    const __nv_bfloat16* conv_state,
-                                                   __nv_bfloat16* out, std::int32_t C,
+                                                   Output out, std::int32_t C,
                                                    std::int32_t T) {
     const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
     const std::int64_t c_blocks  = div_up(C2, static_cast<std::int64_t>(blockDim.x));
@@ -65,7 +91,6 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     const auto* x2      = reinterpret_cast<const __nv_bfloat162*>(x);
     const auto* weight2 = reinterpret_cast<const __nv_bfloat162*>(weight);
     const auto* state2  = reinterpret_cast<const __nv_bfloat162*>(conv_state);
-    auto* out2          = reinterpret_cast<__nv_bfloat162*>(out);
 
     const std::int64_t out_idx = static_cast<std::int64_t>(t) * C2 + p;
     const __nv_bfloat162 x0    = (t >= 3) ? x2[static_cast<std::int64_t>(t - 3) * C2 + p]
@@ -82,7 +107,60 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     causal_conv1d_acc_pair(weight2[C2 + p], x1, acc0, acc1);
     causal_conv1d_acc_pair(weight2[2 * C2 + p], x2v, acc0, acc1);
     causal_conv1d_acc_pair(weight2[3 * C2 + p], x3, acc0, acc1);
-    out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
+    causal_conv_store_pair(out, out_idx, __floats2bfloat162_rn(silu(acc0), silu(acc1)));
+}
+
+// A channel owns its history before publishing state, including snapshot reservations
+// that overlap that row's initial slot. Used for short split windows and adjacent taps.
+template <bool NativeTaps>
+__global__ void causal_conv1d_split_sequence_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* state_in,
+    __nv_bfloat16* state_out, CausalConvSplitOutput out, int channels, int width,
+    const std::int32_t* valid, const std::int32_t* initial, const std::int32_t* snapshots) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) { return; }
+    const int batch = blockIdx.y;
+    const int count = valid ? max(0, min(width, valid[batch])) : width;
+    const std::int64_t stride = 3LL * channels;
+    const std::int64_t start = initial ? initial[batch] * stride : 0;
+    float s0 = __bfloat162float(state_in[start + c]);
+    float s1 = __bfloat162float(state_in[start + channels + c]);
+    float s2 = __bfloat162float(state_in[start + 2LL * channels + c]);
+    const int wc = NativeTaps ? 4 : 1, wt = NativeTaps ? 1 : channels;
+    const float w0 = __bfloat162float(weight[wc * c]);
+    const float w1 = __bfloat162float(weight[wc * c + wt]);
+    const float w2 = __bfloat162float(weight[wc * c + 2LL * wt]);
+    const float w3 = __bfloat162float(weight[wc * c + 3LL * wt]);
+    for (int t = 0; t < width; ++t) {
+        const std::int64_t i = (static_cast<std::int64_t>(batch) * width + t) * channels + c;
+        if (t >= count) { out[i] = __float2bfloat16_rn(0.F); continue; }
+        const float value = __bfloat162float(x[i]);
+        float sum = 0.F;
+        if constexpr (NativeTaps) {
+            sum = fmaf(w0, s0, sum);
+            sum = fmaf(w1, s1, sum);
+            sum = fmaf(w2, s2, sum);
+            sum = fmaf(w3, value, sum);
+        } else {
+            sum += w0 * s0;
+            sum += w1 * s1;
+            sum += w2 * s2;
+            sum += w3 * value;
+        }
+        out[i] = __float2bfloat16_rn(silu(sum));
+        s0 = s1; s1 = s2; s2 = value;
+        if (snapshots) {
+            const std::int64_t dst = (snapshots[batch] + t) * stride;
+            state_out[dst + c] = __float2bfloat16_rn(s0);
+            state_out[dst + channels + c] = __float2bfloat16_rn(s1);
+            state_out[dst + 2LL * channels + c] = __float2bfloat16_rn(s2);
+        }
+    }
+    if (!snapshots) {
+        state_out[c] = __float2bfloat16_rn(s0);
+        state_out[channels + c] = __float2bfloat16_rn(s1);
+        state_out[2LL * channels + c] = __float2bfloat16_rn(s2);
+    }
 }
 
 // Writes the trailing width-3 conv window after consuming the T input columns.

@@ -153,13 +153,11 @@ GdnProjectionRoots gdn_projection(Allocator& allocator, const family::TextGeomet
 
 struct GdnPrefillConvRoots {
     Tensor projected;
-    Tensor convolved;
 };
 
 template <class Allocator>
 GdnPrefillConvRoots gdn_prefill_conv(Allocator& allocator, const family::TextGeometry& geometry, std::int32_t tokens) {
     return {
-        matrix(allocator, DType::BF16, geometry.convolution_dim(), tokens),
         matrix(allocator, DType::BF16, geometry.convolution_dim(), tokens),
     };
 }

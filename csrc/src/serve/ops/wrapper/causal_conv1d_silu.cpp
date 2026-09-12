@@ -132,7 +132,65 @@ void require_metadata_accessible(const Tensor& metadata, const char* label) {
     }
 }
 
+void require_split_outputs(const Tensor& x, const Tensor& query, const Tensor& key, const Tensor& value) {
+    std::int64_t channels = 0;
+    for (const auto* out : {&query, &key, &value}) {
+        if (out->dtype != DType::BF16 || out->ne[0] <= 0 || out->ne[1] != x.ne[1] ||
+            out->ne[2] != x.ne[2] || out->ne[3] != x.ne[3] || !out->is_contiguous() || !out->data) {
+            throw std::invalid_argument("causal_conv1d: split outputs must be contiguous BF16 channel groups of x");
+        }
+        channels += out->ne[0];
+    }
+    if (channels != x.ne[0]) {
+        throw std::invalid_argument("causal_conv1d: split output channels must sum to C");
+    }
+}
+
 } // namespace
+
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                              Tensor& state_out, Tensor& query, Tensor& key, Tensor& value,
+                              const Tensor& valid_columns, cudaStream_t stream) {
+    (void)validate_common(x, weight, state_in, x);
+    if (x.ne[1] <= 0 || state_out.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: split requires positive T and BF16 state output");
+    }
+    require_state_shape(state_out, x.ne[0]);
+    require_non_empty_accessible(x, weight, state_in, state_out);
+    require_split_outputs(x, query, key, value);
+    if (valid_columns.data) {
+        if (valid_columns.dtype != DType::I32) {
+            throw std::invalid_argument("causal_conv1d: valid columns must be I32");
+        }
+        require_selector_shape(valid_columns, 1, "valid columns");
+        require_metadata_accessible(valid_columns, "valid columns");
+    }
+    detail::causal_conv1d_split_launch(x, weight, state_in, state_out, query, key, value,
+                                      valid_columns, Tensor{}, Tensor{}, stream);
+}
+
+void causal_conv1d_silu_snapshot_split(const Tensor& x, const Tensor& weight, Tensor& states,
+                                       const Tensor& valid_columns, const Tensor& initial_slots,
+                                       const Tensor& snapshot_slots, Tensor& query, Tensor& key,
+                                       Tensor& value, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || states.dtype != DType::BF16 ||
+        initial_slots.dtype != DType::I32 || snapshot_slots.dtype != DType::I32 ||
+        (valid_columns.data && valid_columns.dtype != DType::I32)) {
+        throw std::invalid_argument("causal_conv1d: split snapshots require BF16 data and I32 selectors");
+    }
+    require_snapshot_x_shape(x);
+    require_weight_shape(weight, x.ne[0]);
+    require_snapshot_state_shape(states, x.ne[0], x.ne[1], x.ne[2]);
+    require_non_empty_accessible(x, weight, states, x);
+    require_split_outputs(x, query, key, value);
+    for (const auto* selector : {&initial_slots, &snapshot_slots, &valid_columns}) {
+        if (selector == &valid_columns && !selector->data) { continue; }
+        require_selector_shape(*selector, x.ne[2], "split snapshot selector");
+        require_metadata_accessible(*selector, "split snapshot selector");
+    }
+    detail::causal_conv1d_split_launch(x, weight, states, states, query, key, value,
+                                      valid_columns, initial_slots, snapshot_slots, stream);
+}
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                         Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {

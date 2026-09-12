@@ -1,5 +1,6 @@
 #include "api/ops/gated_delta_net.h"
 #include "api/ops/l2norm.h"
+#include "core/device.h"
 
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
@@ -340,40 +341,64 @@ int normalization_parity_case(int tokens, bool snapshot) {
 
 // Appending neutral tokens must not change a prefix's output or final state.
 // This catches a last partial block silently switching to recurrent arithmetic.
-int partial_chunk_parity_case(int tokens, bool normalize, bool split = false) {
+int partial_chunk_parity_case(int tokens, bool normalize, bool split = false, int heads = 8, bool capture = false) {
     const int padded = ((tokens + 63) / 64) * 64;
-    const Case test_case{"partial chunk parity", 4, 8, padded, normalize};
+    const Case test_case{"partial chunk parity", heads / 2, heads, padded, normalize};
     auto in = make_inputs(test_case, 16000u + tokens);
-    std::fill(in.g.begin() + tokens * 8, in.g.end(), 0.0f);
-    std::fill(in.beta.begin() + tokens * 8, in.beta.end(), 0.0f);
+    std::fill(in.g.begin() + tokens * heads, in.g.end(), 0.0f);
+    std::fill(in.beta.begin() + tokens * heads, in.beta.end(), 0.0f);
     DeviceInputs device(in);
-    Tensor q(device.q.p, DType::BF16, {kStateDim, 4, padded});
-    Tensor k(device.k.p, DType::BF16, {kStateDim, 4, padded});
-    Tensor v(device.v.p, DType::BF16, {kStateDim, 8, padded});
-    Tensor g(device.g.p, DType::FP32, {8, padded});
-    Tensor beta(device.beta.p, DType::FP32, {8, padded});
+    Tensor q(device.q.p, DType::BF16, {kStateDim, heads / 2, padded});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, heads / 2, padded});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, heads, padded});
+    Tensor g(device.g.p, DType::FP32, {heads, padded});
+    Tensor beta(device.beta.p, DType::FP32, {heads, padded});
     auto prefix_state = to_device_bf16(in.state), padded_state = to_device_bf16(in.state);
-    GuardedDeviceBuffer prefix_out(std::size_t(kStateDim) * 8 * tokens * 2);
+    GuardedDeviceBuffer prefix_out(std::size_t(kStateDim) * heads * tokens * 2);
     DeviceBuffer padded_out(v.bytes());
-    Tensor ps(prefix_state.p, DType::BF16, {kStateDim, kStateDim, 8});
-    Tensor fs(padded_state.p, DType::BF16, {kStateDim, kStateDim, 8});
-    Tensor po(prefix_out.data(), DType::BF16, {kStateDim, 8, tokens});
-    Tensor fo(padded_out.p, DType::BF16, {kStateDim, 8, padded});
-    const auto bytes = ops::gated_delta_net_workspace_capacity_bytes(4, 8, normalize, tokens, padded);
+    Tensor ps(prefix_state.p, DType::BF16, {kStateDim, kStateDim, heads});
+    Tensor fs(padded_state.p, DType::BF16, {kStateDim, kStateDim, heads});
+    Tensor po(prefix_out.data(), DType::BF16, {kStateDim, heads, tokens});
+    Tensor fo(padded_out.p, DType::BF16, {kStateDim, heads, padded});
+    const auto bytes = ops::gated_delta_net_workspace_capacity_bytes(heads / 2, heads, normalize, tokens, padded);
     WorkspaceArena workspace(bytes);
     const float scale = 1.0f / std::sqrt(float(kStateDim));
+    auto short_input = in;
+    short_input.q.resize(std::size_t(kStateDim) * (heads / 2) * tokens);
+    short_input.k.resize(short_input.q.size());
+    short_input.v.resize(std::size_t(kStateDim) * heads * tokens);
+    short_input.g.resize(heads * tokens); short_input.beta.resize(heads * tokens);
+    DeviceInputs short_device(short_input);
+    Tensor sq(short_device.q.p, DType::BF16, {kStateDim, heads / 2, tokens});
+    Tensor sk(short_device.k.p, DType::BF16, {kStateDim, heads / 2, tokens});
+    Tensor sv(short_device.v.p, DType::BF16, {kStateDim, heads, tokens});
+    Tensor sg(short_device.g.p, DType::FP32, {heads, tokens}), sb(short_device.beta.p, DType::FP32, {heads, tokens});
+    cuda_synchronize();
+    cudaStream_t stream; CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+    if (capture) { CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal)); }
     const int step = split ? 64 : tokens;
     for (int begin = 0; begin < tokens; begin += step) {
         const int count = std::min(step, tokens - begin);
         Tensor part = po.slice(2, begin, count);
-        ops::gated_delta_net(q.slice(2, begin, count), k.slice(2, begin, count), v.slice(2, begin, count),
-                             g.slice(1, begin, count), beta.slice(1, begin, count), scale, normalize,
-                             workspace, ps, part, nullptr);
+        ops::gated_delta_net(sq.slice(2, begin, count), sk.slice(2, begin, count), sv.slice(2, begin, count),
+                             sg.slice(1, begin, count), sb.slice(1, begin, count), scale, normalize,
+                             workspace, ps, part, stream);
     }
-    ops::gated_delta_net(q, k, v, g, beta, scale, normalize, workspace, fs, fo, nullptr);
+    if (capture) {
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (int replay = 0; replay < 2; ++replay) {
+            const auto bits = bf16_bits(in.state);
+            CUDA_CHECK(cudaMemcpyAsync(prefix_state.p, bits.data(), prefix_state.bytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaGraphLaunch(exec, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+    }
+    ops::gated_delta_net(q, k, v, g, beta, scale, normalize, workspace, fs, fo, stream);
     cuda_synchronize();
     const auto label = "partial chunk T=" + std::to_string(tokens) + " normalize=" + std::to_string(normalize) +
-                       " split=" + std::to_string(split);
+                       " split=" + std::to_string(split) + " heads=" + std::to_string(heads) + " graph=" + std::to_string(capture);
     const auto elements = po.numel();
     int failures = verify_exact(label + " output", from_device<std::uint16_t>(prefix_out.data(), elements),
                                 from_device<std::uint16_t>(padded_out, elements));
@@ -384,6 +409,8 @@ int partial_chunk_parity_case(int tokens, bool normalize, bool split = false) {
         std::cerr << label << ": workspace interval missed a partial chunk\n";
         ++failures;
     }
+    if (capture) { CUDA_CHECK(cudaGraphExecDestroy(exec)); CUDA_CHECK(cudaGraphDestroy(graph)); }
+    CUDA_CHECK(cudaStreamDestroy(stream));
     return failures;
 }
 
@@ -711,6 +738,12 @@ int main() {
     for (const int tokens : {128, 192, 256}) {
         failures += partial_chunk_parity_case(tokens, false, true);
         failures += partial_chunk_parity_case(tokens, true, true);
+    }
+
+    for (int heads : {16, 32, 48}) for (bool normalize : {false, true}) {
+        for (int tokens : {65, 127, 2047, 2053}) {
+            failures += partial_chunk_parity_case(tokens, normalize, false, heads, true);
+        }
     }
 
     // Registered 27B/35B-A3B geometries, public state forms, and the recurrent/chunk/tail route

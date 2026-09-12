@@ -19,7 +19,7 @@ cudaError_t launch_fixed(const prepare_wy_wu_config& cfg, dim3 grid, head_map qk
 
     kernel::prepare_wy_wu_kernel<KPanelCols, WuPanelCols, BlockWarps>
         <<<grid, dim3(threads, 1, 1), smem_bytes, cfg.stream>>>(
-            cfg.k, cfg.v, cfg.g_in, cfg.beta, cfg.W, cfg.U, cfg.g_cumsum_out, qk_map);
+            cfg.k, cfg.v, cfg.g_in, cfg.beta, cfg.W, cfg.U, cfg.g_cumsum_out, qk_map, cfg.valid_tokens ? cfg.valid_tokens : cfg.L);
     return cudaGetLastError();
 }
 
@@ -29,6 +29,7 @@ cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg) {
     stage_validator v{"launch_prepare_wy_wu", cfg.H_qk, cfg.H_v, cfg.L};
     SINFER_GATED_DELTA_NET_PROPAGATE(v.check_shape());
     SINFER_GATED_DELTA_NET_PROPAGATE(v.check_full_chunks());
+    if (cfg.valid_tokens < 0 || cfg.valid_tokens > cfg.L) { return cudaErrorInvalidValue; }
     if (cfg.k == nullptr || cfg.v == nullptr || cfg.g_in == nullptr || cfg.beta == nullptr ||
         cfg.W == nullptr || cfg.U == nullptr || cfg.g_cumsum_out == nullptr) {
         return cudaErrorInvalidValue;

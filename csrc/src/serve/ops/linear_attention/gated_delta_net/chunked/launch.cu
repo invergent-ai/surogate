@@ -39,6 +39,7 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     prepare.W            = static_cast<__nv_bfloat16*>(W.data);
     prepare.U            = static_cast<__nv_bfloat16*>(U.data);
     prepare.g_cumsum_out = static_cast<float*>(g_cumsum.data);
+    prepare.valid_tokens = v.ne[2];
     prepare.stream       = stream;
     CUDA_CHECK(chunked::launch_prepare_wy_wu(prepare));
 
@@ -68,6 +69,7 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     output.h_chunk  = static_cast<const __nv_bfloat16*>(h_chunk.data);
     output.attn_out = static_cast<__nv_bfloat16*>(out.data);
     output.scale    = scale;
+    output.valid_tokens = out.ne[2];
     output.stream   = stream;
     CUDA_CHECK(chunked::launch_output(output));
 }

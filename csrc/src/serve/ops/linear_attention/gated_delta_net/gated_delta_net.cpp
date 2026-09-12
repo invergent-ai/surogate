@@ -181,10 +181,6 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
 struct ChunkedWorkspace {
     Tensor normalized_q;
     Tensor normalized_k;
-    Tensor padded_v;
-    Tensor padded_g;
-    Tensor padded_beta;
-    Tensor padded_out;
     DeviceSpan stage;
 };
 
@@ -205,12 +201,6 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
             allocator.alloc(DType::BF16, {detail::gated_delta_net::kStateDim, qk_heads, padded});
         out.normalized_k =
             allocator.alloc(DType::BF16, {detail::gated_delta_net::kStateDim, qk_heads, padded});
-    }
-    if (padded != tokens) {
-        out.padded_v = allocator.alloc(DType::BF16, {detail::gated_delta_net::kStateDim, value_heads, padded});
-        out.padded_g = allocator.alloc(DType::FP32, {value_heads, padded});
-        out.padded_beta = allocator.alloc(DType::FP32, {value_heads, padded});
-        out.padded_out = allocator.alloc(DType::BF16, {detail::gated_delta_net::kStateDim, value_heads, padded});
     }
     out.stage =
         allocator.alloc_bytes(detail::gated_delta_net::chunked_workspace_bytes(value_heads, padded));
@@ -233,9 +223,10 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
         return layout.peak_bytes(1);
     };
     auto bytes = bytes_for(max_tokens);
-    // A partial final chunk also needs padded inputs/output; the preceding
-    // partial shape can therefore need more workspace than an exact multiple.
-    if (max_tokens > min_tokens && max_tokens % detail::gated_delta_net::kChunkSize == 0) {
+    // Raw Q/K need padded copies only for partial chunks. Their preceding tail
+    // can require more storage than an aligned maximum with borrowed Q/K.
+    if (!normalize_qk && max_tokens > min_tokens &&
+        max_tokens % detail::gated_delta_net::kChunkSize == 0) {
         bytes = std::max(bytes, bytes_for(max_tokens - 1));
     }
     return bytes;
@@ -283,9 +274,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         return;
     }
     ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
-    Tensor q_compute = q, k_compute = k, v_compute = v, g_compute = g, beta_compute = beta;
-    Tensor output = out;
-    const bool padded = scratch.padded_out.data != nullptr;
+    Tensor q_compute = q, k_compute = k;
+    const bool padded = T % detail::gated_delta_net::kChunkSize != 0;
     const auto copy_padded = [&](const Tensor& source, Tensor& destination) {
         CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(), cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(destination.data) + source.bytes(), 0,
@@ -310,24 +300,11 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         q_compute = scratch.normalized_q;
         k_compute = scratch.normalized_k;
     }
-    if (padded) {
-        // Keep the last partial block on the same chunked arithmetic as its
-        // causal prefix in a longer prompt. Zero decay and update gates make
-        // padding leave the final state unchanged.
-        copy_padded(v, scratch.padded_v);
-        copy_padded(g, scratch.padded_g);
-        copy_padded(beta, scratch.padded_beta);
-        v_compute = scratch.padded_v;
-        g_compute = scratch.padded_g;
-        beta_compute = scratch.padded_beta;
-        output = scratch.padded_out;
-    }
-    detail::gated_delta_net::launch_chunked(q_compute, k_compute, v_compute, g_compute, beta_compute, scale,
-                                            ssm_state_in, ssm_state_out, output,
+    // Tail lanes read zero V/decay/update gates in the chunk kernel and suppress
+    // output stores. The recurrence and its final state retain the padded arithmetic.
+    detail::gated_delta_net::launch_chunked(q_compute, k_compute, v, g, beta, scale,
+                                            ssm_state_in, ssm_state_out, out,
                                             scratch.stage.data, scratch.stage.bytes, stream);
-    if (padded) {
-        CUDA_CHECK(cudaMemcpyAsync(out.data, output.data, out.bytes(), cudaMemcpyDeviceToDevice, stream));
-    }
 }
 
 } // namespace sinfer::ops

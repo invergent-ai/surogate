@@ -518,6 +518,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         } else if (path == GdnWorkspacePath::ReplayRecord) {
             scratch(layout, Variant::gdn_input_projection_record_workspace_capacity_bytes(plan.geometry, plan.weights_profile, phase, batch_size, min_width, max_width));
         } else {
+            auto conv_scope = layout.scope();
             (void)workspace_recipe::gdn_prefill_conv(layout, plan.geometry, last);
             scratch(layout, Variant::gdn_input_projection_workspace_capacity_bytes(plan.geometry, plan.weights_profile, phase, first, last));
             scratch(layout, ops::detail::marlin_fused_parent_bytes(

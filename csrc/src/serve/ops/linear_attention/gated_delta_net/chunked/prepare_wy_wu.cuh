@@ -235,15 +235,15 @@ template <int WU_PANEL_COLS, int BLOCK_THREADS>
 __device__ __forceinline__ void
 load_scaled_wu_panel(SmemTile<WU_PANEL_COLS> panel, const __nv_bfloat16* __restrict__ input_row0,
                      std::int64_t input_row_stride, const float* __restrict__ scale, int panel_col,
-                     int tid) {
+                     int tid, int valid_rows = BT) {
     constexpr int VEC_PER_ROW = WU_PANEL_COLS / 4;
     constexpr int N_VEC       = BT * VEC_PER_ROW;
 #pragma unroll
     for (int v = tid; v < N_VEC; v += BLOCK_THREADS) {
         const int row           = v / VEC_PER_ROW;
         const int col4          = (v - row * VEC_PER_ROW) * 4;
-        const Bf16x4Pack packed = load_vec<Bf16x4Pack>(
-            input_row0 + (std::int64_t)row * input_row_stride + panel_col + col4);
+        const Bf16x4Pack packed = row < valid_rows ? load_vec<Bf16x4Pack>(
+            input_row0 + (std::int64_t)row * input_row_stride + panel_col + col4) : Bf16x4Pack{};
         const float2 lo          = bf16x2_to_float2(packed.pair[0]);
         const float2 hi          = bf16x2_to_float2(packed.pair[1]);
         const float s            = scale[row];
@@ -355,7 +355,7 @@ __global__ void
 prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16* __restrict__ v_in,
                      const float* __restrict__ g_in, const float* __restrict__ beta_in,
                      __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ U,
-                     float* __restrict__ g_cumsum_out, head_map qk_map) {
+                     float* __restrict__ g_cumsum_out, head_map qk_map, int valid_tokens) {
     static_assert(BLOCK_WARPS == 4 || BLOCK_WARPS == 8);
     static_assert(BLOCK_WARPS % N_SUB == 0);
     static_assert(WU_PANEL_COLS % (BLOCK_WARPS / N_SUB) == 0);
@@ -411,7 +411,7 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
     // any read of g_smem / beta_smem can race the scan stores.
     if (tid < BT) {
         const int64_t boff = (cs + tid) * H_v + h_v;
-        beta_smem[tid]     = beta_in[boff];
+        beta_smem[tid]     = cs + tid < valid_tokens ? beta_in[boff] : 0.0f;
     }
 
     if (warp == 0) {
@@ -419,8 +419,8 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
         const int t0             = 2 * lane; // 0, 2, ..., 62
         const int t1             = t0 + 1;   // 1, 3, ..., 63
 
-        const float a  = g_in[g_row_base + (int64_t)t0 * H_v];
-        const float bv = g_in[g_row_base + (int64_t)t1 * H_v];
+        const float a  = cs + t0 < valid_tokens ? g_in[g_row_base + (int64_t)t0 * H_v] : 0.0f;
+        const float bv = cs + t1 < valid_tokens ? g_in[g_row_base + (int64_t)t1 * H_v] : 0.0f;
 
         // Hillis-Steele inclusive scan over per-lane partials (a + bv).
         float partial = a + bv;
@@ -529,9 +529,10 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
                 for (int v = helper_tid; v < N_VECS; v += HELPER_THREADS) {
                     const int row  = v / VECS_PER_ROW;
                     const int col8 = (v - row * VECS_PER_ROW) * 8;
-                    cp_async<16, Cache::cg>(preload.ptr(row, col8),
-                                            v_in + v_base + static_cast<int64_t>(row) * v_stride_t +
-                                                col8);
+                    const bool valid = cs + row < valid_tokens;
+                    sinfer::ops::cp_async_zfill<16, Cache::cg>(preload.ptr(row, col8),
+                        valid ? v_in + v_base + static_cast<int64_t>(row) * v_stride_t + col8 : v_in,
+                        valid ? 16 : 0);
                 }
                 cp_commit();
                 cp_wait<0>();
@@ -696,11 +697,11 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
                     WU_view, Bf16SmemTile<WU_PANEL_COLS>{output_smem}, beta_smem, tid);
             } else {
                 load_scaled_wu_panel<WU_PANEL_COLS, BLOCK_THREADS>(
-                    WU_view, v_in + v_base, v_stride_t, beta_smem, panel_col, tid);
+                    WU_view, v_in + v_base, v_stride_t, beta_smem, panel_col, tid, valid_tokens - cs);
             }
         } else {
             load_scaled_wu_panel<WU_PANEL_COLS, BLOCK_THREADS>(WU_view, v_in + v_base, v_stride_t,
-                                                               beta_smem, panel_col, tid);
+                                                               beta_smem, panel_col, tid, valid_tokens - cs);
         }
         __syncthreads();
         compute_store_wu_panel<false, WU_PANEL_COLS, BLOCK_WARPS>(

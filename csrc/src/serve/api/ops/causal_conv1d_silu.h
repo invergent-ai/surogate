@@ -62,4 +62,17 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  cudaStream_t stream);
 
+// Same convolution and state semantics, writing consecutive channel groups directly to
+// separate contiguous BF16 tensors. Their channel counts sum to C; their other extents
+// match x. No intermediate output or workspace is required. An empty valid_columns
+// means all columns are valid; otherwise it is a device I32 scalar for ordinary prefill.
+void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                              Tensor& state_out, Tensor& query, Tensor& key, Tensor& value,
+                              const Tensor& valid_columns, cudaStream_t stream);
+
+void causal_conv1d_silu_snapshot_split(const Tensor& x, const Tensor& weight, Tensor& states,
+                                       const Tensor& valid_columns, const Tensor& initial_slots,
+                                       const Tensor& snapshot_slots, Tensor& query, Tensor& key,
+                                       Tensor& value, cudaStream_t stream);
+
 } // namespace sinfer::ops

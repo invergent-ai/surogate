@@ -89,6 +89,49 @@ void native_taps_launch(const Tensor& x, const Tensor& weight, const Tensor& sta
 
 } // namespace
 
+void causal_conv1d_split_launch(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                                Tensor& state_out, Tensor& query, Tensor& key, Tensor& value,
+                                const Tensor& valid, const Tensor& initial,
+                                const Tensor& snapshots, cudaStream_t stream) {
+    const CausalConvSplitOutput out{static_cast<__nv_bfloat16*>(query.data),
+        static_cast<__nv_bfloat16*>(key.data), static_cast<__nv_bfloat16*>(value.data),
+        query.ne[0], key.ne[0], value.ne[0]};
+    const auto* in = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* w = static_cast<const __nv_bfloat16*>(weight.data);
+    const auto* si = static_cast<const __nv_bfloat16*>(state_in.data);
+    auto* so = static_cast<__nv_bfloat16*>(state_out.data);
+    const auto* count = static_cast<const std::int32_t*>(valid.data);
+    const int C = x.ne[0], T = x.ne[1];
+    if (T > kCausalConvSequenceMaxTokens && weight.is_contiguous() && !snapshots.data) {
+        const auto address = reinterpret_cast<std::uintptr_t>(in) |
+            reinterpret_cast<std::uintptr_t>(w) | reinterpret_cast<std::uintptr_t>(si) |
+            reinterpret_cast<std::uintptr_t>(query.data) | reinterpret_cast<std::uintptr_t>(key.data) |
+            reinterpret_cast<std::uintptr_t>(value.data);
+        const bool pairs = !((query.ne[0] | key.ne[0] | value.ne[0]) & 1) && !(address & 3);
+        if (pairs) {
+            causal_conv1d_prefill_pairs_kernel<<<prefill_output_grid_for(C / 2, T, 256), 256, 0, stream>>>(
+                in, w, si, out, C, T);
+        } else {
+            causal_conv1d_prefill_kernel<<<prefill_output_grid_for(C, T, 256), 256, 0, stream>>>(
+                in, w, si, out, C, T);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        causal_conv1d_prefill_state_kernel<<<grid_for(C, 256, "split state"), 256, 0, stream>>>(
+            in, si, so, C, T, count);
+    } else {
+        const int block = T == 1 || !weight.is_contiguous() ? 256 : 32;
+        const dim3 grid(grid_for(C, block, "split sequence"), x.ne[2]);
+        const auto launch = [&]<bool Native>() {
+            causal_conv1d_split_sequence_kernel<Native><<<grid, block, 0, stream>>>(in, w, si, so,
+                out, C, T, count, static_cast<const std::int32_t*>(initial.data),
+                static_cast<const std::int32_t*>(snapshots.data));
+        };
+        if (weight.is_contiguous()) { launch.template operator()<false>(); }
+        else { launch.template operator()<true>(); }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
                                   const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
                                   cudaStream_t stream, const std::int32_t* valid_len) {

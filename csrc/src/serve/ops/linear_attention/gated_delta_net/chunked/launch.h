@@ -63,6 +63,8 @@ struct prepare_wy_wu_config {
     __nv_bfloat16* U    = nullptr;
     float* g_cumsum_out = nullptr;
 
+    // Zero means all L columns are valid; a partial tail is zero-filled on load.
+    std::int32_t valid_tokens = 0;
     cudaStream_t stream = nullptr;
 };
 
@@ -99,6 +101,8 @@ struct chunk_output_config {
 
     float scale = 0.0f;
 
+    // Zero means all L columns are valid; a partial tail is zero-filled on load.
+    std::int32_t valid_tokens = 0;
     cudaStream_t stream = nullptr;
 };
 

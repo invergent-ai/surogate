@@ -28,4 +28,9 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
                                    const Tensor& snapshot_base_slots, Tensor& out,
                                    cudaStream_t stream);
 
+void causal_conv1d_split_launch(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                                Tensor& state_out, Tensor& query, Tensor& key, Tensor& value,
+                                const Tensor& valid, const Tensor& initial,
+                                const Tensor& snapshots, cudaStream_t stream);
+
 } // namespace sinfer::ops::detail

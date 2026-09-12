@@ -1,4 +1,5 @@
 #include "api/ops/causal_conv1d_silu.h"
+#include "core/device.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -476,6 +477,95 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     return failures;
 }
 
+// Differential coverage of the fused destination layout against the oracle-qualified
+// packed operation. Graph replays change the device valid counts and state contents.
+int split_case(std::array<int, 3> rows, int width, int batch, bool snapshot, bool native, bool capture) {
+    const int channels = rows[0] + rows[1] + rows[2], columns = width * batch;
+    const int slots = snapshot ? batch * (width + 1) : 2;
+    const auto input = make_input(channels, columns, 9000 + width);
+    const auto xb = bf16_bits(input.x), wb = stored_weight_bits(input.weight, channels, native);
+    const auto sb = bf16_bits(make_values(std::size_t(channels) * 3 * slots, 9100 + width, -1.F, 1.F));
+    GuardedDeviceBuffer x(xb.size() * 2), w(wb.size() * 2), state(sb.size() * 2), reference_state(sb.size() * 2);
+    GuardedDeviceBuffer packed(xb.size() * 2), q(std::size_t(rows[0]) * columns * 2),
+        k(std::size_t(rows[1]) * columns * 2), v(std::size_t(rows[2]) * columns * 2);
+    GuardedDeviceBuffer valid(batch * 4), initial(batch * 4), bases(batch * 4);
+    x.copy_from_host(xb.data(), x.bytes()); w.copy_from_host(wb.data(), w.bytes());
+    std::vector<int> initials(batch), starts(batch), counts(batch, width);
+    for (int b = 0; b < batch; ++b) { starts[b] = b * (width + 1); initials[b] = starts[b] + width - 1; }
+    initial.copy_from_host(initials.data(), initial.bytes()); bases.copy_from_host(starts.data(), bases.bytes());
+    Tensor tx(x.data(), DType::BF16, {channels, width, batch});
+    Tensor tw = native ? Tensor(w.data(), DType::BF16, {4, channels}).permute({1, 0, 2, 3})
+                       : Tensor(w.data(), DType::BF16, {channels, 4});
+    Tensor ts(state.data(), DType::BF16, {channels, 3, slots}), rs(reference_state.data(), DType::BF16, {channels, 3, slots});
+    Tensor tq(q.data(), DType::BF16, {rows[0], width, batch}), tk(k.data(), DType::BF16, {rows[1], width, batch}),
+        tv(v.data(), DType::BF16, {rows[2], width, batch}), tp(packed.data(), DType::BF16, {channels, width, batch});
+    Tensor tc(valid.data(), DType::I32, {batch}), ti(initial.data(), DType::I32, {batch}), tb(bases.data(), DType::I32, {batch});
+    const bool masked = snapshot || width > 64;
+    const auto launch = [&](bool split, cudaStream_t stream) {
+        auto& storage = split ? ts : rs;
+        if (snapshot) {
+            if (split) { ops::causal_conv1d_silu_snapshot_split(tx, tw, storage, tc, ti, tb, tq, tk, tv, stream); }
+            else { ops::causal_conv1d_silu_snapshot(tx, tw, storage, tc, ti, tb, tp, stream); }
+        } else {
+            Tensor in = storage.slice(2, 0, 1), out = storage.slice(2, 1, 1);
+            if (split) { ops::causal_conv1d_silu_split(tx, tw, in, out, tq, tk, tv, masked ? tc : Tensor{}, stream); }
+            else if (masked) { ops::causal_conv1d_silu(tx, tw, in, out, tp, tc, stream); }
+            else { ops::causal_conv1d_silu(tx, tw, in, out, tp, stream); }
+        }
+    };
+    cudaStream_t stream; CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+    valid.copy_from_host(counts.data(), valid.bytes());
+    cuda_synchronize();
+    if (capture) {
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        launch(true, stream);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    }
+    int failures = 0;
+    for (int replay = 0; replay < 3; ++replay) {
+        for (int b = 0; b < batch; ++b) { counts[b] = replay == 0 || !masked ? width : std::max(1, width - replay - b); }
+        valid.copy_from_host(counts.data(), valid.bytes());
+        auto current_state = sb;
+        if (replay) { std::rotate(current_state.begin(), current_state.begin() + replay, current_state.end()); }
+        state.copy_from_host(current_state.data(), state.bytes());
+        reference_state.copy_from_host(current_state.data(), reference_state.bytes());
+        q.fill(kOutputPoison); k.fill(kOutputPoison); v.fill(kOutputPoison); packed.fill(kOutputPoison);
+        // Fixture uploads use the default stream; the tested stream is nonblocking.
+        cuda_synchronize();
+        launch(false, stream);
+        if (capture) { CUDA_CHECK(cudaGraphLaunch(exec, stream)); } else { launch(true, stream); }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto expected = from_device<std::uint16_t>(packed.data(), xb.size());
+        int offset = 0;
+        for (const auto* part : {&q, &k, &v}) {
+            const int n = part->bytes() / (2 * columns);
+            const auto got = from_device<std::uint16_t>(part->data(), part->bytes() / 2);
+            bool exact = true;
+            for (int b = 0; b < batch; ++b) for (int t = 0; t < width; ++t) {
+                if (!snapshot && t >= counts[b]) { continue; }
+                for (int c = 0; c < n; ++c) {
+                    const int col = b * width + t;
+                    exact &= got[std::size_t(col) * n + c] == expected[std::size_t(col) * channels + offset + c];
+                }
+            }
+            if (!exact) { ++failures; }
+            failures += verify_buffer_guards("split output", *part);
+            offset += n;
+        }
+        failures += verify_bits("split states", state.data(), from_device<std::uint16_t>(reference_state.data(), sb.size()));
+        failures += verify_bits("split input preserved", x.data(), xb);
+        failures += verify_bits("split weights preserved", w.data(), wb);
+        failures += verify_buffer_guards("split state", state);
+    }
+    if (capture) { CUDA_CHECK(cudaGraphExecDestroy(exec)); CUDA_CHECK(cudaGraphDestroy(graph)); }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    std::cout << (failures ? "FAIL" : "OK") << " split C=" << channels << " T=" << width
+              << " B=" << batch << " snapshot=" << snapshot << " native=" << native << " graph=" << capture << "\n";
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -541,6 +631,17 @@ int main() {
         }
         failures += batched_snapshot_case(channels, 6, {18, 19, 20}, {0, 6, 12}, {6, 3, 1}, 21, 7200U, true);
         failures += batched_snapshot_case(channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 7300U, true);
+    }
+
+    for (bool native : {false, true}) for (bool graph : {false, true}) {
+        for (auto rows : {std::array{17, 19, 37}, std::array{2048, 2048, 4096}}) {
+            for (int t : {1, 7, 16, 17, 64, 65, 129, 257, 2053}) {
+                failures += split_case(rows, t, 1, false, native, graph);
+            }
+            for (int t : {1, 7, 16}) {
+                failures += split_case(rows, t, 8, true, native, graph);
+            }
+        }
     }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " causal_conv1d_silu\n";

@@ -1617,26 +1617,19 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
                 value_output, gate_output, ph, work_, s);
         }
     } else {
+        auto conv_scope = work_.scope();
         const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), T);
-        Tensor qkv      = conv.projected;
+        Tensor qkv = conv.projected;
         Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
         if (sub_timing) { sub_lap(ftimer.g_proj, sub_proj); }
-        Tensor qkv_c = conv.convolved;
-        Tensor conv_state =
-            state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
         debug_probe<Variant>("gdn_conv_state_in", conv_state, cfg_.n_layers, s);
-        if (graph_pad_valid_ != nullptr) {
-            ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c,
-                                    *graph_pad_valid_, s);
-        } else {
-            ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
-        }
-        debug_probe<Variant>("gdn_conv", qkv_c, cfg_.n_layers, s);
+        ops::causal_conv1d_silu_split(qkv, *w.conv1d, conv_state, conv_state, qc, kc, vc,
+                                      graph_pad_valid_ ? *graph_pad_valid_ : Tensor{}, s);
+        debug_probe<Variant>("gdn_conv_query", qc, cfg_.n_layers, s);
+        debug_probe<Variant>("gdn_conv_key", kc, cfg_.n_layers, s);
+        debug_probe<Variant>("gdn_conv_value", vc, cfg_.n_layers, s);
         if (sub_timing) { sub_lap(ftimer.g_conv, sub_conv); }
-        ops::extract_bf16_columns(qkv_c, 0, qc, s);
-        ops::extract_bf16_columns(qkv_c, cfg_.key_dim, kc, s);
-        ops::extract_bf16_columns(qkv_c, 2 * cfg_.key_dim, vc, s);
-        if (sub_timing) { sub_lap(ftimer.g_extract, sub_extract); }
     }
 
     Tensor q_recurrent = qc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, T});
@@ -2508,44 +2501,43 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 Tensor qc = projection.query;
                 Tensor kc = projection.key;
                 Tensor vc = projection.value;
-                const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), total);
-                Tensor qkv      = conv.projected;
-                debug_probe<Variant>("mixed_gdn_in", x, cfg_.n_layers, s);
-                Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
-                Tensor qkv_c = conv.convolved;
-                if (timing) { lap(timer.begin, timer.g_proj, acc_g_proj); cudaEventRecord(timer.begin, s); }
                 {
+                    auto conv_scope = work_.scope();
+                    const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), total);
+                    Tensor qkv = conv.projected;
+                    debug_probe<Variant>("mixed_gdn_in", x, cfg_.n_layers, s);
+                    Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
+                    if (timing) { lap(timer.begin, timer.g_proj, acc_g_proj); cudaEventRecord(timer.begin, s); }
                     for (std::size_t sg = 0; sg < segments.size(); ++sg) {
-                        const int off     = segment_begin[sg];
-                        const int len     = static_cast<int>(segments[sg].ids.size());
-                        Tensor qkv_a      = qkv.slice(1, off, len);
-                        Tensor qkv_ca     = qkv_c.slice(1, off, len);
-                        Tensor conv_state = state_.conv_slot(
-                            static_cast<std::uint32_t>(gidx),
+                        const int off = segment_begin[sg];
+                        const int len = static_cast<int>(segments[sg].ids.size());
+                        Tensor qkv_a = qkv.slice(1, off, len);
+                        Tensor qa = qc.slice(1, off, len), ka = kc.slice(1, off, len), va = vc.slice(1, off, len);
+                        Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx),
                             static_cast<std::uint32_t>(segments[sg].state_slot));
-                        ops::causal_conv1d_silu(qkv_a, *gdn.conv1d, conv_state, conv_state, qkv_ca,
-                                                s);
+                        ops::causal_conv1d_silu_split(qkv_a, *gdn.conv1d, conv_state, conv_state,
+                                                      qa, ka, va, Tensor{}, s);
                     }
-                }
-                if (batch > 0) {
-                    Tensor qkv_b  = qkv.slice(1, prefill_cols, decode_columns)
-                                       .view({cfg_.conv_dim, width, batch});
-                    Tensor qkv_cb = qkv_c.slice(1, prefill_cols, decode_columns)
-                                        .view({cfg_.conv_dim, width, batch});
-                    if (width == 1) {
-                        ops::causal_conv1d_silu_snapshot(qkv_b, *gdn.conv1d,
-                            state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
-                            decode.linear_state_slots, decode.linear_state_slots, qkv_cb, s);
-                    } else {
-                        CUDA_CHECK(cudaMemsetAsync(qkv_cb.data, 0, qkv_cb.bytes(), s));
+                    if (batch > 0) {
+                        Tensor qkv_b = qkv.slice(1, prefill_cols, decode_columns).view({cfg_.conv_dim, width, batch});
+                        Tensor qb = qc.slice(1, prefill_cols, decode_columns).view({cfg_.key_dim, width, batch});
+                        Tensor kb = kc.slice(1, prefill_cols, decode_columns).view({cfg_.key_dim, width, batch});
+                        Tensor vb = vc.slice(1, prefill_cols, decode_columns).view({cfg_.value_dim, width, batch});
+                        if (width == 1) {
+                            ops::causal_conv1d_silu_snapshot_split(qkv_b, *gdn.conv1d,
+                                state_.conv.at(static_cast<std::size_t>(gidx)), decode.valid_columns,
+                                decode.linear_state_slots, decode.linear_state_slots, qb, kb, vb, s);
+                        } else {
+                            for (const auto* part : {&qb, &kb, &vb}) {
+                                CUDA_CHECK(cudaMemsetAsync(part->data, 0, part->bytes(), s));
+                            }
+                        }
                     }
+                    if (timing) { lap(timer.begin, timer.g_conv, acc_g_conv); cudaEventRecord(timer.begin, s); }
                 }
-                if (timing) { lap(timer.begin, timer.g_conv, acc_g_conv); cudaEventRecord(timer.begin, s); }
-                debug_probe<Variant>("mixed_gdn_conv", qkv_c, cfg_.n_layers, s);
-                ops::extract_bf16_columns(qkv_c, 0, qc, s);
-                ops::extract_bf16_columns(qkv_c, cfg_.key_dim, kc, s);
-                ops::extract_bf16_columns(qkv_c, 2 * cfg_.key_dim, vc, s);
-                if (timing) { lap(timer.begin, timer.g_extract, acc_g_extract); cudaEventRecord(timer.begin, s); }
+                debug_probe<Variant>("mixed_gdn_conv_query", qc, cfg_.n_layers, s);
+                debug_probe<Variant>("mixed_gdn_conv_key", kc, cfg_.n_layers, s);
+                debug_probe<Variant>("mixed_gdn_conv_value", vc, cfg_.n_layers, s);
 
                 if (batch > 0 && width > 1) {
                     if (!decode.replay_records) { throw std::logic_error("mixed verification has no replay records"); }
@@ -3162,32 +3154,25 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 Tensor qc = projection.query;
                 Tensor kc = projection.key;
                 Tensor vc = projection.value;
-                const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), total);
-                Tensor qkv      = conv.projected;
-                Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
-                Tensor qkv_c = conv.convolved;
                 {
-                    Tensor qkv_a  = qkv.slice(1, 0, prefill_cols);
-                    Tensor qkv_ca = qkv_c.slice(1, 0, prefill_cols);
-                    Tensor conv_state =
-                        state_.conv_slot(static_cast<std::uint32_t>(gidx),
-                                         linear_state_current_slot_);
-                    ops::causal_conv1d_silu(qkv_a, *gdn.conv1d, conv_state, conv_state, qkv_ca,
-                                            valid, s);
+                    auto conv_scope = work_.scope();
+                    const auto conv = workspace_recipe::gdn_prefill_conv(work_, cfg_geometry(), total);
+                    Tensor qkv = conv.projected;
+                    Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
+                    Tensor qkv_a = qkv.slice(1, 0, prefill_cols);
+                    Tensor qa = qc.slice(1, 0, prefill_cols), ka = kc.slice(1, 0, prefill_cols), va = vc.slice(1, 0, prefill_cols);
+                    Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+                    ops::causal_conv1d_silu_split(qkv_a, *gdn.conv1d, conv_state, conv_state, qa, ka, va, valid, s);
+                    if (batch > 0) {
+                        Tensor qkv_b = qkv.slice(1, prefill_cols, batch).view({cfg_.conv_dim, 1, batch});
+                        Tensor qb = qc.slice(1, prefill_cols, batch).view({cfg_.key_dim, 1, batch});
+                        Tensor kb = kc.slice(1, prefill_cols, batch).view({cfg_.key_dim, 1, batch});
+                        Tensor vb = vc.slice(1, prefill_cols, batch).view({cfg_.value_dim, 1, batch});
+                        ops::causal_conv1d_silu_snapshot_split(qkv_b, *gdn.conv1d,
+                            state_.conv.at(static_cast<std::size_t>(gidx)), Tensor{},
+                            decode.linear_state_slots, decode.linear_state_slots, qb, kb, vb, s);
+                    }
                 }
-                if (batch > 0) {
-                    Tensor qkv_b  = qkv.slice(1, prefill_cols, batch)
-                                       .view({cfg_.conv_dim, 1, batch});
-                    Tensor qkv_cb = qkv_c.slice(1, prefill_cols, batch)
-                                        .view({cfg_.conv_dim, 1, batch});
-                    ops::causal_conv1d_silu_snapshot(qkv_b, *gdn.conv1d,
-                                                     state_.conv.at(static_cast<std::size_t>(gidx)),
-                                                     Tensor{}, decode.linear_state_slots,
-                                                     decode.linear_state_slots, qkv_cb, s);
-                }
-                ops::extract_bf16_columns(qkv_c, 0, qc, s);
-                ops::extract_bf16_columns(qkv_c, cfg_.key_dim, kc, s);
-                ops::extract_bf16_columns(qkv_c, 2 * cfg_.key_dim, vc, s);
 
                 Tensor q_recurrent = qc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});
                 Tensor k_recurrent = kc.view({cfg_.gdn_k_dim, cfg_.gdn_k_heads, total});

@@ -154,7 +154,7 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
            const float* __restrict__ g_cumsum_in,
            const __nv_bfloat16* __restrict__ h_chunk_in,
            __nv_bfloat16* __restrict__ attn_out, head_map qk_map, float scale, int chunk, int h_v,
-           float* smem) {
+           float* smem, int valid_tokens) {
     auto* const bf16_smem = reinterpret_cast<__nv_bfloat16*>(smem);
     auto* const q_smem    = bf16_smem;
     auto* const stage0    = q_smem + kernel_dims::Q_BF16;
@@ -327,12 +327,12 @@ output_job(const __nv_bfloat16* __restrict__ q_in,
                 __floats2bfloat162_rn(scale * D_frag[nt][0], scale * D_frag[nt][1]);
             const __nv_bfloat162 out1 =
                 __floats2bfloat162_rn(scale * D_frag[nt][2], scale * D_frag[nt][3]);
-            store_vec(&attn_out[vn_base + static_cast<std::int64_t>(row_g0) * value_row_stride +
-                                d_global],
-                      out0);
-            store_vec(&attn_out[vn_base + static_cast<std::int64_t>(row_g1) * value_row_stride +
-                                d_global],
-                      out1);
+            if (chunk * BT + row_g0 < valid_tokens) {
+                store_vec(&attn_out[vn_base + static_cast<std::int64_t>(row_g0) * value_row_stride + d_global], out0);
+            }
+            if (chunk * BT + row_g1 < valid_tokens) {
+                store_vec(&attn_out[vn_base + static_cast<std::int64_t>(row_g1) * value_row_stride + d_global], out1);
+            }
         }
 
         if (panel + 1 < N_D_PANELS) {
@@ -350,7 +350,7 @@ __launch_bounds__(THREADS, 4) __global__
                        const float* __restrict__ g_cumsum_in,
                        const __nv_bfloat16* __restrict__ h_chunk_in,
                        __nv_bfloat16* __restrict__ attn_out, head_map qk_map, float scale,
-                       int chunks) {
+                       int chunks, int valid_tokens) {
     extern __shared__ float smem[];
 
     const int h_v = static_cast<int>(blockIdx.y);
@@ -358,12 +358,12 @@ __launch_bounds__(THREADS, 4) __global__
         const int chunk_stride = static_cast<int>(gridDim.x);
         for (int chunk = static_cast<int>(blockIdx.x); chunk < chunks; chunk += chunk_stride) {
             output_job(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
-                       chunk, h_v, smem);
+                       chunk, h_v, smem, valid_tokens);
             if (chunk + chunk_stride < chunks) { __syncthreads(); }
         }
     } else {
         output_job(q_in, k_in, v_new_in, g_cumsum_in, h_chunk_in, attn_out, qk_map, scale,
-                   static_cast<int>(blockIdx.x), h_v, smem);
+                   static_cast<int>(blockIdx.x), h_v, smem, valid_tokens);
     }
 }
 
