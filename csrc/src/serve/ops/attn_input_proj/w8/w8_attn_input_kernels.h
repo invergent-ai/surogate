@@ -6,6 +6,9 @@
 
 namespace sinfer::ops::detail {
 
+void w8_attn_input_mma_r4_c8_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                    Tensor& k, Tensor& v, cudaStream_t stream);
+
 void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                  Tensor& k, Tensor& v, cudaStream_t stream);
 void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,

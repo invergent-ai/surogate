@@ -58,8 +58,9 @@ constexpr std::array<RouteSpec, 4> kQwen3Routes{{
 // TinyLlama-1.1B's ungated fused qkv: rows 2560 = q2048 | k256 | v256 at hidden
 // 2048. Keep the tensor-core K reduction across decode and prefill widths;
 // the SIMT/split-K transition amplified rounding for near-constant embeddings.
-constexpr std::array<RouteSpec, 2> kTinyLlamaRoutes{{
-    {1, 128, W8AttnInputScheduleId::MmaR32C128},
+constexpr std::array<RouteSpec, 3> kTinyLlamaRoutes{{
+    {1, 8, W8AttnInputScheduleId::MmaR4C8},
+    {9, 128, W8AttnInputScheduleId::MmaR32C128},
     {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
 
@@ -168,6 +169,8 @@ const char* w8_attn_input_schedule_name(W8AttnInputScheduleId schedule) noexcept
         return "attn_input_proj.w8.splitk.mma.r16.direct";
     case W8AttnInputScheduleId::SimtR8C4:
         return "attn_input_proj.w8.simt.r8.c4";
+    case W8AttnInputScheduleId::MmaR4C8:
+        return "attn_input_proj.w8.mma.r4.c8";
     case W8AttnInputScheduleId::MmaR32C64:
         return "attn_input_proj.w8.mma.r32.c64";
     case W8AttnInputScheduleId::MmaR32C128:
@@ -250,6 +253,7 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
         return;
     case W8AttnInputScheduleId::MmaR32C64:
     case W8AttnInputScheduleId::MmaR64C64:
+    case W8AttnInputScheduleId::MmaR4C8:
     case W8AttnInputScheduleId::MmaR64C96:
     case W8AttnInputScheduleId::MmaR128C64:
     case W8AttnInputScheduleId::MmaR128C80:
@@ -280,6 +284,9 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
             ", T " + std::to_string(problem.cols) + ")");
     }
     switch (plan.schedule) {
+    case W8AttnInputScheduleId::MmaR4C8:
+        w8_attn_input_mma_r4_c8_launch(x, weight, q, k, v, stream);
+        return;
     case W8AttnInputScheduleId::DecodeR8Direct:
         w8_attn_input_decode_launch(x, weight, q, k, v, stream);
         return;

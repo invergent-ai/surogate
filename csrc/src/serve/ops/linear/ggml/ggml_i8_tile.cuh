@@ -136,6 +136,20 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
     const int lane = tid & 31;
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
+    // Dense decode distributes groups over two independent K accumulators.
+    // Use the same fixed partition and final tree here, irrespective of batch
+    // width. The expert path retains its existing accumulation schedule.
+    float partial[2][ExpertBM / 16][4];
+    if constexpr (ExactActivationSum) {
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+#pragma unroll
+            for (int mi = 0; mi < ExpertBM / 16; ++mi) {
+#pragma unroll
+                for (int e = 0; e < 4; ++e) { partial[p][mi][e] = 0.0f; }
+            }
+        }
+    }
 #pragma unroll
     for (int mi = 0; mi < ExpertBM / 16; ++mi) {
 #pragma unroll
@@ -261,15 +275,26 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
                     }
                     const int r0 = mi * 16 + gid;
                     const int r1 = r0 + 8;
-                    auto apply = [&](int d0, int d1, int d2, int d3, const Scale& s0,
+                    auto apply = [&](int partition, int d0, int d1, int d2, int d3, const Scale& s0,
                                      const Scale& s1) {
-                        if constexpr (Codec::kHasMin && ExactActivationSum) {
+                        if constexpr (ExactActivationSum) {
                             // Cancel the weight's affine terms before applying the common
                             // activation scale, retaining the integer sum until this point.
-                            acc[mi][0] += x0.x * __fmaf_rn(s0.x, static_cast<float>(d0), -s0.y * x0.y);
-                            acc[mi][1] += x1.x * __fmaf_rn(s0.x, static_cast<float>(d1), -s0.y * x1.y);
-                            acc[mi][2] += x0.x * __fmaf_rn(s1.x, static_cast<float>(d2), -s1.y * x0.y);
-                            acc[mi][3] += x1.x * __fmaf_rn(s1.x, static_cast<float>(d3), -s1.y * x1.y);
+#pragma unroll
+                            for (int p = 0; p < 2; ++p) {
+                                if (p != partition) { continue; }
+                                if constexpr (Codec::kHasMin) {
+                                    partial[p][mi][0] += x0.x * __fmaf_rn(s0.x, static_cast<float>(d0), -s0.y * x0.y);
+                                    partial[p][mi][1] += x1.x * __fmaf_rn(s0.x, static_cast<float>(d1), -s0.y * x1.y);
+                                    partial[p][mi][2] += x0.x * __fmaf_rn(s1.x, static_cast<float>(d2), -s1.y * x0.y);
+                                    partial[p][mi][3] += x1.x * __fmaf_rn(s1.x, static_cast<float>(d3), -s1.y * x1.y);
+                                } else {
+                                    partial[p][mi][0] += (s0 * x0.x) * static_cast<float>(d0);
+                                    partial[p][mi][1] += (s0 * x1.x) * static_cast<float>(d1);
+                                    partial[p][mi][2] += (s1 * x0.x) * static_cast<float>(d2);
+                                    partial[p][mi][3] += (s1 * x1.x) * static_cast<float>(d3);
+                                }
+                            }
                         } else if constexpr (Codec::kHasMin) {
                             acc[mi][0] += (s0.x * x0.x) * static_cast<float>(d0) - s0.y * x0.y;
                             acc[mi][1] += (s0.x * x1.x) * static_cast<float>(d1) - s0.y * x1.y;
@@ -286,7 +311,7 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
                         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
                         mma_s8(d0, d1, d2, d3, a[0], a[1], a[2], a[3], b0, b1);
                         const int idx = 2 * tib + g;
-                        apply(d0, d1, d2, d3, sm.Sc[slot][idx * ExpertBM + r0],
+                        apply(idx % 2, d0, d1, d2, d3, sm.Sc[slot][idx * ExpertBM + r0],
                               sm.Sc[slot][idx * ExpertBM + r1]);
                     } else {
 #pragma unroll
@@ -294,7 +319,7 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
                             int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
                             mma_s8_k16(d0, d1, d2, d3, a[2 * h], a[2 * h + 1], h ? b1 : b0);
                             const int idx = 4 * tib + 2 * g + h;
-                            apply(d0, d1, d2, d3, sm.Sc[slot][idx * ExpertBM + r0],
+                            apply(idx % 2, d0, d1, d2, d3, sm.Sc[slot][idx * ExpertBM + r0],
                                   sm.Sc[slot][idx * ExpertBM + r1]);
                         }
                     }
@@ -309,6 +334,15 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertB
     }
     cp_wait<0>();
     __syncthreads();
+    if constexpr (ExactActivationSum) {
+#pragma unroll
+        for (int mi = 0; mi < ExpertBM / 16; ++mi) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                acc[mi][e] = partial[0][mi][e] + partial[1][mi][e];
+            }
+        }
+    }
     }
 }
 

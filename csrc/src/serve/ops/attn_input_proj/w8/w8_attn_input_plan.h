@@ -13,6 +13,7 @@ enum class W8AttnInputScheduleId {
     DecodeR8Direct,
     SplitKMmaDirect,
     SimtR8C4,
+    MmaR4C8,
     MmaR32C64,
     MmaR32C128,
     MmaR64C64,

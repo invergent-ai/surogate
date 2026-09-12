@@ -16,6 +16,54 @@ constexpr int kHidden        = 2048;
 using TargetOutput           = W8SplitOutput4<4096, 512, 4096, 512>;
 using CompanionOutput        = W8SplitOutput3<4096, 1024, 1024>;
 
+// Load BF16 MMA fragments directly for a narrow batch. This preserves the
+// prefill kernel's weight rounding and sequence of k16 MMAs while avoiding its
+// shared-memory transpose, barriers, and padded 128-column work. Replicating
+// four weight rows in the fragment supplies enough independent CTAs for decode.
+template <class Output>
+__global__ __launch_bounds__(32) void w8_narrow_mma_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::int8_t* __restrict__ codes,
+    const __half* __restrict__ scales, Output output, int tokens) {
+    const int lane = threadIdx.x & 31;
+    const int row0 = blockIdx.x * 4;
+    const int row = row0 + ((lane >> 2) & 3);
+    const int pair = 2 * (lane & 3);
+    const int input_col = lane >> 2;
+    float acc[4] = {};
+#pragma unroll 16
+    for (int group = 0; group < kHidden / 32; ++group) {
+        const float s0 = __half2float(scales[row * (kHidden / 32) + group]);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int column = group * 32 + half * 16 + pair;
+            const auto pack = [&](int r, int c, float scale) {
+                const auto* w = codes + r * kHidden + c;
+                const auto v = __floats2bfloat162_rn(w[0] * scale, w[1] * scale);
+                return reinterpret_cast<const unsigned&>(v);
+            };
+            const unsigned a0 = pack(row, column, s0);
+            const unsigned a1 = a0;
+            const unsigned a2 = pack(row, column + 8, s0);
+            const unsigned a3 = a2;
+            unsigned b0 = 0, b1 = 0;
+            if (input_col < tokens) {
+                const auto* in = reinterpret_cast<const unsigned*>(x + input_col * kHidden + column);
+                b0 = in[0];
+                b1 = in[4];
+            }
+            mma_bf16(acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1);
+        }
+    }
+    const auto tile = output.tile(row0);
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+        const int col = pair + (e & 1);
+        if (col < tokens && (lane >> 2) < 4) {
+            *tile.at(row, col) = __float2bfloat16_rn(acc[e]);
+        }
+    }
+}
+
 template <class Schedule, bool Full, int Rows, int Hidden, class Output>
 void launch_variant(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
     const dim3 grid(Rows / Schedule::BM, static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
@@ -37,6 +85,22 @@ void launch_route(const Tensor& x, const Weight& weight, Output output, cudaStre
 }
 
 } // namespace
+
+void w8_attn_input_mma_r4_c8_launch(const Tensor& x, const Weight& weight, Tensor& q,
+                                    Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (weight.n != 2560 || weight.k != 2048) {
+        throw std::invalid_argument("W8 narrow attention input MMA: expected TinyLlama geometry");
+    }
+    using Output = W8SplitOutput3<2048, 256, 256>;
+    const Output output{static_cast<__nv_bfloat16*>(q.data),
+                        static_cast<__nv_bfloat16*>(k.data),
+                        static_cast<__nv_bfloat16*>(v.data)};
+    w8_narrow_mma_kernel<<<2560 / 4, 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::int8_t*>(weight.qdata),
+        static_cast<const __half*>(weight.scales), output, x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {

@@ -12,7 +12,7 @@ namespace sinfer::ops::detail::ggml {
 
 /// Token count from which formats without an integer tile expand a BF16 row tile
 /// instead of using chunked GEMVs. Overridable with SUROGATE_GGML_WIDE_MIN_TOKENS.
-/// Q4_K/Q5_K/Q6_K use integer tensor cores with consistent arithmetic at every width.
+/// Q4_K/Q5_K/Q6_K use integer dot products with consistent arithmetic at every width.
 std::int32_t wide_min_tokens() noexcept;
 
 /// Workspace bytes for `tokens` columns of a [rows, k] K-quant weight: the int8 activation

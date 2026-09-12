@@ -4,6 +4,7 @@
 
 #include "ops/linear/bf16/bf16_cublaslt.h"
 #include "ops/linear/ggml/ggml_dequant.h"
+#include "ops/linear/ggml/ggml_dense_decode.cuh"
 #include "ops/linear/ggml/ggml_i8_tile.cuh"
 #include "ops/linear/ggml/ggml_q8_1.h"
 
@@ -91,6 +92,14 @@ void run_wide(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
         auto* ds = reinterpret_cast<__half2*>(codes + static_cast<std::size_t>(tokens) * k);
         quantize_q8_1_planes_launch(x, k, tokens, codes, ds, stream);
         const auto launch = [&]<class Codec>() {
+            // Re-reading the weight for every column pays off only for narrow
+            // batches; larger projections reach that crossover sooner.
+            if (tokens <= 2 || (tokens <= 4 && rows <= 4096)) {
+                dense_decode_kernel<Codec><<<dim3(rows, tokens), 32, 0, stream>>>(
+                    static_cast<const typename Codec::Block*>(blocks), codes, ds, rows, k,
+                    out, beta != 0.0f);
+                return;
+            }
             const auto tile = [&]<int TileRows, int TileCols>() {
                 const dim3 grid((rows + TileRows - 1) / TileRows,
                                 (tokens + TileCols - 1) / TileCols);

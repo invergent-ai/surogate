@@ -611,6 +611,39 @@ int run_w8_ungated_case(DevicePackedWeight& parent, std::int32_t hidden, std::in
     return failures;
 }
 
+int run_w8_tiny_batch_invariant(DevicePackedWeight& parent) {
+    constexpr int hidden = 2048, columns = 129;
+    auto activation = make_bf16_activation(hidden, columns, 631U);
+    // Random, nearly constant and zero inputs cross the narrow/wide routes.
+    std::fill_n(activation.begin() + hidden, hidden, -0.003f);
+    std::fill_n(activation.begin() + 2 * hidden, hidden, 0.0f);
+    DeviceBuffer device_activation = to_device(bf16_bits(activation));
+    int failures = 0;
+    const auto run = [&](int tokens) {
+        GuardedBf16Tensor query(2048, tokens), key(256, tokens), value(256, tokens);
+        Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
+        Tensor q = query.tensor(), k = key.tensor(), v = value.tensor();
+        ops::attn_input_proj(x, parent.view(), q, k, v, nullptr);
+        cuda_synchronize();
+        failures += query.verify_guards("TinyLlama batch invariant q");
+        failures += key.verify_guards("TinyLlama batch invariant k");
+        failures += value.verify_guards("TinyLlama batch invariant v");
+        return std::array{query.values(), key.values(), value.values()};
+    };
+    const auto reference = run(columns);
+    for (int tokens : {1, 2, 3, 8, 9, 17, 32, 64, 128}) {
+        const auto got = run(tokens);
+        for (int part = 0; part < 3; ++part) {
+            if (!std::equal(got[part].begin(), got[part].end(), reference[part].begin())) {
+                std::cerr << "FAIL TinyLlama W8 batch invariant T=" << tokens
+                          << " output=" << part << '\n';
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
 int run_w8_ungated() {
     int failures = 0;
     // Unregistered parent widths and a different split of a registered parent.
@@ -640,6 +673,7 @@ int run_w8_ungated() {
         for (const std::int32_t tokens : {1, 2, 17, 48, 65, 129}) {
             failures += run_w8_ungated_case(parent, 2048, 2048, 256, "tinyllama", 617U, tokens);
         }
+        failures += run_w8_tiny_batch_invariant(parent);
     }
     return failures;
 }

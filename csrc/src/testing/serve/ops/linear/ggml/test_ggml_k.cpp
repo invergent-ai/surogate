@@ -439,7 +439,7 @@ int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
                            std::size_t scratch_bytes) {
     constexpr int columns = 129;
     auto x = random_activation(f.k, columns, 1773);
-    std::fill_n(x.begin(), f.k, __float2bfloat16(0.0f));
+    std::fill_n(x.begin() + 2 * f.k, f.k, __float2bfloat16(0.0f));
     std::fill_n(x.begin() + f.k, f.k, __float2bfloat16(-0.003f));
     __nv_bfloat16 *d_x = nullptr, *d_out = nullptr;
     CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
@@ -487,7 +487,8 @@ int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
 template <class Block>
 int run_affine_zero(gg::GgmlType type, int tokens) {
     constexpr int n = std::is_same_v<Block, gg::block_q6_K> ? 63 : 72;
-    constexpr int k = 512, guard = 16;
+    // An odd number of superblocks also exercises the unrolled decode tail.
+    constexpr int k = 768, guard = 16;
     std::vector<Block> blocks(n * k / gg::QK_K);
     for (auto& block : blocks) {
         if constexpr (std::is_same_v<Block, gg::block_q6_K>) {
@@ -563,12 +564,13 @@ int main() {
         return 77;
     }
     int failures = 0, cases = 0;
-    for (int tokens : {128, 8193}) {
+    for (int tokens : {1, 3, 8, 128, 8193}) {
         failures += run_affine_zero<gg::block_q4_K>(gg::GgmlType::Q4_K, tokens);
         failures += run_affine_zero<gg::block_q5_K>(gg::GgmlType::Q5_K, tokens);
         failures += run_affine_zero<gg::block_q6_K>(gg::GgmlType::Q6_K, tokens);
         cases += 9;
     }
+    const int built_in_cases = cases;
     // every format the list names, so a new one cannot ship untested
     const gg::GgmlType types[] = {
 #define SINFER_TEST_TYPE(NAME) gg::GgmlType::NAME,
@@ -580,6 +582,8 @@ int main() {
             Fixture f;
             if (!load_fixture(dir, type, label, f)) { continue; }
             const bool big = f.label == "big";
+            const bool consistent = type == gg::GgmlType::Q4_K || type == gg::GgmlType::Q5_K ||
+                                    type == gg::GgmlType::Q6_K;
             void* d_blocks = nullptr;
             CHECK_CUDA(cudaMalloc(&d_blocks, f.blocks.size()));
             CHECK_CUDA(cudaMemcpy(d_blocks, f.blocks.data(), f.blocks.size(), cudaMemcpyHostToDevice));
@@ -592,6 +596,9 @@ int main() {
             for (const int tokens : {1, 2, 3, 5, 8, 17, 64, 65, 128, 512}) {
                 if (big && tokens > 2) { continue; }
                 scratch_bytes = std::max(scratch_bytes, gg::linear_workspace_bytes(f.n, f.k, tokens));
+            }
+            if (consistent) {
+                scratch_bytes = std::max(scratch_bytes, gg::linear_workspace_bytes(f.n, f.k, 129));
             }
             void* d_scratch = nullptr;
             CHECK_CUDA(cudaMalloc(&d_scratch, scratch_bytes));
@@ -622,16 +629,16 @@ int main() {
                 failures += run_moe(f, d_blocks, d_scratch, scratch_bytes);
                 failures += run_codec(f, d_blocks);
                 cases += 2;
-                if (type == gg::GgmlType::Q4_K || type == gg::GgmlType::Q5_K || type == gg::GgmlType::Q6_K) {
-                    failures += run_consistent_columns(f, d_blocks, d_scratch, scratch_bytes);
-                    cases += 20;
-                }
+            }
+            if (consistent) {
+                failures += run_consistent_columns(f, d_blocks, d_scratch, scratch_bytes);
+                cases += 20;
             }
             CHECK_CUDA(cudaFree(d_scratch));
             CHECK_CUDA(cudaFree(d_blocks));
         }
     }
-    if (cases == 18) {
+    if (cases == built_in_cases) {
         std::fprintf(stderr, "Only built-in zero-weight cases ran: no fixtures in %s (run gen_fixture.py)\n", dir.c_str());
     }
     std::printf("%d cases, %d failures\n", cases, failures);
