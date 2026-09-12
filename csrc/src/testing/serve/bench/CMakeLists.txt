@@ -43,6 +43,8 @@ sinfer_add_op_bench(sinfer_gdn_input_proj_bench SOURCES ops/gdn_input_proj_bench
 sinfer_add_op_bench(sinfer_gdn_input_proj_conv_snapshot_bench
   SOURCES ops/gdn_input_proj_conv_snapshot_bench.cu)
 sinfer_add_op_bench(sinfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
+# Isolated experiment; it does not change the engine's attention dispatch.
+sinfer_add_op_bench(sinfer_ggml_qkv_quant_bench SOURCES experiments/ggml_qkv_quant_bench.cu)
 sinfer_add_op_bench(sinfer_w8_linear_swiglu_bench SOURCES ops/w8_linear_swiglu_bench.cu)
 # surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b W8 route sweep.
 sinfer_add_op_bench(sinfer_q08_route_sweep_bench SOURCES ops/q08_route_sweep_bench.cu)
