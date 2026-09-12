@@ -9,11 +9,14 @@
 // ops::embedding (the row gather).
 #include "api/ops/embedding.h"
 #include "api/ops/linear.h"
+#include "api/ops/linear_swiglu.h"
+#include "api/ops/silu_mul.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
 #include "ops/linear/ggml/ggml_embedding.h"
 #include "ops/linear/ggml/ggml_linear.h"
 #include "ops/linear/ggml/ggml_moe.h"
 #include "ops/linear/ggml/ggml_q8_1.h"
+#include "ops/linear/ggml/ggml_swiglu.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -499,6 +502,135 @@ int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
     return failures;
 }
 
+// Compare the fused public operation with independent projection + activation
+// calls at a prefill width. Minimal decode workspace also proves that gate/up
+// intermediate buffers are not allocated, including during graph capture.
+int run_swiglu(const Fixture& gate_f, const Fixture& up_f, bool mapped, bool segmented,
+               int& cases) {
+    constexpr int columns = 129;
+    const int n = gate_f.n, k = gate_f.k;
+    auto up_bytes = up_f.blocks;
+    std::rotate(up_bytes.begin(), up_bytes.begin() + gg::block_bytes(up_f.type), up_bytes.end());
+    sinfer::DeviceBuffer gate_storage(gate_f.blocks.size() + (segmented ? 0 : up_bytes.size()));
+    sinfer::DeviceBuffer up_storage(segmented ? up_bytes.size() : 0);
+    gate_storage.copy_from_host(gate_f.blocks.data(), gate_f.blocks.size());
+    void* up_data;
+    if (segmented) {
+        up_storage.copy_from_host(up_bytes.data(), up_bytes.size());
+        up_data = up_storage.p;
+    } else {
+        gate_storage.copy_from_host(up_bytes.data(), up_bytes.size(), gate_f.blocks.size());
+        up_data = static_cast<std::uint8_t*>(gate_storage.p) + gate_f.blocks.size();
+    }
+    Weight parent = make_weight(gate_f, gate_storage.p);
+    parent.n = parent.shape[0] = parent.padded_shape[0] = 2 * n;
+    parent.payload_bytes = gate_f.blocks.size() + up_bytes.size();
+    sinfer::WeightSegment segments[] = {
+        {0, n, qtype_of(gate_f.type), gate_storage.p, gate_f.blocks.size()},
+        {n, n, qtype_of(up_f.type), up_data, up_bytes.size()}};
+    if (segmented) { parent.segments = segments; parent.segment_count = 2; }
+    std::vector<std::int32_t> map(k / 32);
+    for (int i = 0; i < k / 32; ++i) { map[i] = k / 32 - 1 - i; }
+    sinfer::DeviceBuffer map_storage(map.size() * sizeof(std::int32_t));
+    map_storage.copy_from_host(map.data(), map_storage.bytes);
+    if (mapped) { parent.input_group_map = static_cast<const std::int32_t*>(map_storage.p); }
+
+    auto x = random_activation(k, columns, 9127);
+    std::fill_n(x.begin() + k, k, __float2bfloat16(-0.003f));
+    std::fill_n(x.begin() + 2 * k, k, __float2bfloat16(0.0f));
+    sinfer::DeviceBuffer input(x.size() * sizeof(__nv_bfloat16));
+    input.copy_from_host(x.data(), input.bytes);
+    const std::size_t output_bytes = std::size_t(n) * columns * sizeof(__nv_bfloat16);
+    sinfer::DeviceBuffer gate_ref(output_bytes), up_ref(output_bytes), expected_gpu(output_bytes), output(output_bytes);
+    Tensor activation(input.p, DType::BF16, {k, columns});
+    Tensor gate_tensor(gate_ref.p, DType::BF16, {n, columns});
+    Tensor up_tensor(up_ref.p, DType::BF16, {n, columns});
+    Tensor reference_tensor(expected_gpu.p, DType::BF16, {n, columns});
+    sinfer::WorkspaceArena full(sinfer::ops::linear_swiglu_workspace_capacity_bytes(
+        parent.qtype, parent.n, k, 1, columns));
+    sinfer::WorkspaceArena small(gg::linear_workspace_bytes(n, k, 8) + 256);
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    gg::ggml_project_rows(activation, parent, 0, gate_tensor, &full, stream);
+    gg::ggml_project_rows(activation, parent, n, up_tensor, &full, stream);
+    sinfer::ops::silu_mul(gate_tensor, up_tensor, reference_tensor, stream);
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    std::vector<__nv_bfloat16> expected(std::size_t(n) * columns), got(expected.size());
+    expected_gpu.copy_to_host(expected.data(), output_bytes);
+    int failures = 0;
+    for (bool capture : {false, true}) {
+        for (int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 129}) {
+            const bool fused = gg::swiglu_decode_admits(gate_f.type, up_f.type, n, k, tokens);
+            auto& workspace = fused ? small : full;
+            workspace.reset_peak();
+            Tensor in(input.p, DType::BF16, {k, tokens});
+            Tensor out(output.p, DType::BF16, {n, tokens});
+            CHECK_CUDA(cudaMemsetAsync(output.p, 0x3e, output_bytes, stream));
+            if (capture) { CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal)); }
+            sinfer::ops::linear_swiglu(in, parent, out, workspace, stream);
+            if (capture) {
+                cudaGraph_t graph;
+                cudaGraphExec_t executable;
+                CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+                CHECK_CUDA(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+                CHECK_CUDA(cudaGraphLaunch(executable, stream));
+                CHECK_CUDA(cudaStreamSynchronize(stream));
+                CHECK_CUDA(cudaGraphExecDestroy(executable));
+                CHECK_CUDA(cudaGraphDestroy(graph));
+            }
+            CHECK_CUDA(cudaStreamSynchronize(stream));
+            output.copy_to_host(got.data(), output_bytes);
+            const std::size_t count = std::size_t(n) * tokens;
+            const bool equal = std::memcmp(got.data(), expected.data(), count * sizeof(__nv_bfloat16)) == 0;
+            const auto* tail = reinterpret_cast<const unsigned char*>(got.data() + count);
+            const bool guarded = std::all_of(tail, tail + (got.size() - count) * sizeof(__nv_bfloat16),
+                                             [](unsigned char v) { return v == 0x3e; });
+            const bool bounded = workspace.used() == 0 &&
+                (!fused || workspace.peak_used() <= gg::linear_workspace_bytes(n, k, tokens) + 255);
+            const bool ok = equal && guarded && bounded;
+            ++cases;
+            failures += !ok;
+            if (!ok) {
+                std::printf("  SwiGLU %s/%s %s map=%d segments=%d T=%d graph=%d: FAIL (equal=%d guard=%d workspace=%zu)\n",
+                            gg::type_name(gate_f.type), gg::type_name(up_f.type), gate_f.label.c_str(),
+                            mapped, segmented, tokens, capture, equal, guarded, workspace.peak_used());
+            }
+        }
+    }
+    CHECK_CUDA(cudaStreamDestroy(stream));
+    std::printf("  SwiGLU %s/%s %s map=%d segments=%d: %s\n", gg::type_name(gate_f.type),
+                gg::type_name(up_f.type), gate_f.label.c_str(), mapped, segmented, failures ? "FAIL" : "ok");
+    return failures;
+}
+
+// Exercise large matrices on both sides of the bandwidth fallback, including
+// switching between scalar fusion, batched decode and prefill for one weight.
+int run_large_swiglu(const std::string& dir, int& cases) {
+    Fixture q8, iq4;
+    if (!load_fixture(dir, gg::GgmlType::Q8_0, "synthetic", q8) ||
+        !load_fixture(dir, gg::GgmlType::IQ4_NL, "synthetic", iq4)) {
+        return 0;
+    }
+    for (auto* f : {&q8, &iq4}) {
+        const auto original = f->blocks;
+        f->n = f->k = 8192;
+        f->label = "large_swiglu";
+        f->dequant.clear();
+        f->blocks.resize(std::size_t(f->n) * (f->k / 32) * gg::block_bytes(f->type));
+        for (std::size_t offset = 0; offset < f->blocks.size(); offset += original.size()) {
+            std::memcpy(f->blocks.data() + offset, original.data(),
+                        std::min(original.size(), f->blocks.size() - offset));
+        }
+    }
+    int failures = 0;
+    for (const auto* gate : {&q8, &iq4}) {
+        for (const auto* up : {&q8, &iq4}) {
+            failures += run_swiglu(*gate, *up, false, true, cases);
+        }
+    }
+    return failures;
+}
+
 // Every stored value is d*1 - dmin*1 == 0. An affine projection must stay zero
 // even when the activation scale/sum cannot be represented exactly as half2.
 // Using a rounded sum with an independently rounded scale breaks that identity.
@@ -659,10 +791,22 @@ int main() {
             }
             failures += run_consistent_columns(f, d_blocks, d_scratch, scratch_bytes);
             cases += 60;
+            if ((type == gg::GgmlType::Q8_0 || type == gg::GgmlType::IQ4_NL) &&
+                (f.label == "synthetic" || f.label == "tail" || f.label == "decode_rows")) {
+                for (auto up_type : {gg::GgmlType::Q8_0, gg::GgmlType::IQ4_NL, gg::GgmlType::F16}) {
+                    Fixture up;
+                    if (!load_fixture(dir, up_type, f.label, up)) { continue; }
+                    for (bool mapped : {false, true}) {
+                        failures += run_swiglu(f, up, mapped, true, cases);
+                        if (type == up_type) { failures += run_swiglu(f, up, mapped, false, cases); }
+                    }
+                }
+            }
             CHECK_CUDA(cudaFree(d_scratch));
             CHECK_CUDA(cudaFree(d_blocks));
         }
     }
+    failures += run_large_swiglu(dir, cases);
     if (cases == built_in_cases) {
         std::fprintf(stderr, "Only built-in zero-weight cases ran: no fixtures in %s (run gen_fixture.py)\n", dir.c_str());
     }

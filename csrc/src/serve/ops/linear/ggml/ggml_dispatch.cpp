@@ -4,6 +4,7 @@
 #include "core/engine_context.h"
 #include "ops/linear/ggml/ggml_linear.h"
 #include "ops/linear/ggml/ggml_q8_1.h"
+#include "ops/linear/ggml/ggml_swiglu.h"
 
 #include <cuda_bf16.h>
 
@@ -299,6 +300,25 @@ void ggml_project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin,
     const Input in            = input_for(x, w, workspace, bytes, stream);
     linear_launch(type, view.qdata, rows, w.k, in.x, tokens, static_cast<__nv_bfloat16*>(out.data),
                   in.planes.data, in.planes.bytes, stream);
+}
+
+bool ggml_swiglu_decode(const Tensor& x, const Weight& w, Tensor& out,
+                       WorkspaceArena& workspace, cudaStream_t stream) {
+    if (!is_ggml_qtype(w.qtype) || x.ne[1] <= 0 || x.ne[1] > 8) { return false; }
+    require_ggml_weight(w, "ggml swiglu decode");
+    if (w.n % 2 != 0) { throw std::invalid_argument("ggml swiglu decode: odd gate/up row count"); }
+    const int rows = w.n / 2;
+    const Weight gate = ggml_weight_rows(w, 0, rows);
+    const Weight up = ggml_weight_rows(w, rows, rows);
+    const auto gate_type = ggml_type_for(gate.qtype), up_type = ggml_type_for(up.qtype);
+    if (!swiglu_decode_admits(gate_type, up_type, rows, w.k, x.ne[1])) { return false; }
+    require_x_out(x, w.k, out, rows, "ggml swiglu decode");
+    const std::size_t bytes = linear_workspace_bytes(rows, w.k, x.ne[1]);
+    auto scope = workspace.scope();
+    const Input in = input_for(x, w, &workspace, bytes, stream);
+    swiglu_decode_launch(gate_type, gate.qdata, up_type, up.qdata, rows, w.k, in.x, x.ne[1],
+                         static_cast<__nv_bfloat16*>(out.data), in.planes.data, in.planes.bytes, stream);
+    return true;
 }
 
 std::size_t ggml_linear_workspace_capacity_bytes(std::int32_t output_rows,

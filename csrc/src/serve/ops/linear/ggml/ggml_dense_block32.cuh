@@ -5,22 +5,17 @@
 namespace sinfer::ops::detail::ggml {
 
 // Load several consecutive blocks together, then apply their contributions in
-// the same eight-part order as the wide projection. Each warp owns one row.
-template <GgmlType Type, int Lanes, int Warps, int Unroll>
-__global__ __launch_bounds__(Warps * 32) void dense_block32_decode_kernel(
-    const uint8_t* __restrict__ weights, const int8_t* __restrict__ codes,
-    const __half2* __restrict__ ds, int rows, int k, int tokens, __nv_bfloat16* __restrict__ out,
-    bool accumulate) {
+// the same eight-part order as the wide projection. Every lane in the warp
+// participates; lane zero holds the row result.
+template <GgmlType Type, int Lanes, int Unroll>
+__device__ __forceinline__ float dense_block32_dot(const uint8_t* __restrict__ w,
+                                                   const int8_t* __restrict__ x,
+                                                   const __half2* __restrict__ scales, int k) {
     static_assert(Type == GgmlType::Q8_0 || Type == GgmlType::IQ4_NL);
     static_assert(Lanes == 1 || Lanes == 2 || Lanes == 4);
-    const int lane = threadIdx.x & 31, row = blockIdx.x * Warps + (threadIdx.x >> 5),
-              token = blockIdx.y;
-    if (row >= rows) { return; }
+    const int lane  = threadIdx.x & 31;
     const int group = lane / Lanes, slice = lane % Lanes, part = group & 7;
     constexpr int groups = 32 / Lanes;
-    const auto* w        = weights + int64_t(row) * (k / 32) * block_bytes(Type);
-    const auto* x        = codes + int64_t(token) * k;
-    const auto* scales   = ds + int64_t(token) * (k / 32);
     float acc            = 0;
 #pragma unroll Unroll
     for (int chunk = 0; chunk < k; chunk += groups * 32) {
@@ -63,7 +58,20 @@ __global__ __launch_bounds__(Warps * 32) void dense_block32_decode_kernel(
     acc += __shfl_xor_sync(0xffffffffu, acc, Lanes, 8 * Lanes);
     acc += __shfl_xor_sync(0xffffffffu, acc, 2 * Lanes, 8 * Lanes);
     acc += __shfl_xor_sync(0xffffffffu, acc, 4 * Lanes, 8 * Lanes);
-    if (lane == 0) {
+    return acc;
+}
+
+template <GgmlType Type, int Lanes, int Warps, int Unroll>
+__global__ __launch_bounds__(Warps * 32) void dense_block32_decode_kernel(
+    const uint8_t* __restrict__ weights, const int8_t* __restrict__ codes,
+    const __half2* __restrict__ ds, int rows, int k, int tokens, __nv_bfloat16* __restrict__ out,
+    bool accumulate) {
+    const int row = blockIdx.x * Warps + (threadIdx.x >> 5), token = blockIdx.y;
+    if (row >= rows) { return; }
+    const float acc = dense_block32_dot<Type, Lanes, Unroll>(
+        weights + int64_t(row) * (k / 32) * block_bytes(Type), codes + int64_t(token) * k,
+        ds + int64_t(token) * (k / 32), k);
+    if ((threadIdx.x & 31) == 0) {
         const auto i = int64_t(token) * rows + row;
         out[i]       = __float2bfloat16_rn(acc + (accumulate ? __bfloat162float(out[i]) : 0.0f));
     }

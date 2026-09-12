@@ -1,6 +1,7 @@
 #include "api/ops/linear_swiglu.h"
 #include "api/ops/silu_mul.h"
 #include "ops/linear/ggml/ggml_dispatch.h"
+#include "ops/linear/ggml/ggml_swiglu.h"
 #include "ops/linear/fp8_block/fp8_block.h"
 
 #include "api/ops/linear.h"
@@ -146,6 +147,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         if ((gate_up_weight.n % 2) != 0 || out.ne[0] != rows || out.ne[1] != t) {
             throw std::invalid_argument("linear_swiglu: a row-projected gate_up parent must be [2M, k] with out [M, T]");
         }
+        if (detail::ggml::ggml_swiglu_decode(x, gate_up_weight, out, ws, stream)) { return; }
         auto scope  = ws.scope();
         Tensor gate = ws.alloc(DType::BF16, {rows, t});
         Tensor up   = ws.alloc(DType::BF16, {rows, t});
