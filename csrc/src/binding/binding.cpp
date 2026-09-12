@@ -116,6 +116,18 @@ static Tensor glm_kernel_tensor(const Array& a) {
     return t;
 }
 
+static RuntimeOptions::Fp8WeightCacheMode fp8_weight_cache_mode_from_str(const std::string& text) {
+    std::string mode;
+    mode.reserve(text.size());
+    for (char c : text) {
+        mode.push_back((c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c);
+    }
+    if (mode.empty() || mode == "auto") return RuntimeOptions::Fp8WeightCacheMode::Auto;
+    if (mode == "on" || mode == "true" || mode == "1") return RuntimeOptions::Fp8WeightCacheMode::On;
+    if (mode == "off" || mode == "false" || mode == "0") return RuntimeOptions::Fp8WeightCacheMode::Off;
+    throw std::invalid_argument("fp8_weight_cache must be 'auto', 'on' or 'off', got '" + text + "'");
+}
+
 static std::optional<ETensorDType> opt_dtype_from_str(const std::string& dtype_str) {
     if (dtype_str.empty()) {
         return std::nullopt;
@@ -502,6 +514,7 @@ NB_MODULE(_surogate, m) {
                const std::string& recipe,
                const std::string& matmul_backend,
                bool use_fused_rope,
+               const std::string& fp8_weight_cache,
                bool doc_masking,
                int fp8_amax_history,
                bool fp4_four_over_six,
@@ -555,6 +568,7 @@ NB_MODULE(_surogate, m) {
                                        .TrainingRecipe = std::move(training_recipe),
                                        .RecipeOptions = recipe_options,
                                        .UseFusedRope = use_fused_rope,
+                                       .Fp8WeightCache = fp8_weight_cache_mode_from_str(fp8_weight_cache),
                                        .DocMasking = doc_masking,
                                        .UseDslIr = use_dsl_ir,
                                        .MatmulBackend = backend,
@@ -590,6 +604,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("recipe") = "bf16",
             nb::arg("matmul_backend") = "",
             nb::arg("use_fused_rope") = false,
+            nb::arg("fp8_weight_cache") = "auto",
             nb::arg("doc_masking") = true,
             nb::arg("fp8_amax_history") = 1024,
             nb::arg("fp4_four_over_six") = true,
@@ -611,6 +626,7 @@ NB_MODULE(_surogate, m) {
             "- recipe: Training recipe (bf16, fp8-hybrid, nvfp4).\n"
             "- matmul_backend: Matmul backend (auto, cublaslt, cutlass).\n"
             "- use_fused_rope: Use fused RoPE kernel with on-the-fly cos/sin computation.\n"
+            "- fp8_weight_cache: Cache FP8 copies of frozen weights under fp8-hybrid ('auto', 'on', 'off').\n"
             "- doc_masking: Enable document-level attention masking for packed sequences.\n"
             "- fp8_amax_history: FP8 delayed scaling amax history length (for fp8-hybrid recipe).\n"
             "- fp4_backend: FP4 matmul backend (cudnn, cutlass).\n"

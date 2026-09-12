@@ -9,6 +9,7 @@
 #include "runtime/training/model.h"
 #include <cstddef>
 #include <memory>
+#include <functional>
 #include <optional>
 #include <random>
 #include <unordered_map>
@@ -415,6 +416,19 @@ private:
 
     unsigned int next_rng_seed();
 
+    /// Whether the frozen-weight FP8 caches may be primed on this run: the
+    /// config's on/off, or under auto whether both copies fit in free device
+    /// memory with a margin. Decided once, at the first call, which the
+    /// priming sites make after the run state and saved buffers exist.
+    bool fp8_weight_cache_enabled();
+    /// Sums the bytes the forward and transposed FP8 caches would still
+    /// allocate and compares them with free device memory.
+    bool fp8_weight_caches_fit(std::size_t* bytes_needed);
+    /// Visits every weight the forward (or backward, transposed) FP8 cache
+    /// would hold: the same filters the priming functions apply.
+    void for_each_fp8_cacheable_weight(bool backward,
+                                       const std::vector<char>& required,
+                                       const std::function<void(const std::string&, Tensor&)>& fn);
     void prime_fp8_weight_cache(const std::vector<char>& required);
     const Tensor* get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
     void prime_fp8_weight_cache_transposed(const std::vector<char>& required);
@@ -462,6 +476,7 @@ private:
     cudaEvent_t mPrefetchEvent = nullptr;
     bool mPrefetchEnabled = false;
     bool mWeightCachesPrimed = false;  // True after first eager FP8/FP4 cache priming
+    std::optional<bool> mFp8WeightCacheDecision;  // Memoized fp8_weight_cache_enabled()
 
     // Pre-computed layer boundaries for predictable prefetch
     struct LayerBoundary {

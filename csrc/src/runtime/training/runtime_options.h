@@ -119,6 +119,16 @@ struct RuntimeOptions {
     // Eliminates precomputed freq_cis tensor, reduces memory bandwidth.
     bool UseFusedRope = false;
 
+    // FP8 weight cache for frozen (non-trainable) weights under the fp8-hybrid
+    // recipe: quantize each weight once per run instead of at every matmul of
+    // every micro-batch, at the cost of one FP8 copy for forward and one
+    // transposed FP8 copy for backward per weight. Auto turns it on when both
+    // copies fit in the device memory left after the run state is allocated,
+    // with a margin; the SUROGATE_ENABLE_FP8_WEIGHT_CACHE env var is an
+    // unconditional on.
+    enum class Fp8WeightCacheMode { Auto, On, Off };
+    Fp8WeightCacheMode Fp8WeightCache = Fp8WeightCacheMode::Auto;
+
     // Document-level attention masking for packed sequences.
     // When enabled, doc boundaries are inferred from position_id resets.
     bool DocMasking = true;

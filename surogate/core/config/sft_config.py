@@ -185,6 +185,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Mixed precision training recipe to use: bf16 (default), fp8-hybrid, nvfp4
         use_fused_rope (Optional[bool], defaults to False):
             Use fused RoPE kernel with on-the-fly cos/sin computation (saves memory, reduces bandwidth)
+        fp8_weight_cache (Optional[Literal['auto', 'on', 'off']], defaults to 'auto'):
+            Under the fp8-hybrid recipe, keep FP8 copies of frozen weights (LoRA base) so they are quantized once per run instead of at every matmul; costs two bytes per weight element. 'auto' enables it when the copies fit in free GPU memory.
         fp8_amax_history (Optional[int], defaults to 16):
             FP8 delayed scaling amax history length (default: 16, for fp8-hybrid recipe)
         fp4_backend (Optional[Literal['cutlass', 'cudnn']], defaults to 'cutlass'):
@@ -384,6 +386,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     master_dtype: str | None = None
     recipe: Literal["bf16", "fp8_hybrid", "nvfp4"] | None = "bf16"
     use_fused_rope: bool | None = False
+    fp8_weight_cache: Literal["auto", "on", "off"] | None = "auto"
     fp8_amax_history: int | None = 16
     fp4_four_over_six: bool | None = True
     fp4_backend: Literal["cutlass", "cudnn"] | None = "cutlass"
@@ -524,6 +527,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.master_dtype = cfg.get("master_dtype", self.master_dtype)
         self.recipe = cfg.get("recipe", self.recipe)
         self.use_fused_rope = cfg.get("use_fused_rope", self.use_fused_rope)
+        fp8_weight_cache = cfg.get("fp8_weight_cache", self.fp8_weight_cache)
+        if isinstance(fp8_weight_cache, bool):
+            # YAML reads a bare on/off as a boolean.
+            fp8_weight_cache = "on" if fp8_weight_cache else "off"
+        self.fp8_weight_cache = fp8_weight_cache
         self.fp8_amax_history = cfg.get("fp8_amax_history", self.fp8_amax_history)
         self.fp4_backend = cfg.get("fp4_backend", self.fp4_backend)
         self.skip_quant_first_layers = (
@@ -1120,6 +1128,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             master_dtype=self.master_dtype or "",
             recipe=self.recipe,
             use_fused_rope=self.use_fused_rope,
+            fp8_weight_cache=("auto" if self.fp8_weight_cache is None else str(self.fp8_weight_cache)),
             fp8_amax_history=self.fp8_amax_history,
             fp4_four_over_six=self.fp4_four_over_six,
             fp4_backend=self.fp4_backend,

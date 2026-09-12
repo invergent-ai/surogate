@@ -261,6 +261,7 @@ distillation:
 | Option             | Type | Default | Description                                                        |
 | ------------------ | ---- | ------- | ------------------------------------------------------------------ |
 | `fp8_amax_history` | int  | `16`    | FP8 delayed scaling amax history length (for `fp8_hybrid` recipe). |
+| `fp8_weight_cache` | string | `auto` | Keep FP8 copies of frozen weights (the LoRA base) so each is quantized once per run instead of at every matmul of every micro-batch. Costs two bytes per frozen weight element (forward copy plus transposed backward copy). `auto` enables it when the copies fit in free GPU memory with a margin; `on` / `off` force it. Trainable weights are never cached. |
 
 ### FP4/NVFP4 Recipe Options
 

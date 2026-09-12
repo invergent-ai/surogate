@@ -74,6 +74,7 @@ Use this recipe when:
 | Parameter                 | Default | Description                                                    |
 | ------------------------- | ------- | -------------------------------------------------------------- |
 | `fp8_amax_history`        | 1024    | Length of amax history window for delayed scaling              |
+| `fp8_weight_cache`        | auto    | Cache FP8 copies of frozen weights (LoRA base) so they are quantized once per run, not at every matmul; `auto` when they fit in free memory, `on` / `off` to force |
 | `skip_quant_first_layers` | 0       | Number of first layers to skip quantization (keep in bfloat16) |
 | `skip_quant_last_layers`  | 0       | Number of last layers to skip quantization (keep in bfloat16)  |
 

@@ -5,6 +5,8 @@
 
 #include "runtime/executor/graph_executor.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -97,44 +99,141 @@ std::size_t fp8_weight_cache_bytes(const Tensor& weight) {
 
 }  // namespace
 
-void GraphExecutor::prime_fp8_weight_cache(const std::vector<char>& required) {
-    if (!mOptions.TrainingRecipe || !mRunState.has_fp8_forward()) {
+void GraphExecutor::for_each_fp8_cacheable_weight(bool backward,
+                                                  const std::vector<char>& required,
+                                                  const std::function<void(const std::string&, Tensor&)>& fn) {
+    if (!mOptions.TrainingRecipe) {
         return;
     }
-    if (!mForward) {
+    if (backward ? !mRunState.has_fp8_hybrid_backward() : !mRunState.has_fp8_forward()) {
+        return;
+    }
+    const Graph* graph = backward ? mBackward : mForward;
+    if (!graph) {
         return;
     }
     const auto& config = mConfig;
-    for (std::size_t idx = 0; idx < mForward->operations.size(); ++idx) {
+    for (std::size_t idx = 0; idx < graph->operations.size(); ++idx) {
         if (!required.empty() && !required[idx]) {
             continue;
         }
-        const auto& op = mForward->operations[idx];
+        const auto& op = graph->operations[idx];
         const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
-        if (op_type != "matmul" && op_type != "matmul_bias") {
-            continue;
+        if (backward) {
+            if (op_type != "matmul_backward" && op_type != "matmul_swiglu_backward") {
+                continue;
+            }
+            if (op.inputs.size() < 3) {
+                continue;
+            }
+        } else {
+            if (op_type != "matmul" && op_type != "matmul_bias") {
+                continue;
+            }
+            if (op.inputs.size() < 2) {
+                continue;
+            }
         }
-        if (op.inputs.size() < 2) {
+        const std::string& weight_name = op.inputs.at(backward ? 2 : 1);
+        if (is_mlp_gate_weight(weight_name)) {
             continue;
         }
         int layer_idx = -1;
-        auto op_kind = matmul_op_from_weight(op.inputs.at(1), layer_idx);
+        auto op_kind = matmul_op_from_weight(weight_name, layer_idx);
         if (!op_kind.has_value()) {
             continue;
         }
         if (!allow_quant_layer(mOptions, config, layer_idx)) {
             continue;
         }
-        const std::string& weight_name = op.inputs.at(1);
-        if (is_mlp_gate_weight(weight_name)) {
-            continue;
-        }
         if (!mWeights.has(weight_name)) {
             continue;
         }
-        Tensor& weight = mWeights.get(weight_name);
-        (void)get_fp8_cached_weight(weight_name, weight, mRunState.MainStream);
+        fn(weight_name, mWeights.get(weight_name));
     }
+}
+
+bool GraphExecutor::fp8_weight_caches_fit(std::size_t* bytes_needed) {
+    // Only what get_fp8_cached_weight / _transposed would actually allocate:
+    // frozen rank-2 BF16/FP32 weights that are not streamed, minus entries
+    // already resident.
+    auto would_allocate = [&](const std::string& name, const Tensor& weight) {
+        return weight.Rank == 2 && (weight.DType == ETensorDType::BF16 || weight.DType == ETensorDType::FP32) &&
+               !mWeights.is_trainable(name) && !mWeights.work_is_transient(name);
+    };
+    std::size_t bytes = 0;
+    for_each_fp8_cacheable_weight(/*backward=*/false, {}, [&](const std::string& name, Tensor& weight) {
+        if (mFP8WeightCache.count(name) == 0 && would_allocate(name, weight)) {
+            bytes += fp8_weight_cache_bytes(weight);
+        }
+    });
+    for_each_fp8_cacheable_weight(/*backward=*/true, {}, [&](const std::string& name, Tensor& weight) {
+        if (mFP8WeightCacheT.count(name) == 0 && would_allocate(name, weight)) {
+            bytes += fp8_weight_cache_bytes(weight);
+        }
+    });
+    if (bytes_needed) {
+        *bytes_needed = bytes;
+    }
+    if (bytes == 0) {
+        return false;
+    }
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    // Headroom for what is still allocated after priming: graph instantiation,
+    // optimizer state, the odd workspace growth.
+    const std::size_t margin = std::max<std::size_t>(std::size_t{2} << 30, total_bytes / 10);
+    return free_bytes >= bytes + margin;
+}
+
+bool GraphExecutor::fp8_weight_cache_enabled() {
+    if (mFp8WeightCacheDecision.has_value()) {
+        return *mFp8WeightCacheDecision;
+    }
+    bool enabled = false;
+    const char* why = "config off";
+    std::size_t needed = 0;
+    if (std::getenv("SUROGATE_ENABLE_FP8_WEIGHT_CACHE") != nullptr) {
+        enabled = true;
+        why = "SUROGATE_ENABLE_FP8_WEIGHT_CACHE";
+    } else {
+        switch (mOptions.Fp8WeightCache) {
+            case RuntimeOptions::Fp8WeightCacheMode::On:
+                enabled = true;
+                why = "config on";
+                break;
+            case RuntimeOptions::Fp8WeightCacheMode::Off: break;
+            case RuntimeOptions::Fp8WeightCacheMode::Auto:
+                enabled = fp8_weight_caches_fit(&needed);
+                why = enabled ? "auto: fits" : (needed == 0 ? "auto: nothing to cache" : "auto: does not fit");
+                break;
+        }
+    }
+    mFp8WeightCacheDecision = enabled;
+    if (mOptions.Fp8WeightCache == RuntimeOptions::Fp8WeightCacheMode::Auto && needed > 0) {
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+        int device = -1;
+        (void)cudaGetDevice(&device);
+        std::fprintf(stderr,
+                     "[fp8 weight cache] device %d: %s (%zu MiB needed, %zu MiB free)\n",
+                     device,
+                     why,
+                     needed >> 20,
+                     free_bytes >> 20);
+    }
+    return enabled;
+}
+
+void GraphExecutor::prime_fp8_weight_cache(const std::vector<char>& required) {
+    for_each_fp8_cacheable_weight(/*backward=*/false, required, [&](const std::string& name, Tensor& weight) {
+        (void)get_fp8_cached_weight(name, weight, mRunState.MainStream);
+    });
 }
 
 const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream) {
@@ -197,46 +296,9 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
 // ============================================================================
 
 void GraphExecutor::prime_fp8_weight_cache_transposed(const std::vector<char>& required) {
-    if (!mOptions.TrainingRecipe || !mRunState.has_fp8_hybrid_backward()) {
-        return;
-    }
-    if (!mBackward) {
-        return;
-    }
-
-    const auto& config = mConfig;
-    for (std::size_t idx = 0; idx < mBackward->operations.size(); ++idx) {
-        if (!required.empty() && !required[idx]) {
-            continue;
-        }
-        const auto& op = mBackward->operations[idx];
-        const std::string& op_type = (op.kernel_type.empty() || op.kernel_type == "custom") ? op.name : op.kernel_type;
-        if (op_type != "matmul_backward" && op_type != "matmul_swiglu_backward") {
-            continue;
-        }
-        if (op.inputs.size() < 3) {
-            continue;
-        }
-        const std::string& weight_name = op.inputs.at(2);
-        if (is_mlp_gate_weight(weight_name)) {
-            continue;
-        }
-
-        int layer_idx = -1;
-        auto op_kind = matmul_op_from_weight(weight_name, layer_idx);
-        if (!op_kind.has_value()) {
-            continue;
-        }
-        if (!allow_quant_layer(mOptions, config, layer_idx)) {
-            continue;
-        }
-
-        if (!mWeights.has(weight_name)) {
-            continue;
-        }
-        Tensor& weight = mWeights.get(weight_name);
-        (void)get_fp8_cached_weight_transposed(weight_name, weight, mRunState.MainStream);
-    }
+    for_each_fp8_cacheable_weight(/*backward=*/true, required, [&](const std::string& name, Tensor& weight) {
+        (void)get_fp8_cached_weight_transposed(name, weight, mRunState.MainStream);
+    });
 }
 
 const Tensor*
