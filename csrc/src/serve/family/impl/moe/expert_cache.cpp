@@ -7,6 +7,7 @@
 #include <limits>
 #include "core/numa.h"
 #include "core/sleep.h"
+#include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
 #include <cuda.h>
 
@@ -35,12 +36,19 @@ std::int32_t checked_slot_count(const ops::SparseMoeGeometry& geometry,
                                 std::int64_t requested) {
     const auto rows = std::max(geometry.hidden, geometry.expert_rows());
     const auto maximum = rows > 0 ? std::numeric_limits<std::int32_t>::max() / rows : 0;
-    if (requested < geometry.experts || requested > maximum) {
+    if (requested < geometry.experts_per_token || requested > maximum) {
         throw std::invalid_argument("--expert-slots must be between " +
-                                    std::to_string(geometry.experts) + " and " +
+                                    std::to_string(geometry.experts_per_token) + " and " +
                                     std::to_string(maximum) + " for this model");
     }
     return static_cast<std::int32_t>(requested);
+}
+
+std::int32_t minimum_slot_count(const ops::SparseMoeGeometry& geometry) {
+    // Keep a useful decode batch resident even when a full layer would force more weights
+    // off the device. Wide rounds stream expert ranges; one token's selected experts is
+    // the correctness minimum. Spare memory still grows the automatic pool as before.
+    return std::min(geometry.experts, std::max(64, geometry.experts_per_token));
 }
 
 // The two stream memory operations, resolved from the driver at runtime: the runtime header
@@ -371,6 +379,8 @@ struct ExpertCache::Impl {
         ops::ExpertHostBank bank;
         ops::CpuExpertBank cpu_bank; // host addresses of the same planes
         const ops::LoraBank* adapters = nullptr;
+        const std::int32_t* round_adapter_slots = nullptr;
+        bool round_lora_uniform = true;
         std::int32_t round_tokens = 0; // set before the host function of a round is enqueued
         // Round bookkeeping for the CPU split: a round may reach the hook in several slices
         // (prefill and mixed rounds); the split decision is per round and each slice is staged
@@ -458,6 +468,7 @@ struct ExpertCache::Impl {
     std::int32_t scan_ring = 0; // trailing slots reserved for prefill scans (0 = plain LRU)
     void* pool_memory      = nullptr;
     void* directory_memory = nullptr;
+    Tensor active_slots;
     void* miss_memory      = nullptr;
     void* stats_memory     = nullptr;
     ops::ExpertSlotPool pool;
@@ -685,6 +696,13 @@ struct ExpertCache::Impl {
         entry.round_slice  = 0;
         entry.round_split  = cpu_split_enabled() && share_for(tokens) > 0 &&
                              tokens >= cpu_min_tokens && entry.cpu_bank.gate_up_codes != nullptr;
+        if (slots < geometry.experts &&
+            (ops::detail::sparse_moe_uses_prefill(tokens, QType::W8G32_F16S, QType::W8G32_F16S) ||
+             tokens > (slots / geometry.experts_per_token) * kJobMirrors / 2)) {
+            // Streamed expert batches finish entirely on the GPU. Narrow slices may still
+            // use the host split, provided each owns one of the existing job mirrors.
+            entry.round_split = false;
+        }
     }
 
     /// Brings up the memop handshake if the driver has the operations and they survive a
@@ -995,8 +1013,7 @@ struct ExpertCache::Impl {
         if (ordinal >= kJobMirrors) {
             throw std::logic_error("expert cache: CPU split round has more slices than job mirrors");
         }
-        const auto& adapter_round = ops::lora_current_round();
-        const bool uniform = !adapter_round.slots;
+        const bool uniform = entry.round_lora_uniform;
         SliceContext& slice = slice_context(entry, offset, tokens, ordinal, uniform);
         slice.staged_generation = ++staging_generation;
         const std::size_t column0 = static_cast<std::size_t>(offset) * hidden;
@@ -1008,9 +1025,7 @@ struct ExpertCache::Impl {
                                    static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
                                    cudaMemcpyDeviceToHost, stream));
         if (entry.adapters) {
-            const auto* ids = adapter_round.slots
-                ? static_cast<const std::int32_t*>(adapter_round.slots->data) + offset
-                : adapter_round.uniform_cell;
+            const auto* ids = entry.round_adapter_slots + (uniform ? 0 : offset);
             CUDA_CHECK(cudaMemcpyAsync(adapter_slots_host + offset, ids,
                 (uniform ? 1 : tokens) * sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream));
         }
@@ -1058,6 +1073,25 @@ struct ExpertCache::Impl {
         const bool scan = entry->round_total > 32;
         ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream, scan);
         ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
+        cache.copy_active_slots(entry->index, stream);
+    }
+
+    void copy_active_slots(std::int32_t layer, cudaStream_t stream) {
+        if (active_slots.data == nullptr) { return; }
+        const auto table = directory.slot_of_expert.slice(0, layer * geometry.experts,
+                                                         geometry.experts);
+        CUDA_CHECK(cudaMemcpyAsync(active_slots.data, table.data, active_slots.bytes(),
+                                   cudaMemcpyDeviceToDevice, stream));
+    }
+
+    static void resolve_expert_range(void* context, const Tensor& ids, std::int32_t first,
+                                     std::int32_t count, cudaStream_t stream) {
+        auto& entry = *static_cast<Layer*>(context);
+        auto& cache = *entry.owner;
+        ops::expert_slot_resolve_range(ids, entry.index, cache.directory, cache.misses,
+                                       cache.active_slots, first, count, stream);
+        ops::expert_slot_gather(entry.bank, cache.misses, cache.pool, stream);
+        if (cache.stats_every > 0) { cache.record_stats(stream); }
     }
 
     static void resolve_round(void* context, const Tensor& ids, const Tensor& alpha,
@@ -1080,6 +1114,7 @@ struct ExpertCache::Impl {
         }
         gather_probe().begin(stream);
         ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
+        cache.copy_active_slots(entry->index, stream);
         gather_probe().end(stream);
         gather_probe().tick_gather();
         if (split) { cache.cpu_round(*entry, x, stream); }
@@ -1226,7 +1261,8 @@ struct ExpertCache::Impl {
     /// from what the run configured for this device and what the card has free.
     void create(int device) {
         allocation_device = device;
-        // --expert-slots N wins when set; otherwise the environment knob; 0 keeps zero-copy.
+        const auto minimum_slots = minimum_slot_count(geometry);
+        // --expert-slots N wins when set; otherwise the environment knob or automatic sizing.
         long requested = 0;
         if (auto configured = configured_expert_slots().find(device);
             configured != configured_expert_slots().end() && configured->second > 0) {
@@ -1236,14 +1272,10 @@ struct ExpertCache::Impl {
             requested = std::strtol(raw, nullptr, 10);
         }
         if (requested <= 0) {
-            // No slot count asked for. One layer's experts is the floor the resolve needs, and
-            // it is also what the pool used to settle on -- which left most of a card idle and
-            // cost more than half the decode rate, because every other expert then crossed
-            // PCIe on the token that wanted it. Take what is free instead: half of it, and
-            // never into what the runtime's own floor needs (with --kv-capacity auto that floor
-            // is a full-context request's pages plus the prefill workspaces), stopping at the
-            // whole model. Half, because this runs before the KV cache and the round's
-            // workspaces are allocated, so the reading overstates what the pool may take.
+            // Grow beyond the bounded minimum when memory permits: retained experts avoid
+            // repeated PCIe gathers. Leave the requested KV capacity, runtime workspaces,
+            // planned weights and load staging clear; none have been allocated yet.
+            // Half the current free memory remains the additional conservative ceiling.
             const std::size_t per_slot = ops::expert_slot_pool_bytes(geometry, 1);
             const std::size_t free     = device_free_bytes(device);
             std::size_t floor          = 0;
@@ -1258,46 +1290,43 @@ struct ExpertCache::Impl {
                 static_cast<long>(layers) * static_cast<long>(geometry.experts);
             requested = per_slot == 0 ? 0 : static_cast<long>(budget / per_slot);
             requested = std::min(requested, whole_model);
-            if (requested < geometry.experts && per_slot != 0) {
+            if (requested < minimum_slots && per_slot != 0) {
                 // The margin exists for what the load and the runtime carve beyond their
-                // projections; a pool of one layer's experts is the difference between the
-                // split running and every miss crossing PCIe -- or, with a Q4 bank, between
-                // running and refusing. When the minimum pool fits inside half the margin,
-                // it is worth more than that half.
-                const std::size_t minimum = per_slot * static_cast<std::size_t>(geometry.experts);
+                // projections. A minimum streaming batch may use half that margin when
+                // the alternative would be refusing an otherwise usable offload plan.
+                const std::size_t minimum = per_slot * static_cast<std::size_t>(minimum_slots);
                 const std::size_t within_margin =
                     free > floor + kMargin / 2 ? free - floor - kMargin / 2 : 0;
                 if (within_margin >= minimum) {
-                    requested = geometry.experts;
+                    requested = minimum_slots;
                     std::fprintf(stderr,
-                                 "expert cache: the automatic pool takes one layer's %d experts "
+                                 "expert cache: the automatic pool takes its minimum %d experts "
                                  "(%.1f GiB) out of its margin; %.1f GiB free, %.1f GiB floor\n",
-                                 geometry.experts,
+                                 minimum_slots,
                                  static_cast<double>(minimum) / (1024.0 * 1024.0 * 1024.0),
                                  static_cast<double>(free) / (1024.0 * 1024.0 * 1024.0),
                                  static_cast<double>(floor) / (1024.0 * 1024.0 * 1024.0));
                 }
             }
-            if (requested < geometry.experts) {
+            if (requested < minimum_slots) {
                 // Said out loud: without a pool every banked expert crosses PCIe on the token
                 // that wants it, and a run that expected the split would otherwise only see
                 // the rate.
                 std::fprintf(stderr,
                              "expert cache: no pool on device %d: %.1f GiB free, %.1f GiB "
                              "runtime floor, leaves %.1f GiB for a pool that needs %.1f GiB "
-                             "for one layer's %d experts; the banked experts are read over "
+                             "for its minimum %d experts; the banked experts are read over "
                              "PCIe in place (--expert-slots %d asks for that pool regardless)\n",
                              device, static_cast<double>(free) / (1024.0 * 1024.0 * 1024.0),
                              static_cast<double>(floor) / (1024.0 * 1024.0 * 1024.0),
                              static_cast<double>(budget) / (1024.0 * 1024.0 * 1024.0),
-                             static_cast<double>(per_slot) * geometry.experts /
+                             static_cast<double>(per_slot) * minimum_slots /
                                  (1024.0 * 1024.0 * 1024.0),
-                             geometry.experts, geometry.experts);
+                             minimum_slots, minimum_slots);
                 return;
             }
         }
-        // A round can touch every expert of a layer, and resolve must never leave a routed
-        // expert unmapped, so the pool holds at least one layer's worth of experts.
+        // Narrow rounds are bounded by the selected paths; wide rounds stream expert ranges.
         slots = checked_slot_count(geometry, requested);
         const std::size_t pool_bytes = ops::expert_slot_pool_bytes(geometry, slots);
         const std::size_t dir_bytes =
@@ -1326,6 +1355,13 @@ struct ExpertCache::Impl {
                         : 0;
         directory = ops::create_expert_slot_directory(layers, geometry.experts, slots, scan_ring,
                                                       directory_memory, nullptr);
+        if (slots < geometry.experts) {
+            void* table = nullptr;
+            allocate(&table, static_cast<std::size_t>(geometry.experts) * sizeof(std::int32_t));
+            active_slots = Tensor(table, DType::I32, {geometry.experts});
+            std::fprintf(stderr, "expert cache: streaming up to %d of %d experts per batch\n",
+                         slots, geometry.experts);
+        }
         misses    = ops::create_expert_miss_list(geometry.experts, miss_memory);
         CUDA_CHECK(cudaStreamSynchronize(nullptr));
         layer_entries.resize(static_cast<std::size_t>(layers));
@@ -1381,6 +1417,13 @@ struct ExpertCache::Impl {
         }
         const bool prefill_default = prefill_fraction < 0.0;
         if (prefill_default) { prefill_fraction = 0.0; }
+        if (slots < geometry.experts && prefill_fraction > 0.0) {
+            std::fprintf(stderr,
+                         "expert cache: prompt CPU sharing needs at least %d slots; "
+                         "this %d-slot cache runs prompt experts on the GPU\n",
+                         geometry.experts, slots);
+            prefill_fraction = 0.0;
+        }
         if (prefill_chunk == 0) { prefill_chunk = 2048; }
         if (fraction > 0.0 || prefill_fraction > 0.0) {
             cpu_share_q16 = static_cast<std::uint32_t>(std::min(1.0, std::max(0.0, fraction)) * 65536.0);
@@ -1391,6 +1434,11 @@ struct ExpertCache::Impl {
                 cpu_decode_band = static_cast<std::int32_t>(std::strtol(band, nullptr, 10));
             }
             cpu_decode_band = std::clamp(cpu_decode_band, 1, cpu_max_tokens);
+            if (slots < geometry.experts) {
+                cpu_decode_band = std::min({cpu_decode_band,
+                    ops::detail::kSparseMoePrefillW8W8Min - 1,
+                    (slots / geometry.experts_per_token) * kJobMirrors / 2});
+            }
             if (prefill_fraction > 0.0 && prefill_chunk > 0) {
                 cpu_prefill_share_q16 = static_cast<std::uint32_t>(std::min(1.0, prefill_fraction) * 65536.0);
                 cpu_prefill_max_tokens = static_cast<std::int32_t>(prefill_chunk);
@@ -1610,13 +1658,14 @@ std::size_t ExpertCache::pool_floor() {
 
 std::size_t ExpertCache::pool_floor_bytes(const ops::SparseMoeGeometry& geometry,
                                           std::int32_t layers, std::uint32_t requested_slots) {
-    // Automatic sizing needs at least one layer; explicit counts must be representable by
+    // Automatic sizing keeps a bounded expert batch; explicit counts must be representable by
     // the slot pool's tensor dimensions and are never silently clamped.
     const std::int32_t slots = checked_slot_count(
-        geometry, requested_slots == 0 ? geometry.experts : requested_slots);
+        geometry, requested_slots == 0 ? minimum_slot_count(geometry) : requested_slots);
     return ops::expert_slot_pool_bytes(geometry, slots) +
            ops::expert_slot_directory_bytes(layers, geometry.experts, slots) +
-           ops::expert_miss_list_bytes(geometry.experts) + kPoolMarginBytes;
+           ops::expert_miss_list_bytes(geometry.experts) +
+           static_cast<std::size_t>(geometry.experts) * sizeof(std::int32_t) + kPoolMarginBytes;
 }
 
 void ExpertCache::configure_load_staging(std::size_t bytes) {
@@ -1662,12 +1711,24 @@ void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor
     // against the directory and gathers the misses from the host bank before the expert
     // kernels run; the kernels read the pool through the layer's slot table.
     Impl::Layer& layer = cache.layer(mixture);
-    const ops::SparseMoeWeights pooled =
+    ops::SparseMoeWeights pooled =
         ops::expert_slot_weights(cache.pool, cache.directory, mixture.layer, op);
+    if (cache.active_slots.data != nullptr) {
+        pooled.slot_of_expert = static_cast<const std::int32_t*>(cache.active_slots.data);
+    }
     cache.begin_round(layer, tokens);
     layer.adapters = ops::lora_active() && ops::lora_current_round().valid()
         ? ops::lora_store_for_current_device().host_bank_table(op.router_shared_gate.qdata) : nullptr;
+    const auto& adapter_round = ops::lora_current_round();
+    layer.round_lora_uniform = adapter_round.slots == nullptr;
+    layer.round_adapter_slots = adapter_round.slots
+        ? static_cast<const std::int32_t*>(adapter_round.slots->data) : adapter_round.uniform_cell;
     ops::SparseMoeRoundHook hook{&Impl::resolve_round, &layer};
+    if (cache.slots < cache.geometry.experts) {
+        hook.max_resolve_tokens = cache.slots / cache.geometry.experts_per_token;
+        hook.expert_batch_size = cache.slots;
+        hook.resolve_experts = &Impl::resolve_expert_range;
+    }
     ops::sparse_moe(hidden, router_input == nullptr ? hidden : *router_input,
                     pooled, ops::SparseMoeEpilogue::AddResidual, destination, leaf, stream,
                     hook);
@@ -1687,6 +1748,7 @@ void ExpertCache::run(const BankedMixture& mixture, const Tensor& hidden, Tensor
     const DeviceSpan storage2 = workspace.alloc_bytes(bytes);
     WorkspaceArena leaf2(storage2);
     ops::SparseMoeRoundHook shadow_hook{&Impl::resolve_round_shadow, &layer};
+    shadow_hook.max_resolve_tokens = hook.max_resolve_tokens;
     ops::sparse_moe(hidden, router_input == nullptr ? hidden : *router_input,
                     pooled, ops::SparseMoeEpilogue::AddResidual, shadow, leaf2, stream,
                     shadow_hook);
@@ -1799,8 +1861,8 @@ void ExpertCache::prepare_split(const BankedMixture& mixture) {
     constexpr int kRepeats                 = 4;
     cudaStream_t stream                    = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    // PCIe: gather kExpertsTimed experts into the first slots (the pool is otherwise empty).
-    const int timed = std::min(kExpertsTimed, geometry.experts);
+    // Calibration must respect an explicitly bounded cache too.
+    const int timed = std::min({kExpertsTimed, geometry.experts, cache.slots});
     std::vector<std::int32_t> slots(static_cast<std::size_t>(timed)),
         experts(static_cast<std::size_t>(timed));
     for (int i = 0; i < timed; ++i) {

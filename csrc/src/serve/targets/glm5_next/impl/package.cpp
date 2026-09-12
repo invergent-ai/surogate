@@ -14,6 +14,7 @@
 #include "api/ops/sparse_moe.h"
 
 #include "core/device.h"
+#include "runtime/engine/kv_capacity.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
@@ -252,18 +253,17 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     // it is device memory the KV planner must not count as free, so it is created here, before
     // the engine measures free memory for `--kv-capacity auto`, and sized to leave the least
     // the planner says the runtime needs.
-    {
+    if (!options.offload_planning_only) {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));
         CUDA_CHECK(cudaSetDevice(device.device));
         detail::Variant::prewarm_device_scratch(geometry);
-        if (banks_experts() && !options.offload_planning_only) {
+        if (banks_experts()) {
             // The runtime's floor and the load's staging are never resident together, so the
             // pool leaves room for the larger, on top of the weights.
             const std::size_t runtime_floor =
                 family::ExpertCache::derived_reserve() +
-                std::max(planner.capacity_curve().minimum_device_reservation_bytes +
-                             options.kv_capacity.automatic_headroom_bytes,
+                std::max(runtime::minimum_kv_reservation_bytes(options.kv_capacity, planner.capacity_curve()),
                          family::ExpertCache::load_staging());
             if (std::getenv("SUROGATE_SERVE_PIPELINE_TRACE") != nullptr) {
                 std::fprintf(stderr,

@@ -506,11 +506,31 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
     const auto& adapter_round = lora_current_round();
     const auto* adapters = lora_active() && adapter_round.valid()
         ? lora_store_for_current_device().bank_table(weights.router_shared_gate.qdata) : nullptr;
+    const std::int32_t resolve_tokens = hook.max_resolve_tokens > 0
+        ? hook.max_resolve_tokens : std::numeric_limits<std::int32_t>::max();
+    if (adapters && tokens > resolve_tokens) {
+        // Adapter routing is batched too. Keep each hook invocation within the cache's
+        // capacity and preserve the adapter column IDs when advancing through the request.
+        const LoraRound saved_round = adapter_round;
+        for (std::int32_t offset = 0; offset < tokens; offset += resolve_tokens) {
+            const auto count = std::min(resolve_tokens, tokens - offset);
+            const Tensor input = x.slice(1, offset, count);
+            const Tensor router_input = router_x.slice(1, offset, count);
+            Tensor output = destination.slice(1, offset, count);
+            if (saved_round.slots) {
+                ScopedLoraColumns columns(saved_round.slots->slice(0, offset, count));
+                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream, hook);
+            } else {
+                sparse_moe(input, router_input, weights, epilogue, output, workspace, stream, hook);
+            }
+        }
+        return;
+    }
     const bool use_prefill  = !adapters && (nvfp4_routed
                                   ? tokens >= trtllm_min_tokens()
                                   : detail::sparse_moe_uses_prefill(tokens, gate_up, down));
     const bool use_small_t =
-        !adapters && !use_prefill && (detail::sparse_moe_uses_small_t(tokens) ||
+        !adapters && !use_prefill && resolve_tokens >= 3 && (detail::sparse_moe_uses_small_t(tokens) ||
                          ((nvfp4_routed || ggml_k_routed) && tokens > 1));
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
@@ -549,7 +569,8 @@ void sparse_moe(const Tensor& x, const Tensor& router_x, const SparseMoeWeights&
     }
     if (use_small_t) {
         for (std::int32_t offset = 0; offset < tokens;) {
-            const std::int32_t slice = small_t_first_slice(tokens - offset);
+            std::int32_t slice = std::min(small_t_first_slice(tokens - offset), resolve_tokens);
+            if (tokens - offset - slice == 1) { --slice; }
             auto slice_scope = workspace.scope();
             const detail::SparseMoeSmallTPlan plan =
                 detail::resolve_sparse_moe_small_t_plan(geometry, slice, gate_up, down);

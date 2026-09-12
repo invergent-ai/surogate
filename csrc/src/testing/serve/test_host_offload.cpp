@@ -88,11 +88,14 @@ void test_host_codecs() {
 }
 
 void test_slot_limits() {
-    const ops::SparseMoeGeometry geometry{128, 2, 1, 128};
+    const ops::SparseMoeGeometry geometry{128, 256, 8, 128};
     require(family::ExpertCache::pool_floor_bytes(geometry, 2, 0) ==
-                family::ExpertCache::pool_floor_bytes(geometry, 2, 2),
-            "automatic cache minimum must hold one expert layer");
-    for (std::uint32_t slots : {1U, 0xffffffffU, 1U << 24}) {
+                family::ExpertCache::pool_floor_bytes(geometry, 2, 64),
+            "automatic cache minimum must permit a bounded expert batch");
+    require(family::ExpertCache::pool_floor_bytes(geometry, 2, 8) <
+                family::ExpertCache::pool_floor_bytes(geometry, 2, 256),
+            "one token's selected experts should need less memory than a layer");
+    for (std::uint32_t slots : {1U, 7U, 0xffffffffU, 1U << 24}) {
         bool rejected = false;
         try { (void)family::ExpertCache::pool_floor_bytes(geometry, 2, slots); }
         catch (const std::invalid_argument&) { rejected = true; }

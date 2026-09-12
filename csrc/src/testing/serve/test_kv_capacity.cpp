@@ -43,6 +43,16 @@ int main() {
                   explicit_capacity.runtime_reservation_bytes == 1128,
               "explicit KV capacity did not use page-aligned token semantics");
 
+    failures += check(sinfer::runtime::minimum_kv_reservation_bytes(
+                          sinfer::KvCapacityPolicy::automatic(50), curve) == 1050,
+                      "expert cache floor must leave automatic KV headroom");
+    failures += check(sinfer::runtime::minimum_kv_reservation_bytes(
+                          sinfer::KvCapacityPolicy::explicit_capacity(129), curve) == 1128,
+                      "expert cache floor must reserve every explicit KV page");
+    failures += check(sinfer::runtime::minimum_kv_reservation_bytes(
+                          sinfer::KvCapacityPolicy::explicit_capacity(384), curve) == 1512,
+                      "expert cache floor must leave the whole pipeline KV capacity");
+
     bool insufficient_rejected = false;
     try {
         (void)sinfer::runtime::resolve_kv_capacity(sinfer::KvCapacityPolicy::automatic(50), curve,

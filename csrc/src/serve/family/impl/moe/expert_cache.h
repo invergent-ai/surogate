@@ -82,8 +82,8 @@ public:
     /// runtime's own floor -- the two are never resident together, so a caller takes the larger.
     static void configure_load_staging(std::size_t bytes);
     [[nodiscard]] static std::size_t load_staging();
-    /// What an automatic pool will insist on where experts are banked: one layer's experts
-    /// (the least `resolve` can work with), their directory and miss list, and the margin the
+    /// What an automatic pool will insist on where experts are banked: a bounded batch of
+    /// experts, their directory and miss list, and the margin the
     /// derivation keeps clear of the runtime's floor. A target's plan sets it for the current
     /// device (zero when nothing is banked) and a pipeline stage's fit subtracts it before it
     /// resolves the KV capacity, so `--host-moe-layers auto` offloads enough layers for the

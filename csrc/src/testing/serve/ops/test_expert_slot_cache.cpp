@@ -193,6 +193,45 @@ int main() {
     int failures = 0;
     Fixture f;
 
+    {
+        Fixture bounded;
+        GuardedDeviceBuffer active_memory(kGeometry.experts * sizeof(int));
+        Tensor active(active_memory.data(), DType::I32, {kGeometry.experts});
+        const std::vector<int> ids{7, 0, 6, 1, 5, 2, 4, 3, 7};
+        bounded.ids_memory.copy_from_host(ids.data(), ids.size() * sizeof(int));
+        Tensor input(bounded.ids_memory.data(), DType::I32, {static_cast<int>(ids.size())});
+        // All experts are selected, although the pool holds only half a layer. Each batch
+        // must survive repeated eviction by both this layer and another layer's directory.
+        for (int layer : {0, 1, 0}) {
+            for (int first : {0, 4}) {
+                ops::expert_slot_resolve_range(input, layer, bounded.directory, bounded.misses,
+                                               active, first, kSlots, nullptr);
+                ops::expert_slot_gather(bounded.host, bounded.misses, bounded.pool, nullptr);
+                cuda_synchronize();
+                const auto table = from_device<int>(active.data, kGeometry.experts);
+                for (int expert = 0; expert < kGeometry.experts; ++expert) {
+                    if (expert >= first && expert < first + kSlots) {
+                        failures += expect(table[expert] >= 0 && table[expert] < kSlots,
+                                           "bounded range maps every selected expert");
+                        if (table[expert] >= 0 && table[expert] < kSlots) {
+                            failures += bounded.verify_slot("bounded gather", table[expert], expert);
+                        }
+                    } else {
+                        failures += expect(table[expert] == -1, "bounded range masks other experts");
+                    }
+                }
+            }
+        }
+        bool rejected = false;
+        try {
+            ops::expert_slot_resolve_range(input, 0, bounded.directory, bounded.misses,
+                                           active, 0, kSlots + 1, nullptr);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += expect(rejected, "range wider than cache must be rejected");
+        failures += active_memory.verify_guards("bounded active slots");
+        failures += bounded.pool_memory.verify_guards("bounded slot pool");
+    }
+
     // Round 1, layer 0: three distinct experts (one duplicated) → three misses, each gathered.
     auto r1 = f.round(0, {0, 1, 2, 1});
     failures += expect(r1.misses == 3, "round 1 misses == 3 (got " + std::to_string(r1.misses) + ")");

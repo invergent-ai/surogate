@@ -228,6 +228,14 @@ void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t la
                          std::int32_t experts_per_token, cudaStream_t stream,
                          bool scan = false);
 
+/// Resolve only the selected expert range into a pool smaller than a complete layer.
+/// `active_slots` receives an I32 [experts] view with -1 outside the range; the persistent
+/// directory still retains any cached experts outside it. No routing IDs are modified.
+void expert_slot_resolve_range(const Tensor& ids, std::int32_t layer,
+                               ExpertSlotDirectory& directory, ExpertMissList& misses,
+                               Tensor& active_slots, std::int32_t first, std::int32_t count,
+                               cudaStream_t stream);
+
 /// Copies the missing experts of `layer` from the host bank into their slots: one launch,
 /// four banks (gate_up codes/scales, down codes/scales), 16-byte units, row count read from
 /// `misses.count`. Streaming loads (`ld.global.L1::no_allocate`) so the copy does not evict

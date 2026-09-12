@@ -124,12 +124,14 @@ __global__ void __launch_bounds__(kResolveThreads)
                    int* __restrict__ cpu_tokens,
                    int* __restrict__ cpu_experts, float* __restrict__ cpu_weights,
                    long long* __restrict__ cpu_count, int cpu_capacity,
-                   long long* __restrict__ stats) {
+                   long long* __restrict__ stats, int first, int last,
+                   int* __restrict__ active_slots) {
     __shared__ unsigned s_round;
     __shared__ int s_pending;
     __shared__ int s_pending_experts[1024];
     __shared__ int s_cpu_pending;
     __shared__ int s_distinct;
+    __shared__ int s_lookups;
     const int tid = static_cast<int>(threadIdx.x);
     if (tid == 0) {
         s_round       = *round + 1U;
@@ -137,6 +139,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         s_pending     = 0;
         s_cpu_pending = 0;
         s_distinct    = 0;
+        s_lookups     = 0;
         *miss_count   = 0;
         if (cpu_count != nullptr) { *cpu_count = 0; }
     }
@@ -147,7 +150,8 @@ __global__ void __launch_bounds__(kResolveThreads)
     // Pass 1: dedupe and stamp hits; collect the distinct misses.
     for (int i = tid; i < count; i += kResolveThreads) {
         const int expert = ids[i];
-        if (expert < 0 || expert >= experts) { continue; }
+        if (expert < first || expert >= last) { continue; }
+        atomicAdd(&s_lookups, 1);
         if (atomicExch(&seen[expert], this_round) == this_round) { continue; } // duplicate
         atomicAdd(&s_distinct, 1);
         const int slot = layer_table[expert];
@@ -236,7 +240,7 @@ __global__ void __launch_bounds__(kResolveThreads)
             // the kernel is what increments them.
             const int gathered = written < miss_capacity ? written : miss_capacity;
             stats[kExpertSlotStatRounds] += 1;
-            stats[kExpertSlotStatLookups] += count;
+            stats[kExpertSlotStatLookups] += s_lookups;
             stats[kExpertSlotStatDistinct] += s_distinct;
             stats[kExpertSlotStatResident] += s_distinct - s_pending;
             stats[kExpertSlotStatGathered] += gathered;
@@ -244,6 +248,12 @@ __global__ void __launch_bounds__(kResolveThreads)
         }
     }
     __syncthreads();
+
+    if (active_slots != nullptr) {
+        for (int expert = tid; expert < experts; expert += kResolveThreads) {
+            active_slots[expert] = expert >= first && expert < last ? layer_table[expert] : -1;
+        }
+    }
 
     // Pass 3: every (token, path) routed to a CPU expert becomes a host job with its weight.
     if (s_cpu_pending > 0 && cpu_count != nullptr) {
@@ -846,7 +856,36 @@ void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t la
         split ? static_cast<float*>(cpu_jobs->weights.data) : nullptr,
         split ? static_cast<long long*>(cpu_jobs->count.data) : nullptr,
         split ? cpu_jobs->capacity : 0,
-        static_cast<long long*>(directory.stats.data));
+        static_cast<long long*>(directory.stats.data), 0, directory.experts, nullptr);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void expert_slot_resolve_range(const Tensor& ids, std::int32_t layer,
+                               ExpertSlotDirectory& directory, ExpertMissList& misses,
+                               Tensor& active_slots, std::int32_t first, std::int32_t count,
+                               cudaStream_t stream) {
+    const auto slots = static_cast<int>(directory.expert_of_slot.ne[0]);
+    if (ids.dtype != DType::I32 || ids.data == nullptr || ids.numel() <= 0 ||
+        ids.numel() > (1LL << 30) || layer < 0 || layer >= directory.layers ||
+        first < 0 || count <= 0 || first > directory.experts - count ||
+        count > slots - directory.scan_ring || misses.capacity < count ||
+        active_slots.dtype != DType::I32 || active_slots.data == nullptr ||
+        active_slots.numel() != directory.experts) {
+        throw std::invalid_argument("expert_slot_cache: invalid bounded expert range");
+    }
+    resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
+        static_cast<const int*>(ids.data), nullptr, static_cast<int>(ids.numel()),
+        layer, directory.experts, slots, directory.scan_ring, 0,
+        static_cast<int*>(directory.slot_of_expert.data),
+        static_cast<int*>(directory.expert_of_slot.data),
+        static_cast<unsigned*>(directory.last_used.data),
+        static_cast<unsigned*>(directory.active_round.data),
+        static_cast<unsigned*>(directory.round.data), static_cast<int*>(directory.hand.data),
+        static_cast<unsigned*>(directory.seen.data), static_cast<unsigned*>(directory.cpu_round.data),
+        static_cast<int*>(misses.slots.data), static_cast<int*>(misses.experts.data),
+        static_cast<long long*>(misses.count.data), misses.capacity, 0U, 1,
+        nullptr, nullptr, nullptr, nullptr, 0, static_cast<long long*>(directory.stats.data),
+        first, first + count, static_cast<int*>(active_slots.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

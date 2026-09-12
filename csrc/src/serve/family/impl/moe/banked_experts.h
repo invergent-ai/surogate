@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/engine/kv_capacity.h"
+
 #include "family/impl/moe/expert_cache.h"
 #include "api/ops/linear.h"
 
@@ -31,7 +33,7 @@ void plan_banked_experts(artifact::Binder& binder, HostBankPlan& bank,
 
 void configure_banked_experts(DeviceContext& device, const EngineOptions& options,
                               const ops::SparseMoeGeometry& geometry, std::int32_t layers,
-                              std::size_t runtime_minimum);
+                              const runtime::SequenceCapacityCurve& curve);
 
 /// Returns false for resident experts; otherwise runs and joins the cached/CPU result.
 bool run_banked_experts(const BankedExperts& banked, const ops::SparseMoeWeights& weights,

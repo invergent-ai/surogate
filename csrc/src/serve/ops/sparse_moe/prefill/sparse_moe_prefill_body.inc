@@ -1840,6 +1840,13 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
     auto* mid_codes         = static_cast<std::int8_t*>(workspace.mid_codes.data);
     auto* mid_ds            = static_cast<__half2*>(workspace.mid_ds.data);
     auto* routed_sum        = static_cast<float*>(workspace.routed_sum.data);
+    const bool stream_experts = hook != nullptr && hook->resolve_experts != nullptr &&
+                                hook->expert_batch_size > 0 && hook->expert_batch_size < kExperts;
+    if (stream_experts && (weights.routed_gate_up.qtype != QType::W8G32_F16S ||
+                           weights.routed_down.qtype != QType::W8G32_F16S ||
+                           weights.slot_of_expert == nullptr)) {
+        throw std::invalid_argument("sparse_moe prefill: bounded expert batches require a W8 slot pool");
+    }
 
     for (std::int32_t token0 = 0; token0 < plan.tokens; token0 += plan.slice_tokens) {
         const std::int32_t tokens =
@@ -1868,7 +1875,7 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
             scores, ids, alpha, shared_scale, packed_index, tile_counts, tokens,
             weights.router_bias, weights.per_expert_scale);
         CUDA_CHECK(cudaGetLastError());
-        if (hook != nullptr && hook->resolve != nullptr) {
+        if (!stream_experts && hook != nullptr && hook->resolve != nullptr) {
             const Tensor slice_ids(ids, DType::I32, {assignments});
             const Tensor slice_alpha(alpha, DType::FP32, {assignments});
             hook->resolve(hook->context, slice_ids, slice_alpha, input_slice, output_slice, stream);
@@ -1948,6 +1955,51 @@ void prefill_launch(const Tensor& x, const Tensor& router_x, const SparseMoeWeig
         }
 
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
+        if (stream_experts) {
+            // Each expert owns a disjoint interval in grouped_io. Its gate/up consumes that
+            // interval before its down projection overwrites it, so later expert batches
+            // retain their original inputs. Reduce once, in the original top-k order, after
+            // every interval has been written; evicting weights does not discard activations.
+            const Tensor slice_ids(ids, DType::I32, {assignments});
+            const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
+            for (int first = 0; first < kExperts; first += hook->expert_batch_size) {
+                hook->resolve_experts(hook->context, slice_ids, first,
+                                       std::min(hook->expert_batch_size, kExperts - first), stream);
+                sparse_moe_prefill_w8_gate_up_kernel<true>
+                    <<<routed_gate_grid, kExpertThreads, 0, stream>>>(
+                        grouped_io, offsets, weights.slot_of_expert, routed_gate_codes,
+                        routed_gate_scales, routed_activation, tokens, nullptr);
+                CUDA_CHECK(cudaGetLastError());
+                sparse_moe_prefill_w8_down_kernel<true>
+                    <<<routed_down_grid, kExpertThreads, 0, stream>>>(
+                        routed_activation, offsets, weights.slot_of_expert, routed_down_codes,
+                        routed_down_scales, grouped_io, nullptr, nullptr, nullptr, tokens, nullptr);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            sparse_moe_prefill_reduce_kernel<false><<<tokens, kHidden / 8, 0, stream>>>(
+                grouped_io, packed_index, ids, alpha, nullptr, routed_sum, nullptr);
+            CUDA_CHECK(cudaGetLastError());
+            if constexpr (kHasShared) {
+                const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
+                                            (tokens + kExpertBN - 1) / kExpertBN);
+                sparse_moe_prefill_w8_gate_up_kernel<false>
+                    <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
+                        input, nullptr, nullptr, shared_gate_codes, shared_gate_scales,
+                        shared_activation, tokens, nullptr);
+                CUDA_CHECK(cudaGetLastError());
+                const dim3 shared_down_grid(kHidden / kExpertBM,
+                                            (tokens + kExpertBN - 1) / kExpertBN);
+                sparse_moe_prefill_w8_down_kernel<false>
+                    <<<shared_down_grid, kExpertThreads, 0, stream>>>(
+                        shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales,
+                        nullptr, routed_sum, shared_scale, output, tokens, nullptr);
+            } else {
+                sparse_moe_prefill_combine_routed_kernel<<<tokens, 256, 0, stream>>>(
+                    routed_sum, output, tokens);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            continue;
+        }
         if (weights.routed_gate_up.qtype == QType::Q4G64_F16S &&
             detail::marlin_moe_route_enabled()) {
             if (weights.slot_of_expert != nullptr) {
@@ -2207,4 +2259,3 @@ if constexpr (kHasShared) {
         CUDA_CHECK(cudaGetLastError());
     }
 }
-

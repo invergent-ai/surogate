@@ -220,6 +220,7 @@ std::uint32_t resolve_automatic_context(DeviceContext& device, const EngineOptio
     const std::size_t headroom = options.kv_capacity.automatic_headroom_bytes;
     const auto plan_at         = [&](std::uint32_t context) {
         EngineOptions probe   = options;
+        probe.offload_planning_only = true;
         probe.max_context     = context;
         probe.prefill_chunk   = context_prefill(options.prefill_chunk, context);
         return Target::make_sequence_planner(device, probe, weights_profile, geometry, vision_geometry)
@@ -525,9 +526,8 @@ template <class Target>
 struct StagePreflight {
     std::uint32_t max_context = 0;
     std::uint32_t kv_tokens   = 0;
-    /// Mixture layers each stage moves to host memory. Zero everywhere unless the operator
-    /// asked for `auto`, and then the least each stage needs -- usually zero for most of them,
-    /// because the stages are not equally tight.
+    /// Mixture layers each stage moves to host memory. Preserve explicit counts; under
+    /// `auto`, select the least each stage needs because the stages are not equally tight.
     std::vector<std::uint32_t> host_moe;
 };
 
@@ -542,8 +542,10 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
                    typename Target::WeightsProfile weights_profile,
                    const family::TextGeometry& geometry, DeviceContext& probe,
                    std::uint32_t max_context) {
+    EngineOptions sized = stage;
+    sized.offload_planning_only = true;
     artifact::Binder binder(reader);
-    auto plan = Target::plan_load(binder, stage, weights_profile);
+    auto plan = Target::plan_load(binder, sized, weights_profile);
     StageFit fit{};
     fit.budget_bytes = subtract_saturating(
         runtime_bytes_after_planned_weights(plan.materialization().device_capacity_bytes),
@@ -554,7 +556,6 @@ StageFit stage_fit(artifact::Reader& reader, const EngineOptions& stage,
     // fit the KV exactly, and left the bank a pool of nothing (which a Q4 bank refuses).
     fit.budget_bytes = subtract_saturating(fit.budget_bytes, family::ExpertCache::pool_floor());
     if (max_context == 0) { return fit; }
-    EngineOptions sized = stage;
     sized.max_context   = max_context;
     sized.prefill_chunk = context_prefill(stage.prefill_chunk, max_context);
     if (sized.elastic_kv_overcommit) { sized.elastic_kv = true; }
@@ -581,14 +582,17 @@ preflight_pipeline(const EngineOptions& options, artifact::Reader& reader,
     const auto count                    = stage_options.size();
 
     StagePreflight<Target> out{};
-    out.host_moe.assign(count, 0);
+    out.host_moe.assign(count, options.host_moe_layers == EngineOptions::kHostMoeLayersAuto
+                                   ? 0 : options.host_moe_layers);
     for (std::size_t s = 0; s < count; ++s) {
         DeviceContext probe(stage_options[s].device);
         const StageFit fit =
             stage_fit<Target>(reader, stage_options[s], weights_profile, geometry, probe, 0);
         if (options.max_context != 0) { continue; }
+        EngineOptions planning = stage_options[s];
+        planning.offload_planning_only = true;
         const std::uint32_t resolved = resolve_automatic_context<Target>(
-            probe, stage_options[s], weights_profile, geometry, fit.budget_bytes, declared_vision_geometry(reader));
+            probe, planning, weights_profile, geometry, fit.budget_bytes, declared_vision_geometry(reader));
         out.max_context = out.max_context == 0 ? resolved : std::min(out.max_context, resolved);
     }
     if (options.max_context != 0) { out.max_context = options.max_context; }

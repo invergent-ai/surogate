@@ -169,7 +169,9 @@ struct PinnedWeight {
     ~PinnedWeight() { if (host) { cudaFreeHost(host); } }
 };
 
-static void expert_adapters(bool shared, int tokens = 3, bool cpu = false) {
+static void expert_adapters(bool shared, int tokens = 3, bool cpu = false,
+                            int cache_slots = 0, bool expect_host_partial = true,
+                            bool auto_cpu = false) {
     Context context;
     const auto g = shared ? ops::kSparseMoeQwen36Geometry : ops::kSparseMoeQwen3MoeGeometry;
     const int h = g.hidden, m = g.intermediate, e = g.experts;
@@ -225,8 +227,8 @@ static void expert_adapters(bool shared, int tokens = 3, bool cpu = false) {
         weights.routed_gate_up = host_gu->weight;
         weights.routed_down = host_down->weight;
         EngineOptions options;
-        options.expert_slots = e;
-        options.cpu_moe_share = tokens > 3 ? .5F : 1.0F;
+        options.expert_slots = cache_slots > 0 ? cache_slots : e;
+        options.cpu_moe_share = auto_cpu ? -1.0F : tokens > 3 ? .5F : 1.0F;
         options.cpu_moe_prefill_share = options.cpu_moe_share;
         options.cpu_moe_min_tokens = 1;
         options.prefill_chunk = tokens;
@@ -235,12 +237,13 @@ static void expert_adapters(bool shared, int tokens = 3, bool cpu = false) {
         mixture.layer = 0; mixture.layers = 1; mixture.op = &weights;
         mixture.host_gate_up = static_cast<const std::byte*>(host_gu->host);
         mixture.host_down = static_cast<const std::byte*>(host_down->host);
+        if (auto_cpu) { cache->prepare_split(mixture); }
     }
     auto run = [&](cudaStream_t stream) {
         if (cache) {
             cache->run(mixture, x, result, workspace, stream);
-            assert(cache->has_pending_partial());
-            cache->add_pending_partial(result, stream);
+            assert(cache->has_pending_partial() == expect_host_partial);
+            if (cache->has_pending_partial()) { cache->add_pending_partial(result, stream); }
         } else {
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, result, workspace, stream);
         }
@@ -447,5 +450,12 @@ int main() {
     expert_adapters(false, 129);
     expert_adapters(false, 3, true);
     expert_adapters(false, 33, true);
+    // Two token columns fit at once. Distinct per-column adapters must retain their
+    // original IDs through cache slices, CPU partials and CUDA graph replay.
+    expert_adapters(false, 3, true, 17);
+    expert_adapters(true, 7, true, 17);
+    expert_adapters(false, 33, true, 17, false);
+    expert_adapters(false, 129, true, 17, false);
+    expert_adapters(false, 3, true, 8, true, true);
     std::cout << "LoRA split/gated attention and routed/shared expert numerical coverage passed\n";
 }

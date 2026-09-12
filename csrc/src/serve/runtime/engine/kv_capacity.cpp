@@ -47,6 +47,17 @@ std::uint32_t explicit_page_groups(const KvCapacityPolicy& policy,
 
 } // namespace
 
+std::size_t minimum_kv_reservation_bytes(const KvCapacityPolicy& policy,
+                                         const SequenceCapacityCurve& curve) {
+    validate_curve(curve);
+    if (policy.mode == KvCapacityMode::Automatic) {
+        return checked_add(curve.minimum_device_reservation_bytes,
+                           policy.automatic_headroom_bytes, "KV reservation overflows size_t");
+    }
+    return resolve_kv_capacity(policy, curve, std::numeric_limits<std::size_t>::max())
+        .runtime_reservation_bytes;
+}
+
 std::size_t SequenceCapacityCurve::reservation_bytes(std::uint32_t main_page_groups) const {
     validate_curve(*this);
     if (main_page_groups < minimum_main_page_groups ||

@@ -247,6 +247,8 @@ public:
                                                           std::span<const std::uint32_t> lanes,
                                                           std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] runtime::MixedRoundResult consume_mixed_round(runtime::RoundHandle handle);
+    /// Whether the stage stream has completed its enqueued round; does not wait for it.
+    [[nodiscard]] bool round_ready() const;
     /// Pipeline driver, speculative rounds. A decode round licenses up to `width` tokens per
     /// lane. The stage with the head decides the round -- the licensed tokens and the next
     /// drafts, per lane -- and hands that decision out as bytes the stages without the head

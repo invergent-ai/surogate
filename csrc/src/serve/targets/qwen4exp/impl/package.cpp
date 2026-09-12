@@ -10,6 +10,7 @@
 #include "targets/qwen4exp/impl/load/bindings.h"
 #include "targets/qwen4exp/impl/variant.h"
 #include "core/device.h"
+#include "runtime/engine/kv_capacity.h"
 
 #include <stdexcept>
 #include <utility>
@@ -167,8 +168,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     // pool leaves room for the larger, on top of the weights.
     const std::size_t runtime_floor =
         family::ExpertCache::derived_reserve() +
-        std::max(planner.capacity_curve().minimum_device_reservation_bytes +
-                     options.kv_capacity.automatic_headroom_bytes,
+        std::max(runtime::minimum_kv_reservation_bytes(options.kv_capacity, planner.capacity_curve()),
                  family::ExpertCache::load_staging());
     family::ExpertCache::configure(options, runtime_floor, geometry.experts);
     {

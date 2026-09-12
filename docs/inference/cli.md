@@ -137,7 +137,7 @@ whole layers with `--gpu-layers` before using these settings.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--expert-slots N` | automatic | Number of experts cached on the GPU; omitted or `0` sizes the cache from available memory. An explicit count must hold at least one layer’s experts |
+| `--expert-slots N` | automatic | Number of experts cached on the GPU; omitted or `0` sizes the cache from available memory. An explicit count must hold at least the experts selected for one token |
 | `--host-expert-bank auto\|w8\|q4` | `auto` | Precision of offloaded experts. `w8` uses eight bits throughout; `q4` uses four bits, saving RAM but potentially reducing quality |
 | `--cpu-moe-share F\|auto` | off | Fraction of expert work sent to CPU cores; `auto` measures the machine at startup |
 | `--cpu-moe-prefill-share F` | 0 | CPU share during prompt processing; `0` disables it |

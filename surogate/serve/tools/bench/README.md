@@ -3,6 +3,35 @@
 Offline helper for the `sinfer_bench` throughput tool. Correctness/parity tooling lives separately
 under [`tools/parity`](../parity).
 
+## Benchmark host topology
+
+The benchmark host has the following physical GPU topology, supplied on 2026-09-12.
+The trained PCIe width matters for expert offloading and transfers between pipeline stages.
+
+| Physical GPU | PCI BDF | Upstream bridge | NUMA node | Trained PCIe width |
+|---:|---|---|---:|---|
+| 0 | 01:00.0 | 00:01.1 | 0 | x16 |
+| 1 | 21:00.0 | 20:01.1 | 0 | x16 |
+| 2 | 41:00.0 | 40:01.1 | 0 | x8 |
+| 3 | 61:00.0 | 60:01.1 | 0 | x8 |
+| 4 | 81:00.0 | 80:01.1 | 1 | x16 |
+| 5 | a1:00.0 | a0:01.1 | 1 | x8 |
+| 6 | c1:00.0 | c0:01.1 | 1 | x16 |
+| 7 | e1:00.0 | e0:01.1 | 1 | x8 |
+
+Use the same physical GPU for sequential engine comparisons where possible. When comparing
+on separate cards, match PCIe width and account for CPU and host-memory NUMA placement.
+Prefer available x16 cards (0, 1, 4, 6) for single-GPU expert-offload reference measurements.
+Resident-model measurements can still use x8 cards; report the placement rather than assuming
+their steady-state decode throughput scales with PCIe width.
+
+Record physical GPU IDs, PCI BDFs, and `CUDA_VISIBLE_DEVICES`, since CUDA renumbers visible
+devices. For pipelines, also record stage order and host-memory placement across NUMA nodes.
+Avoid concurrent offload comparisons that compete for the same host-memory bandwidth.
+Recheck availability and trained links before a benchmark campaign; this table does not imply
+that every GPU is idle. The six-GPU run on `0,3,4,5,6,7` combines three x16 and three x8 cards
+across both NUMA nodes.
+
 ## Corpus baker
 
 `sinfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a

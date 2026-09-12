@@ -24,6 +24,7 @@
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/request_memory.h"
+#include "runtime/engine/pipeline_schedule.h"
 
 #include <algorithm>
 #include <cmath>
@@ -38,6 +39,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -395,22 +397,18 @@ public:
     void launch_group_prefill(std::uint32_t g, std::uint32_t lane) {
         begin_flight(g, FlightKind::Prefill, {}, {}, {}, lane);
     }
-    /// Advances the pipeline: consumes the stage round that has been running longest (the only
-    /// blocking wait), moves its group to the next stage or finishes it, and launches every
-    /// parked group whose next stage is free. Returns the groups that finished.
+    /// Consume the oldest completed stage, then launch parked groups on free stages. An
+    /// unfinished prompt or host-offload round on one GPU must not prevent another GPU
+    /// from forwarding a residual or publishing a request's first token.
     std::vector<std::uint32_t> tick() {
         // Groups that completed inside a launch (a lone prefill runs its stages synchronously)
         // are handed back here.
         std::vector<std::uint32_t> finished = std::move(pending_finished_);
         pending_finished_.clear();
-        int oldest = -1;
-        for (std::size_t g = 0; g < flights_.size(); ++g) {
-            const Flight& f = flights_[g];
-            if (!f.active || f.between) { continue; }
-            if (oldest < 0 || f.stage_sequence < flights_[static_cast<std::size_t>(oldest)].stage_sequence) {
-                oldest = static_cast<int>(g);
-            }
-        }
+        const int oldest = oldest_ready_pipeline_flight(flights_, [&](std::size_t stage) {
+            select(stage);
+            return stages_[stage]->program->round_ready();
+        });
         if (oldest >= 0) {
             Flight& f = flights_[static_cast<std::size_t>(oldest)];
             const std::size_t s = f.stage;
@@ -436,6 +434,11 @@ public:
             finish_stage(static_cast<std::uint32_t>(oldest), s, finished);
         }
         advance_parked(finished);
+        if (oldest < 0 && finished.empty() && any_in_flight()) {
+            // Keep admission and cancellation responsive without spinning a CPU core while
+            // every GPU is busy. Recheck all stages instead of blocking on one of them.
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
         return finished;
     }
     [[nodiscard]] const GroupResult& group_result(std::uint32_t g) const { return flights_.at(g).result; }

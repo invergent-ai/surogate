@@ -1151,7 +1151,6 @@ private:
         std::array<std::uint32_t, runtime::kMaximumMixedPrefills> staged{};
         std::size_t staged_count  = 0;
         std::uint32_t prefill_lane = 0;
-        std::uint32_t deferred     = 0;
         std::uint32_t next_lane    = 0;
         bool prefill_flight        = false;
         bool previous_prefill      = false;
@@ -1214,17 +1213,10 @@ private:
                 if (!program.mixed_round_supported(candidate, meta.membership.size)) { continue; }
                 meta.staged[meta.staged_count++] = candidate;
             }
-            // Prefill batching (#88) in the pipelined loop: let a group's staged set grow for a
-            // few of its rounds before spending a mixed round on it, bounded as in the
-            // single-round loop.
-            if (meta.staged_count > 0 && !meta.membership.empty() &&
-                meta.staged_count < mixed_prefill_batch_target() && !prefill_lanes_.full() &&
-                meta.deferred < mixed_prefill_batch_wait_rounds()) {
-                ++meta.deferred;
-                meta.staged_count = 0;
-            } else {
-                meta.deferred = 0;
-            }
+            // Pipeline groups already divide the available prompts. A group may never reach
+            // the single-device batch target, and clearing its staged set to wait also sent
+            // it through the synchronous lone-prefill fallback below. Advance ready prompts
+            // immediately through an asynchronous mixed flight, including a single prompt.
             meta.prefill_flight = false;
             if (meta.staged_count > 0 && !meta.membership.empty()) {
                 meta.previous_prefill = false;

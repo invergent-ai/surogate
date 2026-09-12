@@ -8,8 +8,12 @@ re-benchmarked in this run. Source identities, launch commands, request counts, 
 measurements are in the [JSON report](tools/bench/results/2026-09-11-local-models.json).
 
 **Hardware:** RTX 5090 32 GB cards, driver 590.44.01, **400 W power limit**, two EPYC 9124
-CPUs (32 physical cores total), and 503 GiB RAM. The earlier uncapped measurements are not
-direct performance comparisons. GPUs 1 and 2 reported 100% utilization and were excluded.
+CPUs (32 physical cores total), and 503 GiB RAM. The earlier measurements also used a 400 W
+power limit; “uncapped” in those records refers to SM clocks. Their workloads and configurations
+differ, so they are not direct performance comparisons. GPUs 1 and 2 reported 100% utilization
+and were excluded. Physical GPUs 0, 1, 4, and 6 have x16 PCIe links; 2, 3, 5, and 7 have x8
+links. GPUs 0–3 belong to NUMA node 0 and 4–7 to node 1. The six-GPU runs mix three x16 and
+three x8 cards across both nodes. See the [host topology and comparison guidance](tools/bench/README.md#benchmark-host-topology).
 
 **Workload:** exact 512-token prose inputs sent as token IDs and 128 generated tokens over
 streaming Chat Completions. Tokenization happens before timing. Sampling is greedy, EOS

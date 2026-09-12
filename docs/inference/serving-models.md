@@ -204,6 +204,13 @@ The expert cache sizes itself from available GPU memory. Start with the automati
 use `--expert-slots N` if you need to choose its size explicitly. Raising concurrency or
 context length leaves less memory for this cache.
 
+The cache can be smaller than one layer's experts, allowing automatic placement to keep more
+model weights on the GPU. Smaller caches may require more work during prompt processing;
+start with automatic sizing before choosing a smaller explicit count. With a cache smaller
+than one layer, CPU sharing is limited to small decode batches; prompt processing and wider
+batches use GPU expert computation. Choose at least one layer's expert count if you need
+CPU sharing for prompt processing.
+
 `--cpu-moe-share auto` measures the machine at startup to choose how much work to send to the
 CPU. `--cpu-moe-prefill-share` controls the CPU share during prompt processing; `0` disables
 that share.

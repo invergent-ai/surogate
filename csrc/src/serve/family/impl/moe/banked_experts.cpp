@@ -90,7 +90,7 @@ void plan_banked_experts(artifact::Binder& binder, HostBankPlan& bank,
 
 void configure_banked_experts(DeviceContext& device, const EngineOptions& options,
                               const ops::SparseMoeGeometry& geometry, std::int32_t layers,
-                              std::size_t runtime_minimum) {
+                              const runtime::SequenceCapacityCurve& curve) {
     if (options.offload_planning_only || geometry.experts <= 0 || ExpertCache::pool_floor() == 0) {
         return;
     }
@@ -98,7 +98,7 @@ void configure_banked_experts(DeviceContext& device, const EngineOptions& option
     CUDA_CHECK(cudaGetDevice(&previous));
     CUDA_CHECK(cudaSetDevice(device.device));
     const auto floor = ExpertCache::derived_reserve() +
-        std::max(runtime_minimum + options.kv_capacity.automatic_headroom_bytes,
+        std::max(runtime::minimum_kv_reservation_bytes(options.kv_capacity, curve),
                  ExpertCache::load_staging());
     ExpertCache::configure(options, floor, geometry.experts);
     (void)ExpertCache::for_current_device(geometry, layers);
@@ -111,7 +111,7 @@ bool run_banked_experts(const BankedExperts& banked, const ops::SparseMoeWeights
     if (banked.host_gate_up == nullptr) { return false; }
     auto& cache = ExpertCache::for_current_device(ops::sparse_moe_geometry(weights), banked.layers);
     if (!cache.enabled()) {
-        throw std::runtime_error("offloaded experts need enough GPU memory for one expert-cache layer");
+        throw std::runtime_error("offloaded experts need enough GPU memory for the minimum expert-cache batch");
     }
     cache.run(banked.mixture(weights), hidden, destination, workspace, stream, router_input);
     cache.add_pending_partial(destination, stream);

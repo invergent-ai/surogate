@@ -335,6 +335,14 @@ runtime::MixedRoundResult Program<Variant>::consume_mixed_round(runtime::RoundHa
 }
 
 template <>
+bool Program<Variant>::round_ready() const {
+    const auto status = cudaStreamQuery(impl_->device.stream);
+    if (status == cudaErrorNotReady) { return false; }
+    CUDA_CHECK(status);
+    return true;
+}
+
+template <>
 std::uint32_t Program<Variant>::speculative_round_width() const noexcept {
     return impl_->speculative_round_width();
 }

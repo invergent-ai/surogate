@@ -117,7 +117,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                                   geometry, vision_geometry);
     family::configure_banked_experts(device, options, offload_geometry(geometry),
                                      geometry.layers + geometry.mtp_layers,
-                                     planner.capacity_curve().minimum_device_reservation_bytes);
+                                     planner.capacity_curve());
     return planner;
 }
 

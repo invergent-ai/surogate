@@ -299,6 +299,15 @@ struct SparseMoeRoundHook {
     void (*resolve)(void* context, const Tensor& ids, const Tensor& alpha, const Tensor& x,
                     Tensor& destination, cudaStream_t stream) = nullptr;
     void* context                                             = nullptr;
+    /// A bounded cache can resolve only this many tokens together on the narrow path.
+    /// Zero leaves the normal schedule unchanged.
+    std::int32_t max_resolve_tokens = 0;
+    /// Wide W8 rounds retain their routing and grouped activations while fetching experts
+    /// in ranges. The callback installs a slot table containing only [first, first+count).
+    /// Every range completes both projections before the next range reuses its slots.
+    std::int32_t expert_batch_size = 0;
+    void (*resolve_experts)(void* context, const Tensor& ids, std::int32_t first,
+                            std::int32_t count, cudaStream_t stream) = nullptr;
 };
 
 /// As above with a round hook; a hook with a null `resolve` is the plain call.
