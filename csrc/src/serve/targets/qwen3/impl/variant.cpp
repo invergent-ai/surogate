@@ -1,3 +1,4 @@
+#include "family/impl/ggml_mlp_workspace.h"
 #include "targets/qwen3/impl/variant.h"
 
 #include "api/ops/attn_input_proj.h"
@@ -176,6 +177,22 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
         post_mixer_workspace_bytes(geometry, qtype, qtype, kTextPolicy, first, last),
         post_mixer_workspace_bytes(geometry, QType::Q4_K, QType::Q4_K,
                                    ops::LinearPolicy::A16Only, first, last));
+}
+
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry,
+    WeightsProfile weights_profile, family::TextPhase phase, std::int32_t first,
+    std::int32_t last, bool lora_enabled) {
+    family::validate_token_interval(first, last);
+    (void)profile_qtype(weights_profile);
+    if (geometry.linear_storage.empty()) {
+        return post_mixer_workspace_capacity_bytes(geometry, weights_profile, phase, first, last);
+    }
+    std::size_t peak = 0;
+    for (int layer = 0; layer < geometry.layers; ++layer) {
+        peak = std::max(peak, family::stored_mlp_workspace_capacity_bytes(geometry,
+            "text/layers/" + std::to_string(layer) + "/", kTextPolicy, first, last, lora_enabled));
+    }
+    return peak;
 }
 
 // ---- Leaves this target cannot run -----------------------------------------

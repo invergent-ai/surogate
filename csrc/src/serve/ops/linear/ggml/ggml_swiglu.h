@@ -11,12 +11,12 @@ bool swiglu_decode_admits(GgmlType gate, GgmlType up, std::int32_t rows, std::in
 bool swiglu_prefill_admits(GgmlType gate, GgmlType up, std::int32_t rows, std::int32_t k,
                            std::int32_t tokens) noexcept;
 
-void swiglu_prefill_launch(GgmlType type, const void* gate, const void* up,
+void swiglu_prefill_launch(GgmlType type, const void* gate, GgmlType up_type, const void* up,
                            std::int32_t rows, std::int32_t k, const __nv_bfloat16* x,
                            std::int32_t tokens, __nv_bfloat16* out, void* scratch,
                            std::size_t scratch_bytes, cudaStream_t stream);
 
-/// Capacity for known half formats; includes every decode fallback in the interval.
+/// Capacity for known half formats; includes every decode and prefill fallback in the interval.
 std::size_t swiglu_workspace_capacity_bytes(GgmlType gate, GgmlType up, std::int32_t rows,
                                             std::int32_t k, std::int32_t first, std::int32_t last);
 
@@ -32,7 +32,7 @@ void swiglu_decode_launch(GgmlType gate_type, const void* gate, GgmlType up_type
 bool ggml_swiglu_decode(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                         cudaStream_t stream);
 
-/// Decode, fused K-quant prefill, or K-quant projections sharing activation quantization.
+/// Decode, fused prefill, or projections sharing activation quantization.
 bool ggml_swiglu(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                  cudaStream_t stream);
 

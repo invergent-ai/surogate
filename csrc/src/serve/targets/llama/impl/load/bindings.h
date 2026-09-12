@@ -86,6 +86,8 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
+[[nodiscard]] family::TextGeometry resolved_geometry(const artifact::Reader& reader);
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                family::StartupFeatures features);
 

@@ -157,7 +157,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 }
 
 family::TextGeometry Package::declared_geometry(const artifact::Reader& reader) {
-    return family::TextGeometry::resolved(reader.geometry(), reader.layer_types());
+    return detail::resolved_geometry(reader);
 }
 
 std::unique_ptr<Package::Program>

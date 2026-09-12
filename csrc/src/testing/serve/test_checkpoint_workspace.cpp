@@ -1,5 +1,10 @@
 #include "targets/qwen3_5/impl/variant.h"
 #include "targets/qwen3_5_moe/impl/variant.h"
+#include "targets/llama/impl/variant.h"
+#include "targets/qwen3/impl/variant.h"
+#include "api/targets/llama/package.h"
+#include "api/targets/qwen3/package.h"
+#include "artifact/reader.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/gdn_input_proj.h"
 #include "api/ops/linear.h"
@@ -7,6 +12,7 @@
 #include "api/ops/sparse_moe.h"
 
 #include <cassert>
+#include <cstdlib>
 
 using namespace sinfer;
 using Dense = targets::qwen3_5::detail::Variant;
@@ -82,4 +88,56 @@ int main() {
     const auto mixed = mlp(false);
     assert(mixed >= base + 4ULL * g.intermediate * 2048);
     assert(mlp(true) >= mixed);
+
+    const auto check_dense = [&]<class Variant>() {
+        const auto profile = Variant::WeightsProfile::GroupwiseInt;
+        const auto capacity = [&](bool lora) {
+            return Variant::post_mixer_workspace_capacity_bytes(g, profile, phase, 1, 2048, lora);
+        };
+        for (auto type : {QType::Q8_0, QType::IQ4_NL, QType::Q5_K}) {
+            for (int layer = 0; layer < g.layers; ++layer) {
+                put(layer, "mlp/gate_up", 2 * g.intermediate, g.hidden, type);
+            }
+            const auto fused_base = capacity(false), adapters = capacity(true);
+            assert(fused_base + 4ULL * g.intermediate * 2048 <= adapters);
+            assert(adapters <= Variant::post_mixer_workspace_capacity_bytes(g, profile, phase, 1, 2048));
+            auto& formats = g.linear_storage["text/layers/2/mlp/gate_up"].formats;
+            formats.push_back(QType::F16);
+            assert(capacity(false) >= fused_base + 4ULL * g.intermediate * 2048);
+            assert(capacity(true) >= capacity(false));
+        }
+        // Qwen3 may store separate matrices; their temporary outputs remain necessary.
+        const auto fused_base = [&] {
+            for (int layer = 0; layer < g.layers; ++layer) {
+                put(layer, "mlp/gate_up", 2 * g.intermediate, g.hidden, QType::Q8_0);
+            }
+            return capacity(false);
+        }();
+        const auto fused_adapters = capacity(true);
+        put(2, "mlp/gate", g.intermediate, g.hidden, QType::Q8_0);
+        put(2, "mlp/up", g.intermediate, g.hidden, QType::IQ4_NL);
+        assert(capacity(false) >= fused_base + 4ULL * g.intermediate * 2048);
+        assert(capacity(true) >= std::max(capacity(false), fused_adapters));
+        g.linear_storage.erase("text/layers/2/mlp/gate");
+        g.linear_storage.erase("text/layers/2/mlp/up");
+        // Partial metadata must not silently replace a missing layer with a preset.
+        g.linear_storage.erase("text/layers/2/mlp/gate_up");
+        bool refused = false;
+        try { (void)capacity(false); } catch (const std::invalid_argument&) { refused = true; }
+        assert(refused);
+    };
+    check_dense.template operator()<targets::llama::detail::Variant>();
+    check_dense.template operator()<targets::qwen3::detail::Variant>();
+
+    // Startup asks the package for geometry before materializing its weights.
+    // The package must expose the same storage facts as the later binding plan.
+    if (const auto* path = std::getenv("SUROGATE_CHECKPOINT_WORKSPACE_ARTIFACT")) {
+        const artifact::Reader reader(path);
+        const auto declared = reader.identity().architecture == "llama"
+            ? targets::llama::Package::declared_geometry(reader)
+            : targets::qwen3::Package::declared_geometry(reader);
+        assert(!declared.linear_storage.empty());
+        assert(declared.linear_storage.contains("text/layers/0/mlp/gate_up") ||
+               declared.linear_storage.contains("text/layers/0/mlp/gate"));
+    }
 }

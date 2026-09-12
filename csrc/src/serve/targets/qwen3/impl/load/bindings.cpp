@@ -1,3 +1,4 @@
+#include "artifact/linear_storage.h"
 #include "targets/qwen3/impl/load/bindings.h"
 
 #include "targets/qwen3/impl/config.h"
@@ -13,6 +14,12 @@
 #include <string_view>
 
 namespace sinfer::targets::qwen3::detail {
+
+family::TextGeometry resolved_geometry(const artifact::Reader& reader) {
+    auto geometry = family::TextGeometry::resolved(reader.geometry(), reader.layer_types());
+    artifact::resolve_linear_storage(reader, geometry);
+    return geometry;
+}
 namespace {
 
 using artifact::NumericFormat;
@@ -118,7 +125,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     // Required dimensions and the layer schedule come from the artifact.
-    out.geometry = family::TextGeometry::resolved(binder.reader().geometry(), binder.reader().layer_types());
+    out.geometry = resolved_geometry(binder.reader());
     out.frontend     = family::bind_frontend_resources(binder);
     out.features     = features;
 

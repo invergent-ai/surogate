@@ -25,7 +25,7 @@ void linear_launch(GgmlType type, const void* blocks, std::int32_t rows, std::in
                    const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out, void* scratch,
                    std::size_t scratch_bytes, cudaStream_t stream);
 
-/// K-quant projection consuming activation planes already produced by quantize_q8_1_planes.
+/// Q4_K/Q5_K/Q6_K/Q8_0/IQ4_NL projection consuming existing quantize_q8_1_planes output.
 void linear_prequantized_launch(GgmlType type, const void* blocks, std::int32_t rows,
                                 std::int32_t k, std::int32_t tokens, __nv_bfloat16* out,
                                 void* scratch, std::size_t scratch_bytes, cudaStream_t stream);

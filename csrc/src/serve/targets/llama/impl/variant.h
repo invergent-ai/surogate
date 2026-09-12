@@ -161,6 +161,9 @@ struct Variant {
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase phase,
                                         std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t post_mixer_workspace_capacity_bytes(
+        const family::TextGeometry& geometry, WeightsProfile weights_profile, family::TextPhase phase,
+        std::int32_t first, std::int32_t last, bool lora_enabled);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry, std::int32_t first,
                                                                             std::int32_t last);
 

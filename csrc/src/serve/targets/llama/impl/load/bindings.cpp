@@ -1,3 +1,4 @@
+#include "artifact/linear_storage.h"
 #include "targets/llama/impl/load/bindings.h"
 
 #include "targets/llama/impl/config.h"
@@ -13,6 +14,12 @@
 #include <string_view>
 
 namespace sinfer::targets::llama::detail {
+
+family::TextGeometry resolved_geometry(const artifact::Reader& reader) {
+    auto geometry = family::TextGeometry::resolved(reader.geometry(), reader.layer_types());
+    artifact::resolve_linear_storage(reader, geometry);
+    return geometry;
+}
 namespace {
 
 using artifact::NumericFormat;
@@ -114,7 +121,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // The checkpoint's own dimensions, where it states them: absent members keep the
     // target's compiled value, so an artifact written before the member existed binds
     // exactly as it did.
-    out.geometry = family::TextGeometry::resolved(binder.reader().geometry(), binder.reader().layer_types());
+    out.geometry = resolved_geometry(binder.reader());
     const family::TextGeometry& g = out.geometry;
     out.frontend     = family::bind_text_only_frontend_resources(binder);
     out.features     = features;

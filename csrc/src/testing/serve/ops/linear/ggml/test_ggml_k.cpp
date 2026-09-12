@@ -503,7 +503,7 @@ int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
 }
 
 // Compare the fused public operation with independent projection + activation
-// calls at a prefill width. Minimal decode workspace also proves that gate/up
+// calls at a prefill width. Minimal fused workspace also proves that gate/up
 // intermediate buffers are not allocated, including during graph capture.
 int run_swiglu(const Fixture& gate_f, const Fixture& up_f, bool mapped, bool segmented,
                int& cases, int columns = 129) {
@@ -835,9 +835,8 @@ int main() {
                         failures += run_swiglu(f, up, mapped, true, cases);
                         if (type == up_type) { failures += run_swiglu(f, up, mapped, false, cases); }
                     }
-                    if (f.label == "synthetic" &&
-                        (type == gg::GgmlType::Q4_K || type == gg::GgmlType::Q5_K || type == gg::GgmlType::Q6_K) &&
-                        (up_type == gg::GgmlType::Q4_K || up_type == gg::GgmlType::Q5_K || up_type == gg::GgmlType::Q6_K)) {
+                    if ((f.label == "synthetic" || f.label == "odd" || f.label == "tail") &&
+                        up_type != gg::GgmlType::F16) {
                         failures += run_swiglu(f, up, true, true, cases, 2053);
                     }
                 }

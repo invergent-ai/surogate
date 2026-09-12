@@ -4,6 +4,7 @@
 #include "ops/linear/ggml/ggml_q8_1.h"
 #include "ops/linear/ggml/ggml_swiglu_decode.cuh"
 #include "ops/linear/ggml/ggml_swiglu_k.cuh"
+#include "ops/linear/ggml/ggml_swiglu_block32.cuh"
 
 #include <stdexcept>
 #include <algorithm>
@@ -13,11 +14,16 @@ namespace {
 constexpr bool k_quant(GgmlType type) {
     return type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K;
 }
+constexpr bool block32_quant(GgmlType type) {
+    return type == GgmlType::Q8_0 || type == GgmlType::IQ4_NL;
+}
 } // namespace
 
 bool swiglu_prefill_admits(GgmlType gate, GgmlType up, std::int32_t rows, std::int32_t k,
                            std::int32_t tokens) noexcept {
-    if (gate != up || !k_quant(gate) || rows <= 0 || k <= 0 || k % QK_K || tokens <= 8) {
+    if (rows <= 0 || k <= 0 || k % 32 || tokens <= 8) { return false; }
+    if (block32_quant(gate) && block32_quant(up)) { return true; }
+    if (gate != up || !k_quant(gate) || k % QK_K) {
         return false;
     }
     // This narrow Q6 band favors the independent projections at large row counts.
@@ -47,11 +53,11 @@ std::size_t swiglu_workspace_capacity_bytes(GgmlType gate, GgmlType up, std::int
     return peak;
 }
 
-void swiglu_prefill_launch(GgmlType type, const void* gate, const void* up, std::int32_t rows,
+void swiglu_prefill_launch(GgmlType type, const void* gate, GgmlType up_type, const void* up, std::int32_t rows,
                            std::int32_t k, const __nv_bfloat16* x, std::int32_t tokens,
                            __nv_bfloat16* out, void* scratch, std::size_t scratch_bytes,
                            cudaStream_t stream) {
-    if (!swiglu_prefill_admits(type, type, rows, k, tokens) || !gate || !up || !x || !out ||
+    if (!swiglu_prefill_admits(type, up_type, rows, k, tokens) || !gate || !up || !x || !out ||
         !scratch || (reinterpret_cast<std::uintptr_t>(scratch) & 15u) ||
         scratch_bytes < linear_workspace_bytes(rows, k, tokens)) {
         throw std::invalid_argument("ggml swiglu prefill: invalid inputs or scratch");
@@ -59,6 +65,27 @@ void swiglu_prefill_launch(GgmlType type, const void* gate, const void* up, std:
     auto* codes = static_cast<std::int8_t*>(scratch);
     auto* ds    = reinterpret_cast<__half2*>(codes + std::size_t(tokens) * k);
     quantize_q8_1_planes_launch(x, k, tokens, codes, ds, stream);
+    if (block32_quant(type)) {
+        const auto pair = [&]<GgmlType Gate, GgmlType Up>() {
+            const auto tile = [&]<int Rows, int Columns>() {
+                swiglu_block32_prefill_kernel<Gate, Up, Rows, Columns>
+                    <<<dim3((rows + Rows / 2 - 1) / (Rows / 2), (tokens + Columns - 1) / Columns),
+                       (Columns / 8) * 32, 0, stream>>>(static_cast<const uint8_t*>(gate),
+                        static_cast<const uint8_t*>(up), codes, ds, rows, k, tokens, out);
+            };
+            if (tokens < wide_min_tokens()) { tile.template operator()<32, 32>(); }
+            else { tile.template operator()<32, 64>(); }
+        };
+        if (type == GgmlType::Q8_0) {
+            if (up_type == GgmlType::Q8_0) { pair.template operator()<GgmlType::Q8_0, GgmlType::Q8_0>(); }
+            else { pair.template operator()<GgmlType::Q8_0, GgmlType::IQ4_NL>(); }
+        } else {
+            if (up_type == GgmlType::Q8_0) { pair.template operator()<GgmlType::IQ4_NL, GgmlType::Q8_0>(); }
+            else { pair.template operator()<GgmlType::IQ4_NL, GgmlType::IQ4_NL>(); }
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const auto launch = [&]<class Codec>() {
         const auto tile = [&]<int Rows, int Columns>() {
             swiglu_k_tile_kernel<Codec, Rows, Columns>

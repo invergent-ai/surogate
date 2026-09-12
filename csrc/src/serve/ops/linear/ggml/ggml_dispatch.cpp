@@ -326,21 +326,22 @@ bool ggml_swiglu(const Tensor& x, const Weight& w, Tensor& out,
                  WorkspaceArena& workspace, cudaStream_t stream) {
     if (ggml_swiglu_decode(x, w, out, workspace, stream)) { return true; }
     if (!is_ggml_qtype(w.qtype)) { return false; }
-    const auto k_quant = [](GgmlType type) {
-        return type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K;
+    const auto shared_quant = [](GgmlType type) {
+        return type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K ||
+               type == GgmlType::Q8_0 || type == GgmlType::IQ4_NL;
     };
     require_ggml_weight(w, "ggml swiglu");
     if (w.n % 2) { throw std::invalid_argument("ggml swiglu: odd gate/up row count"); }
     const int rows = w.n / 2, tokens = x.ne[1];
     const Weight gate = ggml_weight_rows(w, 0, rows), up = ggml_weight_rows(w, rows, rows);
     const auto gate_type = ggml_type_for(gate.qtype), up_type = ggml_type_for(up.qtype);
-    if (!k_quant(gate_type) || !k_quant(up_type)) { return false; }
+    if (!shared_quant(gate_type) || !shared_quant(up_type)) { return false; }
     require_x_out(x, w.k, out, rows, "ggml swiglu");
     const auto bytes = linear_workspace_bytes(rows, w.k, tokens);
     auto scope = workspace.scope();
     if (swiglu_prefill_admits(gate_type, up_type, rows, w.k, tokens)) {
         const Input in = input_for(x, w, &workspace, bytes, stream);
-        swiglu_prefill_launch(gate_type, gate.qdata, up.qdata, rows, w.k, in.x, tokens,
+        swiglu_prefill_launch(gate_type, gate.qdata, up_type, up.qdata, rows, w.k, in.x, tokens,
                               static_cast<__nv_bfloat16*>(out.data), in.planes.data, in.planes.bytes, stream);
     } else {
         Tensor g = workspace.alloc(DType::BF16, {rows, tokens});
