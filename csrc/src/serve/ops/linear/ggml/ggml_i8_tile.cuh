@@ -2,10 +2,8 @@
 // format's own superblocks, staged and unpacked to int8 codes, against activations quantised to
 // int8 per 32 with a (scale, sum) pair each -- what llama.cpp's MMQ consumes. The routing is
 // the caller's: `row_base(local_row)` names a weight row's first superblock and `act_row(col)`
-// the activation row a column reads, and that is all a kernel supplies. (A dense linear on
-// this tile was built and measured a loss against the BF16 wide route -- TODOv2.md, "Measured
-// and rejected" -- because the per-32 affine scale-apply, not the MMA, is the instruction
-// stream; the routed experts win with it only because their alternative is worse.)
+// the activation row a column reads. Dense projections retain the exact activation code sum
+// so their affine correction uses the same quantised values and scale as decode.
 #pragma once
 
 #include "ops/common/math.cuh"
@@ -64,11 +62,27 @@ __device__ __forceinline__ void stage_ggml_tile(std::uint8_t* dst, const std::ui
 /// on every work item.
 template <class Codec>
 __device__ __forceinline__ void stage_ggml_header(std::uint8_t* dst, const std::uint8_t* row_base,
-                                                  int tile, int unit) {
+                                                  int tile, int unit, int row_tiles) {
     const std::uint8_t* src = row_base + Codec::header_offset(tile);
     if constexpr (Codec::kCpAsync) {
-        if constexpr (Codec::kCover) { src = align_down16(src); }
-        cp_async<16, Cache::cg>(dst + 16 * unit, src + 16 * unit);
+        if constexpr (Codec::kCover) {
+            // The last block can end inside this aligned span. Do not depend
+            // on an allocation padding the row: bound the final scalar loads.
+            const int bytes = tile + kTilesPerBlock < row_tiles ? 16 :
+                min(16, max(0, Codec::kHeaderPayloadBytes +
+                               cover_offset<Codec>(row_base, tile) - 16 * unit));
+            src = align_down16(src);
+            if (bytes == 16) {
+                cp_async<16, Cache::cg>(dst + 16 * unit, src + 16 * unit);
+            } else {
+                const auto* in = reinterpret_cast<const volatile std::uint16_t*>(src + 16 * unit);
+                auto* out = reinterpret_cast<std::uint16_t*>(dst + 16 * unit);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) { out[i] = 2 * i < bytes ? in[i] : 0; }
+            }
+        } else {
+            cp_async<16, Cache::cg>(dst + 16 * unit, src + 16 * unit);
+        }
     } else {
         reinterpret_cast<std::uint16_t*>(dst)[unit] =
             reinterpret_cast<const std::uint16_t*>(src)[unit];
@@ -84,37 +98,38 @@ __device__ __forceinline__ void stage_ggml_header(std::uint8_t* dst, const std::
 // ---------------------------------------------------------------------------------------------
 constexpr int kI8Stride = 80; // int8 tile row stride; conflict-free ldmatrix on 64-byte rows
 
-template <class Codec, int ExpertBN>
+template <class Codec, int ExpertBN, int ExpertBM = kI8BM>
 struct GgmlI8Smem {
     using Scale = std::conditional_t<Codec::kHasMin, float2, float>;
-    alignas(16) std::uint8_t Cr[kI8Stages][kI8BM * Codec::kTileStride];
-    alignas(16) std::uint8_t Hdr[kI8Stages][kI8BM * Codec::kHeaderStride];
-    alignas(16) std::int8_t As[kI8BM * kI8Stride];
+    alignas(16) std::uint8_t Cr[kI8Stages][ExpertBM * Codec::kTileStride];
+    alignas(16) std::uint8_t Hdr[kI8Stages][ExpertBM * Codec::kHeaderStride];
+    alignas(16) std::int8_t As[ExpertBM * kI8Stride];
     alignas(16) std::int8_t Xs[kI8Stages][ExpertBN * kI8Stride];
-    alignas(16) Scale Sc[kI8Stages][Codec::kScaleGroups * kI8BM];
+    alignas(16) Scale Sc[kI8Stages][Codec::kScaleGroups * ExpertBM];
     alignas(16) __half2 Ds[kI8Stages][ExpertBN * 2];
-    std::uint8_t Off[kI8Stages][kI8BM]; // a covering codec's per-row offset, by superblock parity
+    std::uint8_t Off[kI8Stages][ExpertBM]; // a covering codec's per-row offset, by superblock parity
 };
 
 /// The K loop the gate/up and down kernels share. `row_base(local_row)` is a weight row's
 /// first superblock, `act_row(local_col)` the activation row a tile column reads (a token for
 /// gate/up, a packed column for down), and `acc` comes back holding this warp's 64 x 8 products.
-template <class Codec, int ExpertWarps, int ExpertBN, class RowBase, class ActRow>
-__device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
+template <class Codec, int ExpertWarps, int ExpertBN, bool ExactActivationSum = false,
+          int ExpertBM = kI8BM, class RowBase, class ActRow>
+__device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN, ExpertBM>& sm,
                                                     RowBase row_base, ActRow act_row,
                                                     const std::int8_t* __restrict__ codes,
                                                     const __half2* __restrict__ ds, int cols, int K,
-                                             float (&acc)[4][4]) {
+                                             float (&acc)[ExpertBM / 16][4]) {
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int WarpCols      = ExpertBN / ExpertWarps;
     static_assert(WarpCols == 8, "one n8 fragment per warp");
-    static_assert(kI8BM == 64 && kI8BK == 64 && kI8Stages == 2);
+    static_assert((ExpertBM == 16 || ExpertBM == 32 || ExpertBM == 64) && kI8BK == 64 && kI8Stages == 2);
     // K is a whole number of superblocks; the caller's dispatch guarantees it.
     {
     constexpr int TileUnits   = Codec::kCpAsync ? Codec::kTileBytes / 16 : Codec::kTileBytes / 2;
     constexpr int HeaderUnits = Codec::kCpAsync ? Codec::kHeaderBytes / 16 : Codec::kHeaderBytes / 2;
     const int KTiles          = K / kI8BK;
-    using Scale               = typename GgmlI8Smem<Codec, ExpertBN>::Scale;
+    using Scale               = typename GgmlI8Smem<Codec, ExpertBN, ExpertBM>::Scale;
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -122,7 +137,7 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 #pragma unroll
-    for (int mi = 0; mi < 4; ++mi) {
+    for (int mi = 0; mi < ExpertBM / 16; ++mi) {
 #pragma unroll
         for (int e = 0; e < 4; ++e) { acc[mi][e] = 0.0f; }
     }
@@ -143,7 +158,7 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
             cp_async_zfill<8, Cache::ca>(&sm.Ds[stage][col * 2], ds + arow * (K / 32) + kt * 2,
                                          valid ? 8 : 0);
         }
-        for (int item = tid; item < kI8BM * TileUnits; item += ExpertThreads) {
+        for (int item = tid; item < ExpertBM * TileUnits; item += ExpertThreads) {
             const int row  = item / TileUnits;
             const int unit = item - row * TileUnits;
             stage_ggml_tile<Codec>(&sm.Cr[stage][row * Codec::kTileStride], row_base(row), kt,
@@ -151,11 +166,11 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
         }
         if (kt % kTilesPerBlock == 0) {
             const int slot = (kt / kTilesPerBlock) & 1;
-            for (int item = tid; item < kI8BM * HeaderUnits; item += ExpertThreads) {
+            for (int item = tid; item < ExpertBM * HeaderUnits; item += ExpertThreads) {
                 const int row  = item / HeaderUnits;
                 const int unit = item - row * HeaderUnits;
                 stage_ggml_header<Codec>(&sm.Hdr[slot][row * Codec::kHeaderStride],
-                                         row_base(row), kt, unit);
+                                         row_base(row), kt, unit, KTiles);
                 if constexpr (Codec::kCover) {
                     if (unit == 0) {
                         sm.Off[slot][row] = static_cast<std::uint8_t>(cover_offset<Codec>(row_base(row), kt));
@@ -179,19 +194,19 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
         cp_wait<kI8Stages - 1>();
         __syncthreads();
         if (tib == 0) {
-            for (int item = tid; item < Codec::kScaleGroups * kI8BM; item += ExpertThreads) {
-                const int row     = item & (kI8BM - 1);
-                const int idx     = item / kI8BM;
+            for (int item = tid; item < Codec::kScaleGroups * ExpertBM; item += ExpertThreads) {
+                const int row     = item & (ExpertBM - 1);
+                const int idx     = item / ExpertBM;
                 const int off     = Codec::kCover ? sm.Off[slot][row] : 0;
                 const float2 pair = Codec::scale_pair(&sm.Hdr[slot][row * Codec::kHeaderStride] + off, idx);
                 if constexpr (Codec::kHasMin) {
-                    sm.Sc[slot][idx * kI8BM + row] = pair;
+                    sm.Sc[slot][idx * ExpertBM + row] = pair;
                 } else {
-                    sm.Sc[slot][idx * kI8BM + row] = pair.x;
+                    sm.Sc[slot][idx * ExpertBM + row] = pair.x;
                 }
             }
         }
-        for (int item = tid; item < kI8BM * 8; item += ExpertThreads) {
+        for (int item = tid; item < ExpertBM * 8; item += ExpertThreads) {
             const int row = item >> 3;
             const int q   = item & 7;
             unsigned lo   = 0;
@@ -219,10 +234,24 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
                 }
                 const unsigned w0 = g ? dsw0.y : dsw0.x;
                 const unsigned w1 = g ? dsw1.y : dsw1.x;
-                const float2 x0   = __half22float2(*reinterpret_cast<const __half2*>(&w0));
-                const float2 x1   = __half22float2(*reinterpret_cast<const __half2*>(&w1));
+                float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(&w0));
+                float2 x1 = __half22float2(*reinterpret_cast<const __half2*>(&w1));
+                if constexpr (ExactActivationSum && Codec::kHasMin) {
+                    // Four lanes sum one token's 32 codes. Reconstruct with the stored
+                    // scale: rounding d*sum(q) to FP16 independently of d leaves a false
+                    // residual even for an affine block whose weights are exactly zero.
+                    const int token = warp * WarpCols + (lane & 7);
+                    const int* values = reinterpret_cast<const int*>(
+                        &sm.Xs[stage][token * kI8Stride + 32 * g + (lane >> 3) * 8]);
+                    int sum = __dp4a(0x01010101, values[1],
+                                    __dp4a(0x01010101, values[0], 0));
+                    sum += __shfl_xor_sync(0xffffffffu, sum, 8);
+                    sum += __shfl_xor_sync(0xffffffffu, sum, 16);
+                    x0.y = static_cast<float>(__shfl_sync(0xffffffffu, sum, 2 * lid));
+                    x1.y = static_cast<float>(__shfl_sync(0xffffffffu, sum, 2 * lid + 1));
+                }
 #pragma unroll
-                for (int mi = 0; mi < 4; ++mi) {
+                for (int mi = 0; mi < ExpertBM / 16; ++mi) {
                     unsigned a[4];
                     {
                         const int local = mi * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
@@ -234,7 +263,14 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
                     const int r1 = r0 + 8;
                     auto apply = [&](int d0, int d1, int d2, int d3, const Scale& s0,
                                      const Scale& s1) {
-                        if constexpr (Codec::kHasMin) {
+                        if constexpr (Codec::kHasMin && ExactActivationSum) {
+                            // Cancel the weight's affine terms before applying the common
+                            // activation scale, retaining the integer sum until this point.
+                            acc[mi][0] += x0.x * __fmaf_rn(s0.x, static_cast<float>(d0), -s0.y * x0.y);
+                            acc[mi][1] += x1.x * __fmaf_rn(s0.x, static_cast<float>(d1), -s0.y * x1.y);
+                            acc[mi][2] += x0.x * __fmaf_rn(s1.x, static_cast<float>(d2), -s1.y * x0.y);
+                            acc[mi][3] += x1.x * __fmaf_rn(s1.x, static_cast<float>(d3), -s1.y * x1.y);
+                        } else if constexpr (Codec::kHasMin) {
                             acc[mi][0] += (s0.x * x0.x) * static_cast<float>(d0) - s0.y * x0.y;
                             acc[mi][1] += (s0.x * x1.x) * static_cast<float>(d1) - s0.y * x1.y;
                             acc[mi][2] += (s1.x * x0.x) * static_cast<float>(d2) - s1.y * x0.y;
@@ -250,16 +286,16 @@ __device__ __forceinline__ void ggml_i8_tile(GgmlI8Smem<Codec, ExpertBN>& sm,
                         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
                         mma_s8(d0, d1, d2, d3, a[0], a[1], a[2], a[3], b0, b1);
                         const int idx = 2 * tib + g;
-                        apply(d0, d1, d2, d3, sm.Sc[slot][idx * kI8BM + r0],
-                              sm.Sc[slot][idx * kI8BM + r1]);
+                        apply(d0, d1, d2, d3, sm.Sc[slot][idx * ExpertBM + r0],
+                              sm.Sc[slot][idx * ExpertBM + r1]);
                     } else {
 #pragma unroll
                         for (int h = 0; h < 2; ++h) {
                             int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
                             mma_s8_k16(d0, d1, d2, d3, a[2 * h], a[2 * h + 1], h ? b1 : b0);
                             const int idx = 4 * tib + 2 * g + h;
-                            apply(d0, d1, d2, d3, sm.Sc[slot][idx * kI8BM + r0],
-                                  sm.Sc[slot][idx * kI8BM + r1]);
+                            apply(d0, d1, d2, d3, sm.Sc[slot][idx * ExpertBM + r0],
+                                  sm.Sc[slot][idx * ExpertBM + r1]);
                         }
                     }
                 }

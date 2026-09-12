@@ -255,6 +255,7 @@ struct GgmlQ6KPrefill {
     /// `ql`, `qh` and the scales alike.
     static constexpr int kTileBytes   = 128;                             // ql span 80, qh span 48
     static constexpr int kHeaderBytes = 32;                              // scales[16], d: 18 covered
+    static constexpr int kHeaderPayloadBytes = 18;
     static constexpr int kBlockBytes = sizeof(block_q6_K);
     static constexpr bool kCpAsync   = true;
     static constexpr bool kCover     = true;

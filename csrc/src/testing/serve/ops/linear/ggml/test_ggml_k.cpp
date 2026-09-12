@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -118,12 +119,15 @@ Weight make_weight(const Fixture& f, void* d_blocks) {
     return w;
 }
 
-// A linear takes one of two routes and they do different arithmetic, so each is checked
-// against the arithmetic it actually performs: below the threshold the activation is
-// quantised to int8 per 32 (the GEMV route), above it the BF16 activation goes to the tensor
-// cores untouched (the dequantise-once route, which is the more accurate of the two).
+// Q4_K/Q5_K/Q6_K keep the same quantised activation at both batch widths.
+// Other formats retain their BF16 dequantise-once route for wide batches.
 bool takes_wide_route(int rows, int k, int tokens) {
     return tokens >= gg::wide_min_tokens() && (rows % 8) == 0 && (k % 8) == 0;
+}
+
+bool uses_exact_activation(const Fixture& f, int tokens) {
+    return takes_wide_route(f.n, f.k, tokens) && f.type != gg::GgmlType::Q4_K &&
+           f.type != gg::GgmlType::Q5_K && f.type != gg::GgmlType::Q6_K;
 }
 
 std::vector<double> exact_activation(const std::vector<__nv_bfloat16>& x) {
@@ -213,7 +217,8 @@ int run_case(const Fixture& f, int tokens, bool bf16_out, void* d_blocks, void* 
     const auto x = random_activation(k, tokens, static_cast<unsigned>(1234 + tokens + 7 * static_cast<int>(f.type)));
     const bool wide = bf16_out && takes_wide_route(n, k, tokens);
     const std::vector<double> ref =
-        reference(f, wide ? exact_activation(x) : quantised_activation(x, k, tokens), tokens, nullptr);
+        reference(f, bf16_out && uses_exact_activation(f, tokens) ? exact_activation(x)
+                                                                : quantised_activation(x, k, tokens), tokens, nullptr);
     __nv_bfloat16* d_x = nullptr;
     void* d_out        = nullptr;
     CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
@@ -263,7 +268,7 @@ int run_accumulate(const Fixture& f, int tokens, void* d_blocks, void* d_scratch
         base[i]     = __bfloat162float(residual[i]);
     }
     const std::vector<double> ref =
-        reference(f, takes_wide_route(n, k, tokens) ? exact_activation(x)
+        reference(f, uses_exact_activation(f, tokens) ? exact_activation(x)
                                                     : quantised_activation(x, k, tokens),
                   tokens, &base);
     __nv_bfloat16* d_x   = nullptr;
@@ -289,7 +294,7 @@ int run_wrapper_linear(const Fixture& f, int tokens, void* d_blocks) {
     const int n = f.n, k = f.k;
     const auto x = random_activation(k, tokens, static_cast<unsigned>(4242 + tokens));
     const std::vector<double> ref =
-        reference(f, takes_wide_route(n, k, tokens) ? exact_activation(x)
+        reference(f, uses_exact_activation(f, tokens) ? exact_activation(x)
                                                     : quantised_activation(x, k, tokens),
                   tokens, nullptr);
     __nv_bfloat16* d_x   = nullptr;
@@ -428,6 +433,125 @@ int run_codec(const Fixture& f, void* d_blocks) {
     return ok ? 0 : 1;
 }
 
+// One input prefix evaluated at several widths must retain its represented
+// outputs. This crosses both the decode and prefill tile boundaries.
+int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
+                           std::size_t scratch_bytes) {
+    constexpr int columns = 129;
+    auto x = random_activation(f.k, columns, 1773);
+    std::fill_n(x.begin(), f.k, __float2bfloat16(0.0f));
+    std::fill_n(x.begin() + f.k, f.k, __float2bfloat16(-0.003f));
+    __nv_bfloat16 *d_x = nullptr, *d_out = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&d_out, std::size_t(f.n) * columns * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    std::vector<__nv_bfloat16> reference(std::size_t(f.n) * columns), got(reference.size());
+    int failures = 0;
+    for (bool accumulate : {false, true}) {
+        const auto run = [&](int tokens) {
+            CHECK_CUDA(cudaMemset(d_out, 0x3e, got.size() * sizeof(__nv_bfloat16)));
+            if (accumulate) {
+                gg::linear_add_launch(f.type, d_blocks, f.n, f.k, d_x, tokens, d_out,
+                                      scratch, scratch_bytes, nullptr);
+            } else {
+                gg::linear_launch(f.type, d_blocks, f.n, f.k, d_x, tokens, d_out,
+                                  scratch, scratch_bytes, nullptr);
+            }
+            CHECK_CUDA(cudaDeviceSynchronize());
+            CHECK_CUDA(cudaMemcpy(got.data(), d_out, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+        };
+        run(columns);
+        reference = got;
+        for (int tokens : {1, 3, 8, 9, 17, 32, 33, 64, 65, 128}) {
+            run(tokens);
+            const bool ok = std::memcmp(reference.data(), got.data(),
+                                        std::size_t(f.n) * tokens * sizeof(__nv_bfloat16)) == 0;
+            failures += !ok;
+            if (!ok) {
+                std::printf("  %s %s batch invariant accumulate=%d T=%d: FAIL\n",
+                            gg::type_name(f.type), f.label.c_str(), accumulate, tokens);
+            }
+        }
+    }
+    CHECK_CUDA(cudaFree(d_out));
+    CHECK_CUDA(cudaFree(d_x));
+    std::printf("  %s %s batch invariant projection/residual: %s\n",
+                gg::type_name(f.type), f.label.c_str(), failures ? "FAIL" : "ok");
+    return failures;
+}
+
+// Every stored value is d*1 - dmin*1 == 0. An affine projection must stay zero
+// even when the activation scale/sum cannot be represented exactly as half2.
+// Using a rounded sum with an independently rounded scale breaks that identity.
+// Q6_K stores signed zeros in an unpadded buffer, exercising the last header load.
+template <class Block>
+int run_affine_zero(gg::GgmlType type, int tokens) {
+    constexpr int n = std::is_same_v<Block, gg::block_q6_K> ? 63 : 72;
+    constexpr int k = 512, guard = 16;
+    std::vector<Block> blocks(n * k / gg::QK_K);
+    for (auto& block : blocks) {
+        if constexpr (std::is_same_v<Block, gg::block_q6_K>) {
+            block.d = __float2half(1.0f);
+            std::fill_n(block.scales, gg::QK_K / 16, 1);
+            std::fill_n(block.qh, gg::QK_K / 4, 0xaa);
+        } else {
+            block.dm = __floats2half2_rn(1.0f, 1.0f);
+            std::fill_n(block.scales, 8, 1);
+            std::fill_n(block.scales + 8, 4, 0x11);
+            std::fill_n(block.qs, gg::QK_K / 2, 0x11);
+        }
+    }
+    std::vector<__nv_bfloat16> x(k * tokens, __float2bfloat16(0.003f));
+    std::vector<__nv_bfloat16> got(n * tokens + 2 * guard, __float2bfloat16(7.0f));
+    Block* d_blocks = nullptr;
+    __nv_bfloat16 *d_x = nullptr, *d_out = nullptr;
+    void* scratch = nullptr;
+    const auto bytes = gg::linear_workspace_bytes(n, k, tokens);
+    CHECK_CUDA(cudaMalloc(&d_blocks, blocks.size() * sizeof(Block)));
+    CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&d_out, got.size() * sizeof(__nv_bfloat16)));
+    CHECK_CUDA(cudaMalloc(&scratch, bytes));
+    CHECK_CUDA(cudaMemcpy(d_blocks, blocks.data(), blocks.size() * sizeof(Block), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_x, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_out, got.data(), got.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    cudaStream_t stream;
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const auto run = [&] {
+        gg::linear_launch(type, d_blocks, n, k, d_x, tokens, d_out + guard, scratch, bytes, stream);
+    };
+    run();
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    cudaGraph_t graph;
+    cudaGraphExec_t executable;
+    CHECK_CUDA(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    run();
+    CHECK_CUDA(cudaStreamEndCapture(stream, &graph));
+    CHECK_CUDA(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+    int failures = 0;
+    for (float value : {0.003f, -0.0173f, 0.0f}) {
+        std::fill(x.begin(), x.end(), __float2bfloat16(value));
+        CHECK_CUDA(cudaMemcpyAsync(d_x, x.data(), x.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA(cudaGraphLaunch(executable, stream));
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        CHECK_CUDA(cudaMemcpy(got.data(), d_out, got.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+        bool ok = true;
+        for (int i = 0; i < int(got.size()); ++i) {
+            const float expected = i < guard || i >= guard + n * tokens ? 7.0f : 0.0f;
+            ok &= __bfloat162float(got[i]) == expected;
+        }
+        failures += !ok;
+        std::printf("  %-5s zero-weight graph replay T=%d x=%g: %s\n", gg::type_name(type), tokens, value, ok ? "ok" : "FAIL");
+    }
+    CHECK_CUDA(cudaGraphExecDestroy(executable));
+    CHECK_CUDA(cudaGraphDestroy(graph));
+    CHECK_CUDA(cudaStreamDestroy(stream));
+    CHECK_CUDA(cudaFree(scratch));
+    CHECK_CUDA(cudaFree(d_out));
+    CHECK_CUDA(cudaFree(d_x));
+    CHECK_CUDA(cudaFree(d_blocks));
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -439,6 +563,12 @@ int main() {
         return 77;
     }
     int failures = 0, cases = 0;
+    for (int tokens : {128, 8193}) {
+        failures += run_affine_zero<gg::block_q4_K>(gg::GgmlType::Q4_K, tokens);
+        failures += run_affine_zero<gg::block_q5_K>(gg::GgmlType::Q5_K, tokens);
+        failures += run_affine_zero<gg::block_q6_K>(gg::GgmlType::Q6_K, tokens);
+        cases += 9;
+    }
     // every format the list names, so a new one cannot ship untested
     const gg::GgmlType types[] = {
 #define SINFER_TEST_TYPE(NAME) gg::GgmlType::NAME,
@@ -472,8 +602,7 @@ int main() {
             }
             failures += run_case(f, 1, true, d_blocks, d_scratch, scratch_bytes);
             ++cases;
-            // Wide batches: above the threshold these run the dequantise-once tensor-core
-            // route, so the same reference now covers both of a linear's two shapes.
+            // Wide batches cover the integer and dequantise-once tensor-core routes.
             for (const int tokens : {64, 65, 512}) {
                 if (big) { continue; }
                 failures += run_case(f, tokens, true, d_blocks, d_scratch, scratch_bytes);
@@ -493,14 +622,17 @@ int main() {
                 failures += run_moe(f, d_blocks, d_scratch, scratch_bytes);
                 failures += run_codec(f, d_blocks);
                 cases += 2;
+                if (type == gg::GgmlType::Q4_K || type == gg::GgmlType::Q5_K || type == gg::GgmlType::Q6_K) {
+                    failures += run_consistent_columns(f, d_blocks, d_scratch, scratch_bytes);
+                    cases += 20;
+                }
             }
             CHECK_CUDA(cudaFree(d_scratch));
             CHECK_CUDA(cudaFree(d_blocks));
         }
     }
-    if (cases == 0) {
-        std::fprintf(stderr, "SKIP: no fixtures in %s (run gen_fixture.py)\n", dir.c_str());
-        return 77;
+    if (cases == 18) {
+        std::fprintf(stderr, "Only built-in zero-weight cases ran: no fixtures in %s (run gen_fixture.py)\n", dir.c_str());
     }
     std::printf("%d cases, %d failures\n", cases, failures);
     return failures == 0 ? 0 : 1;

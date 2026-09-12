@@ -116,6 +116,21 @@ def check_scores(server, payload, prompt, tokens, generated):
         assert max(errors) <= .12, errors
 
 
+@pytest.mark.parametrize("length", [8, 170])
+def test_prompt_logprobs_preserve_decode_scores(server, length):
+    # These IDs include zero embedding rows in TinyLlama. Its first generated
+    # token exposes changes in arithmetic when a prompt is padded to a graph
+    # bucket, or crosses a chunk boundary. Test without competing requests too.
+    payload = body("test", 0, length, 16)
+    result = ask(server, payload)
+    choice = result["choices"][0]
+    check_scores(server, payload, result["prompt_token_ids"], choice["token_ids"],
+                 choice["logprobs"]["content"])
+    # A shorter teacher-forced replay must score the same first two tokens.
+    check_scores(server, payload, result["prompt_token_ids"], choice["token_ids"][:2],
+                 choice["logprobs"]["content"][:2])
+
+
 def test_overlapping_prefill_preserves_decode_and_adapters(server, record_property):
     models = json.loads(os.getenv("SUROGATE_MIXED_TEST_MODELS", '["test"]'))
     long_decode = body(models[0], 0, 8, 192)

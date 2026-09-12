@@ -424,7 +424,10 @@ void test_directory() {
     };
     check(refused(0, "gate_proj", 16, 32, "SwiGLU"), "module-wide refusal names the reason");
     check(refused(1, "q_proj", 16, 32, "linear attention"), "layer refusal names the reason");
-    check(refused(2, "q_proj", 16, 32, "not applied"), "unregistered module is refused");
+    check(refused(2, "q_proj", 16, 32, "q_proj' on layer 2 is unsupported"),
+          "unregistered module is refused with its layer and name");
+    check(refused(2, "q_proj", 16, 32, "surogate merge"),
+          "unregistered module refusal explains how to serve a merged adapter");
     check(refused(0, "q_proj", 16, 64, "different model"), "shape mismatch names both shapes");
     std::printf("  directory: register/ensure/apply/refuse all behave\n");
 }

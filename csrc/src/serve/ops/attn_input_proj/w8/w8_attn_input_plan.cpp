@@ -56,12 +56,10 @@ constexpr std::array<RouteSpec, 4> kQwen3Routes{{
 }};
 
 // TinyLlama-1.1B's ungated fused qkv: rows 2560 = q2048 | k256 | v256 at hidden
-// 2048. The bands are Qwen3-0.6B's, the closest registered ungated parent; they
-// were not measured for this shape.
-constexpr std::array<RouteSpec, 4> kTinyLlamaRoutes{{
-    {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
-    {2, 64, W8AttnInputScheduleId::SplitKMmaDirect},
-    {65, 128, W8AttnInputScheduleId::MmaR32C128},
+// 2048. Keep the tensor-core K reduction across decode and prefill widths;
+// the SIMT/split-K transition amplified rounding for near-constant embeddings.
+constexpr std::array<RouteSpec, 2> kTinyLlamaRoutes{{
+    {1, 128, W8AttnInputScheduleId::MmaR32C128},
     {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
 

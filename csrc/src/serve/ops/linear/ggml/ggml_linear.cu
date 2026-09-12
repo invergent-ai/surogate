@@ -4,6 +4,7 @@
 
 #include "ops/linear/bf16/bf16_cublaslt.h"
 #include "ops/linear/ggml/ggml_dequant.h"
+#include "ops/linear/ggml/ggml_i8_tile.cuh"
 #include "ops/linear/ggml/ggml_q8_1.h"
 
 #include <algorithm>
@@ -47,9 +48,70 @@ void run_gemv(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
     }
 }
 
+// Keep the activation quantisation used by GEMV when a graph pads a short
+// prompt into a wide batch. Expanding to BF16 changed both activation and weight
+// rounding at that boundary, producing different prompt and decode scores.
+template <class Codec, int TileRows, int TileCols>
+__global__ __launch_bounds__((TileCols / 8) * 32) void dense_i8_kernel(
+    const std::uint8_t* blocks, const std::int8_t* codes, const __half2* ds,
+    int rows, int k, int tokens, __nv_bfloat16* out, bool accumulate) {
+    __shared__ GgmlI8Smem<Codec, TileCols, TileRows> sm;
+    const int row0 = blockIdx.x * TileRows;
+    const int col0 = blockIdx.y * TileCols;
+    auto row_base = [&](int row) {
+        return blocks + static_cast<std::int64_t>(min(row0 + row, rows - 1)) *
+                            (k / QK_K) * Codec::kBlockBytes;
+    };
+    auto act_row = [&](int col) { return static_cast<std::int64_t>(col0 + col); };
+    float acc[TileRows / 16][4];
+    ggml_i8_tile<Codec, TileCols / 8, TileCols, true, TileRows>(
+        sm, row_base, act_row, codes, ds, min(TileCols, tokens - col0), k, acc);
+    const int lane = threadIdx.x & 31;
+    const int col  = col0 + (threadIdx.x >> 5) * 8 + (lane & 3) * 2;
+#pragma unroll
+    for (int mi = 0; mi < TileRows / 16; ++mi) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row = row0 + mi * 16 + (lane >> 2) + (e / 2) * 8;
+            const int t   = col + (e & 1);
+            if (row < rows && t < tokens) {
+                const auto i = static_cast<std::int64_t>(t) * rows + row;
+                const float base = accumulate ? __bfloat162float(out[i]) : 0.0f;
+                out[i] = __float2bfloat16_rn(acc[mi][e] + base);
+            }
+        }
+    }
+}
+
 void run_wide(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
               const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out, void* scratch,
               float beta, cudaStream_t stream) {
+    if (type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K) {
+        auto* codes = static_cast<std::int8_t*>(scratch);
+        auto* ds = reinterpret_cast<__half2*>(codes + static_cast<std::size_t>(tokens) * k);
+        quantize_q8_1_planes_launch(x, k, tokens, codes, ds, stream);
+        const auto launch = [&]<class Codec>() {
+            const auto tile = [&]<int TileRows, int TileCols>() {
+                const dim3 grid((rows + TileRows - 1) / TileRows,
+                                (tokens + TileCols - 1) / TileCols);
+                dense_i8_kernel<Codec, TileRows, TileCols>
+                    <<<grid, (TileCols / 8) * 32, 0, stream>>>(
+                        static_cast<const std::uint8_t*>(blocks), codes, ds, rows, k,
+                        tokens, out, beta != 0.0f);
+            };
+            if (tokens <= 8) { tile.template operator()<16, 8>(); }
+            else if (tokens <= 32) { tile.template operator()<32, 32>(); }
+            else { tile.template operator()<64, 32>(); }
+        };
+        switch (type) {
+        case GgmlType::Q4_K: launch.template operator()<GgmlQ4KPrefill>(); break;
+        case GgmlType::Q5_K: launch.template operator()<GgmlQ5KPrefill>(); break;
+        case GgmlType::Q6_K: launch.template operator()<GgmlQ6KPrefill>(); break;
+        default: break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const std::int32_t tile   = rows_per_tile(rows, k);
     const std::size_t row_bytes = static_cast<std::size_t>(k / block_values(type)) * block_bytes(type);
     auto* staging             = static_cast<__nv_bfloat16*>(scratch);
@@ -73,7 +135,8 @@ void run_bf16(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
         (reinterpret_cast<std::uintptr_t>(scratch) & 15u) != 0) {
         throw std::invalid_argument("ggml linear: scratch too small or misaligned");
     }
-    if (wide_route_admits(rows, k, tokens)) {
+    if (type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K ||
+        wide_route_admits(rows, k, tokens)) {
         run_wide(type, blocks, rows, k, x, tokens, out, scratch, Accumulate ? 1.0F : 0.0F, stream);
         return;
     }
@@ -84,11 +147,8 @@ void run_bf16(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t
 
 std::int32_t wide_min_tokens() noexcept {
     static const std::int32_t value = [] {
-        // Bytes per parameter: the GEMV route re-reads the weight every eight columns, so it
-        // moves 0.56*ceil(T/8) for a Q4_K; the wide route always moves ~4.6 (read the codes,
-        // write the BF16 tile, read it back in the GEMM). They cross near T = 64, and above it
-        // the wide route also has the tensor cores. Tunable because the crossover depends on
-        // how much of the weight the L2 holds, which is a per-card property.
+        // Keep the existing crossover while Q4_K/Q5_K/Q6_K switch to the integer
+        // tensor-core tile. Other formats still expand a bounded BF16 weight tile.
         const char* env = std::getenv("SUROGATE_GGML_WIDE_MIN_TOKENS");
         if (env == nullptr) { return std::int32_t{65}; }
         const int parsed = std::atoi(env);
@@ -99,9 +159,10 @@ std::int32_t wide_min_tokens() noexcept {
 
 std::size_t linear_workspace_bytes(std::int32_t rows, std::int32_t k, std::int32_t tokens) noexcept {
     if (rows <= 0 || k <= 0 || tokens <= 0) { return 0; }
-    const std::size_t gemv = q8_1_bytes(k, std::min(tokens, kMmvqMaxColumns * 1024));
+    // Both quantisers write every column before the projection consumes it.
+    const std::size_t gemv = q8_1_bytes(k, tokens);
     if (!wide_route_admits(rows, k, tokens)) { return gemv; }
-    return static_cast<std::size_t>(rows_per_tile(rows, k)) * k * sizeof(__nv_bfloat16);
+    return std::max(gemv, static_cast<std::size_t>(rows_per_tile(rows, k)) * k * sizeof(__nv_bfloat16));
 }
 
 void linear_launch(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,

@@ -863,7 +863,7 @@ sparse_moe_prefill_ggml_gate_up_kernel(
                     const int row  = item / HeaderUnits;
                     const int unit = item - row * HeaderUnits;
                     ggml::stage_ggml_header<Codec>(&Hdr[slot][row * Codec::kHeaderBytes], row_base(row),
-                                             kt, unit);
+                                             kt, unit, kHidden / kExpertBK);
                     if constexpr (Codec::kCover) {
                         if (unit == 0) {
                             Off[slot][row] = static_cast<std::uint8_t>(
@@ -1045,7 +1045,7 @@ sparse_moe_prefill_ggml_down_kernel(
                     const int row  = item / HeaderUnits;
                     const int unit = item - row * HeaderUnits;
                     ggml::stage_ggml_header<Codec>(&Hdr[slot][row * Codec::kHeaderBytes], row_base(row),
-                                             kt, unit);
+                                             kt, unit, kIntermediate / kExpertBK);
                     if constexpr (Codec::kCover) {
                         if (unit == 0) {
                             Off[slot][row] = static_cast<std::uint8_t>(

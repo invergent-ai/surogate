@@ -10,12 +10,13 @@
 
 namespace sinfer::ops::detail::ggml {
 
-/// Token count from which a linear runs the wide route (dequantise a row tile once, then BF16
-/// tensor cores) instead of chunked GEMVs. Overridable with SUROGATE_GGML_WIDE_MIN_TOKENS.
+/// Token count from which formats without an integer tile expand a BF16 row tile
+/// instead of using chunked GEMVs. Overridable with SUROGATE_GGML_WIDE_MIN_TOKENS.
+/// Q4_K/Q5_K/Q6_K use integer tensor cores with consistent arithmetic at every width.
 std::int32_t wide_min_tokens() noexcept;
 
 /// Workspace bytes for `tokens` columns of a [rows, k] K-quant weight: the int8 activation
-/// planes below the threshold, the BF16 dequantisation tile above it.
+/// planes, or a BF16 dequantisation tile for formats without an integer tensor-core route.
 std::size_t linear_workspace_bytes(std::int32_t rows, std::int32_t k, std::int32_t tokens) noexcept;
 
 /// out[rows, tokens] = W · x. x BF16 [k, tokens], out BF16 [rows, tokens], both contiguous.
