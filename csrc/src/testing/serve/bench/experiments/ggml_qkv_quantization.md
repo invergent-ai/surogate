@@ -106,3 +106,8 @@ The measured `libsinfer.so` SHA-256 is
 Full-model first-token latency, adapters, input permutations, and pipeline
 integration are outside this measurement. Operator percentages must not be
 reported as model-level speedups.
+
+Qwen3.5 measurements using checkpoint weight blocks are recorded separately in
+[`qwen35_quantization.md`](qwen35_quantization.md). The benchmark's `--fixtures`
+mode supports its two- and four-projection cases; the original synthetic Q/K/V
+sweep and CSV format above remain the default.

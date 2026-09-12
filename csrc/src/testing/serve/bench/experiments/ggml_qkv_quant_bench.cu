@@ -1,10 +1,13 @@
-// Isolated Q/K/V measurement: production projection launchers, either quantizing
-// before each projection or sharing one quantization. No engine dispatch changes.
+// Isolated projection measurement: production launchers, either quantizing
+// before each projection or sharing one quantization. Fixtures also cover gated
+// attention and GDN prefill. No engine dispatch changes.
 #include "ops/linear/ggml/ggml_linear.h"
 #include "ops/linear/ggml/ggml_q8_1.h"
 #include "sinfer_bench_common.h"
 
 #include <array>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 
@@ -16,7 +19,7 @@ namespace {
 struct Shape {
     const char* name;
     int hidden;
-    std::array<int, 3> rows;
+    std::vector<int> rows;
 };
 
 // Valid, finite native blocks with deterministic varied codes and scales. These
@@ -56,13 +59,15 @@ double median(std::vector<double> values) {
     return bench::summarize_timings(std::move(values)).median_us;
 }
 
-void measure(const Shape& shape, const std::array<gg::GgmlType, 3>& types,
-             const std::array<DeviceBuffer, 3>& weights, int tokens, int repeat,
-             DeviceBuffer& flush, cudaStream_t stream) {
+template <class Types, class Weights>
+void measure(const Shape& shape, const Types& types, const Weights& weights,
+             int tokens, int repeat, DeviceBuffer& flush, cudaStream_t stream,
+             bool fixture_csv = false) {
     const int hidden = shape.hidden;
+    const int projections = static_cast<int>(shape.rows.size());
     auto x = bench::make_bf16(std::size_t(hidden) * tokens);
-    std::array<DeviceBuffer, 3> out;
-    for (int i = 0; i < 3; ++i) { out[i] = DeviceBuffer(std::size_t(shape.rows[i]) * tokens * 2); }
+    std::vector<DeviceBuffer> out(projections);
+    for (int i = 0; i < projections; ++i) { out[i] = DeviceBuffer(std::size_t(shape.rows[i]) * tokens * 2); }
     // Both paths use this same allocation; the current path reuses it sequentially.
     DeviceBuffer scratch(gg::linear_workspace_bytes(shape.rows[0], hidden, tokens));
     const auto launch = [&](bool shared) {
@@ -72,7 +77,7 @@ void measure(const Shape& shape, const std::array<gg::GgmlType, 3>& types,
             gg::quantize_q8_1_planes_launch(static_cast<const __nv_bfloat16*>(x.p),
                                             hidden, tokens, codes, ds, stream);
         }
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < projections; ++i) {
             if (shared) {
                 gg::linear_prequantized_launch(types[i], weights[i].p, shape.rows[i], hidden,
                     tokens, static_cast<__nv_bfloat16*>(out[i].p), scratch.p, scratch.bytes, stream);
@@ -86,8 +91,8 @@ void measure(const Shape& shape, const std::array<gg::GgmlType, 3>& types,
 
     launch(false);
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::array<std::vector<std::uint16_t>, 3> expected;
-    for (int i = 0; i < 3; ++i) {
+    std::vector<std::vector<std::uint16_t>> expected(projections);
+    for (int i = 0; i < projections; ++i) {
         expected[i].resize(out[i].bytes / 2);
         out[i].copy_to_host(expected[i].data(), out[i].bytes);
         out[i].fill(0xff);
@@ -95,10 +100,10 @@ void measure(const Shape& shape, const std::array<gg::GgmlType, 3>& types,
     launch(true);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto verify = [&] {
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < projections; ++i) {
             std::vector<std::uint16_t> actual(expected[i].size());
             out[i].copy_to_host(actual.data(), out[i].bytes);
-            if (actual != expected[i]) { throw std::runtime_error("Q/K/V bitwise mismatch"); }
+            if (actual != expected[i]) { throw std::runtime_error("projection bitwise mismatch"); }
             for (auto value : actual) {
                 if ((value & 0x7f80) == 0x7f80) { throw std::runtime_error("non-finite output"); }
             }
@@ -115,7 +120,8 @@ void measure(const Shape& shape, const std::array<gg::GgmlType, 3>& types,
             graphs[variant].capture(stream, [&](cudaStream_t) {
                 for (int j = 0; j < inner; ++j) { launch(variant == 1); }
             });
-            if (graphs[variant].nodes() != std::size_t(inner * (variant == 0 ? 6 : 4))) {
+            if (graphs[variant].nodes() !=
+                std::size_t(inner * (variant == 0 ? 2 * projections : projections + 1))) {
                 throw std::runtime_error("unexpected graph node count");
             }
         }
@@ -139,13 +145,83 @@ void measure(const Shape& shape, const std::array<gg::GgmlType, 3>& types,
         const double before = median(samples[0]);
         const double after = median(samples[1]);
         const auto deltas = bench::summarize_timings(savings);
-        std::printf("%s,%s,%s,%s,%d,%d,%d,%d,%d,%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%zu,6,4,1\n",
-            shape.name, gg::type_name(types[0]), gg::type_name(types[1]), gg::type_name(types[2]),
-            hidden, shape.rows[0], shape.rows[1], shape.rows[2], tokens,
-            cold ? "cold" : "warm", repeat, before, after, (before - after) / before * 100,
-            deltas.median_us, deltas.min_us, scratch.bytes);
+        if (fixture_csv) {
+            std::string formats, rows;
+            for (int i = 0; i < projections; ++i) {
+                if (i) { formats += '/'; rows += '/'; }
+                formats += gg::type_name(types[i]);
+                rows += std::to_string(shape.rows[i]);
+            }
+            std::printf("%s,%s,%d,%s,%d,%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%zu,%d,%d,1\n",
+                shape.name, formats.c_str(), hidden, rows.c_str(), tokens,
+                cold ? "cold" : "warm", repeat, before, after, (before - after) / before * 100,
+                deltas.median_us, deltas.min_us, scratch.bytes, 2 * projections, projections + 1);
+        } else {
+            std::printf("%s,%s,%s,%s,%d,%d,%d,%d,%d,%s,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%zu,6,4,1\n",
+                shape.name, gg::type_name(types[0]), gg::type_name(types[1]), gg::type_name(types[2]),
+                hidden, shape.rows[0], shape.rows[1], shape.rows[2], tokens,
+                cold ? "cold" : "warm", repeat, before, after, (before - after) / before * 100,
+                deltas.median_us, deltas.min_us, scratch.bytes);
+        }
         std::fflush(stdout);
     }
+}
+
+void measure_fixtures(const std::filesystem::path& directory, int only_tokens, int repeat,
+                      const std::string& only_shape, DeviceBuffer& flush, cudaStream_t stream) {
+    std::ifstream manifest(directory / "manifest.txt");
+    if (!manifest) { throw std::runtime_error("cannot open fixture manifest"); }
+    std::puts("shape,formats,hidden,rows,tokens,cache,repeat,baseline_us,shared_us,saved_pct,"
+              "paired_saved_us,min_paired_saved_us,scratch_bytes,baseline_kernels,shared_kernels,bitwise_equal");
+    std::string name;
+    int selected = 0;
+    while (manifest >> name) {
+        int hidden, count, min_tokens;
+        if (!(manifest >> hidden >> count >> min_tokens) || hidden <= 0 || hidden > 65536 ||
+            count < 2 || count > 4 || min_tokens < 1) {
+            throw std::runtime_error("invalid fixture geometry");
+        }
+        Shape shape{name.c_str(), hidden, {}};
+        std::vector<gg::GgmlType> types;
+        std::vector<DeviceBuffer> weights;
+        for (int i = 0; i < count; ++i) {
+            std::string format, file;
+            int rows;
+            if (!(manifest >> format >> rows >> file) || rows <= 0 || rows > 65536) {
+                throw std::runtime_error("invalid fixture projection");
+            }
+            const std::array supported{gg::GgmlType::Q4_K, gg::GgmlType::Q5_K,
+                gg::GgmlType::Q6_K, gg::GgmlType::Q8_0, gg::GgmlType::IQ4_NL};
+            const auto type = std::find_if(supported.begin(), supported.end(), [&](auto t) {
+                return format == gg::type_name(t);
+            });
+            if (type == supported.end() || hidden % gg::block_values(*type)) {
+                throw std::runtime_error("unsupported fixture format or hidden width");
+            }
+            std::ifstream input(directory / file, std::ios::binary | std::ios::ate);
+            const std::size_t bytes = std::size_t(rows) * (hidden / gg::block_values(*type)) *
+                                      gg::block_bytes(*type);
+            if (!input || input.tellg() != static_cast<std::streamoff>(bytes)) {
+                throw std::runtime_error("invalid fixture file size: " + file);
+            }
+            std::vector<char> data(bytes);
+            input.seekg(0);
+            if (!input.read(data.data(), bytes)) { throw std::runtime_error("fixture read failed"); }
+            weights.emplace_back(bytes);
+            weights.back().copy_from_host(data.data(), bytes);
+            types.push_back(*type);
+            shape.rows.push_back(rows);
+        }
+        if (!only_shape.empty() && name != only_shape) { continue; }
+        const std::vector<int> tokens = only_tokens ? std::vector<int>{only_tokens} :
+            std::vector<int>{1, 8, 16, 32, 128, 512, 2048};
+        for (int t : tokens) {
+            if (t < min_tokens) { continue; }
+            measure(shape, types, weights, t, repeat, flush, stream, true);
+            ++selected;
+        }
+    }
+    if (!manifest.eof() || selected == 0) { throw std::runtime_error("no valid fixture cases selected"); }
 }
 
 } // namespace
@@ -155,6 +231,7 @@ int main(int argc, char** argv) {
         int repeat = 31;
         int only_tokens = 0;
         std::string only_shape;
+        std::string fixture_dir;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
             if (i + 1 == argc) { throw std::invalid_argument("missing option value"); }
@@ -162,6 +239,7 @@ int main(int argc, char** argv) {
             if (arg == "--repeat") { repeat = std::stoi(value); }
             else if (arg == "--tokens") { only_tokens = std::stoi(value); }
             else if (arg == "--shape") { only_shape = value; }
+            else if (arg == "--fixtures") { fixture_dir = value; }
             else { throw std::invalid_argument("unknown option: " + arg); }
         }
         if (repeat < 1 || repeat > 10000 || only_tokens < 0 || only_tokens > 8192) {
@@ -170,9 +248,14 @@ int main(int argc, char** argv) {
         DeviceContext device;
         char pci[32]{};
         CUDA_CHECK(cudaDeviceGetPCIBusId(pci, sizeof(pci), 0));
-        std::fprintf(stderr, "GPU=%s PCI=%s L2=%d repeat=%d; synthetic weights; exact parity required\n",
-                     device.props.name, pci, device.props.l2CacheSize, repeat);
+        std::fprintf(stderr, "GPU=%s PCI=%s L2=%d repeat=%d; %s weights; exact parity required\n",
+                     device.props.name, pci, device.props.l2CacheSize, repeat,
+                     fixture_dir.empty() ? "synthetic" : "fixture");
         DeviceBuffer flush(std::size_t{256} << 20);
+        if (!fixture_dir.empty()) {
+            measure_fixtures(fixture_dir, only_tokens, repeat, only_shape, flush, device.stream);
+            return 0;
+        }
         using T = gg::GgmlType;
         const std::array<std::array<T, 3>, 7> formats{{
             {T::Q4_K, T::Q4_K, T::Q4_K}, {T::Q5_K, T::Q5_K, T::Q5_K},

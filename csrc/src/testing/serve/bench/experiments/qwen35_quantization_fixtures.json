@@ -1,0 +1,223 @@
+{
+  "checkpoint": "/home/densemax2/work/flavius/surogate/models/Qwen_Qwen3.5-9B-Q5_K_M.gguf",
+  "checkpoint_bytes": 7111487520,
+  "main_layers": 32,
+  "mtp_layers": 1,
+  "hidden": 4096,
+  "input": "deterministic synthetic BF16 activation; checkpoint weights",
+  "cases": [
+    {
+      "name": "qwen35_gdn_l0",
+      "kind": "gdn",
+      "layers_with_same_formats": [
+        0,
+        1,
+        2,
+        4,
+        5,
+        6,
+        8,
+        9,
+        10,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        20,
+        21,
+        22,
+        24,
+        25,
+        26,
+        28,
+        29,
+        30
+      ],
+      "representative_layer": 0,
+      "min_tokens": 2,
+      "projections": [
+        {
+          "label": "qkv",
+          "source_tensor": "blk.0.attn_qkv.weight",
+          "format": "Q8_0",
+          "rows": 8192,
+          "hidden": 4096,
+          "bytes": 35651584,
+          "file": "qwen35_gdn_l0_qkv.blocks",
+          "sha256": "e4d3fda7fadb2dbe6529516f70b2fc0f28eeb0094690d828a2173fca9cf7e25f"
+        },
+        {
+          "label": "z",
+          "source_tensor": "blk.0.attn_gate.weight",
+          "format": "Q5_K",
+          "rows": 4096,
+          "hidden": 4096,
+          "bytes": 11534336,
+          "file": "qwen35_gdn_l0_z.blocks",
+          "sha256": "1aa939531a2831e9a03c2edbc82bb1dbbca0f8baf40dcde23b7257dfc54004f7"
+        }
+      ]
+    },
+    {
+      "name": "qwen35_attention_l3",
+      "kind": "attention",
+      "layers_with_same_formats": [
+        3,
+        15,
+        27,
+        31
+      ],
+      "representative_layer": 3,
+      "min_tokens": 1,
+      "projections": [
+        {
+          "label": "q",
+          "source_tensor": "blk.3.attn_q.weight",
+          "format": "Q6_K",
+          "rows": 4096,
+          "hidden": 4096,
+          "bytes": 13762560,
+          "file": "qwen35_attention_l3_q.blocks",
+          "sha256": "df9ba5efed6dd14503af49b0bc3d7e1624422c8e16e87bc164d844864db57c41"
+        },
+        {
+          "label": "k",
+          "source_tensor": "blk.3.attn_k.weight",
+          "format": "Q6_K",
+          "rows": 1024,
+          "hidden": 4096,
+          "bytes": 3440640,
+          "file": "qwen35_attention_l3_k.blocks",
+          "sha256": "88afe31dfea471b76301464a5357039dfab8d0b7e206b31f920530eb39ae166c"
+        },
+        {
+          "label": "gate",
+          "source_tensor": "blk.3.attn_q.weight",
+          "format": "Q6_K",
+          "rows": 4096,
+          "hidden": 4096,
+          "bytes": 13762560,
+          "file": "qwen35_attention_l3_gate.blocks",
+          "sha256": "2079af310573e85f38c2df68e483b2e668d4f0b5a3a1c8b0673717575aec8d88"
+        },
+        {
+          "label": "v",
+          "source_tensor": "blk.3.attn_v.weight",
+          "format": "Q6_K",
+          "rows": 1024,
+          "hidden": 4096,
+          "bytes": 3440640,
+          "file": "qwen35_attention_l3_v.blocks",
+          "sha256": "0a62dd3864ce435673fb4fa748cbc0bc99ba2296e96c877253407c9d7b6f6f5a"
+        }
+      ]
+    },
+    {
+      "name": "qwen35_attention_l7",
+      "kind": "attention",
+      "layers_with_same_formats": [
+        7,
+        11,
+        19,
+        23
+      ],
+      "representative_layer": 7,
+      "min_tokens": 1,
+      "projections": [
+        {
+          "label": "q",
+          "source_tensor": "blk.7.attn_q.weight",
+          "format": "Q5_K",
+          "rows": 4096,
+          "hidden": 4096,
+          "bytes": 11534336,
+          "file": "qwen35_attention_l7_q.blocks",
+          "sha256": "384e8d480854c79072aac05017d769af1481af939a11a1b7fd922e33b06b750c"
+        },
+        {
+          "label": "k",
+          "source_tensor": "blk.7.attn_k.weight",
+          "format": "Q6_K",
+          "rows": 1024,
+          "hidden": 4096,
+          "bytes": 3440640,
+          "file": "qwen35_attention_l7_k.blocks",
+          "sha256": "6530c5aeb839cca245bedcac448ebb91968b4eaed448a1e47f9621a49a919e86"
+        },
+        {
+          "label": "gate",
+          "source_tensor": "blk.7.attn_q.weight",
+          "format": "Q5_K",
+          "rows": 4096,
+          "hidden": 4096,
+          "bytes": 11534336,
+          "file": "qwen35_attention_l7_gate.blocks",
+          "sha256": "b56730b85710ac8d3c633787112feffb9331eeb69aded9ac3b8063d1fd0e36e4"
+        },
+        {
+          "label": "v",
+          "source_tensor": "blk.7.attn_v.weight",
+          "format": "Q5_K",
+          "rows": 1024,
+          "hidden": 4096,
+          "bytes": 2883584,
+          "file": "qwen35_attention_l7_v.blocks",
+          "sha256": "efdf1ff6b307ff7822a48fb2a1c2e2159aae386415f8b050b7cb8eb664641315"
+        }
+      ]
+    },
+    {
+      "name": "qwen35_mtp_attention_l32",
+      "kind": "mtp_attention",
+      "layers_with_same_formats": [
+        32
+      ],
+      "representative_layer": 32,
+      "min_tokens": 1,
+      "projections": [
+        {
+          "label": "q",
+          "source_tensor": "blk.32.attn_q.weight",
+          "format": "Q8_0",
+          "rows": 4096,
+          "hidden": 4096,
+          "bytes": 17825792,
+          "file": "qwen35_mtp_attention_l32_q.blocks",
+          "sha256": "d883aa41699d9c2ee7efca62345bab48cc392fb9ba8560f0c759c4d9a0bec5b3"
+        },
+        {
+          "label": "k",
+          "source_tensor": "blk.32.attn_k.weight",
+          "format": "Q8_0",
+          "rows": 1024,
+          "hidden": 4096,
+          "bytes": 4456448,
+          "file": "qwen35_mtp_attention_l32_k.blocks",
+          "sha256": "95af7e1f29a62867fedef3903aecd6b6c9f4c1882aff8e1c5f44824cd88fd757"
+        },
+        {
+          "label": "gate",
+          "source_tensor": "blk.32.attn_q.weight",
+          "format": "Q8_0",
+          "rows": 4096,
+          "hidden": 4096,
+          "bytes": 17825792,
+          "file": "qwen35_mtp_attention_l32_gate.blocks",
+          "sha256": "52fb8013fe58714d0aa9ebd08a052246c805b2f9ea680ee9e8532568a2665c83"
+        },
+        {
+          "label": "v",
+          "source_tensor": "blk.32.attn_v.weight",
+          "format": "Q8_0",
+          "rows": 1024,
+          "hidden": 4096,
+          "bytes": 4456448,
+          "file": "qwen35_mtp_attention_l32_v.blocks",
+          "sha256": "46db5c77ec9d5f04b916ec01791fe8c18d7459625d9d0de5c5fd7efb919348e9"
+        }
+      ]
+    }
+  ]
+}
