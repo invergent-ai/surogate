@@ -41,31 +41,39 @@ __global__ __launch_bounds__(64) void swiglu_k_dual_kernel(const uint8_t* gate, 
 
 // A homogeneous pair uses 16 gate rows and 16 up rows in one tile. Keeping
 // each half contiguous also avoids narrow partially-filled decode slowdowns.
-template <class Codec>
-__global__ __launch_bounds__(32) void swiglu_k_tile_kernel(const uint8_t* gate, const uint8_t* up,
+template <class Codec, int TileRows = 32, int TileCols = 8>
+__global__ __launch_bounds__((TileCols / 8) *
+                             32) void swiglu_k_tile_kernel(const uint8_t* gate, const uint8_t* up,
                                                            const int8_t* codes, const __half2* ds,
                                                            int rows, int k, int tokens,
                                                            __nv_bfloat16* out) {
-    __shared__ GgmlI8Smem<Codec, 8, 32> sm;
-    const int row0 = blockIdx.x * 16;
+    static_assert(TileRows == 32 || TileRows == 64);
+    constexpr int half_rows = TileRows / 2;
+    __shared__ GgmlI8Smem<Codec, TileCols, TileRows> sm;
+    const int row0 = blockIdx.x * half_rows;
+    const int col0 = blockIdx.y * TileCols;
     auto row_base  = [&](int row) {
-        return (row < 16 ? gate : up) +
-               int64_t(min(row0 + row % 16, rows - 1)) * (k / QK_K) * Codec::kBlockBytes;
+        return (row < half_rows ? gate : up) +
+               int64_t(min(row0 + row % half_rows, rows - 1)) * (k / QK_K) * Codec::kBlockBytes;
     };
-    auto act_row = [&](int column) { return int64_t(column); };
-    float acc[2][4];
-    ggml_i8_tile<Codec, 1, 8, true, 32>(sm, row_base, act_row, codes, ds, tokens, k, acc);
+    auto act_row = [&](int column) { return int64_t(col0 + column); };
+    float acc[TileRows / 16][4];
+    ggml_i8_tile<Codec, TileCols / 8, TileCols, true, TileRows>(
+        sm, row_base, act_row, codes, ds, min(TileCols, tokens - col0), k, acc);
     const int lane = threadIdx.x & 31;
 #pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        const int row    = row0 + (lane >> 2) + (e / 2) * 8;
-        const int column = (lane & 3) * 2 + (e & 1);
-        if (row < rows && column < tokens) {
-            const float g = __bfloat162float(__float2bfloat16_rn(acc[0][e] + 0.0f));
-            const float u = __bfloat162float(__float2bfloat16_rn(acc[1][e] + 0.0f));
-            out[int64_t(column) * rows + row] = __float2bfloat16_rn(swiglu_clamped(g, u, 0.0f));
+    for (int mi = 0; mi < half_rows / 16; ++mi)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int row    = row0 + mi * 16 + (lane >> 2) + (e / 2) * 8;
+            const int column = col0 + (threadIdx.x >> 5) * 8 + (lane & 3) * 2 + (e & 1);
+            if (row < rows && column < tokens) {
+                const float g = __bfloat162float(__float2bfloat16_rn(acc[mi][e] + 0.0f));
+                const float u =
+                    __bfloat162float(__float2bfloat16_rn(acc[mi + half_rows / 16][e] + 0.0f));
+                out[int64_t(column) * rows + row] = __float2bfloat16_rn(swiglu_clamped(g, u, 0.0f));
+            }
         }
-    }
 }
 
 // Mixed codecs can have different scale widths (Q6_K versus Q4_K/Q5_K).

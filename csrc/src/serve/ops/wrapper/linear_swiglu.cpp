@@ -138,6 +138,25 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
                                                   LinearPolicy::A16Only, min_tokens, max_tokens);
 }
 
+std::size_t linear_swiglu_workspace_capacity_bytes(
+    QType gate_qtype, QType up_qtype, std::int32_t gate_up_rows, std::int32_t input_rows,
+    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (gate_up_rows <= 0 || gate_up_rows % 2) {
+        throw std::invalid_argument("linear_swiglu workspace: invalid parent row count");
+    }
+    if (detail::ggml::is_ggml_qtype(gate_qtype) && detail::ggml::is_ggml_qtype(up_qtype)) {
+        return detail::ggml::swiglu_workspace_capacity_bytes(
+            detail::ggml::ggml_type_for(gate_qtype), detail::ggml::ggml_type_for(up_qtype),
+            gate_up_rows / 2, input_rows, min_tokens, max_tokens);
+    }
+    if (gate_qtype != up_qtype) {
+        throw std::invalid_argument("linear_swiglu workspace: explicit mixed halves require GGML formats");
+    }
+    return linear_swiglu_workspace_capacity_bytes(gate_qtype, gate_up_rows, input_rows,
+                                                  policy, min_tokens, max_tokens);
+}
+
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream) {
     validate_policy(policy);
@@ -147,7 +166,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         if ((gate_up_weight.n % 2) != 0 || out.ne[0] != rows || out.ne[1] != t) {
             throw std::invalid_argument("linear_swiglu: a row-projected gate_up parent must be [2M, k] with out [M, T]");
         }
-        if (detail::ggml::ggml_swiglu_decode(x, gate_up_weight, out, ws, stream)) { return; }
+        if (detail::ggml::ggml_swiglu(x, gate_up_weight, out, ws, stream)) { return; }
         auto scope  = ws.scope();
         Tensor gate = ws.alloc(DType::BF16, {rows, t});
         Tensor up   = ws.alloc(DType::BF16, {rows, t});

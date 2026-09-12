@@ -5,6 +5,7 @@
 #include "ops/linear/ggml/ggml_linear.h"
 #include "ops/linear/ggml/ggml_q8_1.h"
 #include "ops/linear/ggml/ggml_swiglu.h"
+#include "api/ops/silu_mul.h"
 
 #include <cuda_bf16.h>
 
@@ -318,6 +319,42 @@ bool ggml_swiglu_decode(const Tensor& x, const Weight& w, Tensor& out,
     const Input in = input_for(x, w, &workspace, bytes, stream);
     swiglu_decode_launch(gate_type, gate.qdata, up_type, up.qdata, rows, w.k, in.x, x.ne[1],
                          static_cast<__nv_bfloat16*>(out.data), in.planes.data, in.planes.bytes, stream);
+    return true;
+}
+
+bool ggml_swiglu(const Tensor& x, const Weight& w, Tensor& out,
+                 WorkspaceArena& workspace, cudaStream_t stream) {
+    if (ggml_swiglu_decode(x, w, out, workspace, stream)) { return true; }
+    if (!is_ggml_qtype(w.qtype)) { return false; }
+    const auto k_quant = [](GgmlType type) {
+        return type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K;
+    };
+    require_ggml_weight(w, "ggml swiglu");
+    if (w.n % 2) { throw std::invalid_argument("ggml swiglu: odd gate/up row count"); }
+    const int rows = w.n / 2, tokens = x.ne[1];
+    const Weight gate = ggml_weight_rows(w, 0, rows), up = ggml_weight_rows(w, rows, rows);
+    const auto gate_type = ggml_type_for(gate.qtype), up_type = ggml_type_for(up.qtype);
+    if (!k_quant(gate_type) || !k_quant(up_type)) { return false; }
+    require_x_out(x, w.k, out, rows, "ggml swiglu");
+    const auto bytes = linear_workspace_bytes(rows, w.k, tokens);
+    auto scope = workspace.scope();
+    if (swiglu_prefill_admits(gate_type, up_type, rows, w.k, tokens)) {
+        const Input in = input_for(x, w, &workspace, bytes, stream);
+        swiglu_prefill_launch(gate_type, gate.qdata, up.qdata, rows, w.k, in.x, tokens,
+                              static_cast<__nv_bfloat16*>(out.data), in.planes.data, in.planes.bytes, stream);
+    } else {
+        Tensor g = workspace.alloc(DType::BF16, {rows, tokens});
+        Tensor u = workspace.alloc(DType::BF16, {rows, tokens});
+        const Input in = input_for(x, w, &workspace, bytes, stream);
+        auto* codes = static_cast<std::int8_t*>(in.planes.data);
+        auto* ds = reinterpret_cast<__half2*>(codes + std::size_t(tokens) * w.k);
+        quantize_q8_1_planes_launch(in.x, w.k, tokens, codes, ds, stream);
+        linear_prequantized_launch(gate_type, gate.qdata, rows, w.k, tokens,
+                                   static_cast<__nv_bfloat16*>(g.data), in.planes.data, in.planes.bytes, stream);
+        linear_prequantized_launch(up_type, up.qdata, rows, w.k, tokens,
+                                   static_cast<__nv_bfloat16*>(u.data), in.planes.data, in.planes.bytes, stream);
+        ops::silu_mul(g, u, out, stream);
+    }
     return true;
 }
 

@@ -18,6 +18,7 @@
 #include "family/impl/mlp_swiglu.h"
 #include "api/ops/linear_pair.h"
 #include "api/ops/linear_swiglu.h"
+#include "ops/linear/ggml/ggml_dispatch.h"
 #include "api/ops/mtp_pack.h"
 #include "api/ops/residual_add.h"
 #include "api/ops/silu_mul.h"
@@ -123,11 +124,24 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
 std::size_t post_mixer_workspace_bytes(const family::TextGeometry& g, QType gate_up_qtype,
                                        QType down_qtype, ops::LinearPolicy gate_up_policy,
                                        ops::LinearPolicy down_policy,
-                                       std::int32_t first, std::int32_t last) {
+                                       std::int32_t first, std::int32_t last,
+                                       const family::LinearStorage* storage = nullptr) {
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {g.intermediate, last});
-    family::swiglu_mlp_layout(layout, g.intermediate, g.hidden, gate_up_qtype,
-                              gate_up_policy, first, last);
+    if (storage) {
+        auto scope = layout.scope();
+        std::size_t bytes = 0;
+        for (auto gate : storage->formats) {
+            for (auto up : storage->formats) {
+                bytes = std::max(bytes, ops::linear_swiglu_workspace_capacity_bytes(
+                    gate, up, 2 * g.intermediate, g.hidden, gate_up_policy, first, last));
+            }
+        }
+        (void)layout.alloc_bytes(bytes);
+    } else {
+        family::swiglu_mlp_layout(layout, g.intermediate, g.hidden, gate_up_qtype,
+                                  gate_up_policy, first, last);
+    }
     {
         auto scope = layout.scope();
         (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
@@ -698,7 +712,13 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(const 
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry,
-    WeightsProfile, family::TextPhase, std::int32_t first, std::int32_t last) {
+    WeightsProfile profile, family::TextPhase phase, std::int32_t first, std::int32_t last) {
+    // Callers without deployment features retain the adapter-safe reservation.
+    return post_mixer_workspace_capacity_bytes(geometry, profile, phase, first, last, true);
+}
+
+std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeometry& geometry,
+    WeightsProfile, family::TextPhase, std::int32_t first, std::int32_t last, bool lora_enabled) {
     family::validate_token_interval(first, last);
     return text_layers_workspace(geometry, WorkspaceLayers::All, [&](const std::string& prefix) {
         if (geometry.linear_storage.contains(prefix + "mlp/gate")) {
@@ -708,10 +728,13 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(const family::TextGeome
         }
         const auto& gate_up = family::require_linear_storage(geometry, prefix + "mlp/gate_up");
         const auto& down = family::require_linear_storage(geometry, prefix + "mlp/down");
+        const bool known_ggml = !lora_enabled && std::all_of(gate_up.formats.begin(), gate_up.formats.end(),
+            [](QType type) { return ops::detail::ggml::is_ggml_qtype(type); });
         std::size_t peak = 0;
         for (const auto a : gate_up.formats) {
             for (const auto b : down.formats) {
-                peak = std::max(peak, post_mixer_workspace_bytes(geometry, a, b, text_policy(a), text_policy(b), first, last));
+                peak = std::max(peak, post_mixer_workspace_bytes(geometry, a, b, text_policy(a), text_policy(b),
+                                                                 first, last, known_ggml ? &gate_up : nullptr));
             }
         }
         return peak;

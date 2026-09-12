@@ -35,6 +35,12 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
                                        std::int32_t input_rows, LinearPolicy policy,
                                        std::int32_t min_tokens, std::int32_t max_tokens);
 
+/// Capacity when the two GGML half formats are known. The single-QType query
+/// remains conservative for parents whose segments may use other formats.
+[[nodiscard]] std::size_t linear_swiglu_workspace_capacity_bytes(
+    QType gate_qtype, QType up_qtype, std::int32_t gate_up_rows, std::int32_t input_rows,
+    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
+
 /**
  * Op: linear_swiglu
  *

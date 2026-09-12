@@ -506,8 +506,7 @@ int run_consistent_columns(const Fixture& f, void* d_blocks, void* scratch,
 // calls at a prefill width. Minimal decode workspace also proves that gate/up
 // intermediate buffers are not allocated, including during graph capture.
 int run_swiglu(const Fixture& gate_f, const Fixture& up_f, bool mapped, bool segmented,
-               int& cases) {
-    constexpr int columns = 129;
+               int& cases, int columns = 129) {
     const int n = gate_f.n, k = gate_f.k;
     auto up_bytes = up_f.blocks;
     std::rotate(up_bytes.begin(), up_bytes.begin() + gg::block_bytes(up_f.type), up_bytes.end());
@@ -548,7 +547,10 @@ int run_swiglu(const Fixture& gate_f, const Fixture& up_f, bool mapped, bool seg
     Tensor reference_tensor(expected_gpu.p, DType::BF16, {n, columns});
     sinfer::WorkspaceArena full(sinfer::ops::linear_swiglu_workspace_capacity_bytes(
         parent.qtype, parent.n, k, 1, columns));
-    sinfer::WorkspaceArena small(gg::linear_workspace_bytes(n, k, 8) + 256);
+    const auto planned = sinfer::ops::linear_swiglu_workspace_capacity_bytes(
+        parent.qtype, qtype_of(up_f.type), parent.n, k, sinfer::ops::LinearPolicy::A16Only, 1, columns);
+    sinfer::WorkspaceArena selected(planned);
+    sinfer::WorkspaceArena small(gg::linear_workspace_bytes(n, k, columns) + 256);
     cudaStream_t stream;
     CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     gg::ggml_project_rows(activation, parent, 0, gate_tensor, &full, stream);
@@ -559,9 +561,11 @@ int run_swiglu(const Fixture& gate_f, const Fixture& up_f, bool mapped, bool seg
     expected_gpu.copy_to_host(expected.data(), output_bytes);
     int failures = 0;
     for (bool capture : {false, true}) {
-        for (int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 129}) {
-            const bool fused = gg::swiglu_decode_admits(gate_f.type, up_f.type, n, k, tokens);
-            auto& workspace = fused ? small : full;
+        for (int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 31, 32, 33, 63, 64, 65, 128, 129, 257, 513, 2048, 2053}) {
+            if (tokens > columns) { continue; }
+            const bool fused = gg::swiglu_decode_admits(gate_f.type, up_f.type, n, k, tokens) ||
+                               gg::swiglu_prefill_admits(gate_f.type, up_f.type, n, k, tokens);
+            auto& workspace = fused ? small : selected;
             workspace.reset_peak();
             Tensor in(input.p, DType::BF16, {k, tokens});
             Tensor out(output.p, DType::BF16, {n, tokens});
@@ -585,7 +589,12 @@ int run_swiglu(const Fixture& gate_f, const Fixture& up_f, bool mapped, bool seg
             const auto* tail = reinterpret_cast<const unsigned char*>(got.data() + count);
             const bool guarded = std::all_of(tail, tail + (got.size() - count) * sizeof(__nv_bfloat16),
                                              [](unsigned char v) { return v == 0x3e; });
-            const bool bounded = workspace.used() == 0 &&
+            const auto interval_capacity = sinfer::ops::linear_swiglu_workspace_capacity_bytes(
+                parent.qtype, qtype_of(up_f.type), parent.n, k, sinfer::ops::LinearPolicy::A16Only, 1, tokens);
+            const auto call_capacity = sinfer::ops::linear_swiglu_workspace_capacity_bytes(
+                parent.qtype, qtype_of(up_f.type), parent.n, k, sinfer::ops::LinearPolicy::A16Only, tokens, tokens);
+            const bool bounded = workspace.used() == 0 && workspace.peak_used() <= planned &&
+                workspace.peak_used() <= interval_capacity && workspace.peak_used() <= call_capacity &&
                 (!fused || workspace.peak_used() <= gg::linear_workspace_bytes(n, k, tokens) + 255);
             const bool ok = equal && guarded && bounded;
             ++cases;
@@ -825,6 +834,11 @@ int main() {
                     for (bool mapped : {false, true}) {
                         failures += run_swiglu(f, up, mapped, true, cases);
                         if (type == up_type) { failures += run_swiglu(f, up, mapped, false, cases); }
+                    }
+                    if (f.label == "synthetic" &&
+                        (type == gg::GgmlType::Q4_K || type == gg::GgmlType::Q5_K || type == gg::GgmlType::Q6_K) &&
+                        (up_type == gg::GgmlType::Q4_K || up_type == gg::GgmlType::Q5_K || up_type == gg::GgmlType::Q6_K)) {
+                        failures += run_swiglu(f, up, true, true, cases, 2053);
                     }
                 }
             }

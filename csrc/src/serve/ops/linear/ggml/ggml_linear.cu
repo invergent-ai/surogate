@@ -66,11 +66,11 @@ __global__ __launch_bounds__((TileCols / 8) * 32) void dense_i8_kernel(
 
 void run_dense(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,
               const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out, void* scratch,
-              float beta, cudaStream_t stream) {
+              float beta, cudaStream_t stream, bool quantize = true) {
     if (type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K) {
         auto* codes = static_cast<std::int8_t*>(scratch);
         auto* ds = reinterpret_cast<__half2*>(codes + static_cast<std::size_t>(tokens) * k);
-        quantize_q8_1_planes_launch(x, k, tokens, codes, ds, stream);
+        if (quantize) { quantize_q8_1_planes_launch(x, k, tokens, codes, ds, stream); }
         const auto launch = [&]<class Codec>() {
             // Re-reading the weight for every column pays off only for narrow
             // batches; larger projections reach that crossover sooner.
@@ -226,6 +226,18 @@ void linear_launch(GgmlType type, const void* blocks, std::int32_t rows, std::in
                    const __nv_bfloat16* x, std::int32_t tokens, __nv_bfloat16* out, void* scratch,
                    std::size_t scratch_bytes, cudaStream_t stream) {
     run_bf16<false>(type, blocks, rows, k, x, tokens, out, scratch, scratch_bytes, stream);
+}
+
+void linear_prequantized_launch(GgmlType type, const void* blocks, std::int32_t rows,
+                                std::int32_t k, std::int32_t tokens, __nv_bfloat16* out,
+                                void* scratch, std::size_t scratch_bytes, cudaStream_t stream) {
+    if ((type != GgmlType::Q4_K && type != GgmlType::Q5_K && type != GgmlType::Q6_K) ||
+        rows <= 0 || k <= 0 || k % QK_K || tokens <= 0 || !blocks || !out || !scratch ||
+        (reinterpret_cast<std::uintptr_t>(scratch) & 15u) ||
+        scratch_bytes < linear_workspace_bytes(rows, k, tokens)) {
+        throw std::invalid_argument("ggml prequantized linear: invalid K-quant inputs or scratch");
+    }
+    run_dense(type, blocks, rows, k, nullptr, tokens, out, scratch, 0.0f, stream, false);
 }
 
 void linear_add_launch(GgmlType type, const void* blocks, std::int32_t rows, std::int32_t k,

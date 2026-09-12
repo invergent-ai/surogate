@@ -6,6 +6,7 @@
 #include "ops/linear/ggml/ggml_swiglu_k.cuh"
 
 #include <stdexcept>
+#include <algorithm>
 
 namespace sinfer::ops::detail::ggml {
 namespace {
@@ -13,6 +14,82 @@ constexpr bool k_quant(GgmlType type) {
     return type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::Q6_K;
 }
 } // namespace
+
+bool swiglu_prefill_admits(GgmlType gate, GgmlType up, std::int32_t rows, std::int32_t k,
+                           std::int32_t tokens) noexcept {
+    if (gate != up || !k_quant(gate) || rows <= 0 || k <= 0 || k % QK_K || tokens <= 8) {
+        return false;
+    }
+    // This narrow Q6 band favors the independent projections at large row counts.
+    return !(gate == GgmlType::Q6_K && rows >= 8192 && k <= 4096 && tokens <= 32);
+}
+
+std::size_t swiglu_workspace_capacity_bytes(GgmlType gate, GgmlType up, std::int32_t rows,
+                                            std::int32_t k, std::int32_t first, std::int32_t last) {
+    if (rows <= 0 || k <= 0 || k % block_values(gate) || k % block_values(up) || first <= 0 ||
+        last < first) {
+        throw std::invalid_argument("ggml swiglu workspace: invalid dimensions or token interval");
+    }
+    std::size_t peak    = linear_workspace_bytes(rows, k, last) + 256;
+    const auto capacity = [&](int tokens, bool fused) {
+        const std::size_t planes = fused ? 0 : 4 * std::size_t(rows) * tokens + 512;
+        return planes + linear_workspace_bytes(rows, k, tokens) + 256;
+    };
+    for (int tokens = first; tokens <= std::min(last, 8); ++tokens) {
+        peak = std::max(peak, capacity(tokens, swiglu_decode_admits(gate, up, rows, k, tokens)));
+    }
+    for (int tokens : {std::min(last, 32), last}) {
+        if (tokens >= std::max(first, 9)) {
+            peak =
+                std::max(peak, capacity(tokens, swiglu_prefill_admits(gate, up, rows, k, tokens)));
+        }
+    }
+    return peak;
+}
+
+void swiglu_prefill_launch(GgmlType type, const void* gate, const void* up, std::int32_t rows,
+                           std::int32_t k, const __nv_bfloat16* x, std::int32_t tokens,
+                           __nv_bfloat16* out, void* scratch, std::size_t scratch_bytes,
+                           cudaStream_t stream) {
+    if (!swiglu_prefill_admits(type, type, rows, k, tokens) || !gate || !up || !x || !out ||
+        !scratch || (reinterpret_cast<std::uintptr_t>(scratch) & 15u) ||
+        scratch_bytes < linear_workspace_bytes(rows, k, tokens)) {
+        throw std::invalid_argument("ggml swiglu prefill: invalid inputs or scratch");
+    }
+    auto* codes = static_cast<std::int8_t*>(scratch);
+    auto* ds    = reinterpret_cast<__half2*>(codes + std::size_t(tokens) * k);
+    quantize_q8_1_planes_launch(x, k, tokens, codes, ds, stream);
+    const auto launch = [&]<class Codec>() {
+        const auto tile = [&]<int Rows, int Columns>() {
+            swiglu_k_tile_kernel<Codec, Rows, Columns>
+                <<<dim3((rows + Rows / 2 - 1) / (Rows / 2), (tokens + Columns - 1) / Columns),
+                   (Columns / 8) * 32, 0, stream>>>(static_cast<const std::uint8_t*>(gate),
+                                                    static_cast<const std::uint8_t*>(up), codes, ds,
+                                                    rows, k, tokens, out);
+        };
+        if (rows <= 4096 && tokens <= 128) {
+            tile.template operator()<32, 32>();
+        } else if (tokens <= 64) {
+            tile.template operator()<64, 32>();
+        } else {
+            tile.template operator()<64, 64>();
+        }
+    };
+    switch (type) {
+    case GgmlType::Q4_K:
+        launch.template operator()<GgmlQ4KPrefill>();
+        break;
+    case GgmlType::Q5_K:
+        launch.template operator()<GgmlQ5KPrefill>();
+        break;
+    case GgmlType::Q6_K:
+        launch.template operator()<GgmlQ6KPrefill>();
+        break;
+    default:
+        break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
 
 bool swiglu_decode_admits(GgmlType gate, GgmlType up, std::int32_t rows, std::int32_t k,
                           std::int32_t tokens) noexcept {

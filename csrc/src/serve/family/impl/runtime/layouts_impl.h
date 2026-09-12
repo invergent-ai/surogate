@@ -427,6 +427,19 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     return out;
 }
 
+template <class Target>
+std::size_t post_mixer_workspace_capacity(const SequencePlanImpl& plan, family::TextPhase phase,
+                                         std::int32_t first, std::int32_t last) {
+    if constexpr (requires { Target::post_mixer_workspace_capacity_bytes(
+        plan.geometry, plan.weights_profile, phase, first, last, plan.lora_enabled); }) {
+        return Target::post_mixer_workspace_capacity_bytes(
+            plan.geometry, plan.weights_profile, phase, first, last, plan.lora_enabled);
+    } else {
+        return Target::post_mixer_workspace_capacity_bytes(
+            plan.geometry, plan.weights_profile, phase, first, last);
+    }
+}
+
 WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const std::uint32_t chunk_u32 = std::min(plan.prefill_chunk, plan.capacity);
     if (chunk_u32 == 0 ||
@@ -523,8 +536,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                       std::int32_t last, family::TextPhase phase) {
         auto stage = layout.scope();
         (void)workspace_recipe::post_mixer_hidden(layout, plan.geometry, last);
-        scratch(layout, Variant::post_mixer_workspace_capacity_bytes(plan.geometry, plan.weights_profile, phase,
-                                                                     first, last));
+        scratch(layout, post_mixer_workspace_capacity<Variant>(plan, phase, first, last));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, family::TextPhase phase, GdnWorkspacePath path,
@@ -906,6 +918,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     }
     auto impl                 = std::make_unique<SequencePlanImpl>();
     impl->weights_profile     = inputs.weights_profile;
+    impl->lora_enabled        = inputs.lora_enabled;
     impl->geometry            = inputs.geometry;
     impl->vision_geometry = inputs.vision_geometry;
     impl->capacity            = inputs.capacity;
@@ -1050,6 +1063,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .proposal_head             = options.speculative.proposal_head,
         .features                  = family::startup_features(options),
         .use_cuda_graph            = options.use_cuda_graph,
+        .lora_enabled              = options.lora_enable || !options.lora_payloads.empty(),
         .device                    = options.device,
         .pipeline_stage_first      = options.pipeline_stage_first,
         .pipeline_stage_last       = options.pipeline_stage_last,

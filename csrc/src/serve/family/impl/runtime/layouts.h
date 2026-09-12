@@ -88,6 +88,7 @@ struct SequencePlanningInputs {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    bool lora_enabled = false;
     int device          = 0;
     int pipeline_stage_first               = 0; // pipeline stage layer range (0/0 = whole model)
     int pipeline_stage_last                = 0;
@@ -129,6 +130,7 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
+    bool lora_enabled = false;
     int device          = 0;
     SINFER_FAMILY_RUNTIME_NS::PersistentLayout persistent;
     SINFER_FAMILY_RUNTIME_NS::WorkspacePlan workspace;
